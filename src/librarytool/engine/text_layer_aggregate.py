@@ -79,6 +79,12 @@ MAX_TEXT_LAYER_UNITS = 100_000
 MAX_TEXT_LAYER_BATCH_REPLACEMENTS = 4_096
 MAX_TEXT_LAYER_BATCH_CHARACTERS = 32 * 1024 * 1024
 MAX_TEXT_LAYER_RECEIPT_UNITS = MAX_TEXT_LAYER_BATCH_REPLACEMENTS
+# Unit pages are deliberately much smaller than the complete-document budget.
+# The count bound limits object/provenance traversal, while the encoded bound
+# prevents a small number of very large text records from defeating paging.
+MAX_TEXT_LAYER_PAGE_UNITS = 256
+MAX_TEXT_LAYER_PAGE_NUMBER = MAX_TEXT_LAYER_UNITS
+MAX_TEXT_LAYER_PAGE_UNIT_BYTES = 8 * 1024 * 1024
 # Bound picker/list projections and their per-layer source lookups even when a
 # broken adapter reports a lazy or dishonest Sequence.
 MAX_TEXT_LAYERS_PER_ITEM = 10_000
@@ -919,6 +925,244 @@ class TextLayerDocumentView:
 
 
 @dataclass(frozen=True, slots=True)
+class TextLayerUnitPageRequest:
+    """One fixed page from an immutable document/source revision pair."""
+
+    item_id: str
+    layer_id: str
+    document_revision: str
+    source_revision: str
+    page: int = 1
+    limit: int = MAX_TEXT_LAYER_PAGE_UNITS
+
+    def __post_init__(self) -> None:
+        _identifier(self.item_id, "item_id")
+        _identifier(self.layer_id, "layer_id")
+        _revision(self.document_revision, "document_revision")
+        _revision(self.source_revision, "source_revision")
+        if (
+            not isinstance(self.page, int)
+            or isinstance(self.page, bool)
+            or self.page < 1
+            or self.page > MAX_TEXT_LAYER_PAGE_NUMBER
+        ):
+            raise ValueError("page is outside the text-layer page budget")
+        if (
+            not isinstance(self.limit, int)
+            or isinstance(self.limit, bool)
+            or self.limit < 1
+            or self.limit > MAX_TEXT_LAYER_PAGE_UNITS
+        ):
+            raise ValueError(
+                "limit is outside the text-layer page unit budget"
+            )
+
+
+def _unit_collection_encoded_size(
+    units: Sequence[TextLayerUnitSnapshot],
+) -> int:
+    """Exact canonical byte size of the page's JSON unit array."""
+
+    if not units:
+        return 2
+    return 2 + len(units) - 1 + sum(
+        len(_canonical(value.as_dict())) for value in units
+    )
+
+
+def _unit_page_revision(value: JsonMapping) -> str:
+    return _digest("tlp", value)
+
+
+@dataclass(frozen=True, slots=True)
+class TextLayerUnitPageView:
+    """Bounded units from one exact, canonically ordered document snapshot."""
+
+    item_id: str
+    layer_id: str
+    document_revision: str
+    content_revision: str
+    source_revision: str
+    source: TextLayerSourceView
+    page: int
+    next_page: int | None
+    limit: int
+    unit_count: int
+    units: tuple[TextLayerUnitSnapshot, ...]
+    has_more: bool
+    page_revision: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.item_id, "item_id")
+        _identifier(self.layer_id, "layer_id")
+        for name in (
+            "document_revision",
+            "content_revision",
+            "source_revision",
+            "page_revision",
+        ):
+            _revision(getattr(self, name), name)
+        if (
+            not isinstance(self.page, int)
+            or isinstance(self.page, bool)
+            or self.page < 1
+            or self.page > MAX_TEXT_LAYER_PAGE_NUMBER
+        ):
+            raise ValueError("page is outside the text-layer page budget")
+        if (
+            not isinstance(self.limit, int)
+            or isinstance(self.limit, bool)
+            or self.limit < 1
+            or self.limit > MAX_TEXT_LAYER_PAGE_UNITS
+        ):
+            raise ValueError("limit is outside the text-layer page unit budget")
+        if (
+            not isinstance(self.unit_count, int)
+            or isinstance(self.unit_count, bool)
+            or self.unit_count < 0
+            or self.unit_count > MAX_TEXT_LAYER_UNITS
+        ):
+            raise ValueError("unit_count is outside the text-layer unit budget")
+        if not isinstance(self.source, TextLayerSourceView):
+            raise TypeError("source must be TextLayerSourceView")
+        if self.source.pinned_revision != self.source_revision:
+            raise ValueError("source view does not match the page source pin")
+        units = _typed_tuple(
+            self.units,
+            TextLayerUnitSnapshot,
+            "units",
+            maximum=MAX_TEXT_LAYER_PAGE_UNITS,
+        )
+        start = (self.page - 1) * self.limit
+        if self.unit_count == 0 and self.page != 1:
+            raise ValueError("an empty document has only its first page")
+        if self.unit_count and start >= self.unit_count:
+            raise ValueError("unit page starts beyond the document")
+        expected_count = min(self.limit, max(0, self.unit_count - start))
+        if len(units) != expected_count:
+            raise ValueError("unit page does not match its declared range")
+        canonical = tuple(
+            sorted(units, key=lambda value: (value.order, value.selector))
+        )
+        if units != canonical:
+            raise ValueError("unit page is not in canonical document order")
+        selectors = [value.selector for value in units]
+        orders = [value.order for value in units]
+        if (
+            len(selectors) != len(set(selectors))
+            or len(orders) != len(set(orders))
+        ):
+            raise ValueError("unit page identities are ambiguous")
+        if _unit_collection_encoded_size(units) > (
+            MAX_TEXT_LAYER_PAGE_UNIT_BYTES
+        ):
+            raise ValueError("unit page exceeds its encoded-size budget")
+        if not isinstance(self.has_more, bool):
+            raise TypeError("has_more must be a boolean")
+        expected_more = start + len(units) < self.unit_count
+        expected_next = self.page + 1 if expected_more else None
+        if self.has_more != expected_more or self.next_page != expected_next:
+            raise ValueError("unit page continuation does not match its range")
+        expected = _unit_page_revision(self._revision_payload())
+        if self.page_revision != expected:
+            raise ValueError("page_revision does not match the unit page")
+        object.__setattr__(self, "units", units)
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        document: TextLayerDocumentSnapshot,
+        source: TextLayerSourceView,
+        page: int,
+        limit: int,
+        units: Sequence[TextLayerUnitSnapshot],
+    ) -> "TextLayerUnitPageView":
+        if not isinstance(document, TextLayerDocumentSnapshot):
+            raise TypeError("document must be TextLayerDocumentSnapshot")
+        if not isinstance(source, TextLayerSourceView):
+            raise TypeError("source must be TextLayerSourceView")
+        if (
+            source.representation_id != document.source.representation_id
+            or source.pinned_revision != document.source.revision
+        ):
+            raise ValueError("source view does not match the document pin")
+        if (
+            not isinstance(page, int)
+            or isinstance(page, bool)
+            or page < 1
+            or page > MAX_TEXT_LAYER_PAGE_NUMBER
+        ):
+            raise ValueError("page is outside the text-layer page budget")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > MAX_TEXT_LAYER_PAGE_UNITS
+        ):
+            raise ValueError("limit is outside the text-layer page unit budget")
+        values = _typed_tuple(
+            units,
+            TextLayerUnitSnapshot,
+            "units",
+            maximum=MAX_TEXT_LAYER_PAGE_UNITS,
+        )
+        start = (page - 1) * limit
+        expected = document.units[start : start + limit]
+        if values != expected:
+            raise ValueError("units do not match the requested document range")
+        has_more = start + len(values) < len(document.units)
+        payload = {
+            "item_id": document.item_id,
+            "layer_id": document.layer_id,
+            "document_revision": document.document_revision,
+            "content_revision": document.content_revision,
+            "source_revision": document.source.revision,
+            "source": source.as_dict(),
+            "page": page,
+            "next_page": page + 1 if has_more else None,
+            "limit": limit,
+            "unit_count": len(document.units),
+            "units": [value.as_dict() for value in values],
+            "has_more": has_more,
+        }
+        return cls(
+            item_id=document.item_id,
+            layer_id=document.layer_id,
+            document_revision=document.document_revision,
+            content_revision=document.content_revision,
+            source_revision=document.source.revision,
+            source=source,
+            page=page,
+            next_page=page + 1 if has_more else None,
+            limit=limit,
+            unit_count=len(document.units),
+            units=values,
+            has_more=has_more,
+            page_revision=_unit_page_revision(payload),
+        )
+
+    def _revision_payload(self) -> dict[str, Any]:
+        return {
+            "item_id": self.item_id,
+            "layer_id": self.layer_id,
+            "document_revision": self.document_revision,
+            "content_revision": self.content_revision,
+            "source_revision": self.source_revision,
+            "source": self.source.as_dict(),
+            "page": self.page,
+            "next_page": self.next_page,
+            "limit": self.limit,
+            "unit_count": self.unit_count,
+            "units": [value.as_dict() for value in self.units],
+            "has_more": self.has_more,
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {**self._revision_payload(), "page_revision": self.page_revision}
+
+
+@dataclass(frozen=True, slots=True)
 class TextLayerUnitReplacement:
     """Complete replacement of one unit's mutable record fields."""
 
@@ -1511,6 +1755,106 @@ class TextLayerAggregateService:
             )
             return self._view(session, document)
 
+    def page_units(
+        self, query: TextLayerUnitPageRequest
+    ) -> TextLayerUnitPageView:
+        """Read one fixed range of whole units from a pinned document."""
+
+        if not isinstance(query, TextLayerUnitPageRequest):
+            raise ValidationError(
+                "page_units requires a TextLayerUnitPageRequest",
+                code="invalid_text_layer_page_request",
+            )
+        item_id = self._item_id(query.item_id)
+        layer_id = self._layer_id(query.layer_id)
+        expected_document = self._expected_revision(
+            query.document_revision,
+            code="text_layer_document_revision_required",
+            invalid_code="invalid_text_layer_document_revision",
+            details={"item_id": item_id, "layer_id": layer_id},
+        )
+        expected_source = self._expected_source_revision(
+            query.source_revision,
+            item_id=item_id,
+            layer_id=layer_id,
+        )
+        with self._snapshot(item_id) as session:
+            self._require_item(session, item_id)
+            raw = self._repository_method(session, "get", item_id, layer_id)
+            if raw is None:
+                raise NotFoundError(
+                    "the text layer does not exist",
+                    code="text_layer_not_found",
+                    details={"item_id": item_id, "layer_id": layer_id},
+                )
+            document = self._document(
+                raw,
+                item_id=item_id,
+                layer_id=layer_id,
+            )
+            if document.document_revision != expected_document:
+                raise ConflictError(
+                    "the text layer changed elsewhere",
+                    code="text_layer_document_revision_conflict",
+                    details={
+                        "item_id": item_id,
+                        "layer_id": layer_id,
+                        "expected_revision": expected_document,
+                        "current_revision": document.document_revision,
+                    },
+                    retryable=True,
+                )
+            if document.source.revision != expected_source:
+                raise ConflictError(
+                    "the text layer is pinned to another source revision",
+                    code="text_layer_source_revision_conflict",
+                    details={
+                        "item_id": item_id,
+                        "layer_id": layer_id,
+                        "expected_revision": expected_source,
+                        "pinned_revision": document.source.revision,
+                    },
+                )
+
+            start = (query.page - 1) * query.limit
+            if (
+                (not document.units and query.page != 1)
+                or (document.units and start >= len(document.units))
+            ):
+                raise NotFoundError(
+                    "the text-layer unit page does not exist",
+                    code="text_layer_unit_page_not_found",
+                    details={
+                        "item_id": item_id,
+                        "layer_id": layer_id,
+                        "page": query.page,
+                        "unit_count": len(document.units),
+                    },
+                )
+            selected = document.units[start : start + query.limit]
+            if _unit_collection_encoded_size(selected) > (
+                MAX_TEXT_LAYER_PAGE_UNIT_BYTES
+            ):
+                raise ValidationError(
+                    "the text-layer unit page exceeds its response budget",
+                    code="text_layer_unit_page_payload_too_large",
+                    details={
+                        "item_id": item_id,
+                        "layer_id": layer_id,
+                        "page": query.page,
+                        "limit": query.limit,
+                        "maximum_bytes": MAX_TEXT_LAYER_PAGE_UNIT_BYTES,
+                    },
+                )
+            source = self._source_view(session, document)
+            return TextLayerUnitPageView.build(
+                document=document,
+                source=source,
+                page=query.page,
+                limit=query.limit,
+                units=selected,
+            )
+
     def create(self, command: CreateTextLayerCommand) -> TextLayerCommandResult:
         if not isinstance(command, CreateTextLayerCommand):
             raise ValidationError(
@@ -1953,6 +2297,18 @@ class TextLayerAggregateService:
         session: TextLayerReadSessionPort,
         document: TextLayerDocumentSnapshot,
     ) -> TextLayerDocumentView:
+        return TextLayerDocumentView.build(
+            document,
+            self._source_view(session, document),
+        )
+
+    def _source_view(
+        self,
+        session: TextLayerReadSessionPort,
+        document: TextLayerDocumentSnapshot,
+    ) -> TextLayerSourceView:
+        """Resolve source freshness without materializing a full detail view."""
+
         raw = self._repository_method(
             session,
             "source",
@@ -1976,7 +2332,7 @@ class TextLayerAggregateService:
                 current_revision=current.revision,
                 available=True,
             )
-        return TextLayerDocumentView.build(document, source)
+        return source
 
     @staticmethod
     def _source(
@@ -2334,6 +2690,9 @@ __all__ = [
     "MAX_TEXT_LAYER_METADATA_NODES",
     "MAX_TEXT_LAYER_METADATA_STRING_CHARACTERS",
     "MAX_TEXT_LAYER_PROVENANCE_ENCODED_BYTES",
+    "MAX_TEXT_LAYER_PAGE_UNIT_BYTES",
+    "MAX_TEXT_LAYER_PAGE_NUMBER",
+    "MAX_TEXT_LAYER_PAGE_UNITS",
     "MAX_TEXT_LAYER_RECEIPT_UNITS",
     "MAX_TEXT_LAYER_UNITS",
     "MAX_TEXT_UNIT_CHARACTERS",
@@ -2358,6 +2717,8 @@ __all__ = [
     "TextLayerSummaryView",
     "TextLayerStoredMutationReceipt",
     "TextLayerUnitDraft",
+    "TextLayerUnitPageRequest",
+    "TextLayerUnitPageView",
     "TextLayerUnitMutationReceipt",
     "TextLayerUnitOfWorkPort",
     "TextLayerUnitReplacement",

@@ -217,6 +217,63 @@
       isTextLayerRevision(value.view_revision);
   }
 
+  const MAX_TEXT_LAYER_PAGE_UNITS = 256;
+  const MAX_TEXT_LAYER_PAGE_NUMBER = 100000;
+  const MAX_TEXT_LAYER_UNITS = 100000;
+
+  function isTextLayerUnitPage(value, expected) {
+    if (!hasExactKeys(value, [
+      "item_id", "layer_id", "document_revision", "content_revision",
+      "source_revision", "source", "page", "next_page", "limit",
+      "unit_count", "units", "has_more", "page_revision",
+    ]) || value.item_id !== expected.itemId ||
+        value.layer_id !== expected.layerId ||
+        value.document_revision !== expected.documentRevision ||
+        value.source_revision !== expected.sourceRevision ||
+        value.page !== expected.page || value.limit !== expected.limit ||
+        !isPortableIdentifier(value.item_id) ||
+        !isPortableIdentifier(value.layer_id) ||
+        !isTextLayerRevision(value.document_revision) ||
+        !isTextLayerRevision(value.content_revision) ||
+        !isTextLayerRevision(value.source_revision) ||
+        !isTextLayerSourceView(value.source) ||
+        value.source.pinned_revision !== value.source_revision ||
+        !Number.isSafeInteger(value.page) || value.page < 1 ||
+        value.page > MAX_TEXT_LAYER_PAGE_NUMBER ||
+        (value.next_page !== null &&
+          (!Number.isSafeInteger(value.next_page) || value.next_page < 2 ||
+            value.next_page > MAX_TEXT_LAYER_PAGE_NUMBER)) ||
+        !Number.isSafeInteger(value.limit) || value.limit < 1 ||
+        value.limit > MAX_TEXT_LAYER_PAGE_UNITS ||
+        !Number.isSafeInteger(value.unit_count) || value.unit_count < 0 ||
+        value.unit_count > MAX_TEXT_LAYER_UNITS ||
+        !Array.isArray(value.units) || value.units.length > value.limit ||
+        value.units.length > value.unit_count ||
+        !value.units.every(isTextLayerUnit) ||
+        typeof value.has_more !== "boolean" ||
+        !isTextLayerRevision(value.page_revision)) return false;
+
+    const start = (value.page - 1) * value.limit;
+    if ((value.unit_count === 0 && value.page !== 1) ||
+        (value.unit_count > 0 && start >= value.unit_count) ||
+        value.units.length !== Math.min(
+          value.limit, Math.max(0, value.unit_count - start))) return false;
+
+    const selectors = new Set();
+    const orders = new Set();
+    let priorOrder = -1;
+    for (const unit of value.units) {
+      if (selectors.has(unit.selector) || orders.has(unit.order) ||
+          unit.order <= priorOrder) return false;
+      selectors.add(unit.selector);
+      orders.add(unit.order);
+      priorOrder = unit.order;
+    }
+    const hasMore = start + value.units.length < value.unit_count;
+    return value.has_more === hasMore &&
+      value.next_page === (hasMore ? value.page + 1 : null);
+  }
+
   function isTextLayerUnitReceipt(value, selector, expectedUnitRevision) {
     return hasExactKeys(value, [
       "selector", "before_unit_revision", "after_unit_revision",
@@ -372,6 +429,7 @@
       this.textLayers = Object.freeze({
         list: (args) => this._textLayerList(args),
         get: (args) => this._textLayerGet(args),
+        pageUnits: (args) => this._textLayerPageUnits(args),
         replaceUnit: (args) => this._textLayerReplaceUnit(args),
       });
       this.ocr = Object.freeze({
@@ -1066,6 +1124,55 @@
             containsCommandFingerprint(body)) {
           this._invalidResponse(
             "Engine returned an invalid text-layer detail",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _textLayerPageUnits({ itemId, layerId, documentRevision, sourceRevision,
+      page = 1, limit, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const layer = portableIdentifier(layerId, "layerId");
+      if (!Number.isSafeInteger(page) || page < 1 ||
+          page > MAX_TEXT_LAYER_PAGE_NUMBER) {
+        throw new TypeError(
+          `page must be an integer from 1 to ${MAX_TEXT_LAYER_PAGE_NUMBER}`);
+      }
+      if (!Number.isSafeInteger(limit) || limit < 1 ||
+          limit > MAX_TEXT_LAYER_PAGE_UNITS) {
+        throw new TypeError(
+          `limit must be an integer from 1 to ${MAX_TEXT_LAYER_PAGE_UNITS}`);
+      }
+      const document = quoteTextLayerRevision(
+        documentRevision, "documentRevision");
+      const source = quoteTextLayerRevision(sourceRevision, "sourceRevision");
+      const path =
+        `/v1/items/${encodePart(item)}/text-layers/${encodePart(layer)}/units`;
+      return this._requestJson("GET", path, {
+        headers: {
+          "If-Document-Match": document,
+          "If-Source-Match": source,
+        },
+        query: { page, limit },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "page",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.text-layer-unit-page/1" ||
+            !isTextLayerUnitPage(body.page, {
+              itemId: item,
+              layerId: layer,
+              documentRevision,
+              sourceRevision,
+              page,
+              limit,
+            }) || containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid text-layer unit page",
             "GET", path, body, undefined, status);
         }
         return body;

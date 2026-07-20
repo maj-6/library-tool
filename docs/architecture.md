@@ -155,14 +155,19 @@ Per-component detail lives in each part's own README (map at the end).
   `library.text-layers` module now composes that repository as a distinct
   aggregate service and advertises read/edit capabilities only when explicitly
   bound. A separately imported Flask adapter and `EngineClient.textLayers` now
-  provide versioned list, detail, and conditional single-unit replacement
-  resources whenever that service is present. Reads have strong validators;
-  commands require exact idempotency, unit, source, and complete-provenance
-  inputs. The transport caps mutation bodies at 1 MiB and complete detail
-  projections at 16 MiB, returning a structured error rather than truncating;
-  larger layers need a future paged unit-read resource. The service remains
-  absent from the production host, so no native file is created and no legacy
-  OCR path changes. A deliberate migration from page-marked `ocr/*.txt` still
+  provide versioned list, detail, pinned fixed-range unit reads, and
+  conditional single-unit replacement resources whenever that service is
+  present. Page requests require strong document/source pins and explicit
+  one-based page/limit ranges over canonical order, so a pinned traversal
+  cannot skip or duplicate units. Pages contain at most 256 complete units and
+  8 MiB of canonical unit data, carry a page-specific strong ETag, and fail
+  rather than truncate when one unit or the exact response envelope exceeds
+  its bound.
+  Reads perform no lazy writes; commands require exact idempotency, unit,
+  source, and complete-provenance inputs. The transport caps mutation bodies at
+  1 MiB and coherent detail projections at 16 MiB. The service remains absent
+  from the production host, so no native file is created and no legacy OCR
+  path changes. A deliberate migration from page-marked `ocr/*.txt` still
   remains before Replica, translation, or RAG can depend on it.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback

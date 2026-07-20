@@ -150,13 +150,19 @@ larger workbench and packaging split described below remains the target:
   aggregate behind a distinct registry service and contributes read/edit
   capabilities only when explicitly bound. It remains off in the production
   host. An opt-in Flask adapter plus `EngineClient.textLayers` now exposes
-  versioned list, detail, and single-unit replacement, resolving only that
-  registry service. Reads are strongly revalidatable; writes require exact
+  versioned list, detail, fixed-range unit pages, and single-unit replacement,
+  resolving only that registry service. Unit pages require exact document and
+  source pins, use explicit one-based page/limit ranges over canonical order,
+  and bind that range, source freshness, and complete units into a strong page
+  revision. Pages are limited to 256 units and 8 MiB of canonical unit data;
+  the transport enforces its exact envelope ceiling, returns `413` rather than
+  truncating an oversized unit/page, and supports strong ETag revalidation.
+  Reads are side-effect free and strongly revalidatable; writes require exact
   idempotency, unit/source CAS, and complete provenance. A 1 MiB mutation cap
-  and exact 16 MiB full-detail cap fail with structured `413` responses rather
-  than truncating or publishing. Migration from legacy `ocr/*.txt`, production
-  activation, and a paged read resource for larger layers still remain before
-  existing workbenches may depend on it.
+  and exact 16 MiB coherent-detail cap likewise fail with structured `413`
+  responses rather than truncating or publishing. Migration from legacy
+  `ocr/*.txt` and production activation still remain before existing
+  workbenches may depend on the native aggregate.
 - The secret-store contract, current-user DPAPI repository, and optional
   first-party `library.secrets` composition now form a complete but unbound
   backend slice. Only the public masked-status/CAS service enters the registry;
@@ -559,10 +565,13 @@ With the lifecycle seam established, migrate these data boundaries in order:
    deletion. Optional first-party composition now registers the aggregate and
    its read/edit capabilities only when explicitly supplied; the production
    graph remains unbound. The versioned transport/client surface now covers
-   list, coherent detail, and conditional single-unit correction without
-   activating storage. Next, add paged unit reads for documents above the
-   bounded full-detail projection, then let a deliberate compatibility importer
-   map legacy `ocr/*.txt` pages to already-persisted canvas selectors. Replica, translation,
+   list, coherent detail, pinned fixed-range unit reads, and conditional
+   single-unit correction without activating storage. Page traversal cannot
+   skip or duplicate units while its mandatory document/source pins hold; each
+   response contains one arithmetic page of whole canonically ordered units
+   under count and encoded-size ceilings and has its own strong validator.
+   Next, let a deliberate compatibility importer map legacy `ocr/*.txt` pages
+   to already-persisted canvas selectors. Replica, translation,
    Knowledge/RAG, search, and export should consume this one boundary rather
    than rediscovering compiled files independently. A future summary index and
    shared-read mechanism should replace full-document parsing under the current

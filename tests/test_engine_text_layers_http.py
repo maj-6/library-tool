@@ -109,6 +109,18 @@ def text_layer_http(tmp_path: Path):
                             recipe_revision="recipe-r1",
                         ),
                     ),
+                    TextLayerUnitDraft(
+                        selector="canvas-b",
+                        order=2,
+                        label="Folio B",
+                        text="Beta",
+                    ),
+                    TextLayerUnitDraft(
+                        selector="canvas-c",
+                        order=3,
+                        label="Folio C",
+                        text="Gamma",
+                    ),
                 ),
             ),
         )
@@ -141,6 +153,24 @@ def _replace_headers(detail, **overrides):
 
 def _replace_body(text="Corrected"):
     return {"replacement": {"text": text, "provenance": _provenance()}}
+
+
+def _page_headers(detail, **overrides):
+    document = detail["text_layer"]["document"]
+    headers = {
+        "If-Document-Match": f'"{document["document_revision"]}"',
+        "If-Source-Match": f'"{document["source"]["revision"]}"',
+    }
+    headers.update(overrides)
+    return headers
+
+
+def _unit_page(client, detail, *, page=1, limit=2, headers=None):
+    query = f"page={page}&limit={limit}"
+    return client.get(
+        f"/api/v1/items/{ITEM_ID}/text-layers/{LAYER_ID}/units?{query}",
+        headers=headers or _page_headers(detail),
+    )
 
 
 def test_reads_are_versioned_coherent_and_revalidatable(text_layer_http):
@@ -209,6 +239,218 @@ def test_detail_response_has_an_exact_encoded_ceiling(
     over_limit = _detail(client)
     assert over_limit.status_code == 413
     assert over_limit.get_json()["code"] == "text_layer_detail_too_large"
+    assert over_limit.get_json()["details"] == {
+        "maximum_bytes": exact_size - 1
+    }
+    assert over_limit.cache_control.no_store is True
+    assert over_limit.headers["Pragma"] == "no-cache"
+
+
+def test_unit_pages_are_pinned_ordered_and_revalidatable(text_layer_http):
+    client, _engine, _service, _source_revision, _root = text_layer_http
+    detail = _detail(client).get_json()
+
+    first = _unit_page(client, detail, limit=2)
+    assert first.status_code == 200
+    body = first.get_json()
+    page = body["page"]
+    assert body["schema"] == "librarytool.text-layer-unit-page/1"
+    assert [value["selector"] for value in page["units"]] == [
+        "canvas-a",
+        "canvas-b",
+    ]
+    assert page["page"] == 1
+    assert page["next_page"] == 2
+    assert page["has_more"] is True
+    assert page["unit_count"] == 3
+    assert page["limit"] == 2
+    assert first.headers["ETag"] == f'"{page["page_revision"]}"'
+    assert first.headers["X-Page-Revision"] == page["page_revision"]
+    assert first.headers["X-Document-Revision"] == page[
+        "document_revision"
+    ]
+    assert first.headers["X-Content-Revision"] == page["content_revision"]
+    assert first.headers["X-Source-Revision"] == SOURCE_REVISION
+    assert first.cache_control.no_cache is True
+
+    unchanged = _unit_page(
+        client,
+        detail,
+        limit=2,
+        headers={
+            **_page_headers(detail),
+            "If-None-Match": first.headers["ETag"],
+        },
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.get_data() == b""
+    assert unchanged.headers["X-Document-Revision"] == page[
+        "document_revision"
+    ]
+
+    second = _unit_page(client, detail, page=2, limit=2)
+    second_page = second.get_json()["page"]
+    assert [value["selector"] for value in second_page["units"]] == [
+        "canvas-c"
+    ]
+    assert second_page["page"] == 2
+    assert second_page["next_page"] is None
+    assert second_page["has_more"] is False
+    assert second_page["document_revision"] == page["document_revision"]
+    assert second_page["source_revision"] == page["source_revision"]
+    assert second_page["page_revision"] != page["page_revision"]
+
+
+def test_unit_page_requires_exact_pins_and_strict_bounded_query(
+    text_layer_http,
+):
+    client, _engine, _service, _source_revision, _root = text_layer_http
+    detail = _detail(client).get_json()
+    url = (
+        f"/api/v1/items/{ITEM_ID}/text-layers/{LAYER_ID}/units"
+        "?page=1&limit=2"
+    )
+    headers = _page_headers(detail)
+
+    for missing, code in (
+        ("If-Document-Match", "text_layer_document_revision_required"),
+        ("If-Source-Match", "text_layer_source_revision_required"),
+    ):
+        response = client.get(
+            url,
+            headers={key: value for key, value in headers.items()
+                     if key != missing},
+        )
+        assert response.status_code == 428
+        assert response.get_json()["code"] == code
+
+    for name, value, code in (
+        (
+            "If-Document-Match",
+            'W/"tld-old"',
+            "invalid_text_layer_document_revision",
+        ),
+        (
+            "If-Source-Match",
+            SOURCE_REVISION,
+            "invalid_text_layer_source_revision",
+        ),
+    ):
+        response = client.get(url, headers={**headers, name: value})
+        assert response.status_code == 400
+        assert response.get_json()["code"] == code
+
+    cases = (
+        ("", "text_layer_page_range_required"),
+        ("?page=1", "text_layer_page_range_required"),
+        ("?limit=2", "text_layer_page_range_required"),
+        ("?page=0&limit=2", "invalid_text_layer_page_number"),
+        ("?page=100001&limit=2", "invalid_text_layer_page_number"),
+        ("?page=01&limit=2", "invalid_text_layer_page_number"),
+        ("?page=1&limit=0", "invalid_text_layer_page_limit"),
+        ("?page=1&limit=257", "invalid_text_layer_page_limit"),
+        ("?page=1&limit=01", "invalid_text_layer_page_limit"),
+        ("?page=1&page=2&limit=2", "invalid_text_layer_page_query"),
+        ("?page=1&limit=2&limit=3", "invalid_text_layer_page_query"),
+        ("?page=1&limit=2&unknown=1", "invalid_text_layer_page_query"),
+    )
+    base = f"/api/v1/items/{ITEM_ID}/text-layers/{LAYER_ID}/units"
+    for query, code in cases:
+        response = client.get(base + query, headers=headers)
+        assert response.status_code == 400
+        assert response.get_json()["code"] == code
+
+
+def test_unit_page_rejects_stale_document_or_source_pins(text_layer_http):
+    client, _engine, _service, _source_revision, _root = text_layer_http
+    detail = _detail(client).get_json()
+
+    stale_document = _unit_page(
+        client,
+        detail,
+        headers=_page_headers(
+            detail,
+            **{"If-Document-Match": '"tld-stale"'},
+        ),
+    )
+    assert stale_document.status_code == 409
+    assert stale_document.get_json()["code"] == (
+        "text_layer_document_revision_conflict"
+    )
+
+    stale_source = _unit_page(
+        client,
+        detail,
+        headers=_page_headers(
+            detail,
+            **{"If-Source-Match": '"source-stale"'},
+        ),
+    )
+    assert stale_source.status_code == 409
+    assert stale_source.get_json()["code"] == (
+        "text_layer_source_revision_conflict"
+    )
+
+    missing_page = _unit_page(
+        client,
+        detail,
+        page=3,
+        limit=2,
+    )
+    assert missing_page.status_code == 404
+    assert missing_page.get_json()["code"] == (
+        "text_layer_unit_page_not_found"
+    )
+
+
+def test_paged_units_remain_available_when_coherent_detail_exceeds_its_cap(
+    text_layer_http,
+    monkeypatch,
+):
+    client, _engine, _service, _source_revision, _root = text_layer_http
+    detail_body = _detail(client).get_json()
+    headers = _page_headers(detail_body)
+    monkeypatch.setattr(text_layer_http_adapter, "TEXT_LAYER_DETAIL_MAX_BYTES", 1)
+
+    detail = _detail(client)
+    assert detail.status_code == 413
+    page = client.get(
+        f"/api/v1/items/{ITEM_ID}/text-layers/{LAYER_ID}/units?page=1&limit=1",
+        headers=headers,
+    )
+    assert page.status_code == 200
+    assert len(page.get_json()["page"]["units"]) == 1
+
+
+def test_unit_page_response_has_an_exact_encoded_ceiling(
+    text_layer_http,
+    monkeypatch,
+):
+    client, _engine, _service, _source_revision, _root = text_layer_http
+    detail = _detail(client).get_json()
+    baseline = _unit_page(client, detail, limit=1)
+    assert baseline.status_code == 200
+    exact_size = len(baseline.get_data())
+
+    monkeypatch.setattr(
+        text_layer_http_adapter,
+        "TEXT_LAYER_UNIT_PAGE_MAX_BYTES",
+        exact_size,
+    )
+    at_limit = _unit_page(client, detail, limit=1)
+    assert at_limit.status_code == 200
+    assert at_limit.get_data() == baseline.get_data()
+
+    monkeypatch.setattr(
+        text_layer_http_adapter,
+        "TEXT_LAYER_UNIT_PAGE_MAX_BYTES",
+        exact_size - 1,
+    )
+    over_limit = _unit_page(client, detail, limit=1)
+    assert over_limit.status_code == 413
+    assert over_limit.get_json()["code"] == (
+        "text_layer_unit_page_response_too_large"
+    )
     assert over_limit.get_json()["details"] == {
         "maximum_bytes": exact_size - 1
     }

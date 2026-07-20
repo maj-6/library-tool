@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -27,21 +28,31 @@ from librarytool.engine.runtime import (
     LibraryEngine,
 )
 from librarytool.engine.text_layer_aggregate import (
+    MAX_TEXT_LAYER_PAGE_UNIT_BYTES,
+    MAX_TEXT_LAYER_PAGE_NUMBER,
+    MAX_TEXT_LAYER_PAGE_UNITS,
     ReplaceTextLayerUnitCommand,
     TextLayerAggregateService,
     TextLayerProvenance,
+    TextLayerUnitPageRequest,
     TextLayerUnitReplacement,
 )
 
 
 TEXT_LAYER_MUTATION_MAX_BYTES = 1024 * 1024
 TEXT_LAYER_DETAIL_MAX_BYTES = 16 * 1024 * 1024
+# The domain limits the canonical unit array to 8 MiB.  This fixed allowance
+# covers the exact JSON envelope, pins, page range, and source view; the serializer
+# still measures the final response and rejects rather than truncates.
+TEXT_LAYER_UNIT_PAGE_MAX_BYTES = MAX_TEXT_LAYER_PAGE_UNIT_BYTES + 64 * 1024
 
 
 def _error_status(error: EngineError) -> int:
     if error.code in {
         "text_layer_mutation_too_large",
         "text_layer_detail_too_large",
+        "text_layer_unit_page_payload_too_large",
+        "text_layer_unit_page_response_too_large",
     }:
         return 413
     if isinstance(error, NotFoundError):
@@ -131,6 +142,37 @@ def _detail_json(
                 "the text layer detail exceeds this transport's response limit",
                 code="text_layer_detail_too_large",
                 details={"maximum_bytes": TEXT_LAYER_DETAIL_MAX_BYTES},
+            )
+        payload.extend(encoded)
+    response = Response(bytes(payload), mimetype="application/json")
+    response.set_etag(revision, weak=False)
+    response.cache_control.no_cache = True
+    return response.make_conditional(request)
+
+
+def _unit_page_json(
+    body: Mapping[str, Any],
+    *,
+    revision: str,
+) -> Response:
+    """Serialize one complete unit page under an exact transport ceiling."""
+
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=False,
+        separators=(",", ":"),
+    )
+    payload = bytearray()
+    encoded_size = 0
+    for chunk in encoder.iterencode(dict(body)):
+        encoded = chunk.encode("utf-8")
+        encoded_size += len(encoded)
+        if encoded_size > TEXT_LAYER_UNIT_PAGE_MAX_BYTES:
+            raise EngineError(
+                "the text-layer unit page exceeds this transport's response limit",
+                code="text_layer_unit_page_response_too_large",
+                details={"maximum_bytes": TEXT_LAYER_UNIT_PAGE_MAX_BYTES},
             )
         payload.extend(encoded)
     response = Response(bytes(payload), mimetype="application/json")
@@ -303,6 +345,88 @@ def _unit_replacement(
         ) from error
 
 
+def _unit_page_request(
+    *,
+    item_id: str,
+    layer_id: str,
+) -> TextLayerUnitPageRequest:
+    allowed = {"page", "limit"}
+    keys = set(request.args)
+    if not keys.issubset(allowed) or any(
+        len(request.args.getlist(key)) != 1 for key in keys
+    ):
+        raise ValidationError(
+            "the text-layer page query is invalid",
+            code="invalid_text_layer_page_query",
+            details={"allowed": sorted(allowed)},
+        )
+    raw_page = request.args.get("page")
+    raw_limit = request.args.get("limit")
+    if raw_page is None or raw_limit is None:
+        raise ValidationError(
+            "text-layer page and limit parameters are required",
+            code="text_layer_page_range_required",
+            details={"parameters": ["page", "limit"]},
+        )
+    if not re.fullmatch(r"[1-9][0-9]{0,5}", raw_page):
+        raise ValidationError(
+            "the text-layer page number is invalid",
+            code="invalid_text_layer_page_number",
+            details={"maximum": MAX_TEXT_LAYER_PAGE_NUMBER},
+        )
+    page = int(raw_page)
+    if page > MAX_TEXT_LAYER_PAGE_NUMBER:
+        raise ValidationError(
+            "the text-layer page number is invalid",
+            code="invalid_text_layer_page_number",
+            details={"maximum": MAX_TEXT_LAYER_PAGE_NUMBER},
+        )
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", raw_limit):
+        raise ValidationError(
+            "the text-layer page limit is invalid",
+            code="invalid_text_layer_page_limit",
+            details={"maximum": MAX_TEXT_LAYER_PAGE_UNITS},
+        )
+    limit = int(raw_limit)
+    if limit > MAX_TEXT_LAYER_PAGE_UNITS:
+        raise ValidationError(
+            "the text-layer page limit is invalid",
+            code="invalid_text_layer_page_limit",
+            details={"maximum": MAX_TEXT_LAYER_PAGE_UNITS},
+        )
+    document_revision = _strong_revision(
+        "If-Document-Match",
+        required_code="text_layer_document_revision_required",
+        invalid_code="invalid_text_layer_document_revision",
+        item_id=item_id,
+        layer_id=layer_id,
+        selector="",
+    )
+    source_revision = _strong_revision(
+        "If-Source-Match",
+        required_code="text_layer_source_revision_required",
+        invalid_code="invalid_text_layer_source_revision",
+        item_id=item_id,
+        layer_id=layer_id,
+        selector="",
+    )
+    try:
+        return TextLayerUnitPageRequest(
+            item_id=item_id,
+            layer_id=layer_id,
+            document_revision=document_revision,
+            source_revision=source_revision,
+            page=page,
+            limit=limit,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValidationError(
+            "the text-layer page query is invalid",
+            code="invalid_text_layer_page_query",
+            details={"cause_type": type(error).__name__},
+        ) from error
+
+
 def create_text_layer_blueprint(
     engine_for_request: Callable[[], LibraryEngine],
 ) -> Blueprint:
@@ -353,6 +477,32 @@ def create_text_layer_blueprint(
         )
         response.headers["X-Content-Revision"] = view.document.content_revision
         response.headers["X-Source-Revision"] = view.source.pinned_revision
+        return response
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/text-layers/<layer_id>/units"
+    )
+    def get_text_layer_units(item_id: str, layer_id: str):
+        try:
+            page_request = _unit_page_request(
+                item_id=item_id,
+                layer_id=layer_id,
+            )
+            page = _service(engine_for_request).page_units(page_request)
+            response = _unit_page_json(
+                {
+                    "ok": True,
+                    "schema": "librarytool.text-layer-unit-page/1",
+                    "page": page.as_dict(),
+                },
+                revision=page.page_revision,
+            )
+        except EngineError as error:
+            return _error_response(error)
+        response.headers["X-Document-Revision"] = page.document_revision
+        response.headers["X-Content-Revision"] = page.content_revision
+        response.headers["X-Source-Revision"] = page.source_revision
+        response.headers["X-Page-Revision"] = page.page_revision
         return response
 
     @blueprint.put(
@@ -425,5 +575,6 @@ def create_text_layer_blueprint(
 __all__ = [
     "TEXT_LAYER_DETAIL_MAX_BYTES",
     "TEXT_LAYER_MUTATION_MAX_BYTES",
+    "TEXT_LAYER_UNIT_PAGE_MAX_BYTES",
     "create_text_layer_blueprint",
 ]

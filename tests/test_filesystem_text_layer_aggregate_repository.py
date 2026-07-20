@@ -37,6 +37,7 @@ from librarytool.engine.text_layer_aggregate import (
     TextLayerSourcePin,
     TextLayerSourceSnapshot,
     TextLayerUnitDraft,
+    TextLayerUnitPageRequest,
     TextLayerUnitReplacement,
 )
 
@@ -223,6 +224,61 @@ def test_native_create_query_replace_restart_and_private_storage(
     replay = restarted.create(command)
     assert replay.replayed is True
     assert replay.receipt == result.receipt
+
+
+def test_paged_unit_read_survives_restart_without_lazy_publication(
+    tmp_path: Path,
+) -> None:
+    authority = _Authority(tmp_path, ids=["tl-paged"])
+    service = TextLayerAggregateService(_repository(authority))
+    _command, created = _create(service, operation_id="create-paged")
+    document = service.get(ITEM_ID, created.receipt.layer_id).document
+    before = {
+        path.relative_to(tmp_path).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    restarted = TextLayerAggregateService(_repository(authority))
+    first = restarted.page_units(
+        TextLayerUnitPageRequest(
+            ITEM_ID,
+            document.layer_id,
+            document.document_revision,
+            SOURCE_REVISION,
+            page=1,
+            limit=1,
+        )
+    )
+    second = restarted.page_units(
+        TextLayerUnitPageRequest(
+            ITEM_ID,
+            document.layer_id,
+            document.document_revision,
+            SOURCE_REVISION,
+            page=first.next_page,
+            limit=1,
+        )
+    )
+
+    assert [value.selector for value in first.units] == ["canvas-a"]
+    assert first.has_more is True
+    assert first.next_page == 2
+    assert [value.selector for value in second.units] == ["canvas-b"]
+    assert second.has_more is False
+    assert second.next_page is None
+    after = {
+        path.relative_to(tmp_path).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 def test_batch_replace_uses_document_cas_and_persists_all_changed_units(

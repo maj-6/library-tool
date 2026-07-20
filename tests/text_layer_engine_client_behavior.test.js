@@ -53,15 +53,43 @@ function sourceView() {
   };
 }
 
-function unit() {
+function unit(selector = "canvas:a", order = 1, text = "Original") {
   return {
-    selector: "canvas:a",
-    order: 1,
+    selector,
+    order,
     label: "Folio A",
-    text: "Original",
+    text,
     provenance: provenance(),
     content_revision: "tuc-current",
     unit_revision: "tur-current",
+  };
+}
+
+function unitPage(itemId = "book:one", layerId = "layer:one",
+  page = 1, limit = 2) {
+  const units = page === 2 ? [unit("canvas:c", 3, "Gamma")] : [
+    unit("canvas:a", 1),
+    unit("canvas:b", 2, "Beta"),
+  ];
+  const hasMore = page === 1;
+  return {
+    ok: true,
+    schema: "librarytool.text-layer-unit-page/1",
+    page: {
+      item_id: itemId,
+      layer_id: layerId,
+      document_revision: "tld-current",
+      content_revision: "tlc-current",
+      source_revision: "source-current",
+      source: sourceView(),
+      page,
+      next_page: hasMore ? 2 : null,
+      limit,
+      unit_count: 3,
+      units,
+      has_more: hasMore,
+      page_revision: page === 2 ? "tlp-second" : "tlp-first",
+    },
   };
 }
 
@@ -156,8 +184,78 @@ test("EngineClient exposes the revisioned text-layer surface", () => {
   const { client } = harness();
   assert.equal(typeof client.textLayers.list, "function");
   assert.equal(typeof client.textLayers.get, "function");
+  assert.equal(typeof client.textLayers.pageUnits, "function");
   assert.equal(typeof client.textLayers.replaceUnit, "function");
   assert.ok(Object.isFrozen(client.textLayers));
+});
+
+test("text-layer unit pages own page, limit, and exact revision pins",
+  async () => {
+    const { client, calls } = harness(
+      unitPage(), unitPage("book:one", "layer:one", 2));
+
+    const first = await client.textLayers.pageUnits({
+      itemId: "book:one",
+      layerId: "layer:one",
+      documentRevision: "tld-current",
+      sourceRevision: "source-current",
+      page: 1,
+      limit: 2,
+    });
+    const second = await client.textLayers.pageUnits({
+      itemId: "book:one",
+      layerId: "layer:one",
+      documentRevision: "tld-current",
+      sourceRevision: "source-current",
+      page: first.page.next_page,
+      limit: 2,
+    });
+
+    assert.equal(calls[0].url,
+      "/api/v1/items/book%3Aone/text-layers/layer%3Aone/units?page=1&limit=2");
+    assert.equal(calls[1].url,
+      "/api/v1/items/book%3Aone/text-layers/layer%3Aone/units" +
+      "?page=2&limit=2");
+    for (const call of calls) {
+      assert.equal(call.init.method, "GET");
+      assert.equal(call.init.cache, "no-cache");
+      assert.equal(call.init.headers["If-Document-Match"], '"tld-current"');
+      assert.equal(call.init.headers["If-Source-Match"], '"source-current"');
+    }
+    assert.deepEqual(first.page.units.map((value) => value.selector),
+      ["canvas:a", "canvas:b"]);
+    assert.equal(second.page.page, 2);
+    assert.deepEqual(second.page.units.map((value) => value.selector),
+      ["canvas:c"]);
+    assert.equal(second.page.has_more, false);
+  });
+
+test("text-layer unit page inputs are bounded before transport", () => {
+  const { client, calls } = harness(unitPage());
+  const valid = {
+    itemId: "book:one",
+    layerId: "layer:one",
+    documentRevision: "tld-current",
+    sourceRevision: "source-current",
+    page: 1,
+    limit: 2,
+  };
+  const cases = [
+    [{ ...valid, itemId: "book/one" }, /itemId/],
+    [{ ...valid, layerId: "layer one" }, /layerId/],
+    [{ ...valid, page: 0 }, /page/],
+    [{ ...valid, page: 100001 }, /page/],
+    [{ ...valid, page: 1.5 }, /page/],
+    [{ ...valid, documentRevision: "tld current" }, /documentRevision/],
+    [{ ...valid, sourceRevision: "source\u200bcurrent" }, /sourceRevision/],
+    [{ ...valid, limit: 0 }, /limit/],
+    [{ ...valid, limit: 257 }, /limit/],
+    [{ ...valid, limit: 1.5 }, /limit/],
+  ];
+  for (const [args, expected] of cases) {
+    assert.throws(() => client.textLayers.pageUnits(args), expected);
+  }
+  assert.equal(calls.length, 0);
 });
 
 test("text-layer reads use portable path identities", async () => {
@@ -308,6 +406,54 @@ test("text-layer detail validation fails closed on malformed 2xx", async () => {
     const { client } = harness(body);
     await rejectsInvalidResponse(() => client.textLayers.get({
       itemId: "book:one", layerId: "layer:one",
+    }));
+  }
+});
+
+test("text-layer unit page validation fails closed on malformed 2xx", async () => {
+  const wrongDocument = unitPage();
+  wrongDocument.page.document_revision = "tld-other";
+  const wrongSource = unitPage();
+  wrongSource.page.source_revision = "source-other";
+  const wrongPage = unitPage();
+  wrongPage.page.page = 2;
+  const duplicateSelector = unitPage();
+  duplicateSelector.page.units[1].selector = "canvas:a";
+  const duplicateOrder = unitPage();
+  duplicateOrder.page.units[1].order = 1;
+  const outOfOrder = unitPage();
+  outOfOrder.page.units[1].order = 0;
+  const badContinuation = unitPage();
+  badContinuation.page.next_page = 3;
+  const falseFinal = unitPage();
+  falseFinal.page.has_more = false;
+  const leaked = unitPage();
+  leaked.page.units[0].provenance.metadata.command_sha256 = "private";
+  const extra = unitPage();
+  extra.page.offset = 0;
+  const cases = [
+    http(206, unitPage()),
+    { ...unitPage(), schema: "librarytool.text-layer-unit-page/2" },
+    wrongDocument,
+    wrongSource,
+    wrongPage,
+    duplicateSelector,
+    duplicateOrder,
+    outOfOrder,
+    badContinuation,
+    falseFinal,
+    leaked,
+    extra,
+  ];
+  for (const body of cases) {
+    const { client } = harness(body);
+    await rejectsInvalidResponse(() => client.textLayers.pageUnits({
+      itemId: "book:one",
+      layerId: "layer:one",
+      documentRevision: "tld-current",
+      sourceRevision: "source-current",
+      page: 1,
+      limit: 2,
     }));
   }
 });
