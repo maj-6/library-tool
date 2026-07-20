@@ -45,6 +45,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import desktop_transport
 from flask import (
     Flask,
     Response,
@@ -175,6 +176,14 @@ from librarytool.engine.translations import (  # noqa: E402
     TranslationService,
 )
 from librarytool.profiles import WhlBookItemCommandPolicy  # noqa: E402
+
+_DESKTOP_CAPABILITY_HEADER = desktop_transport.CAPABILITY_HEADER
+_DESKTOP_MODE = desktop_transport.CONFIG.mode
+_DESKTOP_CAPABILITY_DIGEST = desktop_transport.CONFIG.capability_digest
+_DESKTOP_PORT = desktop_transport.CONFIG.port
+_DESKTOP_EXPECTED_HOST = desktop_transport.CONFIG.expected_host
+_DESKTOP_EXPECTED_ORIGIN = desktop_transport.CONFIG.expected_origin
+
 # Importing the compatibility transport must not claim a workspace. The first
 # request, or the explicit __main__ startup barrier, opens one complete session
 # and publishes these aliases together for processors that have not crossed the
@@ -215,6 +224,26 @@ app.jinja_env.auto_reload = True
 
 
 _TRUSTED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_DESKTOP_CSP = "; ".join((
+    "default-src 'self'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self'",
+    "frame-src 'self' blob:",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+))
+_RESOURCE_CSP = "; ".join((
+    "default-src 'none'",
+    "base-uri 'none'",
+    "style-src 'unsafe-inline'",
+    "img-src 'self' data:",
+    "frame-ancestors 'none'",
+))
 
 
 @app.before_request
@@ -225,9 +254,31 @@ def _reject_untrusted_host():
     only credential routes is insufficient because other endpoints expose
     client state, local PDFs, and a fetch proxy.
     """
-    host = (request.host or "").partition(":")[0].lower().rstrip(".")
+    request_host = (request.host or "").lower()
+    if _DESKTOP_EXPECTED_HOST is not None:
+        if request_host != _DESKTOP_EXPECTED_HOST:
+            abort(403)
+        return
+    host = request_host.partition(":")[0].rstrip(".")
     if host not in _TRUSTED_LOOPBACK_HOSTS:
         abort(403)
+
+
+@app.before_request
+def _enforce_api_origin_and_desktop_capability():
+    """Authenticate desktop API traffic before any engine or route executes."""
+    if not request.path.startswith("/api/"):
+        return
+    origin = request.headers.get("Origin")
+    if origin:
+        expected = _DESKTOP_EXPECTED_ORIGIN or f"http://{request.host}"
+        if not desktop_transport.origin_matches(origin, expected):
+            abort(403)
+    if (_DESKTOP_CAPABILITY_DIGEST is not None and
+            not desktop_transport.capability_matches(
+                request.headers.get(_DESKTOP_CAPABILITY_HEADER),
+                _DESKTOP_CAPABILITY_DIGEST)):
+        abort(401)
 
 
 @app.before_request
@@ -251,9 +302,26 @@ def _static_cache_headers(resp):
     a freshly installed app.js) must not become a year-long cached error for a
     URL whose ?v= token won't change on retry.
     """
-    if resp.status_code not in (200, 304):
-        return resp
-    if request.path.startswith("/static/"):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    resp.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), display-capture=(), "
+        "usb=(), serial=(), bluetooth=()",
+    )
+    if _DESKTOP_CAPABILITY_DIGEST is not None and request.path.startswith("/api/"):
+        # A custom request header does not participate in ordinary cache keys.
+        # Never let a response authenticated for the app frame be reused by an
+        # unauthenticated same-origin frame without contacting this guard again.
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Pragma"] = "no-cache"
+    if resp.mimetype == "text/html":
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        csp = _DESKTOP_CSP if request.path == "/" else _RESOURCE_CSP
+        resp.headers.setdefault("Content-Security-Policy", csp)
+    if resp.status_code in (200, 304) and request.path.startswith("/static/"):
         if request.args.get("v"):
             resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         else:
@@ -989,6 +1057,13 @@ def _ch_row(idx: int, row: dict) -> dict:
 
 
 # --- routes ----------------------------------------------------------------
+
+
+@app.get("/healthz")
+def healthz():
+    """Uncredentialed loopback readiness probe; contains no application data."""
+    return jsonify({"ok": True})
+
 
 def _asset_v(filename):
     """Cache-busting token = the static file's mtime, so a changed asset always
@@ -12009,36 +12084,8 @@ def api_db_download():
 
 @app.route("/api/webview")
 def api_webview():
-    """Proxy a remote URL for the in-app web view: fetch it and re-serve it from
-    this origin WITHOUT the X-Frame-Options / frame-ancestors headers that would
-    block embedding. HTML gets a <base> so its relative assets resolve to the
-    original site; PDFs stream through. The client frames this in a SANDBOXED
-    iframe (no allow-same-origin) so the proxied page's scripts run isolated and
-    cannot reach the app. (Local/loopback only — never expose publicly: it is an
-    open fetch proxy.)"""
-    url = (request.args.get("url") or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
-        abort(400)
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": whl_client.USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            body = resp.read(25 * 1024 * 1024)   # cap: don't proxy huge pages
-            charset = resp.headers.get_content_charset() or "utf-8"
-    except Exception:
-        abort(502)
-    if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
-        return Response(body, content_type="application/pdf")
-    if "html" in ctype or not ctype:
-        html = body.decode(charset, "replace")
-        base = '<base href="' + url.replace('"', "%22") + '">'
-        if re.search(r"<head[^>]*>", html, re.I):
-            html = re.sub(r"(<head[^>]*>)", lambda m: m.group(1) + base, html,
-                          count=1, flags=re.I)
-        else:
-            html = base + html
-        return Response(html, content_type="text/html; charset=utf-8")
-    return Response(body, content_type=ctype or "application/octet-stream")
+    """Refuse the retired same-origin remote-content proxy in every run mode."""
+    return jsonify({"ok": False, "error": "embedded_remote_content_disabled"}), 410
 
 
 @app.route("/api/ia/meta")

@@ -11718,6 +11718,91 @@ function pdfOcrMode(wanted, requested, hasText) {
   return { wanted: nextWanted, on: nextWanted && !!hasText };
 }
 
+const DESKTOP_PDF_EMBED_MAX_BYTES = 32 * 1024 * 1024;
+
+function pdfResponseLength(response) {
+  const raw = response && response.headers && response.headers.get("content-length");
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const length = Number(raw);
+  return Number.isSafeInteger(length) && length > 0 ? length : null;
+}
+
+function pdfEmbedFallback(message, bytes = 0) {
+  const error = new Error(message);
+  error.code = "PDF_EMBED_FALLBACK";
+  error.bytes = bytes;
+  return error;
+}
+
+async function cancelResponseBody(response) {
+  try {
+    if (response && response.body && typeof response.body.cancel === "function") {
+      await response.body.cancel();
+    }
+  } catch (e) { /* cancellation is best-effort */ }
+}
+
+async function readBoundedPdfBody(response, maxBytes) {
+  if (!response.body || typeof response.body.getReader !== "function") {
+    await cancelResponseBody(response);
+    throw pdfEmbedFallback("PDF stream cannot be bounded");
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  while (true) {
+    const part = await reader.read();
+    if (part.done) break;
+    const chunk = part.value instanceof Uint8Array
+      ? part.value : new Uint8Array(part.value || 0);
+    if (bytes + chunk.byteLength > maxBytes) {
+      try { await reader.cancel(); } catch (e) { /* already closed */ }
+      throw pdfEmbedFallback("PDF is too large to embed", bytes + chunk.byteLength);
+    }
+    chunks.push(chunk);
+    bytes += chunk.byteLength;
+  }
+  const contentType = response.headers.get("content-type") || "application/pdf";
+  return { blob: new Blob(chunks, { type: contentType }), bytes };
+}
+
+async function fetchBoundedPdfBlob(url, opts = {}) {
+  const fetchImpl = opts.fetchImpl || fetch;
+  const maxBytes = opts.maxBytes || DESKTOP_PDF_EMBED_MAX_BYTES;
+  const request = opts.signal ? { signal: opts.signal } : {};
+  const head = await fetchImpl(url, { ...request, method: "HEAD" });
+  if (!head.ok) throw new Error(`PDF request failed (${head.status})`);
+  const expected = pdfResponseLength(head);
+  if (expected == null) throw pdfEmbedFallback("PDF size is unavailable");
+  if (expected > maxBytes) throw pdfEmbedFallback("PDF is too large to embed", expected);
+
+  const response = await fetchImpl(url, request);
+  if (!response.ok) throw new Error(`PDF request failed (${response.status})`);
+  const responseLength = pdfResponseLength(response);
+  if (responseLength != null && responseLength > maxBytes) {
+    await cancelResponseBody(response);
+    throw pdfEmbedFallback("PDF is too large to embed", responseLength);
+  }
+  const result = await readBoundedPdfBody(response, maxBytes);
+  return { blob: result.blob, bytes: result.bytes || responseLength || expected };
+}
+
+function replaceObjectUrl(previous, blob) {
+  if (previous) URL.revokeObjectURL(previous);
+  return blob ? URL.createObjectURL(blob) : "";
+}
+
+function requestDesktopResource(url) {
+  const desktop = window.whlDesktop;
+  if (!desktop || !desktop.isDesktop || typeof desktop.openResource !== "function") return false;
+  desktop.openResource(url);
+  return true;
+}
+
+function openLocalResource(url) {
+  if (!requestDesktopResource(url)) window.open(url, "_blank", "noopener");
+}
+
 function createPdfViewer() {
   const root = document.createElement("div");
   root.className = "pdf-viewer";
@@ -11755,6 +11840,8 @@ function createPdfViewer() {
   const pagesSave = root.querySelector(".pdf-pagesave");
   const pagesBox = root.querySelector(".pdf-pagesbox");
   let sizeSeq = 0;
+  let frameObjectUrl = "";
+  let frameFetchController = null;
   let textSrc = "";
   // A PDF with OCR opens in the useful comparison view. Each viewer still
   // remembers an explicit toggle for the rest of the session, and callers may
@@ -11773,6 +11860,17 @@ function createPdfViewer() {
   let pagesWhole = false;   // marker-less file: one whole-text box, verbatim
   let pagesDirty = false;   // unsaved page-view edits
   let pagesSeq = 0;
+
+  function revokeFrameObjectUrl() {
+    frameObjectUrl = replaceObjectUrl(frameObjectUrl, null);
+  }
+
+  open.addEventListener("click", (event) => {
+    const href = open.getAttribute("href") || "";
+    if (href.startsWith("/api/") && requestDesktopResource(href)) {
+      event.preventDefault();
+    }
+  });
 
   // side-by-side page view: one row per page (image | that page's OCR
   // text), scrolling together — the same idiom as the OCR tab
@@ -12031,17 +12129,54 @@ function createPdfViewer() {
     el: root,
     setOcr,
     show(src, label, opts = {}) {
+      if (frameFetchController) frameFetchController.abort();
+      frameFetchController = null;
+      const seq = ++sizeSeq;
       // undecorated: suppress the browser PDF viewer's toolbar/side panes
       // (scrollbar=0 for viewers that honor it; the frame is also
       // oversized so remaining scrollbars are clipped away)
       const framed = src.startsWith("/api/pdf")
         ? src + "#toolbar=0&navpanes=0&scrollbar=0" : src;
-      if (frame.getAttribute("src") !== framed) frame.src = framed;
+      const authenticatedBlob = !!(window.whlDesktop && window.whlDesktop.isDesktop &&
+        src.startsWith("/api/pdf"));
+      if (authenticatedBlob) {
+        const controller = new AbortController();
+        frameFetchController = controller;
+        frame.removeAttribute("src");
+        revokeFrameObjectUrl();
+        open.hidden = true;
+        fetchBoundedPdfBlob(src, { signal: controller.signal }).then((result) => {
+          if (seq !== sizeSeq) return;
+          frameObjectUrl = replaceObjectUrl(frameObjectUrl, result.blob);
+          frame.src = frameObjectUrl + "#toolbar=0&navpanes=0&scrollbar=0";
+          // The open action always asks the trusted main frame to stream the
+          // original route in a hardened resource window. A blob popup would
+          // reintroduce an opener callback with no source-frame identity.
+          open.href = src;
+          open.hidden = false;
+          if (result.bytes) size.textContent = fmtBytes(result.bytes);
+        }).catch((error) => {
+          if (seq !== sizeSeq) return;
+          if (error && error.name === "AbortError") return;
+          open.href = src;
+          open.hidden = false;
+          if (error && error.bytes) size.textContent = fmtBytes(error.bytes);
+          note.textContent = error && error.code === "PDF_EMBED_FALLBACK"
+            ? "Open PDF in a separate window" : "Could not load PDF";
+          note.hidden = false;
+          frameWrap.hidden = true;
+        }).finally(() => {
+          if (frameFetchController === controller) frameFetchController = null;
+        });
+      } else {
+        revokeFrameObjectUrl();
+        if (frame.getAttribute("src") !== framed) frame.src = framed;
+        open.href = src;
+        open.hidden = false;
+      }
       note.hidden = true;
       path.textContent = label || src;
       path.dataset.tip = src;
-      open.href = src;
-      open.hidden = false;
       size.textContent = "";
       textSrc = opts.textSrc || "";
       ocrBtn.hidden = !textSrc;
@@ -12062,8 +12197,7 @@ function createPdfViewer() {
       setPages(pagesOn && !!pagesPdf);
       frameWrap.hidden = pagesOn;
       setOcr(opts.ocr != null ? opts.ocr : ocrWanted);
-      const seq = ++sizeSeq;
-      if (src.startsWith("/api/pdf")) {
+      if (src.startsWith("/api/pdf") && !authenticatedBlob) {
         fetch(src, { method: "HEAD" }).then((r) => {
           if (seq !== sizeSeq || !r.ok) return;
           const n = parseInt(r.headers.get("content-length") || "", 10);
@@ -12072,8 +12206,11 @@ function createPdfViewer() {
       }
     },
     clear(msg) {
+      if (frameFetchController) frameFetchController.abort();
+      frameFetchController = null;
       sizeSeq++;
       frame.removeAttribute("src");
+      revokeFrameObjectUrl();
       frameWrap.hidden = true;
       note.textContent = msg || "No PDF";
       note.hidden = false;
@@ -23528,9 +23665,9 @@ function initReplica() {
     const summary = rwState.transSummaries.find(
       (translation) => translation.id === rwState.previewLang);
     const layer = summary ? summary.target_language : rwState.previewLang;
-    window.open(engineClient.replica.printUrl({
+    openLocalResource(engineClient.replica.printUrl({
       bookId: rwState.book, sourceId: rwState.src, layer,
-    }), "_blank");
+    }));
   });
   el("rw-import-file").addEventListener("change", async () => {
     const input = el("rw-import-file");
@@ -23699,7 +23836,7 @@ function initOcrTab() {
     const ex = ev.target.closest("button.src-extract");
     if (ex) { ocrExtractSource(ex.dataset.src); return; }
     const pdf = ev.target.closest("button.artifact-open-pdf");
-    if (pdf) { window.open(pdfApiUrl(pdf.dataset.pdf), "_blank"); return; }
+    if (pdf) { openLocalResource(pdfLocalSrc(pdf.dataset.pdf)); return; }
     const artifact = ev.target.closest("li.artifact-text");
     if (artifact) {
       openTextArtifact(artifact.dataset.artifactKind, artifact.dataset.artifactName);
@@ -23708,15 +23845,15 @@ function initOcrTab() {
     const captureRow = ev.target.closest("li.capture-img-row");
     if (captureRow) {
       if (captureRow.dataset.captureAvailable)
-        window.open("/api/capture/image?path=" +
-          encodeURIComponent(captureRow.dataset.capturePath), "_blank");
+        openLocalResource("/api/capture/image?path=" +
+          encodeURIComponent(captureRow.dataset.capturePath));
       return;
     }
     // an extracted-image row isn't a document to select — open it full size
     const imgRow = ev.target.closest("li.ocr-img-row");
     if (imgRow) {
-      window.open(`/api/builds/${encodeURIComponent(ocrState.book)}/ocr/images/` +
-        encodeURIComponent(imgRow.dataset.imgName), "_blank");
+      openLocalResource(`/api/builds/${encodeURIComponent(ocrState.book)}/ocr/images/` +
+        encodeURIComponent(imgRow.dataset.imgName));
       return;
     }
     const srcLi = ev.target.closest("li.ocr-src");
@@ -24042,11 +24179,8 @@ function initMenubar() {
 
 // --- wire up ---------------------------------------------------------------
 
-// --- embedded web view -------------------------------------------------------
-// Links that would open a new browser tab open here instead: a proxied,
-// SANDBOXED iframe. /api/webview strips the X-Frame-Options that block framing;
-// the sandbox has no allow-same-origin, so the proxied page's scripts run
-// isolated and cannot reach the app. Ctrl/Cmd+click still opens a real tab.
+// --- external web links ------------------------------------------------------
+// Remote HTML always opens outside the application's authenticated origin.
 function openWebView(url) {
   if (!/^https?:\/\//i.test(url)) return false;
   // In the desktop shell a plain web link belongs in the real browser, not an
@@ -24055,10 +24189,7 @@ function openWebView(url) {
   // with local preview + downloads) and stays in-app on desktop.
   const d = window.whlDesktop;
   if (d && d.isDesktop && d.openExternal) { d.openExternal(url); return true; }
-  el("webview-url").textContent = url;
-  el("webview-url").dataset.url = url;
-  el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(url);
-  el("webview-overlay").hidden = false;
+  window.open(url, "_blank", "noopener");
   return true;
 }
 function closeWebView() {
@@ -24067,12 +24198,26 @@ function closeWebView() {
 }
 function reloadWebView() {
   const u = el("webview-url").dataset.url;
-  if (u) el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(u);
+  if (u) openWebView(u);
 }
 
 // --- Internet Archive viewer (PDF preview + metadata + downloads) ------------
 // --- IA preview page viewer (local compressed copy, arrow-key paging) --------
-const iaViewer = { pages: 0, page: 1 };
+const iaViewer = { pages: 0, page: 1, objectUrl: "", seq: 0, controller: null };
+
+function revokeIaObjectUrl() {
+  iaViewer.objectUrl = replaceObjectUrl(iaViewer.objectUrl, null);
+}
+
+function abortIaRequest() {
+  if (iaViewer.controller) iaViewer.controller.abort();
+  iaViewer.controller = null;
+}
+
+function iaRequestIsCurrent(seq, controller) {
+  return seq === iaViewer.seq && iaViewer.controller === controller &&
+    !controller.signal.aborted;
+}
 
 function renderIaPages(previewPath, pages) {
   const box = el("ia-pages");
@@ -24117,49 +24262,95 @@ function onIaViewerKey(ev) {
   }
 }
 
-// choose the framed local preview if we have one; else the proxied iframe
-async function showIaPreview(ident, data) {
+// Choose the local preview if available; a remote PDF is fetched into a blob.
+async function showIaPreview(ident, data, seq, controller) {
+  if (!iaRequestIsCurrent(seq, controller)) return;
   el("ia-pages").hidden = true;
-  el("ia-frame").hidden = false;
+  el("ia-frame").hidden = true;
+  el("ia-frame").src = "about:blank";
+  revokeIaObjectUrl();
   let pv = null;
-  try { pv = await (await fetch("/api/ia/preview/" + encodeURIComponent(ident))).json(); }
-  catch (e) { pv = null; }
+  try {
+    const response = await fetch("/api/ia/preview/" + encodeURIComponent(ident), {
+      signal: controller.signal,
+    });
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    pv = await response.json();
+  } catch (e) {
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    pv = null;
+  }
+  if (!iaRequestIsCurrent(seq, controller)) return;
   if (pv && pv.ok && pv.pages) {
     renderIaPages(pv.preview, pv.pages);
     el("ia-pages").hidden = false;
-    el("ia-frame").hidden = true;
-    el("ia-frame").src = "about:blank";
     return;
   }
-  el("ia-frame").src = (data && data.pdf)
-    ? "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1"
-    : "/api/webview?url=" + encodeURIComponent(
-        (data && data.details) || ("https://archive.org/details/" + ident));
+  if (data && data.pdf) {
+    try {
+      const result = await fetchBoundedPdfBlob(
+        "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1", {
+          signal: controller.signal,
+        });
+      if (!iaRequestIsCurrent(seq, controller)) return;
+      iaViewer.objectUrl = replaceObjectUrl(iaViewer.objectUrl, result.blob);
+      el("ia-frame").src = iaViewer.objectUrl;
+      el("ia-frame").hidden = false;
+    } catch (e) {
+      if (!iaRequestIsCurrent(seq, controller)) return;
+      el("ia-pages").innerHTML = "<div class='empty'>Preview unavailable. Open in browser to view.</div>";
+      el("ia-pages").hidden = false;
+    }
+  } else {
+    el("ia-pages").innerHTML = "<div class='empty'>Preview unavailable. Open in browser to view.</div>";
+    el("ia-pages").hidden = false;
+  }
   // no local copy yet — queue a background download (shares the cap/accounting)
   // so the framed preview (and its compressed 10-page copy) is ready next time
-  if (state.settings.autoIaDownload) enqueueAutoDl(ident, {});
+  if (iaRequestIsCurrent(seq, controller) && state.settings.autoIaDownload) {
+    enqueueAutoDl(ident, {});
+  }
 }
 
 async function openIaViewer(ident) {
   if (!ident) return;
+  abortIaRequest();
+  const seq = ++iaViewer.seq;
+  const controller = new AbortController();
+  iaViewer.controller = controller;
   const meta = el("ia-meta"), dls = el("ia-downloads");
   el("ia-title").textContent = "Internet Archive :: " + ident;
+  el("ia-pages").hidden = true;
+  el("ia-pages").innerHTML = "";
+  el("ia-frame").hidden = true;
   el("ia-frame").src = "about:blank";
+  revokeIaObjectUrl();
   meta.innerHTML = "<tr><td>Loading …</td></tr>";
   dls.innerHTML = "";
   el("ia-external").onclick = () =>
     window.open("https://archive.org/details/" + ident, "_blank", "noopener");
   el("ia-overlay").hidden = false;
   let data;
-  try { data = await (await fetch("/api/ia/meta?id=" + encodeURIComponent(ident))).json(); }
-  catch (e) { meta.innerHTML = "<tr><td>Could not load Internet Archive metadata</td></tr>"; return; }
+  try {
+    const response = await fetch("/api/ia/meta?id=" + encodeURIComponent(ident), {
+      signal: controller.signal,
+    });
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    data = await response.json();
+  } catch (e) {
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    meta.innerHTML = "<tr><td>Could not load Internet Archive metadata</td></tr>";
+    iaViewer.controller = null;
+    return;
+  }
+  if (!iaRequestIsCurrent(seq, controller)) return;
   const md = data.metadata || {};
   const arr = (v) => Array.isArray(v) ? v.join("; ") : (v == null ? "" : String(v));
   el("ia-title").textContent = arr(md.title) || ident;
   el("ia-external").onclick = () => window.open(data.details, "_blank", "noopener");
-  // Prefer the locally-downloaded compressed preview (page frames + arrow keys);
-  // otherwise fall back to the proxied remote preview iframe.
-  await showIaPreview(ident, data);
+  // Prefer the locally-downloaded compressed preview (page frames + arrow keys).
+  await showIaPreview(ident, data, seq, controller);
+  if (!iaRequestIsCurrent(seq, controller)) return;
   const rows = [["Title", "title"], ["Author", "creator"], ["Year", "year"], ["Date", "date"],
     ["Publisher", "publisher"], ["Language", "language"], ["Pages", "imagecount"],
     ["Subjects", "subject"], ["Collection", "collection"]];
@@ -24175,12 +24366,16 @@ async function openIaViewer(ident) {
   dls.querySelectorAll(".ia-dl").forEach((btn) => {
     btn.onclick = () => window.open(data.downloads[+btn.dataset.i].url, "_blank", "noopener");
   });
+  if (iaViewer.controller === controller) iaViewer.controller = null;
 }
 function closeIaViewer() {
+  iaViewer.seq++;
+  abortIaRequest();
   el("ia-overlay").hidden = true;
   el("ia-frame").src = "about:blank";
   el("ia-pages").innerHTML = "";
   el("ia-pages").hidden = true;
+  revokeIaObjectUrl();
   iaViewer.pages = 0;
   iaViewer.page = 1;
 }
