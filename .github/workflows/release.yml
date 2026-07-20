@@ -260,6 +260,9 @@ jobs:
       - name: Freeze the sidecar
         run: python -m PyInstaller --clean --noconfirm --distpath dist-sidecar --workpath build-sidecar sidecar/whl_explorer.spec
 
+      - name: Smoke-test the frozen sidecar transport
+        run: python ../.github/scripts/smoke_packaged_sidecar.py --sidecar dist-sidecar/whl-explorer-sidecar/whl-explorer-sidecar.exe
+
       # Sign only when the cert secret is present. electron-builder's CSC_LINK
       # takes the PFX as base64 directly, so no file is written to disk. Without
       # the secret the installer builds unsigned (auto-discovery off so

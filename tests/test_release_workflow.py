@@ -114,6 +114,17 @@ def test_desktop_job_requires_the_complete_updater_artifact_set():
     assert 'grep -Fq "LibraryTool-Setup-$V.exe" release/latest.yml' in desktop
 
 
+def test_desktop_job_smokes_the_frozen_sidecar_before_packaging():
+    desktop = _job("desktop", "publish")
+
+    freeze = desktop.index("Freeze the sidecar")
+    smoke = desktop.index("Smoke-test the frozen sidecar transport")
+    package = desktop.index("Build the installer")
+    assert freeze < smoke < package
+    assert "../.github/scripts/smoke_packaged_sidecar.py" in desktop
+    assert "dist-sidecar/whl-explorer-sidecar/whl-explorer-sidecar.exe" in desktop
+
+
 def test_release_docs_use_raw_windows_base64_not_certutil_pem():
     docs = (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8")
     assert "[Convert]::ToBase64String" in docs

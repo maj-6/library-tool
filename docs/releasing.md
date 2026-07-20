@@ -72,6 +72,7 @@ pushed:
    builds with the debug key and is suffixed `-debug-DONOTPUBLISH.apk`; that is
    the only signer-mismatch path the workflow permits.
 2. **desktop** freezes the Flask sidecar with PyInstaller and runs
+   an isolated transport smoke against that frozen executable before running
    electron-builder on a Windows runner, producing the NSIS installer
    `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
    `.blockmap`** — those two are the auto-update channel: installed apps check
