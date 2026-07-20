@@ -6,6 +6,7 @@ import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pypdf import PdfWriter
@@ -40,6 +41,21 @@ def _write_pdf(path: Path, *, title: str) -> bytes:
     data = path.read_bytes()
     assert data.startswith(b"%PDF-")
     return data
+
+
+def _stat_view(value, **changes: int | float) -> SimpleNamespace:
+    fields: dict[str, int | float] = {
+        "st_dev": value.st_dev,
+        "st_ino": value.st_ino,
+        "st_mode": value.st_mode,
+        "st_size": value.st_size,
+        "st_mtime": value.st_mtime,
+        "st_ctime": value.st_ctime,
+        "st_mtime_ns": value.st_mtime_ns,
+        "st_ctime_ns": value.st_ctime_ns,
+    }
+    fields.update(changes)
+    return SimpleNamespace(**fields)
 
 
 def _document(
@@ -186,6 +202,118 @@ def representation_catalog(monkeypatch, tmp_path: Path):
         }
     finally:
         current_session[0].close()
+
+
+def test_manifest_accepts_cross_interface_ctime_disagreement_and_persists_path_stat(
+    representation_catalog,
+    monkeypatch,
+):
+    catalog = representation_catalog
+    server = catalog["server"]
+    path = catalog["paths"]["primary"]
+    named = path.stat()
+    real_fstat = server.os.fstat
+
+    def fstat_with_path_ctime_disagreement(descriptor: int):
+        result = real_fstat(descriptor)
+        if not server.os.path.samestat(result, named):
+            return result
+        return _stat_view(
+            result,
+            st_ctime=result.st_ctime + 1,
+            st_ctime_ns=result.st_ctime_ns + 1_000_000_000,
+        )
+
+    monkeypatch.setattr(server.os, "fstat", fstat_with_path_ctime_disagreement)
+    draft = server.RepresentationAttachmentDraft(
+        representation_id="primary",
+        source_token=str(path),
+        role="primary",
+        media_type="application/pdf",
+    )
+
+    record = server._engine_representation_manifest_record(draft, path)
+
+    assert record["source_stat"] == server._engine_file_stat(path.stat())
+    snapshot = server._engine_source_snapshot(
+        "book-one",
+        "primary",
+        str(path),
+        role="primary",
+        label="Primary source",
+        manifest=record,
+    )
+    assert snapshot["content_state"] == "unchanged"
+    assert snapshot["available"] is True
+
+
+def test_manifest_rejects_same_handle_content_metadata_change(
+    representation_catalog,
+    monkeypatch,
+):
+    catalog = representation_catalog
+    server = catalog["server"]
+    path = catalog["paths"]["primary"]
+    named = path.stat()
+    real_fstat = server.os.fstat
+    observations = 0
+
+    def fstat_with_late_size_change(descriptor: int):
+        nonlocal observations
+        result = real_fstat(descriptor)
+        if not server.os.path.samestat(result, named):
+            return result
+        observations += 1
+        if observations == 1:
+            return result
+        return _stat_view(result, st_size=result.st_size + 1)
+
+    monkeypatch.setattr(server.os, "fstat", fstat_with_late_size_change)
+    draft = server.RepresentationAttachmentDraft(
+        representation_id="primary",
+        source_token=str(path),
+        role="primary",
+        media_type="application/pdf",
+    )
+
+    with pytest.raises(server.EngineConflictError) as raised:
+        server._engine_representation_manifest_record(draft, path)
+
+    assert raised.value.code == "representation_source_changed"
+
+
+def test_manifest_rejects_same_identity_cross_interface_metadata_change(
+    representation_catalog,
+    monkeypatch,
+):
+    catalog = representation_catalog
+    server = catalog["server"]
+    path = catalog["paths"]["primary"]
+    real_stat = Path.stat
+
+    def stat_with_late_metadata_change(current: Path, *args, **kwargs):
+        result = real_stat(current, *args, **kwargs)
+        if current != path:
+            return result
+        return _stat_view(
+            result,
+            st_size=result.st_size + 1,
+            st_mtime=result.st_mtime + 1,
+            st_mtime_ns=result.st_mtime_ns + 1_000_000_000,
+        )
+
+    monkeypatch.setattr(Path, "stat", stat_with_late_metadata_change)
+    draft = server.RepresentationAttachmentDraft(
+        representation_id="primary",
+        source_token=str(path),
+        role="primary",
+        media_type="application/pdf",
+    )
+
+    with pytest.raises(server.EngineConflictError) as raised:
+        server._engine_representation_manifest_record(draft, path)
+
+    assert raised.value.code == "representation_source_changed"
 
 
 def test_capability_attach_and_restart_replay_do_not_publish_source_tokens(

@@ -33,6 +33,22 @@ def _workspace_files(root: Path) -> dict[str, bytes]:
     }
 
 
+def _stat_view(value: os.stat_result, **changes: int | float) -> SimpleNamespace:
+    fields: dict[str, int | float] = {
+        "st_dev": value.st_dev,
+        "st_ino": value.st_ino,
+        "st_mode": value.st_mode,
+        "st_nlink": value.st_nlink,
+        "st_size": value.st_size,
+        "st_mtime": value.st_mtime,
+        "st_ctime": value.st_ctime,
+        "st_mtime_ns": value.st_mtime_ns,
+        "st_ctime_ns": value.st_ctime_ns,
+    }
+    fields.update(changes)
+    return SimpleNamespace(**fields)
+
+
 def test_prepare_records_both_hashes_and_commit_publishes_the_set(tmp_path):
     root = tmp_path / "workspace"
     root.mkdir()
@@ -829,6 +845,97 @@ def test_tree_fingerprint_is_deterministic_and_covers_paths_empty_dirs_and_bytes
     assert fingerprints["items/path"] != fingerprints["items/same-a"]
     assert fingerprints["items/bytes"] != fingerprints["items/same-a"]
     assert fingerprints["items/empty"] != fingerprints["items/same-a"]
+
+
+def test_tree_fingerprint_accepts_only_cross_interface_ctime_disagreement(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "workspace" / "items" / "book"
+    source.mkdir(parents=True)
+    leaf = source / "leaf.bin"
+    leaf.write_bytes(b"stable")
+    real_stat = os.stat
+
+    def stat_with_descriptor_ctime_disagreement(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if Path(path) != leaf or kwargs.get("follow_symlinks") is not False:
+            return result
+        return _stat_view(
+            result,
+            st_ctime=result.st_ctime + 1,
+            st_ctime_ns=result.st_ctime_ns + 1_000_000_000,
+        )
+
+    monkeypatch.setattr(os, "stat", stat_with_descriptor_ctime_disagreement)
+
+    fingerprint = write_set_module._fingerprint_tree(source)
+
+    assert fingerprint["file_count"] == 1
+    assert len(fingerprint["sha256"]) == 64
+
+
+def test_tree_fingerprint_rejects_same_identity_path_metadata_change(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "workspace" / "items" / "book"
+    source.mkdir(parents=True)
+    leaf = source / "leaf.bin"
+    leaf.write_bytes(b"stable")
+    real_stat = os.stat
+    observations = 0
+
+    def stat_with_late_metadata_change(path, *args, **kwargs):
+        nonlocal observations
+        result = real_stat(path, *args, **kwargs)
+        if Path(path) != leaf or kwargs.get("follow_symlinks") is not False:
+            return result
+        observations += 1
+        if observations == 1:
+            return result
+        return _stat_view(
+            result,
+            st_size=result.st_size + 1,
+            st_mtime=result.st_mtime + 1,
+            st_mtime_ns=result.st_mtime_ns + 1_000_000_000,
+        )
+
+    monkeypatch.setattr(os, "stat", stat_with_late_metadata_change)
+
+    with pytest.raises(WriteSetError) as raised:
+        write_set_module._fingerprint_tree(source)
+
+    assert raised.value.code == "write_set_prepare_conflict"
+
+
+def test_tree_fingerprint_rejects_path_identity_substitution(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "workspace" / "items" / "book"
+    source.mkdir(parents=True)
+    leaf = source / "leaf.bin"
+    leaf.write_bytes(b"stable")
+    real_stat = os.stat
+    observations = 0
+
+    def stat_with_late_identity_change(path, *args, **kwargs):
+        nonlocal observations
+        result = real_stat(path, *args, **kwargs)
+        if Path(path) != leaf or kwargs.get("follow_symlinks") is not False:
+            return result
+        observations += 1
+        if observations == 1:
+            return result
+        return _stat_view(result, st_ino=result.st_ino + 1)
+
+    monkeypatch.setattr(os, "stat", stat_with_late_identity_change)
+
+    with pytest.raises(WriteSetError) as raised:
+        write_set_module._fingerprint_tree(source)
+
+    assert raised.value.code == "write_set_prepare_conflict"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows exposes limited POSIX modes")

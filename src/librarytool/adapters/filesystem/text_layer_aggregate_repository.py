@@ -154,6 +154,14 @@ def _bounded_json_bytes(value: Any, *, maximum: int, artifact: str) -> bytes:
 
 
 def _stable_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Return metadata stable across observations from one stat interface.
+
+    In particular, Windows does not guarantee that path-stat and descriptor-
+    stat change times are directly comparable.  Cross-interface checks must
+    use ``os.path.samestat``; this signature is reserved for path/path or
+    descriptor/descriptor before-and-after comparisons.
+    """
+
     return (
         int(info.st_dev),
         int(info.st_ino),
@@ -826,7 +834,7 @@ class FilesystemTextLayerAggregateSession:
             or _is_redirecting_path(path)
             or not os.path.samestat(opened_after, named_after)
             or _stable_identity(opened_before) != _stable_identity(opened_after)
-            or _stable_identity(opened_before) != _stable_identity(named_after)
+            or _stable_identity(named_before) != _stable_identity(named_after)
         ):
             raise _repository_error(
                 "a text-layer artifact changed or exceeded its storage limit",

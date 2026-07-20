@@ -379,6 +379,55 @@ def test_path_signature_race_is_refused_even_when_bytes_match(
     assert caught.value.retryable is True
 
 
+def test_cross_interface_ctime_disagreement_does_not_look_like_a_pdf_race(
+    tmp_path,
+    monkeypatch,
+):
+    entry = _entry(tmp_path)
+    pdf = tmp_path / "attached.pdf"
+    data = _write_pdf(pdf, ((612, 792, 0),))
+    tracked = _asset(pdf, data)
+    path_signature = module._path_signature(pdf)
+    descriptor_signature = replace(
+        path_signature,
+        changed_ns=path_signature.changed_ns + 1,
+    )
+    monkeypatch.setattr(
+        module,
+        "_stream_signature",
+        lambda _stream: descriptor_signature,
+    )
+
+    inspection = FilesystemAttachedPdfInspector(lambda *_args: tracked)(
+        _representation(),
+        entry,
+    )
+
+    assert len(inspection.observations) == 1
+
+
+def test_path_identity_substitution_is_refused_even_when_bytes_match(
+    tmp_path,
+    monkeypatch,
+):
+    entry = _entry(tmp_path)
+    pdf = tmp_path / "attached.pdf"
+    data = _write_pdf(pdf, ((612, 792, 0),))
+    tracked = _asset(pdf, data)
+    actual = module._path_signature(pdf)
+    values = iter((actual, replace(actual, inode=actual.inode + 1)))
+    monkeypatch.setattr(module, "_path_signature", lambda _path: next(values))
+
+    with pytest.raises(ConflictError) as caught:
+        FilesystemAttachedPdfInspector(lambda *_args: tracked)(
+            _representation(),
+            entry,
+        )
+
+    assert caught.value.code == "canvas_pdf_asset_changed"
+    assert caught.value.retryable is True
+
+
 @pytest.mark.parametrize(
     "changes",
     (

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from queue import Empty
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -166,6 +167,22 @@ def _read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(value, dict)
     return value
+
+
+def _stat_view(value: os.stat_result, **changes: int | float) -> SimpleNamespace:
+    fields: dict[str, int | float] = {
+        "st_dev": value.st_dev,
+        "st_ino": value.st_ino,
+        "st_mode": value.st_mode,
+        "st_nlink": value.st_nlink,
+        "st_size": value.st_size,
+        "st_mtime": value.st_mtime,
+        "st_ctime": value.st_ctime,
+        "st_mtime_ns": value.st_mtime_ns,
+        "st_ctime_ns": value.st_ctime_ns,
+    }
+    fields.update(changes)
+    return SimpleNamespace(**fields)
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -761,6 +778,71 @@ def test_hard_linked_document_is_not_accepted_as_private_storage(
         with pytest.raises(RepositoryError) as raised:
             session.list(ITEM_ID)
     assert raised.value.code == "unsafe_text_layer_storage_path"
+
+
+def test_read_accepts_only_cross_interface_ctime_disagreement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    authority = _Authority(tmp_path, ids=["tl-ctime"])
+    _create(TextLayerAggregateService(_repository(authority)))
+    path = _document_path(authority, "tl-ctime")
+    expected = path.read_bytes()
+    repository = _repository(authority, recover=False)
+    real_fstat = os.fstat
+
+    def fstat_with_path_ctime_disagreement(descriptor: int):
+        result = real_fstat(descriptor)
+        return _stat_view(
+            result,
+            st_ctime=result.st_ctime + 1,
+            st_ctime_ns=result.st_ctime_ns + 1_000_000_000,
+        )
+
+    monkeypatch.setattr(os, "fstat", fstat_with_path_ctime_disagreement)
+
+    with repository.snapshot(ITEM_ID) as session:
+        assert session._read_bytes(
+            path,
+            maximum=len(expected),
+            artifact="document",
+        ) == expected
+
+
+def test_read_rejects_same_handle_content_metadata_change(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    authority = _Authority(tmp_path, ids=["tl-changing"])
+    _create(TextLayerAggregateService(_repository(authority)))
+    path = _document_path(authority, "tl-changing")
+    expected = path.read_bytes()
+    repository = _repository(authority, recover=False)
+    real_fstat = os.fstat
+    named = path.stat()
+    observations = 0
+
+    def fstat_with_late_size_change(descriptor: int):
+        nonlocal observations
+        result = real_fstat(descriptor)
+        if not os.path.samestat(result, named):
+            return result
+        observations += 1
+        if observations == 1:
+            return result
+        return _stat_view(result, st_size=result.st_size + 1)
+
+    monkeypatch.setattr(os, "fstat", fstat_with_late_size_change)
+
+    with repository.snapshot(ITEM_ID) as session:
+        with pytest.raises(RepositoryError) as raised:
+            session._read_bytes(
+                path,
+                maximum=len(expected),
+                artifact="document",
+            )
+
+    assert raised.value.code == "invalid_text_layer_storage"
 
 
 def test_interrupted_publication_rolls_back_on_restart_and_can_retry(

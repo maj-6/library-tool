@@ -1500,6 +1500,15 @@ def _filesystem_kind(mode: int) -> str:
 
 
 def _stable_stat_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Return metadata that must stay stable for one stat interface.
+
+    Windows can expose different change-time values for ``stat(path)`` and
+    ``fstat(open_file)`` even when both observations name the same file.  This
+    signature is therefore only valid for before/after comparisons made
+    through the same interface.  Cross-interface identity checks use
+    ``os.path.samestat`` below.
+    """
+
     return (
         int(info.st_dev),
         int(info.st_ino),
@@ -1507,6 +1516,16 @@ def _stable_stat_identity(info: os.stat_result) -> tuple[int, ...]:
         int(info.st_size),
         int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
         int(getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000))),
+    )
+
+
+def _portable_file_metadata(info: os.stat_result) -> tuple[int, ...]:
+    """Return fields that are comparable between path and handle stats."""
+
+    return (
+        int(info.st_mode),
+        int(info.st_size),
+        int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
     )
 
 
@@ -1573,7 +1592,8 @@ def _fingerprint_tree(root: Path) -> dict[str, Any]:
         if (
             _is_redirecting_path(path)
             or _stable_stat_identity(before) != _stable_stat_identity(after)
-            or _stable_stat_identity(before) != _stable_stat_identity(path_after)
+            or not os.path.samestat(after, path_after)
+            or _portable_file_metadata(after) != _portable_file_metadata(path_after)
         ):
             raise WriteSetError(
                 "a tree file changed while it was fingerprinted",

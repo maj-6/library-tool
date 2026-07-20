@@ -32,6 +32,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -4131,6 +4132,16 @@ def _engine_file_stat(value) -> dict:
     }
 
 
+def _engine_cross_interface_file_metadata(value) -> tuple[int, int, int]:
+    """Metadata safe to compare between path-stat and descriptor-stat."""
+
+    return (
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+    )
+
+
 def _engine_source_snapshot(item_id: str, source_id: str, raw: str,
                             *, role: str, label: str,
                             manifest: Mapping | None = None) -> dict:
@@ -4285,8 +4296,22 @@ def _engine_representation_manifest_record(
     from pypdf import PdfReader
 
     try:
+        named_before = path.stat()
         with path.open("rb") as stream:
-            before = _engine_file_stat(os.fstat(stream.fileno()))
+            opened_before = os.fstat(stream.fileno())
+            before = _engine_file_stat(opened_before)
+            if (
+                not stat.S_ISREG(named_before.st_mode)
+                or not stat.S_ISREG(opened_before.st_mode)
+                or not os.path.samestat(opened_before, named_before)
+                or _engine_cross_interface_file_metadata(opened_before)
+                != _engine_cross_interface_file_metadata(named_before)
+            ):
+                raise EngineConflictError(
+                    "the representation source changed while it was being attached",
+                    code="representation_source_changed",
+                    retryable=True,
+                )
             if stream.read(5) != b"%PDF-":
                 raise EngineValidationError(
                     "the representation source is not a PDF",
@@ -4307,8 +4332,10 @@ def _engine_representation_manifest_record(
             while chunk := stream.read(1024 * 1024):
                 digest_state.update(chunk)
             digest = digest_state.hexdigest()
-            after = _engine_file_stat(os.fstat(stream.fileno()))
-        path_after = _engine_file_stat(path.stat())
+            opened_after = os.fstat(stream.fileno())
+            after = _engine_file_stat(opened_after)
+            named_after = path.stat()
+            path_after = _engine_file_stat(named_after)
     except EngineError:
         raise
     except OSError as exc:
@@ -4317,7 +4344,15 @@ def _engine_representation_manifest_record(
             code="representation_source_changed",
             retryable=True,
         ) from exc
-    if before != after or after != path_after:
+    if (
+        before != after
+        or _engine_file_stat(named_before) != path_after
+        or not stat.S_ISREG(opened_after.st_mode)
+        or not stat.S_ISREG(named_after.st_mode)
+        or not os.path.samestat(opened_after, named_after)
+        or _engine_cross_interface_file_metadata(opened_after)
+        != _engine_cross_interface_file_metadata(named_after)
+    ):
         raise EngineConflictError(
             "the representation source changed while it was being attached",
             code="representation_source_changed",
@@ -4332,7 +4367,10 @@ def _engine_representation_manifest_record(
             code="representation_source_digest_mismatch",
             details={"expected_sha256": draft.expected_content_sha256},
         )
-    if draft.expected_size is not None and after["size"] != draft.expected_size:
+    if (
+        draft.expected_size is not None
+        and path_after["size"] != draft.expected_size
+    ):
         raise EngineConflictError(
             "the representation source size does not match",
             code="representation_source_size_mismatch",
@@ -4344,8 +4382,11 @@ def _engine_representation_manifest_record(
         "label": draft.label,
         "acquisition": draft.acquisition,
         "content_sha256": digest,
-        "size": after["size"],
-        "source_stat": after,
+        "size": path_after["size"],
+        # Drift checks later compare path-stat to path-stat.  Persist the final
+        # named observation, never descriptor-only metadata such as Windows'
+        # cross-interface ctime value.
+        "source_stat": path_after,
         "metadata": json.loads(json.dumps(
             draft.as_dict()["metadata"], ensure_ascii=False, allow_nan=False,
         )),

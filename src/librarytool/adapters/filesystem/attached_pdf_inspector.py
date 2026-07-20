@@ -170,6 +170,17 @@ class _FileSignature:
     modified_ns: int
     changed_ns: int
 
+    # ``os.path.samestat`` deliberately compares only the platform's file
+    # identity fields.  Keep the friendlier names used by this adapter while
+    # exposing the stat-result protocol it expects.
+    @property
+    def st_dev(self) -> int:
+        return self.device
+
+    @property
+    def st_ino(self) -> int:
+        return self.inode
+
 
 def _signature(value: os.stat_result) -> _FileSignature:
     return _FileSignature(
@@ -542,7 +553,11 @@ class FilesystemAttachedPdfInspector:
                 opened_before = _stream_signature(source)
                 if not stat.S_ISREG(opened_before.mode):
                     raise OSError("attachment is not a regular file")
-                if path_before != opened_before:
+                # Do not compare a path stat and a descriptor stat field for
+                # field.  On Windows their ctime values can legitimately
+                # disagree for the same file.  Same-interface snapshots below
+                # still protect metadata/content stability during the copy.
+                if not os.path.samestat(path_before, opened_before):
                     raise ConflictError(
                         "the attached PDF changed while inspection began",
                         code="canvas_pdf_asset_changed",
