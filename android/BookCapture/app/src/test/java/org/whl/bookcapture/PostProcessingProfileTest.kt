@@ -115,7 +115,6 @@ class PostProcessingProfileTest {
             "postProcessingPresetModern",
             "postProcessingPresetOlder",
             "postProcessingPresetEarly",
-            "postProcessingPresetSummary",
             "postProcessingDewarp",
             "postProcessingMarginCrop",
             "postProcessingContrast",
@@ -132,7 +131,8 @@ class PostProcessingProfileTest {
         assertTrue(strings.contains(">Modern books (1950 and later)</string>"))
         assertTrue(strings.contains(">Older books (1850-1949)</string>"))
         assertTrue(strings.contains(">Early books (before 1850)</string>"))
-        assertTrue(strings.contains("Camera originals remain unchanged."))
+        assertFalse(layout.contains("@string/set_post_processing_note"))
+        assertFalse(layout.contains("postProcessingPresetSummary"))
 
         val prefs = File("src/main/java/org/whl/bookcapture/Prefs.kt").readText()
         for (key in listOf(

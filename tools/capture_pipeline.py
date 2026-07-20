@@ -40,7 +40,7 @@ STANDARD_QUALITY = 82     # JPEG quality for the stored copy
 
 # The dedicated bibliographic fields (everything else lands in "extra").
 FIELDS = ("title", "subtitle", "author", "volume", "edition",
-          "publisher", "year", "city", "language")
+          "publisher", "year", "city", "language", "spine_title")
 
 
 # --- 1. perspective correction ------------------------------------------------
@@ -226,6 +226,8 @@ Return a single JSON object with exactly these keys (string values; "" when abse
   "year"       - the publication year as a 4-digit Arabic number (convert Roman numerals)
   "city"       - the place of publication (first city if several)
   "language"   - the language of the book as a lowercase English word ("english")
+  "spine_title" - the title printed on the spine only when it differs materially
+                  from the published title; "" when it is absent or equivalent
   "extra"      - an object of any OTHER bibliographic facts found, using short
                  snake_case keys, e.g. printer, series, translator, illustrator,
                  copyright_year, copyright_holder, printing_number, dedication.

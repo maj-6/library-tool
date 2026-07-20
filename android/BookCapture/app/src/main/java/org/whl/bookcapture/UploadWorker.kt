@@ -426,7 +426,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
         // 4xx is permanent — except the two that are really the network's or
         // the server's mood: timeout and rate limit.
-        private fun permanent(code: Int) = code in 400..499 && code != 408 && code != 429
+        private fun permanent(code: Int) =
+            code in 400..499 && code != 408 && code != 425 && code != 429
     }
 
     private data class PendingCapture(val key: UploadQueueKey, val dir: File)
@@ -877,8 +878,12 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         markDelivered(ctx, dir, delivery, "imported")
     }
 
-    private fun hasPendingImports(ctx: Context): Boolean =
-        Entries.recent(ctx).any { it.uploaded && isRemoteImportPending(it.cloudStatus) }
+    private fun hasPendingImports(ctx: Context): Boolean = Entries.recent(ctx).any { entry ->
+        entry.uploaded && (
+            isRemoteImportPending(entry.cloudStatus) ||
+                cloudPhotoWorkPending(PhotoAssetStore.read(entry.dir))
+            )
+    }
 
     /** A delayed poll never drains uploads or changes upload-error state. Its
      * only job is to synchronize already-sent cloud rows. The persisted chain
@@ -898,26 +903,211 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
     /** Ask the cloud whether the desktop has imported what we sent. Returns
      * true while at least one local sent row still needs a later poll. */
-    private fun pollImports(ctx: Context, client: SupabaseClient): Boolean {
-        val waiting = Entries.recent(ctx)
-            .filter { it.uploaded && isRemoteImportPending(it.cloudStatus) }
-        if (waiting.isEmpty()) return false
-        val statuses = try {
-            client.captureStatuses(waiting.map { it.id })
+    private suspend fun pollImports(ctx: Context, client: SupabaseClient): Boolean {
+        val sent = Entries.recent(ctx).filter { it.uploaded }
+        if (sent.isEmpty()) return false
+        val ownerId = Prefs.userId(ctx)
+        var cloudQueryFailed = false
+        val jobs = try {
+            client.photoProcessingJobs(sent.map { it.id })
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
-            return true                              // later bounded poll tries again
+            cloudQueryFailed = true
+            emptyList()
         }
-        for (e in waiting) {
-            val s = statuses[e.id]?.let(::normalizeRemoteImportStatus) ?: continue
-            if (s == normalizeRemoteImportStatus(e.cloudStatus)) continue
+        val entriesById = sent.associateBy { it.id }
+        for (job in jobs) {
+            if (job.ownerId != ownerId || Prefs.userId(ctx) != ownerId) continue
+            val entry = entriesById[job.captureId] ?: continue
+            syncCloudPhotoJob(ctx, client, entry, job, ownerId)
+        }
+
+        val waitingForImport = sent.filter { isRemoteImportPending(it.cloudStatus) }
+        var importQueryFailed = false
+        val statuses = if (waitingForImport.isEmpty()) emptyMap() else try {
+            client.captureStatuses(waitingForImport.map { it.id })
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            importQueryFailed = true
+            emptyMap()
+        }
+        for (entry in waitingForImport) {
+            val status = statuses[entry.id]?.let(::normalizeRemoteImportStatus) ?: continue
+            if (status == normalizeRemoteImportStatus(entry.cloudStatus)) continue
             try {
-                val mf = File(e.dir, "manifest.json")
-                Entries.atomicWrite(
-                    mf,
-                    JSONObject(mf.readText()).put("cloud_status", s).toString(),
-                )
+                EntryOperationLocks.withLock(entry.id) {
+                    val manifestFile = File(entry.dir, "manifest.json")
+                    if (!manifestFile.isFile) return@withLock
+                    Entries.atomicWrite(
+                        manifestFile,
+                        JSONObject(manifestFile.readText())
+                            .put("cloud_status", status)
+                            .toString(),
+                    )
+                }
             } catch (_: Exception) { }
         }
-        return hasPendingImports(ctx)
+        return cloudQueryFailed || importQueryFailed || hasPendingImports(ctx)
+    }
+
+    private suspend fun syncCloudPhotoJob(
+        ctx: Context,
+        client: SupabaseClient,
+        entry: Entries.Entry,
+        job: CloudPhotoProcessingJob,
+        ownerId: String,
+    ) {
+        if (job.state != "completed") {
+            EntryOperationLocks.withLock(entry.id) {
+                if (entry.dir.isDirectory) PhotoAssetStore.recordCloudJobState(entry.dir, job)
+            }
+            return
+        }
+
+        val decision = EntryOperationLocks.withLock(entry.id) {
+            if (!entry.dir.isDirectory) CloudResultDecision.NotApplicable
+            else validateCloudPhotoResult(PhotoAssetStore.read(entry.dir), job, ownerId)
+        }
+        when (decision) {
+            CloudResultDecision.NotApplicable,
+            CloudResultDecision.Superseded -> return
+            is CloudResultDecision.Rejected -> {
+                recordCloudResultFailure(
+                    entry,
+                    job,
+                    "Cloud result failed verification: ${decision.reason}",
+                )
+                return
+            }
+            is CloudResultDecision.Ready -> {
+                val alreadyInstalled = EntryOperationLocks.withLock(entry.id) {
+                    entry.dir.isDirectory && PhotoAssetStore.hasVerifiedCloudDisplay(
+                        entry.dir,
+                        decision.plan,
+                    )
+                }
+                if (!alreadyInstalled) downloadAndInstallCloudDisplay(
+                    ctx,
+                    client,
+                    entry,
+                    decision.plan,
+                        ownerId,
+                    )
+                // Nonlinear page-curvature correction cannot transform old
+                // polygons with a homography. Schedule OCR against only the
+                // verified display derivative; its durable marker survives a
+                // missing key, process death, and exhausted transient retries.
+                CloudDisplayReocrWorker.enqueuePending(ctx, entry.id)
+            }
+        }
+    }
+
+    private suspend fun downloadAndInstallCloudDisplay(
+        ctx: Context,
+        client: SupabaseClient,
+        entry: Entries.Entry,
+        plan: CloudDisplayInstallPlan,
+        ownerId: String,
+    ) {
+        val temporary = try {
+            EntryOperationLocks.withLock(entry.id) {
+                if (!entry.dir.isDirectory) null else File.createTempFile(
+                    ".cloud-${plan.job.id.take(12)}-",
+                    ".part",
+                    entry.dir,
+                )
+            }
+        } catch (_: Exception) {
+            recordCloudInstallRetry(entry, plan.job, "Cloud display could not be staged")
+            return
+        } ?: return
+        try {
+            val receipt = client.downloadPrivateObject(
+                plan.artifact.bucket,
+                plan.artifact.path,
+                temporary,
+                plan.artifact.bytes.coerceAtMost(MAX_CLOUD_DERIVATIVE_BYTES),
+            )
+            val invalid = verifyCloudDisplayDownload(
+                temporary,
+                plan.artifact,
+                receipt.contentType,
+                receipt.bytes,
+            )
+            if (invalid != null) {
+                recordCloudResultFailure(
+                    entry,
+                    plan.job,
+                    "Cloud display failed verification: $invalid",
+                )
+                return
+            }
+            if (Prefs.userId(ctx) != ownerId) throw SupabaseClient.AccountChanged()
+            val installed = EntryOperationLocks.withLock(entry.id) {
+                entry.dir.isDirectory && PhotoAssetStore.installCloudDisplayDerivative(
+                    entry.dir,
+                    plan,
+                    temporary,
+                    receipt,
+                )
+            }
+            if (!installed) {
+                recordCloudInstallRetry(entry, plan.job, "Cloud display could not be saved")
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: SupabaseClient.ObjectTooLarge) {
+            recordCloudResultFailure(
+                entry,
+                plan.job,
+                "Cloud display failed verification: artifact size",
+            )
+        } catch (e: SupabaseClient.SignedOut) {
+            throw e
+        } catch (e: SupabaseClient.AccountChanged) {
+            throw e
+        } catch (e: SupabaseClient.HttpException) {
+            if (permanent(e.code)) {
+                recordCloudResultFailure(
+                    entry,
+                    plan.job,
+                    "Cloud display download was rejected (HTTP ${e.code})",
+                )
+            } else {
+                recordCloudInstallRetry(entry, plan.job)
+            }
+        } catch (_: Exception) {
+            // HTTP/network/storage availability can recover; the completed job
+            // remains queryable and the bounded poll chain will try again.
+            recordCloudInstallRetry(entry, plan.job)
+        } finally {
+            temporary.delete()
+        }
+    }
+
+    private suspend fun recordCloudInstallRetry(
+        entry: Entries.Entry,
+        job: CloudPhotoProcessingJob,
+        error: String = "Cloud display download will retry",
+    ) {
+        EntryOperationLocks.withLock(entry.id) {
+            if (entry.dir.isDirectory) {
+                PhotoAssetStore.recordCloudInstallRetry(entry.dir, job, error)
+            }
+        }
+    }
+
+    private suspend fun recordCloudResultFailure(
+        entry: Entries.Entry,
+        job: CloudPhotoProcessingJob,
+        error: String,
+    ) {
+        EntryOperationLocks.withLock(entry.id) {
+            if (entry.dir.isDirectory) {
+                PhotoAssetStore.recordCloudResultFailure(entry.dir, job, error)
+            }
+        }
     }
 }

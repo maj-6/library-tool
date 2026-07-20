@@ -16,6 +16,7 @@
     <color name="whl_ink_dim">#6A6152</color>
     <color name="whl_cyan">#35635A</color>
     <color name="whl_green">#4A743A</color>
+    <color name="whl_green_pressed">#385D2B</color>
     <color name="whl_amber">#97681A</color>
     <color name="whl_red">#A5402C</color>
     <color name="whl_blue">#55503F</color>
@@ -25,7 +26,7 @@
     <color name="whl_current_blue_pressed">#C9E2EB</color>
     <color name="whl_thumbnail_border">#616661</color>
     <color name="whl_button_text">#FBF9F2</color>
-    <color name="ic_launcher_bg">#FBF7EE</color>
+    <color name="ic_launcher_bg">#4A743A</color>
 
     <!-- Sage is a light paper palette: default widget text goes
          dark, and the status/nav bars carry dark icons over the light canvas. -->
@@ -51,7 +52,8 @@
         <item name="android:background">@drawable/whl_button</item>
         <item name="android:foreground">?attr/selectableItemBackground</item>
         <item name="android:textColor">@color/whl_button_text</item>
-        <item name="android:fontFamily">monospace</item>
+        <item name="android:fontFamily">@font/roboto_slab</item>
+        <item name="android:textAllCaps">false</item>
         <item name="android:textSize">20sp</item>
         <item name="android:minHeight">52dp</item>
         <item name="android:minWidth">0dp</item>
@@ -89,7 +91,8 @@
         <item name="android:insetBottom">0dp</item>
         <item name="android:paddingStart">10dp</item>
         <item name="android:paddingEnd">10dp</item>
-        <item name="android:fontFamily">monospace</item>
+        <item name="android:fontFamily">@font/roboto_slab</item>
+        <item name="android:textAllCaps">false</item>
         <item name="android:textSize">12sp</item>
         <item name="android:textColor">@color/whl_ink</item>
         <item name="backgroundTint">@android:color/transparent</item>
@@ -97,10 +100,10 @@
 
     <!-- mono field label / small chrome text -->
     <style name="WhlLabel">
-        <item name="android:fontFamily">monospace</item>
+        <item name="android:fontFamily">@font/roboto_slab</item>
         <item name="android:textSize">11sp</item>
         <item name="android:textColor">@color/whl_ink_dim</item>
-        <item name="android:textAllCaps">true</item>
+        <item name="android:textAllCaps">false</item>
     </style>
 
     <!-- a settings/detail card: face panel, padded, spaced from the last -->

@@ -9,12 +9,25 @@ import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 
+internal data class PrivateObjectDownload(
+    val contentType: String,
+    val bytes: Long,
+)
+
+private val SAFE_CLOUD_FILTER_TOKEN = Regex("[A-Za-z0-9._-]+")
+
+private fun encodedStoragePath(value: String): String = value.split('/').joinToString("/") {
+    URLEncoder.encode(it, Charsets.UTF_8.name()).replace("+", "%20")
+}
+
 internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
     val id = row.optString("id").trim()
     val name = normalizeCollectionField(row.optString("name"))
     if (id.isEmpty() || name.isEmpty()) return null
     val mergedInto = if (row.isNull("merged_into")) null
     else row.optString("merged_into").trim().ifEmpty { null }
+    val parentId = if (row.isNull("parent_id")) null
+    else row.optString("parent_id").trim().ifEmpty { null }
     return BookCollection(
         id = id,
         name = name,
@@ -22,6 +35,7 @@ internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
         updatedAt = row.optString("updated_at").trim(),
         deleted = row.optBoolean("deleted", false),
         mergedInto = mergedInto,
+        parentId = parentId,
     )
 }
 
@@ -61,6 +75,8 @@ internal fun collectionCloudBody(
     .put("id", row.id)
     .put("name", row.name)
     .put("from_place", row.from)
+    // JSON null deliberately clears a parent during PATCH.
+    .put("parent_id", row.parentId ?: JSONObject.NULL)
     .put("deleted", row.deleted)
     .apply {
         ownerId?.takeIf { it.isNotEmpty() }?.let { put("created_by", it) }
@@ -81,6 +97,7 @@ class SupabaseClient(
     class HttpException(val code: Int, message: String) : IOException(message)
     class SignedOut : IOException("signed out")
     class AccountChanged : IOException("account changed during delivery")
+    class ObjectTooLarge : IOException("private object exceeds the download limit")
 
     private val baseUrl = Prefs.supabaseUrl(ctx)
     private val ownerId = expectedUserId?.trim().orEmpty().ifEmpty { Prefs.userId(ctx) }
@@ -156,6 +173,80 @@ class SupabaseClient(
         }
     }
 
+    /** Owner-readable processing rows for the sent captures retained locally. */
+    internal fun photoProcessingJobs(ids: List<String>): List<CloudPhotoProcessingJob> {
+        val safeIds = ids.distinct().filter {
+            it.isNotEmpty() && it.length <= 160 && it.matches(SAFE_CLOUD_FILTER_TOKEN) &&
+                it != "." && it != ".."
+        }
+        if (safeIds.isEmpty()) return emptyList()
+        val filter = safeIds.joinToString(",") {
+            URLEncoder.encode(it, Charsets.UTF_8.name())
+        }
+        val select = "id,capture_id,owner_id,asset_id,request_id,request_revision," +
+            "source_sha256,state,result,last_error"
+        val conn = open(
+            "GET",
+            "$baseUrl/rest/v1/photo_processing_jobs" +
+                "?capture_id=in.($filter)&select=$select" +
+                "&order=capture_id.asc,asset_id.asc,request_revision.asc&limit=1000",
+            null,
+        )
+        val rows = JSONArray(finish(conn).ifEmpty { "[]" })
+        return (0 until rows.length()).map { index ->
+            rows.optJSONObject(index)?.let(::cloudPhotoProcessingJobFromJson)
+                ?: throw IOException("invalid photo processing job row")
+        }
+    }
+
+    /**
+     * Stream one private object with the signed-in user's JWT. The caller still
+     * verifies the result-declared MIME, exact byte count, JPEG structure,
+     * dimensions, and checksum before installation.
+     */
+    internal fun downloadPrivateObject(
+        bucket: String,
+        objectPath: String,
+        destination: File,
+        maxBytes: Long,
+    ): PrivateObjectDownload {
+        require(maxBytes > 0L) { "maxBytes must be positive" }
+        val url = "$baseUrl/storage/v1/object/authenticated/" +
+            "${encodedStoragePath(bucket)}/${encodedStoragePath(objectPath)}"
+        val conn = open("GET", url, null)
+        destination.delete()
+        try {
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                finish(conn)
+                throw HttpException(code, "HTTP $code")
+            }
+            val declared = conn.contentLengthLong
+            if (declared > maxBytes) throw ObjectTooLarge()
+            var total = 0L
+            conn.inputStream.use { input ->
+                destination.outputStream().use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        total += read
+                        if (total > maxBytes) throw ObjectTooLarge()
+                        output.write(buffer, 0, read)
+                    }
+                    output.flush()
+                }
+            }
+            return PrivateObjectDownload(conn.contentType.orEmpty(), total)
+        } catch (e: Exception) {
+            destination.delete()
+            throw e
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     /** All shared collection rows, including soft-deleted tombstones. */
     fun collections(): List<BookCollection> = collectCollectionPages { afterId ->
         val cursor = afterId?.let {
@@ -164,7 +255,7 @@ class SupabaseClient(
         val conn = open(
             "GET",
             "$baseUrl/rest/v1/collections" +
-                "?select=id,name,from_place,updated_at,deleted,merged_into" +
+                "?select=id,name,from_place,updated_at,deleted,merged_into,parent_id" +
                 "&order=id.asc&limit=$COLLECTION_PAGE_SIZE$cursor",
             null,
         )

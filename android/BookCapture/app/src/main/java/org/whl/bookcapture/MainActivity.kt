@@ -12,11 +12,16 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import android.util.Size
+import android.view.GestureDetector
 import android.view.LayoutInflater
+import android.view.MotionEvent
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.RadioGroup
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
@@ -24,6 +29,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalZeroShutterLag
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
@@ -36,6 +42,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
+import com.google.android.material.checkbox.MaterialCheckBox
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -43,7 +51,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.whl.bookcapture.databinding.ActivityMainBinding
 import java.io.File
 import java.util.UUID
@@ -94,6 +101,7 @@ class MainActivity : AppCompatActivity() {
     private var initialized = false
     private var voicePermissionRequestedForEnablement = false
     private var extraFieldsDialog: AlertDialog? = null
+    private var cameraSettingsDialog: AlertDialog? = null
     private var lastBookPreviewJob: Job? = null
     private val captureQueue = ShallowCaptureQueue()
     private val acceptedShots = mutableMapOf<Long, AcceptedShot>()
@@ -122,6 +130,7 @@ class MainActivity : AppCompatActivity() {
         val profile: CameraCaptureProfile,
         val sharpenPreview: Boolean,
         val torchEnabled: Boolean,
+        val orientation: CameraCaptureOrientation,
     )
 
     private data class BoundCameraUseCases(
@@ -166,9 +175,32 @@ class MainActivity : AppCompatActivity() {
             if (voiceNoteDraft == null) requestStartVoiceNote()
             else finishVoiceNote(save = !voiceNoteDiscardPending)
         }
-        binding.btnSettings.setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
+        binding.btnCameraSettings.setOnClickListener { showCameraSettings() }
+        binding.btnCaptureOrientation.setOnClickListener {
+            val current = cameraCaptureOrientation(Prefs.cameraCaptureOrientation(this))
+            val next = when (current) {
+                CameraCaptureOrientation.PORTRAIT -> CameraCaptureOrientation.LANDSCAPE
+                CameraCaptureOrientation.LANDSCAPE -> CameraCaptureOrientation.PORTRAIT
+            }
+            Prefs.setCameraCaptureOrientation(this, next)
+            updateCaptureOrientationUi()
+            applyCameraPreferenceChanges()
+            setStatus(getString(
+                if (next == CameraCaptureOrientation.PORTRAIT)
+                    R.string.camera_orientation_portrait_status
+                else R.string.camera_orientation_landscape_status,
+            ))
         }
+        val focusGesture = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(event: MotionEvent): Boolean = true
+
+            override fun onSingleTapUp(event: MotionEvent): Boolean {
+                focusAtPreviewPoint(event.x, event.y, announce = true)
+                return true
+            }
+        })
+        binding.preview.setOnTouchListener { _, event -> focusGesture.onTouchEvent(event) }
+        updateCaptureOrientationUi()
         binding.configWarning.setOnClickListener {
             startActivity(Intent(this, LoginActivity::class.java))
         }
@@ -252,6 +284,8 @@ class MainActivity : AppCompatActivity() {
         if (!captureQueue.busy) discardAllCaptureRequests()
         extraFieldsDialog?.dismiss()
         extraFieldsDialog = null
+        cameraSettingsDialog?.dismiss()
+        cameraSettingsDialog = null
         boundCamera = null
         boundCameraConfig = null
         cameraBindingInFlight = null
@@ -718,6 +752,7 @@ class MainActivity : AppCompatActivity() {
             field.backgroundTintList = ColorStateList.valueOf(getColor(noteFieldColor(noteRow.field)))
             value.text = noteRow.value.ifBlank { getString(R.string.capture_note_value_pending) }
             row.contentDescription = "${field.text}: ${value.text}"
+            RemoteUiCatalog.apply(row)
             binding.noteRows.addView(row)
         }
     }
@@ -743,6 +778,7 @@ class MainActivity : AppCompatActivity() {
         sharpenPreview = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             Prefs.sharpenPreview(this),
         torchEnabled = Prefs.torchEnabled(this),
+        orientation = cameraCaptureOrientation(Prefs.cameraCaptureOrientation(this)),
     )
 
     @androidx.annotation.OptIn(markerClass = [ExperimentalZeroShutterLag::class])
@@ -791,6 +827,7 @@ class MainActivity : AppCompatActivity() {
                         config = config,
                         requestZsl = requestZsl,
                         constrainResolution = true,
+                        targetRotation = captureTargetRotation(requestedBinding.orientation),
                     )
                 } catch (primary: Exception) {
                     Log.w(
@@ -807,6 +844,7 @@ class MainActivity : AppCompatActivity() {
                             config = config,
                             requestZsl = false,
                             constrainResolution = false,
+                            targetRotation = captureTargetRotation(requestedBinding.orientation),
                         )
                     } catch (fallback: Exception) {
                         fallback.addSuppressed(primary)
@@ -819,6 +857,7 @@ class MainActivity : AppCompatActivity() {
                 boundCameraConfig = requestedBinding
                 cameraBindingInFlight = null
                 applyPreviewSharpen(sharpen)
+                applyStoredCameraControls(bound.camera)
                 applyTorchAndPersistDiagnostics(
                     requestedBinding = requestedBinding,
                     config = config,
@@ -828,6 +867,8 @@ class MainActivity : AppCompatActivity() {
                     zslActive = zslActiveExpected,
                     usedBindFallback = usedBindFallback,
                 )
+                updateCaptureOrientationUi()
+                updateUi()
                 submitDeferredCaptureIfReady()
             } catch (e: Exception) {
                 imageCapture = null
@@ -950,8 +991,11 @@ class MainActivity : AppCompatActivity() {
         config: CameraCaptureConfig,
         requestZsl: Boolean,
         constrainResolution: Boolean,
+        targetRotation: Int,
     ): BoundCameraUseCases {
-        val preview = Preview.Builder().build().also {
+        val preview = Preview.Builder()
+            .setTargetRotation(targetRotation)
+            .build().also {
             it.setSurfaceProvider(binding.preview.surfaceProvider)
         }
         val builder = ImageCapture.Builder()
@@ -960,6 +1004,7 @@ class MainActivity : AppCompatActivity() {
                 else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY,
             )
                 .setFlashMode(ImageCapture.FLASH_MODE_OFF)
+            .setTargetRotation(targetRotation)
             .setJpegQuality(config.jpegQuality)
         if (constrainResolution) {
             val fallbackRule = when (config.resolutionFallback) {
@@ -1097,6 +1142,340 @@ class MainActivity : AppCompatActivity() {
         binding.preview.setRenderEffect(
             if (on) RenderEffect.createRuntimeShaderEffect(RuntimeShader(SHARPEN_AGSL), "content")
             else null)
+    }
+
+    private fun captureTargetRotation(orientation: CameraCaptureOrientation): Int =
+        when (orientation) {
+            CameraCaptureOrientation.PORTRAIT -> Surface.ROTATION_0
+            CameraCaptureOrientation.LANDSCAPE -> Surface.ROTATION_90
+        }
+
+    private fun updateCaptureOrientationUi() {
+        val orientation = cameraCaptureOrientation(Prefs.cameraCaptureOrientation(this))
+        binding.pageMarginOverlay.captureOrientation = orientation
+        binding.pageMarginOverlay.setLockedFocusPoint(
+            Prefs.cameraFocusPointX(this),
+            Prefs.cameraFocusPointY(this),
+            Prefs.cameraFocusLocked(this),
+        )
+        when (orientation) {
+            CameraCaptureOrientation.PORTRAIT -> {
+                binding.btnCaptureOrientation.setImageResource(R.drawable.ic_capture_portrait)
+                binding.btnCaptureOrientation.contentDescription =
+                    getString(R.string.camera_orientation_portrait)
+            }
+            CameraCaptureOrientation.LANDSCAPE -> {
+                binding.btnCaptureOrientation.setImageResource(R.drawable.ic_capture_landscape)
+                binding.btnCaptureOrientation.contentDescription =
+                    getString(R.string.camera_orientation_landscape)
+            }
+        }
+        RemoteUiCatalog.apply(binding.btnCaptureOrientation)
+    }
+
+    /** Zoom and exposure are ordinary CameraX controls and are reapplied after
+     * every lifecycle rebind. Focus lock is posted until PreviewView has real
+     * dimensions so its normalized saved point maps to the correct sensor area. */
+    private fun applyStoredCameraControls(camera: Camera) {
+        camera.cameraInfo.zoomState.value?.let { state ->
+            val requested = normalizedZoomRatio(
+                Prefs.cameraZoomRatio(this),
+                state.minZoomRatio,
+                state.maxZoomRatio,
+            )
+            Prefs.setCameraZoomRatio(this, requested)
+            val future = camera.cameraControl.setZoomRatio(requested)
+            future.addListener({
+                runCatching { future.get() }
+                    .onFailure { Log.w(CAMERA_LOG_TAG, "Could not restore zoom", it) }
+            }, ContextCompat.getMainExecutor(this))
+        }
+
+        val exposure = camera.cameraInfo.exposureState
+        if (exposure.isExposureCompensationSupported) {
+            val range = exposure.exposureCompensationRange
+            val requested = normalizedExposureIndex(
+                Prefs.cameraExposureIndex(this),
+                range.lower,
+                range.upper,
+            )
+            Prefs.setCameraExposureIndex(this, requested)
+            val future = camera.cameraControl.setExposureCompensationIndex(requested)
+            future.addListener({
+                runCatching { future.get() }
+                    .onFailure { Log.w(CAMERA_LOG_TAG, "Could not restore exposure", it) }
+            }, ContextCompat.getMainExecutor(this))
+        }
+
+        binding.preview.post {
+            if (boundCamera !== camera || isDestroyed) return@post
+            val locked = Prefs.cameraFocusLocked(this)
+            binding.pageMarginOverlay.setLockedFocusPoint(
+                Prefs.cameraFocusPointX(this),
+                Prefs.cameraFocusPointY(this),
+                locked,
+            )
+            if (locked) applyFocusPoint(camera, announce = false)
+        }
+    }
+
+    private fun focusAtPreviewPoint(x: Float, y: Float, announce: Boolean) {
+        val camera = boundCamera ?: return
+        if (binding.preview.width <= 0 || binding.preview.height <= 0) return
+        Prefs.setCameraFocusPoint(
+            this,
+            x / binding.preview.width,
+            y / binding.preview.height,
+        )
+        applyFocusPoint(camera, announce)
+    }
+
+    private fun focusAction(locked: Boolean): FocusMeteringAction {
+        val point = binding.preview.meteringPointFactory.createPoint(
+            Prefs.cameraFocusPointX(this) * binding.preview.width.coerceAtLeast(1),
+            Prefs.cameraFocusPointY(this) * binding.preview.height.coerceAtLeast(1),
+            0.15f,
+        )
+        return FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+            .apply { if (locked) disableAutoCancel() }
+            .build()
+    }
+
+    private fun focusControlSupported(camera: Camera): Boolean = runCatching {
+        camera.cameraInfo.isFocusMeteringSupported(focusAction(locked = true))
+    }.getOrDefault(false)
+
+    private fun applyFocusPoint(camera: Camera, announce: Boolean) {
+        val locked = Prefs.cameraFocusLocked(this)
+        val action = focusAction(locked)
+        if (!camera.cameraInfo.isFocusMeteringSupported(action)) {
+            binding.pageMarginOverlay.setLockedFocusPoint(
+                Prefs.cameraFocusPointX(this),
+                Prefs.cameraFocusPointY(this),
+                visible = false,
+            )
+            if (announce) setStatus(getString(R.string.camera_settings_focus_unavailable))
+            return
+        }
+
+        binding.pageMarginOverlay.setLockedFocusPoint(
+            Prefs.cameraFocusPointX(this),
+            Prefs.cameraFocusPointY(this),
+            visible = locked,
+        )
+        val future = camera.cameraControl.startFocusAndMetering(action)
+        future.addListener({
+            if (boundCamera !== camera || !canUpdateCaptureUi()) return@addListener
+            val successful = runCatching { future.get().isFocusSuccessful }
+                .onFailure { Log.w(CAMERA_LOG_TAG, "Focus/metering request failed", it) }
+                .getOrDefault(false)
+            if (announce) {
+                setStatus(getString(when {
+                    !successful -> R.string.camera_focus_failed_status
+                    locked -> R.string.camera_focus_locked_status
+                    else -> R.string.camera_focus_set_status
+                }))
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun clearFocusLock(camera: Camera?) {
+        Prefs.setCameraFocusLocked(this, false)
+        binding.pageMarginOverlay.setLockedFocusPoint(
+            Prefs.cameraFocusPointX(this),
+            Prefs.cameraFocusPointY(this),
+            visible = false,
+        )
+        camera ?: return
+        val future = camera.cameraControl.cancelFocusAndMetering()
+        future.addListener({
+            runCatching { future.get() }
+                .onFailure { Log.w(CAMERA_LOG_TAG, "Could not restore continuous focus", it) }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    /** This dialog intentionally contains no account, network, update, or app
+     * preferences. It is a short, capability-aware surface for the live camera
+     * and scan-quality controls needed while a book is on the copy stand. */
+    private fun showCameraSettings() {
+        cameraSettingsDialog?.takeIf { it.isShowing }?.let { return }
+        val camera = boundCamera ?: run {
+            setStatus(getString(R.string.camera_settings_starting))
+            return
+        }
+        val content = LayoutInflater.from(this)
+            .inflate(R.layout.dialog_capture_camera_settings, null)
+        val focusLock = content.findViewById<MaterialCheckBox>(R.id.cameraFocusLock)
+        val focusState = content.findViewById<TextView>(R.id.cameraFocusState)
+        val zoom = content.findViewById<SeekBar>(R.id.cameraZoom)
+        val zoomLabel = content.findViewById<TextView>(R.id.cameraZoomLabel)
+        val exposure = content.findViewById<SeekBar>(R.id.cameraExposure)
+        val exposureLabel = content.findViewById<TextView>(R.id.cameraExposureLabel)
+        val torch = content.findViewById<MaterialCheckBox>(R.id.cameraTorch)
+        val profile = content.findViewById<RadioGroup>(R.id.cameraProfile)
+        val sharpen = content.findViewById<MaterialCheckBox>(R.id.cameraSharpen)
+
+        val focusSupported = focusControlSupported(camera)
+        focusLock.isEnabled = focusSupported
+        focusLock.isChecked = focusSupported && Prefs.cameraFocusLocked(this)
+        focusState.setText(when {
+            !focusSupported -> R.string.camera_settings_focus_unavailable
+            focusLock.isChecked -> R.string.camera_settings_focus_locked
+            else -> R.string.camera_settings_focus_auto
+        })
+        focusLock.setOnCheckedChangeListener { _, checked ->
+            if (!focusSupported) return@setOnCheckedChangeListener
+            Prefs.setCameraFocusLocked(this, checked)
+            focusState.setText(
+                if (checked) R.string.camera_settings_focus_locked
+                else R.string.camera_settings_focus_auto,
+            )
+            if (checked) applyFocusPoint(camera, announce = true) else clearFocusLock(camera)
+        }
+
+        val zoomState = camera.cameraInfo.zoomState.value
+        val minimumZoom = zoomState?.minZoomRatio ?: 1f
+        val maximumZoom = zoomState?.maxZoomRatio ?: minimumZoom
+        val requestedZoom = normalizedZoomRatio(
+            Prefs.cameraZoomRatio(this),
+            minimumZoom,
+            maximumZoom,
+        )
+        zoom.max = 1000
+        zoom.progress = zoomProgressFromRatio(
+            requestedZoom,
+            zoom.max,
+            minimumZoom,
+            maximumZoom,
+        )
+        zoom.isEnabled = maximumZoom > minimumZoom
+        zoomLabel.text = if (zoom.isEnabled) {
+            getString(R.string.camera_settings_zoom_value, requestedZoom)
+        } else {
+            getString(R.string.camera_settings_zoom_unavailable)
+        }
+        zoom.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (!fromUser || !seekBar.isEnabled) return
+                val ratio = zoomRatioFromProgress(
+                    progress,
+                    seekBar.max,
+                    minimumZoom,
+                    maximumZoom,
+                )
+                Prefs.setCameraZoomRatio(this@MainActivity, ratio)
+                zoomLabel.text = getString(R.string.camera_settings_zoom_value, ratio)
+                val future = camera.cameraControl.setZoomRatio(ratio)
+                future.addListener({
+                    runCatching { future.get() }
+                        .onFailure { Log.w(CAMERA_LOG_TAG, "Could not set zoom", it) }
+                }, ContextCompat.getMainExecutor(this@MainActivity))
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar) = Unit
+        })
+
+        val exposureState = camera.cameraInfo.exposureState
+        val exposureRange = exposureState.exposureCompensationRange
+        val exposureSupported = exposureState.isExposureCompensationSupported &&
+            exposureRange.lower <= exposureRange.upper
+        val requestedExposure = normalizedExposureIndex(
+            Prefs.cameraExposureIndex(this),
+            exposureRange.lower,
+            exposureRange.upper,
+        )
+        exposure.max = (exposureRange.upper - exposureRange.lower).coerceAtLeast(0)
+        exposure.progress = (requestedExposure - exposureRange.lower).coerceIn(0, exposure.max)
+        exposure.isEnabled = exposureSupported && exposure.max > 0
+        val exposureStep = exposureState.exposureCompensationStep.toFloat()
+        exposureLabel.text = if (exposureSupported) {
+            getString(
+                R.string.camera_settings_exposure_value,
+                requestedExposure * exposureStep,
+            )
+        } else {
+            getString(R.string.camera_settings_exposure_unavailable)
+        }
+        exposure.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (!fromUser || !seekBar.isEnabled) return
+                val index = normalizedExposureIndex(
+                    exposureRange.lower + progress,
+                    exposureRange.lower,
+                    exposureRange.upper,
+                )
+                Prefs.setCameraExposureIndex(this@MainActivity, index)
+                exposureLabel.text = getString(
+                    R.string.camera_settings_exposure_value,
+                    index * exposureStep,
+                )
+                val future = camera.cameraControl.setExposureCompensationIndex(index)
+                future.addListener({
+                    runCatching { future.get() }
+                        .onFailure { Log.w(CAMERA_LOG_TAG, "Could not set exposure", it) }
+                }, ContextCompat.getMainExecutor(this@MainActivity))
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar) = Unit
+        })
+
+        val torchSupported = camera.cameraInfo.hasFlashUnit()
+        torch.isEnabled = torchSupported
+        torch.isChecked = torchSupported && Prefs.torchEnabled(this)
+        if (!torchSupported) torch.setText(R.string.camera_settings_light_unavailable)
+        torch.setOnCheckedChangeListener { _, checked ->
+            if (!torchSupported) return@setOnCheckedChangeListener
+            Prefs.setTorchEnabled(this, checked)
+            applyCameraPreferenceChanges()
+        }
+
+        profile.check(
+            when (Prefs.cameraProfile(this)) {
+                Prefs.CAMERA_PROFILE_LOW -> R.id.cameraProfileLow
+                Prefs.CAMERA_PROFILE_DETAIL -> R.id.cameraProfileDetail
+                else -> R.id.cameraProfileFast
+            },
+        )
+        profile.setOnCheckedChangeListener { _, checkedId ->
+            Prefs.setCameraProfile(
+                this,
+                when (checkedId) {
+                    R.id.cameraProfileLow -> Prefs.CAMERA_PROFILE_LOW
+                    R.id.cameraProfileDetail -> Prefs.CAMERA_PROFILE_DETAIL
+                    else -> Prefs.CAMERA_PROFILE_FAST
+                },
+            )
+        }
+
+        sharpen.isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        sharpen.isChecked = sharpen.isEnabled && Prefs.sharpenPreview(this)
+        sharpen.setOnCheckedChangeListener { _, checked ->
+            if (sharpen.isEnabled) Prefs.setSharpenPreview(this, checked)
+        }
+
+        RemoteUiCatalog.apply(content)
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(RemoteUiCatalog.text(this, R.string.camera_settings_title))
+            .setView(content)
+            .setNeutralButton(
+                RemoteUiCatalog.text(this, R.string.camera_settings_reset),
+            ) { _, _ ->
+                clearFocusLock(camera)
+                Prefs.resetCameraOptions(this)
+                updateCaptureOrientationUi()
+                applyCameraPreferenceChanges()
+            }
+            .setPositiveButton(android.R.string.ok, null)
+            .create()
+        cameraSettingsDialog = dialog
+        dialog.setOnDismissListener {
+            if (cameraSettingsDialog === dialog) cameraSettingsDialog = null
+            applyCameraPreferenceChanges()
+        }
+        dialog.show()
+        RemoteUiCatalog.apply(dialog)
     }
 
     // --- the command state machine --------------------------------------------
@@ -1747,15 +2126,26 @@ class MainActivity : AppCompatActivity() {
         iv.layoutParams = LinearLayout.LayoutParams(h, h).apply { marginEnd = gap }
         iv.scaleType = ImageView.ScaleType.CENTER_CROP
         binding.thumbs.addView(iv)
+        updateThumbnailStripVisibility()
         lifecycleScope.launch(Dispatchers.IO) {
             val bmp = decodeSampledOriented(File(path), maxWidth = 640, maxHeight = 640)
             withContext(Dispatchers.Main) {
-                if (bmp == null) { binding.thumbs.removeView(iv); return@withContext }
+                if (bmp == null) {
+                    binding.thumbs.removeView(iv)
+                    updateThumbnailStripVisibility()
+                    return@withContext
+                }
                 val w = h * bmp.width / bmp.height.coerceAtLeast(1)
                 iv.layoutParams = LinearLayout.LayoutParams(w, h).apply { marginEnd = gap }
                 iv.setImageBitmap(bmp)
             }
         }
+    }
+
+    /** Do not reserve a fixed-height blank band underneath the viewfinder. */
+    private fun updateThumbnailStripVisibility() {
+        binding.thumbsScroll.visibility =
+            if (binding.thumbs.childCount == 0) View.GONE else View.VISIBLE
     }
 
     private fun setStatus(msg: String) {
@@ -1777,9 +2167,14 @@ class MainActivity : AppCompatActivity() {
         binding.btnCancel.isEnabled = active && captureAvailable && !noteActive
         binding.btnNote.isEnabled = active &&
             !voiceNoteFinalizing && (noteActive || captureAvailable && !captureQueue.busy)
-        binding.btnSettings.isEnabled = !captureQueue.busy && !captureMutationInFlight && !noteActive
+        val cameraControlsAvailable = boundCamera != null && !captureQueue.busy &&
+            !captureMutationInFlight && !noteActive
+        binding.btnCameraSettings.isEnabled = cameraControlsAvailable
+        binding.btnCaptureOrientation.isEnabled = cameraControlsAvailable
         binding.configWarning.isEnabled = !captureQueue.busy && !captureMutationInFlight && !noteActive
         if (!active) binding.thumbs.removeAllViews()
+        updateThumbnailStripVisibility()
+        updateCaptureOrientationUi()
 
         val signedIn = Auth.signedIn(this)
         val err = Prefs.lastUploadError(this) ?: Prefs.lastProcError(this)
@@ -1798,10 +2193,14 @@ class MainActivity : AppCompatActivity() {
     private fun refreshLastCapturedBook() {
         lastBookPreviewJob?.cancel()
         lastBookPreviewJob = lifecycleScope.launch {
-            val entry = withContext(Dispatchers.IO) {
-                selectLastSubmittedEntry(Entries.recent(this@MainActivity))
+            val (entry, thumbnail) = withContext(Dispatchers.IO) {
+                val latest = selectLastSubmittedEntry(Entries.recent(this@MainActivity))
+                val bitmap = latest?.thumbnailPhoto()?.let { photo ->
+                    decodeSampledOriented(photo, maxWidth = 360, maxHeight = 480)
+                }
+                latest to bitmap
             }
-            renderLastCapturedBook(entry)
+            renderLastCapturedBook(entry, thumbnail)
         }
     }
 
@@ -1813,8 +2212,10 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun renderLastCapturedBook(entry: Entries.Entry?) {
+    private fun renderLastCapturedBook(entry: Entries.Entry?, thumbnail: android.graphics.Bitmap?) {
         if (entry == null) {
+            binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
+            binding.lastBookThumb.contentDescription = getString(R.string.capture_last_book_empty)
             binding.lastBookTitle.setText(R.string.capture_last_book_empty)
             binding.lastBookAuthor.setText(R.string.capture_last_book_author_empty)
             binding.lastBookYear.setText(R.string.capture_last_book_year_empty)
@@ -1837,6 +2238,15 @@ class MainActivity : AppCompatActivity() {
             entry.meta == null -> Entries.titleLabel(this, entry)
             else -> getString(R.string.capture_last_book_title_missing)
         }
+        if (thumbnail == null) {
+            binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
+        } else {
+            binding.lastBookThumb.setImageBitmap(thumbnail)
+        }
+        binding.lastBookThumb.contentDescription = getString(
+            R.string.capture_last_book_thumbnail_description,
+            title,
+        )
         binding.lastBookTitle.text = title
         binding.lastBookAuthor.text = if (entry.author.isNotEmpty())
             getString(R.string.capture_last_book_author, entry.author)
@@ -1911,5 +2321,6 @@ class MainActivity : AppCompatActivity() {
             if (extraFieldsDialog === dialog) extraFieldsDialog = null
         }
         dialog.show()
+        RemoteUiCatalog.apply(dialog)
     }
 }

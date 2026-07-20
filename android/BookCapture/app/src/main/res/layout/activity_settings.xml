@@ -103,13 +103,6 @@
                 android:minHeight="48dp"
                 android:text="@string/set_compact_scan_list"
                 android:textColor="@color/whl_ink" />
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textColor="@color/whl_ink_dim"
-                android:text="@string/set_compact_scan_list_note" />
             <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/showOcrRegions"
                 android:layout_width="match_parent"
@@ -118,13 +111,6 @@
                 android:minHeight="48dp"
                 android:text="@string/set_show_ocr_regions"
                 android:textColor="@color/whl_ink" />
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:text="@string/set_show_ocr_regions_note"
-                android:textColor="@color/whl_ink_dim"
-                android:textSize="11sp" />
             <LinearLayout
                 android:id="@+id/ocrRegionOptions"
                 android:layout_width="match_parent"
@@ -171,14 +157,6 @@
                 android:textColor="@color/whl_ink"
                 android:textSize="16sp"
                 android:textStyle="bold" />
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:fontFamily="@font/roboto_slab"
-                android:text="@string/set_post_processing_note"
-                android:textColor="@color/whl_ink_dim"
-                android:textSize="12sp" />
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -232,15 +210,6 @@
                     android:textAllCaps="false"
                     android:textColor="@color/whl_ink" />
             </RadioGroup>
-            <TextView
-                android:id="@+id/postProcessingPresetSummary"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="4dp"
-                android:fontFamily="@font/roboto_slab"
-                android:accessibilityLiveRegion="polite"
-                android:textColor="@color/whl_ink_dim"
-                android:textSize="12sp" />
             <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/postProcessingDewarp"
                 android:layout_width="match_parent"
@@ -297,6 +266,13 @@
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
                 <RadioButton
+                    android:id="@+id/cameraProfileLow"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="@string/set_camera_low"
+                    android:textColor="@color/whl_ink" />
+                <RadioButton
                     android:id="@+id/cameraProfileFast"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -328,13 +304,6 @@
                 android:textSize="13sp"
                 android:textColor="@color/whl_ink"
                 android:text="@string/set_sharpen" />
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textColor="@color/whl_ink_dim"
-                android:text="@string/set_sharpen_note" />
             <Button
                 android:id="@+id/resetCamera"
                 style="@style/WhlButton"
@@ -345,19 +314,6 @@
                 android:paddingEnd="14dp"
                 android:text="@string/set_camera_reset"
                 android:textSize="12sp" />
-            <TextView style="@style/WhlLabel"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:text="@string/set_camera_diagnostics" />
-            <TextView
-                android:id="@+id/cameraDiagnostics"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="3dp"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textColor="@color/whl_ink_dim" />
         </LinearLayout>
 
         <!-- voice is optional and downloads its model only after opt-in -->
@@ -374,13 +330,6 @@
                 android:minHeight="48dp"
                 android:text="@string/set_voice_enable"
                 android:textColor="@color/whl_ink" />
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textColor="@color/whl_ink_dim"
-                android:text="@string/set_voice_note" />
         </LinearLayout>
 
         <!-- transport / LAN pairing -->
@@ -421,8 +370,7 @@
                 android:layout_width="match_parent" android:layout_height="wrap_content"
                 android:layout_marginTop="3dp"
                 android:inputType="textNoSuggestions"
-                android:importantForAutofill="no"
-                android:hint="@string/lan_host_hint" />
+                android:importantForAutofill="no" />
             <TextView style="@style/WhlLabel"
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
@@ -440,12 +388,6 @@
                 android:textSize="12sp"
                 android:paddingStart="14dp" android:paddingEnd="14dp"
                 android:text="@string/lan_test" />
-            <TextView
-                android:layout_width="match_parent" android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:fontFamily="monospace" android:textSize="11sp"
-                android:textColor="@color/whl_ink_dim"
-                android:text="@string/lan_note" />
         </LinearLayout>
 
         <!-- API keys, synced to the account -->
@@ -455,15 +397,6 @@
             <TextView style="@style/WhlLabel"
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:text="@string/set_api_keys" />
-            <TextView
-                android:id="@+id/apiKeysNote"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textColor="@color/whl_ink_dim"
-                android:text="@string/set_api_keys_note" />
             <TextView style="@style/WhlLabel"
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
@@ -505,8 +438,7 @@
                 android:importantForAutofill="no"
                 android:inputType="textCapSentences|textMultiLine"
                 android:maxLength="4000"
-                android:minLines="3"
-                android:hint="@string/set_extraction_instructions_hint" />
+                android:minLines="3" />
         </LinearLayout>
 
         <LinearLayout

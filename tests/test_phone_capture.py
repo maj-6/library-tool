@@ -1,6 +1,77 @@
 from __future__ import annotations
 
+import hashlib
 import json
+
+
+def _android_photo_contract(capture_id: str, raw: bytes) -> dict:
+    return {
+        "schema": "org.whl.bookcapture.photo-assets",
+        "version": 1,
+        "capture_id": capture_id,
+        "legacy_fallback": False,
+        "assets": [{
+            "asset_id": "asset-1",
+            "capture_order": 1,
+            "capture_file": "photo_1.jpg",
+            "original": {
+                "reference": "original_asset-1.jpg",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "revision": 1,
+                "width": 1,
+                "height": 1,
+                "orientation": 0,
+            },
+            "display": {
+                "reference": "photo_1.jpg",
+                "sha256": hashlib.sha256(b"display-" + raw).hexdigest(),
+                "revision": 1,
+                "width": 1,
+                "height": 1,
+                "orientation": 0,
+                "recipe": "android-standardize",
+                "recipe_version": "1",
+            },
+            "lifecycle": {"state": "completed"},
+            "role": {"suggested": "title_page", "confidence": 0.7},
+            "geometry": [],
+        }],
+        "selections": {
+            "primary_title": {"asset_id": "asset-1"},
+            "thumbnail": {"asset_id": None},
+        },
+        "transport": {"representation": "original", "version": 1},
+    }
+
+
+def _android_capture_notes(capture_id: str) -> dict:
+    return {
+        "schema": "org.whl.bookcapture.capture-notes",
+        "version": 1,
+        "capture_id": capture_id,
+        "notes": [{
+            "id": "note-1",
+            "status": "completed",
+            "transcript": (
+                "Auction copy. Price: $12. Pages: 240. "
+                "Condition: sound. Illustrations: twelve plates. Remark: signed"
+            ),
+            "unclassified_text": "Auction copy.",
+            "rows": [
+                {"field": "price", "label": "Price", "value": "$12"},
+                {"field": "pages", "label": "Pages", "value": "240"},
+                {"field": "condition", "label": "Condition", "value": "sound"},
+                {"field": "illustrations", "label": "Illustrations",
+                 "value": "twelve plates"},
+                {"field": "remark", "label": "Remark", "value": "signed"},
+            ],
+            "started_at_ms": 1000,
+            "updated_at_ms": 2000,
+            "completed_at_ms": 2000,
+            "provider": "mistral",
+            "model": "voxtral-mini-transcribe-realtime-2602",
+        }],
+    }
 
 
 def test_phone_result_preserves_unknown_metadata(monkeypatch):
@@ -11,6 +82,7 @@ def test_phone_result_preserves_unknown_metadata(monkeypatch):
         "ocr": {"title.jpg": "OCR text"},
         "meta": {
             "title": "A Book",
+            "spine_title": "A Short Spine Title",
             "extra": {"series": "Library studies"},
             "binding": {"material": "cloth", "colors": ["red", "gold"]},
             "former_owner": "Jane Doe",
@@ -22,6 +94,7 @@ def test_phone_result_preserves_unknown_metadata(monkeypatch):
     assert result["fields"]["title"] == "A Book"
     assert result["extra"] == {
         "series": "Library studies",
+        "spine_title": "A Short Spine Title",
         "binding": {"material": "cloth", "colors": ["red", "gold"]},
         "former_owner": "Jane Doe",
     }
@@ -89,6 +162,192 @@ def test_phone_collection_and_origin_reach_the_entry(monkeypatch, data_root):
     for key in ("scan_collection_id", "scan_collection", "scan_from"):
         assert key not in lib.MANUAL_ENTRY_FIELDS
         assert key not in {name for name in entry if name != "extra"}
+
+
+def test_photo_asset_contract_is_transport_metadata_not_catalog_metadata(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
+    capture_id = "2ec86526-1133-4e74-a2c7-497886201d76"
+    contract = _android_photo_contract(capture_id, b"image")
+    cap = {
+        "id": capture_id,
+        "ocr": {},
+        "meta": {server.PHONE_PHOTO_ASSETS_KEY: contract},
+    }
+
+    assert server._phone_result(cap, [b"image"], []) is None
+    cap["meta"]["title"] = "A Book"
+    result = server._phone_result(cap, [b"image"], [])
+    assert result["fields"]["title"] == "A Book"
+    assert server.PHONE_PHOTO_ASSETS_KEY not in result["extra"]
+
+
+def test_capture_notes_are_internal_and_cannot_select_phone_ocr(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
+    capture_id = "ed3cb24e-490a-49b1-a066-4e9768bf3f00"
+    notes = _android_capture_notes(capture_id)
+    cap = {
+        "id": capture_id,
+        "ocr": {},
+        "meta": {server.PHONE_CAPTURE_NOTES_KEY: notes},
+    }
+
+    assert server._phone_result(cap, [b"image"], []) is None
+
+    cap["meta"]["title"] = "A Book"
+    result = server._phone_result(cap, [b"image"], [])
+    assert result["fields"]["title"] == "A Book"
+    assert server.PHONE_CAPTURE_NOTES_KEY not in result["extra"]
+    assert "price" not in result["extra"]
+
+
+def test_notes_merge_only_after_desktop_ocr_selection_and_keep_raw_sidecar(
+        monkeypatch, data_root):
+    import libcommon as lib
+    import server
+
+    called = []
+
+    def desktop_ocr(raws, key):
+        called.append((raws, key))
+        return {
+            "photos": list(raws),
+            "ocr_text": "desktop OCR",
+            "fields": {"title": "Desktop Read This"},
+            "extra": {"condition": "OCR guess", "binding": "cloth"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(server.capture, "process_capture", desktop_ocr)
+    monkeypatch.setattr(server, "_entry_checks", lambda entry: {})
+    capture_id = "221a5882-b861-424f-b3ef-029ea1eb62e3"
+    notes = _android_capture_notes(capture_id)
+    cap = {
+        "id": capture_id,
+        "meta": {server.PHONE_CAPTURE_NOTES_KEY: notes},
+    }
+
+    entry_id, errors = server.ingest_capture(cap, [b"image"], "desktop-key")
+    entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
+
+    assert errors == []
+    assert called == [([b"image"], "desktop-key")]
+    assert entry["title"] == "Desktop Read This"
+    assert entry["extra"] == {
+        "binding": "cloth",
+        "price": "$12",
+        "pages": "240",
+        "condition": "sound",
+        "illustrations": "twelve plates",
+        "remark": "signed",
+    }
+    assert server.PHONE_CAPTURE_NOTES_KEY not in entry["extra"]
+    stored = json.loads(
+        (server.CAPTURES_DIR / capture_id / "capture_notes.json").read_text("utf-8")
+    )
+    assert stored == notes
+    assert stored["notes"][0]["provider"] == "mistral"
+    assert stored["notes"][0]["transcript"].startswith("Auction copy.")
+
+
+def test_ingest_preserves_versioned_photo_contract_and_desktop_lineage(
+        monkeypatch, data_root):
+    import server
+
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: b"corrected-" + raw)
+    monkeypatch.setattr(server, "_entry_checks", lambda entry: {})
+    raw = b"raw-image"
+    capture_id = "aa7f0ec0-fb63-4b8d-850e-d88f7054c113"
+    contract = _android_photo_contract(capture_id, raw)
+    cap = {
+        "id": capture_id,
+        "photo_assets": contract,
+        "meta": {"title": "A Book"},
+    }
+
+    server.ingest_capture(cap, [raw], "", ["photo_1.jpg"])
+    sidecar = json.loads((server.CAPTURES_DIR / cap["id"] /
+                          "photo_assets.json").read_text("utf-8"))
+
+    assert sidecar["assets"] == contract["assets"]
+    imported = sidecar["desktop_import"]["assets"][0]
+    assert imported["raw_ref"] == "orig_1.jpg"
+    assert imported["display_ref"] == "photo_1.jpg"
+    assert imported["asset_id"] == "asset-1"
+    assert imported["transport_representation"] == "original"
+    assert imported["lifecycle"] == "completed"
+    assert imported["source_checksum"] != imported["derivative_checksum"]
+
+
+def test_ingest_rejects_a_valid_contract_with_the_wrong_original_bytes(
+        monkeypatch, data_root):
+    import server
+
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
+    capture_id = "8e056b0c-8d94-4ad6-91cf-0b40f15dfdb2"
+    cap = {
+        "id": capture_id,
+        "photo_assets": _android_photo_contract(capture_id, b"expected-original"),
+        "meta": {"title": "A Book"},
+    }
+
+    try:
+        server.ingest_capture(cap, [b"different-original"], "", ["photo_1.jpg"])
+    except ValueError as exc:
+        assert "checksum mismatch" in str(exc)
+    else:
+        raise AssertionError("mismatched original must not produce an import receipt")
+    assert not (server.CAPTURES_DIR / capture_id).exists()
+
+
+def test_ingest_rejects_display_bytes_advertised_as_original(
+        monkeypatch, data_root):
+    import server
+
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
+    capture_id = "1df82465-61c4-43da-b549-1dc1cb2fe623"
+    raw = b"expected-original"
+    cap = {
+        "id": capture_id,
+        "photo_assets": _android_photo_contract(capture_id, raw),
+        "meta": {"title": "A Book"},
+    }
+
+    try:
+        server.ingest_capture(cap, [b"display-" + raw], "", ["photo_1.jpg"])
+    except ValueError as exc:
+        assert "display derivative" in str(exc)
+    else:
+        raise AssertionError("display bytes must not satisfy an original transport contract")
+
+
+def test_ingest_fails_closed_for_an_advertised_malformed_contract(
+        monkeypatch, data_root):
+    import server
+
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
+    capture_id = "a56435da-e719-4187-89a7-40fd2ac02af3"
+    cap = {
+        "id": capture_id,
+        "photo_assets": {
+            "schema": "org.whl.bookcapture.photo-assets",
+            "version": 1,
+            "capture_id": capture_id,
+            "assets": [{"asset_id": "asset-1"}],
+        },
+        "meta": {"title": "A Book"},
+    }
+
+    try:
+        server.ingest_capture(cap, [b"bytes"], "", ["photo_1.jpg"])
+    except ValueError as exc:
+        assert "invalid photo asset contract" in str(exc)
+    else:
+        raise AssertionError("malformed advertised contract must not fall back to legacy")
+    assert not (server.CAPTURES_DIR / capture_id).exists()
 
 
 def test_malformed_wire_provenance_is_ignored_as_non_string_metadata(
@@ -317,3 +576,26 @@ def test_unknown_phone_metadata_does_not_create_table_fields(monkeypatch, data_r
     assert entry["extra"] == {"binding": "full calf"}
     assert "binding" not in lib.MANUAL_ENTRY_FIELDS
     assert "binding" not in {key for key in entry if key != "extra"}
+
+
+def test_spine_title_is_retained_as_distinct_manual_metadata(monkeypatch, data_root):
+    import libcommon as lib
+    import server
+
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
+    monkeypatch.setattr(server, "_entry_checks", lambda entry: {})
+    cap = {
+        "id": "4f262bb1-49c1-40b3-a871-827503f15d41",
+        "meta": {
+            "title": "The Complete Herbal",
+            "spine_title": "Culpeper's Herbal",
+        },
+    }
+
+    entry_id, errors = server.ingest_capture(cap, [b"image"], "")
+    entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
+
+    assert errors == []
+    assert entry["title"] == "The Complete Herbal"
+    assert entry["extra"]["spine_title"] == "Culpeper's Herbal"
+    assert "spine_title" not in lib.MANUAL_ENTRY_FIELDS

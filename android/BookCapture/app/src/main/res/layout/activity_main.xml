@@ -49,15 +49,6 @@
                 android:layout_width="0dp"
                 android:layout_height="1dp"
                 android:layout_weight="1" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnSettings"
-                style="@style/WhlToolbarAction"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:contentDescription="@string/open_settings"
-                android:textSize="16sp"
-                android:text="@string/gear" />
         </LinearLayout>
 
         <TextView
@@ -76,10 +67,21 @@
         android:id="@+id/preview"
         android:layout_width="0dp"
         android:layout_height="0dp"
+        app:scaleType="fillCenter"
         app:layout_constraintTop_toBottomOf="@id/topbar"
         app:layout_constraintBottom_toTopOf="@id/thumbs_scroll"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
+
+    <org.whl.bookcapture.PageMarginOverlayView
+        android:id="@+id/pageMarginOverlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:importantForAccessibility="no"
+        app:layout_constraintTop_toTopOf="@id/preview"
+        app:layout_constraintBottom_toBottomOf="@id/preview"
+        app:layout_constraintStart_toStartOf="@id/preview"
+        app:layout_constraintEnd_toEndOf="@id/preview" />
 
     <!-- shutter flash: a white overlay pulsed on capture, invisible at rest -->
     <View
@@ -164,6 +166,36 @@
         app:srcCompat="@drawable/ic_note"
         app:tint="@color/whl_icon_button_tint" />
 
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/btnCameraSettings"
+        style="@style/WhlIconButton"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="8dp"
+        android:contentDescription="@string/camera_settings_open"
+        android:elevation="7dp"
+        app:layout_constraintEnd_toEndOf="@id/preview"
+        app:layout_constraintTop_toBottomOf="@id/btnNote"
+        app:srcCompat="@drawable/ic_camera_settings"
+        app:tint="@color/whl_icon_button_tint" />
+
+    <!-- The plate never rotates or changes sides. Switching page orientation
+         replaces only the glyph and CameraX target rotation. -->
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/btnCaptureOrientation"
+        style="@style/WhlIconButton"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="8dp"
+        android:contentDescription="@string/camera_orientation_portrait"
+        android:elevation="7dp"
+        app:layout_constraintEnd_toEndOf="@id/preview"
+        app:layout_constraintTop_toBottomOf="@id/btnCameraSettings"
+        app:srcCompat="@drawable/ic_capture_portrait"
+        app:tint="@color/whl_icon_button_tint" />
+
     <TextView
         android:id="@+id/configWarning"
         android:layout_width="0dp"
@@ -184,6 +216,7 @@
         android:layout_height="88dp"
         android:background="@color/whl_canvas_line"
         android:padding="4dp"
+        android:visibility="gone"
         app:layout_constraintBottom_toTopOf="@id/lastBookPreview"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -213,6 +246,18 @@
         app:layout_constraintBottom_toTopOf="@id/buttons"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
+
+        <androidx.appcompat.widget.AppCompatImageView
+            android:id="@+id/lastBookThumb"
+            android:layout_width="66dp"
+            android:layout_height="86dp"
+            android:layout_marginEnd="10dp"
+            android:background="@color/whl_face_sh"
+            android:contentDescription="@string/capture_last_book_empty"
+            android:foreground="@drawable/whl_thumbnail_frame"
+            android:padding="1dp"
+            android:scaleType="centerCrop"
+            app:srcCompat="@drawable/ic_launcher_safe_fg" />
 
         <LinearLayout
             android:id="@+id/lastBookPrimary"

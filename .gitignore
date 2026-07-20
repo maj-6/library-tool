@@ -79,6 +79,10 @@ android/BookCapture/local.properties
 android/BookCapture/.idea/caches/
 android/BookCapture/.idea/deploymentTargetSelector.xml
 
+# local emulator screenshots and release-verification scratch data
+.qa/
+android/BookCapture/.qa/
+
 # large binaries kept local, excluded from the published repo (the corpus
 # images are covered by their own block above since they left git entirely)
 copyright_renewals.csv

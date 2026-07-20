@@ -111,6 +111,14 @@ internal data class PhotoDisplayDerivative(
     val orientationDegrees: Int = 0,
     val recipe: String = "camera-original",
     val recipeVersion: String = "1",
+    /**
+     * Row-major 3x3 projective transform from the immediately preceding
+     * display revision's normalized coordinates into this revision's
+     * normalized coordinates. A correction response can therefore move the
+     * persisted OCR polygons without re-running OCR. Null means that the
+     * provider did not prove how the pixels moved, so geometry must not be
+     * carried forward speculatively.
+     */
     val sourceToDisplayHomography: List<Double>? = null,
 )
 
@@ -271,6 +279,7 @@ internal data class EntryPhotoDescriptor(
     val lifecycle: PhotoLifecycleState,
     val displayRevision: Int,
     val geometry: List<EntryPhotoGeometryRegion>,
+    val postProcessingPending: Boolean = false,
 ) {
     val captureOrder: Int get() = order + 1
     val roleLabel: String get() = role.wireValue
@@ -647,7 +656,16 @@ internal object PhotoAssetStore {
         val lifecycle = if (changed || asset.lifecycle.state != PhotoAssetLifecycle.COMPLETED) {
             PhotoLifecycleState(PhotoAssetLifecycle.COMPLETED, updatedAt = System.currentTimeMillis())
         } else asset.lifecycle
-        val next = asset.copy(display = display, lifecycle = lifecycle)
+        val migratedGeometry = if (changed) {
+            asset.geometries.mapNotNull { geometry ->
+                transformGeometryForDisplay(geometry, asset.original, asset.display, display)
+            }
+        } else emptyList()
+        val next = asset.copy(
+            display = display,
+            lifecycle = lifecycle,
+            geometries = (asset.geometries + migratedGeometry).distinctBy(::geometryKey),
+        )
         if (next == asset) return@synchronized true
         persistCurrent(
             dir,
@@ -737,44 +755,79 @@ internal object PhotoAssetStore {
             if (draft == null || draft.regions.isEmpty()) return@synchronized false
             val current = readCurrent(dir) ?: return@synchronized false
             val asset = current.assets.firstOrNull { it.captureFile == photo.name } ?: return@synchronized false
-            val geometry = PhotoOcrGeometry(
-                assetId = asset.assetId,
-                sourceSha256 = asset.original.sha256,
-                sourceRevision = asset.original.revision,
-                displayRevision = asset.display.revision,
-                coordinateSpace = draft.coordinateSpace,
-                width = draft.width,
-                height = draft.height,
-                orientationDegrees = asset.display.orientationDegrees,
-                engine = draft.engine,
-                model = draft.model,
-                engineVersion = draft.engineVersion,
-                regions = draft.regions.asSequence()
-                    .filter(::validRegion)
-                    .take(MAX_OCR_REGIONS_PER_ASSET)
-                    .map { region ->
-                        region.copy(
-                            id = region.id.take(120),
-                            regionType = region.regionType.take(80),
-                            polygon = region.polygon.take(MAX_OCR_POLYGON_POINTS),
-                            text = region.text.take(MAX_OCR_REGION_TEXT_CHARS),
-                        )
-                    }
-                    .toList(),
-            )
-            if (geometry.regions.isEmpty()) return@synchronized false
-            val keep = asset.geometries.filterNot {
-                it.displayRevision == geometry.displayRevision &&
-                    it.engine == geometry.engine && it.model == geometry.model &&
-                    it.coordinateSpace == geometry.coordinateSpace
-            }
-            if (asset.geometries.contains(geometry)) return@synchronized true
-            val next = asset.copy(geometries = keep + geometry)
-            persistCurrent(
-                dir,
-                current.copy(assets = current.assets.filterNot { it.assetId == asset.assetId } + next),
-            )
+            mergeGeometryLocked(dir, current, asset, draft)
         }
+
+    /**
+     * Apply OCR produced from a verified nonlinear cloud derivative. The
+     * target is checked against the current contract both before the network
+     * call (by the worker) and again here at commit time. This cannot replace
+     * the capture transport or immutable original because it writes geometry
+     * only.
+     */
+    fun mergeCloudDisplayReocrGeometry(
+        dir: File,
+        target: CloudDisplayReocrTarget,
+        draft: OcrGeometryDraft?,
+    ): Boolean = synchronized(monitor) {
+        if (draft == null || draft.regions.isEmpty()) return@synchronized false
+        val current = readCurrent(dir) ?: return@synchronized false
+        val asset = current.assets.firstOrNull { it.assetId == target.assetId }
+            ?: return@synchronized false
+        if (!cloudDisplayReocrTargetMatches(current, asset, target) ||
+            asset.display.width > 0 && draft.width != asset.display.width ||
+            asset.display.height > 0 && draft.height != asset.display.height) {
+            return@synchronized false
+        }
+        val saved = mergeGeometryLocked(dir, current, asset, draft)
+        if (saved) cloudDisplayReocrMarker(dir, target).delete()
+        saved
+    }
+
+    private fun mergeGeometryLocked(
+        dir: File,
+        current: CapturePhotoAssets,
+        asset: CapturePhotoAsset,
+        draft: OcrGeometryDraft,
+    ): Boolean {
+        val geometry = PhotoOcrGeometry(
+            assetId = asset.assetId,
+            sourceSha256 = asset.original.sha256,
+            sourceRevision = asset.original.revision,
+            displayRevision = asset.display.revision,
+            coordinateSpace = draft.coordinateSpace,
+            width = draft.width,
+            height = draft.height,
+            orientationDegrees = asset.display.orientationDegrees,
+            engine = draft.engine,
+            model = draft.model,
+            engineVersion = draft.engineVersion,
+            regions = draft.regions.asSequence()
+                .filter(::validRegion)
+                .take(MAX_OCR_REGIONS_PER_ASSET)
+                .map { region ->
+                    region.copy(
+                        id = region.id.take(120),
+                        regionType = region.regionType.take(80),
+                        polygon = region.polygon.take(MAX_OCR_POLYGON_POINTS),
+                        text = region.text.take(MAX_OCR_REGION_TEXT_CHARS),
+                    )
+                }
+                .toList(),
+        )
+        if (geometry.regions.isEmpty()) return false
+        val keep = asset.geometries.filterNot {
+            it.displayRevision == geometry.displayRevision &&
+                it.engine == geometry.engine && it.model == geometry.model &&
+                it.coordinateSpace == geometry.coordinateSpace
+        }
+        if (asset.geometries.contains(geometry)) return true
+        val next = asset.copy(geometries = keep + geometry)
+        return persistCurrent(
+            dir,
+            current.copy(assets = current.assets.filterNot { it.assetId == asset.assetId } + next),
+        )
+    }
 
     fun applyBibliographicSuggestions(dir: File, metadata: JSONObject): Boolean =
         synchronized(monitor) {
@@ -904,6 +957,275 @@ internal object PhotoAssetStore {
         persistCurrent(dir, merged)
     }
 
+    /** Mirror a live or terminal server job state without ever treating a
+     * completed row as installed. Completion is written only by
+     * [installCloudDisplayDerivative] after byte verification. */
+    fun recordCloudJobState(dir: File, job: CloudPhotoProcessingJob): Boolean =
+        synchronized(monitor) {
+            val state = cloudLifecycleForRemoteState(job.state) ?: return@synchronized false
+            val error = when (state) {
+                PhotoAssetLifecycle.FAILED -> job.lastError.ifEmpty {
+                    "Cloud image processing failed"
+                }
+                PhotoAssetLifecycle.CANCELLED -> job.lastError.ifEmpty {
+                    "Cloud image processing cancelled"
+                }
+                PhotoAssetLifecycle.RETRYING -> job.lastError
+                else -> ""
+            }
+            recordCloudLifecycle(dir, job, state, error)
+        }
+
+    /** A completed server job whose object fetch failed remains retryable. */
+    fun recordCloudInstallRetry(
+        dir: File,
+        job: CloudPhotoProcessingJob,
+        error: String = "Cloud display download will retry",
+    ): Boolean = synchronized(monitor) {
+        recordCloudLifecycle(dir, job, PhotoAssetLifecycle.RETRYING, error)
+    }
+
+    /** Persist a permanent schema/integrity failure so it cannot look pending
+     * forever or silently fall back to an unverified derivative. */
+    fun recordCloudResultFailure(
+        dir: File,
+        job: CloudPhotoProcessingJob,
+        error: String,
+    ): Boolean = synchronized(monitor) {
+        recordCloudLifecycle(dir, job, PhotoAssetLifecycle.FAILED, error)
+    }
+
+    /** Avoid redownloading an immutable artifact on every later import poll,
+     * while still repairing a missing or locally damaged display file. */
+    fun hasVerifiedCloudDisplay(
+        dir: File,
+        plan: CloudDisplayInstallPlan,
+    ): Boolean = synchronized(monitor) {
+        val current = readCurrent(dir) ?: return@synchronized false
+        val asset = current.assets.firstOrNull { it.assetId == plan.job.assetId }
+            ?: return@synchronized false
+        if (!cloudJobMatchesAsset(current.captureId, asset, plan.job) ||
+            asset.lifecycle.state != PhotoAssetLifecycle.COMPLETED ||
+            asset.lifecycle.jobId != plan.job.id ||
+            asset.display.revision != plan.targetRevision ||
+            asset.display.sha256 != plan.artifact.sha256) return@synchronized false
+        val file = File(dir, asset.display.reference).takeIf { it.isFile }
+            ?: return@synchronized false
+        verifyCloudDisplayDownload(
+            file,
+            plan.artifact,
+            plan.artifact.mime,
+            file.length(),
+        ) == null
+    }
+
+    /** Pending nonlinear derivatives only. A marker is created in the same
+     * installation transaction as the new display contract, so scheduling can
+     * be recovered by a later cloud poll without guessing from stale pixels. */
+    fun pendingCloudDisplayReocrTargets(dir: File): List<CloudDisplayReocrTarget> =
+        synchronized(monitor) {
+            val current = readCurrent(dir) ?: return@synchronized emptyList()
+            current.orderedAssets().mapNotNull { asset ->
+                cloudDisplayReocrTarget(current, asset)?.takeIf { target ->
+                    val marker = cloudDisplayReocrMarker(dir, target)
+                    if (hasCurrentDisplayGeometry(asset)) {
+                        marker.delete()
+                        false
+                    } else marker.isFile
+                }
+            }
+        }
+
+    /** Resolve and checksum the exact corrected pixels immediately before OCR. */
+    fun cloudDisplayReocrFile(
+        dir: File,
+        target: CloudDisplayReocrTarget,
+    ): File? = synchronized(monitor) {
+        val current = readCurrent(dir) ?: return@synchronized null
+        val asset = current.assets.firstOrNull { it.assetId == target.assetId }
+            ?: return@synchronized null
+        if (!cloudDisplayReocrTargetMatches(current, asset, target) ||
+            hasCurrentDisplayGeometry(asset) ||
+            !cloudDisplayReocrMarker(dir, target).isFile) return@synchronized null
+        val file = File(dir, asset.display.reference).takeIf { it.isFile }
+            ?: return@synchronized null
+        file.takeIf { runCatching { sha256(it) }.getOrDefault("") == target.displaySha256 }
+    }
+
+    private fun recordCloudLifecycle(
+        dir: File,
+        job: CloudPhotoProcessingJob,
+        state: PhotoAssetLifecycle,
+        error: String,
+    ): Boolean {
+        val current = readCurrent(dir) ?: return false
+        val asset = current.assets.firstOrNull { it.assetId == job.assetId } ?: return false
+        if (!cloudJobMatchesAsset(current.captureId, asset, job)) return false
+        val terminal = setOf(
+            PhotoAssetLifecycle.COMPLETED,
+            PhotoAssetLifecycle.FAILED,
+            PhotoAssetLifecycle.CANCELLED,
+        )
+        // A stale live projection must not resurrect a terminal result for the
+        // same immutable job.
+        if (asset.lifecycle.jobId == job.id && asset.lifecycle.state in terminal &&
+            state !in terminal) return true
+        val cleanError = cleanCloudError(error)
+        if (asset.lifecycle.jobId == job.id && asset.lifecycle.state == state &&
+            asset.lifecycle.error == cleanError) return true
+        val next = asset.copy(lifecycle = PhotoLifecycleState(
+            state = state,
+            jobId = job.id,
+            error = cleanError,
+            updatedAt = System.currentTimeMillis(),
+        ))
+        return persistCurrent(
+            dir,
+            current.copy(assets = current.assets.filterNot { it.assetId == asset.assetId } + next),
+        )
+    }
+
+    /**
+     * Atomically promote a verified private derivative into a new local
+     * display revision. The destination is a separate cloud_* file; neither
+     * the immutable original nor the established photo_N transport is ever
+     * overwritten. A nonlinear result receives no carried-forward OCR boxes.
+     */
+    fun installCloudDisplayDerivative(
+        dir: File,
+        proposed: CloudDisplayInstallPlan,
+        downloaded: File,
+        receipt: PrivateObjectDownload,
+    ): Boolean = synchronized(monitor) {
+        if (!dir.isDirectory || downloaded.parentFile != dir) return@synchronized false
+        val current = readCurrent(dir) ?: return@synchronized false
+        val checked = when (val decision = validateCloudPhotoResult(
+            current,
+            proposed.job,
+            proposed.job.ownerId,
+        )) {
+            is CloudResultDecision.Ready -> decision.plan
+            else -> return@synchronized false
+        }
+        if (checked.artifact != proposed.artifact ||
+            checked.targetRevision != proposed.targetRevision ||
+            checked.baseToOutputHomography != proposed.baseToOutputHomography ||
+            checked.reocrRequired != proposed.reocrRequired) {
+            return@synchronized false
+        }
+        if (verifyCloudDisplayDownload(
+                downloaded,
+                checked.artifact,
+                receipt.contentType,
+                receipt.bytes,
+            ) != null) return@synchronized false
+
+        val asset = current.assets.firstOrNull { it.assetId == checked.job.assetId }
+            ?: return@synchronized false
+        val atMergeBase = asset.display.revision == checked.mergeBaseRevision &&
+            asset.display.sha256 == checked.mergeBaseSha256
+        val repairingTarget = asset.display.revision == checked.targetRevision &&
+            asset.display.sha256 == checked.artifact.sha256
+        if (!atMergeBase && !repairingTarget) return@synchronized false
+
+        val destination = File(dir, cloudDisplayFileName(checked))
+        if (destination.name == asset.original.reference ||
+            destination.name == asset.captureFile) return@synchronized false
+        val destinationExisted = destination.isFile
+        val destinationAlreadyValid = destinationExisted &&
+            verifyCloudDisplayDownload(
+                destination,
+                checked.artifact,
+                checked.artifact.mime,
+                destination.length(),
+            ) == null
+        var movedDownload = false
+        if (destinationAlreadyValid) {
+            downloaded.delete()
+        } else {
+            try {
+                try {
+                    Files.move(
+                        downloaded.toPath(),
+                        destination.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                } catch (_: Exception) {
+                    Files.move(
+                        downloaded.toPath(),
+                        destination.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                }
+                movedDownload = true
+            } catch (_: Exception) {
+                return@synchronized false
+            }
+        }
+
+        val display = PhotoDisplayDerivative(
+            reference = destination.name,
+            sha256 = checked.artifact.sha256,
+            revision = checked.targetRevision,
+            width = checked.artifact.width,
+            height = checked.artifact.height,
+            orientationDegrees = 0,
+            recipe = checked.recipe,
+            recipeVersion = checked.recipeVersion,
+            sourceToDisplayHomography = checked.baseToOutputHomography,
+        )
+        val geometries = when {
+            atMergeBase && checked.baseToOutputHomography != null -> {
+                val migrated = asset.geometries.mapNotNull { geometry ->
+                    transformGeometryForDisplay(geometry, asset.original, asset.display, display)
+                }
+                (asset.geometries.filterNot { it.displayRevision == display.revision } + migrated)
+                    .distinctBy(::geometryKey)
+            }
+            checked.baseToOutputHomography == null ->
+                asset.geometries.filterNot { it.displayRevision == display.revision }
+            else -> asset.geometries
+        }
+        val next = asset.copy(
+            display = display,
+            lifecycle = PhotoLifecycleState(
+                state = PhotoAssetLifecycle.COMPLETED,
+                jobId = checked.job.id,
+                error = "",
+                updatedAt = System.currentTimeMillis(),
+            ),
+            geometries = geometries,
+        )
+        val reocrTarget = if (checked.reocrRequired) CloudDisplayReocrTarget(
+            captureId = current.captureId,
+            assetId = asset.assetId,
+            jobId = checked.job.id,
+            displayReference = display.reference,
+            displaySha256 = display.sha256,
+            displayRevision = display.revision,
+        ) else null
+        val reocrMarker = reocrTarget?.let { cloudDisplayReocrMarker(dir, it) }
+        val markerExisted = reocrMarker?.isFile == true
+        if (reocrMarker != null && !markerExisted) {
+            try {
+                Entries.atomicWrite(reocrMarker, "pending\n")
+            } catch (_: Exception) {
+                if (movedDownload && !destinationExisted &&
+                    asset.display.reference != destination.name) destination.delete()
+                return@synchronized false
+            }
+        }
+        val saved = persistCurrent(
+            dir,
+            current.copy(assets = current.assets.filterNot { it.assetId == asset.assetId } + next),
+        )
+        if (!saved && !markerExisted) reocrMarker?.delete()
+        if (!saved && movedDownload && !destinationExisted &&
+            asset.display.reference != destination.name) destination.delete()
+        saved
+    }
+
     fun payload(dir: File, manifest: JSONObject? = null): JSONObject = synchronized(monitor) {
         val current = readCurrent(dir, manifest) ?: legacyContract(dir)
         current.toJson()
@@ -1003,9 +1325,62 @@ internal object PhotoAssetStore {
             lifecycle = asset.lifecycle,
             displayRevision = asset.display.revision,
             geometry = geometry,
+            postProcessingPending = photoPostProcessingPending(asset),
         )
     }
 }
+
+private fun cloudDisplayReocrTarget(
+    contract: CapturePhotoAssets,
+    asset: CapturePhotoAsset,
+): CloudDisplayReocrTarget? {
+    val request = asset.processingRequest ?: return null
+    if (asset.lifecycle.state != PhotoAssetLifecycle.COMPLETED ||
+        asset.lifecycle.jobId.isBlank() ||
+        asset.display.recipe != "whl-cloud-book-cleanup" ||
+        asset.display.sourceToDisplayHomography != null ||
+        asset.display.sha256.isEmpty() ||
+        request.sourceAssetId != asset.assetId ||
+        request.sourceOriginalSha256 != asset.original.sha256 ||
+        request.sourceOriginalRevision != asset.original.revision ||
+        request.sourceDisplayRevision + 1 != asset.display.revision ||
+        request.operations.none { it.outcome == PhotoProcessingOutcome.PAGE_DEWARP }) return null
+    return CloudDisplayReocrTarget(
+        captureId = contract.captureId,
+        assetId = asset.assetId,
+        jobId = asset.lifecycle.jobId,
+        displayReference = asset.display.reference,
+        displaySha256 = asset.display.sha256,
+        displayRevision = asset.display.revision,
+    )
+}
+
+private fun cloudDisplayReocrTargetMatches(
+    contract: CapturePhotoAssets,
+    asset: CapturePhotoAsset,
+    target: CloudDisplayReocrTarget,
+): Boolean = cloudDisplayReocrTarget(contract, asset) == target
+
+private fun cloudDisplayReocrMarker(dir: File, target: CloudDisplayReocrTarget): File =
+    File(
+        dir,
+        ".cloud-reocr-${target.assetId}-r${target.displayRevision}-" +
+            "${target.displaySha256.take(20)}.pending",
+    )
+
+private fun hasCurrentDisplayGeometry(asset: CapturePhotoAsset): Boolean =
+    asset.geometries.any { geometry ->
+        geometry.assetId == asset.assetId &&
+            geometry.coordinateSpace == "display_normalized" &&
+            geometry.displayRevision == asset.display.revision &&
+            geometry.sourceRevision == asset.original.revision &&
+            (asset.original.sha256.isEmpty() ||
+                geometry.sourceSha256 == asset.original.sha256) &&
+            (asset.display.width == 0 || geometry.width == asset.display.width) &&
+            (asset.display.height == 0 || geometry.height == asset.display.height) &&
+            geometry.orientationDegrees == asset.display.orientationDegrees &&
+            geometry.regions.any(::validRegion)
+    }
 
 internal fun rankTitlePageEvidence(
     evidence: List<BibliographicPhotoEvidence>,
@@ -1022,6 +1397,60 @@ internal fun matchedBibliographicFields(ocrText: String, metadata: JSONObject): 
         val needle = normalizeEvidence(metadata.optString(field))
         needle.isNotEmpty() && haystack.contains(needle)
     }
+}
+
+/**
+ * A request is pending only while it still names the pixels currently shown.
+ * Once a newer display derivative lands, the v1 request has reached its only
+ * locally observable terminal condition even though no fake service result is
+ * stored in the request contract.
+ */
+internal fun photoPostProcessingPending(asset: CapturePhotoAsset): Boolean {
+    val request = asset.processingRequest ?: return false
+    return asset.lifecycle.state !in setOf(
+        PhotoAssetLifecycle.FAILED,
+        PhotoAssetLifecycle.CANCELLED,
+    ) && request.operations.isNotEmpty() &&
+        request.sourceAssetId == asset.assetId &&
+        request.sourceOriginalRevision == asset.original.revision &&
+        request.sourceOriginalSha256 == asset.original.sha256 &&
+        request.sourceDisplayRevision == asset.display.revision &&
+        request.sourceDisplaySha256 == asset.display.sha256
+}
+
+/**
+ * Carry OCR polygons onto a proved corrected derivative. The transform is
+ * applied in normalized display space and clipped to the corrected image, so
+ * a crop cannot leave boxes floating outside the visible pixels.
+ */
+internal fun transformGeometryForDisplay(
+    geometry: PhotoOcrGeometry,
+    original: PhotoOriginal,
+    sourceDisplay: PhotoDisplayDerivative,
+    targetDisplay: PhotoDisplayDerivative,
+): PhotoOcrGeometry? {
+    val homography = validHomography(targetDisplay.sourceToDisplayHomography) ?: return null
+    if (targetDisplay.revision <= sourceDisplay.revision ||
+        geometry.coordinateSpace != "display_normalized" ||
+        geometry.sourceRevision != original.revision ||
+        original.sha256.isNotEmpty() && geometry.sourceSha256 != original.sha256 ||
+        geometry.displayRevision != sourceDisplay.revision ||
+        sourceDisplay.width > 0 && geometry.width > 0 && geometry.width != sourceDisplay.width ||
+        sourceDisplay.height > 0 && geometry.height > 0 && geometry.height != sourceDisplay.height ||
+        geometry.orientationDegrees != sourceDisplay.orientationDegrees) return null
+
+    val transformed = geometry.regions.mapNotNull { region ->
+        val polygon = transformAndClipPolygon(region.polygon, homography)
+        region.copy(polygon = polygon).takeIf(::validRegion)
+    }
+    if (transformed.isEmpty()) return null
+    return geometry.copy(
+        displayRevision = targetDisplay.revision,
+        width = targetDisplay.width,
+        height = targetDisplay.height,
+        orientationDegrees = targetDisplay.orientationDegrees,
+        regions = transformed,
+    )
 }
 
 internal fun mergePhotoAssetContracts(
@@ -1065,6 +1494,12 @@ internal fun mergePhotoAssetContracts(
             original,
             display,
         )
+        val migratedGeometry = if (acceptDisplay &&
+            display.revision > existing.display.revision) {
+            existing.geometries.mapNotNull { geometry ->
+                transformGeometryForDisplay(geometry, original, existing.display, display)
+            }
+        } else emptyList()
         val acceptedIncomingGeometry = if (acceptDisplay) candidate.geometries.filter { geometry ->
             geometry.assetId == existing.assetId &&
                 geometry.displayRevision == display.revision &&
@@ -1076,10 +1511,8 @@ internal fun mergePhotoAssetContracts(
                 (display.height == 0 || geometry.height == display.height) &&
                 geometry.regions.any(::validRegion)
         } else emptyList()
-        fun geometryKey(value: PhotoOcrGeometry): String =
-            "${value.displayRevision}|${value.engine}|${value.model}|${value.coordinateSpace}"
         val incomingGeometryKeys = acceptedIncomingGeometry.map(::geometryKey).toSet()
-        val geometry = (existing.geometries.filterNot {
+        val geometry = ((existing.geometries + migratedGeometry).filterNot {
             geometryKey(it) in incomingGeometryKeys
         } + acceptedIncomingGeometry)
             .filter { it.assetId == existing.assetId }
@@ -1643,6 +2076,93 @@ private fun validRegion(region: PhotoOcrRegion): Boolean = region.polygon.size >
 
 private fun validHomography(values: List<Double>?): List<Double>? =
     values?.takeIf { it.size == 9 && it.all(Double::isFinite) }
+
+private fun geometryKey(value: PhotoOcrGeometry): String =
+    "${value.displayRevision}|${value.engine}|${value.model}|${value.coordinateSpace}"
+
+private fun transformAndClipPolygon(
+    polygon: List<NormalizedPoint>,
+    homography: List<Double>,
+): List<NormalizedPoint> {
+    if (polygon.size < 3) return emptyList()
+    var transformed = polygon.map { point ->
+        val denominator = homography[6] * point.x + homography[7] * point.y + homography[8]
+        if (!denominator.isFinite() || kotlin.math.abs(denominator) < 1e-12) {
+            return emptyList()
+        }
+        NormalizedPoint(
+            (homography[0] * point.x + homography[1] * point.y + homography[2]) /
+                denominator,
+            (homography[3] * point.x + homography[4] * point.y + homography[5]) /
+                denominator,
+        )
+    }
+    if (transformed.any { !it.x.isFinite() || !it.y.isFinite() }) return emptyList()
+    transformed = clipPolygon(transformed, { it.x >= 0.0 }) { a, b -> intersectX(a, b, 0.0) }
+    transformed = clipPolygon(transformed, { it.x <= 1.0 }) { a, b -> intersectX(a, b, 1.0) }
+    transformed = clipPolygon(transformed, { it.y >= 0.0 }) { a, b -> intersectY(a, b, 0.0) }
+    transformed = clipPolygon(transformed, { it.y <= 1.0 }) { a, b -> intersectY(a, b, 1.0) }
+    if (transformed.size < 3) return emptyList()
+    val cleaned = transformed.map { point ->
+        NormalizedPoint(point.x.coerceIn(0.0, 1.0), point.y.coerceIn(0.0, 1.0))
+    }.fold(mutableListOf<NormalizedPoint>()) { result, point ->
+        if (result.lastOrNull()?.let { nearlySamePoint(it, point) } != true) result += point
+        result
+    }.also { points ->
+        if (points.size > 1 && nearlySamePoint(points.first(), points.last())) {
+            points.removeAt(points.lastIndex)
+        }
+    }
+    if (cleaned.size < 3 || kotlin.math.abs(polygonArea(cleaned)) < 1e-10) return emptyList()
+    return cleaned
+}
+
+private fun clipPolygon(
+    polygon: List<NormalizedPoint>,
+    inside: (NormalizedPoint) -> Boolean,
+    intersection: (NormalizedPoint, NormalizedPoint) -> NormalizedPoint?,
+): List<NormalizedPoint> {
+    if (polygon.isEmpty()) return emptyList()
+    val output = mutableListOf<NormalizedPoint>()
+    var previous = polygon.last()
+    var previousInside = inside(previous)
+    polygon.forEach { current ->
+        val currentInside = inside(current)
+        when {
+            currentInside && !previousInside -> {
+                intersection(previous, current)?.let(output::add)
+                output += current
+            }
+            currentInside -> output += current
+            previousInside -> intersection(previous, current)?.let(output::add)
+        }
+        previous = current
+        previousInside = currentInside
+    }
+    return output
+}
+
+private fun intersectX(a: NormalizedPoint, b: NormalizedPoint, x: Double): NormalizedPoint? {
+    val delta = b.x - a.x
+    if (kotlin.math.abs(delta) < 1e-12) return null
+    val fraction = (x - a.x) / delta
+    return NormalizedPoint(x, a.y + (b.y - a.y) * fraction)
+}
+
+private fun intersectY(a: NormalizedPoint, b: NormalizedPoint, y: Double): NormalizedPoint? {
+    val delta = b.y - a.y
+    if (kotlin.math.abs(delta) < 1e-12) return null
+    val fraction = (y - a.y) / delta
+    return NormalizedPoint(a.x + (b.x - a.x) * fraction, y)
+}
+
+private fun nearlySamePoint(a: NormalizedPoint, b: NormalizedPoint): Boolean =
+    kotlin.math.abs(a.x - b.x) < 1e-10 && kotlin.math.abs(a.y - b.y) < 1e-10
+
+private fun polygonArea(points: List<NormalizedPoint>): Double = points.indices.sumOf { index ->
+    val next = points[(index + 1) % points.size]
+    points[index].x * next.y - next.x * points[index].y
+} / 2.0
 
 private fun validProcessingOperations(operations: List<PhotoProcessingOperation>): Boolean =
     operations.size <= PhotoProcessingOutcome.values().size &&

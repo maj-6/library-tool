@@ -7,6 +7,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.security.MessageDigest
 
 class CollectionSyncTest {
 
@@ -17,7 +18,16 @@ class CollectionSyncTest {
         from: String = "Storage",
         id: String = "00000000-0000-0000-0000-000000000001",
         mergedInto: String? = null,
-    ) = BookCollection(id, name, from, updatedAt, deleted, mergedInto)
+        parentId: String? = null,
+    ) = BookCollection(
+        id = id,
+        name = name,
+        from = from,
+        updatedAt = updatedAt,
+        deleted = deleted,
+        mergedInto = mergedInto,
+        parentId = parentId,
+    )
 
     private fun shadowOf(row: BookCollection) = mapOf(
         row.id to CollectionSyncShadow(collectionContentHash(row), row.updatedAt),
@@ -339,6 +349,47 @@ class CollectionSyncTest {
     }
 
     @Test
+    fun parentChangesParticipateInSyncAndUseJsonNullToClear() {
+        val baseline = row("Periodicals", "2026-07-19T10:00:00Z")
+        val local = baseline.copy(
+            parentId = "00000000-0000-0000-0000-000000000002",
+            updatedAt = "2026-07-19T11:00:00Z",
+        )
+
+        val merge = mergeCollections(
+            listOf(local),
+            listOf(baseline),
+            shadowOf(baseline),
+            setOf(local.id),
+        )
+
+        assertEquals(local.parentId, merge.writes.single().row.parentId)
+        assertEquals(local.parentId, collectionCloudBody(local).getString("parent_id"))
+        assertTrue(collectionCloudBody(local.copy(parentId = null)).isNull("parent_id"))
+    }
+
+    @Test
+    fun parentlessRowsKeepTheirVersionTwoContentHash() {
+        val unchanged = row("Blue crate", "2026-07-19T10:00:00Z")
+        val canonical = listOf(
+            unchanged.id,
+            unchanged.name,
+            unchanged.from,
+            unchanged.deleted.toString(),
+            unchanged.mergedInto.orEmpty(),
+        ).joinToString("\u0000")
+        val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray())
+        val legacyHash = digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+        assertEquals(legacyHash, collectionContentHash(unchanged))
+        assertFalse(
+            legacyHash == collectionContentHash(
+                unchanged.copy(parentId = "00000000-0000-0000-0000-000000000002"),
+            ),
+        )
+    }
+
+    @Test
     fun storeRoundTripsTombstonesAndSyncBaseline() {
         val tombstone = row(
             "Blue crate", "2026-07-19T12:00:00Z", deleted = true,
@@ -359,11 +410,18 @@ class CollectionSyncTest {
                 .put("from_place", "Storage")
                 .put("updated_at", "2026-07-19T12:00:00Z")
                 .put("deleted", true)
-                .put("merged_into", "b"),
+                .put("merged_into", "b")
+                .put("parent_id", "parent"),
         )
         assertEquals(
             BookCollection(
-                "a", "Blue crate", "Storage", "2026-07-19T12:00:00Z", true, "b",
+                "a",
+                "Blue crate",
+                "Storage",
+                "2026-07-19T12:00:00Z",
+                true,
+                "b",
+                "parent",
             ),
             parsed,
         )

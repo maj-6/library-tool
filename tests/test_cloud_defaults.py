@@ -146,6 +146,13 @@ def test_capture_rest_headers_separate_public_key_and_user_jwt():
                        "Authorization": "Bearer user-jwt"}
 
 
+def test_modern_supabase_secret_is_not_misused_as_a_bearer_token():
+    import supabase_sync as sbase
+    _, _, headers = sbase._cfg({"url": "https://x.supabase.co",
+                                "key": "sb_secret_processor_123"})
+    assert headers == {"apikey": "sb_secret_processor_123"}
+
+
 def test_cloud_cfg_still_requires_protected_service_key_status(
         settings, monkeypatch):
     settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="")

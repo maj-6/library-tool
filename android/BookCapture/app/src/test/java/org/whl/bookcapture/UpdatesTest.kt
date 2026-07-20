@@ -2,10 +2,13 @@ package org.whl.bookcapture
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
 
-/** Version precedence and which published build a user is offered. */
+/** Dormant APK precedence plus the active remote-interface refresh contract. */
 class UpdatesTest {
 
     private fun release(version: String, channel: String = "stable") =
@@ -115,5 +118,20 @@ class UpdatesTest {
     @Test
     fun rowsWithNoDownloadUrlAreNotOffered() {
         assertNull(pickUpdate("0.5.0", listOf(Release("0.6.0", "stable", "  ", ""))))
+    }
+
+    @Test
+    fun checkForUpdatesReportsOnlyRemoteInterfaceRefreshState() {
+        assertSame(
+            Updates.Result.UiUpdated,
+            Updates.resultFor(RemoteUiCatalog.Refresh.CHANGED),
+        )
+        assertSame(
+            Updates.Result.UiCurrent,
+            Updates.resultFor(RemoteUiCatalog.Refresh.UNCHANGED),
+        )
+        assertThrows(IOException::class.java) {
+            Updates.resultFor(RemoteUiCatalog.Refresh.EMPTY)
+        }
     }
 }

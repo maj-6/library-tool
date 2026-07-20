@@ -19,4 +19,12 @@ class CameraPreferencesTest {
             Prefs.validatedCameraProfile(Prefs.CAMERA_PROFILE_DETAIL),
         )
     }
+
+    @Test
+    fun cameraProfileAcceptsLowResolution() {
+        assertEquals(
+            Prefs.CAMERA_PROFILE_LOW,
+            Prefs.validatedCameraProfile(Prefs.CAMERA_PROFILE_LOW),
+        )
+    }
 }

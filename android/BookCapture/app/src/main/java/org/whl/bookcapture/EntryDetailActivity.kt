@@ -11,11 +11,9 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageButton
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.lifecycle.lifecycleScope
@@ -47,7 +45,6 @@ class EntryDetailActivity : AppCompatActivity() {
     private var photoJob: Job? = null
     private var viewerJob: Job? = null
     private var viewerDialog: Dialog? = null
-    private var discardDialog: AlertDialog? = null
     private var ocrExpanded = false
     private var diagnosticsExpanded = false
     private var diagnosticsTab = DIAGNOSTICS_TAB_JSON
@@ -109,8 +106,6 @@ class EntryDetailActivity : AppCompatActivity() {
         viewerJob?.cancel()
         viewerDialog?.dismiss()
         viewerDialog = null
-        discardDialog?.dismiss()
-        discardDialog = null
         super.onDestroy()
     }
 
@@ -120,7 +115,7 @@ class EntryDetailActivity : AppCompatActivity() {
         diagnosticsEntry = entry
         val details = BookDetailPresenter.from(entry.meta)
 
-        binding.title.text = details.title.ifEmpty { Entries.titleLabel(this, entry) }
+        binding.title.text = details.title.ifEmpty { getString(R.string.detail_untitled) }
         binding.author.text = details.author
         binding.author.visibility = details.author.visibleOrGone()
         binding.year.text = details.year
@@ -140,17 +135,12 @@ class EntryDetailActivity : AppCompatActivity() {
         binding.overviewSection.visibility = details.overview.visibleOrGone()
         renderFields(binding.otherFields, details.other, compact = true)
         binding.otherSection.visibility = if (details.other.isEmpty()) View.GONE else View.VISIBLE
-        renderProvenance(entry)
         renderOwnership(entry)
 
         binding.ocrText.text = entry.ocrText().ifEmpty { getString(R.string.detail_no_ocr) }
         renderOcrExpansion()
         if (diagnosticsExpanded) loadDiagnostics(entry, force = true)
         renderPhotos(entry)
-
-        val isActiveCapture = Prefs.currentEntryId(this) == entry.id
-        binding.discard.visibility = if (entry.uploaded || isActiveCapture) View.GONE else View.VISIBLE
-        binding.discard.setOnClickListener { showDiscardConfirmation(entry) }
     }
 
     private fun renderOwnership(entry: Entries.Entry) {
@@ -180,7 +170,11 @@ class EntryDetailActivity : AppCompatActivity() {
         compact: Boolean,
     ) {
         container.removeAllViews()
-        fields.forEach { field -> container.addView(fieldRow(field.label, field.value, compact)) }
+        fields.forEach { field ->
+            val row = fieldRow(field.label, field.value, compact)
+            RemoteUiCatalog.apply(row)
+            container.addView(row)
+        }
     }
 
     private fun renderOcrExpansion() {
@@ -192,6 +186,7 @@ class EntryDetailActivity : AppCompatActivity() {
             if (ocrExpanded) R.string.detail_collapse_ocr else R.string.detail_expand_ocr,
         )
         binding.ocrToggle.isSelected = ocrExpanded
+        RemoteUiCatalog.apply(binding.ocrToggle)
     }
 
     private fun configureDiagnosticsPanel() {
@@ -281,6 +276,7 @@ class EntryDetailActivity : AppCompatActivity() {
             binding.diagnosticsToggle,
             getString(if (diagnosticsExpanded) R.string.expanded else R.string.collapsed),
         )
+        RemoteUiCatalog.apply(binding.diagnosticsToggle)
     }
 
     private fun renderDiagnosticsText() {
@@ -355,29 +351,60 @@ class EntryDetailActivity : AppCompatActivity() {
         val others = descriptors.filterNot { it.assetId == hero.assetId }
         binding.otherPhotosLabel.visibility = if (others.isEmpty()) View.GONE else View.VISIBLE
         binding.photosScroll.visibility = if (others.isEmpty()) View.GONE else View.VISIBLE
-        binding.heroState.text = roleLabel(hero, hero.order)
+        binding.heroState.text = photoStatusLabel(hero, hero.order)
         binding.heroState.visibility = View.VISIBLE
         binding.heroPhoto.setOnClickListener {
-            showPhotoViewer(hero, getString(R.string.detail_title_page))
+            showPhotoViewer(hero, photoStatusLabel(hero, hero.order))
         }
 
         photoJob = lifecycleScope.launch {
-            val heroBitmap = withContext(Dispatchers.IO) {
-                decodeSampledOriented(hero.displayFile, maxWidth = 1800, maxHeight = 1800)
+            val (heroBitmap, heroOriginal) = withContext(Dispatchers.IO) {
+                val display = decodeSampledOriented(
+                    hero.displayFile,
+                    maxWidth = 1800,
+                    maxHeight = 1800,
+                )
+                val original = if (hero.originalPreserved && hero.rawFile.isFile) {
+                    decodeSampledOriented(hero.rawFile, maxWidth = 1800, maxHeight = 1800)
+                } else null
+                display to original
             }
-            if (heroBitmap != null) binding.heroPhoto.setPhotoBitmap(heroBitmap)
+            if (heroBitmap != null) {
+                binding.heroPhoto.setPhotoBitmap(heroBitmap)
+                installOriginalHold(binding.heroPhoto, hero, heroBitmap, heroOriginal)
+            }
             applyOverlay(binding.heroPhoto, hero)
 
             others.forEach { descriptor ->
-                val bitmap = withContext(Dispatchers.IO) {
-                    decodeSampledOriented(descriptor.displayFile, maxWidth = 420, maxHeight = 420)
-                } ?: return@forEach
-                addThumbnail(descriptor, bitmap)
+                val (bitmap, original) = withContext(Dispatchers.IO) {
+                    val decoded = decodeSampledOriented(
+                        descriptor.displayFile,
+                        maxWidth = 420,
+                        maxHeight = 420,
+                    ) ?: return@withContext null to null
+                    val display = if (descriptor.postProcessingPending) {
+                        softenedThumbnail(decoded)
+                    } else decoded
+                    val raw = if (descriptor.originalPreserved && descriptor.rawFile.isFile) {
+                        decodeSampledOriented(
+                            descriptor.rawFile,
+                            maxWidth = 420,
+                            maxHeight = 420,
+                        )
+                    } else null
+                    display to raw
+                }
+                bitmap ?: return@forEach
+                addThumbnail(descriptor, bitmap, original)
             }
         }
     }
 
-    private fun addThumbnail(descriptor: EntryPhotoDescriptor, bitmap: Bitmap) {
+    private fun addThumbnail(
+        descriptor: EntryPhotoDescriptor,
+        bitmap: Bitmap,
+        original: Bitmap?,
+    ) {
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -385,25 +412,74 @@ class EntryDetailActivity : AppCompatActivity() {
         }
         val height = resources.getDimensionPixelSize(R.dimen.detail_thumbnail_height)
         val width = (height * bitmap.width / bitmap.height.coerceAtLeast(1)).coerceAtLeast(height / 2)
-        val image = ImageView(this).apply {
+        val image = ZoomablePhotoView(this).apply {
             layoutParams = LinearLayout.LayoutParams(width, height)
-            scaleType = ImageView.ScaleType.CENTER_CROP
             setBackgroundResource(R.drawable.whl_photo_frame)
             setPadding(1, 1, 1, 1)
-            setImageBitmap(bitmap)
-            contentDescription = getString(R.string.detail_photo_description, descriptor.order + 1)
-            setOnClickListener { showPhotoViewer(descriptor, roleLabel(descriptor, descriptor.order)) }
+            setPhotoBitmap(bitmap)
+            alpha = if (descriptor.postProcessingPending) .82f else 1f
+            contentDescription = getString(
+                if (descriptor.postProcessingPending) {
+                    R.string.detail_photo_pending_description
+                } else {
+                    R.string.detail_photo_description
+                },
+                descriptor.order + 1,
+            )
+            setOnClickListener {
+                showPhotoViewer(descriptor, photoStatusLabel(descriptor, descriptor.order))
+            }
         }
+        applyOverlay(image, descriptor)
+        installOriginalHold(image, descriptor, bitmap, original)
         column.addView(image)
         column.addView(TextView(this).apply {
-            text = roleLabel(descriptor, descriptor.order)
+            text = photoStatusLabel(descriptor, descriptor.order)
             setTextColor(getColor(R.color.whl_ink_dim))
             textSize = 11f
             gravity = Gravity.CENTER
             maxLines = 1
             setPadding(3, 4, 3, 0)
         }, LinearLayout.LayoutParams(width, ViewGroup.LayoutParams.WRAP_CONTENT))
+        RemoteUiCatalog.apply(column)
         binding.photos.addView(column)
+    }
+
+    /** Press-and-hold compares the retained camera original in place. Releasing
+     * restores the corrected display revision and its revision-bound OCR boxes. */
+    private fun installOriginalHold(
+        view: ZoomablePhotoView,
+        descriptor: EntryPhotoDescriptor,
+        display: Bitmap,
+        original: Bitmap?,
+    ) {
+        view.onOriginalHoldChanged = original?.let { raw ->
+            { showingOriginal ->
+                view.setPhotoBitmap(if (showingOriginal) raw else display)
+                if (showingOriginal) {
+                    view.setOverlayRegions(emptyList())
+                } else {
+                    applyOverlay(view, descriptor)
+                }
+            }
+        }
+    }
+
+    /** A pending derivative remains visibly distinct without altering its
+     * immutable source. The verified cloud result replaces this preview. */
+    private fun softenedThumbnail(source: Bitmap): Bitmap {
+        if (source.width < 4 || source.height < 4) return source
+        val small = Bitmap.createScaledBitmap(
+            source,
+            (source.width / 12).coerceAtLeast(2),
+            (source.height / 12).coerceAtLeast(2),
+            true,
+        )
+        if (small === source) return source
+        val softened = Bitmap.createScaledBitmap(small, source.width, source.height, true)
+        small.recycle()
+        if (softened !== source) source.recycle()
+        return softened
     }
 
     private fun showPhotoViewer(descriptor: EntryPhotoDescriptor, label: String) {
@@ -470,6 +546,7 @@ class EntryDetailActivity : AppCompatActivity() {
             compare.text = getString(
                 if (original) R.string.detail_processed else R.string.detail_original,
             )
+            RemoteUiCatalog.apply(compare)
             val target = if (original) descriptor.rawFile else descriptor.displayFile
             viewerJob?.cancel()
             viewerJob = lifecycleScope.launch {
@@ -493,6 +570,7 @@ class EntryDetailActivity : AppCompatActivity() {
         viewerDialog = dialog
         dialog.show()
         show(false)
+        RemoteUiCatalog.apply(dialog)
     }
 
     /** Geometry is revision-bound by EntryPhotoDescriptor; unrecognized or
@@ -527,25 +605,15 @@ class EntryDetailActivity : AppCompatActivity() {
         return if (descriptor.roleSuggested) getString(R.string.detail_suggested_role, role) else role
     }
 
-    private fun showDiscardConfirmation(entry: Entries.Entry) {
-        if (discardDialog?.isShowing == true) return
-        discardDialog = MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.detail_discard_title)
-            .setMessage(R.string.detail_discard_message)
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.detail_discard_confirm) { _, _ -> deleteEntry(entry.id) }
-            .create()
-            .also { dialog ->
-                dialog.setOnShowListener {
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(getColor(R.color.whl_red))
-                }
-                dialog.setOnDismissListener { discardDialog = null }
-                dialog.show()
-            }
+    private fun photoStatusLabel(descriptor: EntryPhotoDescriptor, order: Int): String {
+        val label = roleLabel(descriptor, order)
+        return if (descriptor.postProcessingPending) {
+            getString(R.string.detail_cleanup_pending, label)
+        } else label
     }
 
     private fun showClaimConfirmation(entryId: String) {
-        MaterialAlertDialogBuilder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.detail_claim_title)
             .setMessage(getString(R.string.detail_claim_message, Prefs.email(this)))
             .setNegativeButton(android.R.string.cancel, null)
@@ -581,134 +649,8 @@ class EntryDetailActivity : AppCompatActivity() {
                 }
             }
             .show()
+        RemoteUiCatalog.apply(dialog)
     }
-
-    private fun deleteEntry(entryId: String) {
-        lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                Entries.deleteLocalSafely(
-                    this@EntryDetailActivity,
-                    entryId,
-                    allowUploaded = false,
-                )
-            }
-            when (result) {
-                Entries.DeleteResult.DELETED, Entries.DeleteResult.MISSING -> finish()
-                Entries.DeleteResult.ACTIVE_CAPTURE -> {
-                    Toast.makeText(
-                        this@EntryDetailActivity,
-                        R.string.detail_discard_active,
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    finish()
-                }
-                Entries.DeleteResult.ALREADY_UPLOADED -> {
-                    Toast.makeText(
-                        this@EntryDetailActivity,
-                        R.string.detail_discard_uploaded,
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    render()
-                }
-                Entries.DeleteResult.DELETE_FAILED -> Toast.makeText(
-                    this@EntryDetailActivity,
-                    R.string.detail_delete_failed,
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        }
-    }
-
-    /** Provenance describes the capture rather than the book, so it stays out
-     * of the bibliographic Other-details table. */
-    private fun renderProvenance(entry: Entries.Entry) {
-        binding.provenanceFields.removeAllViews()
-        val provenance = entry.provenance
-        binding.provenanceSection.visibility = if (provenance == null) View.GONE else View.VISIBLE
-        if (provenance == null) return
-        binding.provenanceFields.addView(fieldRow(
-            getString(R.string.collections_field_name),
-            provenance.collectionName,
-            compact = true,
-        ))
-        val fromValue = provenance.from.ifEmpty { getString(R.string.detail_from_none) }
-        val fromRow = fieldRow(getString(R.string.detail_from), fromValue, compact = true)
-        if (entry.uploaded) {
-            fromRow.setOnClickListener {
-                Toast.makeText(this, R.string.detail_from_locked, Toast.LENGTH_LONG).show()
-            }
-            fromRow.alpha = .7f
-        } else {
-            (fromRow as LinearLayout).addView(TextView(this).apply {
-                textSize = 11f
-                setTextColor(getColor(R.color.whl_cyan))
-                setText(R.string.detail_from_edit)
-            })
-            fromRow.setOnClickListener { editFrom(entry) }
-        }
-        fromRow.contentDescription = getString(R.string.detail_from_description, fromValue)
-        binding.provenanceFields.addView(fromRow)
-    }
-
-    private fun editFrom(entry: Entries.Entry) {
-        val field = android.widget.EditText(this).apply {
-            setText(entry.from)
-            setSingleLine()
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or
-                android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS
-            setHint(R.string.detail_from_hint)
-            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
-        }
-        val frame = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(56, 24, 56, 0)
-            addView(field)
-            addView(TextView(this@EntryDetailActivity).apply {
-                textSize = 11f
-                setTextColor(getColor(R.color.whl_ink_dim))
-                setPadding(0, 16, 0, 0)
-                setText(R.string.detail_from_help)
-            })
-        }
-        AlertDialog.Builder(this)
-            .setTitle(R.string.detail_from_title)
-            .setView(frame)
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.collections_save) { _, _ ->
-                saveFrom(entry, field.text.toString())
-            }
-            .show()
-    }
-
-    private fun saveFrom(entry: Entries.Entry, from: String) {
-        lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                EntryOperationLocks.withLock(entry.id) {
-                    val current = Entries.find(this@EntryDetailActivity, entry.id)
-                        ?: return@withLock FromSaveResult.MISSING
-                    if (current.uploaded) return@withLock FromSaveResult.UPLOADED
-                    if (overrideEntryFrom(current.dir, from)) FromSaveResult.SAVED
-                    else FromSaveResult.WRITE_FAILED
-                }
-            }
-            when (result) {
-                FromSaveResult.SAVED, FromSaveResult.MISSING -> Unit
-                FromSaveResult.UPLOADED -> Toast.makeText(
-                    this@EntryDetailActivity,
-                    R.string.detail_from_locked,
-                    Toast.LENGTH_LONG,
-                ).show()
-                FromSaveResult.WRITE_FAILED -> Toast.makeText(
-                    this@EntryDetailActivity,
-                    R.string.detail_from_failed,
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-            render()
-        }
-    }
-
-    private enum class FromSaveResult { SAVED, UPLOADED, MISSING, WRITE_FAILED }
 
     private fun fieldRow(label: String, value: String, compact: Boolean): View {
         val row = LinearLayout(this).apply {

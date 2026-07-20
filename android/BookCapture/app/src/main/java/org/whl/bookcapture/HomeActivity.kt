@@ -1,17 +1,24 @@
 package org.whl.bookcapture
 
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.os.Bundle
+import android.text.method.LinkMovementMethod
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.CheckBox
 import android.widget.ImageView
+import android.widget.ProgressBar
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.text.HtmlCompat
+import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
@@ -80,11 +87,6 @@ class HomeActivity : AppCompatActivity() {
         binding.configWarning.setOnClickListener {
             startActivity(Intent(this, LoginActivity::class.java))
         }
-        binding.btnSelect.setOnClickListener {
-            selectionMode = true
-            updateSelectionUi()
-            refreshHome()
-        }
         binding.cancelSelection.setOnClickListener { leaveSelectionMode() }
         binding.deleteSelected.setOnClickListener { confirmDeleteSelected() }
         // when background OCR / upload lands, the list re-renders itself
@@ -135,6 +137,9 @@ class HomeActivity : AppCompatActivity() {
     private fun showAppMenu() {
         val menu = androidx.appcompat.widget.PopupMenu(this, binding.appMenu)
         menu.menuInflater.inflate(R.menu.home_app_menu, menu.menu)
+        RemoteUiCatalog.apply(this, menu.menu)
+        menu.menu.findItem(R.id.menuSignOut).isVisible = Auth.signedIn(this)
+        MenuCompat.setGroupDividerEnabled(menu.menu, true)
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 R.id.menuSettings -> {
@@ -142,6 +147,7 @@ class HomeActivity : AppCompatActivity() {
                 }
                 R.id.menuAbout -> { showAbout(); true }
                 R.id.menuCheckUpdates -> { checkForUpdates(); true }
+                R.id.menuSignOut -> { signOut(); true }
                 else -> false
             }
         }
@@ -149,18 +155,49 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun showAbout() {
-        AlertDialog.Builder(this)
-            .setTitle(R.string.about_title)
-            .setMessage(getString(R.string.about_body, BuildConfig.VERSION_NAME))
+        val view = layoutInflater.inflate(R.layout.dialog_about, null)
+        view.findViewById<TextView>(R.id.aboutTitle).text = getString(R.string.about_title)
+        view.findViewById<TextView>(R.id.aboutVersion).text =
+            getString(R.string.about_version, BuildConfig.VERSION_NAME)
+        view.findViewById<TextView>(R.id.aboutDescription).apply {
+            text = HtmlCompat.fromHtml(
+                getString(R.string.about_description_html),
+                HtmlCompat.FROM_HTML_MODE_COMPACT,
+            )
+            movementMethod = LinkMovementMethod.getInstance()
+        }
+        view.findViewById<TextView>(R.id.aboutChangelog).text = aboutChangelog()
+        RemoteUiCatalog.apply(view)
+        val dialog = AlertDialog.Builder(this)
+            .setView(view)
             .setPositiveButton(R.string.about_close, null)
             .show()
+        RemoteUiCatalog.apply(dialog)
     }
 
-    /**
-     * Reads the published releases and offers the newest build this one should
-     * see. Runs off the main thread; the result is discarded if the Activity has
-     * gone away, so a slow network can't resurrect a dialog on a dead window.
-     */
+    private fun aboutChangelog(): String {
+        if (BuildConfig.DEBUG) return getString(R.string.about_changelog_not_included)
+        val resourceId = resources.getIdentifier("android_changelog", "raw", packageName)
+        if (resourceId == 0) return getString(R.string.about_changelog_not_included)
+        val markdown = resources.openRawResource(resourceId).bufferedReader().use { it.readText() }
+        return formatChangelogForAbout(markdown)
+    }
+
+    private fun signOut() {
+        lifecycleScope.launch {
+            val error = withContext(Dispatchers.IO) { Auth.signOut(this@HomeActivity) }
+            binding.configWarning.visibility = View.VISIBLE
+            refreshCollectionBar()
+            Toast.makeText(
+                this@HomeActivity,
+                error?.let { getString(R.string.signed_out_revoke_warning, it) }
+                    ?: getString(R.string.signed_out_local),
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+
+    /** Refresh remote in-app icons and strings without offering an uncertified APK. */
     private fun checkForUpdates() {
         Toast.makeText(this, R.string.update_checking, Toast.LENGTH_SHORT).show()
         lifecycleScope.launch {
@@ -169,40 +206,12 @@ class HomeActivity : AppCompatActivity() {
             }
             fun say(message: String) =
                 Toast.makeText(this@HomeActivity, message, Toast.LENGTH_LONG).show()
-            when (val result = outcome.getOrNull()) {
+            when (outcome.getOrNull()) {
                 null -> say(getString(R.string.update_failed))
                 Updates.Result.NotConfigured -> say(getString(R.string.update_not_configured))
-                Updates.Result.UpToDate ->
-                    say(getString(R.string.update_current, BuildConfig.VERSION_NAME))
-                is Updates.Result.Available -> AlertDialog.Builder(this@HomeActivity)
-                    .setTitle(R.string.update_available_title)
-                    .setMessage(getString(
-                        R.string.update_available_body,
-                        result.release.version, BuildConfig.VERSION_NAME))
-                    .setNegativeButton(android.R.string.cancel, null)
-                    .setPositiveButton(R.string.update_download) { _, _ ->
-                        openDownload(result.release)
-                    }
-                    .show()
+                Updates.Result.UiCurrent -> say(getString(R.string.update_resources_current))
+                Updates.Result.UiUpdated -> say(getString(R.string.update_resources_updated))
             }
-        }
-    }
-
-    /**
-     * Hand the APK URL to the browser rather than installing in-app.
-     *
-     * Not a stopgap — don't "upgrade" this later. These builds are not Play
-     * Store certified, so a self-install would land the user in the unknown-
-     * sources flow regardless, and the app would additionally have to hold
-     * REQUEST_INSTALL_PACKAGES for the privilege. The browser already handles
-     * that path, and handles it with the warnings the user should be seeing.
-     */
-    private fun openDownload(update: Release) {
-        val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(update.url))
-        try {
-            startActivity(intent)
-        } catch (_: android.content.ActivityNotFoundException) {
-            Toast.makeText(this, R.string.update_no_browser, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -219,8 +228,6 @@ class HomeActivity : AppCompatActivity() {
         binding.newScan.visibility = if (collections) View.GONE else View.VISIBLE
         binding.newCollection.visibility = if (collections) View.VISIBLE else View.GONE
         binding.collectionBar.visibility = if (collections) View.GONE else View.VISIBLE
-        binding.btnSelect.visibility =
-            if (collections || selectionMode) View.GONE else View.VISIBLE
         emphasizeTab(binding.tabScans, !collections)
         emphasizeTab(binding.tabCollections, collections)
         if (collections) refreshCollections() else refreshHome()
@@ -235,10 +242,11 @@ class HomeActivity : AppCompatActivity() {
 
     private fun refreshCollectionBar() {
         val current = Collections.current(this)
-        binding.collectionBar.text = when {
-            current == null -> getString(R.string.collections_none_selected)
-            current.from.isEmpty() -> getString(R.string.collections_current, current.name)
-            else -> getString(R.string.collections_current_from, current.name, current.from)
+        val paths = collectionDisplayPaths(Collections.allRecords(this))
+        binding.collectionBar.text = if (current == null) {
+            getString(R.string.collections_none_selected)
+        } else {
+            getString(R.string.collections_current, paths[current.id] ?: current.name)
         }
         binding.collectionBar.setTextColor(
             getColor(if (current == null) R.color.whl_amber else R.color.whl_ink_dim))
@@ -249,6 +257,7 @@ class HomeActivity : AppCompatActivity() {
         list.removeAllViews()
         val collections = Collections.all(this)
         val current = Collections.current(this)
+        val collectionPaths = collectionDisplayPaths(Collections.allRecords(this))
         refreshCollectionBar()
         if (collections.isEmpty()) {
             list.addView(emptyNotice(getString(R.string.collections_empty)))
@@ -267,7 +276,8 @@ class HomeActivity : AppCompatActivity() {
                 getString(R.string.collections_current_state).takeIf { isCurrent },
             )
             val name = row.findViewById<TextView>(R.id.name)
-            name.text = c.name
+            val displayName = collectionPaths[c.id] ?: c.name
+            name.text = displayName
             name.setTypeface(name.typeface, if (isCurrent) Typeface.BOLD else Typeface.NORMAL)
             row.setBackgroundResource(
                 if (isCurrent) R.drawable.whl_collection_current else R.drawable.whl_row)
@@ -289,10 +299,13 @@ class HomeActivity : AppCompatActivity() {
                 Prefs.setCurrentCollectionId(this, c.id)
                 expandedScanGroups.add(c.id)
                 Toast.makeText(
-                    this, getString(R.string.collections_current, c.name), Toast.LENGTH_SHORT
+                    this,
+                    getString(R.string.collections_current, displayName),
+                    Toast.LENGTH_SHORT,
                 ).show()
                 refreshCollections()
             }
+            RemoteUiCatalog.apply(row)
             list.addView(row)
         }
     }
@@ -303,7 +316,7 @@ class HomeActivity : AppCompatActivity() {
         setTextColor(getColor(R.color.whl_ink_dim))
         setPadding(28, 40, 28, 28)
         this.text = text
-    }
+    }.also { RemoteUiCatalog.apply(it) }
 
     /** Add ([existing] null) or edit one collection. */
     private fun editCollection(existing: BookCollection?) {
@@ -311,19 +324,34 @@ class HomeActivity : AppCompatActivity() {
         // soon as mutate() returns, so selecting the list's last row would race
         // that pull and could choose a different collection.
         val collectionId = existing?.id ?: UUID.randomUUID().toString()
+        val collections = Collections.all(this)
+        val collectionPaths = collectionDisplayPaths(Collections.allRecords(this))
         val view = layoutInflater.inflate(R.layout.dialog_collection, null)
         val nameField = view.findViewById<android.widget.EditText>(R.id.collectionName)
+        val parentField = view.findViewById<Spinner>(R.id.collectionParent)
         val fromField = view.findViewById<android.widget.EditText>(R.id.collectionFrom)
-        // Existing values are editable content. The layout's examples remain
-        // generic hints and never duplicate a saved collection as placeholder text.
+        val parentIds = mutableListOf<String?>(null)
+        val parentLabels = mutableListOf(getString(R.string.collections_parent_none))
+        collectionParentCandidates(collections, collectionId)
+            .sortedBy { (collectionPaths[it.id] ?: it.name).lowercase() }
+            .forEach { parent ->
+                parentIds += parent.id
+                parentLabels += collectionPaths[parent.id] ?: parent.name
+            }
+        existing?.parentId?.takeIf { it !in parentIds }?.let { missingParentId ->
+            parentIds += missingParentId
+            parentLabels += getString(R.string.collections_parent_unavailable)
+        }
+        parentField.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            parentLabels,
+        ).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        parentField.setSelection(parentIds.indexOf(existing?.parentId).coerceAtLeast(0))
         nameField.setText(existing?.name.orEmpty())
         fromField.setText(existing?.from.orEmpty())
-        if (existing != null) {
-            // Edit mode already contains the saved values; showing the new-item
-            // examples again after a field is cleared reads like prefilled data.
-            nameField.hint = null
-            fromField.hint = null
-        }
         val dialog = AlertDialog.Builder(this)
             .setTitle(
                 if (existing == null) R.string.collections_add_title
@@ -336,9 +364,19 @@ class HomeActivity : AppCompatActivity() {
         view.findViewById<View>(R.id.saveCollectionEdit).setOnClickListener {
             val name = nameField.text.toString()
             val from = fromField.text.toString()
+            val parentId = parentIds.getOrNull(parentField.selectedItemPosition)
             val error = Collections.mutate(this) { current ->
-                if (existing == null) addCollection(current, name, from, id = collectionId)
-                else updateCollection(current, existing.id, name, from)
+                if (existing == null) {
+                    addCollection(
+                        current,
+                        name,
+                        from,
+                        id = collectionId,
+                        parentId = parentId,
+                    )
+                } else {
+                    updateCollection(current, existing.id, name, from, parentId)
+                }
             }
             if (error != null) {
                 Toast.makeText(this, error, Toast.LENGTH_LONG).show()
@@ -354,10 +392,11 @@ class HomeActivity : AppCompatActivity() {
             refreshCollections()
         }
         dialog.show()
+        RemoteUiCatalog.apply(dialog)
     }
 
     private fun confirmDeleteCollection(collection: BookCollection) {
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.collections_delete_title)
             .setMessage(getString(R.string.collections_delete_message, collection.name))
             .setNegativeButton(android.R.string.cancel, null)
@@ -369,6 +408,7 @@ class HomeActivity : AppCompatActivity() {
                 refreshCollections()
             }
             .show()
+        RemoteUiCatalog.apply(dialog)
     }
 
     override fun onDestroy() {
@@ -389,16 +429,18 @@ class HomeActivity : AppCompatActivity() {
             return
         }
         val inflater = LayoutInflater.from(this)
-        val thumbs = ArrayList<Pair<ImageView, java.io.File>>()
-        val knownCollectionNames = Collections.all(this).associate { it.id to it.name }
+        val thumbs = ArrayList<Triple<ImageView, java.io.File, Boolean>>()
+        val knownCollectionPaths = collectionDisplayPaths(Collections.allRecords(this))
         val currentCollectionId = Collections.current(this)?.id
         val groups = groupScansByCollection(
             items = entries,
             currentCollectionId = currentCollectionId,
             collectionId = { it.provenance?.collectionId },
             collectionLabel = { entry ->
-                entry.provenance?.collectionId?.let(knownCollectionNames::get)
-                    .orEmpty().ifEmpty { entry.collectionName }
+                entry.provenance?.collectionId?.let(knownCollectionPaths::get)
+                    .orEmpty().ifEmpty {
+                        collectionDisplayLabel(entry.from, entry.collectionName)
+                    }
             },
             unfiledLabel = getString(R.string.home_group_unfiled),
         )
@@ -433,6 +475,7 @@ class HomeActivity : AppCompatActivity() {
                 if (!expandedScanGroups.add(group.key)) expandedScanGroups.remove(group.key)
                 refreshHome()
             }
+            RemoteUiCatalog.apply(header)
             list.addView(header)
             if (!expanded) continue
 
@@ -449,7 +492,24 @@ class HomeActivity : AppCompatActivity() {
                         else getString(R.string.collections_row_from, e.from),
                     ).filter { it.isNotEmpty() }.joinToString(" · ")
                 val state = Entries.statusLabel(this, e)
-                row.findViewById<TextView>(R.id.state).text = state
+                val presentation = homeStatusPresentation(state)
+                row.findViewById<TextView>(R.id.state).apply {
+                    text = presentation.text
+                    visibility = if (presentation.text.isEmpty()) View.GONE else View.VISIBLE
+                }
+                row.findViewById<ProgressBar>(R.id.waitingIndicator).apply {
+                    visibility = if (presentation.adornment == HomeStatusAdornment.WAITING)
+                        View.VISIBLE else View.GONE
+                    contentDescription = getString(R.string.home_status_waiting)
+                }
+                row.findViewById<ImageView>(R.id.stateIcon).apply {
+                    visibility = if (presentation.adornment == HomeStatusAdornment.UPLOADED)
+                        View.VISIBLE else View.GONE
+                    contentDescription = getString(
+                        if (presentation.accessibilityLabel == "imported")
+                            R.string.home_status_imported else R.string.home_status_uploaded,
+                    )
+                }
                 row.findViewById<View>(R.id.marker)
                     .setBackgroundColor(getColor(markerColor(state)))
                 val thumb = row.findViewById<ImageView>(R.id.thumb)
@@ -457,30 +517,58 @@ class HomeActivity : AppCompatActivity() {
                 val selected = row.findViewById<CheckBox>(R.id.selected)
                 selected.visibility = if (selectionMode) View.VISIBLE else View.GONE
                 selected.isChecked = e.id in selectedIds
-                selected.setOnClickListener { toggleSelection(e.id) }
-                e.thumbnailPhoto()?.let { thumbs.add(thumb to it) }
-                row.setOnClickListener {
-                    if (selectionMode) toggleSelection(e.id)
-                    else startActivity(Intent(this, EntryDetailActivity::class.java)
-                        .putExtra(EntryDetailActivity.EXTRA_ID, e.id))
-                }
-                row.setOnLongClickListener {
-                    if (!selectionMode) selectionMode = true
-                    toggleSelection(e.id)
+                selected.setOnClickListener { selectSingle(e.id) }
+                selected.setOnLongClickListener {
+                    toggleAdditiveSelection(e.id)
                     true
                 }
+                row.findViewById<View>(R.id.openDetails).setOnClickListener {
+                    openEntryDetails(e.id)
+                }
+                e.thumbnailPhoto()?.let { photo ->
+                    val cleanupPending = e.photoDescriptor(photo)?.postProcessingPending == true
+                    thumb.alpha = if (cleanupPending) .82f else 1f
+                    thumbs.add(Triple(thumb, photo, cleanupPending))
+                }
+                // A tap replaces the selection. Only a long press changes one
+                // member without clearing the others; the disclosure icon opens details.
+                row.setOnClickListener { selectSingle(e.id) }
+                row.setOnLongClickListener {
+                    toggleAdditiveSelection(e.id)
+                    true
+                }
+                RemoteUiCatalog.apply(row)
                 list.addView(row)
             }
         }
         // decode the page thumbnails off the UI thread, in list order
         thumbJob = lifecycleScope.launch {
-            for ((iv, file) in thumbs) {
+            for ((iv, file, cleanupPending) in thumbs) {
                 val bmp = withContext(Dispatchers.IO) {
-                    decodeSampledOriented(file, maxWidth = 512, maxHeight = 512)
+                    val decoded = decodeSampledOriented(file, maxWidth = 512, maxHeight = 512)
+                        ?: return@withContext null
+                    if (cleanupPending) softenPendingThumbnail(decoded) else decoded
                 } ?: continue
                 iv.setImageBitmap(bmp)
             }
         }
+    }
+
+    /** A deliberately cheap blur for small list thumbnails while the remote
+     * cleanup derivative is pending. The retained source file is untouched. */
+    private fun softenPendingThumbnail(source: Bitmap): Bitmap {
+        if (source.width < 4 || source.height < 4) return source
+        val small = Bitmap.createScaledBitmap(
+            source,
+            (source.width / 12).coerceAtLeast(2),
+            (source.height / 12).coerceAtLeast(2),
+            true,
+        )
+        if (small === source) return source
+        val softened = Bitmap.createScaledBitmap(small, source.width, source.height, true)
+        small.recycle()
+        if (softened !== source) source.recycle()
+        return softened
     }
 
     private fun applyScanListLayout(row: View, thumb: ImageView, compact: Boolean) {
@@ -501,16 +589,33 @@ class HomeActivity : AppCompatActivity() {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).roundToInt()
 
-    private fun toggleSelection(id: String) {
-        if (id in selectedIds) selectedIds.remove(id) else selectedIds.add(id)
+    private fun selectSingle(id: String) {
+        selectionMode = true
+        val updated = replaceScanSelection(selectedIds, id)
+        selectedIds.clear()
+        selectedIds.addAll(updated)
         updateSelectionUi()
         refreshHome()
     }
 
+    private fun toggleAdditiveSelection(id: String) {
+        selectionMode = true
+        val updated = toggleScanSelectionAdditively(selectedIds, id)
+        selectedIds.clear()
+        selectedIds.addAll(updated)
+        updateSelectionUi()
+        refreshHome()
+    }
+
+    private fun openEntryDetails(id: String) {
+        startActivity(
+            Intent(this, EntryDetailActivity::class.java)
+                .putExtra(EntryDetailActivity.EXTRA_ID, id),
+        )
+    }
+
     private fun updateSelectionUi() {
         binding.selectionBar.visibility = if (selectionMode) View.VISIBLE else View.GONE
-        binding.btnSelect.visibility =
-            if (selectionMode || showingCollections) View.GONE else View.VISIBLE
         binding.newScan.isEnabled = !selectionMode
         binding.selectionCount.text = resources.getQuantityString(
             R.plurals.home_selected_count, selectedIds.size, selectedIds.size)
@@ -528,7 +633,7 @@ class HomeActivity : AppCompatActivity() {
     private fun confirmDeleteSelected() {
         if (selectedIds.isEmpty()) return
         val count = selectedIds.size
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.home_delete_title)
             .setMessage(resources.getQuantityString(
                 R.plurals.home_delete_message, count, count))
@@ -565,6 +670,7 @@ class HomeActivity : AppCompatActivity() {
                 }
             }
             .show()
+        RemoteUiCatalog.apply(dialog)
     }
 
     private fun markerColor(state: String): Int = when {

@@ -1,6 +1,6 @@
 # Collections on the desktop: two-way sync
 
-Status: **implemented and deployed on 2026-07-19.** Migrations 009 and 010 are
+Status: **implemented and deployed on 2026-07-19.** Migrations 009–011 are
 applied to the `library-tool-store` Supabase project and verified against the
 live catalogue, grants, policies, function ACL, and both migration ledgers.
 
@@ -35,7 +35,7 @@ never treat an arbitrary deleted row as a merge.
 ## Deployment verification
 
 The live rollout was database-first so neither client can encounter a missing
-`collections` table. Verification after applying migrations 009 and 010
+`collections` table. Verification after applying migrations 009–011
 confirmed:
 
 - RLS is enabled, with authenticated select/insert/update policies and no anon
@@ -45,13 +45,14 @@ confirmed:
 - update access requires a non-null signed-in identity while remaining shared
   across contributors;
 - all checks, foreign keys, and covering indexes are present;
-- `merge_collections(...)` has a pinned empty `search_path`, rejects callers
-  without an authenticated JWT role, and is executable only by
+- `merge_collections(...)` has a pinned empty `search_path`, requires a non-null
+  user identity from authenticated callers, and is executable only by
   `authenticated` and `service_role` (not `anon` or `PUBLIC`);
 - the merge RPC completed an authenticated, rollback-only missing-row smoke
   test; and
-- both `009_collections` and `010_collections_authenticated_identity` appear in
-  the project ledger as well as the Supabase migration history.
+- `009_collections`, `010_collections_authenticated_identity`, and
+  `011_collection_merge_authenticated_identity` appear in the project ledger
+  as well as the Supabase migration history.
 
 The Supabase advisor intentionally reports the authenticated
 `SECURITY DEFINER` merge RPC: signed-in callers must be able to invoke that
@@ -138,8 +139,8 @@ Entries imported before this change have a name but no id. Treat a missing id as
 
 ## Data model — migration 009
 
-Next migration number is **009** (`docs/cloud/migrations/`, highest is
-`008_profile_secrets_trigger_grants.sql`). The contract is in
+Migration 009 introduced the table and merge function; migrations 010 and 011
+harden authenticated identity checks. The contract is in
 `docs/cloud/schema.sql`: append-only, idempotent DDL only, explicit
 revoke/grant + RLS beside every new table, ending with the `schema_migrations`
 insert. Verify with `python3 tools/cloud_setup.py check`.

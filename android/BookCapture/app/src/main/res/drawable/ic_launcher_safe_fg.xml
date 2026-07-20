@@ -2,7 +2,7 @@
 <!-- Keep the complete 48 dp mark inside Android's 66 dp adaptive-icon safe zone. -->
 <inset xmlns:android="http://schemas.android.com/apk/res/android"
     android:drawable="@drawable/ic_launcher_fg"
-    android:insetLeft="14.5dp"
-    android:insetTop="14.5dp"
-    android:insetRight="14.5dp"
-    android:insetBottom="14.5dp" />
+    android:insetLeft="13.5dp"
+    android:insetTop="13.5dp"
+    android:insetRight="13.5dp"
+    android:insetBottom="13.5dp" />

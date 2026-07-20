@@ -12,60 +12,72 @@
     <LinearLayout
         android:id="@+id/topbar"
         android:layout_width="0dp"
-        android:layout_height="wrap_content"
+        android:layout_height="56dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:background="@drawable/whl_panel"
-        android:paddingStart="8dp"
-        android:paddingEnd="6dp"
-        android:paddingTop="6dp"
-        android:paddingBottom="6dp"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
         <ImageButton
             android:id="@+id/appMenu"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
-            android:layout_marginEnd="6dp"
-            android:padding="4dp"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:padding="1dp"
             android:background="@drawable/whl_icon_plate"
             android:contentDescription="@string/app_menu"
             android:scaleType="fitCenter"
-            android:src="@drawable/ic_launcher_fg" />
+            android:src="@drawable/ic_app_mark" />
+
+        <!-- The mark is a separate menu plate, not a third tab. This quiet
+             rule keeps it visually distinct without putting a border around
+             the botanical-green square. -->
+        <View
+            android:layout_width="1dp"
+            android:layout_height="match_parent"
+            android:background="@color/whl_face_sh2" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/tabScans"
             style="@style/WhlToolbarAction"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="match_parent"
             android:layout_weight="1"
             android:paddingStart="4dp"
             android:paddingEnd="4dp"
+            android:fontFamily="@font/roboto_slab"
+            android:textAllCaps="false"
             android:textSize="12sp"
-            android:text="@string/home_tab_scans" />
+            android:text="@string/home_tab_scans"
+            app:icon="@drawable/ic_scans"
+            app:iconGravity="textStart"
+            app:iconPadding="7dp"
+            app:iconSize="20dp"
+            app:iconTint="@color/whl_ink" />
+
+        <View
+            android:layout_width="1dp"
+            android:layout_height="32dp"
+            android:background="@color/whl_face_sh2" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/tabCollections"
             style="@style/WhlToolbarAction"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="match_parent"
             android:layout_weight="1"
             android:paddingStart="4dp"
             android:paddingEnd="4dp"
+            android:fontFamily="@font/roboto_slab"
+            android:textAllCaps="false"
             android:textSize="12sp"
-            android:text="@string/home_tab_collections" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnSelect"
-            style="@style/WhlToolbarAction"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingStart="6dp"
-            android:paddingEnd="6dp"
-            android:textSize="11sp"
-            android:text="@string/home_select" />
+            android:text="@string/home_tab_collections"
+            app:icon="@drawable/ic_collections"
+            app:iconGravity="textStart"
+            app:iconPadding="7dp"
+            app:iconSize="20dp"
+            app:iconTint="@color/whl_ink" />
     </LinearLayout>
 
     <TextView
@@ -104,7 +116,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:fontFamily="monospace"
+            android:fontFamily="@font/roboto_slab"
             android:textSize="12sp"
             android:textColor="@color/whl_ink" />
 
@@ -113,6 +125,8 @@
             style="@style/WhlToolbarAction"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:fontFamily="@font/roboto_slab"
+            android:textAllCaps="false"
             android:textSize="11sp"
             android:textColor="@color/whl_red"
             android:text="@string/home_delete_selected" />
@@ -122,6 +136,8 @@
             style="@style/WhlToolbarAction"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:fontFamily="@font/roboto_slab"
+            android:textAllCaps="false"
             android:textSize="11sp"
             android:text="@string/home_cancel_select" />
     </LinearLayout>
@@ -191,23 +207,30 @@
         app:layout_constraintEnd_toEndOf="parent">
 
         <!-- the way into capture; the app no longer opens straight onto the camera -->
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/newScan"
             style="@style/WhlButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:drawableStart="@drawable/ic_camera_new"
-            android:drawablePadding="8dp"
+            android:fontFamily="@font/roboto_slab"
             android:gravity="center"
+            android:textAllCaps="false"
             android:textSize="15sp"
-            android:text="@string/home_new_scan" />
+            android:text="@string/home_new_scan"
+            app:icon="@drawable/ic_camera_new"
+            app:iconGravity="textStart"
+            app:iconPadding="8dp"
+            app:iconSize="26dp"
+            app:iconTint="@color/whl_button_text" />
 
         <Button
             android:id="@+id/newCollection"
             style="@style/WhlButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:fontFamily="@font/roboto_slab"
             android:gravity="center"
+            android:textAllCaps="false"
             android:textSize="15sp"
             android:visibility="gone"
             android:text="@string/collections_new" />

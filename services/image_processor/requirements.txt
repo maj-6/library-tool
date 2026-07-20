@@ -1,0 +1,15 @@
+# Runtime dependencies are exact-pinned so the same container can be rebuilt.
+fastapi==0.139.2
+httpx==0.28.1
+numpy==2.4.6
+opencv-python-headless==4.13.0.92
+Pillow==12.3.0
+pydantic==2.13.4
+uvicorn==0.51.0
+
+# page-dewarp 0.3.4 declares the GUI OpenCV wheel. The Dockerfile installs it
+# with --no-deps after supplying these headless-compatible dependencies.
+matplotlib==3.10.9
+msgspec==0.21.1
+scipy==1.17.1
+sympy==1.14.0

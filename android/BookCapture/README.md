@@ -1,155 +1,232 @@
-# Book Capture (Android)
+# Library Tool Capture (Android)
 
-Hands-free companion app for the Library Tool: photograph title/copyright
-pages of old books, OCR and extract the bibliography in the background, and
-upload everything to the cloud (or straight to a paired desktop over the
-LAN), where the desktop Library Tool files each capture as an entry with
-its photos attached.
+Library Tool Capture `0.5.1-alpha.8` is the Android companion for Library
+Tool. It photographs books, runs OCR and catalog extraction in the background,
+and sends captures either through the cloud or directly to a paired desktop on
+the local network.
 
-## Screens
+The app is still a prerelease. **Check for updates** currently refreshes the
+validated remote catalog of Android strings and in-app icons; it does not offer
+or install an uncertified APK.
 
-The app opens on **Home**, which has two tabs.
+## Home and book details
 
-**Scans** is the recent-scans list (page thumbnail, extracted title /
-author / year or "Processing…" until the OCR/extraction pipeline catches
-up, where the book came from, and status: pending upload / uploaded /
-imported), with multi-select delete. Home owns the sign-in gate; **New
-scan** opens the capture screen. Tapping a scan opens its **detail**: all
-photos, the OCR text, every extracted field, and re-running the extraction
-with per-book custom instructions.
+The app opens on **Home**, which has **Scans** and **Collections** tabs.
 
-**Collections** is where books get their provenance. A collection is the
-batch a book was scanned into — a shelf, a crate, a room — and it carries a
-**From**: where that batch physically came from ("Storage", "Christopher
-Office"). Add, rename, re-origin and delete collections here; tapping one
-makes it the collection the next book lands in.
+The Scans tab groups books into collapsible collection sections. The current
+collection is listed first and expanded initially. Waiting work uses an
+animated indicator, delivered work uses an icon, and the colored state marker
+carries the successful/complete state.
+
+Scan-row gestures are literal:
+
+- Tap a row to select exactly that one scan.
+- Long-press a row to add or remove it without clearing the other selections.
+- Tap the trailing chevron to open book details.
+
+Selection state survives Activity recreation. The selection bar provides
+cancel and local-delete actions; deleting an uploaded row never deletes its
+cloud or desktop copy.
+
+Book details present title, author, and year as primary catalog fields;
+publisher, language, edition, and subtitle as secondary fields; and remaining
+metadata in a compact table. The title page is the large hero image, cover and
+spine roles are inferred when the evidence supports them, a cover can supply
+the list thumbnail, OCR text is collapsed initially, and JSON/Mistral
+diagnostics live in a separate collapsible panel. OCR polygons can be drawn on
+the corrected display image. Press and hold any photo with a retained camera
+original to compare it directly; releasing restores the corrected revision and
+its revision-bound overlays.
+
+## Capture view
+
+A collection must be current before a scan can start. The camera preview has a
+faint page-margin frame that remains at least two physical pixels wide, with
+the area outside the intended title-page margin slightly darkened. The fixed
+right-side controls open voice notes and camera/scan settings and switch
+portrait/landscape framing; only the orientation glyph changes.
+
+The camera popup contains practical capture controls only: tap/manual focus and
+focus lock, zoom, exposure compensation, continuous light, low/fast/detail
+resolution profiles, and preview sharpening where the Android version supports
+it. Display-overlay and post-processing choices remain in the main Settings
+screen.
+
+The old recent-book selector is gone. The space between the camera/captured-page
+preview and the bottom controls contains one **last captured book** card:
+
+- It shows the newest sealed capture submitted for processing, not the open
+  capture currently being photographed.
+- It remains visible while the next book is open and changes only after that
+  next capture is sealed.
+- With no submitted capture, it shows the app-mark dummy thumbnail and an empty
+  state.
+- Its title, author, and year area opens book details. A bracketed-list action
+  appears only when additional fields exist and opens a popup containing only
+  those extra fields.
 
 ## Collections and provenance
 
-**A collection must be chosen before a book scan can start.** Both routes
-in are gated — the Home button and the spoken word "start" — and
-`CaptureSession.start()` takes the collection as a parameter, so the
-requirement is enforced by the type rather than by remembering to ask. A
-single existing collection selects itself; with several, the choice is
-explicit.
+A collection represents the catalog batch into which a book was scanned. It
+has two deliberately separate location concepts:
 
-Provenance is frozen per book at `start()`, before the first photo, into
-`filesDir/queue/<entryId>/collection.json`. Re-selecting a different
-collection halfway down a shelf therefore never relabels books already
-captured, and a crash mid-book is recovered with the provenance it was
-started under. A single book's **From** can be overridden from its detail
-screen up until it uploads; after that the cloud row is insert-only, so the
-field is locked rather than allowed to disagree with what the desktop
-already holds.
+- `parentId` is the durable collection-to-collection hierarchy edge. It builds
+  paths such as `Office > Periodicals` and is synchronized as `parent_id`.
+- `from` is physical provenance: where that batch came from, such as `Storage`
+  or `Christopher Office`. It never identifies a parent collection.
 
-Collections always live on the phone (`filesDir/collections.json`), so adding,
-editing, deleting and scanning remain available while signed out or offline.
-When signed in, a background job reconciles them two-way with the shared cloud
-`collections` rows. Local edits and soft-delete tombstones sync on reconnect;
-the first sign-in pushes collections created in local mode without changing
-their UUIDs.
+A root collection may display its physical origin as a prefix, but nested
+identity is always resolved by `parentId`. Missing/deleted parents and cycles
+stop safely rather than inventing hierarchy from matching names. The collection
+editor excludes the collection itself and its descendants from the parent
+choices.
 
-Each capture sends `scan_collection_id` for durable identity alongside the
-frozen `scan_collection` name and `scan_from` snapshot. Renaming a shared
-collection therefore updates its current row without relabelling books already
-scanned into it. The `scan_` prefix also keeps these passthrough fields out of
-the desktop's fallback-OCR metadata test — see `tests/test_phone_capture.py`.
+`CaptureSession.start()` requires a `BookCollection`, so both the Home button
+and spoken **start** command are gated. The collection UUID, name, and `from`
+value are frozen before the first photo in
+`filesDir/queue/<entryId>/collection.json`. A later hierarchy or collection
+rename can improve the live group label through the UUID without changing the
+book's stored provenance snapshot.
 
-## Voice flow
+Collections remain available offline in `filesDir/collections.json`. When
+signed in, a background worker reconciles their edits, hierarchy, tombstones,
+and merges with the shared cloud rows. Each capture sends
+`scan_collection_id`, `scan_collection`, and `scan_from`.
 
-| Say        | Effect                                            |
-|------------|---------------------------------------------------|
-| **start**  | begin a book entry                                |
-| **photo**  | photograph the page shown in the preview          |
-| **done**   | seal the entry and queue it for upload            |
-| **cancel** | void the entry (photos discarded)                 |
+## Voice commands and notes
 
-Every registered command is confirmed with a short distinct tone.
-Recognition is offline (Vosk, restricted to the four command words, firing
-on partial results so a command lands in well under a second) — the small
-English model (~40 MB) downloads automatically the first time the capture
-screen is opened. The on-screen icon buttons (new-entry camera, camera,
-check, cross) mirror the voice commands; the top bar shows the open entry's
-photo count and a dropdown of recent scans.
+General hands-free commands use the optional offline Vosk recognizer. Voice
+notes use Mistral realtime speech-to-text and therefore require microphone
+permission, a Mistral API key, and network access. Vosk pauses while Mistral
+owns the microphone.
+
+| Say | Effect |
+| --- | --- |
+| **start** | Begin a capture in the current collection. |
+| **photo** | Photograph the page shown in the preview. |
+| **done** | Seal the capture and submit it for background processing/upload. |
+| **cancel** | Discard the open capture immediately; no confirmation dialog. |
+| **restart** | Discard the open capture and start a fresh one in the same/current collection. |
+| **undo** | Discard the most recent committed photo or saved/in-progress note. |
+| **notes** | Start a Mistral voice note for the open capture. |
+| **end notes** | Finish and save the active note. |
+
+The floating note button provides the same start/finish action. While a note is
+active, a compact translucent overlay shows the evolving transcript. The words
+**Price**, **Pages**, **Condition**, **Illustrations**, and **Remark** become
+colored field rows; later transcript updates may retroactively classify text
+that first appeared unstructured. Note checkpoints survive lifecycle changes,
+and in-flight photo/note mutations defer destructive commands until they can be
+applied safely.
+
+## Cloud image derivatives
+
+After OCR/extraction assigns title-page, cover, and spine roles, Android freezes
+a versioned post-processing request for those photos. Settings provide
+automatic-by-date, modern (1950+), older (1850-1949), and early (before 1850)
+presets plus feature controls for page/perspective dewarping, detected-margin
+cropping, contrast normalization, and spine cropping.
+
+For cloud captures, the active derivative flow is:
+
+1. Android uploads verified immutable camera originals and the capture row.
+2. Supabase migration 015 creates owner-scoped `photo_processing_jobs` and
+   holds desktop import while jobs are processing.
+3. The Cloud Run image worker verifies the original hash, corrects perspective
+   and supported page curvature, crops detected margins/spines, and produces
+   display, OCR, thumbnail, and transform artifacts in the private
+   `capture-derivatives` bucket.
+4. Android polls the jobs, validates ownership, request/revision lineage,
+   hashes, dimensions, MIME type, byte count, and complete JPEG structure, then
+   atomically installs the corrected display revision.
+
+The camera original is never replaced. Pending derivatives use softened
+thumbnails, press-and-hold comparison reads the retained original, and OCR
+geometry is transformed only when the worker returns a mapping that is valid
+for the exact source/display revisions. See
+[`services/image_processor/README.md`](../../services/image_processor/README.md)
+for deployment and worker details.
+
+## Transport
+
+Settings chooses how sealed entries leave the phone:
+
+- **Cloud** uploads through Supabase with the signed-in account.
+- **LAN** sends directly to a paired desktop using its address and token and
+  works without internet or an account.
+- **Auto** prefers the paired desktop when reachable and otherwise uses cloud.
+
+LAN import reuses phone OCR/fields when available; otherwise the desktop runs
+its normal ingest processing. A successful LAN response is the terminal
+`imported` state and bypasses the Supabase derivative queue.
+
+## Data path
+
+```text
+photo
+  -> filesDir/queue/<entryId>/photo_N.jpg
+  -> collection.json provenance + versioned photo-assets contract
+  -> background Mistral OCR (*.jpg.txt) + extraction (meta.json)
+  -> role/date-specific derivative request
+  -> Cloud: immutable originals in captures + captures row
+       -> photo_processing_jobs -> capture-derivatives
+       -> verified corrected display revision installed on Android
+       -> desktop import
+  -> LAN: direct authenticated POST -> desktop import
+  -> local history in filesDir/sent/<entryId>
+```
+
+The strict cloud `captures.photos` array remains the original-photo transport
+contract. Corrected display artifacts never masquerade as camera originals.
 
 ## Build
 
-1. Open `android/BookCapture` in Android Studio Koala Feature Drop
-   (2024.1.2) or newer and let it sync. The project uses AGP 8.6, Kotlin
-   1.9.24, JDK 17, and the checked-in Gradle 8.12 wrapper.
-2. Fork maintainers export `WHL_SUPABASE_URL` / `WHL_SUPABASE_ANON_KEY` before
-   building to bake their public project configuration in (release CI already
-   does this for official builds). App users never enter a Supabase key.
-3. Run on a device with Android 8.0+ (minSdk 26). Grant camera + microphone.
-4. Sign in with your Library Tool account (see
-   `docs/cloud_capture_setup.md`); set the Mistral / DeepSeek API keys once —
-   they are stored in your cloud profile and shared with the desktop.
+1. Open `android/BookCapture` in Android Studio Koala Feature Drop (2024.1.2)
+   or newer and let it sync. The project uses AGP 8.6, Kotlin 1.9.24, JDK 17,
+   and the checked-in Gradle 8.12 wrapper.
+2. Fork maintainers export `WHL_SUPABASE_URL` and `WHL_SUPABASE_ANON_KEY`
+   before building. Official release CI injects the project configuration; app
+   users never enter a Supabase key.
+3. Run on Android 8.0+ (`minSdk 26`) and grant camera/microphone access as
+   needed.
+4. Sign in for cloud sync and save Mistral/DeepSeek credentials in Settings.
+   Account profile secrets synchronize with the desktop; local-mode values stay
+   on the device until sign-in.
 
-## Running it on an emulator
+## Running on an emulator
 
-`tools/emulator.ps1` starts a headless AVD, installs nothing itself, and exits
-either when the guest reports `sys.boot_completed` or when it gives up:
+`tools/emulator.ps1` starts a headless AVD and waits for bounded boot
+completion:
 
-```
-powershell -File tools/emulator.ps1 -Action start     # boots, waits, exits
+```powershell
+powershell -File tools/emulator.ps1 -Action start
 powershell -File tools/emulator.ps1 -Action status
 powershell -File tools/emulator.ps1 -Action stop
 ./gradlew :app:assembleDebug
 adb install -r -t app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Create the AVD once (needs `cmdline-tools` in the SDK):
+Create the AVD once (with Android SDK command-line tools installed):
 
-```
+```powershell
 sdkmanager "system-images;android-34;default;x86_64"
 avdmanager create avd -n whl_test -k "system-images;android-34;default;x86_64" -d pixel_6
 ```
 
-Three things about that script are deliberate, each from a failure:
+The script launches the emulator detached, kills it after a bounded boot
+timeout, and supplies an explicit DNS server to avoid VPN-adapter boot loops.
 
-- **The emulator is launched detached.** It is a server and never exits, so
-  running it as a tracked child of a build/tool runner leaves that runner
-  waiting forever and holding file handles.
-- **The boot wait is bounded** and kills the emulator on timeout. A hung
-  emulator is otherwise indistinguishable from a slow one.
-- **It passes an explicit `-dns-server`.** With a VPN adapter up (NordLynx and
-  friends) the emulator otherwise re-enumerates the tunnel's addresses forever —
-  the log fills with `Ignore IPv6 address` and the guest never boots at all.
+## Launcher icon
 
-The launcher icon is generated, not hand-placed: `icon.png` here is the
-1024 px master, and `python tools/make_android_icon.py` (from the repo root)
-rewrites the five `ic_launcher_fg.png` density buckets from it.
-`--check` verifies the committed bitmaps still match. It exists because
-adaptive-icon framing is easy to get wrong — the launcher's mask is
-inscribed in the centre 72 dp of the 108 dp canvas and can be a circle, so
-artwork has to fit that circle's *diameter*, not the square. The script
-documents the arithmetic; the 14.5 dp inset it works back from is asserted
-by `ResourceContractTest`.
+The launcher icon is generated from the 1024 px `icon.png` master. From the
+repository root, run:
 
-## Transport
+```powershell
+python tools/make_android_icon.py
+python tools/make_android_icon.py --check
+```
 
-Settings picks how sealed entries leave the phone: **Cloud** (Supabase,
-the default), **LAN** (a paired desktop on the local network — host +
-token, with a connection test), or **Auto** (LAN when the desktop answers,
-else cloud). Over the LAN the entry POSTs straight to the desktop, which
-imports it synchronously — reusing the phone's OCR and fields when they
-arrived with the POST, else doing its own OCR on ingest — no cloud upload
-and no signed-in account needed for that leg.
-
-## Data path
-
-photo → `filesDir/queue/<entryId>/photo_N.jpg`
-  → provenance frozen at start → `collection.json` (its own sidecar: the
-    ownership sidecar `capture.json` is rewritten wholesale when a legacy
-    capture is repaired, which would erase provenance folded in beside it)
-  → (background) standardized in place, OCR → `photo_N.jpg.txt`,
-    fields → `meta.json`
-  → (upload, as the signed-in user) Supabase storage
-    `captures/<device>/<entryId>/photo_N.jpg` + a `captures` table row
-    (`status=pending`, with `created_by`/`contributor`/`ocr`/`meta`)
-  → folder moves to `filesDir/sent/<entryId>` (the recent list's history;
-    pruned to the last 15) → desktop Library Tool imports it and marks the
-    row `imported`.
-
-Over LAN the upload step instead POSTs the entry to the paired desktop —
-a 200 response IS "imported", so there is nothing to poll afterwards.
+The generator writes the five `ic_launcher_fg.png` density buckets. The
+adaptive-icon foreground uses the botanical-green background and a 13.5 dp safe
+inset so circular launcher masks do not clip the square mark; the resource
+contract tests enforce that geometry.

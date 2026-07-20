@@ -33,9 +33,6 @@ class SettingsActivity : AppCompatActivity() {
             else getString(R.string.set_local_mode)
         binding.signOut.text = getString(
             if (signedInAtOpen) R.string.set_sign_out else R.string.set_sign_in)
-        binding.apiKeysNote.text = getString(
-            if (signedInAtOpen) R.string.set_api_keys_note
-            else R.string.set_api_keys_note_local)
         binding.displayName.setText(Prefs.displayName(this))
         binding.device.setText(Prefs.deviceName(this))
         binding.compactScanList.isChecked = Prefs.compactScanList(this)
@@ -77,7 +74,6 @@ class SettingsActivity : AppCompatActivity() {
                 else -> PostProcessingPreset.AUTOMATIC_BY_DATE
             }
             Prefs.setPostProcessingPreset(this, preset)
-            renderPostProcessingSummary(preset)
         }
         binding.postProcessingDewarp.setOnCheckedChangeListener { _, enabled ->
             Prefs.setPostProcessingDewarp(this, enabled)
@@ -99,8 +95,11 @@ class SettingsActivity : AppCompatActivity() {
         // viewfinder sharpen is a GPU shader on the preview — Android 13+ only
         renderCameraSettings()
         binding.cameraProfileGroup.setOnCheckedChangeListener { _, checkedId ->
-            Prefs.setCameraProfile(this, if (checkedId == R.id.cameraProfileDetail)
-                Prefs.CAMERA_PROFILE_DETAIL else Prefs.CAMERA_PROFILE_FAST)
+            Prefs.setCameraProfile(this, when (checkedId) {
+                R.id.cameraProfileLow -> Prefs.CAMERA_PROFILE_LOW
+                R.id.cameraProfileDetail -> Prefs.CAMERA_PROFILE_DETAIL
+                else -> Prefs.CAMERA_PROFILE_FAST
+            })
         }
         binding.continuousLight.setOnCheckedChangeListener { _, on ->
             Prefs.setTorchEnabled(this, on)
@@ -212,6 +211,9 @@ class SettingsActivity : AppCompatActivity() {
             }
             rememberProfileBaseline()
             ProcessWorker.enqueue(this)
+            // Also revives a nonlinear-display OCR marker left by missing
+            // credentials or an exhausted bounded retry run.
+            CloudDisplayReocrWorker.enqueueAllPending(this)
         }
 
         binding.test.setOnClickListener {
@@ -241,7 +243,6 @@ class SettingsActivity : AppCompatActivity() {
                     binding.signOut.isEnabled = true
                     binding.accountEmail.text = getString(R.string.set_local_mode)
                     binding.signOut.text = getString(R.string.set_sign_in)
-                    binding.apiKeysNote.text = getString(R.string.set_api_keys_note_local)
                     binding.displayName.setText(Prefs.displayName(this@SettingsActivity))
                     binding.mistralKey.setText(Prefs.mistralKey(this@SettingsActivity))
                     binding.deepseekKey.setText(Prefs.deepseekKey(this@SettingsActivity))
@@ -255,17 +256,15 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun renderCameraSettings() {
-        binding.cameraProfileFast.isChecked =
-            Prefs.cameraProfile(this) == Prefs.CAMERA_PROFILE_FAST
-        binding.cameraProfileDetail.isChecked =
-            Prefs.cameraProfile(this) == Prefs.CAMERA_PROFILE_DETAIL
+        binding.cameraProfileGroup.check(when (Prefs.cameraProfile(this)) {
+            Prefs.CAMERA_PROFILE_LOW -> R.id.cameraProfileLow
+            Prefs.CAMERA_PROFILE_DETAIL -> R.id.cameraProfileDetail
+            else -> R.id.cameraProfileFast
+        })
         binding.continuousLight.isChecked = Prefs.torchEnabled(this)
         binding.sharpenPreview.isEnabled =
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
         binding.sharpenPreview.isChecked = Prefs.sharpenPreview(this)
-        binding.cameraDiagnostics.text = Prefs.cameraDiagnostics(this).ifEmpty {
-            getString(R.string.set_camera_diagnostics_unavailable)
-        }
     }
 
     private fun renderOcrOverlaySettings() {
@@ -298,20 +297,6 @@ class SettingsActivity : AppCompatActivity() {
         binding.postProcessingContrast.isChecked =
             features.normalizePageAndTextContrast
         binding.postProcessingSpineCrop.isChecked = features.detectAndCropSpine
-        renderPostProcessingSummary(preset)
-    }
-
-    private fun renderPostProcessingSummary(preset: PostProcessingPreset) {
-        binding.postProcessingPresetSummary.setText(when (preset) {
-            PostProcessingPreset.AUTOMATIC_BY_DATE ->
-                R.string.set_post_processing_summary_automatic
-            PostProcessingPreset.MODERN_1950_AND_LATER ->
-                R.string.set_post_processing_summary_modern
-            PostProcessingPreset.OLDER_1850_TO_1949 ->
-                R.string.set_post_processing_summary_older
-            PostProcessingPreset.EARLY_BEFORE_1850 ->
-                R.string.set_post_processing_summary_early
-        })
     }
 
     private fun rememberProfileBaseline() {

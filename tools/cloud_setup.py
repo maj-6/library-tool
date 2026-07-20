@@ -2,7 +2,7 @@
 """Set up and inspect the Library Tool Supabase project.
 
     python3 tools/cloud_setup.py check      what exists, what is missing
-    python3 tools/cloud_setup.py buckets    create the storage buckets
+    python3 tools/cloud_setup.py buckets    create/repair the storage buckets
     python3 tools/cloud_setup.py seed       publish local builds as volumes (metadata only)
     python3 tools/cloud_setup.py anon-key   print the website's config snippet
 
@@ -35,14 +35,34 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "docs" / "cloud" / "migra
 # (expected_schema below) — one source of truth. Views are few enough to
 # name by hand: view -> the columns its consumers select.
 VIEWS = {"author_index": ["author", "work_count"]}
-BUCKETS = {"captures": False, "volumes": True}       # name -> public?
+BUCKETS = {
+    "captures": False,
+    "capture-derivatives": False,
+    "volumes": True,
+}                                                       # name -> public?
+BUCKET_OPTIONS = {
+    "captures": {
+        "file_size_limit": 32 * 1024 * 1024,
+        "allowed_mime_types": ["image/jpeg"],
+    },
+    "capture-derivatives": {
+        "file_size_limit": 32 * 1024 * 1024,
+        "allowed_mime_types": ["image/jpeg", "application/json"],
+    },
+}
 # Role smoke tests: the website reads ANON_CAN with the anon key; ANON_CANNOT
 # holds user data behind revoked grants — an anon read succeeding on any of
 # them means the revoke/RLS blocks were not applied. passages is RPC-only by
 # design (docs/search-design.md D6): anon reaches it through search_passages,
 # never a table read.
-ANON_CAN = ["volumes", "volume_pages", "releases", "index_versions"]
-ANON_CANNOT = ["profiles", "events", "captures", "passages", "collections"]
+ANON_CAN = [
+    "volumes", "volume_pages", "releases", "index_versions",
+    "android_ui_catalog",
+]
+ANON_CANNOT = [
+    "profiles", "events", "captures", "photo_processing_jobs", "passages",
+    "collections", "android_ui_publishers",
+]
 
 
 def config() -> dict:
@@ -52,7 +72,11 @@ def config() -> dict:
 
 
 def key_role(key: str) -> str:
-    """service_role or anon, read straight out of the JWT (no verification)."""
+    """Identify modern opaque keys or read a legacy JWT role without verification."""
+    if key.startswith("sb_secret_"):
+        return "secret"
+    if key.startswith("sb_publishable_"):
+        return "publishable"
     import base64
     try:
         payload = key.split(".")[1]
@@ -67,9 +91,17 @@ def migration_files() -> list[Path]:
     return sorted(MIGRATIONS_DIR.glob("*.sql"))
 
 
-_CREATE_RE = re.compile(r"^\s*create table if not exists (\w+)\s*\(")
-_ADD_RE = re.compile(r"^\s*alter table (\w+) add column (?:if not exists )?(\w+)")
-_DROP_RE = re.compile(r"^\s*alter table (\w+) drop column (?:if exists )?(\w+)")
+_CREATE_RE = re.compile(
+    r"^\s*create table if not exists (?:public\.)?(\w+)\s*\("
+)
+_ADD_RE = re.compile(
+    r"^\s*alter table (?:public\.)?(\w+) "
+    r"add column (?:if not exists )?(\w+)"
+)
+_DROP_RE = re.compile(
+    r"^\s*alter table (?:public\.)?(\w+) "
+    r"drop column (?:if exists )?(\w+)"
+)
 _IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*")
 _CONSTRAINTS = {"primary", "unique", "check", "foreign", "constraint", "like"}
 
@@ -163,8 +195,8 @@ def cmd_check(args) -> None:
     cfg = config()
     ref = cfg["url"].split("//")[-1].split(".")[0]
     print(f"project  {ref[:6]}…{ref[-4:]}   key role: {key_role(cfg['key'])}")
-    if key_role(cfg["key"]) != "service_role":
-        print("  ! the desktop needs the service_role key, not the anon key")
+    if key_role(cfg["key"]) not in {"service_role", "secret"}:
+        print("  ! owner setup needs a secret key, not a public/anon key")
 
     bad: list[str] = []
     try:
@@ -265,14 +297,28 @@ def cmd_buckets(args) -> None:
     url, _, headers = sb._cfg(cfg)
     have = existing_buckets(cfg)
     for name, public in BUCKETS.items():
+        options = BUCKET_OPTIONS.get(name, {})
+        body_value = {"public": public, **options}
         if name in have:
-            print(f"  {name}: exists (public={have[name]})")
+            if args.dry_run:
+                if options or have[name] != public:
+                    print(f"  {name}: would enforce private/type/size settings")
+                else:
+                    print(f"  {name}: exists (public={have[name]})")
+                continue
+            if options or have[name] != public:
+                h = dict(headers, **{"Content-Type": "application/json"})
+                body = json.dumps(body_value).encode()
+                sb._request("PUT", f"{url}/storage/v1/bucket/{name}", h, body)
+                print(f"  {name}: updated (public={public}, restrictions enforced)")
+            else:
+                print(f"  {name}: exists (public={have[name]})")
             continue
         if args.dry_run:
             print(f"  {name}: would create (public={public})")
             continue
         h = dict(headers, **{"Content-Type": "application/json"})
-        body = json.dumps({"id": name, "name": name, "public": public}).encode()
+        body = json.dumps({"id": name, "name": name, **body_value}).encode()
         sb._request("POST", f"{url}/storage/v1/bucket", h, body)
         print(f"  {name}: created (public={public})")
     if args.dry_run:
@@ -442,7 +488,7 @@ def main() -> None:
 
     sub.add_parser("check", help="what exists, what is missing").set_defaults(fn=cmd_check)
 
-    b = sub.add_parser("buckets", help="create the storage buckets")
+    b = sub.add_parser("buckets", help="create or repair the storage buckets")
     b.add_argument("--apply", dest="dry_run", action="store_false", default=True)
     b.set_defaults(fn=cmd_buckets)
 

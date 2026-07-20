@@ -1,6 +1,7 @@
 # Cloud capture setup (Supabase)
 
-The phone app and the desktop Library Tool meet in a free Supabase project:
+The phone app, the desktop Library Tool, and the optional cloud image worker
+meet in a Supabase project:
 the phone inserts one row + photos per captured book, along with the OCR
 text and fields it already extracted in the background (BookCapture 0.2.0+,
 i.e. every current build);
@@ -36,7 +37,8 @@ fresh project, paste each file into the SQL Editor and run it, in order
 API keys; plus `builds`, `ia_catalog`, `corrections` and `taxonomy` for the
 working-store sync (the desktop's gitignored builds / IA-download catalog /
 WHL corrections / category taxonomy merge through these; see
-`tools/store_sync.py`).
+`tools/store_sync.py`). Migration 015 adds the owner-readable
+`photo_processing_jobs` queue used by the optional image processor.
 
 On an existing project, don't re-paste everything: `python3
 tools/cloud_setup.py check` diffs the `schema_migrations` table against the
@@ -50,10 +52,13 @@ applied file — ship a new migration that reverses the change.
 python3 tools/cloud_setup.py buckets --apply
 ```
 
-`captures` (private) holds phone photos; `volumes` (public) holds published
-PDFs. Bucket creation is an owner setup task. `tools/cloud_setup.py` reads a
-service credential from `SUPABASE_KEY` for this one-time administration step;
-that credential is never distributed to phone or desktop users.
+`captures` (private) holds phone originals; `capture-derivatives` (private)
+holds corrected display/OCR/thumbnail artifacts; `volumes` (public) holds
+published PDFs. Bucket creation is an owner setup task. `tools/cloud_setup.py`
+reads `SUPABASE_KEY` from the process environment for this one-time
+administration step. Use a backend-only `sb_secret_...` key or legacy
+service-role credential; it is never saved in desktop settings or distributed
+to phone/desktop users.
 
 Then check the whole thing:
 
@@ -90,6 +95,17 @@ The `captures` bucket stays small: after an entry is imported the desktop
 keeps the processed photos locally under `DATA_ROOT/captures/<id>/` and (by
 default) deletes the cloud copies.
 
+When migration 015 finds a valid processing request in an uploaded capture,
+it atomically changes that row from `pending` to `processing`. The desktop
+therefore waits while the worker uses the immutable original. Once every job
+for that capture is completed or terminally failed, the worker returns the
+capture to `pending` and normal desktop import resumes. Corrected files do not
+go into `captures.photos`; that array remains the exact original-photo
+transport contract.
+
+The deployable worker, its local test commands, and a complete Cloud Run setup
+are in [`services/image_processor/README.md`](../services/image_processor/README.md).
+
 ## 5. Accounts: confirmation links + email copy
 
 If people will sign in from the app, set the auth **Site URL / Redirect URLs**
@@ -102,9 +118,11 @@ the project-specific confirmation email — both in **[docs/cloud/auth_setup.md]
   captures, and lets a desktop process only its own or explicitly assigned
   contributors' captures. Storage follows the same rule; upload remains
   available to signed-in phones.
-- A service credential is still appropriate for explicitly privileged owner
+- A backend secret is still appropriate for explicitly privileged owner
   tasks such as publishing public volumes and maintaining project-wide working
-  stores. It is optional and is not part of phone sync.
+  stores, and it is required by the image worker. It is never part of phone or
+  desktop account sync.
 - The `books` table is a one-way mirror of the desktop catalog (checked +
   manual) so future tools (or the phone) can read it; the desktop never
-  reads it back.
+  reads it back. Each row has a database-generated UUID identity; its unique
+  source `key` remains only the conflict target for mirror upserts.

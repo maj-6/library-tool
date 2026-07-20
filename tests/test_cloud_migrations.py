@@ -11,6 +11,7 @@ import base64
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import cloud_setup
 import pytest
@@ -32,6 +33,15 @@ TRIGGER_GRANTS_FLAT = " ".join(TRIGGER_GRANTS.split())
 COLLECTIONS_MIG = SQL["009_collections"]
 COLLECTIONS_FLAT = " ".join(COLLECTIONS_MIG.split())
 COLLECTIONS_IDENTITY = SQL["010_collections_authenticated_identity"]
+COLLECTION_MERGE_IDENTITY = SQL["011_collection_merge_authenticated_identity"]
+BOOKS_IDENTITY = SQL["012_books_random_identity"]
+BOOKS_IDENTITY_FLAT = " ".join(BOOKS_IDENTITY.split())
+ANDROID_UI_CATALOG = SQL["013_android_ui_catalog"]
+ANDROID_UI_CATALOG_FLAT = " ".join(ANDROID_UI_CATALOG.split())
+ANDROID_UI_DEFAULTS = SQL["014_android_ui_catalog_defaults"]
+ANDROID_UI_DEFAULTS_FLAT = " ".join(ANDROID_UI_DEFAULTS.split())
+PHOTO_PROCESSING = SQL["015_photo_processing_jobs"]
+PHOTO_PROCESSING_FLAT = " ".join(PHOTO_PROCESSING.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -177,6 +187,169 @@ def test_migrations_lint_clean():
         assert sql.rstrip().endswith(";"), f"{mid}: missing final semicolon"
 
 
+# --- 012: random mirrored-book identity ------------------------------------------
+
+def test_books_migration_adds_random_primary_identity_without_rekeying_sync():
+    schema = cloud_setup.expected_schema("\n".join(SQL.values()))
+    assert schema["books"] == {"id", "key", "data", "updated_at"}
+    assert ("add column if not exists id uuid default gen_random_uuid();"
+            in BOOKS_IDENTITY_FLAT)
+    assert "alter column id set default gen_random_uuid();" in BOOKS_IDENTITY_FLAT
+    assert "alter column id set not null;" in BOOKS_IDENTITY_FLAT
+    assert "add constraint books_pkey primary key (id);" in BOOKS_IDENTITY_FLAT
+    assert ("create unique index if not exists books_key_uidx on public.books "
+            "(key);" in BOOKS_IDENTITY_FLAT)
+
+
+def test_books_identity_backfill_is_idempotent_and_preserves_existing_ids():
+    body = re.sub(r"--[^\n]*", "", BOOKS_IDENTITY)
+    flat = " ".join(body.split())
+    assert "update public.books set id = gen_random_uuid() where id is null;" in flat
+    assert flat.count("set id = gen_random_uuid()") == 1
+    assert "if not coalesce(primary_is_id, false) then" in flat
+    assert "drop constraint %I" in flat
+    assert not re.search(r"create (?:unique )?index (?!if not exists)", body)
+
+
+# --- 013: remotely refreshed Android UI catalog ---------------------------------
+
+def test_android_ui_catalog_is_public_read_and_publisher_only_write():
+    schema = cloud_setup.expected_schema(ANDROID_UI_CATALOG)
+    assert schema["android_ui_publishers"] == {"user_id", "created_at"}
+    assert schema["android_ui_catalog"] == {
+        "id", "revision", "catalog", "updated_at", "updated_by",
+    }
+    assert "alter table android_ui_catalog enable row level security;" in \
+        ANDROID_UI_CATALOG_FLAT
+    assert "grant select on public.android_ui_catalog to anon, authenticated;" in \
+        ANDROID_UI_CATALOG_FLAT
+    assert "grant delete on public.android_ui_catalog to authenticated" not in \
+        ANDROID_UI_CATALOG_FLAT
+    assert "android_ui_catalog" in cloud_setup.ANON_CAN
+    assert "android_ui_publishers" in cloud_setup.ANON_CANNOT
+
+
+def test_android_ui_catalog_payload_is_bounded_and_writes_are_attributed():
+    assert "pg_column_size(catalog) <= 786432" in ANDROID_UI_CATALOG_FLAT
+    assert ("create index if not exists android_ui_catalog_updated_by_idx "
+            "on android_ui_catalog (updated_by) where updated_by is not null;"
+            in ANDROID_UI_CATALOG_FLAT)
+    assert "jsonb_typeof(catalog -> 'strings') = 'object'" in \
+        ANDROID_UI_CATALOG_FLAT
+    assert "jsonb_typeof(catalog -> 'icons') = 'object'" in \
+        ANDROID_UI_CATALOG_FLAT
+    assert ANDROID_UI_CATALOG.count("updated_by = (select auth.uid())") == 2
+    assert ANDROID_UI_CATALOG.count(
+        "publisher.user_id = (select auth.uid())",
+    ) == 3
+
+
+def test_android_ui_publisher_seed_is_conditional_and_not_a_hardcoded_identity():
+    assert "information_schema.columns" in ANDROID_UI_CATALOG_FLAT
+    assert "role = 'maintainer' and status = 'approved'" in \
+        ANDROID_UI_CATALOG_FLAT
+    assert not re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        ANDROID_UI_CATALOG,
+        re.I,
+    )
+
+
+def test_initial_android_ui_overlay_is_a_compatible_catalog_baseline():
+    source = json.loads((Path(__file__).parents[1] / "android" / "BookCapture" /
+                         "remote-ui" / "catalog.json").read_text(encoding="utf-8"))
+    assert source["revision"] >= 2
+    assert "set revision = 2" in ANDROID_UI_DEFAULTS_FLAT
+    for key, value in source["strings"].items():
+        assert f'"{key}": "{value}"' in ANDROID_UI_DEFAULTS
+    assert "where id = 'current' and revision < 2;" in ANDROID_UI_DEFAULTS_FLAT
+
+
+# --- 015: asynchronous photo processing -----------------------------------------
+
+def test_photo_processing_jobs_are_private_owner_readable_and_server_written():
+    schema = cloud_setup.expected_schema(PHOTO_PROCESSING)
+    assert schema["photo_processing_jobs"] == {
+        "id", "capture_id", "owner_id", "asset_id", "request_id",
+        "request_revision", "source_path", "source_sha256", "request",
+        "state", "attempt_count", "available_at", "leased_until",
+        "processor_version", "result", "last_error", "created_at",
+        "updated_at", "started_at", "finished_at",
+    }
+    assert "alter table public.photo_processing_jobs enable row level security;" in \
+        PHOTO_PROCESSING_FLAT
+    assert "revoke all on public.photo_processing_jobs from anon, authenticated;" in \
+        PHOTO_PROCESSING_FLAT
+    assert "grant select on public.photo_processing_jobs to authenticated;" in \
+        PHOTO_PROCESSING_FLAT
+    assert "photo_processing_jobs" in cloud_setup.ANON_CANNOT
+
+
+def test_photo_processing_enqueue_is_pinned_private_and_source_owner_bound():
+    assert "create schema if not exists private;" in PHOTO_PROCESSING_FLAT
+    assert "security definer" in PHOTO_PROCESSING.lower()
+    assert "set search_path = ''" in PHOTO_PROCESSING_FLAT
+    assert "source_object.owner_id = new.created_by::text" in PHOTO_PROCESSING_FLAT
+    assert "source_object.bucket_id = 'captures'" in PHOTO_PROCESSING_FLAT
+    assert "split_part(source_path, '/', 2) = capture_id::text" in PHOTO_PROCESSING_FLAT
+    assert "contract #>> '{transport,representation}' <> 'original'" in \
+        PHOTO_PROCESSING_FLAT
+    assert "not (processing_request ? 'result')" in PHOTO_PROCESSING_FLAT
+    assert "jsonb_array_length(contract -> 'assets') > 32" in PHOTO_PROCESSING_FLAT
+    assert "pg_catalog.pg_advisory_xact_lock" in PHOTO_PROCESSING_FLAT
+
+
+def test_photo_processing_gates_desktop_and_authorizes_only_recorded_derivatives():
+    assert "set status = 'processing'" in PHOTO_PROCESSING_FLAT
+    assert "create trigger captures_preserve_live_processing_status" in \
+        PHOTO_PROCESSING_FLAT
+    assert "new.status := old.status;" in PHOTO_PROCESSING_FLAT
+    assert "create or replace function public.reconcile_photo_processing_captures" in \
+        PHOTO_PROCESSING_FLAT
+    assert "bucket_id = 'capture-derivatives'" in PHOTO_PROCESSING_FLAT
+    for kind in ("display", "ocr", "thumbnail", "transform"):
+        assert f"job.result #>> '{{artifacts,{kind},path}}'" in PHOTO_PROCESSING_FLAT
+    assert cloud_setup.BUCKETS["capture-derivatives"] is False
+    assert cloud_setup.BUCKET_OPTIONS["captures"] == {
+        "file_size_limit": 32 * 1024 * 1024,
+        "allowed_mime_types": ["image/jpeg"],
+    }
+    assert "application/json" in \
+        cloud_setup.BUCKET_OPTIONS["capture-derivatives"]["allowed_mime_types"]
+
+
+def test_bucket_apply_repairs_existing_public_derivative_bucket(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cloud_setup, "config", lambda: {
+        "url": "https://project.test", "key": "k",
+    })
+    monkeypatch.setattr(
+        cloud_setup,
+        "existing_buckets",
+        lambda _cfg: {"captures": False, "capture-derivatives": True, "volumes": True},
+    )
+    monkeypatch.setattr(
+        cloud_setup.sb,
+        "_cfg",
+        lambda _cfg: ("https://project.test", "k", {"apikey": "k"}),
+    )
+    monkeypatch.setattr(
+        cloud_setup.sb,
+        "_request",
+        lambda method, url, headers, body=None: calls.append((method, url, body)),
+    )
+
+    cloud_setup.cmd_buckets(SimpleNamespace(dry_run=False))
+
+    derivative = next(call for call in calls if call[1].endswith("/capture-derivatives"))
+    assert derivative[0] == "PUT"
+    assert json.loads(derivative[2]) == {
+        "public": False,
+        "file_size_limit": 32 * 1024 * 1024,
+        "allowed_mime_types": ["image/jpeg", "application/json"],
+    }
+
+
 # --- 009: shared collections ------------------------------------------------------
 
 def test_collections_migration_declares_offline_identity_and_tombstones():
@@ -314,6 +487,45 @@ def test_collection_merge_rpc_is_atomic_narrow_and_exactly_idempotent():
     assert ("to authenticated, service_role;" in flat)
 
 
+def test_collection_merge_rpc_requires_an_identity_before_bypassing_rls():
+    body = re.sub(r"--[^\n]*", "", COLLECTION_MERGE_IDENTITY)
+    fn = body.split(
+        "create or replace function public.merge_collections", 1
+    )[1]
+    flat = " ".join(fn.split())
+
+    assert "security definer" in flat.lower()
+    assert "set search_path = ''" in flat
+    assert "coalesce(auth.jwt() ->> 'role', '') = 'service_role'" in flat
+    assert "coalesce(auth.jwt() ->> 'role', '') = 'authenticated'" in flat
+    assert "and (select auth.uid()) is not null" in flat
+    assert "raise exception 'authentication required'" in flat
+
+    original_fn = COLLECTIONS_MIG.split(
+        "create or replace function public.merge_collections", 1
+    )[1].split("revoke all on function public.merge_collections", 1)[0]
+    hardened_fn = COLLECTION_MERGE_IDENTITY.split(
+        "create or replace function public.merge_collections", 1
+    )[1].split("revoke all on function public.merge_collections", 1)[0]
+    original_flat = " ".join(original_fn.split())
+    hardened_flat = " ".join(hardened_fn.split())
+    old_guard = (
+        "if coalesce(auth.jwt() ->> 'role', '') not in "
+        "('authenticated', 'service_role') then raise exception "
+        "'authentication required' using errcode = '42501'; end if;"
+    )
+    new_guard = (
+        "if coalesce(auth.jwt() ->> 'role', '') = 'service_role' then null; "
+        "elsif coalesce(auth.jwt() ->> 'role', '') = 'authenticated' and "
+        "(select auth.uid()) is not null then null; else raise exception "
+        "'authentication required' using errcode = '42501'; end if;"
+    )
+    assert old_guard in original_flat
+    assert old_guard not in hardened_flat
+    assert hardened_flat == original_flat.replace(old_guard, new_guard, 1)
+    assert hardened_flat.index(new_guard) < hardened_flat.index("for v_lock_id in")
+
+
 # --- 004: passages + index versions (issue #140) ----------------------------------
 
 PASSAGES_MIG = SQL["004_passages_index"]
@@ -377,9 +589,10 @@ create table if not exists t (
 alter table t add column if not exists extra jsonb not null default '{}';
 alter table t add column legacy text;
 alter table t drop column if exists legacy;
+alter table public.t add column if not exists qualified text;
 create index if not exists t_kind_idx on t (kind);
 """)
-    assert sch == {"t": {"id", "kind", "extra"}}
+    assert sch == {"t": {"id", "kind", "extra", "qualified"}}
 
 
 def test_expected_schema_reads_the_real_migrations():
@@ -414,6 +627,18 @@ def _jwt(role: str) -> str:
     return "h." + body.decode().rstrip("=") + ".s"
 
 
+def test_cloud_setup_never_loads_backend_secret_from_desktop_state(monkeypatch):
+    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+    monkeypatch.setattr(
+        cloud_setup.lib,
+        "load_json",
+        lambda *_args, **_kwargs: pytest.fail("desktop state must not be read"),
+    )
+
+    with pytest.raises(SystemExit, match="SUPABASE_KEY"):
+        cloud_setup.config()
+
+
 @pytest.fixture()
 def cloud_env(monkeypatch):
     monkeypatch.setenv("SUPABASE_URL", "https://testproject.supabase.co")
@@ -434,7 +659,9 @@ def test_check_green_path(cloud_env, monkeypatch, capsys):
     monkeypatch.setattr(cloud_setup, "applied_migrations",
                         lambda cfg: {p.stem for p in MIGRATIONS})
     monkeypatch.setattr(cloud_setup, "existing_buckets",
-                        lambda cfg: {"captures": False, "volumes": True})
+                        lambda cfg: {"captures": False,
+                                     "capture-derivatives": False,
+                                     "volumes": True})
     monkeypatch.setattr(cloud_setup, "anon_selects",
                         lambda cfg, table: table in cloud_setup.ANON_CAN)
     monkeypatch.setattr(cloud_setup.sb, "_rest", lambda *a, **k: [{"id": 1}])
@@ -453,7 +680,9 @@ def test_check_red_path_reports_and_exits_nonzero(cloud_env, monkeypatch, capsys
     monkeypatch.setattr(cloud_setup, "openapi_definitions", lambda cfg: live)
     monkeypatch.setattr(cloud_setup, "applied_migrations", lambda cfg: set())
     monkeypatch.setattr(cloud_setup, "existing_buckets",
-                        lambda cfg: {"captures": True, "volumes": True})
+                        lambda cfg: {"captures": True,
+                                     "capture-derivatives": False,
+                                     "volumes": True})
     monkeypatch.setattr(cloud_setup, "anon_selects",
                         lambda cfg, table: table == "profiles")
     with pytest.raises(SystemExit) as exc:
@@ -477,7 +706,9 @@ def test_check_skips_anon_probes_without_a_key(cloud_env, monkeypatch, capsys):
     monkeypatch.setattr(cloud_setup, "applied_migrations",
                         lambda cfg: {p.stem for p in MIGRATIONS})
     monkeypatch.setattr(cloud_setup, "existing_buckets",
-                        lambda cfg: {"captures": False, "volumes": True})
+                        lambda cfg: {"captures": False,
+                                     "capture-derivatives": False,
+                                     "volumes": True})
     monkeypatch.setattr(cloud_setup.sb, "_rest", lambda *a, **k: [])
     monkeypatch.setattr(cloud_setup, "anon_selects",
                         lambda cfg, table: pytest.fail("must not probe"))
@@ -490,7 +721,9 @@ def test_check_treats_a_missing_ledger_as_all_pending(cloud_env, monkeypatch, ca
                         lambda cfg: _live_definitions())
     monkeypatch.setattr(cloud_setup, "applied_migrations", lambda cfg: None)
     monkeypatch.setattr(cloud_setup, "existing_buckets",
-                        lambda cfg: {"captures": False, "volumes": True})
+                        lambda cfg: {"captures": False,
+                                     "capture-derivatives": False,
+                                     "volumes": True})
     monkeypatch.setattr(cloud_setup, "anon_selects",
                         lambda cfg, table: table in cloud_setup.ANON_CAN)
     with pytest.raises(SystemExit):
