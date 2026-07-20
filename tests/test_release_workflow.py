@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / ".github" / "workflows" / "release.yml").read_text(
     encoding="utf-8"
 )
+CI_WORKFLOW = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    encoding="utf-8"
+)
 ANDROID_CERT_SHA256 = (
     ROOT / "android" / "BookCapture" / "release-signing-cert.sha256"
 ).read_text(encoding="utf-8").strip()
@@ -183,3 +186,10 @@ def test_tagged_release_uses_its_committed_release_notes_when_present():
     assert 'cat "$notes_file" >> "$effective_notes"' in publish
     assert 'notes_args=(--notes-file "$effective_notes")' in publish
     assert '"${notes_args[@]}"' in publish
+
+
+def test_ci_uses_cross_platform_node_test_discovery():
+    # Shell glob expansion differs between bash and PowerShell, while Node 20
+    # discovers the repository's *.test.js files itself when no path is given.
+    assert "node --test\n" in CI_WORKFLOW
+    assert "node --test tests" not in CI_WORKFLOW
