@@ -45,8 +45,20 @@ Per-component detail lives in each part's own README (map at the end).
   versioned catalogue updates must supply through strong
   `If-Record-Match`. Catalogue-only create and update commands now run through
   a recoverable filesystem repository and require replay-safe
-  `Idempotency-Key` values. Their `EngineClient` methods are ready, but the
-  transitional catalogue metadata editor still uses legacy mutation routes.
+  `Idempotency-Key` values. Browser creation, normal metadata Save, attention,
+  category assignment, and release-bundle selection use that durable command,
+  preserve one operation identity across ambiguous responses, and chain undo
+  and redo from committed receipt revisions. Loading the catalogue no longer
+  writes inferred volume grouping. Verification/OCR workflow state remains a
+  deliberately narrow compatibility mutation until its owning aggregate is
+  extracted.
+  Item commands accept an optional validation-only product profile after
+  durable replay and before allocation or staging. Production installs the
+  Flask-free WHL book profile with an injected category vocabulary, so direct
+  CLI or future desktop clients receive the same domain rules as HTTP clients.
+  The legacy WHL row revision, decode/encode, managed-state preservation, and
+  restore codec likewise live in a reusable filesystem adapter; Flask retains
+  only transport parsing and injected compatibility callbacks.
   Interactive PDF attachment, replacement, and detachment now use a separate
   representation command service with item-level and representation-level
   compare-and-swap, durable replay receipts, and atomic catalogue publication.
@@ -65,6 +77,34 @@ Per-component detail lives in each part's own README (map at the end).
   models copied acquisition, but an owned-asset copier and transactional asset
   staging are not installed yet. Only the explicit `build-workbench` projection
   carries the old local build record.
+  The engine also defines opaque, ordered canvas query contracts. A strict
+  filesystem reader can project an explicitly persisted, representation-
+  revision-bound item index while withholding private source positions and
+  paths. It performs no preparation or ID generation during a read. The engine
+  preparation command now requires exact replay and a monotonic private ledger
+  that reserves retired IDs. Its recoverable filesystem adapter atomically
+  publishes the query index, private identity ledger, and durable receipt. The
+  reusable first-party graph composes query and preparation only as one
+  optional `library.canvases` vertical. A closed private page-materialization
+  record now binds exact asset bytes and page evidence to repository-minted
+  random correlations, and publishes atomically with the ledger, index, and
+  receipt. Identical assets reuse those correlations even when their
+  representation revision changes; changed assets fail closed without minting
+  or retiring IDs. Page hashes, object numbers, paths, and ordinals remain
+  evidence or locators, never identity. An exact attached-PDF inspector now
+  verifies an authority-supplied revision, size, and SHA-256, copies the source
+  once, and parses only that immutable path-private snapshot. Its pypdf-6
+  snapshot-geometry evidence is versioned and explicitly not a page-content
+  reconciliation fingerprint. The optional attached-PDF composition factory
+  remains off in the production WHL host until the exact asset authority,
+  hostile-parser worker isolation, transport/client surface, and explicit
+  changed-asset reconciliation command are installed.
+  The transitional PDF-page trash path now records the exact post-delete
+  SHA-256 and verifies it before restore. A different or rewritten PDF with
+  the same page count is therefore refused, and older rows without lineage
+  evidence are download-only. This closes the immediate silent-splice hazard;
+  page delete/restore still needs to become an engine-owned source/canvas
+  transaction before it can maintain stable canvas identities.
   The translation aggregate now supplies
   versioned list/detail/page-replacement resources, authoritative
   current/stale/untracked/missing/orphaned status, dual document/source
@@ -79,13 +119,56 @@ Per-component detail lives in each part's own README (map at the end).
   route delegates to it, and portable clients use `/api/v1/lib-opens`.
   Provider-backed OCR/region and translation generation are not yet fully
   migrated to these command boundaries. Item delete/restore now has a neutral
-  dual-CAS, tombstone, receipt, and replay contract plus a recoverable no-copy
-  managed-tree move primitive; its filesystem repository, composition, and
-  versioned transport are the next integration slice, so the current routes
-  remain transitional.
+  dual-CAS, tombstone, receipt, replay, and coherent preflight contract plus a
+  recoverable no-copy managed-tree move primitive. Its filesystem repository
+  persists private raw-record envelopes, moves owned trees before publishing
+  tombstone/receipt files, and publishes the catalogue last. The service is an
+  optional capability-composed module; installing it disables the older
+  catalogue-only delete authority. The production host installs that module
+  through the reusable first-party composition package. Versioned preflight,
+  delete, tombstone-list/detail, and restore resources are consumed through
+  `EngineClient`; browser delete/undo/redo retains exact operation identity and
+  compare-and-swap revisions across ambiguous failures. Item-scoped job starts,
+  in-process cloud catalogue/entry sync, engine repositories, compatibility
+  delete/restore routes, and remaining synchronous entry writers now join the
+  same workspace isolation. A delete therefore either waits for a complete
+  write and removes it, or wins and prevents that writer from recreating an
+  orphan entry tree. Active lifecycle tombstones reserve their item identities,
+  including case aliases, during direct creation and new-item `.lib` open. The
+  narrow reservation reader remains active even if lifecycle commands are
+  disabled, preserving optional-module state for a later reinstall. Historical
+  catalogue-only Trash rows remain downloadable but are intentionally not
+  restorable as aggregate items.
+  This guarantee is currently local to the one authoritative sidecar and its
+  `DATA_ROOT`. Lifecycle tombstones are not yet a replicated cloud event type,
+  so a second independent host must not treat the ordinary last-write-wins
+  build mirror as lifecycle authority.
+  A separate revisioned text-layer aggregate contract now supplies bounded,
+  deterministic documents with opaque ordered selectors, exact source pins,
+  document/unit revisions, source freshness, provenance, conditional single
+  and batch edits, and durable replay. Public mutation receipts contain no
+  command fingerprint; a distinct immutable storage envelope owns replay
+  evidence. A strict native filesystem repository now persists closed/versioned
+  documents and global hashed replay envelopes through one recoverable
+  transaction, re-derives stored revisions, rechecks source/item state at
+  commit, and performs no lazy read writes. An optional first-party
+  `library.text-layers` module now composes that repository as a distinct
+  aggregate service and advertises read/edit capabilities only when explicitly
+  bound. It remains absent from the production host: versioned HTTP/client
+  resources and a deliberate migration from legacy page-marked `ocr/*.txt`
+  remain before Replica, translation, or RAG can depend on it.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
-  port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,
+  port. Each desktop launch now creates a 256-bit capability that is passed
+  only through the child environment, consumed before the Flask application
+  imports, and retained by the sidecar only as a digest. Exact Host, supplied
+  Origin, request provenance, redirect tainting, API `no-store`, sandbox,
+  navigation, permission, and resource-window policies prevent arbitrary
+  renderer or remote-content access to authenticated APIs. The former
+  same-origin remote HTML proxy is retired. Large PDF previews use bounded
+  streaming with explicit authenticated resource-window fallback instead of
+  unbounded renderer blobs. Paths split into two roots (`tools/libcommon.py`):
+  **`APP_ROOT`**,
   read-only assets shipped with the app (`ch_library.xlsx`, the reference
   CSVs, the generated catalogue JSON — the PyInstaller bundle dir when
   frozen); and **`DATA_ROOT`**, all writable per-user state — the JSON
@@ -193,11 +276,39 @@ RLS is what protects the project.
 - Desktop API keys and credentials (AI, OCR, Supabase service key, R2
   key/secret, the Google service-account key path) live in
   `DATA_ROOT/output/secrets.json` — local-only, gitignored, never synced,
-  and served only through the Host-guarded `/api/secrets` (loopback
-  origin, anti-DNS-rebinding). They were migrated *out* of
-  `client_state.json` so the synced settings blob carries no secrets.
+  and currently served through the Host-guarded `/api/secrets` (loopback
+  origin, anti-DNS-rebinding). This is safer than synced settings but remains
+  a transitional boundary: the renderer can read the plaintext values. The
+  provider/secret-store slice must replace it with presence, a fixed mask,
+  replace, and clear operations; provider-specific bounded validation and
+  health probes remain part of provider discovery. Only the engine-side
+  provider adapter may lease a secret value. The framework-neutral
+  status/CAS/lease contract now exists, including authenticated replay seams.
+  Secure persistence
+  is implemented but deliberately unbound: the Windows current-user DPAPI
+  adapter uses one closed, versioned vault envelope containing values, random
+  status revisions, receipts, and keyed replay evidence. Only ciphertext may
+  reach its target or temporary files; Windows publication is write-through and
+  verified byte-for-byte before success is acknowledged. Corruption, a wrong
+  user, or a newer schema preserves the vault and fails closed, never falling
+  back to plaintext. An optional `library.secrets` module now composes only the
+  public status/CAS mutation service when an explicit repository is supplied;
+  the credential lease and repository remain private and undiscoverable. The
+  production host deliberately does not bind it, and endpoint migration does
+  not yet exist. Migration must commit and reopen that vault before removing
+  legacy values. The Electron sidecar transport prerequisite is now complete:
+  a per-launch capability, exact desktop Host, supplied-Origin validation,
+  provenance-aware header injection, hardened windows, and retirement of
+  `/api/webview` isolate authenticated APIs from remote and untrusted frames.
+  This does not complete the secret cutover—the trusted main renderer can still
+  read plaintext through `/api/secrets` until the status/CAS resources and
+  provider-only credential leases replace that compatibility path. The credentials
+  were migrated *out* of `client_state.json` so the synced settings blob
+  carries no secrets.
   The signed-in session token sits in `output/auth_session.json`
-  (gitignored); the LAN pairing token in `DATA_ROOT/lan_token.txt`.
+  (gitignored); the LAN pairing token in `DATA_ROOT/lan_token.txt`. Those are
+  separate future security boundaries rather than provider API keys. The LAN
+  token is no longer written to the application log.
 - Bring-your-own Mistral/DeepSeek keys shared between phone and desktop
   live in the `profile_secrets` table — a separate table, not a
   `profiles` column, readable and writable by exactly one user

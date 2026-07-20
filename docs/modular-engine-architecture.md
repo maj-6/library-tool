@@ -89,17 +89,40 @@ larger workbench and packaging split described below remains the target:
   replay-safe operation IDs, safe receipts, and one recoverable transaction
   that publishes the catalogue last. Versioned HTTP resources and
   `EngineClient.items` expose that boundary, and the browser's interactive
-   primary/secondary PDF controls now use it instead of HEAD plus generic build
-   PATCH. The current production adapter supports referenced local PDFs; the
-   neutral contract also carries copied acquisition, expected SHA-256, and
-   expected size, but owned-asset materialization is still a later assets
-   boundary. Legacy create, PATCH, and direct undo-restore reject representation
-   fields. Entry-folder repointing and page rewrites refresh their integrity
-   manifest through the same command service. Item delete/restore now has a
-   framework-neutral composite lifecycle contract and a recoverable managed-
-   tree move primitive, but its filesystem repository and public transport are
-   not composed yet. The catalogue metadata editor has not adopted engine
-   create/update yet.
+  primary/secondary PDF controls now use it instead of HEAD plus generic build
+  PATCH. Browser item creation also uses the durable engine command and retains
+  one idempotency key across ambiguous responses. Its three transitional local
+  acquisition fields are seeded afterward through a narrow conditional bridge;
+  that bridge preserves concurrent catalogue edits and never becomes the
+  allocation authority. The current production adapter supports referenced
+  local PDFs; the neutral contract also carries copied acquisition, expected
+  SHA-256, and expected size, but owned-asset materialization is still a later
+  assets boundary. Legacy create, PATCH, and direct undo-restore reject
+  representation fields. Entry-folder repointing and page rewrites refresh
+  their integrity manifest through the same command service. Item
+  delete/restore now has a framework-neutral composite lifecycle contract and
+  a recoverable managed-tree move primitive. The production module, versioned
+  resources, `EngineClient` delete/restore flow, browser history, retained job
+  guard, cloud-sync policy, and compatibility adapters now use that one
+  authority. Engine-native and transitional synchronous writers revalidate
+  live item membership while holding the shared workspace lease, so they
+  cannot recreate a managed tree after deletion. Active tombstones reserve
+  their item identities, including case aliases, for direct create and new-item
+  `.lib` open. That reservation survives temporarily disabling the lifecycle
+  command module so preserved module state cannot be overwritten. Historical
+  catalogue-only Trash records are download-only. The catalogue metadata
+  editor's create and normal edit/save paths are engine-backed. Attention,
+  category, and release-bundle edits use the same conditional receipt chain;
+  raw build PATCH is restricted to transitional OCR/workflow selectors, and
+  the initial item read no longer persists inferred grouping.
+- The generic item command service now accepts a validation-only product
+  profile. Replay is checked before the profile; create validates before ID
+  allocation and update validates the complete immutable candidate before
+  staging. The production WHL book profile is Flask-free and receives its
+  category vocabulary through an injected port. The legacy WHL catalogue-row
+  revision, raw validation, decode/encode, managed-field preservation, and
+  restore logic have also moved from `server.py` into a reusable filesystem
+  codec with injected clock, taxonomy, and representation-manifest seams.
 - The revisioned translation aggregate is now composed over the legacy entry
   folders through `FilesystemTranslationRepository`. Versioned list/detail
   resources and conditional page replacement expose authoritative current,
@@ -111,6 +134,36 @@ larger workbench and packaging split described below remains the target:
   selectors instead of parsing translation files itself. Provider-backed
   generation remains on the legacy path and is not advertised as an engine
   generation capability.
+- A separate revisioned text-layer aggregate contract now exists for the
+  durable replacement of the page-marked OCR compatibility helper. It defines
+  opaque ordered selectors, exact representation-source pins, document and
+  unit revisions, source freshness, conditional single/batch corrections,
+  provenance, deterministic content identity, bounded metadata and command
+  inputs, and durable replay. Public receipts are deliberately separate from
+  the immutable storage-only replay envelope, so command fingerprints cannot
+  escape through generic dataclass serialization. A strict native filesystem
+  repository now stores closed/versioned documents per item and global hashed
+  replay envelopes in one recoverable document-plus-receipt transaction. It
+  re-derives every persisted revision, rechecks item/source state at commit,
+  rejects redirecting or unstable storage, and performs no lazy query writes.
+  The optional first-party `library.text-layers` module now composes the
+  aggregate behind a distinct registry service and contributes read/edit
+  capabilities only when explicitly bound. It remains off in the production
+  host; HTTP/client resources and migration from legacy `ocr/*.txt` still
+  remain before existing workbenches may depend on it.
+- The secret-store contract, current-user DPAPI repository, and optional
+  first-party `library.secrets` composition now form a complete but unbound
+  backend slice. Only the public masked-status/CAS service enters the registry;
+  the repository and provider credential lease remain private. No production
+  activation, plaintext migration, or renderer mutation route is implied.
+- Electron now authenticates its loopback sidecar with a 256-bit per-launch
+  capability retained only by the main process and the sidecar digest. Exact
+  Host and supplied-Origin checks, request-provenance and redirect-chain
+  tainting, authenticated-response `no-store`, sandbox/navigation/permission
+  policy, strict resource-window grants, bounded PDF streaming, and retirement
+  of the same-origin remote HTML proxy establish the transport prerequisite for
+  secret migration. The compatibility `/api/secrets` route still exposes
+  plaintext to the trusted main renderer, so the secret cutover remains open.
 - `.lib` import now has immutable command, plan, receipt, planner, repository,
   and unit-of-work contracts. The application service binds idempotency to the
   complete command and rejects malformed plugin plans before staging. A
@@ -226,6 +279,87 @@ The neutral contract admits `copy`, expected digest, and expected size, but the
 production adapter intentionally installs reference-only PDF acquisition until
 owned asset staging and provider traits are available.
 
+### Canvas identity foundation
+
+Canvas identity is the next shared dependency, ahead of provider-backed region
+or translation commands. Today Replica raster requests, region keys,
+translation selectors, Knowledge inputs, remarks, `.lib` pages, and several job
+subjects still identify content by a local PDF path plus a mutable page number.
+Extracting more automation on top of that would freeze a contract that every
+future Qt, Godot, web, and batch client would later have to break.
+
+The engine now defines a read-only canvas query boundary:
+
+- `CanvasKey(item_id, representation_id, canvas_id)` uses an opaque persisted
+  canvas identity. Order, label, filename, PDF ordinal, and path are never
+  identity.
+- `CanvasExtent` supports a spatial width/height/unit, temporal duration, or
+  both, so the same model can address pages, photographs, maps, audio, and
+  video without pretending all media are PDF pages.
+- `CanvasView` has its own revision, explicit order, presentation label,
+  availability, supported resource kinds, public metadata, and extent.
+- `CanvasSequenceView` binds the ordered set to an exact representation
+  revision and has a separate deterministic sequence revision.
+- `CanvasQueryService` lists or gets only already-persisted IDs. It never mints
+  identity during a GET, and its public serialization excludes adapter paths,
+  filenames, URIs, asset references, ordinals, and storage positions.
+
+The service keys and an optional first-party `library.canvases` module now
+exist, but the production WHL host does not bind or advertise them. A strict,
+read-only filesystem adapter consumes a private
+`.librarytool/canvases.json` index beneath each managed item tree. It binds a
+requested sequence to the exact live representation revision, rejects unsafe
+or ambiguous storage, validates but strips private source positions and paths,
+and isolates an optional representation's drift from healthy sequences. It
+does not create, repair, or infer IDs on read. The engine now also defines the
+explicit idempotent preparation command: exact replay precedes media reads,
+the repository owns inspection and private source correlations, and a
+monotonic active/retired ledger prevents removed canvas IDs from ever being
+recycled. Its receipt exposes only the exact representation revision and
+ordered active IDs. The recoverable filesystem command adapter now publishes
+the query index, private ledger, and receipt in one transaction, and reusable
+composition installs query and preparation only as an invariant pair.
+
+The private page-key materialization foundation is now implemented as a closed,
+versioned fourth preparation artifact. Inspection supplies an exact asset
+digest plus ordered observations and private matching evidence, never an
+identity. The repository mints random 256-bit correlations, records current
+private locators and active/retired generation state, and stages the
+materialization, identity ledger, public index, and receipt in one recoverable
+transaction. Identical asset bytes reuse stored correlations, including across
+a new representation revision. A digest change at the same revision is source
+drift; a digest change with a new revision requires explicit reconciliation.
+Neither path allocates IDs or mutates artifacts, and a legacy index/ledger pair
+without materialization refuses implicit migration.
+
+An exact attached-PDF inspector now closes the next adapter seam. An injected
+attachment authority must identify one item, representation revision, size,
+and SHA-256; the adapter copies and hashes that source once, parses only the
+immutable private snapshot, and produces path-free ordered observations. It
+handles bounded PDF numeric geometry and `/UserUnit`, uses a fixed pypdf-6
+snapshot-geometry evidence profile, and fails before allocation or publication
+on drift. The evidence is intentionally snapshot-specific, not a page-content
+fingerprint suitable for automatic reconciliation. Stable external path aliases
+are permitted because exact bytes are pinned; this does not claim containment
+of referenced files.
+
+`CanvasBindings.for_attached_pdfs(...)` makes that inspector explicitly
+composable, but it is not a hidden production default. In-process pypdf parsing
+has byte, declared-count, and post-materialization page limits, yet is not a
+hostile-input CPU/memory sandbox. Broad ingestion should therefore put parsing
+in a killable worker with time and memory limits before advertising the binding
+as hardened. Remaining production work is the attachment-authority/host
+binding, that worker boundary, versioned HTTP/client resources, and a separate
+reconciliation command whose evidence may propose but never silently choose
+mappings. Ordinals and paths are recyclable; PDF object IDs change on rewrite;
+content/raster hashes collide for duplicate pages and remain evidence rather
+than identity. After that, migrate raster delivery and the Replica filmstrip
+first, followed by region/text/translation selectors, remarks, jobs, and
+`.lib` compatibility.
+Page deletion/restore ultimately becomes one recoverable transaction across
+the source asset, page manifest, canvas sequence, text/layout selectors,
+provenance, and catalogue revision while preserving surviving canvas IDs.
+
 ### Item lifecycle foundation
 
 Recoverable delete/restore is now modeled independently from any UI or Flask
@@ -233,9 +367,9 @@ route. Delete requires both the catalogue record revision and the logical
 managed-tree revision. Restore requires the tombstone revision and refuses a
 recreated record or orphan tree. Exact operation retries replay a durable
 receipt; reuse of the operation ID for different preconditions conflicts. The
-public tombstone contains identities and revisions only, while the future
-filesystem adapter must keep the full raw record and storage details in a
-private envelope.
+public tombstone contains identities and revisions only. The filesystem
+adapter keeps the full raw record and storage details in a separate private,
+versioned namespace, preserving unknown/storage-only fields across restore.
 
 The shared write set can now relocate a whole managed entry tree without
 copying its bytes. A version-2 journal fingerprints paths, empty directories,
@@ -250,9 +384,25 @@ version instead of silently ignoring a moved tree.
 `ManagedTreeSnapshot` describes the logical set of engine-owned assets, not an
 external referenced PDF. A live item with no entry directory receives a stable
 empty-tree revision and uses a no-op move; an orphan physical directory still
-counts as a restore collision. The remaining work is the filesystem lifecycle
-repository, active-job guard, capability/runtime composition, versioned
-delete/restore resources, and migration of the legacy Trash path.
+counts as a restore collision. The production filesystem repository and its
+optional service-registry/composition wiring are now enabled. A coherent
+preflight query supplies both CAS tokens, and `JobManager` supplies a retained
+all-kind deletion guard. Versioned resources expose delete plus durable
+tombstone list/detail/restore; the browser uses them for exact delete, undo,
+and redo. In-process cloud catalogue and entry sync apply the lifecycle
+deletion index, and standalone mutating sync is refused because it cannot join
+the host-owned guard. Compatibility delete/restore routes delegate to the same
+service. Engine Replica transactions and all identified synchronous legacy
+entry writers revalidate membership inside the shared workspace lease; legacy
+page and translation Trash payloads cannot resurrect a deleted aggregate.
+
+The guarantee is deliberately scoped to one authoritative local workspace.
+Lifecycle tombstones are not yet replicated through the ordinary cloud build
+mirror, so a fresh independent host can still observe older cloud rows and
+entry objects. Multi-host editing requires a dedicated replicated lifecycle
+event/tombstone protocol; last-write-wins catalogue rows are not an acceptable
+substitute. Until that exists, Qt, Godot, CLI, and web workbenches either
+connect to the sole sidecar or become the sole conforming workspace owner.
 
 ### Translation aggregate boundary
 
@@ -312,6 +462,16 @@ in composition. Composition deliberately does not recover storage, create
 global resources, start workers, or own shutdown; it verifies that its host has
 settled recovery before exposing services.
 
+The graph also accepts an optional complete `CanvasBindings` bundle. It binds
+authoritative item/representation snapshots, local inspection, monotonic ID
+allocation, and one broad host lock, or withholds both canvas services. The
+first-party capability graph therefore supports a catalogue-only installation
+without dead controls and upgrades the Facsimile workbench only when both
+canvas read and prepare are real. The explicit attached-PDF factory now supplies
+the inspection half from a caller-owned exact-asset authority. Production still
+supplies no bundle until that authority, hostile-parser isolation, transport,
+and reconciliation policies are installed.
+
 The transport-neutral lifecycle host above it is now implemented. Importing or
 constructing its configuration performs no I/O. Opening a session creates the
 workspace resources, rejects concurrent conforming hosts on the same root,
@@ -327,10 +487,12 @@ This is not yet a claim of coordinated application shutdown. Legacy background
 workers and provider executors are still launched by `server.py` and have no
 single supervisor that can cancel and join them. The session therefore releases
 only resources it truly owns. Its lifetime lease also coordinates only clients
-using this host; remaining legacy scripts that write the same workspace must be
-migrated before multi-client access is safe. First-party callback bundles and
-module selection still live in the transitional server and should move into a
-framework-neutral production package as their underlying data verticals move.
+using this host; arbitrary external scripts that write the same workspace must
+be migrated before multi-client access is safe. First-party module manifests
+and policy contributions now live in a reusable framework-neutral composition
+package. Transitional filesystem codecs and provider callbacks still live in
+the server and should move behind their data verticals as those boundaries
+mature.
 The embedded Flask transport is deliberately single-process. A pre-fork or
 multi-worker WSGI deployment would create competing workspace owners; other
 processes and workbenches must connect to the one sidecar instead. Controlled
@@ -345,27 +507,139 @@ With the lifecycle seam established, migrate these data boundaries in order:
    rollback, and restart recovery in one transaction. Source attachment now
    reuses the catalogue staging seam and publishes its receipt plus catalogue
    update atomically. The neutral delete/restore service and recoverable tree
-   transaction now exist. Next compose their filesystem repository, job guard,
-   capability, and versioned resources, then migrate the browser and retire the
-   older catalogue-only tombstone path. Do not regress to nesting independently
-   committing services.
+   transaction, filesystem repository, retained job guard, neutral preflight,
+   production capability composition, versioned resources, browser history,
+   cloud-sync policy, and compatibility retirement are complete for the
+   authoritative local sidecar. Same-host entry writers now share deletion
+   isolation, and active tombstones reserve item IDs even while lifecycle
+   commands are disabled. Remaining lifecycle work is replicated tombstones,
+   restart-visible recovery UX, and a coordinated worker/provider shutdown
+   supervisor. Do not regress to nesting independently committing services.
 2. **Representation and canvas resources.** Replace attached filesystem paths
    and page-number assumptions with opaque representation, asset, ordered
    canvas, and structure identities. The first explicit representation
    attachment/detachment boundary is complete for referenced PDFs. Add owned
    asset copying, immutable asset manifests, ordered canvas/structure records,
    and raster/text addressing commands before a new Replica UI or generalized
-   manuscript/audio workbench depends on them.
+   manuscript/audio workbench depends on them. The first read-only canvas
+   contract now defines opaque `CanvasKey` identity, spatial/temporal extents,
+   availability/resource kinds, independent canvas and sequence revisions,
+   strict ordering, and a query service that never mints IDs or exposes paths,
+   ordinals, filenames, URIs, or storage positions. A strict private,
+   representation-revision-bound filesystem index reader now exists. An
+   explicit idempotent engine preparation command, a private monotonic
+   active/retired identity ledger, and a recoverable filesystem adapter now
+   prevent GET-time mutation and ID reuse while atomically publishing index,
+   ledger, materialization, and receipt. The repository now owns random source
+   correlations, preserves them only for byte-identical assets, and refuses
+   changed-asset reconciliation without mutation. Optional composition
+   installs read and prepare together. The exact attached-PDF snapshot
+   inspector and explicit composition factory now exist. Production activation
+   still requires the asset-authority/host binding, hostile-parser isolation,
+   HTTP/client resources, and explicit reconciliation command described above;
+   no ordinal, path, object number, or page hash may be substituted for
+   identity.
+   As an immediate compatibility safeguard, legacy page restore now pins and
+   verifies the exact post-delete PDF SHA-256. Page count alone is no longer
+   accepted as lineage, and older recovery rows without the digest refuse
+   automatic restore while keeping their page payload downloadable.
 3. **Text-layer aggregate.** Promote the current text-layer services and OCR
-   files into a persisted, revisioned aggregate with stable selectors,
-   provenance, conditional corrections, and derived-layer freshness. Replica,
-   translation, Knowledge/RAG, search, and export should consume this one
-   boundary rather than rediscovering compiled files independently.
-4. **Provider discovery and secrets.** Add provider descriptors, traits,
-   configuration/health probes, selection policy, and a masked/write-only
-   secret-store port. Only then migrate translation generation and remaining
-   OCR/AI jobs, advertising each optional command when its capability is truly
-   available rather than when a UI happens to contain a button.
+   files into the new persisted, revisioned aggregate contract. The engine
+   model now provides stable selectors, source pins/freshness, provenance,
+   conditional unit and batch corrections, bounded deterministic content, and
+   replay-safe receipts without depending on Flask or a UI. A recoverable
+   native filesystem repository now atomically stores each document and its
+   global replay envelope, with receipt-first replay surviving live-item
+   deletion. Optional first-party composition now registers the aggregate and
+   its read/edit capabilities only when explicitly supplied; the production
+   graph remains unbound. The next step is a versioned transport/client surface;
+   only then should a deliberate compatibility importer map legacy
+   `ocr/*.txt` pages to already-persisted canvas selectors. Replica, translation,
+   Knowledge/RAG, search, and export should consume this one boundary rather
+   than rediscovering compiled files independently. A future summary index and
+   shared-read mechanism should replace full-document parsing under the current
+   exclusive snapshot lease for very large libraries.
+4. **Provider discovery and secrets.** A framework-neutral secret-store
+   contract now exposes fixed masked status plus CAS replace/clear, keeps
+   exact-replay authentication behind the backend, scrubs repository failures,
+   and separates an engine-only credential lease from the public service. It
+   now has a Windows adapter and optional first-party composition, but remains
+   unbound in production: current-user DPAPI protects
+   one closed, versioned atomic envelope with ciphertext-only temporary/target
+   files, write-through replacement, exact post-publication verification,
+   random status revisions, and authenticated replay. Add production
+   binding plus status/CAS transport and migrate the plaintext compatibility
+   endpoint, then add provider descriptors, traits, configuration/health
+   probes, and selection policy. Only after that migrate translation
+   generation and remaining OCR/AI jobs, advertising each optional command
+   when its capability is truly available rather than when a UI happens to
+   contain a button.
+
+The provider/secret slice remains a parallel security priority. The current
+host-guarded `/api/secrets` endpoint still returns plaintext credentials to the
+browser renderer, and some compatibility requests send those values back to
+the sidecar. Loopback origin checks reduce exposure but do not satisfy the
+target trust boundary. Public provider state should expose only installed,
+configured, health, reasons, models/traits, and masked secret status; secret
+values are write/replace/clear operations and are readable only by an
+engine-side provider lease. The engine contract now enforces that semantic
+split. The DPAPI adapter implements secure persistence for an application-
+controlled Windows vault directory. Optional composition exposes only the
+public service and keeps the repository and credential lease out of discovery;
+production binding and migration are intentionally not installed yet.
+
+The selected first backend now matches the actual Windows-only desktop
+distribution: current-user DPAPI protects one versioned atomic envelope that
+contains every registered credential, random status revision, durable receipt,
+replay HMAC key, and replay authenticator. This is intentionally not a
+`RecoverableWriteSet` transaction or a collection of Credential Manager
+entries: one ciphertext replacement is the atomic boundary, and no plaintext
+journal, backup, or temporary file is permitted. Registered-but-empty secrets
+have fixed initial revisions without creating a vault on GET. A corrupt,
+wrong-user, locked, or newer-schema vault remains untouched and reports a
+sanitized unhealthy state. Future provider readiness policy must use that state
+to disable only credential-dependent capabilities.
+
+The cutover audit found that secure persistence could not be exposed behind the
+old unauthenticated renderer boundary. That transport prerequisite is now
+implemented. Electron creates a random 256-bit capability, sends it only in the
+child environment, retains it only in the main process, and allows the sidecar
+to retain only its digest after earliest-import consumption. Exact desktop Host
+and supplied-Origin checks, request-provenance and redirect-chain tainting,
+main-frame-only IPC, narrow PDF/print/capture resource grants, sandbox and
+navigation policy, least-privilege clipboard permission, CSP, and API
+`no-store` prevent remote or untrusted frames from acquiring authenticated API
+access. `/api/webview` is retired with `410`; remote HTML opens outside the app.
+Renderer PDF fetches are bounded and cancellable, with an authenticated child
+window fallback for large or unknown-size resources.
+
+The trust-boundary migration itself is still required. `/api/secrets` returns
+every plaintext value to the trusted main renderer; renderer state retains
+them; and OCR and other jobs copy credentials into long-lived configuration
+dictionaries. Public services must expose status and CAS mutation only, while
+credential leases remain private to provider execution. A packaged Electron
+smoke should verify Chromium PDF Range behavior and native clipboard behavior,
+which pure policy tests cannot prove.
+
+Compound credentials such as AWS and R2 must be leased/replaced atomically (or
+stored as one opaque bundle), and the Google service-account JSON itself—not
+merely its path—needs a secure ownership decision. The registered secret-ID set
+is append-only for vault compatibility. Receipt retention also needs an
+explicit compaction/versioning policy before claiming indefinite write
+availability.
+
+The cutover must run before workers and listeners: read legacy values into
+memory, commit and reopen/verify the protected vault, then sanitize
+`client_state.json` and remove `secrets.json` without making a plaintext
+archive. Versioned per-secret GET/PUT/DELETE resources expose status, fixed
+mask, CAS, and idempotent receipts only; the old plaintext endpoint becomes
+`410`. The renderer stores status rather than values, and provider workers
+lease only their own credential inside the provider call. The per-launch
+Electron-to-sidecar capability and Host/Origin/navigation/CSP controls are now
+installed; they authorize this migration but do not substitute for it. macOS
+Keychain and Linux Secret Service can later
+protect a random master key for one AEAD envelope; an unavailable native vault
+disables provider features and never selects a plaintext fallback.
 
 Capability modules remain the unit of dependency and discovery throughout
 this sequence. A module contributes services, commands, readiness policies,
@@ -623,11 +897,11 @@ redistributing text in frontend-only code.
 
 ## Research/RAG engine boundary
 
-The next non-Replica extraction should begin with deterministic passage
-generation, lexical retrieval, and evaluation. Cloud indexes, embeddings, and
-answer generation should remain adapters until the local corpus contract is
-sound. The current implementation has several integrity hazards that must not
-be copied into the engine:
+The first non-Replica extraction has begun with framework-neutral deterministic
+passage generation, lexical retrieval, and evaluation. Persistence, versioned
+routes, cloud indexes, embeddings, and answer generation remain adapters or
+future work until the local corpus contract is sound. The current implementation
+has several integrity hazards that must not be copied into the engine:
 
 - a new `stable` cloud version becomes searchable before all passage batches
   finish, so readers can observe an empty or partial index;
@@ -719,7 +993,7 @@ one synced client-state object:
 - `UIProfile`: window geometry, panel sizes, themes, keymaps, and last-open
   views, owned separately by each client implementation.
 - `SecretStore`: write-only provider credentials exposed to clients only as
-  presence, masked suffix, and validation status.
+  presence, a fixed configured mask, and validation status.
 - `AuthSessionStore`: external account sessions, isolated from API keys and
   synchronized preferences.
 - Workspace/item configuration: instructions, selected profiles, rights,
