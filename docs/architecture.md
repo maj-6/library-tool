@@ -347,7 +347,9 @@ RLS is what protects the project.
 **OWNER-ONLY** (never on a client, never in the repo):
 
 - The Supabase `service_role` key — publishing, working-store sync, and
-  maintenance; bypasses RLS. Entered by hand on the owner's desktop only.
+  maintenance; bypasses RLS. The desktop keeps it in the protected store;
+  standalone owner tools accept it only through `SUPABASE_KEY` for that
+  process and never recover it from UI state.
 - R2 write credentials (`r2KeyId`/`r2Secret` in the secrets store).
 - The Google Sheets service-account JSON key (Settings > Credentials;
   no credentials exist yet, the sync is TODO-verify).
@@ -356,6 +358,12 @@ RLS is what protects the project.
   `WIN_CSC_LINK_B64`/`WIN_CSC_KEY_PASSWORD` (see `docs/releasing.md`).
 - The Supabase dashboard / SQL editor, where the migrations are applied,
   in order.
+
+Standalone maintenance scripts use the environment-only matrix in
+`tools/README.md`; they do not import the desktop vault or inspect
+`client_state.json`/`secrets.json`. `tools/worktree.py --seed` copies useful
+nonsecret work state but removes every registered legacy credential field and
+never copies either secret-store file.
 
 ## Account model
 

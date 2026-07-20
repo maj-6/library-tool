@@ -237,6 +237,20 @@ provider. Alternate clients therefore cannot yet submit provider-neutral
 detection through the engine alone. The workbench does observe the shared job
 directly and distinguishes completion, failure, cancellation, and restart
 interruption instead of inferring completion from browser-local OCR markers.
+Each detection command also has a portable operation identity and canonical
+fingerprint. `JobManager` persists bounded terminal receipts beside its job
+history, so an exact retry can replay the paid-for result before current-state
+checks, including after restart. A separate client may observe an identical
+active job without acquiring the originating command receipt.
+
+Detected figure crops on protected pages are now proposal-scoped rather than
+canonical assets. Their immutable names include source and proposal identity;
+apply verifies a safe, nonempty regular file and its SHA-256 inside the Replica
+unit of work before atomically publishing the manifest. Dismissal makes the
+crops unreachable before unlinking them, and startup garbage collection
+removes orphans left by an interrupted cleanup. Detection therefore cannot
+mutate human or verified page assets merely by running.
+
 The item query service is composed into `/api/v1`; existing-item import and
 new-item `.lib` open demonstrate recoverable multi-artifact transactions. The
 local-path compatibility route is preserved, while `EngineClient` imports or
@@ -649,12 +663,26 @@ archive.
 The renderer now receives only fixed masked status and revisions through
 versioned GET plus idempotent CAS PUT/DELETE. `/api/secrets` returns `410`, and
 `EngineClient` rejects malformed or disclosure-shaped success documents.
+Credentials left in a pre-cutover renderer cache are isolated before settings
+sync, imported one at a time through that protected API, and removed from local
+storage only after a confirmed protected write; an ambiguous failure remains
+safe to retry without entering `client_state.json`.
 Repository and lease capabilities remain private. OCR, AI/image generation,
 embeddings, Google Sheets, Supabase auth/profile/owner sync, R2, and capture
 code lease credentials inside provider execution and remove temporary config
 fields afterward; long-lived job records contain nonsecret settings only.
 Custom Supabase projects use the same context-managed path, so the protected
 anon key remains supported without returning to `client_state.json`.
+
+Mistral profile synchronization now records explicit account ownership and a
+redacted write-ahead phase beside the protected vault. Local mutation and
+pending-cloud intent recover together across a crash; exact receipt replay
+cannot transfer ownership. Signed-out keys remain explicitly unowned,
+local-only credentials, while account switches hide another user's cache and
+never upload it. Standalone maintenance CLIs are a separate boundary: they
+accept documented environment variables for the current process, never inspect
+desktop UI state or the protected vault, and worktree seeding strips every
+registered legacy credential field while retaining nonsecret work state.
 
 Remaining secret-store work is narrower: atomic mutation semantics for compound
 AWS/R2 credentials, secure ownership of the Google service-account JSON rather
