@@ -2,22 +2,24 @@ name: release
 
 # Build both apps and put them on the website's Downloads page.
 #
-# Push a tag like v0.8.0-alpha.1 and this builds the Android APK and the Windows
-# installer, attaches them to a GitHub Release named after the tag, and
+# Push a desktop tag like v0.8.0-alpha.1 to build both apps, or an Android tag
+# like android-v0.5.1-alpha.7 to publish Library Tool Capture without issuing an
+# unrelated desktop version. The workflow attaches the resulting artifacts to
+# a GitHub Release named after the tag and
 # registers each in the Supabase `releases` table — which is the Downloads
 # page's data source, so the site shows the new builds immediately, no
 # redeploy. Each app keeps its own version (gradle versionName, package.json),
-# and the tag must match the desktop version so the updater can order releases.
+# and each tag is checked against the version of the product it publishes.
 #
 # workflow_dispatch runs the two builds as a dry run: artifacts to inspect,
 # nothing published.
 #
 # One-time repository setup, all under Settings > Secrets and variables:
-#   vars.SUPABASE_URL                  (already set for the pages workflow)
-#   secrets.SUPABASE_SERVICE_ROLE_KEY  RLS leaves anon read-only on `releases`,
-#                                      so registering rows needs this. Without
-#                                      it the GitHub Release still happens and
-#                                      the register step says what is missing.
+#   vars.SUPABASE_URL                  required for a publishable Android APK
+#   vars.SUPABASE_ANON_KEY             required for a publishable Android APK
+#   secrets.SUPABASE_SERVICE_ROLE_KEY  registers rows in `releases`. Without it
+#                                      the GitHub Release still publishes and
+#                                      registration can be completed manually.
 #   secrets.ANDROID_KEYSTORE_B64       required to publish Android on a tag:
 #   secrets.ANDROID_KEYSTORE_PASSWORD  base64 of the signing keystore, its
 #   secrets.ANDROID_KEY_ALIAS          password, and the key alias. A tagged
@@ -31,7 +33,7 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "android-v*"]
   workflow_dispatch:
 
 permissions:
@@ -60,23 +62,39 @@ jobs:
         with:
           node-version: "22.12"
 
-      # The tag drives the GitHub Release and updater channel, while the
-      # installer filename/version comes from package.json. Refuse the entire
-      # release when they disagree: a partial release would otherwise hide the
-      # failure while installed desktop clients never see a newer version.
-      - name: Verify tag matches the desktop version
+      # A desktop tag drives the updater channel; an Android-only tag is tied to
+      # Gradle's versionName. Refuse publication when either tag disagrees with
+      # the product it names, then derive the supported public channel from
+      # that exact product version.
+      - name: Verify tag matches its product version
         id: version
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
-          version="$(node -p 'require("./desktop/package.json").version')"
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match desktop/package.json v$version"
+          desktop_version="$(node -p 'require("./desktop/package.json").version')"
+          case "$GITHUB_REF_NAME" in
+            android-v*)
+              version="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' android/BookCapture/app/build.gradle.kts | head -1)"
+              expected="android-v$version"
+              product="android/BookCapture Gradle version"
+              ;;
+            v*)
+              version="$(node -p 'require("./desktop/package.json").version')"
+              expected="v$version"
+              product="desktop/package.json version"
+              ;;
+            *)
+              echo "::error::Unsupported release tag $GITHUB_REF_NAME"
+              exit 1
+              ;;
+          esac
+          if [ "$expected" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match $product $version"
             exit 1
           fi
           python3 .github/scripts/release_preflight.py classify-version \
             --version "$version" --github-output "$GITHUB_OUTPUT"
-          echo "desktop_version=$version" >> "$GITHUB_OUTPUT"
+          echo "desktop_version=$desktop_version" >> "$GITHUB_OUTPUT"
 
       # Desktop and Book Capture version independently. A desktop tag must not
       # rebuild changed Android sources under the same Android version identity:
@@ -90,7 +108,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" != "push" ] || [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
             empty_releases="$RUNNER_TEMP/empty-release-pages.json"
             printf '[]\n' > "$empty_releases"
             python3 .github/scripts/release_preflight.py android-scope \
@@ -142,7 +160,7 @@ jobs:
           KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: |
           if [ -n "$KS_B64" ]; then
             # strip any CR/LF/space first: a secret uploaded from a Windows
@@ -173,14 +191,28 @@ jobs:
 
       # The anon key is public by design (the website ships it to every
       # visitor); baking it in spares first-run typing — sign-in is what
-      # authorizes anything. Blank falls back to the in-app Settings project.
+      # authorizes anything. Tagged builds reject blank configuration.
       - name: Build
         env:
           WHL_SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           WHL_SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: |
+          if [ "$IS_RELEASE" = "true" ]; then
+            if [ -z "$WHL_SUPABASE_URL" ] || [ -z "$WHL_SUPABASE_ANON_KEY" ]; then
+              echo "::error::Tagged Android release requires non-empty SUPABASE_URL and SUPABASE_ANON_KEY repository variables. The app has no in-app project fallback, so refusing to build a cloud-disabled APK."
+              exit 1
+            fi
+            case "$WHL_SUPABASE_URL" in
+              https://*) ;;
+              *)
+                echo "::error::SUPABASE_URL must be an https URL for a tagged Android release."
+                exit 1
+                ;;
+            esac
+          fi
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease
+          ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease
 
       - name: Name the APK after its versionName
         id: ver
@@ -275,6 +307,7 @@ jobs:
           if-no-files-found: error
 
   desktop:
+    if: ${{ !startsWith(github.ref_name, 'android-v') }}
     needs: preflight
     runs-on: windows-latest
     outputs:
@@ -393,7 +426,7 @@ jobs:
   # each publish step below is guarded on its artifact being present.
   publish:
     if: |
-      !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
       needs.preflight.result == 'success' &&
       (needs.desktop.result == 'success' || needs.android.result == 'success')
     needs: [preflight, android, desktop]
@@ -594,9 +627,11 @@ jobs:
               partial_message="Only Library Tool Desktop is attached. Android Book Capture did not build successfully, so this release contains no Android APK."
             fi
           else
-            release_title="Android Book Capture ${APK_V:-$ANDROID_VERSION} ($GITHUB_REF_NAME; Android only)"
-            notes="Android BookCapture ${APK_V:-$ANDROID_VERSION}"
-            partial_message="Only Android Book Capture is attached. Library Tool Desktop did not build successfully, so this release contains no Windows installer or updater files."
+            release_title="Library Tool Capture ${APK_V:-$ANDROID_VERSION} ($GITHUB_REF_NAME; Android only)"
+            notes="Library Tool Capture ${APK_V:-$ANDROID_VERSION}"
+            if [[ "$GITHUB_REF_NAME" != android-v* ]]; then
+              partial_message="Only Library Tool Capture is attached. Library Tool Desktop did not build successfully, so this release contains no Windows installer or updater files."
+            fi
           fi
           notes_file="docs/releases/$GITHUB_REF_NAME.md"
           effective_notes="$RUNNER_TEMP/release-notes.md"

@@ -51,15 +51,6 @@
                 android:layout_weight="1" />
 
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/queueChip"
-                style="@style/WhlToolbarAction"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:contentDescription="@string/open_recent"
-                android:textSize="12sp"
-                android:text="@string/recent_chip" />
-
-            <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnSettings"
                 style="@style/WhlToolbarAction"
                 android:layout_width="wrap_content"
@@ -102,28 +93,76 @@
         app:layout_constraintStart_toStartOf="@id/preview"
         app:layout_constraintEnd_toEndOf="@id/preview" />
 
-    <!-- the recent-scans dropdown, over the preview -->
-    <ScrollView
-        android:id="@+id/recentPanel"
+    <!-- Live voice-note structure floats over the preview only while a note is
+         active. It is intentionally shallow and translucent so page framing
+         remains visible underneath it. -->
+    <LinearLayout
+        android:id="@+id/noteOverlay"
         android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:background="@drawable/whl_panel"
+        android:layout_height="156dp"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="68dp"
+        android:background="@drawable/whl_note_overlay"
+        android:elevation="5dp"
+        android:orientation="vertical"
+        android:padding="6dp"
         android:visibility="gone"
-        android:elevation="6dp"
-        app:layout_constrainedHeight="true"
-        app:layout_constraintHeight_max="320dp"
-        app:layout_constraintTop_toBottomOf="@id/topbar"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
+        app:layout_constraintEnd_toEndOf="@id/preview"
+        app:layout_constraintStart_toStartOf="@id/preview"
+        app:layout_constraintTop_toTopOf="@id/preview">
 
-        <LinearLayout
-            android:id="@+id/recentList"
+        <TextView
+            android:id="@+id/noteStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:paddingTop="2dp"
-            android:paddingBottom="4dp" />
-    </ScrollView>
+            android:fontFamily="sans"
+            android:text="@string/capture_note_connecting"
+            android:textColor="@color/whl_green"
+            android:textSize="10sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/noteUnclassified"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:ellipsize="end"
+            android:fontFamily="sans"
+            android:maxLines="2"
+            android:textColor="@color/whl_ink_dim"
+            android:textSize="10sp"
+            android:visibility="gone" />
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_marginTop="2dp"
+            android:layout_weight="1"
+            android:fadeScrollbars="false"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:id="@+id/noteRows"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+        </ScrollView>
+    </LinearLayout>
+
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/btnNote"
+        style="@style/WhlIconButton"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="8dp"
+        android:contentDescription="@string/capture_note_start"
+        android:elevation="7dp"
+        app:layout_constraintEnd_toEndOf="@id/preview"
+        app:layout_constraintTop_toTopOf="@id/preview"
+        app:srcCompat="@drawable/ic_note"
+        app:tint="@color/whl_icon_button_tint" />
 
     <TextView
         android:id="@+id/configWarning"
@@ -145,7 +184,7 @@
         android:layout_height="88dp"
         android:background="@color/whl_canvas_line"
         android:padding="4dp"
-        app:layout_constraintBottom_toTopOf="@id/buttons"
+        app:layout_constraintBottom_toTopOf="@id/lastBookPreview"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
@@ -155,6 +194,109 @@
             android:layout_height="match_parent"
             android:orientation="horizontal" />
     </HorizontalScrollView>
+
+    <!-- The newest sealed/submitted book remains here while the next book is
+         open. It changes only when that next capture is sent for processing. -->
+    <LinearLayout
+        android:id="@+id/lastBookPreview"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:minHeight="108dp"
+        android:orientation="horizontal"
+        android:baselineAligned="false"
+        android:gravity="center_vertical"
+        android:background="@drawable/whl_panel"
+        android:paddingStart="12dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="8dp"
+        app:layout_constraintBottom_toTopOf="@id/buttons"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <LinearLayout
+            android:id="@+id/lastBookPrimary"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:clickable="true"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="@font/roboto_slab"
+                android:text="@string/capture_last_book_label"
+                android:textColor="@color/whl_ink_dim"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/lastBookTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:ellipsize="end"
+                android:fontFamily="@font/roboto_slab"
+                android:maxLines="2"
+                android:text="@string/capture_last_book_empty"
+                android:textColor="@color/whl_ink"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/lastBookAuthor"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:ellipsize="end"
+                android:fontFamily="@font/roboto_slab"
+                android:maxLines="1"
+                android:text="@string/capture_last_book_author_empty"
+                android:textColor="@color/whl_ink_dim"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/lastBookYear"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:fontFamily="@font/roboto_slab"
+                android:maxLines="1"
+                android:text="@string/capture_last_book_year_empty"
+                android:textColor="@color/whl_ink_dim"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/lastBookExtrasGroup"
+            android:layout_width="64dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:orientation="vertical"
+            android:gravity="center_horizontal"
+            android:visibility="gone">
+
+            <androidx.appcompat.widget.AppCompatImageButton
+                android:id="@+id/lastBookExtras"
+                style="@style/WhlIconButton"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:contentDescription="@string/capture_extra_fields_description_placeholder"
+                app:srcCompat="@drawable/ic_extra_fields"
+                app:tint="@color/whl_icon_button_tint" />
+
+            <TextView
+                android:id="@+id/lastBookExtraCount"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:importantForAccessibility="no"
+                android:text="@string/capture_extra_fields_count_placeholder"
+                android:textColor="@color/whl_ink_dim"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </LinearLayout>
 
     <!-- glyph controls; labels are the abstraction, tones the confirmation -->
     <LinearLayout

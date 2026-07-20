@@ -79,10 +79,12 @@ class LanClient(ctx: Context) {
 
     /** One capture -> the desktop: a "meta" JSON field + N "photo" file parts. */
     fun uploadCapture(id: String, device: String, note: String, createdAt: String,
-                      ocr: JSONObject, meta: JSONObject, photos: List<Pair<String, File>>) {
+                      ocr: JSONObject, meta: JSONObject, photoAssets: JSONObject,
+                      photos: List<Pair<String, File>>) {
         val metaJson = JSONObject()
             .put("id", id).put("device", device).put("note", note)
             .put("created_at", createdAt).put("ocr", ocr).put("meta", meta)
+            .put(PHOTO_ASSETS_MANIFEST_KEY, photoAssets)
         val boundary = "whl" + UUID.randomUUID().toString().replace("-", "")
         val crlf = "\r\n"; val dash = "--"
         val c = open("/lan/capture")

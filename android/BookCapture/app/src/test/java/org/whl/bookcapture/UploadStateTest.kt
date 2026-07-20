@@ -5,9 +5,11 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class UploadStateTest {
@@ -53,6 +55,52 @@ class UploadStateTest {
 
         assertTrue(problem.message.orEmpty().contains("photo_2.jpg (not listed)"))
         assertTrue(dir.isDirectory)
+    }
+
+    @Test
+    fun versionedDeliveryUsesTheVerifiedCameraOriginalUnderTheLogicalPageName() =
+        withEntry { dir ->
+            val display = File(dir, "photo_1.jpg").also { jpeg(it, entropy = 1) }
+            val original = File(dir, "original_asset-1.jpg").also { jpeg(it, entropy = 2) }
+            writePhotoContract(dir, display, original, sha256(original))
+
+            val selected = selectTransportOriginals(
+                dir,
+                validateUploadPhotos(dir, listOf(display.name)),
+            ).single()
+
+            assertEquals("photo_1.jpg", selected.name)
+            assertEquals(original.canonicalFile, selected.file.canonicalFile)
+            assertFalse(display.readBytes().contentEquals(selected.file.readBytes()))
+        }
+
+    @Test
+    fun changedCameraOriginalKeepsTheCapturePending() = withEntry { dir ->
+        val display = File(dir, "photo_1.jpg").also { jpeg(it, entropy = 1) }
+        val original = File(dir, "original_asset-1.jpg").also { jpeg(it, entropy = 2) }
+        writePhotoContract(dir, display, original, sha256(original))
+        jpeg(original, entropy = 3)
+
+        val problem = assertThrows(UploadEntryProblem::class.java) {
+            selectTransportOriginals(dir, validateUploadPhotos(dir, listOf(display.name)))
+        }
+
+        assertTrue(problem.message.orEmpty().contains("changed camera original"))
+        assertTrue(dir.isDirectory)
+    }
+
+    @Test
+    fun outboundContractExplicitlyDeclaresOriginalTransportBytes() {
+        val local = JSONObject().put("version", 1)
+
+        val outbound = originalTransportPayload(local)
+
+        assertFalse(local.has("transport"))
+        assertEquals(
+            "original",
+            outbound.getJSONObject("transport").getString("representation"),
+        )
+        assertEquals(1, outbound.getJSONObject("transport").getInt("version"))
     }
 
     @Test
@@ -249,17 +297,40 @@ class UploadStateTest {
         assertTrue(source.contains("resolution=ignore-duplicates"))
     }
 
-    private fun jpeg(file: File) {
+    private fun jpeg(file: File, entropy: Int = 0) {
         file.writeBytes(byteArrayOf(
             0xff.toByte(), 0xd8.toByte(),                         // SOI
             0xff.toByte(), 0xc0.toByte(), 0x00, 0x0b,             // SOF0, 1 component
             0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
             0xff.toByte(), 0xda.toByte(), 0x00, 0x08,             // SOS, 1 component
             0x01, 0x01, 0x00, 0x00, 0x3f, 0x00,
-            0x00,                                                // entropy payload
+            entropy.toByte(),                                    // entropy payload
             0xff.toByte(), 0xd9.toByte(),                         // EOI
         ))
     }
+
+    private fun writePhotoContract(
+        dir: File,
+        display: File,
+        original: File,
+        originalSha256: String,
+    ) {
+        val contract = CapturePhotoAssets(
+            captureId = dir.name,
+            assets = listOf(CapturePhotoAsset(
+                assetId = "asset-1",
+                captureOrder = 1,
+                captureFile = display.name,
+                original = PhotoOriginal(original.name, sha256 = originalSha256),
+                display = PhotoDisplayDerivative(display.name),
+            )),
+        )
+        File(dir, PHOTO_ASSETS_FILE).writeText(contract.toJson().toString())
+    }
+
+    private fun sha256(file: File): String = MessageDigest.getInstance("SHA-256")
+        .digest(file.readBytes())
+        .joinToString("") { "%02x".format(it) }
 
     private fun withEntry(block: (File) -> Unit) {
         val root = Files.createTempDirectory("upload-state-test").toFile()

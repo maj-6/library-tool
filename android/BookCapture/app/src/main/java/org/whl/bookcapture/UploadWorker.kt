@@ -19,6 +19,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.TimeUnit
 
@@ -141,6 +142,94 @@ internal fun validateUploadPhotos(dir: File, names: List<String>): List<Validate
                 "It was kept pending; restore them or discard and recapture.")
     }
     return photos
+}
+
+/**
+ * Keep the established transport names (`photo_N.jpg`) but send the immutable
+ * camera source behind each name. Existing cloud and LAN importers already
+ * treat those parts as capture originals and generate their own display
+ * derivatives, so this closes the raw-retention gap without duplicating pages
+ * or requiring a new protocol field.
+ */
+internal fun selectTransportOriginals(
+    dir: File,
+    displayPhotos: List<ValidatedPhoto>,
+): List<ValidatedPhoto> {
+    val label = dir.name.take(8).ifEmpty { "unknown" }
+    val contract = PhotoAssetStore.read(dir)
+    val byCaptureFile = contract.assets.associateBy { it.captureFile }
+    return displayPhotos.map { display ->
+        val asset = byCaptureFile[display.name]
+        if (asset == null) {
+            if (contract.legacyFallback) return@map display
+            throw UploadEntryProblem(
+                "Entry $label has no photo-asset record for ${display.name}; " +
+                    "it was kept pending to preserve its camera original.",
+            )
+        }
+        val original = File(dir, asset.original.reference)
+        val sameAsDisplay = runCatching {
+            original.canonicalFile == display.file.canonicalFile
+        }.getOrDefault(original.absolutePath == display.file.absolutePath)
+        if (!contract.legacyFallback && sameAsDisplay) {
+            throw UploadEntryProblem(
+                "Entry $label has no separate camera original for ${display.name}; " +
+                    "it was kept pending.",
+            )
+        }
+        if (!original.isFile || !looksLikeCompleteJpeg(original)) {
+            throw UploadEntryProblem(
+                "Entry $label has a missing or corrupt camera original for ${display.name}; " +
+                    "it was kept pending.",
+            )
+        }
+        val expected = asset.original.sha256.lowercase()
+        if (!contract.legacyFallback && expected.isEmpty()) {
+            throw UploadEntryProblem(
+                "Entry $label has an unverified camera original for ${display.name}; " +
+                    "it was kept pending.",
+            )
+        }
+        if (expected.isNotEmpty() && sha256Hex(original) != expected) {
+            throw UploadEntryProblem(
+                "Entry $label has a changed camera original for ${display.name}; " +
+                    "it was kept pending.",
+            )
+        }
+        ValidatedPhoto(display.name, original)
+    }
+}
+
+private fun sha256Hex(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+internal fun originalTransportPayload(photoAssets: JSONObject): JSONObject =
+    JSONObject(photoAssets.toString()).put(
+        "transport",
+        JSONObject().put("representation", "original").put("version", 1),
+    )
+
+/** The note document is transport metadata, not model-extracted bibliography.
+ * Replace a same-named value from meta.json with the authoritative sidecar
+ * snapshot and omit the key entirely when the capture has no notes. */
+internal fun attachCaptureNotes(
+    meta: JSONObject,
+    notes: JSONObject?,
+): JSONObject = meta.apply {
+    remove(CAPTURE_NOTES_META_KEY)
+    if (notes != null && CaptureNotes.hasNotes(notes)) {
+        put(CAPTURE_NOTES_META_KEY, JSONObject(notes.toString()))
+    }
 }
 
 /** Cheap structural guard for the camera JPEGs: readable, bounded correctly,
@@ -533,6 +622,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         val manifest: JSONObject,
         val id: String,
         val creator: CaptureCreator,
+        val photoAssets: JSONObject,
+        val captureNotes: JSONObject?,
         val photos: List<ValidatedPhoto>,
     )
 
@@ -580,11 +671,24 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 "Entry ${dir.name.take(8)} has inconsistent upload information; it was kept " +
                     "pending. Open Recent to discard and recapture.")
         }
+        val displayPhotos = validateUploadPhotos(dir, names)
+        // Upload is the final local boundary before another system sees the
+        // capture. Complete any provisional checksums/dimensions and refresh
+        // the embedded manifest snapshot without changing legacy photo paths.
+        PhotoAssetStore.completeForUpload(dir, displayPhotos.map { it.file })
+        val photoAssets = PhotoAssetStore.payload(dir, manifest)
+        manifest.put(PHOTO_ASSETS_MANIFEST_KEY, photoAssets)
+        val transportPhotos = selectTransportOriginals(dir, displayPhotos)
+        val outboundPhotoAssets = originalTransportPayload(photoAssets)
+        val captureNotes = CaptureNotes.payload(dir, manifest)
+            .takeIf(CaptureNotes::hasNotes)
         return PreparedCapture(
             manifest,
             id,
             captureCreatorFromManifest(manifest, Prefs.anonymousCreatorId(ctx)),
-            validateUploadPhotos(dir, names),
+            outboundPhotoAssets,
+            captureNotes,
+            transportPhotos,
         )
     }
 
@@ -605,9 +709,10 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         }
         val createdMs = manifest.optLong("created_at", 0L)
         val createdAt = if (createdMs > 0) Instant.ofEpochMilli(createdMs).toString() else ""
-        val meta = withProvenance(File(dir, "meta.json").takeIf { it.isFile }
+        val meta = attachCaptureNotes(withProvenance(File(dir, "meta.json").takeIf { it.isFile }
             ?.let { try { JSONObject(it.readText()) } catch (_: Exception) { null } }
-            ?: JSONObject(), dir)
+            ?: JSONObject(), dir), prepared.captureNotes)
+            .put(PHOTO_ASSETS_META_KEY, prepared.photoAssets)
         return deliverValidatedCapture(
             entryId = id,
             deviceFolder = deviceSafe,
@@ -748,11 +853,12 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         }
         val createdMs = manifest.optLong("created_at", 0L)
         val createdAt = if (createdMs > 0) Instant.ofEpochMilli(createdMs).toString() else ""
-        val meta = withProvenance(File(dir, "meta.json").takeIf { it.isFile }
+        val meta = attachCaptureNotes(withProvenance(File(dir, "meta.json").takeIf { it.isFile }
             ?.let { try { JSONObject(it.readText()) } catch (_: Exception) { null } }
-            ?: JSONObject(), dir)
+            ?: JSONObject(), dir), prepared.captureNotes)
         client.uploadCapture(id, device, manifest.optString("note", ""),
-                             createdAt, ocr, meta, photos)
+                             createdAt, ocr, meta,
+                             prepared.photoAssets, photos)
         return ConfirmedDelivery(id, photos.size, photos.map { it.first })
     }
 

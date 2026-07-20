@@ -1,41 +1,83 @@
 package org.whl.bookcapture
 
-import android.graphics.BitmapFactory
+import android.app.Dialog
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
+import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.tabs.TabLayout
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityEntryDetailBinding
-import org.whl.bookcapture.databinding.DialogDeepseekInstructionsBinding
+import java.io.File
 
-/** One recent scan, in full: extracted record, pages, OCR text, status. */
+/** Catalog-style presentation for one historical or recently captured book. */
 class EntryDetailActivity : AppCompatActivity() {
 
-    companion object { const val EXTRA_ID = "entry_id" }
+    companion object {
+        const val EXTRA_ID = "entry_id"
+        private const val STATE_OCR_EXPANDED = "ocr_expanded"
+        private const val STATE_DIAGNOSTICS_EXPANDED = "diagnostics_expanded"
+        private const val STATE_DIAGNOSTICS_TAB = "diagnostics_tab"
+        private const val STATE_DIAGNOSTICS_SCROLL = "diagnostics_scroll"
+        private const val DIAGNOSTICS_TAB_JSON = 0
+        private const val DIAGNOSTICS_TAB_MISTRAL = 1
+    }
 
     private lateinit var binding: ActivityEntryDetailBinding
     private var photoJob: Job? = null
-    private var instructionsDialog: AlertDialog? = null
-    private var instructionsDialogBinding: DialogDeepseekInstructionsBinding? = null
+    private var viewerJob: Job? = null
+    private var viewerDialog: Dialog? = null
     private var discardDialog: AlertDialog? = null
+    private var ocrExpanded = false
+    private var diagnosticsExpanded = false
+    private var diagnosticsTab = DIAGNOSTICS_TAB_JSON
+    private var diagnosticsContent: BookDiagnosticsContent? = null
+    private var diagnosticsEntry: Entries.Entry? = null
+    private var diagnosticsLoadedEntryId: String? = null
+    private var diagnosticsRequestedEntryId: String? = null
+    private var diagnosticsJob: Job? = null
+    private var diagnosticsLoadGeneration = 0
+    private var diagnosticsPendingScrollY: Int? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityEntryDetailBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        ocrExpanded = savedInstanceState?.getBoolean(STATE_OCR_EXPANDED, false) ?: false
+        diagnosticsExpanded = savedInstanceState
+            ?.getBoolean(STATE_DIAGNOSTICS_EXPANDED, false) ?: false
+        diagnosticsTab = savedInstanceState
+            ?.getInt(STATE_DIAGNOSTICS_TAB, DIAGNOSTICS_TAB_JSON)
+            ?.coerceIn(DIAGNOSTICS_TAB_JSON, DIAGNOSTICS_TAB_MISTRAL)
+            ?: DIAGNOSTICS_TAB_JSON
+        diagnosticsPendingScrollY = savedInstanceState
+            ?.getInt(STATE_DIAGNOSTICS_SCROLL, 0)
         binding.toolbar.setNavigationOnClickListener { finish() }
-        binding.deepseekInstructions.setOnClickListener { showDeepseekInstructions() }
+        binding.ocrToggle.setOnClickListener {
+            ocrExpanded = !ocrExpanded
+            renderOcrExpansion()
+        }
+        configureDiagnosticsPanel()
         val entryId = intent.getStringExtra(EXTRA_ID).orEmpty()
         for (workName in listOf(
             ProcessWorker.UNIQUE_WORK_NAME,
@@ -48,6 +90,14 @@ class EntryDetailActivity : AppCompatActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(STATE_OCR_EXPANDED, ocrExpanded)
+        outState.putBoolean(STATE_DIAGNOSTICS_EXPANDED, diagnosticsExpanded)
+        outState.putInt(STATE_DIAGNOSTICS_TAB, diagnosticsTab)
+        outState.putInt(STATE_DIAGNOSTICS_SCROLL, binding.diagnosticsScroll.scrollY)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onResume() {
         super.onResume()
         render()
@@ -55,104 +105,426 @@ class EntryDetailActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         photoJob?.cancel()
-        instructionsDialog?.dismiss()
-        instructionsDialog = null
-        instructionsDialogBinding = null
+        diagnosticsJob?.cancel()
+        viewerJob?.cancel()
+        viewerDialog?.dismiss()
+        viewerDialog = null
         discardDialog?.dismiss()
         discardDialog = null
         super.onDestroy()
     }
 
     private fun render() {
-        val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID) ?: "") ?: return finish()
+        val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID).orEmpty())
+            ?: return finish()
+        diagnosticsEntry = entry
+        val details = BookDetailPresenter.from(entry.meta)
 
-        binding.title.text = Entries.titleLabel(this, entry)
-        binding.subline.text = listOf(entry.author, entry.year)
-            .filter { it.isNotEmpty() }.joinToString(" · ")
+        binding.title.text = details.title.ifEmpty { Entries.titleLabel(this, entry) }
+        binding.author.text = details.author
+        binding.author.visibility = details.author.visibleOrGone()
+        binding.year.text = details.year
+        binding.year.visibility = details.year.visibleOrGone()
+        binding.volumeTag.text = details.volumeTag
+        binding.volumeTag.contentDescription = details.volumeTag
+        binding.volumeTag.visibility = details.volumeTag.visibleOrGone()
+        renderFields(binding.secondaryDetails, details.secondary, compact = false)
+
         binding.stateLine.text = listOf(
             Entries.statusLabel(this, entry),
-            resources.getQuantityString(
-                R.plurals.capture_count, entry.photoCount, entry.photoCount),
+            resources.getQuantityString(R.plurals.capture_count, entry.photoCount, entry.photoCount),
             android.text.format.DateFormat.format("yyyy-MM-dd HH:mm", entry.createdAt),
-        ).joinToString("  ·  ")
+        ).joinToString("  \u00b7  ")
 
+        binding.overviewText.text = details.overview
+        binding.overviewSection.visibility = details.overview.visibleOrGone()
+        renderFields(binding.otherFields, details.other, compact = true)
+        binding.otherSection.visibility = if (details.other.isEmpty()) View.GONE else View.VISIBLE
+        renderProvenance(entry)
+        renderOwnership(entry)
+
+        binding.ocrText.text = entry.ocrText().ifEmpty { getString(R.string.detail_no_ocr) }
+        renderOcrExpansion()
+        if (diagnosticsExpanded) loadDiagnostics(entry, force = true)
+        renderPhotos(entry)
+
+        val isActiveCapture = Prefs.currentEntryId(this) == entry.id
+        binding.discard.visibility = if (entry.uploaded || isActiveCapture) View.GONE else View.VISIBLE
+        binding.discard.setOnClickListener { showDiscardConfirmation(entry) }
+    }
+
+    private fun renderOwnership(entry: Entries.Entry) {
         val ownership = cloudUploadOwnership(
             readCaptureCreator(this, entry.dir),
             Prefs.userId(this),
         )
         binding.ownershipNotice.visibility =
-            if (!entry.uploaded && ownership != CloudUploadOwnership.ALLOWED) View.VISIBLE
-            else View.GONE
+            if (!entry.uploaded && ownership != CloudUploadOwnership.ALLOWED) View.VISIBLE else View.GONE
         binding.ownershipNotice.text = when (ownership) {
             CloudUploadOwnership.ALLOWED -> ""
             CloudUploadOwnership.NEEDS_CLAIM -> getString(
                 if (Auth.signedIn(this)) R.string.detail_local_claim_available
-                else R.string.detail_local_sign_in_to_claim)
-            CloudUploadOwnership.DIFFERENT_ACCOUNT ->
-                getString(R.string.detail_different_account)
+                else R.string.detail_local_sign_in_to_claim,
+            )
+            CloudUploadOwnership.DIFFERENT_ACCOUNT -> getString(R.string.detail_different_account)
         }
         binding.claimCloud.visibility = if (
             !entry.uploaded && ownership == CloudUploadOwnership.NEEDS_CLAIM && Auth.signedIn(this)
         ) View.VISIBLE else View.GONE
         binding.claimCloud.setOnClickListener { showClaimConfirmation(entry.id) }
+    }
 
-        // extracted fields, mono rows, only what exists
-        binding.fields.removeAllViews()
-        renderProvenance(entry)
-        entry.meta?.let { meta ->
-            for (k in Pipeline.FIELDS) {
-                val v = meta.optString(k).trim()
-                if (v.isEmpty()) continue
-                binding.fields.addView(fieldRow(k, v))
+    private fun renderFields(
+        container: LinearLayout,
+        fields: List<BookDetailField>,
+        compact: Boolean,
+    ) {
+        container.removeAllViews()
+        fields.forEach { field -> container.addView(fieldRow(field.label, field.value, compact)) }
+    }
+
+    private fun renderOcrExpansion() {
+        binding.ocrText.visibility = if (ocrExpanded) View.VISIBLE else View.GONE
+        binding.ocrToggle.setIconResource(
+            if (ocrExpanded) R.drawable.ic_expand_less else R.drawable.ic_expand_more,
+        )
+        binding.ocrToggle.contentDescription = getString(
+            if (ocrExpanded) R.string.detail_collapse_ocr else R.string.detail_expand_ocr,
+        )
+        binding.ocrToggle.isSelected = ocrExpanded
+    }
+
+    private fun configureDiagnosticsPanel() {
+        binding.diagnosticsTabs.apply {
+            addTab(newTab()
+                .setText(R.string.detail_diagnostics_json_tab)
+                .setContentDescription(R.string.detail_diagnostics_json_tab_description))
+            addTab(newTab()
+                .setText(R.string.detail_diagnostics_mistral_tab)
+                .setContentDescription(R.string.detail_diagnostics_mistral_tab_description))
+            getTabAt(diagnosticsTab)?.select()
+            addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+                override fun onTabSelected(tab: TabLayout.Tab) {
+                    diagnosticsTab = tab.position
+                    diagnosticsPendingScrollY = null
+                    renderDiagnosticsText()
+                    if (diagnosticsExpanded && diagnosticsContent == null) {
+                        diagnosticsEntry?.let { loadDiagnostics(it, force = false) }
+                    }
+                    binding.diagnosticsScroll.post { binding.diagnosticsScroll.scrollTo(0, 0) }
+                }
+
+                override fun onTabUnselected(tab: TabLayout.Tab) = Unit
+                override fun onTabReselected(tab: TabLayout.Tab) = Unit
+            })
+        }
+        binding.diagnosticsToggle.setOnClickListener {
+            diagnosticsExpanded = !diagnosticsExpanded
+            if (diagnosticsExpanded) {
+                diagnosticsEntry?.let { loadDiagnostics(it, force = false) }
+            } else {
+                diagnosticsPendingScrollY = binding.diagnosticsScroll.scrollY
+                cancelDiagnosticsLoad()
             }
-            meta.optJSONObject("extra")?.let { extra ->
-                for (k in extra.keys()) {
-                    val v = extra.optString(k).trim()
-                    if (v.isNotEmpty()) binding.fields.addView(fieldRow(k, v))
+            renderDiagnosticsExpansion()
+        }
+        renderDiagnosticsExpansion()
+    }
+
+    private fun loadDiagnostics(entry: Entries.Entry, force: Boolean) {
+        if (!diagnosticsExpanded) return
+        if (diagnosticsJob?.isActive == true && diagnosticsRequestedEntryId == entry.id) return
+        if (!force && diagnosticsLoadedEntryId == entry.id && diagnosticsContent != null) return
+
+        diagnosticsJob?.cancel()
+        diagnosticsRequestedEntryId = entry.id
+        if (diagnosticsLoadedEntryId != entry.id) {
+            diagnosticsContent = null
+            diagnosticsLoadedEntryId = null
+            renderDiagnosticsText()
+        }
+        val generation = ++diagnosticsLoadGeneration
+        diagnosticsJob = lifecycleScope.launch {
+            val content = withContext(Dispatchers.IO) { BookDiagnosticsPresenter.from(entry) }
+            if (generation != diagnosticsLoadGeneration || !diagnosticsExpanded) return@launch
+            diagnosticsContent = content
+            diagnosticsLoadedEntryId = entry.id
+            diagnosticsRequestedEntryId = null
+            diagnosticsJob = null
+            renderDiagnosticsText()
+        }
+    }
+
+    private fun cancelDiagnosticsLoad() {
+        diagnosticsLoadGeneration++
+        diagnosticsJob?.cancel()
+        diagnosticsJob = null
+        diagnosticsRequestedEntryId = null
+        diagnosticsContent = null
+        diagnosticsLoadedEntryId = null
+    }
+
+    private fun renderDiagnosticsExpansion() {
+        binding.diagnosticsContent.visibility = if (diagnosticsExpanded) View.VISIBLE else View.GONE
+        binding.diagnosticsToggle.setIconResource(
+            if (diagnosticsExpanded) R.drawable.ic_expand_less else R.drawable.ic_expand_more,
+        )
+        binding.diagnosticsToggle.contentDescription = getString(
+            if (diagnosticsExpanded) {
+                R.string.detail_collapse_diagnostics
+            } else {
+                R.string.detail_expand_diagnostics
+            },
+        )
+        binding.diagnosticsToggle.isSelected = diagnosticsExpanded
+        ViewCompat.setStateDescription(
+            binding.diagnosticsToggle,
+            getString(if (diagnosticsExpanded) R.string.expanded else R.string.collapsed),
+        )
+    }
+
+    private fun renderDiagnosticsText() {
+        val content = diagnosticsContent
+        if (content == null) {
+            binding.diagnosticsText.text = getString(R.string.detail_loading_book_data)
+            return
+        }
+        binding.diagnosticsText.text = when (diagnosticsTab) {
+            DIAGNOSTICS_TAB_MISTRAL -> {
+                if (content.mistralSections.isEmpty()) {
+                    getString(R.string.detail_no_persisted_mistral)
+                } else {
+                    content.mistralSections.joinToString("\n\n\u2014\u2014\u2014\n\n") { section ->
+                        val heading = when (section.kind) {
+                            Entries.MistralResponseKind.OCR -> getString(
+                                R.string.detail_mistral_capture_heading,
+                                section.captureOrder ?: 1,
+                            )
+                            Entries.MistralResponseKind.EXTRACTION -> getString(
+                                R.string.detail_mistral_extraction_heading,
+                            )
+                        }
+                        if (section.validJson) {
+                            "$heading\n\n${section.humanReadableBody}"
+                        } else {
+                            "$heading\n\n${getString(R.string.detail_invalid_mistral_json)}" +
+                                "\n\n${section.humanReadableBody}"
+                        }
+                    }
                 }
             }
+            else -> content.bookJson?.let(::syntaxHighlightedJson)
+                ?: getString(R.string.detail_no_book_json)
         }
+        diagnosticsPendingScrollY?.let { scrollY ->
+            diagnosticsPendingScrollY = null
+            binding.diagnosticsScroll.post { binding.diagnosticsScroll.scrollTo(0, scrollY) }
+        }
+    }
 
-        val ocr = entry.ocrText()
-        binding.ocrText.text = ocr.ifEmpty { getString(R.string.detail_no_ocr) }
+    private fun syntaxHighlightedJson(json: String): CharSequence {
+        val styled = SpannableString(json)
+        JsonSyntaxTokenizer.tokenize(json).forEach { token ->
+            val color = when (token.kind) {
+                JsonSyntaxKind.KEY -> R.color.whl_cyan
+                JsonSyntaxKind.STRING -> R.color.whl_green
+                JsonSyntaxKind.NUMBER -> R.color.whl_amber
+                JsonSyntaxKind.BOOLEAN, JsonSyntaxKind.NULL -> R.color.whl_red
+                JsonSyntaxKind.PUNCTUATION -> R.color.whl_ink_dim
+            }
+            styled.setSpan(
+                ForegroundColorSpan(getColor(color)),
+                token.start,
+                token.end,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        return styled
+    }
 
-        renderDeepseekDialog(entry)
-        binding.deepseekInstructions.isEnabled = !entry.uploaded
-        binding.deepseekInstructions.alpha = if (entry.uploaded) .55f else 1f
-        binding.reprocessAvailability.visibility = if (entry.uploaded) View.VISIBLE else View.GONE
-        binding.reprocessAvailability.text = if (entry.uploaded)
-            getString(R.string.detail_reprocess_desktop) else ""
-
-        // pages, decoded off the UI thread at thumbnail scale. Cancel any decode
-        // still running from a previous render (a second onResume) so its views
-        // can't append onto the freshly-cleared strip and duplicate pages.
+    private fun renderPhotos(entry: Entries.Entry) {
         photoJob?.cancel()
         binding.photos.removeAllViews()
-        val photos = entry.photos()
+        binding.heroPhoto.setPhotoBitmap(null)
+        val descriptors = entry.photoDescriptors()
+        val heroFile = entry.detailHeroPhoto()
+        val hero = heroFile?.let(entry::photoDescriptor)
+        binding.photoSection.visibility = if (hero == null) View.GONE else View.VISIBLE
+        if (hero == null) return
+
+        val others = descriptors.filterNot { it.assetId == hero.assetId }
+        binding.otherPhotosLabel.visibility = if (others.isEmpty()) View.GONE else View.VISIBLE
+        binding.photosScroll.visibility = if (others.isEmpty()) View.GONE else View.VISIBLE
+        binding.heroState.text = roleLabel(hero, hero.order)
+        binding.heroState.visibility = View.VISIBLE
+        binding.heroPhoto.setOnClickListener {
+            showPhotoViewer(hero, getString(R.string.detail_title_page))
+        }
+
         photoJob = lifecycleScope.launch {
-            for ((index, p) in photos.withIndex()) {
-                val bmp = withContext(Dispatchers.IO) {
-                    BitmapFactory.decodeFile(p.absolutePath,
-                        BitmapFactory.Options().apply { inSampleSize = 4 })
-                } ?: continue
-                val iv = ImageView(this@EntryDetailActivity)
-                val h = resources.getDimensionPixelSize(R.dimen.detail_thumbnail_height)
-                val w = h * bmp.width / bmp.height.coerceAtLeast(1)
-                iv.layoutParams = LinearLayout.LayoutParams(w, h).apply {
-                    marginEnd = resources.getDimensionPixelSize(R.dimen.detail_thumbnail_gap)
+            val heroBitmap = withContext(Dispatchers.IO) {
+                decodeSampledOriented(hero.displayFile, maxWidth = 1800, maxHeight = 1800)
+            }
+            if (heroBitmap != null) binding.heroPhoto.setPhotoBitmap(heroBitmap)
+            applyOverlay(binding.heroPhoto, hero)
+
+            others.forEach { descriptor ->
+                val bitmap = withContext(Dispatchers.IO) {
+                    decodeSampledOriented(descriptor.displayFile, maxWidth = 420, maxHeight = 420)
+                } ?: return@forEach
+                addThumbnail(descriptor, bitmap)
+            }
+        }
+    }
+
+    private fun addThumbnail(descriptor: EntryPhotoDescriptor, bitmap: Bitmap) {
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, 0, resources.getDimensionPixelSize(R.dimen.detail_thumbnail_gap), 0)
+        }
+        val height = resources.getDimensionPixelSize(R.dimen.detail_thumbnail_height)
+        val width = (height * bitmap.width / bitmap.height.coerceAtLeast(1)).coerceAtLeast(height / 2)
+        val image = ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(width, height)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundResource(R.drawable.whl_photo_frame)
+            setPadding(1, 1, 1, 1)
+            setImageBitmap(bitmap)
+            contentDescription = getString(R.string.detail_photo_description, descriptor.order + 1)
+            setOnClickListener { showPhotoViewer(descriptor, roleLabel(descriptor, descriptor.order)) }
+        }
+        column.addView(image)
+        column.addView(TextView(this).apply {
+            text = roleLabel(descriptor, descriptor.order)
+            setTextColor(getColor(R.color.whl_ink_dim))
+            textSize = 11f
+            gravity = Gravity.CENTER
+            maxLines = 1
+            setPadding(3, 4, 3, 0)
+        }, LinearLayout.LayoutParams(width, ViewGroup.LayoutParams.WRAP_CONTENT))
+        binding.photos.addView(column)
+    }
+
+    private fun showPhotoViewer(descriptor: EntryPhotoDescriptor, label: String) {
+        viewerJob?.cancel()
+        viewerDialog?.dismiss()
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val root = android.widget.FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val photo = ZoomablePhotoView(this).apply {
+            zoomEnabled = true
+            contentDescription = label
+        }
+        root.addView(photo, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+
+        val topBar = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(8, 8, 8, 8)
+            setBackgroundColor(0xB522211F.toInt())
+        }
+        val close = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_close_detail)
+            imageTintList = android.content.res.ColorStateList.valueOf(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            contentDescription = getString(R.string.close)
+            minimumWidth = resources.getDimensionPixelSize(R.dimen.touch_target)
+            minimumHeight = resources.getDimensionPixelSize(R.dimen.touch_target)
+            setOnClickListener { dialog.dismiss() }
+        }
+        topBar.addView(close)
+        topBar.addView(TextView(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            maxLines = 2
+            setPadding(8, 0, 8, 0)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val canCompare = descriptor.rawFile.canonicalPath != descriptor.displayFile.canonicalPath &&
+            descriptor.rawFile.isFile
+        val compare = MaterialButton(this).apply {
+            text = getString(R.string.detail_original)
+            setIconResource(R.drawable.ic_compare_original)
+            iconTint = android.content.res.ColorStateList.valueOf(Color.WHITE)
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            isAllCaps = false
+            contentDescription = getString(R.string.detail_compare_description)
+            visibility = if (canCompare) View.VISIBLE else View.GONE
+        }
+        topBar.addView(compare)
+        root.addView(topBar, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP,
+        ))
+
+        var showingOriginal = false
+        fun show(original: Boolean) {
+            if (!canCompare && original) return
+            showingOriginal = original
+            compare.text = getString(
+                if (original) R.string.detail_processed else R.string.detail_original,
+            )
+            val target = if (original) descriptor.rawFile else descriptor.displayFile
+            viewerJob?.cancel()
+            viewerJob = lifecycleScope.launch {
+                val bitmap = withContext(Dispatchers.IO) {
+                    decodeSampledOriented(target, maxWidth = 3000, maxHeight = 3000)
+                } ?: return@launch
+                if (dialog.isShowing) {
+                    photo.setPhotoBitmap(bitmap)
+                    if (original) photo.setOverlayRegions(emptyList())
+                    else applyOverlay(photo, descriptor)
                 }
-                iv.scaleType = ImageView.ScaleType.CENTER_CROP
-                iv.contentDescription = getString(R.string.detail_photo_description, index + 1)
-                iv.setImageBitmap(bmp)
-                binding.photos.addView(iv)
+            }
+        }
+        compare.setOnClickListener { show(!showingOriginal) }
+        photo.onOriginalHoldChanged = if (canCompare) { original -> show(original) } else null
+        dialog.setContentView(root)
+        dialog.setOnDismissListener {
+            viewerJob?.cancel()
+            if (viewerDialog === dialog) viewerDialog = null
+        }
+        viewerDialog = dialog
+        dialog.show()
+        show(false)
+    }
+
+    /** Geometry is revision-bound by EntryPhotoDescriptor; unrecognized or
+     * geometry-less provider responses intentionally render no decorative box. */
+    private fun overlayRegions(descriptor: EntryPhotoDescriptor): List<PhotoOverlayRegion> =
+        descriptor.geometry.mapNotNull { region ->
+            val points = region.normalizedPolygon.map { point ->
+                android.graphics.PointF(point.x.toFloat(), point.y.toFloat())
+            }
+            points.takeIf { it.size >= 3 }?.let {
+                PhotoOverlayRegion(it, region.label)
             }
         }
 
-        // discard is for what has not shipped; the cloud copy is the desktop's
-        val isActiveCapture = Prefs.currentEntryId(this) == entry.id
-        binding.discard.visibility =
-            if (entry.uploaded || isActiveCapture) View.GONE else View.VISIBLE
-        binding.discard.setOnClickListener { showDiscardConfirmation(entry) }
+    private fun applyOverlay(view: ZoomablePhotoView, descriptor: EntryPhotoDescriptor) {
+        val regions = if (Prefs.showOcrRegions(this)) overlayRegions(descriptor) else emptyList()
+        view.setOverlayRegions(
+            regions,
+            opacity = Prefs.ocrRegionOpacityPercent(this) / 100f,
+            labels = Prefs.showOcrRegionLabels(this),
+        )
+    }
+
+    private fun roleLabel(descriptor: EntryPhotoDescriptor, order: Int): String {
+        val role = descriptor.role.toString()
+            .lowercase()
+            .replace('_', ' ')
+            .replaceFirstChar { it.titlecase() }
+        if (role == "Other" || role == "Unknown") {
+            return getString(R.string.detail_page_number, order + 1)
+        }
+        return if (descriptor.roleSuggested) getString(R.string.detail_suggested_role, role) else role
     }
 
     private fun showDiscardConfirmation(entry: Entries.Entry) {
@@ -161,14 +533,11 @@ class EntryDetailActivity : AppCompatActivity() {
             .setTitle(R.string.detail_discard_title)
             .setMessage(R.string.detail_discard_message)
             .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.detail_discard_confirm) { _, _ ->
-                deleteEntry(entry.id)
-            }
+            .setPositiveButton(R.string.detail_discard_confirm) { _, _ -> deleteEntry(entry.id) }
             .create()
             .also { dialog ->
                 dialog.setOnShowListener {
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE)
-                        .setTextColor(getColor(R.color.whl_red))
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(getColor(R.color.whl_red))
                 }
                 dialog.setOnDismissListener { discardDialog = null }
                 dialog.show()
@@ -224,8 +593,7 @@ class EntryDetailActivity : AppCompatActivity() {
                 )
             }
             when (result) {
-                Entries.DeleteResult.DELETED,
-                Entries.DeleteResult.MISSING -> finish()
+                Entries.DeleteResult.DELETED, Entries.DeleteResult.MISSING -> finish()
                 Entries.DeleteResult.ACTIVE_CAPTURE -> {
                     Toast.makeText(
                         this@EntryDetailActivity,
@@ -251,136 +619,35 @@ class EntryDetailActivity : AppCompatActivity() {
         }
     }
 
-    private fun showDeepseekInstructions() {
-        if (instructionsDialog?.isShowing == true) return
-        val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID) ?: "") ?: return
-        val dialogBinding = DialogDeepseekInstructionsBinding.inflate(layoutInflater)
-        dialogBinding.customInstructions.setText(entry.customInstructions())
-        dialogBinding.customInstructions.setSelection(dialogBinding.customInstructions.length())
-
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.detail_deepseek_instructions)
-            .setView(dialogBinding.root)
-            .setNegativeButton(R.string.close, null)
-            .create()
-        instructionsDialog = dialog
-        instructionsDialogBinding = dialogBinding
-        dialogBinding.resubmit.setOnClickListener {
-            resubmit(dialogBinding.customInstructions.text?.toString().orEmpty())
-        }
-        dialog.setOnDismissListener {
-            instructionsDialog = null
-            instructionsDialogBinding = null
-        }
-        renderDeepseekDialog(entry)
-        dialog.show()
-    }
-
-    private fun renderDeepseekDialog(entry: Entries.Entry) {
-        val dialogBinding = instructionsDialogBinding ?: return
-        val pending = entry.reprocessPending()
-        val error = entry.reprocessError()
-        dialogBinding.resubmit.isEnabled = !pending && !entry.uploaded
-        dialogBinding.reprocessState.text = when {
-            pending -> getString(R.string.detail_reprocessing)
-            error.isNotEmpty() -> getString(R.string.detail_reprocess_error, error)
-            else -> ""
-        }
-    }
-
-    private fun resubmit(customInstructions: String) {
-        val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID) ?: "") ?: return
-        if (entry.uploaded) {
-            Toast.makeText(this, R.string.detail_reprocess_desktop, Toast.LENGTH_LONG).show()
-            return
-        }
-        if (Prefs.deepseekKey(this).isEmpty()) {
-            Toast.makeText(this, R.string.detail_need_deepseek, Toast.LENGTH_LONG).show()
-            return
-        }
-        if (entry.ocrText().isEmpty()) {
-            Toast.makeText(this, R.string.detail_need_ocr, Toast.LENGTH_LONG).show()
-            return
-        }
-        lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                EntryOperationLocks.withLock(entry.id) {
-                    val current = Entries.find(this@EntryDetailActivity, entry.id)
-                        ?: return@withLock ReprocessRequestResult.MISSING
-                    if (current.uploaded) return@withLock ReprocessRequestResult.UPLOADED
-                    current.setCustomInstructions(customInstructions)
-                    if (!current.requestReprocess()) {
-                        return@withLock ReprocessRequestResult.LOCAL_WRITE_FAILED
-                    }
-                    Prefs.setLastProcError(this@EntryDetailActivity, null)
-                    ProcessWorker.enqueue(this@EntryDetailActivity, current.id)
-                    ReprocessRequestResult.QUEUED
-                }
-            }
-            when (result) {
-                ReprocessRequestResult.QUEUED -> {
-                    render()
-                    Toast.makeText(
-                        this@EntryDetailActivity,
-                        R.string.detail_reprocess_queued,
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-                ReprocessRequestResult.UPLOADED -> {
-                    render()
-                    Toast.makeText(
-                        this@EntryDetailActivity,
-                        R.string.detail_reprocess_desktop,
-                        Toast.LENGTH_LONG,
-                    ).show()
-                }
-                ReprocessRequestResult.MISSING -> finish()
-                ReprocessRequestResult.LOCAL_WRITE_FAILED -> Toast.makeText(
-                    this@EntryDetailActivity,
-                    R.string.detail_reprocess_local_write_failed,
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        }
-    }
-
-    private enum class ReprocessRequestResult {
-        QUEUED, UPLOADED, MISSING, LOCAL_WRITE_FAILED
-    }
-
-    /**
-     * Where this book came from, above the extracted bibliography — it describes
-     * the scan, not the book. "From" is editable until the capture uploads:
-     * after that the cloud row is insert-only, so a local edit would disagree
-     * with what the desktop already holds.
-     */
+    /** Provenance describes the capture rather than the book, so it stays out
+     * of the bibliographic Other-details table. */
     private fun renderProvenance(entry: Entries.Entry) {
-        val provenance = entry.provenance ?: return
-        binding.fields.addView(
-            fieldRow(getString(R.string.collections_field_name), provenance.collectionName))
-        val fromRow = fieldRow(
-            getString(R.string.detail_from),
-            provenance.from.ifEmpty { getString(R.string.detail_from_none) })
+        binding.provenanceFields.removeAllViews()
+        val provenance = entry.provenance
+        binding.provenanceSection.visibility = if (provenance == null) View.GONE else View.VISIBLE
+        if (provenance == null) return
+        binding.provenanceFields.addView(fieldRow(
+            getString(R.string.collections_field_name),
+            provenance.collectionName,
+            compact = true,
+        ))
+        val fromValue = provenance.from.ifEmpty { getString(R.string.detail_from_none) }
+        val fromRow = fieldRow(getString(R.string.detail_from), fromValue, compact = true)
         if (entry.uploaded) {
             fromRow.setOnClickListener {
                 Toast.makeText(this, R.string.detail_from_locked, Toast.LENGTH_LONG).show()
             }
             fromRow.alpha = .7f
         } else {
-            // Nothing else in this list is tappable, so the row needs to say so
-            // — an unmarked one reads as another read-only field.
             (fromRow as LinearLayout).addView(TextView(this).apply {
-                typeface = android.graphics.Typeface.MONOSPACE
-                textSize = 10f
+                textSize = 11f
                 setTextColor(getColor(R.color.whl_cyan))
                 setText(R.string.detail_from_edit)
             })
             fromRow.setOnClickListener { editFrom(entry) }
         }
-        fromRow.contentDescription = getString(
-            R.string.detail_from_description,
-            provenance.from.ifEmpty { getString(R.string.detail_from_none) })
-        binding.fields.addView(fromRow)
+        fromRow.contentDescription = getString(R.string.detail_from_description, fromValue)
+        binding.provenanceFields.addView(fromRow)
     }
 
     private fun editFrom(entry: Entries.Entry) {
@@ -390,14 +657,13 @@ class EntryDetailActivity : AppCompatActivity() {
             inputType = android.text.InputType.TYPE_CLASS_TEXT or
                 android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS
             setHint(R.string.detail_from_hint)
-            setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO)
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
         }
         val frame = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(56, 24, 56, 0)
             addView(field)
             addView(TextView(this@EntryDetailActivity).apply {
-                typeface = android.graphics.Typeface.MONOSPACE
                 textSize = 11f
                 setTextColor(getColor(R.color.whl_ink_dim))
                 setPadding(0, 16, 0, 0)
@@ -408,18 +674,12 @@ class EntryDetailActivity : AppCompatActivity() {
             .setTitle(R.string.detail_from_title)
             .setView(frame)
             .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.collections_save) { _, _ -> saveFrom(entry, field.text.toString()) }
+            .setPositiveButton(R.string.collections_save) { _, _ ->
+                saveFrom(entry, field.text.toString())
+            }
             .show()
     }
 
-    /**
-     * Same discipline as [requestReprocess]: off the UI thread, under the
-     * entry's lock, re-reading the entry inside it. `entry.uploaded` in
-     * [renderProvenance] is a snapshot from render() time, which does not cover
-     * an upload that starts while the dialog is open — without the lock this
-     * can interleave with UploadWorker's read-modify-write of the same
-     * manifest, leaving the phone showing an origin the cloud never received.
-     */
     private fun saveFrom(entry: Entries.Entry, from: String) {
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
@@ -431,10 +691,6 @@ class EntryDetailActivity : AppCompatActivity() {
                     else FromSaveResult.WRITE_FAILED
                 }
             }
-            // Each outcome needs its own words. "Free storage and try again" is
-            // actively wrong advice for a book that uploaded while the dialog
-            // was open — retrying can never succeed. MISSING says nothing at
-            // all: render() finishes the Activity, and a Toast would outlive it.
             when (result) {
                 FromSaveResult.SAVED, FromSaveResult.MISSING -> Unit
                 FromSaveResult.UPLOADED -> Toast.makeText(
@@ -454,24 +710,38 @@ class EntryDetailActivity : AppCompatActivity() {
 
     private enum class FromSaveResult { SAVED, UPLOADED, MISSING, WRITE_FAILED }
 
-    private fun fieldRow(label: String, value: String): View {
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.setPadding(0, 3, 0, 3)
-        val l = TextView(this)
-        l.typeface = android.graphics.Typeface.MONOSPACE
-        l.textSize = 11f
-        l.setTextColor(getColor(R.color.whl_ink_dim))
-        l.text = label.uppercase().padEnd(10)
-        val v = TextView(this)
-        v.typeface = android.graphics.Typeface.MONOSPACE
-        v.textSize = 12f
-        v.setTextColor(getColor(R.color.whl_ink))
-        v.text = value
-        row.addView(l, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        row.addView(v, LinearLayout.LayoutParams(
-            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+    private fun fieldRow(label: String, value: String, compact: Boolean): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.TOP
+            setPadding(0, if (compact) 5 else 4, 0, if (compact) 5 else 4)
+        }
+        val labelView = TextView(this).apply {
+            textSize = if (compact) 11f else 12f
+            setTextColor(getColor(R.color.whl_ink_dim))
+            text = label
+        }
+        val valueView = TextView(this).apply {
+            if (compact) typeface = android.graphics.Typeface.MONOSPACE
+            textSize = if (compact) 11f else 13f
+            setTextColor(getColor(R.color.whl_ink))
+            text = value
+            setPadding(10, 0, 0, 0)
+            setTextIsSelectable(true)
+        }
+        row.addView(labelView, LinearLayout.LayoutParams(
+            resources.getDimensionPixelSize(
+                if (compact) R.dimen.detail_field_label_width else R.dimen.detail_secondary_label_width,
+            ),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        row.addView(valueView, LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            1f,
+        ))
         return row
     }
+
+    private fun String.visibleOrGone(): Int = if (isBlank()) View.GONE else View.VISIBLE
 }

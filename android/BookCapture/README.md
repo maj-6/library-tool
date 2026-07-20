@@ -74,8 +74,9 @@ photo count and a dropdown of recent scans.
 
 ## Build
 
-1. Open `android/BookCapture` in Android Studio (Koala 2024.1.1 or newer)
-   and let it sync (AGP 8.5 / Kotlin 1.9; Android Studio supplies Gradle).
+1. Open `android/BookCapture` in Android Studio Koala Feature Drop
+   (2024.1.2) or newer and let it sync. The project uses AGP 8.6, Kotlin
+   1.9.24, JDK 17, and the checked-in Gradle 8.12 wrapper.
 2. Fork maintainers export `WHL_SUPABASE_URL` / `WHL_SUPABASE_ANON_KEY` before
    building to bake their public project configuration in (release CI already
    does this for official builds). App users never enter a Supabase key.

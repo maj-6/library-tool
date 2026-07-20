@@ -1,4 +1,4 @@
-# Library Tool — Changelog
+# Library Tool Desktop — Changelog
 
 Stable releases are listed newest first. Prerelease changes are included in the
 next stable release. These notes are also available in the desktop app under
@@ -10,13 +10,12 @@ Help → View changelog.
 
 - Analyze now combines OCR and text analysis in one workspace with a resizable page preview.
 - Publish adds a browsable catalogue tree and an online-record preview.
-- Book Capture adds scan selection, deletion, and guided reprocessing.
 - The Archive Browser adds search suggestions, author pages, and cover thumbnails.
 - Copyright search now covers later U.S. registration records.
 
 ### Other Changes
 
-- Book Capture and the desktop app now use the same signed-in account for scan sync.
+- Desktop scan sync now uses the same signed-in account as Library Tool Capture.
 - OCR progress and page-level failures are shown in the workspace, and running jobs can stop after the current page.
 - Generated About text now updates the Editor description.
 
@@ -37,8 +36,6 @@ Help → View changelog.
 
 ### Additions
 
-- Book Capture can send scans directly to a paired desktop over a local network, including without internet access.
-- Book Capture adds Google and GitHub sign-in, page-edge guidance, and an optional sharpened viewfinder.
 - The PDF reader adds page jumping and keyboard navigation.
 
 ### Other Changes
@@ -57,7 +54,6 @@ Help → View changelog.
 ### Additions
 
 - Offline catalogue and copyright databases can now be added through the database folder without configuring a download address.
-- Book Capture now opens to a home screen with recent scans, extracted book details, and upload status.
 
 ### Bugfixes
 
@@ -87,7 +83,6 @@ Help → View changelog.
 - Added AI-assisted summaries, margin annotations, and page-aligned translations for verified volumes.
 - Added hierarchical categories for the collection.
 - Added an online catalogue with an in-page reader.
-- Book Capture adds account sign-in, recent scans, and background OCR and cataloguing.
 - Desktop imports now reuse phone-generated text and book details while retaining contributor credit.
 
 ### Other Changes

@@ -141,6 +141,91 @@ object Prefs {
 
     fun setDeviceName(ctx: Context, v: String) = put(ctx, "device_name" to v.trim())
 
+    /** Home-list density is a device preference: it changes only presentation,
+     * never capture metadata or the account profile. */
+    fun compactScanList(ctx: Context): Boolean =
+        sp(ctx).getBoolean("compact_scan_list", false)
+
+    fun setCompactScanList(ctx: Context, compact: Boolean) =
+        sp(ctx).edit().putBoolean("compact_scan_list", compact).apply()
+
+    /** OCR geometry is a display preference. It never changes the persisted
+     * provider evidence, so hiding boxes cannot erase a later-useful sidecar. */
+    fun showOcrRegions(ctx: Context): Boolean =
+        sp(ctx).getBoolean("show_ocr_regions", true)
+
+    fun setShowOcrRegions(ctx: Context, show: Boolean) =
+        sp(ctx).edit().putBoolean("show_ocr_regions", show).apply()
+
+    fun ocrRegionOpacityPercent(ctx: Context): Int =
+        sp(ctx).getInt("ocr_region_opacity", 55).coerceIn(10, 90)
+
+    fun setOcrRegionOpacityPercent(ctx: Context, percent: Int) =
+        sp(ctx).edit().putInt("ocr_region_opacity", percent.coerceIn(10, 90)).apply()
+
+    fun showOcrRegionLabels(ctx: Context): Boolean =
+        sp(ctx).getBoolean("show_ocr_region_labels", false)
+
+    fun setShowOcrRegionLabels(ctx: Context, show: Boolean) =
+        sp(ctx).edit().putBoolean("show_ocr_region_labels", show).apply()
+
+    /** Shared extraction guidance replaces the removed per-book DeepSeek
+     * action. Individual legacy instructions still take precedence. */
+    fun extractionInstructions(ctx: Context): String = str(ctx, "extraction_instructions")
+
+    fun setExtractionInstructions(ctx: Context, value: String) =
+        put(ctx, "extraction_instructions" to value.trim().take(4_000))
+
+    // --- display-derivative post-processing ---------------------------------
+
+    /**
+     * Post-processing is device-local until the derivative service exists.
+     * These preferences describe a requested derivative only; capture
+     * originals remain immutable regardless of the selected profile.
+     */
+    internal fun postProcessingPreset(ctx: Context): PostProcessingPreset =
+        PostProcessingPreset.fromStoredValue(
+            sp(ctx).getString("post_processing_preset", null),
+        )
+
+    internal fun setPostProcessingPreset(ctx: Context, preset: PostProcessingPreset) =
+        put(ctx, "post_processing_preset" to preset.storedValue)
+
+    internal fun postProcessingFeatures(ctx: Context): PostProcessingFeatures =
+        PostProcessingFeatures(
+            dewarpPerspectiveAndPageCurvature =
+                sp(ctx).getBoolean("post_processing_dewarp", true),
+            cropToDetectedPageMargins =
+                sp(ctx).getBoolean("post_processing_margin_crop", true),
+            normalizePageAndTextContrast =
+                sp(ctx).getBoolean("post_processing_contrast", true),
+            detectAndCropSpine =
+                sp(ctx).getBoolean("post_processing_spine_crop", true),
+        )
+
+    internal fun setPostProcessingDewarp(ctx: Context, enabled: Boolean) =
+        sp(ctx).edit().putBoolean("post_processing_dewarp", enabled).apply()
+
+    internal fun setPostProcessingMarginCrop(ctx: Context, enabled: Boolean) =
+        sp(ctx).edit().putBoolean("post_processing_margin_crop", enabled).apply()
+
+    internal fun setPostProcessingContrast(ctx: Context, enabled: Boolean) =
+        sp(ctx).edit().putBoolean("post_processing_contrast", enabled).apply()
+
+    internal fun setPostProcessingSpineCrop(ctx: Context, enabled: Boolean) =
+        sp(ctx).edit().putBoolean("post_processing_spine_crop", enabled).apply()
+
+    /** A ready-to-serialize request for a catalog year (or an unknown year). */
+    internal fun postProcessingProfile(
+        ctx: Context,
+        publicationYear: Int?,
+    ): PostProcessingProfile =
+        resolvePostProcessingProfile(
+            selectedPreset = postProcessingPreset(ctx),
+            publicationYear = publicationYear,
+            features = postProcessingFeatures(ctx),
+        )
+
     const val CREATOR_ACCOUNT = "account"
     const val CREATOR_LOCAL = "local"
 
@@ -178,15 +263,22 @@ object Prefs {
         str(ctx, "current_collection").ifEmpty { null }
     fun setCurrentCollectionId(ctx: Context, id: String?) = put(ctx, "current_collection" to id)
 
-    /** A Done/Cancel accepted while CameraX owns a file must survive an
+    /** A terminal command accepted while CameraX owns a file must survive an
      * Activity replacement. Commit synchronously because this is a tiny state
      * transition whose durability is more important than avoiding a disk
      * flush on a button press. */
-    fun setPendingCaptureCommand(ctx: Context, entryId: String?, command: String?) {
-        val valid = command?.takeIf { it == "done" || it == "cancel" }
+    fun setPendingCaptureCommand(
+        ctx: Context,
+        entryId: String?,
+        command: String?,
+        targetPage: Int? = null,
+    ) {
+        val valid = command?.takeIf { it in PENDING_CAPTURE_COMMANDS }
+        val validTarget = targetPage?.takeIf { valid == "undo" && it > 0 } ?: -1
         sp(ctx).edit()
             .putString("pending_capture_entry", if (valid == null) "" else entryId.orEmpty())
             .putString("pending_capture_command", valid.orEmpty())
+            .putInt("pending_capture_target_page", validTarget)
             .commit()
     }
 
@@ -194,8 +286,7 @@ object Prefs {
         val storedEntry = str(ctx, "pending_capture_entry")
         val command = str(ctx, "pending_capture_command")
         if (storedEntry.isEmpty() || storedEntry != entryId ||
-            (command != "done" && command != "cancel")
-        ) {
+            command !in PENDING_CAPTURE_COMMANDS) {
             if (storedEntry.isNotEmpty() || command.isNotEmpty()) {
                 setPendingCaptureCommand(ctx, null, null)
             }
@@ -204,11 +295,21 @@ object Prefs {
         return command
     }
 
+    /** The exact accepted page owned by a deferred Undo. If that page never
+     * commits (capture error/process death), Undo is already satisfied and
+     * must not fall back to deleting an older photo or note. */
+    fun pendingCaptureTargetPage(ctx: Context, entryId: String?): Int? {
+        if (pendingCaptureCommand(ctx, entryId) != "undo") return null
+        return sp(ctx).getInt("pending_capture_target_page", -1).takeIf { it > 0 }
+    }
+
     fun clearPendingCaptureCommand(ctx: Context, entryId: String?) {
         if (str(ctx, "pending_capture_entry") == entryId.orEmpty()) {
             setPendingCaptureCommand(ctx, null, null)
         }
     }
+
+    private val PENDING_CAPTURE_COMMANDS = setOf("done", "cancel", "restart", "undo")
 
     /** Last failure that retrying can't fix; the main screen shows these
      *  instead of counting work forever. */

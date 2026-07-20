@@ -19,151 +19,360 @@
         app:title="@string/detail_title"
         app:titleTextColor="@color/whl_ink" />
 
-    <ScrollView
+    <androidx.core.widget.NestedScrollView
+        android:id="@+id/detailScroll"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_weight="1"
+        android:fillViewport="true">
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="12dp">
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp">
 
-        <LinearLayout style="@style/WhlPanelSection"
-            android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="vertical">
-
-            <TextView
-                android:id="@+id/title"
+            <LinearLayout
+                style="@style/WhlPanelSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:textSize="17sp"
-                android:textStyle="bold"
-                android:textColor="@color/whl_ink" />
+                android:layout_marginTop="0dp"
+                android:orientation="vertical">
 
-            <TextView
-                android:id="@+id/subline"
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:id="@+id/title"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:textColor="@color/whl_ink"
+                        android:textSize="22sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/volumeTag"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="10dp"
+                        android:background="@drawable/whl_detail_tag"
+                        android:contentDescription="@string/detail_volume_description"
+                        android:paddingHorizontal="8dp"
+                        android:paddingVertical="4dp"
+                        android:textColor="@color/whl_green"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:visibility="gone" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/author"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:textColor="@color/whl_ink"
+                    android:textSize="16sp" />
+
+                <TextView
+                    android:id="@+id/year"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:textColor="@color/whl_ink_dim"
+                    android:textSize="14sp" />
+
+                <LinearLayout
+                    android:id="@+id/secondaryDetails"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:orientation="vertical" />
+
+                <TextView
+                    android:id="@+id/stateLine"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/whl_ink_dim"
+                    android:textSize="11sp" />
+
+                <TextView
+                    android:id="@+id/ownershipNotice"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:textColor="@color/whl_amber"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/claimCloud"
+                    style="@style/WhlButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="end"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/detail_claim_cloud"
+                    android:textAllCaps="false"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/overviewSection"
+                style="@style/WhlPanelSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:fontFamily="monospace"
-                android:textSize="12sp"
-                android:textColor="@color/whl_ink_dim" />
+                android:orientation="vertical"
+                android:visibility="gone">
 
-            <TextView
-                android:id="@+id/stateLine"
+                <TextView
+                    style="@style/WhlLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/detail_overview"
+                    android:textAllCaps="false" />
+
+                <TextView
+                    android:id="@+id/overviewText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:lineSpacingExtra="3dp"
+                    android:textColor="@color/whl_ink"
+                    android:textIsSelectable="true"
+                    android:textSize="14sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/provenanceSection"
+                style="@style/WhlPanelSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textAllCaps="true"
-                android:textColor="@color/whl_ink_dim" />
+                android:orientation="vertical"
+                android:visibility="gone">
 
-            <TextView
-                android:id="@+id/ownershipNotice"
+                <TextView
+                    style="@style/WhlLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/detail_capture_source"
+                    android:textAllCaps="false" />
+
+                <LinearLayout
+                    android:id="@+id/provenanceFields"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:orientation="vertical" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/otherSection"
+                style="@style/WhlPanelSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textColor="@color/whl_amber"
-                android:visibility="gone" />
+                android:orientation="vertical"
+                android:visibility="gone">
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/claimCloud"
+                <TextView
+                    style="@style/WhlLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/detail_other_details"
+                    android:textAllCaps="false" />
+
+                <LinearLayout
+                    android:id="@+id/otherFields"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:divider="@drawable/whl_table_divider"
+                    android:orientation="vertical"
+                    android:showDividers="middle" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/photoSection"
+                style="@style/WhlPanelSection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    style="@style/WhlLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/detail_title_page"
+                    android:textAllCaps="false" />
+
+                <FrameLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="360dp"
+                    android:layout_marginTop="8dp"
+                    android:background="@drawable/whl_photo_frame"
+                    android:padding="1dp">
+
+                    <org.whl.bookcapture.ZoomablePhotoView
+                        android:id="@+id/heroPhoto"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:background="@color/whl_face_sh"
+                        android:contentDescription="@string/detail_open_title_page"
+                        android:padding="4dp" />
+
+                    <TextView
+                        android:id="@+id/heroState"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_gravity="bottom|start"
+                        android:layout_margin="10dp"
+                        android:background="@drawable/whl_detail_tag"
+                        android:paddingHorizontal="7dp"
+                        android:paddingVertical="4dp"
+                        android:textColor="@color/whl_ink"
+                        android:textSize="11sp"
+                        android:visibility="gone" />
+                </FrameLayout>
+
+                <TextView
+                    android:id="@+id/otherPhotosLabel"
+                    style="@style/WhlLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="@string/detail_other_photos"
+                    android:textAllCaps="false"
+                    android:visibility="gone" />
+
+                <HorizontalScrollView
+                    android:id="@+id/photosScroll"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:fillViewport="false"
+                    android:scrollbars="none"
+                    android:visibility="gone">
+
+                    <LinearLayout
+                        android:id="@+id/photos"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal" />
+                </HorizontalScrollView>
+            </LinearLayout>
+
+            <LinearLayout
+                style="@style/WhlPanelSection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/ocrToggle"
+                    style="@style/WhlToolbarAction"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="start|center_vertical"
+                    android:text="@string/detail_ocr"
+                    android:textAllCaps="false"
+                    app:icon="@drawable/ic_expand_more"
+                    app:iconGravity="end"
+                    app:iconTint="@color/whl_ink_dim" />
+
+                <TextView
+                    android:id="@+id/ocrText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/whl_ink"
+                    android:textIsSelectable="true"
+                    android:textSize="11sp"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/discard"
                 style="@style/WhlButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="end"
-                android:layout_marginTop="8dp"
-                android:text="@string/detail_claim_cloud"
+                android:layout_marginTop="12dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/detail_discard"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_button_text"
                 android:textSize="12sp"
                 android:visibility="gone" />
 
-            <!-- extracted fields, one mono row each, added in code -->
             <LinearLayout
-                android:id="@+id/fields"
+                style="@style/WhlPanelSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:orientation="vertical" />
-        </LinearLayout>
+                android:orientation="vertical">
 
-        <Button
-            android:id="@+id/deepseekInstructions"
-            style="@style/WhlButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:layout_gravity="end"
-            android:contentDescription="@string/detail_deepseek_action_description"
-            android:drawableStart="@drawable/ic_sparkles"
-            android:drawablePadding="8dp"
-            android:paddingStart="14dp"
-            android:paddingEnd="14dp"
-            android:text="@string/detail_deepseek_action"
-            android:textSize="12sp" />
-
-        <TextView
-            android:id="@+id/reprocessAvailability"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:fontFamily="monospace"
-            android:textSize="11sp"
-            android:textColor="@color/whl_ink_dim"
-            android:visibility="gone" />
-
-        <LinearLayout style="@style/WhlPanelSection"
-            android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="vertical">
-            <TextView style="@style/WhlLabel"
-                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:text="@string/detail_photos" />
-            <HorizontalScrollView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp">
-                <LinearLayout
-                    android:id="@+id/photos"
-                    android:layout_width="wrap_content"
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/diagnosticsToggle"
+                    style="@style/WhlToolbarAction"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:orientation="horizontal" />
-            </HorizontalScrollView>
-        </LinearLayout>
+                    android:gravity="start|center_vertical"
+                    android:text="@string/detail_diagnostics"
+                    android:textAllCaps="false"
+                    app:icon="@drawable/ic_expand_more"
+                    app:iconGravity="end"
+                    app:iconTint="@color/whl_ink_dim" />
 
-        <LinearLayout style="@style/WhlPanelSection"
-            android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="vertical">
-            <TextView style="@style/WhlLabel"
-                android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:text="@string/detail_ocr" />
-            <TextView
-                android:id="@+id/ocrText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textIsSelectable="true"
-                android:textColor="@color/whl_ink" />
-        </LinearLayout>
+                <LinearLayout
+                    android:id="@+id/diagnosticsContent"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
 
-        <Button
-            android:id="@+id/discard"
-            style="@style/WhlButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:layout_gravity="end"
-            android:textSize="12sp"
-            android:textColor="@color/whl_button_text"
-            android:paddingStart="14dp"
-            android:paddingEnd="14dp"
-            android:visibility="gone"
-            android:text="@string/detail_discard" />
-    </LinearLayout>
-    </ScrollView>
+                    <com.google.android.material.tabs.TabLayout
+                        android:id="@+id/diagnosticsTabs"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:contentDescription="@string/detail_diagnostics_tabs_description"
+                        app:tabGravity="fill"
+                        app:tabIndicatorColor="@color/whl_green"
+                        app:tabMode="fixed"
+                        app:tabSelectedTextColor="@color/whl_ink"
+                        app:tabTextColor="@color/whl_ink_dim" />
+
+                    <androidx.core.widget.NestedScrollView
+                        android:id="@+id/diagnosticsScroll"
+                        android:layout_width="match_parent"
+                        android:layout_height="260dp"
+                        android:layout_marginTop="6dp"
+                        android:background="@drawable/whl_input"
+                        android:fadeScrollbars="false"
+                        android:fillViewport="true"
+                        android:overScrollMode="ifContentScrolls">
+
+                        <TextView
+                            android:id="@+id/diagnosticsText"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="monospace"
+                            android:importantForAccessibility="yes"
+                            android:lineSpacingExtra="2dp"
+                            android:padding="10dp"
+                            android:textColor="@color/whl_ink"
+                            android:textIsSelectable="true"
+                            android:textSize="10sp" />
+                    </androidx.core.widget.NestedScrollView>
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+    </androidx.core.widget.NestedScrollView>
 </LinearLayout>
