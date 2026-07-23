@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import copy
 import contextlib
 import functools
 import hashlib
@@ -8985,10 +8986,27 @@ def api_jobs():
                              "state": "running",
                              "done": int(d.get("bytes") or 0),
                              "total": int(d.get("total") or 0)})
-    with _cloudsync_lock:
-        if _cloudsync.get("running"):
-            rows.append({"kind": "cloudsync", "label": "Cloud sync",
-                         "state": "running"})
+    cloud = _cloudsync_snapshot()
+    if cloud.get("running"):
+        progress = cloud.get("progress") or {}
+        rows.append({
+            "id": cloud.get("run_id") or "",
+            "kind": "cloudsync",
+            "label": "Cloud sync",
+            "state": "running",
+            "created_at": cloud.get("started_at") or "",
+            "done": int(progress.get("completed") or 0),
+            "total": int(progress.get("total") or 0),
+            "note": cloud.get("stage_label") or "Cloud sync",
+            "stage": cloud.get("stage") or "",
+            "progress": progress,
+            "counts": {
+                "imported": int(progress.get("imported") or 0),
+                "skipped": int(progress.get("skipped") or 0),
+                "failed": int(progress.get("failed") or 0),
+            },
+            "events": cloud.get("events") or [],
+        })
     active = sum(1 for r in rows if r.get("state") in _JOB_ACTIVE)
     return jsonify({"ok": True, "jobs": rows, "active": active})
 
@@ -12257,7 +12275,11 @@ def _checked_diff(old, new, cap: int = 3):
 
 @app.route("/api/manual")
 def api_manual_list():
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    # Cloud capture ingest publishes one whole entry at a time. Pair the read
+    # with that writer's lock so a progress-event consumer can fetch the book
+    # named by the event immediately and always see a coherent durable row.
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
     out = sorted(entries.values(), key=lambda e: e.get("created_at", ""), reverse=True)
     return jsonify(out)
 
@@ -12360,6 +12382,19 @@ def api_manual_add():
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     activity("added", "manual entry", detail=entry.get("title", ""))
     return jsonify({"ok": True, "entry": entry})
+
+
+@app.route("/api/manual/<entry_id>")
+def api_manual_get(entry_id: str):
+    """Fetch one manual row for incremental capture-event consumption."""
+
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        entry = entries.get(entry_id)
+        if not isinstance(entry, dict):
+            abort(404)
+        out = copy.deepcopy(entry)
+    return jsonify({"ok": True, "entry": out})
 
 
 @app.route("/api/manual/<entry_id>", methods=["PATCH"])
@@ -14645,8 +14680,269 @@ def api_scans():
 
 CAPTURES_DIR = lib.DATA_ROOT / "captures"
 _cloudsync_lock = threading.Lock()
-_cloudsync = {"running": False, "last_run": "", "last_error": "", "last_result": None}
+_CLOUDSYNC_EVENT_KEEP = 128
+_cloudsync = {
+    "running": False,
+    "run_id": "",
+    "revision": 0,
+    "event_seq": 0,
+    "stage": "idle",
+    "stage_label": "Idle",
+    "started_at": "",
+    "updated_at": "",
+    "last_run": "",
+    "last_error": "",
+    "last_result": None,
+    "progress": {
+        "phase": "idle",
+        "completed": 0,
+        "total": 0,
+        "unit": "captures",
+        "indeterminate": False,
+        "capture_completed": 0,
+        "capture_total": 0,
+        "imported": 0,
+        "skipped": 0,
+        "failed": 0,
+        "current_capture": "",
+        "current_book": "",
+        "current_index": 0,
+        "photo_count": 0,
+    },
+    "events": [],
+}
 _autosync_last = 0.0
+
+
+def _cloudsync_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _cloudsync_changed_locked() -> None:
+    """Stamp one atomic live-state mutation.
+
+    ``revision`` is process-lifetime monotonic, so a polling client can detect
+    every state change even when multiple stages have the same counts.
+    """
+
+    _cloudsync["revision"] = int(_cloudsync.get("revision") or 0) + 1
+    _cloudsync["updated_at"] = _cloudsync_now()
+
+
+def _cloudsync_begin() -> str | None:
+    """Claim the single cloud-sync slot and initialize its public job state."""
+
+    with _cloudsync_lock:
+        if _cloudsync.get("running"):
+            return None
+        run_id = uuid.uuid4().hex
+        event_seq = int(_cloudsync.get("event_seq") or 0)
+        revision = int(_cloudsync.get("revision") or 0)
+        last_run = str(_cloudsync.get("last_run") or "")
+        _cloudsync.clear()
+        _cloudsync.update({
+            "running": True,
+            "run_id": run_id,
+            "revision": revision,
+            "event_seq": event_seq,
+            "stage": "starting",
+            "stage_label": "Starting cloud sync",
+            "started_at": _cloudsync_now(),
+            "updated_at": "",
+            "last_run": last_run,
+            "last_error": "",
+            "last_result": None,
+            "progress": {
+                "phase": "starting",
+                "completed": 0,
+                "total": 0,
+                "unit": "captures",
+                "indeterminate": True,
+                "capture_completed": 0,
+                "capture_total": 0,
+                "imported": 0,
+                "skipped": 0,
+                "failed": 0,
+                "current_capture": "",
+                "current_book": "",
+                "current_index": 0,
+                "photo_count": 0,
+            },
+            "events": [],
+        })
+        _cloudsync_changed_locked()
+        return run_id
+
+
+def _cloudsync_set_stage(stage: str, label: str, *,
+                         total: int | None = None,
+                         completed: int | None = None,
+                         unit: str | None = None,
+                         indeterminate: bool | None = None,
+                         current_capture: str | None = None,
+                         current_book: str | None = None,
+                         current_index: int | None = None,
+                         photo_count: int | None = None) -> None:
+    """Publish a stage/current-item transition as one coherent snapshot."""
+
+    with _cloudsync_lock:
+        if not _cloudsync.get("running"):
+            return
+        _cloudsync["stage"] = str(stage)
+        _cloudsync["stage_label"] = str(label)[:240]
+        progress = _cloudsync.setdefault("progress", {})
+        progress["phase"] = str(stage)
+        if total is not None:
+            progress["total"] = max(0, int(total))
+        if completed is not None:
+            progress["completed"] = max(0, int(completed))
+        if unit is not None:
+            progress["unit"] = str(unit)[:40]
+        if indeterminate is not None:
+            progress["indeterminate"] = bool(indeterminate)
+        if total is not None and progress.get("unit") == "captures":
+            progress["capture_total"] = max(0, int(total))
+        if current_capture is not None:
+            progress["current_capture"] = str(current_capture)[:64]
+        if current_book is not None:
+            progress["current_book"] = str(current_book)[:240]
+        if current_index is not None:
+            progress["current_index"] = max(0, int(current_index))
+        if photo_count is not None:
+            progress["photo_count"] = max(0, int(photo_count))
+        _cloudsync_changed_locked()
+
+
+def _cloudsync_append_event_locked(*, kind: str, status: str,
+                                   capture_id: str = "", book_id: str = "",
+                                   title: str = "", message: str = "",
+                                   details: list[str] | None = None) -> dict:
+    seq = int(_cloudsync.get("event_seq") or 0) + 1
+    _cloudsync["event_seq"] = seq
+    event = {
+        "seq": seq,
+        "kind": str(kind)[:40],
+        "status": str(status)[:40],
+        "capture_id": str(capture_id)[:64],
+        "book_id": str(book_id)[:64],
+        "title": str(title)[:240],
+        "message": str(message)[:500],
+        "at": _cloudsync_now(),
+    }
+    if details:
+        event["details"] = [str(value)[:500] for value in details[:20]]
+    events = _cloudsync.setdefault("events", [])
+    events.append(event)
+    del events[:-_CLOUDSYNC_EVENT_KEEP]
+    return event
+
+
+def _cloudsync_book_ready(import_result: dict) -> None:
+    """Publish an imported book only after its manual-entry save returned."""
+
+    with _cloudsync_lock:
+        if not _cloudsync.get("running"):
+            return
+        _cloudsync_append_event_locked(
+            kind="capture",
+            status="imported",
+            capture_id=import_result.get("capture_id", ""),
+            book_id=import_result.get("book_id", ""),
+            title=import_result.get("title", ""),
+            message=import_result.get("message") or "Book imported",
+            details=import_result.get("warnings") or None,
+        )
+        _cloudsync_changed_locked()
+
+
+def _cloudsync_item_completed(*, completed: int, imported: int, skipped: int,
+                              failed: int, event: dict | None = None) -> None:
+    """Commit one capture outcome and clear the in-flight identity."""
+
+    with _cloudsync_lock:
+        if not _cloudsync.get("running"):
+            return
+        progress = _cloudsync.setdefault("progress", {})
+        progress.update({
+            "completed": max(0, int(completed)),
+            "capture_completed": max(0, int(completed)),
+            "imported": max(0, int(imported)),
+            "skipped": max(0, int(skipped)),
+            "failed": max(0, int(failed)),
+            "current_capture": "",
+            "current_book": "",
+            "current_index": 0,
+            "photo_count": 0,
+            "unit": "captures",
+            "indeterminate": False,
+        })
+        if event:
+            _cloudsync_append_event_locked(**event)
+        _cloudsync_changed_locked()
+
+
+def _cloudsync_snapshot() -> dict:
+    """Return a detached, internally consistent public state snapshot."""
+
+    with _cloudsync_lock:
+        out = copy.deepcopy(_cloudsync)
+    progress = out.get("progress") or {}
+    if (progress.get("current_capture") or progress.get("current_book") or
+            progress.get("current_index")):
+        out["current"] = {
+            "index": int(progress.get("current_index") or 0),
+            "total": int(progress.get("total") or 0),
+            "capture_id": str(progress.get("current_capture") or ""),
+            "title": str(progress.get("current_book") or ""),
+            "photo_count": int(progress.get("photo_count") or 0),
+        }
+    else:
+        out["current"] = None
+    # Compatibility view for the first incremental desktop client. ``events``
+    # is canonical; both views share the same monotonic sequence.
+    out["recent_items"] = [{
+        "sequence": event.get("seq", 0),
+        "outcome": event.get("status", ""),
+        "capture_id": event.get("capture_id", ""),
+        "entry_id": event.get("book_id", ""),
+        "title": event.get("title", ""),
+        "detail": event.get("message", ""),
+        "errors": list(event.get("details") or []),
+        "completed_at": event.get("at", ""),
+    } for event in out.get("events") or []]
+    return out
+
+
+def _cloudsync_finish(run_id: str, result: dict) -> None:
+    """Publish a terminal snapshot without letting a stale worker overwrite it."""
+
+    with _cloudsync_lock:
+        if str(_cloudsync.get("run_id") or "") != str(run_id):
+            return
+        ok = bool(result.get("ok"))
+        errors = result.get("errors") or []
+        terminal = "complete" if ok else "failed"
+        label = "Cloud sync complete" if ok else "Cloud sync completed with errors"
+        _cloudsync["running"] = False
+        _cloudsync["stage"] = terminal
+        _cloudsync["stage_label"] = label
+        progress = _cloudsync.setdefault("progress", {})
+        progress["phase"] = terminal
+        progress["unit"] = "captures"
+        progress["indeterminate"] = False
+        progress["completed"] = int(progress.get("capture_completed") or 0)
+        progress["total"] = int(progress.get("capture_total") or 0)
+        progress["current_capture"] = ""
+        progress["current_book"] = ""
+        progress["current_index"] = 0
+        progress["photo_count"] = 0
+        _cloudsync["last_run"] = _cloudsync_now()
+        _cloudsync["last_result"] = copy.deepcopy(result)
+        _cloudsync["last_error"] = (
+            str(result.get("error") or "") or
+            "; ".join(str(value) for value in errors)
+        )[:4000]
+        _cloudsync_changed_locked()
 
 
 def _cloud_public_cfg() -> dict:
@@ -18837,9 +19133,34 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
             "fields": fields, "extra": extra, "errors": errors}
 
 
+_CAPTURE_INGEST_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+def _capture_ingest_lock(capture_id: str) -> threading.Lock:
+    """Stable bounded lock stripe for one capture's local asset publication."""
+
+    digest = hashlib.sha256(capture_id.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:2], "big") % len(_CAPTURE_INGEST_LOCKS)
+    return _CAPTURE_INGEST_LOCKS[index]
+
+
 def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
                    photo_paths: list | None = None, *,
                    transport: str = "unknown"):
+    """Serialize one capture through duplicate check, assets, and row commit."""
+
+    cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
+    if not cap_id:
+        return None, None
+    with _capture_ingest_lock(cap_id):
+        return _ingest_capture_locked(
+            cap, raw_photos, mistral_key, photo_paths, transport=transport)
+
+
+def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
+                           mistral_key: str,
+                           photo_paths: list | None = None, *,
+                           transport: str = "unknown"):
     """Raw photo bytes + a capture dict -> a manual entry, with NO cloud
     involved. Shared by the cloud sync (photos downloaded first) and the LAN
     endpoint (photos arrive in the request). Prefers the phone's OCR/fields (via
@@ -18954,6 +19275,22 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     entry["checks"] = _entry_checks(entry)
     with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        # Cloud and paired-LAN delivery can race after both initial duplicate
+        # checks complete but while either side is doing expensive photo work.
+        # Recheck at the commit boundary so one capture can never publish two
+        # manual books.
+        duplicate = next((
+            (str(entry_id), existing)
+            for entry_id, existing in entries.items()
+            if (isinstance(existing, dict) and
+                existing.get("capture_id") == cap_id)
+        ), None)
+        if duplicate is not None:
+            duplicate_id, duplicate_entry = duplicate
+        else:
+            duplicate_id = ""
+            duplicate_entry = None
         # Close the ingest/merge interleaving: a merge alias can be committed
         # while photo processing is in flight, after the first resolution
         # above but before this entry exists for the merge repoint walk.
@@ -18962,10 +19299,22 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
             entry["extra"] = dict(extra, scan_collection_id=
                                   _resolve_collection_alias(
                                       str(extra["scan_collection_id"])))
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        entry["id"] = lib.gen_id(set(entries))
-        entries[entry["id"]] = entry
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        if duplicate_entry is None:
+            entry["id"] = lib.gen_id(set(entries))
+            entries[entry["id"]] = entry
+            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+
+    if duplicate_entry is not None:
+        if phone_review:
+            target = {
+                "kind": "row", "id": duplicate_id, "record": duplicate_entry,
+                "title": str(duplicate_entry.get("title") or "phone capture"),
+                "updated_at": str(duplicate_entry.get("updated_at") or
+                                  duplicate_entry.get("created_at") or ""),
+            }
+            _merge_phone_review_into_target(target, phone_review)
+            _remember_pending_capture_review(phone_review)
+        return None, None
 
     # a phone capture is attributed to whoever photographed it (the signed-in
     # contributor), not to whoever ran the sync; device name is the fallback
@@ -18982,29 +19331,89 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
     return entry["id"], result["errors"]
 
 
+def _cloud_capture_photo_paths(cap: dict) -> list:
+    value = cap.get("photos") or []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = []
+    return list(value) if isinstance(value, list) else []
+
+
+def _cloud_capture_title(cap: dict) -> str:
+    """Best available pre-import book label, bounded for live job display."""
+
+    meta = cap.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            meta = {}
+    candidates = [cap]
+    if isinstance(meta, dict):
+        candidates.append(meta)
+        if isinstance(meta.get("fields"), dict):
+            candidates.append(meta["fields"])
+    for source in candidates:
+        title = str(source.get("title") or "").strip()
+        if title:
+            return title[:240]
+    capture_id = _clean_capture_id(cap.get("id"))
+    return f"Capture {capture_id[:8]}" if capture_id else "Phone capture"
+
+
+def _manual_capture_identity(capture_id: str) -> tuple[str, str]:
+    """Return the durable local entry id/title for one capture, if present."""
+
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        for entry_id, entry in entries.items():
+            if (isinstance(entry, dict) and
+                    str(entry.get("capture_id") or "") == capture_id):
+                return str(entry_id), str(
+                    entry.get("title") or f"Capture {capture_id[:8]}"
+                )[:240]
+    return "", ""
+
+
 def _import_capture(cfg: dict, cap: dict, mistral_key: str,
-                    delete_remote: bool) -> str:
-    """One pending CLOUD capture -> a manual entry. Returns 'imported'|'skipped'."""
+                    delete_remote: bool, on_persisted=None) -> dict:
+    """Import one pending cloud capture and return its detailed outcome.
+
+    ``on_persisted`` runs after the manual entry is durably saved but before
+    remote acknowledgement/cleanup. Live status can therefore expose each book
+    without waiting for the rest of a batch.
+    """
     cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
     if not cap_id:
-        return "skipped"
-    photo_paths = cap.get("photos") or []
-    if isinstance(photo_paths, str):
+        return {
+            "status": "skipped", "capture_id": "", "book_id": "",
+            "title": "Phone capture", "message": "Invalid capture id",
+            "warnings": [],
+        }
+    photo_paths = _cloud_capture_photo_paths(cap)
+    book_id, title = _manual_capture_identity(cap_id)
+    if book_id:
+        result = {
+            "status": "skipped", "capture_id": cap_id, "book_id": book_id,
+            "title": title, "message": "Already present on this desktop",
+            "warnings": [],
+        }
         try:
-            photo_paths = json.loads(photo_paths)
-        except json.JSONDecodeError:
-            photo_paths = []
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        dup = any(e.get("capture_id") == cap_id for e in entries.values())
-    if dup:
-        sbase.mark_capture(cfg, cap["id"], "imported")   # already here: idempotent
+            # Idempotently repair a lost acknowledgement from an earlier run.
+            sbase.mark_capture(cfg, cap["id"], "imported")
+        except Exception as exc:
+            result["sync_error"] = (
+                f"cloud acknowledgement failed: {type(exc).__name__}: {exc}"
+            )[:500]
+            return result
         if delete_remote:                                # a lost mark left these behind
             try:
                 sbase.delete_photos(cfg, photo_paths)
             except sbase.SyncError:
                 pass
-        return "skipped"
+        return result
     try:
         raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
     except sbase.SyncError as exc:
@@ -19015,15 +19424,44 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     new_id, errors = ingest_capture(
         cap, raw_photos, mistral_key, photo_paths, transport="cloud")
 
-    sbase.mark_capture(cfg, cap["id"], "imported")
+    # A concurrent/idempotent ingest may have won between the first duplicate
+    # check and the save. Resolve the durable identity either way.
+    book_id, title = _manual_capture_identity(cap_id)
+    warnings = [str(error)[:500] for error in (errors or [])[:20]]
+    result = {
+        "status": "imported" if new_id else "skipped",
+        "capture_id": cap_id,
+        "book_id": str(new_id or book_id),
+        "title": title or _cloud_capture_title(cap),
+        "message": (
+            f"Imported with {len(warnings)} processing warning(s)"
+            if new_id and warnings else
+            "Book imported" if new_id else
+            "Already present on this desktop"
+        ),
+        "warnings": warnings,
+    }
+    if new_id and on_persisted is not None:
+        on_persisted(dict(result))
+    try:
+        sbase.mark_capture(cfg, cap["id"], "imported")
+    except Exception as exc:
+        # The local book is already durable and must remain visible. Leave the
+        # remote row pending for a later idempotent acknowledgement repair.
+        result["sync_error"] = (
+            f"cloud acknowledgement failed: {type(exc).__name__}: {exc}"
+        )[:500]
+        return result
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
     if delete_remote and not errors:
         try:
             sbase.delete_photos(cfg, photo_paths)
-        except sbase.SyncError:
-            pass                                   # cleanup is best-effort
-    return "imported" if new_id else "skipped"
+        except sbase.SyncError as exc:
+            result["warnings"].append(
+                f"remote photo cleanup deferred: {type(exc).__name__}: {exc}"
+            )
+    return result
 
 
 def _books_mirror_rows() -> list[dict]:
@@ -20095,7 +20533,8 @@ def _cloud_sync_item_policy_guard():
 
 
 def _cloud_sync_run_with_configs(owner_cfg: dict | None,
-                                 capture_cfg: dict | None) -> dict:
+                                 capture_cfg: dict | None,
+                                 claimed_run_id: str = "") -> dict:
     """Run independent phone-account and owner-maintenance pipelines.
 
     Capture ingest runs with the signed-in user's JWT and RLS. If an owner has
@@ -20108,13 +20547,25 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
     exception lands in `result` — the flag can never stay stuck on, and a
     failed pass can't masquerade as the previous run's outcome."""
     if not capture_cfg and not owner_cfg:
-        return {"ok": False,
-                "error": "Cloud sync is not configured"}
-    with _cloudsync_lock:
-        if _cloudsync["running"]:
+        result = {"ok": False, "error": "Cloud sync is not configured",
+                  "errors": []}
+        if claimed_run_id:
+            _cloudsync_finish(claimed_run_id, result)
+        return result
+    if claimed_run_id:
+        with _cloudsync_lock:
+            claimed = (
+                _cloudsync.get("running") and
+                str(_cloudsync.get("run_id") or "") == claimed_run_id
+            )
+        if not claimed:
+            return {"ok": False, "error": "sync claim is no longer active"}
+        run_id = claimed_run_id
+    else:
+        run_id = _cloudsync_begin()
+        if not run_id:
             return {"ok": False, "error": "sync already running"}
-        _cloudsync["running"] = True
-    imported = skipped = 0
+    imported = skipped = failed = completed = 0
     errors: list[str] = []
     result: dict = {"ok": False, "error": "sync crashed", "errors": errors}
     log.info("cloud sync started")
@@ -20122,6 +20573,9 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
         s = _client_settings()
         delete_remote = s.get("cloudDeleteRemote") is not False
         if capture_cfg:
+            _cloudsync_set_stage(
+                "collections", "Refreshing collection identities",
+                total=0, completed=0, unit="operations", indeterminate=True)
             # A different desktop may have merged an identity since this
             # process last opened Collections. Refresh durable merge markers
             # before filing account-scoped captures.
@@ -20130,25 +20584,103 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                 str(capture_cfg.get("key") or "").strip()
             )
             _refresh_collection_aliases(capture_cfg, collection_token)
-            for cap in sbase.list_pending_captures(capture_cfg):
+            _cloudsync_set_stage(
+                "capture_discovery", "Checking for phone captures",
+                total=0, completed=0, unit="captures", indeterminate=True)
+            pending_captures = list(sbase.list_pending_captures(capture_cfg))
+            _cloudsync_set_stage(
+                "capture_import",
+                ("No phone captures to import" if not pending_captures else
+                 f"Importing {len(pending_captures)} phone capture(s)"),
+                total=len(pending_captures),
+                completed=0,
+                unit="captures",
+                indeterminate=False,
+            )
+            for index, cap in enumerate(pending_captures, 1):
+                capture_id = _clean_capture_id(cap.get("id"))
+                title_hint = _cloud_capture_title(cap)
+                _cloudsync_set_stage(
+                    "capture_import",
+                    f"Importing {index} of {len(pending_captures)}: {title_hint}",
+                    current_capture=capture_id,
+                    current_book=title_hint,
+                    current_index=index,
+                    photo_count=len(_cloud_capture_photo_paths(cap)),
+                )
+                item_event = None
                 try:
                     lease = (_lease_secret("mistralKey")
                              if _secret_is_configured("mistralKey")
                              else contextlib.nullcontext(""))
                     with lease as mistral_key:
                         outcome = _import_capture(
-                            capture_cfg, cap, mistral_key, delete_remote)
-                    if outcome == "imported":
+                            capture_cfg, cap, mistral_key, delete_remote,
+                            on_persisted=_cloudsync_book_ready,
+                        )
+                    status = str(outcome.get("status") or "skipped")
+                    if status == "imported":
                         imported += 1
                     else:
                         skipped += 1
+                        item_event = {
+                            "kind": "capture",
+                            "status": "skipped",
+                            "capture_id": outcome.get("capture_id", capture_id),
+                            "book_id": outcome.get("book_id", ""),
+                            "title": outcome.get("title", title_hint),
+                            "message": outcome.get("message") or
+                            "Capture was already present",
+                            "details": outcome.get("warnings") or None,
+                        }
+                    if outcome.get("sync_error"):
+                        sync_error = str(outcome["sync_error"])
+                        errors.append(
+                            f"capture {capture_id[:8]}: {sync_error}")
+                        if status == "imported":
+                            item_event = {
+                                "kind": "capture",
+                                "status": "warning",
+                                "capture_id": outcome.get(
+                                    "capture_id", capture_id),
+                                "book_id": outcome.get("book_id", ""),
+                                "title": outcome.get("title", title_hint),
+                                "message": sync_error,
+                                "details": outcome.get("warnings") or None,
+                            }
+                        elif item_event:
+                            details = list(item_event.get("details") or [])
+                            details.append(sync_error)
+                            item_event["details"] = details
                 except Exception as exc:  # one bad capture must not stop the rest
-                    errors.append(f"capture {str(cap.get('id'))[:8]}: {exc}")
+                    failed += 1
+                    detail = f"{type(exc).__name__}: {exc}"
+                    errors.append(f"capture {capture_id[:8]}: {detail}")
+                    item_event = {
+                        "kind": "capture",
+                        "status": "failed",
+                        "capture_id": capture_id,
+                        "book_id": "",
+                        "title": title_hint,
+                        "message": detail,
+                    }
+                finally:
+                    completed += 1
+                    _cloudsync_item_completed(
+                        completed=completed,
+                        imported=imported,
+                        skipped=skipped,
+                        failed=failed,
+                        event=item_event,
+                    )
         pushed = metadata_pushed = 0
         review_sync: dict = {}
         stores: dict = {}
         entries_res: dict = {}
         if owner_cfg:
+            _cloudsync_set_stage(
+                "owner_stores", "Reconciling desktop catalog data",
+                total=0, completed=0, unit="operations", indeterminate=True)
             # the working stores that left git in 87a9bf2 (two-way, per record;
             # store_sync guards against an emptier side clobbering a fuller
             # one). Reconcile builds before deriving phone projections: a
@@ -20173,17 +20705,29 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                 builds_result.get("error") or builds_result.get("guard")
             )
             if catalogue_safe:
+                _cloudsync_set_stage(
+                    "book_mirror", "Publishing the desktop book catalog",
+                    total=0, completed=0, unit="operations",
+                    indeterminate=True)
                 try:
                     pushed = sbase.push_books(owner_cfg, _books_mirror_rows())
                 except Exception as exc:
                     errors.append(f"books mirror: {exc}")
                 if capture_cfg:
+                    _cloudsync_set_stage(
+                        "capture_reviews", "Synchronizing capture review status",
+                        total=0, completed=0, unit="operations",
+                        indeterminate=True)
                     try:
                         review_sync = _sync_capture_reviews(
                             owner_cfg, capture_cfg)
                         errors.extend(review_sync.get("errors") or [])
                     except Exception as exc:
                         errors.append(f"capture reviews: {exc}")
+                    _cloudsync_set_stage(
+                        "capture_metadata", "Publishing phone book metadata",
+                        total=0, completed=0, unit="operations",
+                        indeterminate=True)
                     try:
                         # Review merge runs first so this snapshot reflects
                         # local state durably accepted from the phone.
@@ -20196,6 +20740,9 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
             else:
                 errors.append(
                     "capture metadata: skipped because builds sync was unsafe")
+            _cloudsync_set_stage(
+                "entry_files", "Synchronizing entry files",
+                total=0, completed=0, unit="operations", indeterminate=True)
             with _lease_r2_cfg() as r2cfg:
                 if r2.configured(r2cfg):
                     try:
@@ -20209,7 +20756,11 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                     entries_res = {"skipped": "R2 not configured"}
         else:
             entries_res = {"skipped": "owner sync not configured"}
+        _cloudsync_set_stage(
+            "finishing", "Finalizing cloud sync",
+            total=0, completed=0, unit="operations", indeterminate=True)
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
+                  "failed": failed, "captures_total": completed,
                   "books_pushed": pushed,
                   "capture_metadata_pushed": metadata_pushed,
                   "capture_reviews": review_sync,
@@ -20218,16 +20769,11 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                   "owner_sync": bool(owner_cfg)}
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
-                  "imported": imported, "errors": errors}
+                  "imported": imported, "skipped": skipped, "failed": failed,
+                  "captures_total": completed, "errors": errors}
         log.error("cloud sync crashed", exc_info=exc)
     finally:
-        with _cloudsync_lock:
-            _cloudsync["running"] = False
-            _cloudsync["last_run"] = datetime.now(timezone.utc).isoformat(
-                timespec="seconds")
-            _cloudsync["last_result"] = result
-            _cloudsync["last_error"] = (result.get("error", "")
-                                        or "; ".join(result.get("errors") or []))
+        _cloudsync_finish(run_id, result)
         if result.get("ok"):
             stores = result.get("stores") or {}
             log.info("cloud sync done: %d imported, %d skipped, %d books pushed, "
@@ -20248,12 +20794,24 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
     return result
 
 
-def _cloud_sync_run() -> dict:
+def _cloud_sync_run(claimed_run_id: str = "") -> dict:
     """Acquire owner credentials inside the sync execution, never a job."""
-    with contextlib.ExitStack() as stack:
-        capture_cfg = stack.enter_context(_lease_capture_cfg())
-        owner_cfg = stack.enter_context(_lease_cloud_cfg())
-        return _cloud_sync_run_with_configs(owner_cfg, capture_cfg)
+    try:
+        with contextlib.ExitStack() as stack:
+            capture_cfg = stack.enter_context(_lease_capture_cfg())
+            owner_cfg = stack.enter_context(_lease_cloud_cfg())
+            return _cloud_sync_run_with_configs(
+                owner_cfg, capture_cfg, claimed_run_id=claimed_run_id)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "errors": [],
+        }
+        if claimed_run_id:
+            _cloudsync_finish(claimed_run_id, result)
+        log.error("cloud sync credential setup failed", exc_info=exc)
+        return result
 
 
 def _cloud_autosync_loop() -> None:
@@ -20282,17 +20840,30 @@ def api_cloudsync_run():
     if not (_capture_configured() or _cloud_configured()):
         return jsonify({"ok": False,
                         "error": "Sign in to your Library Tool account to sync phone captures"})
-    with _cloudsync_lock:
-        already = _cloudsync["running"]
-    if not already:
-        threading.Thread(target=_cloud_sync_run, daemon=True).start()
-    return jsonify({"ok": True, "started": not already})
+    # Claim under the state lock before spawning. Two clicks, or a manual click
+    # racing the interval loop, can no longer both report that they started.
+    run_id = _cloudsync_begin()
+    if not run_id:
+        snapshot = _cloudsync_snapshot()
+        return jsonify({
+            "ok": True, "started": False,
+            "run_id": snapshot.get("run_id") or "",
+        })
+    try:
+        threading.Thread(
+            target=_cloud_sync_run, args=(run_id,), daemon=True).start()
+    except Exception as exc:
+        result = {"ok": False,
+                  "error": f"could not start cloud sync: {exc}",
+                  "errors": []}
+        _cloudsync_finish(run_id, result)
+        return jsonify(result), 500
+    return jsonify({"ok": True, "started": True, "run_id": run_id})
 
 
 @app.route("/api/cloudsync/status")
 def api_cloudsync_status():
-    with _cloudsync_lock:
-        out = dict(_cloudsync)
+    out = _cloudsync_snapshot()
     out["configured"] = bool(_capture_configured() or _cloud_configured())
     return jsonify(out)
 
