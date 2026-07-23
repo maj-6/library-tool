@@ -554,6 +554,29 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
       error.code === "invalid-response",
   );
 
+  const invalidCaption = rasterArtifact({
+    caption_assertions: [
+      manualCaptionAssertion("Caption"),
+    ],
+  });
+  invalidCaption.caption_assertions[0].language = "en_invalid";
+  invalidCaption.effective_caption = invalidCaption.caption_assertions[0];
+  const invalidCaptionClient = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifact/1",
+      artifact: invalidCaption,
+    }),
+  });
+  await assert.rejects(
+    invalidCaptionClient.rasterArtifacts.get({
+      itemId: "book:one",
+      artifactId: "image:one",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
   assert.throws(() => client.rasterArtifacts.resourceUrl({
     itemId: "book:one",
     artifactId: "image:one",
@@ -795,7 +818,7 @@ test("caption metadata and review commands own exact conditional transport",
         inversePayload: {
           artifact_id: "image:one",
           restore_assertions: [manualMetadataAssertion()],
-          clear_names: [],
+          clear_names: ["caption_source"],
         },
       }),
       correctionMutationResult({
@@ -1151,6 +1174,47 @@ test("correction mutations reject unsafe commands and malformed receipts", async
     (error) => error instanceof EngineClientError &&
       error.code === "invalid-response",
   );
+
+  for (const [suffix, inversePayload] of [
+    ["missing", {
+      artifact_id: "image:one",
+      restore_assertions: [manualMetadataAssertion()],
+      clear_names: [],
+    }],
+    ["unrelated", {
+      artifact_id: "image:one",
+      restore_assertions: [manualMetadataAssertion()],
+      clear_names: ["rights_note"],
+    }],
+    ["extra", {
+      artifact_id: "image:one",
+      restore_assertions: [manualMetadataAssertion()],
+      clear_names: ["caption_source", "rights_note"],
+    }],
+  ]) {
+    const operationId = `metadata:assert:${suffix}-inverse`;
+    const invalidMetadataInverse = new EngineClient({
+      transport: async () => response(200, correctionMutationResult({
+        action: "metadata.assert",
+        operationId,
+        targets: [target],
+        inverseAction: "metadata.assert",
+        inversePayload,
+      })),
+    });
+    await assert.rejects(
+      invalidMetadataInverse.corrections.assertArtifactMetadata({
+        itemId: "book:one",
+        artifactId: "image:one",
+        expectedArtifactRevision: "artifact-r1",
+        assertions: { plate_number: 8 },
+        clearNames: ["caption_source"],
+        idempotencyKey: operationId,
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  }
 });
 
 test("correction transforms own their canonical queue transport", async () => {

@@ -608,6 +608,30 @@ def test_manual_caption_transport_replays_and_preserves_machine_evidence(
     assert refreshed["effective_caption"]["origin"] == "machine"
 
 
+def test_manual_caption_transport_rejects_overlong_valid_language_tag(tmp_path):
+    client = _projected_app(
+        tmp_path,
+        (
+            _raster("image-1"),
+            _raster("figure-1", kind="extracted-figure"),
+        ),
+        (replace(_annotation("region-1"), linked_artifact_ids=("figure-1",)),),
+    ).test_client()
+    language = "en-" + "-".join(["abcdef"] * 10)
+
+    response = client.put(
+        "/api/v1/items/book-1/raster-artifacts/image-1/caption",
+        json={"text": "Human correction", "language": language},
+        headers={
+            "Idempotency-Key": "caption-language-too-long",
+            "If-Artifact-Match": '"artifact-image-1-r1"',
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_caption_assertion"
+
+
 def test_metadata_transport_is_conditional_replay_safe_and_reversible(tmp_path):
     rows = (
         _raster("image-1"),

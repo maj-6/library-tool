@@ -672,9 +672,17 @@
     return value;
   }
 
+  const CORRECTION_LANGUAGE_RE =
+    /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/;
+
+  function isCorrectionLanguage(value) {
+    return typeof value === "string" && value.length <= 64 &&
+      (value === "" || CORRECTION_LANGUAGE_RE.test(value));
+  }
+
   function correctionLanguage(value) {
     const language = correctionText(value, "language", 64);
-    if (language && !/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(language)) {
+    if (!isCorrectionLanguage(language)) {
       throw new TypeError("language must be empty or a language tag");
     }
     return language;
@@ -750,7 +758,7 @@
       value.text.length <= 16384 &&
       ["manual", "machine", "inherited", "imported"].includes(value.origin) &&
       isArtifactRevision(value.revision) &&
-      typeof value.language === "string" && value.language.length <= 64 &&
+      isCorrectionLanguage(value.language) &&
       (value.source_annotation_id === "" ||
         isPortableIdentifier(value.source_annotation_id)) &&
       (value.confidence === null || typeof value.confidence === "number" &&
@@ -1100,7 +1108,15 @@
           !isSortedUnique(payload.clear_names)) return false;
       const restored = new Set(payload.restore_assertions.map(
         (value) => value.name));
-      return !payload.clear_names.some((name) => restored.has(name));
+      const inverseNames = [
+        ...restored,
+        ...payload.clear_names,
+      ].sort();
+      return !payload.clear_names.some((name) => restored.has(name)) &&
+        Array.isArray(expected.metadataNames) &&
+        inverseNames.length === expected.metadataNames.length &&
+        inverseNames.every((name, index) =>
+          name === expected.metadataNames[index]);
     }
     if (!review || artifact || annotation ||
         !expected.action.startsWith("attention.") ||
@@ -2187,6 +2203,7 @@
     _correctionAssertArtifactMetadata({ itemId, artifactId,
       expectedArtifactRevision, assertions = {}, clearNames = [],
       idempotencyKey, signal } = {}) {
+      const body = correctionMetadata(assertions, clearNames);
       return this._correctionMutation({
         action: "metadata.assert",
         method: "PATCH",
@@ -2198,7 +2215,11 @@
         pathSuffix: "raster-artifacts",
         mutationSuffix: "metadata",
         revisionHeader: "If-Artifact-Match",
-        body: correctionMetadata(assertions, clearNames),
+        body,
+        metadataNames: [
+          ...Object.keys(body.assertions),
+          ...body.clear_names,
+        ].sort(),
         signal,
       });
     }
@@ -2374,7 +2395,7 @@
     async _correctionMutation({ action, method, itemId, targetId, targetKind,
       expectedTargetRevision, idempotencyKey, pathSuffix, mutationSuffix,
       revisionHeader, headers = {}, body, targets = null,
-      omitTargetInPath = false, signal }) {
+      metadataNames = null, omitTargetInPath = false, signal }) {
       const item = portableIdentifier(itemId, "itemId");
       const target = portableIdentifier(targetId, `${targetKind}Id`);
       if (!isArtifactRevision(expectedTargetRevision)) {
@@ -2413,6 +2434,7 @@
             operationId,
             itemId: item,
             targets: expectedTargets,
+            metadataNames,
           }) || containsCommandFingerprint(response)) {
         this._invalidResponse(
           "Engine returned an invalid correction mutation receipt",
