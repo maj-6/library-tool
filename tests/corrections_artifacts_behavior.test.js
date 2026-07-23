@@ -328,8 +328,12 @@ test("engine-backed images page same-canvas annotations into the editor overlay"
     },
     resources: {
       async resolveRaster() { return { url: "/safe/display.jpg" }; },
-      async listRegions({ representationId, canvasId, cursor, limit }) {
-        regionCalls.push({ representationId, canvasId, cursor, limit });
+      async listRegions({
+        representationId, canvasId, canvasRevision, cursor, limit,
+      }) {
+        regionCalls.push({
+          representationId, canvasId, canvasRevision, cursor, limit,
+        });
         return cursor
           ? { items: [region("region-2")], nextCursor: null }
           : { items: [region("region-1")], nextCursor: "regions-2" };
@@ -344,12 +348,14 @@ test("engine-backed images page same-canvas annotations into the editor overlay"
     {
       representationId: "scan-1",
       canvasId: "page-1",
+      canvasRevision: "page-r1",
       cursor: null,
       limit: 200,
     },
     {
       representationId: "scan-1",
       canvasId: "page-1",
+      canvasRevision: "page-r1",
       cursor: "regions-2",
       limit: 200,
     },
@@ -358,6 +364,80 @@ test("engine-backed images page same-canvas annotations into the editor overlay"
     published.at(-1).regions.map((value) => value.annotation_id),
     ["region-1", "region-2"],
   );
+});
+
+
+test("region detail paging keeps all source pins and deduplicates the selected row", async () => {
+  const selected = annotation("region-1");
+  const sibling = annotation("region-2");
+  const later = annotation("region-3");
+  const calls = [];
+  const { feature, published } = harness({
+    initialExpandedGroups: ["layout-regions"],
+    catalog: {
+      async list() { return { items: [selected], nextCursor: null }; },
+      async get() { return selected; },
+    },
+    resources: {
+      async listRegions(args) {
+        calls.push(args);
+        return args.cursor
+          ? { items: [sibling, later], nextCursor: null }
+          : { items: [selected, sibling], nextCursor: "regions-2" };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select("annotation:region-1");
+  const first = published.at(-1);
+  const identity = (value) => value.annotation_id || value.annotationId ||
+    value.id || value.key && value.key.annotation_id;
+
+  assert.deepEqual(first.regions.map(identity), ["region-1", "region-2"]);
+  assert.equal(calls[0].representationId, "scan-1");
+  assert.equal(calls[0].canvasId, "page-1");
+  assert.equal(calls[0].canvasRevision, "page-r1");
+
+  await first.loadNext();
+  assert.deepEqual(
+    published.at(-1).regions.map(identity),
+    ["region-1", "region-2", "region-3"],
+  );
+  assert.equal(calls[1].representationId, "scan-1");
+  assert.equal(calls[1].canvasId, "page-1");
+  assert.equal(calls[1].canvasRevision, "page-r1");
+});
+
+
+test("a full region page keeps its last row when selected detail is prepended", async () => {
+  const selected = annotation("selected-region");
+  const page = Array.from({ length: 200 }, (_value, index) =>
+    annotation(index === 0 ? "selected-region" : `region-${index + 1}`));
+  const { feature, published } = harness({
+    initialExpandedGroups: ["layout-regions"],
+    catalog: {
+      async list() { return { items: [selected], nextCursor: null }; },
+      async get() { return selected; },
+    },
+    resources: {
+      async listRegions() {
+        return { items: page, nextCursor: "regions-200" };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select("annotation:selected-region");
+  const resource = published.at(-1);
+  const identities = resource.regions.map((value) =>
+    value.annotation_id || value.annotationId || value.id ||
+      value.key && value.key.annotation_id);
+
+  assert.equal(identities.length, 200);
+  assert.equal(identities.filter((id) => id === "selected-region").length, 1);
+  assert.equal(identities.includes("region-200"), true);
+  assert.equal(resource.nextCursor, "regions-200");
 });
 
 

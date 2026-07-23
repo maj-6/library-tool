@@ -167,6 +167,8 @@ def test_resource_state_and_reference_must_agree():
     ("changes", "code"),
     (
         ({"revision": "bad revision"}, "invalid_artifact_revision"),
+        ({"revision": "artifact-😀"}, "invalid_artifact_revision"),
+        ({"revision": "artifact-\x00r1"}, "invalid_artifact_revision"),
         ({"media_type": "application/octet-stream"}, "invalid_raster_media_type"),
         ({"media_type": "image/svg+xml"}, "invalid_raster_media_type"),
         ({"content_sha256": "not-a-hash"}, "invalid_artifact_checksum"),

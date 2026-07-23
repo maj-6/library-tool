@@ -18,6 +18,17 @@ def _jpeg_bytes() -> bytes:
     return output.getvalue()
 
 
+def _opaque_identity(namespace: str, *parts) -> str:
+    encoded = json.dumps(
+        parts,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{namespace}:{hashlib.sha256(encoded).hexdigest()[:40]}"
+
+
 def _bind_engine_session(monkeypatch, server, session) -> None:
     aliases = {
         "_engine_session": session,
@@ -128,11 +139,14 @@ def test_production_bridge_lists_and_serves_capture_artifacts(
     assert collection.status_code == 200
     body = collection.get_json()
     assert body["schema"] == "librarytool.raster-artifacts/1"
+    capture_namespace = _opaque_identity("capture", "capture-1", "asset-1")
+    display_id = f"{capture_namespace}:display"
+    original_id = f"{capture_namespace}:original"
     assert [
         artifact["key"]["artifact_id"] for artifact in body["artifacts"]
     ] == [
-        "capture:asset-1:display",
-        "capture:asset-1:original",
+        display_id,
+        original_id,
     ]
     assert all(
         artifact["source"]["representation_id"] == "capture"
@@ -145,7 +159,7 @@ def test_production_bridge_lists_and_serves_capture_artifacts(
     resource = display["resource"]
     response = client.get(
         "/api/v1/items/book-one/raster-artifacts/"
-        "capture:asset-1:display/resource?"
+        f"{display_id}/resource?"
         + urlencode({"revision": resource["revision"]})
     )
 

@@ -156,6 +156,25 @@ test("visible controls and shortcuts invoke the same registered image command", 
 });
 
 
+test("classification commands stay unavailable without a mutation port", () => {
+  const documentRef = fakeDocument();
+  documentRef.hasFocus = () => true;
+  const scope = new FakeNode("main", documentRef);
+  const controller = createClassificationController({
+    scope,
+    documentRef,
+    port: null,
+  });
+  controller.setSelectionTarget(image());
+  controller.mount();
+
+  assert.equal(
+    controller.registry.canInvoke(CLASSIFICATION_COMMAND_IDS.titlePage),
+    false,
+  );
+});
+
+
 test("region classification is one CAS-pinned linked-artifact transaction and undoable", async () => {
   const order = [];
   const history = [];

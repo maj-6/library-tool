@@ -9,7 +9,6 @@
   function correctionsEngineAdapterFactory(deps) {
     "use strict";
 
-    const MAX_EMPTY_PAGE_SCAN = 8;
     const RASTER_GROUPS = new Set([
       "source-images",
       "extracted-figures",
@@ -110,36 +109,45 @@
       return Object.freeze(result);
     }
 
-    function createCorrectionsEnginePorts(engineClient, options = {}) {
+    function rasterOwnsAnnotationFrame(artifact) {
+      const source = artifact && artifact.source || {};
+      const artifactId = artifact && artifact.key &&
+        artifact.key.artifact_id || "";
+      if (!source.canvas_id || !source.canvas_revision) return false;
+      const correctionsUi = artifact && artifact.extensions &&
+        artifact.extensions.corrections_ui;
+      const annotationFrame = correctionsUi &&
+        correctionsUi.annotation_frame;
+      if (annotationFrame === "canvas") return true;
+      if (annotationFrame === "crop" || annotationFrame === "detached") {
+        return false;
+      }
+      if (["page-image", "scan", "source-image"].includes(artifact.kind)) {
+        return true;
+      }
+      return source.representation_id === "capture" &&
+        artifactId.startsWith("capture:") &&
+        artifactId.endsWith(":display");
+    }
+
+    function createCorrectionsEnginePorts(engineClient) {
       const client = requireEngineClient(engineClient);
-      const emptyPageScanLimit = Number.isSafeInteger(options.emptyPageScanLimit)
-        ? Math.max(1, Math.min(32, options.emptyPageScanLimit))
-        : MAX_EMPTY_PAGE_SCAN;
 
       async function listRasterGroup({ context, group, cursor, limit, signal }) {
         if (!RASTER_GROUPS.has(group)) {
           return pageResult(null, []);
         }
         const query = engineQuery(context, signal);
-        let nextCursor = cursor || null;
-        let response = null;
-        for (let page = 0; page < emptyPageScanLimit; page += 1) {
-          const requestCursor = nextCursor;
-          response = await client.rasterArtifacts.list({
-            ...query,
-            cursor: requestCursor,
-            limit,
-          });
-          const values = response.artifacts
-            .map(decorateRasterArtifact)
-            .filter((value) => value.group === group);
-          const following = response.next_cursor || null;
-          if (values.length || !following || following === requestCursor) {
-            return pageResult(response, values);
-          }
-          nextCursor = following;
-        }
-        return pageResult(response, []);
+        const response = await client.rasterArtifacts.list({
+          ...query,
+          group,
+          cursor: cursor || null,
+          limit,
+        });
+        const values = response.artifacts
+          .map(decorateRasterArtifact)
+          .filter((value) => value.group === group);
+        return pageResult(response, values, { includeTotal: true });
       }
 
       async function listSpatial({ context, cursor, limit, signal }) {
@@ -156,19 +164,34 @@
       }
 
       async function listRegions({
-        context, representationId, canvasId, cursor, limit, signal,
+        context, representationId, canvasId, canvasRevision, cursor, limit,
+        signal,
       }) {
         const query = engineQuery(context, signal);
         const response = await client.spatialAnnotations.list({
           ...query,
           representationId: representationId || query.representationId,
           canvasId: canvasId || query.canvasId,
+          canvasRevision,
           cursor: cursor || null,
           limit,
         });
+        const expectedRepresentation = representationId ||
+          query.representationId;
+        const expectedCanvas = canvasId || query.canvasId;
+        const values = response.annotations
+          .map(decorateSpatialAnnotation)
+          .filter((annotation) => {
+            const source = annotation.source || {};
+            return (!expectedRepresentation ||
+                source.representation_id === expectedRepresentation) &&
+              (!expectedCanvas || source.canvas_id === expectedCanvas) &&
+              (!canvasRevision ||
+                source.canvas_revision === canvasRevision);
+          });
         return pageResult(
           response,
-          response.annotations.map(decorateSpatialAnnotation),
+          values,
           { includeTotal: true },
         );
       }
@@ -182,7 +205,6 @@
         });
         const artifact = decorateRasterArtifact(response.artifact);
         const source = artifact.source || {};
-        if (!source.canvas_id) return artifact;
         const correctionsUi = artifact.extensions &&
           artifact.extensions.corrections_ui;
         return Object.freeze({
@@ -192,7 +214,8 @@
             corrections_ui: Object.freeze({
               ...(correctionsUi && typeof correctionsUi === "object" &&
                 !Array.isArray(correctionsUi) ? correctionsUi : {}),
-              paged_regions: true,
+              paged_regions: Boolean(
+                source.canvas_id && rasterOwnsAnnotationFrame(artifact)),
             }),
           }),
         });

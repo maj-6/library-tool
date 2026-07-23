@@ -656,7 +656,10 @@
   }
 
   function isArtifactRevision(value, optional = false) {
-    return isLifecycleRevision(value, optional);
+    if (typeof value !== "string") return false;
+    if (!value) return optional;
+    return value.length <= 512 && /^[\x21-\x7e]+$/.test(value) &&
+      !/["\\]/.test(value);
   }
 
   function isArtifactProvenance(value) {
@@ -1560,7 +1563,7 @@
         "GET", `/v1/items/${encodePart(itemId)}/artifacts`, { signal });
     }
 
-    _rasterArtifactList({ itemId, representationId, canvasId, cursor,
+    _rasterArtifactList({ itemId, representationId, canvasId, group, cursor,
       limit = 100, signal } = {}) {
       const item = portableIdentifier(itemId, "itemId");
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 512) {
@@ -1572,6 +1575,11 @@
       if (canvasId != null && canvasId !== "") {
         portableIdentifier(canvasId, "canvasId");
       }
+      if (group != null && group !== "" &&
+          !["source-images", "extracted-figures", "processed-images",
+            "generated-images"].includes(group)) {
+        throw new TypeError("group is not a supported raster artifact group");
+      }
       if (cursor != null && cursor !== "" &&
           (typeof cursor !== "string" || cursor.length > 2048)) {
         throw new TypeError("cursor must be a bounded opaque string");
@@ -1581,6 +1589,7 @@
         query: {
           representation_id: representationId,
           canvas_id: canvasId,
+          group,
           cursor,
           limit,
         },
@@ -1651,8 +1660,8 @@
       );
     }
 
-    _spatialAnnotationList({ itemId, representationId, canvasId, cursor,
-      limit = 100, signal } = {}) {
+    _spatialAnnotationList({ itemId, representationId, canvasId,
+      canvasRevision, cursor, limit = 100, signal } = {}) {
       const item = portableIdentifier(itemId, "itemId");
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 512) {
         throw new TypeError("limit must be an integer from 1 to 512");
@@ -1663,6 +1672,11 @@
       if (canvasId != null && canvasId !== "") {
         portableIdentifier(canvasId, "canvasId");
       }
+      if (canvasRevision != null && canvasRevision !== "" &&
+          !isArtifactRevision(canvasRevision)) {
+        throw new TypeError(
+          "canvasRevision is not a valid canvas revision");
+      }
       if (cursor != null && cursor !== "" &&
           (typeof cursor !== "string" || cursor.length > 2048)) {
         throw new TypeError("cursor must be a bounded opaque string");
@@ -1672,6 +1686,7 @@
         query: {
           representation_id: representationId,
           canvas_id: canvasId,
+          canvas_revision: canvasRevision,
           cursor,
           limit,
         },

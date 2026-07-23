@@ -113,6 +113,24 @@ test("Properties visibly separates immutable machine facts from human assertions
 });
 
 
+test("read-only Properties disables caption mutation controls", async () => {
+  const { inspector, root } = harness();
+  inspector.setSelection(artifact());
+
+  const textarea = root.querySelector("textarea");
+  const language = root.querySelector("input");
+  const buttons = root.querySelectorAll("button");
+  assert.equal(textarea.disabled, true);
+  assert.equal(language.disabled, true);
+  assert.deepEqual(buttons.map((button) => button.disabled), [true, true, true]);
+  assert.match(root.textContent, /read-only session/i);
+
+  inspector.saveDraft({ text: "Must not be written" });
+  assert.equal(await inspector.setManualCaption(), null);
+  assert.equal(await inspector.clearManualCaption(), null);
+});
+
+
 test("manual caption set uses exact artifact CAS pins and records an inverse", async () => {
   const calls = [];
   const history = [];

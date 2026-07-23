@@ -20,6 +20,7 @@ import os
 import re
 import stat
 import tempfile
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,7 @@ from ...engine.raster_artifacts import (
     ResourceState,
 )
 from ...engine.spatial_annotations import (
+    NormalizedPoint,
     NormalizedPolygonSelector,
     RoleAssignmentOrigin,
     SpatialAnnotationKey,
@@ -78,11 +80,16 @@ MISTRAL_LAYOUT_RELATIVE = ("ocr", "layout.json")
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PERSISTED_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_FIGURE_NAME_RE = re.compile(r"^(?!\.+$)[\w.\-]{1,120}$")
+_RESOURCE_LEAF_RE = re.compile(r"^(?!\.+$)[\w.\-]{1,255}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _FIGURE_REFERENCE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _MAX_PHOTO_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_LAYOUT_BYTES = 64 * 1024 * 1024
 _MAX_CAPTURE_ASSETS = 4096
+_MAX_CAPTURE_GEOMETRIES_PER_ASSET = 64
+_MAX_CAPTURE_REGIONS_PER_GEOMETRY = 500
+_MAX_CAPTURE_POLYGON_POINTS = 16
 _MAX_LAYOUT_PAGES = 100_000
 _MAX_PAGE_REGIONS = 20_000
 _MAX_FIGURES = 100_000
@@ -97,6 +104,15 @@ _KNOWN_MEDIA_TYPES = {
     ".tiff": "image/tiff",
     ".webp": "image/webp",
 }
+_PIL_MEDIA_TYPES = {
+    "BMP": "image/bmp",
+    "GIF": "image/gif",
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "TIFF": "image/tiff",
+    "WEBP": "image/webp",
+}
+_UNKNOWN_IMAGE_MEDIA_TYPE = "image/unknown"
 _PHOTO_ASSET_FIELDS = frozenset(
     {
         "asset_id",
@@ -172,7 +188,7 @@ def _reject_constant(_value: str) -> Any:
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
-        ensure_ascii=False,
+        ensure_ascii=True,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -227,6 +243,22 @@ def _persisted_token(
     return value
 
 
+def _figure_name(value: Any, *, item_id: str) -> str:
+    if not isinstance(value, str) or not _FIGURE_NAME_RE.fullmatch(value):
+        raise _repository_error(
+            "a persisted Mistral figure name is invalid",
+            code="invalid_mistral_layout",
+            item_id=item_id,
+            field="figure_name",
+        )
+    return value
+
+
+def _opaque_identity(namespace: str, *parts: Any) -> str:
+    digest = hashlib.sha256(_canonical_bytes(parts)).hexdigest()
+    return f"{namespace}:{digest[:40]}"
+
+
 def _composite_identity(
     *parts: str,
     item_id: str,
@@ -255,10 +287,11 @@ def _revision(
         not isinstance(value, str)
         or not value
         or len(value) > 512
-        or value != value.strip()
-        or '"' in value
-        or "\\" in value
-        or any(character.isspace() for character in value)
+        or any(
+            not 0x21 <= ord(character) <= 0x7E
+            or character in {'"', "\\"}
+            for character in value
+        )
     ):
         raise _repository_error(
             "a Corrections source revision is invalid",
@@ -296,21 +329,82 @@ def _sha256(value: Any) -> str:
     return value.casefold()
 
 
-def _file_sha256(path: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise OSError("resource is not a regular file")
-        for block in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(block)
-            size += len(block)
-    return digest.hexdigest(), size
+def _stable_stat_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_mode),
+        int(info.st_nlink),
+        int(info.st_size),
+        int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
+        int(getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000))),
+    )
+
+
+def _open_verified_regular(
+    path: Path,
+    named_before: os.stat_result,
+) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOINHERIT", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    # A swapped FIFO or device must not block a read before fstat rejects it.
+    flags |= int(getattr(os, "O_NONBLOCK", 0))
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        named_opened = path.lstat()
+        if (
+            _is_redirecting_path(path)
+            or not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(named_opened.st_mode)
+            or opened.st_nlink != 1
+            or named_opened.st_nlink != 1
+            or not os.path.samestat(named_before, named_opened)
+            or not os.path.samestat(opened, named_opened)
+            or _stable_stat_identity(named_before)
+            != _stable_stat_identity(named_opened)
+        ):
+            raise OSError("private file identity changed while it was opened")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, opened
+
+
+def _finish_verified_regular(
+    path: Path,
+    descriptor: int,
+    *,
+    named_before: os.stat_result,
+    opened_before: os.stat_result,
+) -> os.stat_result:
+    opened_after = os.fstat(descriptor)
+    named_after = path.lstat()
+    if (
+        _is_redirecting_path(path)
+        or not stat.S_ISREG(opened_after.st_mode)
+        or not stat.S_ISREG(named_after.st_mode)
+        or opened_after.st_nlink != 1
+        or named_after.st_nlink != 1
+        or not os.path.samestat(opened_after, named_after)
+        or _stable_stat_identity(opened_before)
+        != _stable_stat_identity(opened_after)
+        or _stable_stat_identity(named_before)
+        != _stable_stat_identity(named_after)
+    ):
+        raise OSError("private file changed while it was read")
+    return named_after
 
 
 def _orientation(value: Any) -> int:
     # Android persists clockwise degrees while RasterDimensions uses EXIF tags.
     return {0: 1, 90: 6, 180: 3, 270: 8}.get(value, 1)
+
+
+def _orientation_degrees(value: int) -> int:
+    return {1: 0, 6: 90, 3: 180, 8: 270}.get(value, 0)
 
 
 def _media_type(reference: Any) -> str:
@@ -319,15 +413,92 @@ def _media_type(reference: Any) -> str:
     return _KNOWN_MEDIA_TYPES.get(Path(reference).suffix.casefold(), "")
 
 
-def _image_dimensions(path: Path) -> tuple[int, int] | None:
+def _verified_image_properties(stream: BinaryIO) -> tuple[int, int, str] | None:
     try:
-        with Image.open(path) as image:
-            width, height = image.size
-    except (OSError, UnidentifiedImageError, ValueError):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            stream.seek(0)
+            with Image.open(stream) as image:
+                width, height = image.size
+                image_format = str(image.format or "").upper()
+                image.verify()
+            # ``verify`` checks structure without decoding pixels. Reopen and
+            # load once so an AVAILABLE grant always names fully decodable
+            # raster bytes, not merely a plausible header.
+            stream.seek(0)
+            with Image.open(stream) as image:
+                image.load()
+                if image.size != (width, height):
+                    return None
+                if str(image.format or "").upper() != image_format:
+                    return None
+        media_type = _PIL_MEDIA_TYPES.get(image_format, "")
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        OSError,
+        UnidentifiedImageError,
+        ValueError,
+    ):
         return None
-    if width <= 0 or height <= 0:
+    if width <= 0 or height <= 0 or not media_type:
         return None
-    return int(width), int(height)
+    return int(width), int(height), media_type
+
+
+def _public_extensions(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return a bounded public view of permissive legacy metadata.
+
+    Legacy stores intentionally retain a wider JSON extension contract than
+    the engine exposes. Keep safe metadata verbatim; otherwise publish only a
+    deterministic quarantine receipt while leaving the source sidecar
+    untouched.
+    """
+
+    try:
+        ArtifactProvenance(extensions=value)
+    except ValidationError:
+        encoded = _canonical_bytes(value)
+        return {
+            "quarantine": {
+                "reason": "legacy-extension-not-public",
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "encoded_bytes": len(encoded),
+                "top_level_fields": len(value),
+            }
+        }
+    return value
+
+
+def _public_text(value: Any, *, maximum: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(
+        character
+        for character in value[:maximum]
+        if not (
+            ord(character) == 127
+            or (ord(character) < 32 and character not in "\n\r\t")
+            or 0xD800 <= ord(character) <= 0xDFFF
+        )
+    )
+
+
+def _public_provider_id(value: Any) -> str:
+    text = _public_text(value, maximum=127)
+    return text if _IDENTIFIER_RE.fullmatch(text) else ""
+
+
+def _capture_region_role(value: Any) -> str | None:
+    text = _public_text(value, maximum=80).strip().casefold()
+    aliases = {
+        "ill": "figure",
+        "illustration": "figure",
+        "mar": "marginalia",
+    }
+    if text in aliases:
+        return aliases[text]
+    return text if _IDENTIFIER_RE.fullmatch(text) else None
 
 
 def _unknown_fields(value: Mapping[str, Any], known: frozenset[str]) -> dict[str, Any]:
@@ -354,6 +525,8 @@ class ResolvedRasterResource:
 @dataclass(frozen=True, slots=True)
 class _ResolvedRasterCandidate:
     path: Path
+    file_identity: tuple[int, ...]
+    section: str
     media_type: str
     content_sha256: str
     size: int
@@ -533,14 +706,38 @@ class FilesystemCorrectionsArtifactRepository(
         digest = hashlib.sha256()
         size = 0
         granted = False
+        descriptor = -1
         try:
-            with candidate.path.open("rb") as source:
-                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                    return None
-                for block in iter(lambda: source.read(1 << 20), b""):
-                    digest.update(block)
-                    size += len(block)
-                    snapshot.write(block)
+            self._assert_safe_path(
+                candidate.path,
+                item_id=item_id,
+                section=candidate.section,
+            )
+            named = candidate.path.lstat()
+            if (
+                _is_redirecting_path(candidate.path)
+                or _stable_stat_identity(named) != candidate.file_identity
+            ):
+                return None
+            descriptor, opened = _open_verified_regular(candidate.path, named)
+            while True:
+                block = os.read(descriptor, 1 << 20)
+                if not block:
+                    break
+                digest.update(block)
+                size += len(block)
+                snapshot.write(block)
+            _finish_verified_regular(
+                candidate.path,
+                descriptor,
+                named_before=named,
+                opened_before=opened,
+            )
+            self._assert_safe_path(
+                candidate.path,
+                item_id=item_id,
+                section=candidate.section,
+            )
             if (
                 size != candidate.size
                 or digest.hexdigest() != candidate.content_sha256
@@ -556,9 +753,11 @@ class FilesystemCorrectionsArtifactRepository(
             )
             granted = True
             return resolved
-        except OSError:
+        except (OSError, RepositoryError):
             return None
         finally:
+            if descriptor >= 0:
+                os.close(descriptor)
             if not granted:
                 snapshot.close()
 
@@ -826,18 +1025,36 @@ class FilesystemCorrectionsArtifactRepository(
                 section=section,
                 cause_type=type(exc).__name__,
             ) from exc
-        if _is_redirecting_path(path) or not stat.S_ISREG(info.st_mode):
+        if (
+            _is_redirecting_path(path)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+        ):
             raise _repository_error(
                 "a Corrections sidecar is not a private regular file",
                 code="unsafe_corrections_store_path",
                 item_id=item_id,
                 section=section,
             )
+        descriptor = -1
         try:
-            with path.open("rb") as stream:
-                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                    raise OSError("sidecar is not a regular file")
-                encoded = stream.read(maximum_bytes + 1)
+            descriptor, opened = _open_verified_regular(path, info)
+            chunks: list[bytes] = []
+            remaining = maximum_bytes + 1
+            while remaining:
+                chunk = os.read(descriptor, min(1 << 20, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            encoded = b"".join(chunks)
+            _finish_verified_regular(
+                path,
+                descriptor,
+                named_before=info,
+                opened_before=opened,
+            )
+            self._assert_safe_path(path, item_id=item_id, section=section)
             if len(encoded) > maximum_bytes:
                 raise ValueError("sidecar exceeds its size limit")
             value = json.loads(
@@ -857,6 +1074,9 @@ class FilesystemCorrectionsArtifactRepository(
                 section=section,
                 cause_type=type(exc).__name__,
             ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         if not isinstance(value, Mapping):
             raise _repository_error(
                 "a Corrections sidecar must contain an object",
@@ -890,13 +1110,18 @@ class FilesystemCorrectionsArtifactRepository(
                 maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
             )
             if photo_assets is not None:
-                capture_views, capture_resources = self._project_capture(
+                (
+                    capture_views,
+                    capture_spatial,
+                    capture_resources,
+                ) = self._project_capture(
                     item_id,
                     capture_id,
                     capture_directory,
                     photo_assets,
                 )
                 raster.extend(capture_views)
+                spatial.extend(capture_spatial)
                 resources.update(capture_resources)
 
         layout_path = entry_directory.joinpath(*MISTRAL_LAYOUT_RELATIVE)
@@ -954,6 +1179,7 @@ class FilesystemCorrectionsArtifactRepository(
         manifest: Mapping[str, Any],
     ) -> tuple[
         tuple[RasterArtifactView, ...],
+        tuple[SpatialAnnotationView, ...],
         Mapping[tuple[str, str, str], _ResolvedRasterCandidate],
     ]:
         if (
@@ -1009,6 +1235,7 @@ class FilesystemCorrectionsArtifactRepository(
             {"capture_id": capture_id, "originals": manifest_source},
         )
         values: list[RasterArtifactView] = []
+        spatial: list[SpatialAnnotationView] = []
         resources: dict[tuple[str, str, str], _ResolvedRasterCandidate] = {}
         seen_assets: set[str] = set()
         seen_orders: set[int] = set()
@@ -1058,43 +1285,14 @@ class FilesystemCorrectionsArtifactRepository(
             display_sha = _sha256(
                 imported.get("derivative_checksum") or display.get("sha256")
             )
-            original_id = _composite_identity(
+            capture_namespace = _opaque_identity(
                 "capture",
+                capture_id,
                 asset_id,
-                "original",
-                item_id=item_id,
-                field="artifact_id",
-                code="invalid_capture_photo_assets",
             )
-            display_id = _composite_identity(
-                "capture",
-                asset_id,
-                "display",
-                item_id=item_id,
-                field="artifact_id",
-                code="invalid_capture_photo_assets",
-            )
-            canvas_id = _composite_identity(
-                "capture",
-                asset_id,
-                item_id=item_id,
-                field="canvas_id",
-                code="invalid_capture_photo_assets",
-            )
-            canvas_revision = _digest_revision(
-                "canvas",
-                {
-                    "asset_id": asset_id,
-                    "sha256": original_sha,
-                    "revision": original.get("revision"),
-                },
-            )
-            source = RasterSourceRef(
-                "capture",
-                representation_revision,
-                canvas_id,
-                canvas_revision,
-            )
+            original_id = f"{capture_namespace}:original"
+            display_id = f"{capture_namespace}:display"
+            canvas_id = capture_namespace
             original_observation = self._observe_resource(
                 item_id,
                 directory,
@@ -1127,9 +1325,54 @@ class FilesystemCorrectionsArtifactRepository(
                 ),
                 section="capture",
             )
-            if original_observation is None or display_observation is None:
-                continue
-
+            original_source = (
+                RasterSourceRef(
+                    "capture",
+                    representation_revision,
+                    canvas_id,
+                    _digest_revision(
+                        "canvas",
+                        {
+                            "asset_id": asset_id,
+                            "rendition": "original",
+                            "record_revision": original.get("revision"),
+                            "content_sha256": (
+                                original_observation.content_sha256
+                            ),
+                            "dimensions": (
+                                original_observation.dimensions.as_dict()
+                            ),
+                        },
+                    ),
+                )
+                if original_observation is not None
+                else None
+            )
+            display_source = (
+                RasterSourceRef(
+                    "capture",
+                    representation_revision,
+                    canvas_id,
+                    _digest_revision(
+                        "canvas",
+                        {
+                            "asset_id": asset_id,
+                            "rendition": "display",
+                            "record_revision": display.get("revision"),
+                            "content_sha256": (
+                                display_observation.content_sha256
+                            ),
+                            "dimensions": (
+                                display_observation.dimensions.as_dict()
+                            ),
+                            "source_revision": original.get("revision"),
+                            "source_sha256": original_sha,
+                        },
+                    ),
+                )
+                if display_observation is not None
+                else None
+            )
             assignments = self._capture_assignments(
                 item_id,
                 raw.get("role"),
@@ -1140,40 +1383,56 @@ class FilesystemCorrectionsArtifactRepository(
                 provider_id="android",
                 model="bookcapture",
             )
-            original_view = self._capture_view(
-                item_id,
-                artifact_id=original_id,
-                kind="captured-image",
-                observation=original_observation,
-                source=source,
-                label=f"Capture {order} original",
-                freshness=self._capture_freshness(
-                    raw,
-                    original_observation,
-                ),
-                assignments=assignments,
-                provenance=provenance,
-                lineage=(),
-                extensions={
-                    "capture_order": order,
-                    "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
-                    "rendition": _unknown_fields(
-                        original,
-                        _PHOTO_RENDITION_FIELDS,
+            original_view = (
+                self._capture_view(
+                    item_id,
+                    artifact_id=original_id,
+                    kind="captured-image",
+                    observation=original_observation,
+                    source=original_source,
+                    label=f"Capture {order} original",
+                    freshness=self._capture_freshness(
+                        raw,
+                        original_observation,
                     ),
-                },
+                    assignments=assignments,
+                    provenance=provenance,
+                    lineage=(),
+                    extensions={
+                        "capture_order": order,
+                        "corrections_ui": {"annotation_frame": "canvas"},
+                        "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
+                        "rendition": _unknown_fields(
+                            original,
+                            _PHOTO_RENDITION_FIELDS,
+                        ),
+                    },
+                )
+                if original_observation is not None
+                and original_source is not None
+                else None
             )
-            display_relation = RasterLineageRef(
-                original_id,
-                original_view.revision,
-                "derived_from",
+            display_lineage = (
+                (
+                    RasterLineageRef(
+                        original_id,
+                        original_view.revision,
+                        "derived_from",
+                    ),
+                )
+                if original_view is not None
+                else ()
             )
-            recipe = str(
+            recipe = _public_text(
                 imported.get("recipe")
                 or display.get("recipe")
-                or "camera-original"
-            )[:256]
-            recipe_revision = str(display.get("recipe_version") or "1")[:512]
+                or "camera-original",
+                maximum=256,
+            )
+            recipe_revision = _public_text(
+                str(display.get("recipe_version") or "1"),
+                maximum=512,
+            )
             display_provenance = ArtifactProvenance(
                 origin="transform" if recipe != "camera-original" else "capture",
                 provider_id="desktop" if imported else "android",
@@ -1181,47 +1440,67 @@ class FilesystemCorrectionsArtifactRepository(
                 recipe_revision=(
                     recipe_revision
                     if recipe_revision
-                    and not any(character.isspace() for character in recipe_revision)
+                    and all(
+                        0x21 <= ord(character) <= 0x7E
+                        and character not in {'"', "\\"}
+                        for character in recipe_revision
+                    )
                     else ""
                 ),
             )
-            display_view = self._capture_view(
-                item_id,
-                artifact_id=display_id,
-                kind=(
-                    "processed-image"
-                    if (
-                        imported
-                        or display_observation.content_sha256
-                        != original_observation.content_sha256
-                    )
-                    else "captured-image"
-                ),
-                observation=display_observation,
-                source=source,
-                label=f"Capture {order} display",
-                freshness=self._capture_freshness(
-                    raw,
-                    display_observation,
-                ),
-                assignments=assignments,
-                provenance=display_provenance,
-                lineage=(display_relation,),
-                extensions={
-                    "capture_order": order,
-                    "recipe": recipe,
-                    "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
-                    "rendition": _unknown_fields(
-                        display,
-                        _PHOTO_RENDITION_FIELDS,
+            display_view = (
+                self._capture_view(
+                    item_id,
+                    artifact_id=display_id,
+                    kind=(
+                        "processed-image"
+                        if (
+                            imported
+                            or recipe != "camera-original"
+                            or (
+                                original_observation is not None
+                                and display_observation.content_sha256
+                                != original_observation.content_sha256
+                            )
+                        )
+                        else "captured-image"
                     ),
-                },
+                    observation=display_observation,
+                    source=display_source,
+                    label=f"Capture {order} display",
+                    freshness=self._capture_freshness(
+                        raw,
+                        display_observation,
+                    ),
+                    assignments=assignments,
+                    provenance=display_provenance,
+                    lineage=display_lineage,
+                    extensions={
+                        "capture_order": order,
+                        "recipe": recipe,
+                        "corrections_ui": {"annotation_frame": "canvas"},
+                        "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
+                        "rendition": _unknown_fields(
+                            display,
+                            _PHOTO_RENDITION_FIELDS,
+                        ),
+                    },
+                )
+                if display_observation is not None
+                and display_source is not None
+                else None
             )
-            values.extend((original_view, display_view))
+            values.extend(
+                view
+                for view in (original_view, display_view)
+                if view is not None
+            )
             for view, observation in (
                 (original_view, original_observation),
                 (display_view, display_observation),
             ):
+                if view is None or observation is None:
+                    continue
                 if view.resource is not None and observation.resolved is not None:
                     resources[
                         (
@@ -1230,7 +1509,265 @@ class FilesystemCorrectionsArtifactRepository(
                             view.resource.variant,
                         )
                     ] = observation.resolved
-        return tuple(values), resources
+            if (
+                display_view is not None
+                and display_observation is not None
+                and display_source is not None
+                and display_observation.state is ResourceState.AVAILABLE
+                and (
+                    not imported
+                    or (
+                        bool(_sha256(display.get("sha256")))
+                        and display_observation.content_sha256
+                        == _sha256(display.get("sha256"))
+                    )
+                )
+            ):
+                spatial.extend(
+                    self._capture_geometry_annotations(
+                        item_id,
+                        capture_id=capture_id,
+                        asset_id=asset_id,
+                        raw_geometry=raw.get("geometry"),
+                        original=original,
+                        display=display,
+                        original_sha256=_sha256(original.get("sha256")),
+                        display_dimensions=display_observation.dimensions,
+                        source=SpatialSourceRef(
+                            display_source.representation_id,
+                            display_source.representation_revision,
+                            display_source.canvas_id,
+                            display_source.canvas_revision,
+                        ),
+                        display_artifact_id=display_id,
+                    )
+                )
+        return tuple(values), tuple(spatial), resources
+
+    def _capture_geometry_annotations(
+        self,
+        item_id: str,
+        *,
+        capture_id: str,
+        asset_id: str,
+        raw_geometry: Any,
+        original: Mapping[str, Any],
+        display: Mapping[str, Any],
+        original_sha256: str,
+        display_dimensions: RasterDimensions,
+        source: SpatialSourceRef,
+        display_artifact_id: str,
+    ) -> tuple[SpatialAnnotationView, ...]:
+        if (
+            isinstance(raw_geometry, (str, bytes))
+            or not isinstance(raw_geometry, Sequence)
+        ):
+            return ()
+        original_revision = _positive_integer(original.get("revision"))
+        display_revision = _positive_integer(display.get("revision"))
+        declared_display_width = _non_negative_integer(display.get("width")) or 0
+        declared_display_height = _non_negative_integer(display.get("height")) or 0
+        display_width = display_dimensions.width
+        display_height = display_dimensions.height
+        display_orientation = _orientation_degrees(
+            display_dimensions.orientation
+        )
+        if original_revision is None or display_revision is None:
+            return ()
+
+        values: list[SpatialAnnotationView] = []
+        seen_ids: set[str] = set()
+        geometries = [
+            geometry
+            for geometry in raw_geometry[:_MAX_CAPTURE_GEOMETRIES_PER_ASSET]
+            if isinstance(geometry, Mapping)
+        ]
+        geometries.sort(
+            key=lambda geometry: (
+                _public_text(geometry.get("engine"), maximum=80),
+                _public_text(geometry.get("model"), maximum=120),
+            )
+        )
+        for geometry_index, geometry in enumerate(geometries):
+            geometry_width = _non_negative_integer(geometry.get("width")) or 0
+            geometry_height = _non_negative_integer(geometry.get("height")) or 0
+            geometry_sha256 = _sha256(geometry.get("source_sha256"))
+            if (
+                geometry.get("asset_id") != asset_id
+                or geometry.get("coordinate_space") != "display_normalized"
+                or _positive_integer(geometry.get("source_revision"))
+                != original_revision
+                or _positive_integer(geometry.get("display_revision"))
+                != display_revision
+                or (original_sha256 and geometry_sha256 != original_sha256)
+                or (
+                    declared_display_width
+                    and geometry_width
+                    and geometry_width != declared_display_width
+                )
+                or (
+                    declared_display_height
+                    and geometry_height
+                    and geometry_height != declared_display_height
+                )
+                or (
+                    display_width
+                    and geometry_width
+                    and geometry_width != display_width
+                )
+                or (
+                    display_height
+                    and geometry_height
+                    and geometry_height != display_height
+                )
+                or geometry.get("orientation") != display_orientation
+            ):
+                continue
+            regions = geometry.get("regions")
+            if (
+                isinstance(regions, (str, bytes))
+                or not isinstance(regions, Sequence)
+            ):
+                continue
+            engine = _public_text(geometry.get("engine"), maximum=80)
+            model = _public_text(geometry.get("model"), maximum=120)
+            engine_version = _public_text(
+                geometry.get("engine_version"),
+                maximum=80,
+            )
+            provenance = ArtifactProvenance(
+                origin="ocr",
+                provider_id=_public_provider_id(engine),
+                model=model,
+            )
+            for region_index, region in enumerate(
+                regions[:_MAX_CAPTURE_REGIONS_PER_GEOMETRY]
+            ):
+                if not isinstance(region, Mapping):
+                    continue
+                region_id = _public_text(region.get("id"), maximum=120).strip()
+                polygon = region.get("polygon")
+                if (
+                    not region_id
+                    or isinstance(polygon, (str, bytes))
+                    or not isinstance(polygon, Sequence)
+                    or not 3
+                    <= len(polygon)
+                    <= _MAX_CAPTURE_POLYGON_POINTS
+                ):
+                    continue
+                try:
+                    points = tuple(
+                        NormalizedPoint(point[0], point[1])
+                        for point in polygon
+                        if (
+                            isinstance(point, Sequence)
+                            and not isinstance(point, (str, bytes))
+                            and len(point) >= 2
+                        )
+                    )
+                    if len(points) != len(polygon):
+                        continue
+                    selector = NormalizedPolygonSelector(
+                        "display_normalized",
+                        source.canvas_revision,
+                        points,
+                    )
+                except ValidationError:
+                    continue
+                identity_payload = {
+                    "capture_id": capture_id,
+                    "asset_id": asset_id,
+                    "coordinate_space": "display_normalized",
+                    "engine": engine,
+                    "model": model,
+                    "region_id": region_id,
+                }
+                annotation_id = (
+                    "capture-region:"
+                    + hashlib.sha256(
+                        _canonical_bytes(identity_payload)
+                    ).hexdigest()[:40]
+                )
+                if annotation_id in seen_ids:
+                    continue
+                seen_ids.add(annotation_id)
+                provider_type = _public_text(
+                    region.get("type"),
+                    maximum=80,
+                )
+                role = _capture_region_role(provider_type)
+                confidence = _confidence(region.get("confidence"))
+                text = _public_text(region.get("text"), maximum=500)
+                extensions = _public_extensions(
+                    {
+                        "text": text,
+                        "android_geometry": {
+                            "region_id": region_id,
+                            "provider_type": provider_type,
+                            "engine_version": engine_version,
+                            "source_revision": original_revision,
+                            "display_revision": display_revision,
+                        },
+                    }
+                )
+                role_revision = (
+                    _digest_revision(
+                        "role",
+                        {
+                            "annotation_id": annotation_id,
+                            "role": role,
+                            "confidence": confidence,
+                            "provider_type": provider_type,
+                        },
+                    )
+                    if role is not None
+                    else ""
+                )
+                revision_payload = {
+                    "annotation_id": annotation_id,
+                    "source": source.as_dict(),
+                    "selector": selector.as_dict(),
+                    "order": (
+                        geometry_index * _MAX_CAPTURE_REGIONS_PER_GEOMETRY
+                        + region_index
+                    ),
+                    "role": role,
+                    "confidence": confidence,
+                    "provenance": provenance.as_dict(),
+                    "extensions": extensions,
+                }
+                values.append(
+                    SpatialAnnotationView(
+                        key=SpatialAnnotationKey(item_id, annotation_id),
+                        revision=_digest_revision(
+                            "annotation",
+                            revision_payload,
+                        ),
+                        source=source,
+                        selector=selector,
+                        order=revision_payload["order"],
+                        label=(text or provider_type or role or region_id)[:512],
+                        freshness=ArtifactFreshness.CURRENT,
+                        role_assignments=(
+                            (
+                                SpatialRoleAssignment(
+                                    role,
+                                    RoleAssignmentOrigin.MACHINE,
+                                    role_revision,
+                                    confidence=confidence,
+                                    provenance=provenance,
+                                ),
+                            )
+                            if role is not None
+                            else ()
+                        ),
+                        linked_artifact_ids=(display_artifact_id,),
+                        provenance=provenance,
+                        extensions=extensions,
+                    )
+                )
+        return tuple(values)
 
     def _capture_assignments(
         self,
@@ -1264,7 +1801,10 @@ class FilesystemCorrectionsArtifactRepository(
                     provenance=ArtifactProvenance(
                         origin="machine",
                         provider_id="android",
-                        model=str(value.get("algorithm") or "")[:256],
+                        model=_public_text(
+                            value.get("algorithm"),
+                            maximum=256,
+                        ),
                     ),
                 )
             )
@@ -1330,6 +1870,7 @@ class FilesystemCorrectionsArtifactRepository(
             artifact_id,
             observation,
         )
+        public_extensions = _public_extensions(extensions)
         public_revision = _digest_revision(
             "artifact",
             {
@@ -1344,7 +1885,7 @@ class FilesystemCorrectionsArtifactRepository(
                 "lineage": [value.as_dict() for value in lineage],
                 "assignments": [value.as_dict() for value in assignments],
                 "provenance": provenance.as_dict(),
-                "extensions": extensions,
+                "extensions": public_extensions,
             },
         )
         return RasterArtifactView(
@@ -1362,7 +1903,7 @@ class FilesystemCorrectionsArtifactRepository(
             lineage=lineage,
             category_assignments=assignments,
             provenance=provenance,
-            extensions=extensions,
+            extensions=public_extensions,
         )
 
     def _resource_ref(
@@ -1405,7 +1946,7 @@ class FilesystemCorrectionsArtifactRepository(
         section: str,
         fallback_dimensions: tuple[int, int] | None = None,
     ) -> _ResourceObservation | None:
-        media_type = _media_type(reference)
+        expected_media_type = _media_type(reference)
         width, height = declared_dimensions
         if (width is None or height is None) and fallback_dimensions is not None:
             fallback_width, fallback_height = fallback_dimensions
@@ -1413,17 +1954,17 @@ class FilesystemCorrectionsArtifactRepository(
             height = height or _positive_integer(fallback_height)
         safe_reference = (
             isinstance(reference, str)
-            and _PERSISTED_TOKEN_RE.fullmatch(reference) is not None
+            and _RESOURCE_LEAF_RE.fullmatch(reference) is not None
             and "/" not in reference
             and "\\" not in reference
             and reference not in {".", ".."}
         )
-        if not safe_reference or not media_type:
+        if not safe_reference:
             if not declared_sha256 or width is None or height is None:
                 return None
             return _ResourceObservation(
                 ResourceState.UNAVAILABLE,
-                media_type or "image/jpeg",
+                expected_media_type or _UNKNOWN_IMAGE_MEDIA_TYPE,
                 declared_sha256,
                 RasterDimensions(width, height, orientation),
                 None,
@@ -1436,7 +1977,7 @@ class FilesystemCorrectionsArtifactRepository(
                 return None
             return _ResourceObservation(
                 ResourceState.UNAVAILABLE,
-                media_type,
+                expected_media_type or _UNKNOWN_IMAGE_MEDIA_TYPE,
                 declared_sha256,
                 RasterDimensions(width, height, orientation),
                 None,
@@ -1448,7 +1989,7 @@ class FilesystemCorrectionsArtifactRepository(
                 return None
             return _ResourceObservation(
                 ResourceState.MISSING,
-                media_type,
+                expected_media_type or _UNKNOWN_IMAGE_MEDIA_TYPE,
                 declared_sha256,
                 RasterDimensions(width, height, orientation),
                 None,
@@ -1458,47 +1999,98 @@ class FilesystemCorrectionsArtifactRepository(
                 return None
             return _ResourceObservation(
                 ResourceState.UNAVAILABLE,
-                media_type,
+                expected_media_type or _UNKNOWN_IMAGE_MEDIA_TYPE,
                 declared_sha256,
                 RasterDimensions(width, height, orientation),
                 None,
             )
-        if _is_redirecting_path(path) or not stat.S_ISREG(info.st_mode):
+        if (
+            _is_redirecting_path(path)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+        ):
             if not declared_sha256 or width is None or height is None:
                 return None
             return _ResourceObservation(
                 ResourceState.UNAVAILABLE,
-                media_type,
+                expected_media_type or _UNKNOWN_IMAGE_MEDIA_TYPE,
                 declared_sha256,
                 RasterDimensions(width, height, orientation),
                 None,
             )
+        descriptor = -1
+        snapshot: BinaryIO | None = None
         try:
-            actual_sha256, size = _file_sha256(path)
-        except OSError:
+            snapshot = tempfile.TemporaryFile(mode="w+b")
+            descriptor, opened = _open_verified_regular(path, info)
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                block = os.read(descriptor, 1 << 20)
+                if not block:
+                    break
+                digest.update(block)
+                size += len(block)
+                snapshot.write(block)
+            named_after = _finish_verified_regular(
+                path,
+                descriptor,
+                named_before=info,
+                opened_before=opened,
+            )
+            self._assert_safe_path(path, item_id=item_id, section=section)
+            actual_sha256 = digest.hexdigest()
+            verified = _verified_image_properties(snapshot)
+        except (OSError, RepositoryError):
             if not declared_sha256 or width is None or height is None:
                 return None
             return _ResourceObservation(
                 ResourceState.UNAVAILABLE,
-                media_type,
+                expected_media_type or _UNKNOWN_IMAGE_MEDIA_TYPE,
                 declared_sha256,
                 RasterDimensions(width, height, orientation),
                 None,
             )
-        measured = _image_dimensions(path)
-        if measured is not None:
-            # Persisted Android dimensions describe the sending device's
-            # rendition.  A desktop import may have normalized it again, so
-            # the bytes actually being granted are authoritative here.
-            width, height = measured
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if snapshot is not None:
+                snapshot.close()
+        if verified is None:
+            if not declared_sha256 or width is None or height is None:
+                return None
+            return _ResourceObservation(
+                ResourceState.UNAVAILABLE,
+                _UNKNOWN_IMAGE_MEDIA_TYPE,
+                declared_sha256,
+                RasterDimensions(width, height, orientation),
+                None,
+                integrity_mismatch=True,
+            )
+        # Persisted Android dimensions describe the sending device's
+        # rendition. A desktop import may have normalized it again, so the
+        # bytes actually being granted are authoritative here.
+        width, height, actual_media_type = verified
         if width is None or height is None:
             return None
         content_sha256 = declared_sha256 or actual_sha256
         dimensions = RasterDimensions(width, height, orientation)
+        if (
+            not expected_media_type
+            or actual_media_type != expected_media_type
+        ):
+            return _ResourceObservation(
+                ResourceState.UNAVAILABLE,
+                actual_media_type,
+                content_sha256,
+                dimensions,
+                None,
+                integrity_mismatch=True,
+            )
         if declared_sha256 and actual_sha256 != declared_sha256:
             return _ResourceObservation(
                 ResourceState.UNAVAILABLE,
-                media_type,
+                actual_media_type,
                 declared_sha256,
                 dimensions,
                 None,
@@ -1507,14 +2099,16 @@ class FilesystemCorrectionsArtifactRepository(
         revision = f"bytes:{content_sha256}"
         resolved = _ResolvedRasterCandidate(
             path=path,
-            media_type=media_type,
+            file_identity=_stable_stat_identity(named_after),
+            section=section,
+            media_type=actual_media_type,
             content_sha256=content_sha256,
             size=size,
             revision=revision,
         )
         return _ResourceObservation(
             ResourceState.AVAILABLE,
-            media_type,
+            actual_media_type,
             content_sha256,
             dimensions,
             resolved,
@@ -1645,6 +2239,17 @@ class FilesystemCorrectionsArtifactRepository(
                 draft.observation,
             )
             captions = (draft.caption,) if draft.caption is not None else ()
+            figure_extensions = _public_extensions(
+                {
+                    "corrections_ui": {"annotation_frame": "crop"},
+                    "extension_metadata": (
+                        draft.info.get("ext")
+                        if isinstance(draft.info.get("ext"), Mapping)
+                        else {}
+                    ),
+                    "legacy": _unknown_fields(draft.info, _FIGURE_FIELDS),
+                }
+            )
             view = RasterArtifactView(
                 key=RasterArtifactKey(item_id, draft.artifact_id),
                 revision=draft.revision,
@@ -1669,14 +2274,7 @@ class FilesystemCorrectionsArtifactRepository(
                     origin="ocr",
                     provider_id="mistral",
                 ),
-                extensions={
-                    "extension_metadata": (
-                        draft.info.get("ext")
-                        if isinstance(draft.info.get("ext"), Mapping)
-                        else {}
-                    ),
-                    "legacy": _unknown_fields(draft.info, _FIGURE_FIELDS),
-                },
+                extensions=figure_extensions,
             )
             raster.append(view)
             if view.resource is not None and draft.observation.resolved is not None:
@@ -1817,12 +2415,7 @@ class FilesystemCorrectionsArtifactRepository(
         for name_value, value in images.items():
             if not isinstance(value, Mapping):
                 continue
-            name = _persisted_token(
-                name_value,
-                item_id=item_id,
-                field="figure_name",
-                code="invalid_mistral_layout",
-            )
+            name = _figure_name(name_value, item_id=item_id)
             source_name = self._layout_source_id(
                 item_id,
                 value.get("src_key") or "primary",
@@ -1832,21 +2425,12 @@ class FilesystemCorrectionsArtifactRepository(
             if page is None or context is None:
                 continue
             spatial_source, page_dimensions = context
-            artifact_id = _composite_identity(
-                "figure",
-                name,
-                item_id=item_id,
-                field="artifact_id",
-                code="invalid_mistral_layout",
-            )
-            annotation_id = _composite_identity(
+            artifact_id = _opaque_identity("figure", name)
+            annotation_id = _opaque_identity(
                 "figure-box",
                 source_name,
-                str(page),
+                page,
                 name,
-                item_id=item_id,
-                field="annotation_id",
-                code="invalid_mistral_layout",
             )
             selector = self._selector(
                 value,
@@ -1882,6 +2466,17 @@ class FilesystemCorrectionsArtifactRepository(
                 value,
                 annotation_id=annotation_id,
             )
+            public_extensions = _public_extensions(
+                {
+                    "corrections_ui": {"annotation_frame": "crop"},
+                    "extension_metadata": (
+                        value.get("ext")
+                        if isinstance(value.get("ext"), Mapping)
+                        else {}
+                    ),
+                    "legacy": _unknown_fields(value, _FIGURE_FIELDS),
+                }
+            )
             revision_payload = {
                 "artifact_id": artifact_id,
                 "source": spatial_source.as_dict(),
@@ -1892,7 +2487,7 @@ class FilesystemCorrectionsArtifactRepository(
                 "selector": selector.as_dict() if selector else None,
                 "caption": caption.as_dict() if caption else None,
                 "rework_of": value.get("rework_of"),
-                "extensions": _unknown_fields(value, _FIGURE_FIELDS),
+                "extensions": public_extensions,
             }
             drafts.append(
                 _FigureDraft(
@@ -1938,7 +2533,9 @@ class FilesystemCorrectionsArtifactRepository(
             text = info["ext"].get("caption")
         if not isinstance(text, str) or not text.strip():
             return None
-        bounded = text.strip()[:16_384]
+        bounded = _public_text(text, maximum=16_384).strip()
+        if not bounded:
+            return None
         return CaptionAssertion(
             bounded,
             CaptionOrigin.IMPORTED,
@@ -2003,13 +2600,7 @@ class FilesystemCorrectionsArtifactRepository(
                         field="region_rid",
                         code="invalid_mistral_layout",
                     )
-                    annotation_id = _composite_identity(
-                        "region",
-                        region_id,
-                        item_id=item_id,
-                        field="annotation_id",
-                        code="invalid_mistral_layout",
-                    )
+                    annotation_id = _opaque_identity("region", region_id)
                     selector = self._selector(
                         raw.get("box"),
                         coordinate_space_revision=spatial_source.canvas_revision,
@@ -2018,31 +2609,40 @@ class FilesystemCorrectionsArtifactRepository(
                     role = raw.get("role")
                     if selector is None or not isinstance(role, str) or not role:
                         continue
+                    public_role = _capture_region_role(role)
                     origin = (
                         RoleAssignmentOrigin.MACHINE
                         if record.get("origin") == "machine"
                         else RoleAssignmentOrigin.IMPORTED
                     )
-                    role_revision = _digest_revision(
-                        "role",
-                        {
-                            "annotation_id": annotation_id,
-                            "role": role,
-                            "confidence": raw.get("confidence"),
-                            "origin": origin.value,
-                        },
+                    role_revision = (
+                        _digest_revision(
+                            "role",
+                            {
+                                "annotation_id": annotation_id,
+                                "role": public_role,
+                                "confidence": raw.get("confidence"),
+                                "origin": origin.value,
+                            },
+                        )
+                        if public_role is not None
+                        else ""
                     )
                     linked = self._linked_figures(raw.get("text"), figure_ids)
                     caption = None
-                    if isinstance(raw.get("caption"), str) and raw["caption"].strip():
+                    caption_text = _public_text(
+                        raw.get("caption"),
+                        maximum=16_384,
+                    ).strip()
+                    if caption_text:
                         caption = CaptionAssertion(
-                            raw["caption"].strip()[:16_384],
+                            caption_text,
                             CaptionOrigin.IMPORTED,
                             _digest_revision(
                                 "caption",
                                 {
                                     "annotation_id": annotation_id,
-                                    "text": raw["caption"].strip()[:16_384],
+                                    "text": caption_text,
                                 },
                             ),
                             source_annotation_id=annotation_id,
@@ -2051,20 +2651,27 @@ class FilesystemCorrectionsArtifactRepository(
                                 provider_id="mistral",
                             ),
                         )
-                    extensions: dict[str, Any] = {
-                        "document": str(record.get("doc") or "")[:512],
-                        "text": (
-                            str(raw.get("text") or "")[:8192]
-                        ),
-                        "normalized_text": (
-                            str(raw.get("norm") or "")[:8192]
-                        ),
-                        "legacy": _unknown_fields(raw, _REGION_FIELDS),
-                    }
+                    extensions = _public_extensions(
+                        {
+                            "document": _public_text(
+                                record.get("doc"),
+                                maximum=512,
+                            ),
+                            "text": _public_text(
+                                raw.get("text"),
+                                maximum=8192,
+                            ),
+                            "normalized_text": _public_text(
+                                raw.get("norm"),
+                                maximum=8192,
+                            ),
+                            "legacy": _unknown_fields(raw, _REGION_FIELDS),
+                        }
+                    )
                     revision_payload = {
                         "annotation_id": annotation_id,
                         "selector": selector.as_dict(),
-                        "role": role,
+                        "role": public_role,
                         "order": raw.get("order"),
                         "caption": caption.as_dict() if caption else None,
                         "linked": linked,
@@ -2080,23 +2687,32 @@ class FilesystemCorrectionsArtifactRepository(
                         source=spatial_source,
                         selector=selector,
                         order=index if order is None else order,
-                        label=str(raw.get("text") or role)[:512],
+                        label=(
+                            _public_text(raw.get("text"), maximum=512)
+                            or _public_text(role, maximum=512)
+                        ),
                         freshness=(
                             ArtifactFreshness.STALE
                             if record.get("stale")
                             else ArtifactFreshness.CURRENT
                         ),
                         role_assignments=(
-                            SpatialRoleAssignment(
-                                role,
-                                origin,
-                                role_revision,
-                                confidence=_confidence(raw.get("confidence")),
-                                provenance=ArtifactProvenance(
-                                    origin="ocr",
-                                    provider_id="mistral",
+                            (
+                                SpatialRoleAssignment(
+                                    public_role,
+                                    origin,
+                                    role_revision,
+                                    confidence=_confidence(
+                                        raw.get("confidence")
+                                    ),
+                                    provenance=ArtifactProvenance(
+                                        origin="ocr",
+                                        provider_id="mistral",
+                                    ),
                                 ),
-                            ),
+                            )
+                            if public_role is not None
+                            else ()
                         ),
                         caption_assertions=(caption,) if caption else (),
                         linked_artifact_ids=linked,
@@ -2117,10 +2733,17 @@ class FilesystemCorrectionsArtifactRepository(
         if not isinstance(text, str):
             return ()
         found: list[str] = []
+        seen: set[str] = set()
         for reference in _FIGURE_REFERENCE_RE.findall(text):
             artifact_id = figure_ids.get(reference)
-            if artifact_id and artifact_id not in found:
+            if artifact_id and artifact_id not in seen:
                 found.append(artifact_id)
+                seen.add(artifact_id)
+                # SpatialAnnotationView intentionally bounds its public graph.
+                # Preserve the first references in source-text order so a
+                # valid legacy region cannot invalidate the whole projection.
+                if len(found) == 64:
+                    break
         return tuple(found)
 
     def _selector(

@@ -333,6 +333,7 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
     itemId: "book:one",
     representationId: "capture:one",
     canvasId: "page:one",
+    group: "source-images",
     limit: 1,
   })).artifacts[0].key.artifact_id, "image:one");
   assert.equal((await client.rasterArtifacts.get({
@@ -343,6 +344,7 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
     itemId: "book:one",
     representationId: "capture:one",
     canvasId: "page:one",
+    canvasRevision: "page-r1",
     limit: 200,
   })).annotations[0].key.annotation_id, "region:one");
   assert.equal((await client.spatialAnnotations.get({
@@ -351,10 +353,12 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
   })).annotation.revision, "annotation-r1");
   assert.deepEqual(calls.map(({ url }) => url), [
     "/api/v1/items/book%3Aone/raster-artifacts" +
-      "?representation_id=capture%3Aone&canvas_id=page%3Aone&limit=1",
+      "?representation_id=capture%3Aone&canvas_id=page%3Aone" +
+      "&group=source-images&limit=1",
     "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone",
     "/api/v1/items/book%3Aone/spatial-annotations" +
-      "?representation_id=capture%3Aone&canvas_id=page%3Aone&limit=200",
+      "?representation_id=capture%3Aone&canvas_id=page%3Aone" +
+      "&canvas_revision=page-r1&limit=200",
     "/api/v1/items/book%3Aone/spatial-annotations/region%3Aone",
   ]);
   assert.equal(client.rasterArtifacts.resourceUrl({
@@ -386,6 +390,24 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
       error.code === "invalid-response",
   );
 
+  const unicodeRevision = rasterArtifact({ revision: "artifact-😀" });
+  const unicodeClient = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifacts/1",
+      item_id: "book:one",
+      revision: "rac-r1",
+      artifacts: [unicodeRevision],
+      next_cursor: null,
+      total: 1,
+    }),
+  });
+  await assert.rejects(
+    unicodeClient.rasterArtifacts.list({ itemId: "book:one" }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
   assert.throws(() => client.rasterArtifacts.resourceUrl({
     itemId: "book:one",
     artifactId: "image:one",
@@ -394,6 +416,14 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
   assert.throws(() => client.spatialAnnotations.list({
     itemId: "book:one",
     limit: 513,
+  }), TypeError);
+  assert.throws(() => client.rasterArtifacts.list({
+    itemId: "book:one",
+    group: "not-a-group",
+  }), TypeError);
+  assert.throws(() => client.spatialAnnotations.list({
+    itemId: "book:one",
+    canvasRevision: "bad revision",
   }), TypeError);
 });
 

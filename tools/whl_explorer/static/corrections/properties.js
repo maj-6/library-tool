@@ -124,7 +124,16 @@
         }
         this.root = options.root;
         this.documentRef = options.documentRef || this.root.ownerDocument;
-        this.commands = options.commands || unavailableCommands();
+        const commands = options.commands || null;
+        this.commands = commands || unavailableCommands();
+        this.captionCapabilities = Object.freeze({
+          set: Boolean(commands &&
+            typeof commands.setManualCaption === "function"),
+          clear: Boolean(commands &&
+            typeof commands.clearManualCaption === "function"),
+          undo: Boolean(commands &&
+            typeof commands.executeInverse === "function"),
+        });
         this.drafts = draftAdapter(options.draftStore);
         this.history = options.history || null;
         this.reloadDetail = typeof options.reloadDetail === "function"
@@ -281,7 +290,7 @@
         textarea.id = textId;
         textarea.rows = 6;
         textarea.value = this.draft ? this.draft.text : "";
-        textarea.disabled = this.busy;
+        textarea.disabled = this.busy || !this.captionCapabilities.set;
         textarea.addEventListener("input", () => this.saveDraft({ text: textarea.value }));
 
         const languageId = `manual-caption-language-${this.detail.id}`;
@@ -292,21 +301,23 @@
         language.type = "text";
         language.maxLength = 64;
         language.value = this.draft ? this.draft.language : "";
-        language.disabled = this.busy;
+        language.disabled = this.busy || !this.captionCapabilities.set;
         language.addEventListener("input", () =>
           this.saveDraft({ language: language.value }));
 
         const actions = element(this.documentRef, "div", "property-actions");
         const save = element(this.documentRef, "button", "", "Save caption");
         save.type = "submit";
-        save.disabled = this.busy || !(this.draft && this.draft.text.trim());
+        save.disabled = this.busy || !this.captionCapabilities.set ||
+          !(this.draft && this.draft.text.trim());
         const clear = element(this.documentRef, "button", "", "Clear manual caption");
         clear.type = "button";
-        clear.disabled = this.busy || !manual;
+        clear.disabled = this.busy || !this.captionCapabilities.clear || !manual;
         clear.addEventListener("click", () => void this.clearManualCaption());
         const undo = element(this.documentRef, "button", "", "Undo last caption change");
         undo.type = "button";
-        undo.disabled = this.busy || this.undoStack.length === 0;
+        undo.disabled = this.busy || !this.captionCapabilities.undo ||
+          this.undoStack.length === 0;
         undo.addEventListener("click", () => void this.undoLast());
         actions.append(save, clear, undo);
 
@@ -316,10 +327,13 @@
           void this.setManualCaption();
         });
         form.append(textLabel, textarea, languageLabel, language, actions);
+        const assertionNote = manual
+          ? `Human assertion at ${manual.revision || this.detail.revision}`
+          : "No human caption assertion. Machine data remains immutable.";
         const note = element(this.documentRef, "p", "property-assertion-note",
-          manual
-            ? `Human assertion at ${manual.revision || this.detail.revision}`
-            : "No human caption assertion. Machine data remains immutable.");
+          !this.captionCapabilities.set && !this.captionCapabilities.clear
+            ? `${assertionNote} Caption editing is unavailable in this read-only session.`
+            : assertionNote);
         wrapper.append(note, form);
         return wrapper;
       }
@@ -435,7 +449,8 @@
       }
 
       async setManualCaption() {
-        if (!this.detail || !this.draft || !this.draft.text.trim() || this.busy) return null;
+        if (!this.captionCapabilities.set || !this.detail || !this.draft ||
+            !this.draft.text.trim() || this.busy) return null;
         const attempted = { ...this.draft, dirty: true };
         const mutation = this.beginMutation();
         const payload = {
@@ -468,7 +483,8 @@
       }
 
       async clearManualCaption() {
-        if (!this.detail || !assertionByOrigin(this.detail, "manual") || this.busy) return null;
+        if (!this.captionCapabilities.clear || !this.detail ||
+            !assertionByOrigin(this.detail, "manual") || this.busy) return null;
         const attempted = this.draft ? { ...this.draft, dirty: true } : null;
         const mutation = this.beginMutation();
         const payload = {
@@ -499,7 +515,8 @@
       }
 
       async undoLast() {
-        if (!this.detail || !this.undoStack.length || this.busy) return null;
+        if (!this.captionCapabilities.undo || !this.detail ||
+            !this.undoStack.length || this.busy) return null;
         const entry = this.undoStack[this.undoStack.length - 1];
         const mutation = this.beginMutation();
         try {

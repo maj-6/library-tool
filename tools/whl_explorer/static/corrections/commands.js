@@ -605,6 +605,20 @@
       );
     }
 
+    function portSupportsCommand(port, command) {
+      if (!port || !command) return false;
+      if (typeof port.invokeClassificationCommand === "function" ||
+          typeof port.invoke === "function") return true;
+      if (command.targetKind === TARGET_KINDS.IMAGE) {
+        return typeof port.assignImageCategory === "function" ||
+          typeof port.assignCategory === "function";
+      }
+      if (command.targetKind === TARGET_KINDS.ANNOTATION) {
+        return typeof port.assignRegionRole === "function";
+      }
+      return false;
+    }
+
     class ClassificationCommandExecutor {
       constructor(options = {}) {
         this.port = options.port || options.commands || null;
@@ -622,6 +636,7 @@
       }
 
       available(context, command) {
+        if (!portSupportsCommand(this.port, command)) return false;
         const resolved = resolveClassificationTarget(context, command);
         return !!resolved;
       }

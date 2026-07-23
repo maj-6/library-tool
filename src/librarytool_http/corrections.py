@@ -45,6 +45,36 @@ from librarytool.engine.spatial_annotations import (
 
 ARTIFACT_PAGE_LIMIT = 512
 _CURSOR_SCHEMA = "librarytool.corrections-cursor/1"
+_RASTER_GROUP_KINDS = {
+    "source-images": frozenset(
+        {"capture", "captured-image", "page-image", "scan", "source-image"}
+    ),
+    "extracted-figures": frozenset(
+        {"extracted-figure", "figure", "illustration"}
+    ),
+    "processed-images": frozenset(
+        {
+            "corrected-image",
+            "perspective-corrected",
+            "processed-image",
+            "processed-source",
+        }
+    ),
+    "generated-images": frozenset(
+        {"generated-image", "reworked-figure", "reworked-image"}
+    ),
+}
+
+
+def _raster_group(value: RasterArtifactView) -> str:
+    kind = value.kind.casefold()
+    for group, kinds in _RASTER_GROUP_KINDS.items():
+        if kind in kinds:
+            return group
+    # RasterArtifactView is image-only. Unknown future/plugin image kinds use
+    # the same generated-image fallback as the Corrections artifact model, so
+    # adding a kind never makes a valid artifact disappear from the tree.
+    return "generated-images"
 
 
 def _error_status(error: EngineError) -> int:
@@ -78,6 +108,17 @@ def _error_response(error: EngineError) -> tuple[Response, int]:
     response.cache_control.no_store = True
     response.headers["Pragma"] = "no-cache"
     return response, _error_status(error)
+
+
+def _close_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        # Cleanup must not obscure the repository contract violation.
+        pass
 
 
 def _query_service(
@@ -306,6 +347,7 @@ def _raster_list(
     )
     representation_id = request.args.get("representation_id", "")
     canvas_id = request.args.get("canvas_id", "")
+    group = request.args.get("group", "")
     if representation_id:
         rows = [
             value
@@ -314,6 +356,15 @@ def _raster_list(
         ]
     if canvas_id:
         rows = [value for value in rows if value.source.canvas_id == canvas_id]
+    if group:
+        kinds = _RASTER_GROUP_KINDS.get(group)
+        if kinds is None:
+            raise ValidationError(
+                "raster artifact group is invalid",
+                code="invalid_raster_artifact_group",
+                details={"field": "group"},
+            )
+        rows = [value for value in rows if _raster_group(value) == group]
     serialized = [value.as_dict() for value in rows]
     revision = _collection_revision("rac-", serialized)
     page, next_cursor = _page(serialized, revision=revision)
@@ -366,12 +417,19 @@ def _spatial_list(
 ) -> Response:
     representation_id = request.args.get("representation_id", "")
     canvas_id = request.args.get("canvas_id", "")
+    canvas_revision = request.args.get("canvas_revision", "")
     values = _spatial_service(engine_for_request).list_spatial_annotations(
         item_id,
         representation_id=representation_id,
         canvas_id=canvas_id,
     )
     rows = _validated_annotations(values, item_id=item_id)
+    if canvas_revision:
+        rows = [
+            value
+            for value in rows
+            if value.source.canvas_revision == canvas_revision
+        ]
     serialized = [value.as_dict() for value in rows]
     revision = _collection_revision("sac-", serialized)
     page, next_cursor = _page(serialized, revision=revision)
@@ -506,6 +564,7 @@ def _resource_response(
         or size < 0
         or revision != artifact.resource.revision
     ):
+        _close_stream(stream)
         raise RepositoryError(
             "the raster resource resolver returned an invalid result",
             code="invalid_raster_resource_resolution",
@@ -520,7 +579,7 @@ def _resource_response(
             max_age=0,
         )
     except BaseException:
-        stream.close()
+        _close_stream(stream)
         raise
     response.content_length = size
     response.call_on_close(stream.close)

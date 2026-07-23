@@ -113,13 +113,14 @@ def _revision(value: Any, field_name: str) -> str:
         not isinstance(value, str)
         or not value
         or len(value) > 512
-        or value != value.strip()
-        or '"' in value
-        or "\\" in value
-        or any(character.isspace() for character in value)
+        or any(
+            not 0x21 <= ord(character) <= 0x7E
+            or character in {'"', "\\"}
+            for character in value
+        )
     ):
         raise _validation(
-            f"{field_name} must be a revision token",
+            f"{field_name} must be a transport-safe ASCII revision token",
             code="invalid_artifact_revision",
             field_name=field_name,
         )

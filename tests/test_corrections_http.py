@@ -36,13 +36,14 @@ def _raster(
     *,
     content: bytes = b"png",
     canvas_id: str = "page-1",
+    kind: str = "capture",
 ) -> RasterArtifactView:
     revision = f"artifact-{artifact_id}-r1"
     digest = hashlib.sha256(content).hexdigest()
     return RasterArtifactView(
         key=RasterArtifactKey("book-1", artifact_id),
         revision=revision,
-        kind="capture",
+        kind=kind,
         media_type="image/png",
         content_sha256=digest,
         dimensions=RasterDimensions(40, 60),
@@ -63,7 +64,11 @@ def _raster(
     )
 
 
-def _annotation(annotation_id: str) -> SpatialAnnotationView:
+def _annotation(
+    annotation_id: str,
+    *,
+    canvas_revision: str = "page-1-r1",
+) -> SpatialAnnotationView:
     return SpatialAnnotationView(
         key=SpatialAnnotationKey("book-1", annotation_id),
         revision=f"annotation-{annotation_id}-r1",
@@ -71,11 +76,11 @@ def _annotation(annotation_id: str) -> SpatialAnnotationView:
             "capture",
             "capture-r1",
             "page-1",
-            "page-1-r1",
+            canvas_revision,
         ),
         selector=NormalizedPolygonSelector(
             "canvas-normalized",
-            "page-1-r1",
+            canvas_revision,
             (
                 NormalizedPoint(0.1, 0.1),
                 NormalizedPoint(0.9, 0.1),
@@ -183,6 +188,8 @@ def test_raster_list_is_versioned_filterable_and_revision_paged():
         _raster("image-b", canvas_id="page-2"),
         _raster("image-a"),
         _raster("image-c"),
+        _raster("processed-a", kind="processed-image"),
+        _raster("future-a", kind="ai-upscaled-image"),
     )
     client = _app(
         _Engine(_RasterProjector(rows), _SpatialProjector(()))
@@ -191,6 +198,7 @@ def test_raster_list_is_versioned_filterable_and_revision_paged():
     first = client.get(
         "/api/v1/items/book-1/raster-artifacts?limit=1"
         "&representation_id=capture&canvas_id=page-1"
+        "&group=source-images"
     )
     assert first.status_code == 200
     payload = first.get_json()
@@ -206,6 +214,7 @@ def test_raster_list_is_versioned_filterable_and_revision_paged():
     second = client.get(
         "/api/v1/items/book-1/raster-artifacts?limit=1"
         "&representation_id=capture&canvas_id=page-1"
+        "&group=source-images"
         f"&cursor={payload['next_cursor']}"
     )
     assert second.status_code == 200
@@ -217,10 +226,36 @@ def test_raster_list_is_versioned_filterable_and_revision_paged():
     cached = client.get(
         "/api/v1/items/book-1/raster-artifacts"
         "?limit=1&representation_id=capture&canvas_id=page-1"
+        "&group=source-images"
         f"&cursor={payload['next_cursor']}",
         headers={"If-None-Match": first.headers["ETag"]},
     )
     assert cached.status_code == 304
+    invalid = client.get(
+        "/api/v1/items/book-1/raster-artifacts?group=not-a-group"
+    )
+    assert invalid.status_code == 400
+    assert invalid.get_json()["code"] == "invalid_raster_artifact_group"
+    future = client.get(
+        "/api/v1/items/book-1/raster-artifacts"
+        "?group=generated-images&limit=10"
+    )
+    assert future.status_code == 200
+    assert [
+        value["key"]["artifact_id"]
+        for value in future.get_json()["artifacts"]
+    ] == ["future-a"]
+    mixed_case_client = _app(
+        _Engine(
+            _RasterProjector((_raster("scan-a", kind="SCAN"),)),
+            _SpatialProjector(()),
+        )
+    ).test_client()
+    mixed_case = mixed_case_client.get(
+        "/api/v1/items/book-1/raster-artifacts?group=source-images"
+    )
+    assert mixed_case.status_code == 200
+    assert mixed_case.get_json()["total"] == 1
 
 
 def test_collection_cursor_rejects_a_different_snapshot():
@@ -242,7 +277,9 @@ def test_collection_cursor_rejects_a_different_snapshot():
 def test_raster_and_spatial_details_are_conditional_and_missing_is_explicit():
     raster = _raster("image-a")
     spatial = _annotation("region-a")
-    projector = _SpatialProjector((spatial,))
+    projector = _SpatialProjector(
+        (spatial, _annotation("stale-region", canvas_revision="page-1-r0"))
+    )
     client = _app(
         _Engine(_RasterProjector((raster,)), projector)
     ).test_client()
@@ -263,8 +300,10 @@ def test_raster_and_spatial_details_are_conditional_and_missing_is_explicit():
     spatial_response = client.get(
         "/api/v1/items/book-1/spatial-annotations"
         "?representation_id=capture&canvas_id=page-1"
+        "&canvas_revision=page-1-r1"
     )
     assert spatial_response.status_code == 200
+    assert spatial_response.get_json()["total"] == 1
     assert spatial_response.get_json()["annotations"][0]["key"] == {
         "item_id": "book-1",
         "annotation_id": "region-a",
@@ -328,3 +367,32 @@ def test_raster_resource_requires_its_pin_and_never_serializes_a_path(tmp_path):
         headers={"If-None-Match": response.headers["ETag"]},
     )
     assert cached.status_code == 304
+
+
+def test_invalid_resolver_result_closes_its_owned_stream():
+    artifact = _raster("image-a")
+    stream = io.BytesIO(b"invalid metadata")
+
+    class InvalidResolver:
+        def resolve_raster_resource(self, _item_id, resource):
+            return _Resolved(
+                stream,
+                "image/jpeg",
+                artifact.content_sha256,
+                len(stream.getvalue()),
+                resource.revision,
+            )
+
+    client = _app(
+        _Engine(_RasterProjector((artifact,)), _SpatialProjector(())),
+        InvalidResolver(),
+    ).test_client()
+
+    response = client.get(
+        "/api/v1/items/book-1/raster-artifacts/image-a/resource"
+        f"?revision={artifact.resource.revision}"
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["code"] == "invalid_raster_resource_resolution"
+    assert stream.closed is True

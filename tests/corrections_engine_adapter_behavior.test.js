@@ -137,24 +137,19 @@ test("engine decorations preserve transport values and supply artifact model ide
 });
 
 
-test("raster catalog paging skips unrelated engine pages without losing cursors", async () => {
+test("raster catalog delegates group paging in one bounded engine call", async () => {
   const { calls, engineClient } = engineHarness({
     rasterArtifacts: {
       async list(args) {
         calls.rasterList.push(args);
-        if (!args.cursor) {
-          return {
-            revision: "raster-inventory-r1",
-            artifacts: [raster("processed-1", "processed-image")],
-            next_cursor: "page-2",
-            total: 2,
-          };
-        }
+        const artifacts = args.group === "generated-images"
+          ? [raster("future-1", "ai-upscaled-image")]
+          : [raster("capture-1")];
         return {
           revision: "raster-inventory-r1",
-          artifacts: [raster("capture-1")],
+          artifacts,
           next_cursor: null,
-          total: 2,
+          total: 1,
         };
       },
     },
@@ -173,10 +168,24 @@ test("raster catalog paging skips unrelated engine pages without losing cursors"
 
   assert.deepEqual(page.items.map((item) => item.key.artifact_id), ["capture-1"]);
   assert.equal(page.nextCursor, null);
-  assert.deepEqual(calls.rasterList.map((call) => call.cursor), [null, "page-2"]);
+  assert.equal(page.total, 1);
+  assert.deepEqual(calls.rasterList.map((call) => call.cursor), [null]);
+  assert.equal(calls.rasterList[0].group, "source-images");
   assert.equal(calls.rasterList[0].itemId, "book-1");
   assert.equal(calls.rasterList[0].representationId, "scan-1");
   assert.equal(calls.rasterList[0].canvasId, "page-1");
+
+  const future = await ports.artifacts.catalog.list({
+    context: { itemId: "book-1" },
+    group: "generated-images",
+    cursor: null,
+    limit: 20,
+  });
+  assert.deepEqual(
+    future.items.map((item) => item.key.artifact_id),
+    ["future-1"],
+  );
+  assert.equal(future.items[0].group, "generated-images");
 
   const empty = await ports.artifacts.catalog.list({
     context: { item_id: "book-1" },
@@ -192,7 +201,14 @@ test("raster catalog paging skips unrelated engine pages without losing cursors"
 
 test("spatial catalog and region resources retain engine paging", async () => {
   const first = annotation("region-1");
-  const second = annotation("region-2");
+  const second = annotation("region-2", {
+    source: {
+      representation_id: "scan-7",
+      representation_revision: "scan-r7",
+      canvas_id: "page-7",
+      canvas_revision: "page-r7",
+    },
+  });
   const { calls, engineClient } = engineHarness({
     spatialAnnotations: {
       async list(args) {
@@ -247,14 +263,47 @@ test("spatial catalog and region resources retain engine paging", async () => {
 
 test("raster details advertise paged regions and pin resource URLs to revisions", async () => {
   const figure = raster("figure:1", "extracted-figure");
+  const pageImage = raster("page-image:1", "page-image");
+  const display = raster(
+    "capture:asset-1:display",
+    "processed-image",
+    {
+      source: {
+        representation_id: "capture",
+        representation_revision: "capture-r1",
+        canvas_id: "capture:asset-1",
+        canvas_revision: "display-r1",
+      },
+    },
+  );
   const region = annotation("figure-region", {
-    linked_artifact_ids: ["figure:1"],
+    linked_artifact_ids: ["capture:asset-1:display"],
+    source: {
+      representation_id: "capture",
+      representation_revision: "capture-r1",
+      canvas_id: "capture:asset-1",
+      canvas_revision: "display-r1",
+    },
+  });
+  const staleRegion = annotation("stale-region", {
+    source: {
+      representation_id: "capture",
+      representation_revision: "capture-r1",
+      canvas_id: "capture:asset-1",
+      canvas_revision: "display-r0",
+    },
   });
   const { calls, engineClient } = engineHarness({
     rasterArtifacts: {
       async get(args) {
         calls.rasterGet.push(args);
-        return { artifact: figure };
+        return {
+          artifact: args.artifactId === "figure:1"
+            ? figure
+            : args.artifactId === "page-image:1"
+              ? pageImage
+              : display,
+        };
       },
     },
     spatialAnnotations: {
@@ -262,9 +311,9 @@ test("raster details advertise paged regions and pin resource URLs to revisions"
         calls.spatialList.push(args);
         return {
           revision: "spatial-inventory-r1",
-          annotations: [region],
+          annotations: [region, staleRegion],
           next_cursor: null,
-          total: 1,
+          total: 2,
         };
       },
     },
@@ -272,23 +321,43 @@ test("raster details advertise paged regions and pin resource URLs to revisions"
   const ports = createCorrectionsEnginePorts(engineClient);
   const detail = await ports.artifacts.catalog.get({
     context: { item_id: "book-1", canvas_id: "ignored-context-canvas" },
-    key: "artifact:figure:1",
+    key: "artifact:capture:asset-1:display",
   });
 
-  assert.equal(detail.group, "extracted-figures");
+  assert.equal(detail.group, "processed-images");
   assert.equal(detail.extensions.corrections_ui.paged_regions, true);
   assert.equal(calls.spatialList.length, 0,
     "the editor loads annotations through its bounded paging port");
 
   const regions = await ports.artifacts.resources.listRegions({
     context: { itemId: "book-1", representationId: "scan-1" },
-    canvasId: "page-1",
+    representationId: "capture",
+    canvasId: "capture:asset-1",
+    canvasRevision: "display-r1",
     cursor: null,
     limit: 200,
   });
   assert.equal(regions.items[0].annotation_id, "figure-region");
-  assert.equal(calls.spatialList[0].representationId, "scan-1");
-  assert.equal(calls.spatialList[0].canvasId, "page-1");
+  assert.equal(regions.items.length, 1,
+    "annotations from another canvas revision stay out of the editor");
+  assert.equal(calls.spatialList[0].representationId, "capture");
+  assert.equal(calls.spatialList[0].canvasId, "capture:asset-1");
+  assert.equal(calls.spatialList[0].canvasRevision, "display-r1");
+
+  const crop = await ports.artifacts.catalog.get({
+    context: { itemId: "book-1" },
+    key: "artifact:figure:1",
+  });
+  assert.equal(crop.group, "extracted-figures");
+  assert.equal(crop.extensions.corrections_ui.paged_regions, false,
+    "page-space boxes must not be drawn directly over extracted crop bytes");
+
+  const fullCanvas = await ports.artifacts.catalog.get({
+    context: { itemId: "book-1" },
+    key: "artifact:page-image:1",
+  });
+  assert.equal(fullCanvas.extensions.corrections_ui.paged_regions, true,
+    "known full-canvas rasters retain revision-filtered overlays");
 
   const resolved = ports.artifacts.resources.resolveRaster({
     itemId: "book-1",
