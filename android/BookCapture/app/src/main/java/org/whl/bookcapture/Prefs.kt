@@ -213,6 +213,21 @@ object Prefs {
     fun setCompactScanList(ctx: Context, compact: Boolean) =
         sp(ctx).edit().putBoolean("compact_scan_list", compact).apply()
 
+    /** Windows-like collection-content presentation used by Inspect. This is
+     * device chrome only; it never changes collection or book metadata. */
+    fun inspectViewMode(ctx: Context): String =
+        str(ctx, "inspect_view_mode").ifEmpty { "tiles" }
+
+    fun setInspectViewMode(ctx: Context, mode: String) =
+        put(ctx, "inspect_view_mode" to mode.trim().lowercase())
+
+    /** A tag conflict needs a human decision because the losing value may
+     * already be printed on a physical box. Keep it visible until sync succeeds. */
+    fun collectionTagConflict(ctx: Context): String = str(ctx, "collection_tag_conflict")
+
+    fun setCollectionTagConflict(ctx: Context, tagId: String?) =
+        put(ctx, "collection_tag_conflict" to tagId?.let(::normalizeCollectionTagId))
+
     /** OCR geometry is a display preference. It never changes the persisted
      * provider evidence, so hiding boxes cannot erase a later-useful sidecar. */
     fun showOcrRegions(ctx: Context): Boolean =

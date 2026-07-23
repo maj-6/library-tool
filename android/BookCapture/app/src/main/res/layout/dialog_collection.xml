@@ -17,6 +17,7 @@
             style="@style/WhlLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:labelFor="@id/collectionName"
             android:text="@string/collections_field_name" />
 
         <EditText
@@ -33,6 +34,37 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
+            android:labelFor="@id/collectionTagId"
+            android:text="@string/collections_field_tag_id" />
+
+        <EditText
+            android:id="@+id/collectionTagId"
+            style="@style/WhlInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:digits="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+            android:fontFamily="monospace"
+            android:hint="@string/collections_hint_tag_id"
+            android:inputType="textCapCharacters"
+            android:maxLength="32"
+            android:maxLines="1"
+            android:importantForAutofill="no" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:fontFamily="monospace"
+            android:text="@string/collections_tag_id_help"
+            android:textColor="@color/whl_ink_dim"
+            android:textSize="11sp" />
+
+        <TextView
+            style="@style/WhlLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:labelFor="@id/collectionParent"
             android:text="@string/collections_field_parent" />
 
         <androidx.appcompat.widget.AppCompatSpinner
@@ -48,6 +80,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
+            android:labelFor="@id/collectionFrom"
             android:text="@string/collections_field_from" />
 
         <EditText

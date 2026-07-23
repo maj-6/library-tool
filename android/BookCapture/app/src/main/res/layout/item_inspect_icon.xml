@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_margin="3dp"
+    android:background="@drawable/whl_panel"
+    android:gravity="center_horizontal"
+    android:minHeight="122dp"
+    android:orientation="vertical"
+    android:padding="7dp">
+
+    <ImageView
+        android:id="@+id/inspectThumb"
+        android:layout_width="54dp"
+        android:layout_height="74dp"
+        android:background="@color/whl_face_sh"
+        android:contentDescription="@string/detail_photos"
+        android:foreground="@drawable/whl_thumbnail_frame"
+        android:scaleType="centerCrop"
+        android:src="@drawable/ic_app_mark" />
+
+    <TextView
+        android:id="@+id/inspectTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:ellipsize="end"
+        android:gravity="center"
+        android:maxLines="2"
+        android:textColor="@color/whl_ink"
+        android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/inspectSubtitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:fontFamily="monospace"
+        android:gravity="center"
+        android:maxLines="1"
+        android:textColor="@color/whl_ink_dim"
+        android:textSize="11sp" />
+</LinearLayout>

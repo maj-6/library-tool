@@ -57,5 +57,11 @@
             android:name=".EntryDetailActivity"
             android:exported="false"
             android:label="@string/app_name" />
+
+        <activity
+            android:name=".QrScannerActivity"
+            android:exported="false"
+            android:label="@string/inspect_scan_box"
+            android:screenOrientation="portrait" />
     </application>
 </manifest>

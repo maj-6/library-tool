@@ -3,6 +3,28 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.1-alpha.10 — 2026-07-22
+
+Android version code: `29`.
+
+### Additions
+
+- Added short, editable collection tag IDs for printed box labels. Tags are canonical, globally unique, and remain stable when a collection is renamed.
+- Added an Inspect tab with an on-device QR scanner and Windows-like Tiles, Content, and Icons views for browsing the books recorded in a box.
+- Added a durable, photo-free collection inventory so delivered scans remain visible in Inspect after old local media is cleared.
+
+### Other Changes
+
+- Collection sync now carries tag IDs in both directions, upgrades older local collection stores deterministically, and preserves retired tags so printed labels are never silently reused.
+- Scanning a merged collection's former tag follows the authoritative merge to the surviving collection without changing the collection selected for the next capture.
+- The Inspect layout choice is stored on the device, and cleared scans keep only a lightweight, photo-free bibliographic summary for box browsing.
+
+### Bugfixes
+
+- Prevented a collection editor opened before sync from overwriting a newer cloud tag when the tag itself was left unchanged.
+- Rejected duplicate or malformed tags and broken merge-alias chains instead of opening an ambiguous collection.
+- Preserved corrupt or unknown inventory files for recovery instead of replacing them during pruning.
+
 ## 0.5.1-alpha.9 — 2026-07-22
 
 ### Additions

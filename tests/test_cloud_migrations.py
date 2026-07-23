@@ -44,6 +44,14 @@ PHOTO_PROCESSING = SQL["015_photo_processing_jobs"]
 PHOTO_PROCESSING_FLAT = " ".join(PHOTO_PROCESSING.split())
 CAPTURE_PHONE_SYNC = SQL["017_capture_phone_sync"]
 CAPTURE_PHONE_SYNC_FLAT = " ".join(CAPTURE_PHONE_SYNC.split())
+COLLECTION_TAG_IDS = SQL["018_collection_tag_ids"]
+COLLECTION_TAG_IDS_FLAT = " ".join(COLLECTION_TAG_IDS.split())
+COLLECTION_TAG_RESERVATION_HARDENING = SQL[
+    "019_collection_tag_reservation_hardening"
+]
+COLLECTION_TAG_RESERVATION_HARDENING_FLAT = " ".join(
+    COLLECTION_TAG_RESERVATION_HARDENING.split()
+)
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -604,6 +612,160 @@ def test_collection_merge_rpc_requires_an_identity_before_bypassing_rls():
     assert old_guard not in hardened_flat
     assert hardened_flat == original_flat.replace(old_guard, new_guard, 1)
     assert hardened_flat.index(new_guard) < hardened_flat.index("for v_lock_id in")
+
+
+# --- 018: permanently reserved collection QR tag IDs -----------------------------
+
+def test_collection_tag_ids_are_required_canonical_and_permanently_reserved():
+    schema = cloud_setup.expected_schema("\n".join(SQL.values()))
+    assert "tag_id" in schema["collections"]
+    assert ('add column if not exists tag_id text collate "C";'
+            in COLLECTION_TAG_IDS_FLAT)
+    assert ('alter column tag_id type text collate "C" using tag_id;'
+            in COLLECTION_TAG_IDS_FLAT)
+    assert "alter column tag_id set not null;" in COLLECTION_TAG_IDS_FLAT
+    assert ('(tag_id collate "C") ~ '
+            '(\'^[A-Z0-9]+(_[A-Z0-9]+)*$\' collate "C")'
+            in COLLECTION_TAG_IDS_FLAT)
+    assert "pg_catalog.char_length(tag_id) <= 32" in COLLECTION_TAG_IDS_FLAT
+    assert "add constraint collections_tag_id_key unique (tag_id);" in \
+        COLLECTION_TAG_IDS_FLAT
+    assert ("add constraint collection_tag_reservations_pkey primary key "
+            "(tag_id)" in COLLECTION_TAG_IDS_FLAT)
+    assert ("foreign key (collection_id) references public.collections(id) "
+            "on update restrict on delete restrict deferrable initially deferred"
+            in COLLECTION_TAG_IDS_FLAT)
+
+    # The ledger has no live/deleted predicate and survives edits, tombstones,
+    # merges, and service attempts to hard-delete the owning collection.
+    body = re.sub(r"--[^\n]*", "", COLLECTION_TAG_IDS)
+    assert "where deleted" not in body.lower()
+    assert "create table if not exists private.collection_tag_reservations" in \
+        COLLECTION_TAG_IDS_FLAT
+    assert "delete from private.collection_tag_reservations" not in body.lower()
+
+
+def test_collection_tag_backfill_is_deterministic_and_collision_safe():
+    body = re.sub(r"--[^\n]*", "", COLLECTION_TAG_IDS)
+    flat = " ".join(body.split())
+
+    # UUID order determines which duplicate name keeps NAME_1. Updating the
+    # nullable column invokes the same allocator used for future legacy inserts.
+    assert "where c.tag_id is null order by c.id for update" in flat
+    assert ("set tag_id = null where id = v_collection_id and tag_id is null;"
+            in flat)
+    assert "v_sequence := v_sequence + 1;" in flat
+    assert ("insert into private.collection_tag_reservations (tag_id, "
+            "collection_id) values (v_candidate, new.id) on conflict (tag_id) "
+            "do nothing;" in flat)
+
+    # One helper owns the same extension-free folding contract as Android.
+    assert 'normalize(coalesce(p_name, \'\'), NFKD) collate "C"' in flat
+    assert r"U&'[\0300-\036F\1AB0-\1AFF\1DC0-\1DFF\20D0-\20FF\FE20-\FE2F]+'" in flat
+    assert ("pg_catalog.translate(" in flat and
+            "'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'" in flat)
+    assert "'[^A-Z0-9]+' collate \"C\"" in flat
+    assert "'COLLECTION'" in flat
+    assert "v_stem := public.canonical_collection_tag_stem(new.name);" in flat
+    assert "32 - pg_catalog.char_length(v_suffix)" in flat
+
+
+def test_legacy_inserts_atomically_allocate_and_reserve_a_tag():
+    body = re.sub(r"--[^\n]*", "", COLLECTION_TAG_IDS)
+    fn = body.split(
+        "create or replace function private.reserve_collection_tag_id()", 1,
+    )[1].split("drop trigger if exists collections_tag_id_lock", 1)[0]
+    flat = " ".join(fn.split())
+
+    assert "returns trigger language plpgsql security definer" in flat
+    assert "set search_path = ''" in flat
+    assert "if new.tag_id is null then" in flat
+    assert "if tg_op = 'INSERT' then" in flat
+    assert "from public.collections as c where c.id = new.id;" in flat
+    assert "if found and v_candidate is not null then" in flat
+    assert "elsif new.tag_id is null and old.tag_id is not null then" in flat
+    assert "new.tag_id := old.tag_id; return new;" in flat
+    assert "v_stem := public.canonical_collection_tag_stem(new.name);" in flat
+    assert "on conflict (tag_id) do nothing;" in flat
+    assert "if found then new.tag_id := v_candidate; return new;" in flat
+    assert ("create trigger collections_reserve_tag_id before insert or update "
+            "of tag_id on public.collections for each row execute function "
+            "private.reserve_collection_tag_id();" in " ".join(body.split()))
+    assert "pg_advisory_xact_lock" not in flat
+
+
+def test_old_tags_can_return_to_their_owner_but_never_move_to_another_uuid():
+    body = re.sub(r"--[^\n]*", "", COLLECTION_TAG_IDS)
+    fn = body.split(
+        "create or replace function private.reserve_collection_tag_id()", 1,
+    )[1].split("drop trigger if exists collections_tag_id_lock", 1)[0]
+    flat = " ".join(fn.split())
+
+    assert ("values (new.tag_id, new.id) on conflict (tag_id) do nothing;"
+            in flat)
+    assert ("from private.collection_tag_reservations as r where r.tag_id = "
+            "new.tag_id;" in flat)
+    assert "if v_owner is distinct from new.id then" in flat
+    assert "constraint = 'collection_tag_reservations_pkey'" in flat
+    assert "return new;" in flat
+    assert "delete from private.collection_tag_reservations" not in flat
+
+
+def test_collection_tag_migration_repairs_drafts_and_rebuilds_exact_acl():
+    body = re.sub(r"--[^\n]*", "", COLLECTION_TAG_IDS)
+    flat = " ".join(body.split())
+
+    assert "add column if not exists tag_id text" in flat
+    assert "alter column tag_id drop default" in flat
+    assert "create table if not exists private.collection_tag_reservations" in flat
+    assert "create or replace function public.canonical_collection_tag_stem" in flat
+    assert "create or replace function private.reserve_collection_tag_id()" in flat
+    assert "drop trigger if exists collections_tag_id_lock" in flat
+    assert "drop trigger if exists collections_default_tag_id" in flat
+    assert "drop trigger if exists collections_reserve_tag_id" in flat
+    assert "drop constraint if exists collections_tag_id_check" in flat
+    assert "drop constraint if exists collections_tag_id_key" in flat
+    assert "drop constraint if exists collection_tag_reservations_pkey" in flat
+
+    assert ("revoke all on public.collections from public, anon, authenticated;"
+            in flat)
+    assert ("grant insert ( id, name, from_place, created_by, updated_at, "
+            "deleted, parent_id, tag_id ) on public.collections to "
+            "authenticated;" in flat)
+    assert ("grant update ( name, from_place, updated_at, deleted, parent_id, "
+            "tag_id ) on public.collections to authenticated;" in flat)
+    assert ("grant select, insert, update, delete on public.collections to "
+            "service_role;" in flat)
+    assert ("revoke all on schema private from public, anon, authenticated, "
+            "service_role;" in flat)
+    assert ("revoke all on private.collection_tag_reservations from public, "
+            "anon, authenticated, service_role;" in flat)
+    assert not re.search(
+        r"grant\s+[^;]+\s+on\s+public\.collections\s+to\s+[^;]*\banon\b",
+        flat,
+    )
+    assert ("revoke all on function private.reserve_collection_tag_id() from "
+            "public, anon, authenticated, service_role;" in flat)
+    assert ("revoke all on function public.canonical_collection_tag_stem(text) "
+            "from public, anon, authenticated, service_role;" in flat)
+    assert "grant insert, update on public.collections to authenticated" not in flat
+    assert "grant delete on public.collections to authenticated" not in flat
+
+
+def test_collection_tag_reservation_followup_closes_advisor_items():
+    flat = COLLECTION_TAG_RESERVATION_HARDENING_FLAT
+    assert ("create index if not exists "
+            "collection_tag_reservations_collection_id_idx on "
+            "private.collection_tag_reservations (collection_id);" in flat)
+    assert ("create policy collection_tag_reservations_deny_api on "
+            "private.collection_tag_reservations for all to anon, authenticated "
+            "using (false) with check (false);" in flat)
+    assert ("revoke all on schema private from public, anon, authenticated, "
+            "service_role;" in flat)
+    assert ("revoke all on private.collection_tag_reservations from public, "
+            "anon, authenticated, service_role;" in flat)
+    assert ("values ('019_collection_tag_reservation_hardening') on conflict "
+            "do nothing;" in flat)
 
 
 # --- 004: passages + index versions (issue #140) ----------------------------------
