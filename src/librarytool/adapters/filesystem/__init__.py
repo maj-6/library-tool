@@ -15,6 +15,7 @@ from .canvas_preparation_repository import (
 )
 from .canvas_query_repository import FilesystemCanvasQueryRepository
 from .correction_repository import FilesystemCorrectionRepository
+from .correction_transform_store import FilesystemCorrectionTransformStore
 from .corrections_artifact_repository import (
     FilesystemCorrectionsArtifactRepository,
     FilesystemRasterResourceResolverPort,
@@ -68,6 +69,7 @@ __all__ = [
     "FilesystemCanvasPreparationRepository",
     "FilesystemCanvasQueryRepository",
     "FilesystemCorrectionRepository",
+    "FilesystemCorrectionTransformStore",
     "FilesystemCorrectionsArtifactRepository",
     "FilesystemRasterResourceResolverPort",
     "FilesystemItemCommandRepository",
