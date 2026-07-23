@@ -109,6 +109,70 @@ class CaptureReliabilityTest {
         ))
     }
 
+    @Test
+    fun captureCommitRunsOffTheCameraMainThreadCallback() {
+        val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        val sessionSource = File("src/main/java/org/whl/bookcapture/CaptureSession.kt").readText()
+        val savedCallback = source.substringAfter("private fun handleCaptureSaved(")
+            .substringBefore("private fun finishCaptureCommit(")
+        val completion = source.substringAfter("private fun finishCaptureCommit(")
+            .substringBefore("private fun handleCaptureError(")
+
+        assertTrue(savedCallback.contains("CAPTURE_COMMIT_EXECUTOR.execute"))
+        assertTrue(savedCallback.contains("session.commitPhoto(reservation)"))
+        assertTrue(savedCallback.contains("ContextCompat.getMainExecutor(this).execute"))
+        assertFalse(completion.contains("session.commitPhoto(reservation)"))
+        assertTrue(sessionSource.contains("photoCount = reservation.pageNumber"))
+        assertFalse(sessionSource.contains("photoCount += 1"))
+    }
+
+    @Test
+    fun captureScreenBoundsThumbnailWorkAndIgnoresTerminalWorkerHistory() {
+        val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        val addThumbnail = source.substringAfter("private fun addThumbnail(")
+            .substringBefore("private fun clearThumbnailStrip()")
+
+        assertTrue(source.contains("private val thumbnailDecodeGate = Semaphore(permits = 2)"))
+        assertTrue(source.contains("thumbnailDecodeGate.withPermit"))
+        assertTrue(source.contains("maxWidth = h * 2"))
+        assertTrue(source.contains("maxHeight = h"))
+        assertTrue(source.contains("thumbnailBitmaps.values.forEach"))
+        assertTrue(source.contains("bitmap.recycle()"))
+        assertTrue(source.contains("getWorkInfosLiveData(activeUniqueWorkQuery("))
+        assertFalse(source.contains("getWorkInfosForUniqueWorkLiveData"))
+        assertTrue(addThumbnail.contains("finally {"))
+        assertTrue(addThumbnail.contains(
+            "unclaimedBitmap?.takeIf { !it.isRecycled }?.recycle()",
+        ))
+        assertTrue(
+            addThumbnail.indexOf("thumbnailBitmaps[iv] = bitmap") <
+                addThumbnail.indexOf("unclaimedBitmap = null"),
+        )
+    }
+
+    @Test
+    fun previousBookPreviewCoalescesRefreshesAndReusesUnchangedBitmap() {
+        val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        val updateUi = source.substringAfter("private fun updateUi()")
+            .substringBefore("/** An open capture is intentionally excluded.")
+        val refresh = source.substringAfter("private fun refreshLastCapturedBook()")
+            .substringBefore("private fun requestMicrophonePermission()")
+
+        assertFalse(updateUi.contains("refreshLastCapturedBook()"))
+        assertTrue(source.contains("lastBookPreviewRefreshPending"))
+        assertTrue(source.contains("fingerprint != previousFingerprint"))
+        assertTrue(source.contains("if (lastBookPreviewJob?.isActive == true) return"))
+        assertTrue(source.contains("lastBookPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()"))
+        assertTrue(refresh.contains("finally {"))
+        assertTrue(refresh.contains(
+            "unclaimedBitmap?.takeIf { !it.isRecycled }?.recycle()",
+        ))
+        assertTrue(
+            refresh.indexOf("renderLastCapturedBook(load)") <
+                refresh.indexOf("unclaimedBitmap = null"),
+        )
+    }
+
     private fun withTempDir(block: (File) -> Unit) {
         val root = Files.createTempDirectory("whl-capture-reliability-").toFile()
         try {

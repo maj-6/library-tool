@@ -6,6 +6,15 @@
     <string name="navigate_up">Navigate up</string>
 
     <string name="home_new_scan">New scan</string>
+    <string name="home_sync_captures">Sync captures</string>
+    <string name="home_sync_queued">Sync queued</string>
+    <string name="home_sync_running">Syncing %1$d/%2$d</string>
+    <string name="home_sync_complete">Synced %1$d capture(s)</string>
+    <string name="home_sync_partial">Synced %1$d; %2$d need attention</string>
+    <string name="home_sync_failed">Sync failed; captures remain on this device</string>
+    <string name="home_sync_none">No captures ready to sync</string>
+    <string name="home_sync_review_queued">Review changes queued for sync</string>
+    <string name="home_sync_sign_in">Sign in before syncing captures</string>
 
     <!-- The app mark at the head of the toolbar is the menu; there is no gear. -->
     <string name="app_menu">Library Tool Capture menu</string>
@@ -26,24 +35,62 @@
     <string name="update_failed">Could not refresh icons and interface text. Check your connection and try again.</string>
     <string name="update_not_configured">This build has no cloud project configured, so remote interface sync is unavailable.</string>
     <string name="home_empty">No scans</string>
-    <string name="home_select_scan">Select book scan</string>
     <string name="home_open_details">Open book details</string>
-    <plurals name="home_selected_count">
-        <item quantity="one">%1$d selected</item>
-        <item quantity="other">%1$d selected</item>
+    <string name="home_mark_needs_attention">Mark needs attention</string>
+    <string name="home_copyright_status">Copyright status</string>
+    <string name="home_whl_available">Available in WHL</string>
+    <string name="home_ia_available">Available in Internet Archive</string>
+    <string name="home_scan_status">Scan status</string>
+    <string name="home_scan_status_value">Scan status: %1$s</string>
+    <string name="home_availability_detail">%1$s: %2$s</string>
+    <string name="home_remarks">Remarks</string>
+    <plurals name="home_remarks_count">
+        <item quantity="one">%1$d remark</item>
+        <item quantity="other">%1$d remarks</item>
     </plurals>
-    <string name="home_delete_selected">Delete</string>
-    <string name="home_cancel_select">Cancel</string>
+    <string name="home_needs_attention">Needs attention</string>
+    <string name="home_needs_review">Needs review</string>
+    <string name="attention_title">Needs attention</string>
+    <string name="attention_reason">Reason</string>
+    <string name="attention_reason_hint">Optional reason</string>
+    <string name="attention_mark_review">Needs review</string>
+    <string name="attention_save">Save</string>
+    <string name="attention_clear">Clear</string>
+    <string name="attention_save_failed">Could not save review status</string>
+    <string name="attention_marked">Marked as needing attention</string>
+    <string name="copyright_records_title">Copyright records</string>
+    <string name="copyright_status_value">Status: %1$s</string>
+    <string name="copyright_registration_heading">Registration records</string>
+    <string name="copyright_renewal_heading">Renewal records</string>
+    <string name="copyright_no_records">No registration or renewal records are attached.</string>
+    <plurals name="copyright_records_omitted">
+        <item quantity="one">%1$d additional record omitted</item>
+        <item quantity="other">%1$d additional records omitted</item>
+    </plurals>
+    <plurals name="copyright_fields_omitted">
+        <item quantity="one">%1$d additional field omitted</item>
+        <item quantity="other">%1$d additional fields omitted</item>
+    </plurals>
+    <string name="detail_copyright">Copyright</string>
+    <string name="detail_whl_availability">WHL availability</string>
+    <string name="detail_ia_availability">Internet Archive availability</string>
+    <string name="detail_scan_status">Scan status</string>
+    <string name="detail_remarks">Remarks</string>
+    <string name="detail_available">Available</string>
+    <string name="detail_unavailable">Unavailable</string>
+    <string name="detail_unknown">Unknown</string>
+    <string name="detail_marked">Marked</string>
+    <plurals name="detail_registration_count">
+        <item quantity="one">%1$d registration record</item>
+        <item quantity="other">%1$d registration records</item>
+    </plurals>
+    <plurals name="detail_renewal_count">
+        <item quantity="one">%1$d renewal record</item>
+        <item quantity="other">%1$d renewal records</item>
+    </plurals>
     <string name="home_status_waiting">Waiting</string>
     <string name="home_status_uploaded">Uploaded</string>
     <string name="home_status_imported">Imported</string>
-    <string name="home_delete_title">Delete selected book scans?</string>
-    <string name="home_delete_active_skipped">The active book scan was kept. Discard it from the camera screen.</string>
-    <string name="home_delete_failed">Some book scans could not be deleted and remain on this device. Free storage and try again.</string>
-    <plurals name="home_delete_message">
-        <item quantity="one">Deletes %1$d local book scan. Uploaded and imported cloud copies are not deleted.</item>
-        <item quantity="other">Deletes %1$d local book scans. Uploaded and imported cloud copies are not deleted.</item>
-    </plurals>
     <plurals name="capture_count">
         <item quantity="one">%1$d page photo</item>
         <item quantity="other">%1$d page photos</item>
@@ -123,6 +170,24 @@
     <string name="capture_last_book_year_empty">Year: —</string>
     <string name="capture_last_book_description">Open last captured book. Title: %1$s. Author: %2$s. Year: %3$s.</string>
     <string name="capture_last_book_thumbnail_description">Thumbnail for %1$s</string>
+    <string name="capture_thumbnail_delete_description">Page photo %1$d. Long press to delete.</string>
+    <string name="capture_thumbnail_remove_busy">Finish the active page photo before removing another.</string>
+    <string name="capture_thumbnail_removing">Removing page photo…</string>
+    <string name="capture_thumbnail_removed">Page photo removed.</string>
+    <string name="capture_thumbnail_remove_failed">The page photo could not be removed safely.</string>
+    <string name="capture_thumbnail_remove_error">Could not remove photo</string>
+    <string name="capture_finishing_change">Finishing capture change…</string>
+    <string name="capture_finishing_photos">Finishing accepted page photos…</string>
+    <string name="capture_edit_already_open_error">Capture already open</string>
+    <string name="capture_edit_finish_current">Finish the current capture before editing another book.</string>
+    <string name="capture_edit_busy_error">Capture is busy</string>
+    <string name="capture_edit_busy_status">Finishing the active page photo…</string>
+    <string name="capture_edit_reopening">Reopening the last scan…</string>
+    <string name="capture_edit_failed_error">Could not reopen capture</string>
+    <string name="capture_edit_failed_status">The last scan could not be reopened.</string>
+    <string name="capture_edit_reopened">Last scan reopened.</string>
+    <string name="capture_edit_none_error">No local scan to edit</string>
+    <string name="capture_edit_none_status">There is no unsent scan to edit.</string>
     <string name="capture_extra_fields_title">Extra fields</string>
     <string name="capture_extra_field_description">%1$s: %2$s</string>
     <string name="capture_extra_fields_count">(%1$d)</string>
@@ -333,9 +398,9 @@
     <string name="detail_local_sign_in_to_claim">This local book can use paired LAN. Sign in before claiming it for cloud upload.</string>
     <string name="detail_different_account">This book belongs to a different account and will remain on this phone.</string>
     <string name="detail_claim_title">Claim this local book?</string>
-    <string name="detail_claim_message">Cloud upload will permanently associate this book scan with %1$s.</string>
+    <string name="detail_claim_message">A manual cloud sync will permanently associate this book scan with %1$s.</string>
     <string name="detail_claim_confirm">Claim and upload</string>
-    <string name="detail_claim_queued">Book claimed. Cloud upload is queued.</string>
+    <string name="detail_claim_queued">Book claimed. Press Sync captures to upload.</string>
     <string name="detail_no_ocr">(no OCR text yet)</string>
     <string name="detail_diagnostics">Book data</string>
     <string name="detail_expand_diagnostics">Expand book data</string>

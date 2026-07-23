@@ -32,6 +32,31 @@ object Entries {
     private const val INSTRUCTIONS = "instructions.txt"
     private const val REPROCESS_ERROR = "reprocess.error"
 
+    internal data class SentRetentionCandidate(
+        val entryId: String,
+        val createdAt: Long,
+        val retainLocally: Boolean,
+    )
+
+    /** Pending entries are protected but do not consume the browsing-copy
+     * allowance for completed entries. Otherwise one indefinitely pending
+     * import would retain every completed capture that follows it. */
+    internal fun sentRetentionOverflow(
+        candidates: Collection<SentRetentionCandidate>,
+        keepCount: Int = KEEP_SENT,
+    ): List<String> {
+        require(keepCount >= 0)
+        return candidates.asSequence()
+            .filterNot(SentRetentionCandidate::retainLocally)
+            .sortedWith(
+                compareByDescending<SentRetentionCandidate> { it.createdAt }
+                    .thenBy { it.entryId },
+            )
+            .drop(keepCount)
+            .map(SentRetentionCandidate::entryId)
+            .toList()
+    }
+
     enum class ProcessingStatus(val wireValue: String) {
         WAITING("waiting"),
         PROCESSING("processing"),
@@ -87,9 +112,12 @@ object Entries {
         val photoCount: Int,
         val meta: JSONObject?,          // null until extraction lands
         val cloudStatus: String,        // "", "pending", "imported", "void"
+        val deliveryTransport: String = "", // "cloud" / "lan" for sent captures
         val processing: ProcessingState,
         val processingRecorded: Boolean,
         val provenance: CaptureProvenance? = null,  // null for pre-collections captures
+        val desktopBook: DesktopBookMetadata? = null,
+        val captureReview: CaptureReviewMetadata? = null,
     ) {
         val collectionName: String get() = provenance?.collectionName ?: ""
         val from: String get() = provenance?.from ?: ""
@@ -114,7 +142,10 @@ object Entries {
         /** Details and list thumbnails deliberately resolve independently. */
         fun detailHeroPhoto(): File? = PhotoAssetStore.detailHero(dir)?.displayFile
 
-        fun thumbnailPhoto(): File? = PhotoAssetStore.thumbnail(dir)?.displayFile
+        internal fun thumbnailDescriptor(): EntryPhotoDescriptor? =
+            PhotoAssetStore.thumbnail(dir)
+
+        fun thumbnailPhoto(): File? = thumbnailDescriptor()?.displayFile
 
         fun ocrText(): String = photos().mapIndexedNotNull { i, p ->
             val t = File(dir, p.name + ".txt").takeIf { it.isFile }?.readText()?.trim()
@@ -308,6 +339,29 @@ object Entries {
         return load(if (q.isDirectory) q else s)
     }
 
+    /** Persist a phone review immediately and offline. Cloud work is
+     * deliberately not enqueued here: only the explicit Sync action may push
+     * dirty review state. The entry lock prevents queue -> sent delivery (or
+     * local deletion) from moving the directory during the atomic mutation. */
+    suspend fun setCaptureReview(
+        ctx: Context,
+        entryId: String,
+        needsAttention: Boolean,
+        needsReview: Boolean,
+        reason: String,
+    ): Boolean = EntryOperationLocks.withLock(entryId) {
+        val entry = find(ctx, entryId) ?: return@withLock false
+        CaptureMetadataStore.mutateReview(entry.dir) { current ->
+            editCaptureReview(
+                current,
+                entry.id,
+                needsAttention,
+                needsReview,
+                reason,
+            )
+        }
+    }
+
     /** Remove only this device's browsing/queue copy while excluding delivery
      *  and processing for the same entry. The active in-memory capture must be
      *  discarded from Camera, never out from under its CaptureSession. */
@@ -351,11 +405,14 @@ object Entries {
             photoCount = photos.size,
             meta = meta,
             cloudStatus = manifest?.optString("cloud_status") ?: "",
+            deliveryTransport = manifest?.optString("delivery_transport") ?: "",
             processing = processing,
             processingRecorded = recorded,
             // The sidecar, not the manifest: it exists from the first photo, so
             // an entry still being captured into already reports its collection.
             provenance = readProvenance(dir),
+            desktopBook = CaptureMetadataStore.readDesktopBook(dir),
+            captureReview = CaptureMetadataStore.readReview(dir)?.current,
         )
     }
 
@@ -419,15 +476,36 @@ object Entries {
         return "(no title found)"
     }
 
-    /** Drop the oldest sent entries beyond KEEP_SENT; photos are already in
-     *  the cloud, this is only the local browsing copy. */
-    suspend fun pruneSent(ctx: Context) {
+    /** Drop the oldest eligible sent entries beyond KEEP_SENT. Entries still
+     * needed for import, photo processing, or an offline review remain local,
+     * but do not prevent completed browsing copies from being capped. */
+    suspend fun pruneSent(
+        ctx: Context,
+        retainLocally: (Entry) -> Boolean,
+    ) {
         val dirs = sentRoot(ctx).listFiles { f: File -> f.isDirectory } ?: return
-        dirs.sortedByDescending { load(it)?.createdAt ?: 0L }
-            .drop(KEEP_SENT)
-            .forEach { dir ->
-                EntryOperationLocks.withLock(dir.name) { dir.deleteRecursively() }
+        val entriesById = dirs.mapNotNull { dir ->
+            runCatching { load(dir) }.getOrNull()?.let { entry -> dir.name to entry }
+        }.toMap()
+        val overflowIds = sentRetentionOverflow(
+            entriesById.map { (entryId, entry) ->
+                SentRetentionCandidate(
+                    entryId = entryId,
+                    createdAt = entry.createdAt,
+                    retainLocally = runCatching { retainLocally(entry) }.getOrDefault(true),
+                )
+            },
+        )
+        overflowIds.forEach { entryId ->
+            val dir = File(sentRoot(ctx), entryId)
+            EntryOperationLocks.withLock(entryId) {
+                // Re-read under the same lock used for deletion so a late
+                // import, photo job, or review edit cannot be pruned.
+                val latest = runCatching { load(dir) }.getOrNull() ?: return@withLock
+                if (runCatching { retainLocally(latest) }.getOrDefault(true)) return@withLock
+                CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation(dir)
             }
+        }
     }
 
     fun atomicWrite(target: File, text: String) {

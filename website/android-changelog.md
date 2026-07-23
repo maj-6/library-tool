@@ -3,6 +3,28 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.1-alpha.9 — 2026-07-22
+
+### Additions
+
+- Added an explicit Sync captures action; cloud uploads now wait for the user and sync only the captures that were ready when the action was pressed.
+- Added desktop-to-phone catalog status sync over cloud and paired LAN for copyright and registration records, WHL and Internet Archive availability, scan status, remarks, and review state.
+- Added Needs attention and Needs review controls, with an optional reason, to scan rows and the latest-book capture preview.
+- Added the Edit voice command for reopening the latest scan while it is still unsent so more photos or notes can be added.
+
+### Other Changes
+
+- Tapping a scan now opens its details, while long-pressing marks it as needing attention instead of entering selection mode.
+- Scan rows use compact copyright, availability, scan, remarks, and attention indicators; tapping the copyright tag shows located registration and renewal records.
+- Long-pressing a capture thumbnail now deletes that photo immediately and safely compacts the remaining page files, with recovery if Android stops during the operation.
+
+### Bugfixes
+
+- Prevented lifecycle and background-processing work from silently starting a new capture upload batch.
+- Made explicit metadata/review sync crash-safe across delivery, additive when desktop and phone reasons change together, isolated from malformed or oversized rows, and recoverable after a paired desktop revision-ledger reset.
+- Preserved capture photos, OCR, notes, and originals when a scan is reopened for editing while invalidating only stale extraction results.
+- Prevented partial speech recognition from accidentally triggering the Edit command.
+
 ## 0.5.1-alpha.8 — 2026-07-20
 
 ### Additions

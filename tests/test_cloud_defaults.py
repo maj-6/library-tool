@@ -177,6 +177,11 @@ def test_phone_sync_does_not_run_owner_pipelines(monkeypatch):
                         ([] if cfg == public else 1 / 0))
     monkeypatch.setattr(server.sbase, "push_books",
                         lambda *a, **k: pytest.fail("owner mirror must not run"))
+    monkeypatch.setattr(
+        server.sbase,
+        "push_capture_book_metadata",
+        lambda *a, **k: pytest.fail("owner capture snapshots must not run"),
+    )
     monkeypatch.setattr(server.store_sync, "sync_stores",
                         lambda *a, **k: pytest.fail("owner stores must not run"))
     out = server._cloud_sync_run()
@@ -188,6 +193,61 @@ def test_phone_sync_does_not_run_owner_pipelines(monkeypatch):
         ("collections", public, "user-jwt"),
         ("captures", public),
     ]
+
+
+def test_signed_out_owner_sync_still_runs_books_stores_and_r2(monkeypatch):
+    owner = {"url": "https://x.supabase.co", "key": "owner-service"}
+    reached = []
+    monkeypatch.setattr(server, "_client_settings", lambda: {})
+    monkeypatch.setattr(
+        server, "_refresh_collection_aliases",
+        lambda *_args: pytest.fail("signed-out sync must not use capture scope"),
+    )
+    monkeypatch.setattr(
+        server.sbase, "list_pending_captures",
+        lambda *_args, **_kwargs: pytest.fail(
+            "signed-out sync must not list account captures"),
+    )
+    monkeypatch.setattr(server, "_books_mirror_rows", lambda: [{"id": "b1"}])
+    monkeypatch.setattr(
+        server.store_sync, "sync_stores",
+        lambda cfg, **_kwargs: reached.append(("stores", cfg)) or {
+            "builds": {"pushed": 0, "pulled": 0, "guard": ""},
+        },
+    )
+    monkeypatch.setattr(
+        server.sbase, "push_books",
+        lambda cfg, rows: reached.append(("books", cfg, rows)) or 1,
+    )
+    monkeypatch.setattr(
+        server, "_sync_capture_reviews",
+        lambda *_args: pytest.fail("reviews require signed-in capture scope"),
+    )
+    monkeypatch.setattr(
+        server, "_publish_capture_book_metadata",
+        lambda *_args: pytest.fail("metadata requires signed-in capture scope"),
+    )
+    monkeypatch.setattr(
+        server, "_lease_r2_cfg",
+        lambda: contextlib.nullcontext({"bucket": "entries"}),
+    )
+    monkeypatch.setattr(server.r2, "configured", lambda _cfg: True)
+    monkeypatch.setattr(
+        server.store_sync, "sync_entry_files",
+        lambda cfg, **_kwargs: reached.append(("entries", cfg)) or {
+            "pushed": 1, "pulled": 0,
+        },
+    )
+
+    result = server._cloud_sync_run_with_configs(owner, None)
+
+    assert result["ok"] is True
+    assert result["owner_sync"] is True
+    assert result["imported"] == 0
+    assert result["books_pushed"] == 1
+    assert result["capture_metadata_pushed"] == 0
+    assert result["capture_reviews"] == {"skipped": "signed out"}
+    assert [value[0] for value in reached] == ["stores", "books", "entries"]
 
 
 def test_auth_status_reports_cloud_without_any_settings(settings, client):

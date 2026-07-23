@@ -17034,69 +17034,686 @@ async function submitManual(ev) {
   btn.disabled = false;
 }
 
-async function loadManual() {
+let _manualRevealGeneration = 0;
+
+function mergeCloudManualEntry(entry) {
+  if (!entry || !entry.id) return false;
+  const present = state.manual.findIndex((candidate) =>
+    String(candidate.id || "") === String(entry.id));
+  if (present >= 0) state.manual[present] = entry;
+  else state.manual.unshift(entry);
+  _manualRevealGeneration += 1;
+  updateCheckedCount();
+  scheduleRenderChecked();
+  return true;
+}
+
+async function loadManual(reveal) {
+  // Per-id reads let a completed capture appear without fetching or replacing
+  // the rest of a large catalog. Older servers fall through to the list route.
+  if (reveal && reveal.entryId) {
+    try {
+      const response = await fetch(
+        `/api/manual/${encodeURIComponent(String(reveal.entryId))}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data && data.ok !== false && mergeCloudManualEntry(data.entry))
+          return true;
+      }
+    } catch (error) { /* retained event retries via the list route below */ }
+  }
+  const startedGeneration = _manualRevealGeneration;
+  let fresh;
   try {
     const res = await fetch("/api/manual");
-    state.manual = res.ok ? await res.json() : [];
-  } catch (e) { state.manual = []; }
+    fresh = res.ok ? await res.json() : null;
+  } catch (e) { fresh = null; }
+  if (!Array.isArray(fresh)) {
+    // A background per-book reveal must never blank the catalog during a
+    // transient disconnect. The full startup load keeps its historical
+    // fail-closed behavior.
+    if (!reveal) {
+      state.manual = [];
+      updateCheckedCount();
+      renderChecked();
+    }
+    return false;
+  }
+  if (reveal && (reveal.entryId || reveal.captureId)) {
+    const entryId = String(reveal.entryId || "");
+    const captureId = String(reveal.captureId || "");
+    const entry = fresh.find((candidate) =>
+      (entryId && String(candidate.id || "") === entryId) ||
+      (captureId && String(candidate.capture_id || "") === captureId));
+    if (!entry) return false;
+    // Reveal only the entry named by this durable import event. Pulling every
+    // new row from the snapshot would turn several events into one visual
+    // chunk; replacing unrelated rows could invalidate a live cell editor.
+    return mergeCloudManualEntry(entry);
+  } else {
+    // An initial bulk read can begin before a capture commit and resolve after
+    // its exact-entry reveal. Preserve rows added after this request began;
+    // the terminal bulk reconciliation remains authoritative once the run is
+    // quiescent.
+    if (startedGeneration !== _manualRevealGeneration) {
+      const ids = new Set(fresh.map((entry) => String(entry.id || "")));
+      const later = state.manual.filter((entry) =>
+        entry.id && !ids.has(String(entry.id)));
+      fresh = later.concat(fresh);
+    }
+    state.manual = fresh;
+  }
   updateCheckedCount();
   renderChecked();
+  return true;
 }
 
 // --- phone-capture cloud sync (Supabase) ---------------------------------------
 // The server pulls pending captures, runs the photo pipeline, and files them as
 // manual entries; this triggers a run and refreshes the table when it finishes.
 let _cloudPoll = null;
+const cloudSyncUi = {
+  polling: false,
+  runId: "",
+  seenItems: new Set(),
+  terminalKey: "",
+  lastStatus: null,
+  connectionFailures: 0,
+  commandGeneration: 0,
+  commandPending: false,
+  pendingRunId: "",
+  revision: -1,
+};
+
+function cloudSyncNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+}
+
+function cloudSyncRunKey(sync) {
+  return String((sync && (sync.run_id || sync.started_at || sync.last_run)) || "");
+}
+
+function cloudSyncStageText(sync) {
+  const given = String((sync && sync.stage_label) || "").trim();
+  if (given) return given;
+  const stage = String((sync && sync.stage) || "").trim();
+  if (!stage) return sync && sync.running ? "Running" : "Complete";
+  return stage.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) =>
+    letter.toUpperCase());
+}
+
+function cloudSyncFailureHeadline(sync) {
+  const result = sync && sync.last_result &&
+    typeof sync.last_result === "object" ? sync.last_result : {};
+  const errors = Array.isArray(result.errors) ? result.errors : [];
+  const full = String(result.error || errors[0] || sync.last_error ||
+    "See job details").trim();
+  const limit = 160;
+  return full.length > limit ? `${full.slice(0, limit - 1)}…` : full;
+}
+
+function cloudSyncProgressValues(sync) {
+  const progress = (sync && sync.progress) || {};
+  const current = (sync && sync.current) || {};
+  const total = cloudSyncNumber(progress.total || current.total);
+  return {
+    completed: Math.min(total || Number.MAX_SAFE_INTEGER,
+      cloudSyncNumber(progress.completed)),
+    total,
+    imported: cloudSyncNumber(progress.imported),
+    skipped: cloudSyncNumber(progress.skipped),
+    failed: cloudSyncNumber(progress.failed),
+  };
+}
+
+function cloudSyncMeterModel(sync) {
+  const values = cloudSyncProgressValues(sync);
+  const progress = (sync && sync.progress) || {};
+  const phase = String((sync && sync.stage) || progress.phase || "");
+  const importingCaptures = phase === "capture_import";
+  const captureCompleted = cloudSyncNumber(
+    progress.capture_completed ?? values.completed);
+  const captureTotal = cloudSyncNumber(
+    progress.capture_total ?? values.total);
+  const backendIndeterminate = typeof progress.indeterminate === "boolean"
+    ? progress.indeterminate : null;
+  const indeterminate = !!(sync && sync.running) && (
+    backendIndeterminate !== null
+      ? backendIndeterminate
+      : (!importingCaptures || !values.total)
+  );
+  let processed;
+  if (!sync || !sync.running) {
+    processed = captureTotal
+      ? `${captureCompleted} of ${captureTotal} captures`
+      : `${captureCompleted} captures`;
+  } else if (importingCaptures && values.total) {
+    processed = `${values.completed} of ${values.total} captures`;
+  } else if (phase === "collections" || phase === "capture_discovery" ||
+             phase === "starting") {
+    processed = "Discovering captures";
+  } else {
+    processed = captureTotal
+      ? `${captureCompleted} of ${captureTotal} captures processed`
+      : `${captureCompleted} capture${captureCompleted === 1 ? "" : "s"} processed`;
+  }
+  return {
+    ...values,
+    captureCompleted,
+    captureTotal,
+    phase,
+    indeterminate,
+    max: Math.max(1, values.total),
+    value: values.total ? Math.min(values.total, values.completed) : 1,
+    label: `${processed} · ${values.imported} imported · ` +
+      `${values.skipped} skipped · ${values.failed} failed`,
+  };
+}
+
+function cloudSyncItems(sync) {
+  if (sync && Array.isArray(sync.events)) {
+    return sync.events.map((event) => ({
+      sequence: event.seq,
+      capture_id: event.capture_id,
+      entry_id: event.book_id,
+      title: event.title,
+      outcome: event.status,
+      detail: event.message,
+      errors: event.details,
+      completed_at: event.at,
+    }));
+  }
+  return sync && Array.isArray(sync.recent_items) ? sync.recent_items : [];
+}
+
+function cloudSyncCurrent(sync) {
+  if (sync && sync.current && typeof sync.current === "object")
+    return sync.current;
+  const progress = (sync && sync.progress) || {};
+  if (!(progress.current_capture || progress.current_book ||
+        progress.current_index || progress.photo_count))
+    return null;
+  return {
+    index: progress.current_index,
+    total: progress.total,
+    capture_id: progress.current_capture,
+    title: progress.current_book,
+    photo_count: progress.photo_count,
+  };
+}
+
+function cloudSyncItemKey(sync, item) {
+  const run = cloudSyncRunKey(sync) || "legacy";
+  const sequence = item && item.sequence;
+  if (sequence !== undefined && sequence !== null && sequence !== "")
+    return `${run}:${sequence}`;
+  return `${run}:${String((item && item.capture_id) || "")}:` +
+    `${String((item && item.outcome) || "")}:` +
+    `${String((item && item.completed_at) || "")}`;
+}
+
+function cloudSyncOutcomeLabel(value) {
+  const outcome = String(value || "").trim().toLowerCase();
+  if (outcome === "imported") return "Imported";
+  if (outcome === "skipped") return "Already present";
+  if (outcome === "failed" || outcome === "error") return "Failed";
+  return outcome
+    ? outcome.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) =>
+      letter.toUpperCase())
+    : "Updated";
+}
+
+function cloudSyncItemDetail(item) {
+  const detail = String((item && item.detail) || "").trim();
+  const errors = Array.isArray(item && item.errors)
+    ? item.errors.map((error) => String(error || "").trim()).filter(Boolean)
+    : [];
+  return [detail, ...errors].filter(Boolean).join(" · ");
+}
+
+function cloudSyncClock(value) {
+  const date = new Date(String(value || ""));
+  if (!Number.isFinite(date.getTime())) return "";
+  return date.toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+}
+
+function cloudSyncTerminalModel(result) {
+  result = result && typeof result === "object" ? result : {};
+  const stores = result.stores && typeof result.stores === "object"
+    ? result.stores : {};
+  const storeRows = Object.entries(stores).map(([name, value]) => {
+    const store = value && typeof value === "object" ? value : {};
+    const pushed = cloudSyncNumber(store.pushed);
+    const tombstoned = cloudSyncNumber(store.tombstoned);
+    const pulled = cloudSyncNumber(store.pulled);
+    const deleted = cloudSyncNumber(store.deleted);
+    return {
+      name,
+      pushed,
+      tombstoned,
+      pulled,
+      deleted,
+      up: pushed + tombstoned,
+      down: pulled + deleted,
+      inSync: cloudSyncNumber(store.in_sync),
+      error: String(store.error || ""),
+      guard: String(store.guard || ""),
+    };
+  });
+  const storeUp = storeRows.reduce((total, store) => total + store.up, 0);
+  const storeDown = storeRows.reduce((total, store) => total + store.down, 0);
+  const storeSame = storeRows.reduce((total, store) => total + store.inSync, 0);
+  const entries = result.entries && typeof result.entries === "object"
+    ? result.entries : {};
+  const reviews = result.capture_reviews &&
+    typeof result.capture_reviews === "object" ? result.capture_reviews : {};
+  const facts = [
+    { label: "Books pushed", value: String(cloudSyncNumber(result.books_pushed)) },
+    {
+      label: "Phone metadata",
+      value: `${cloudSyncNumber(result.capture_metadata_pushed)} pushed`,
+    },
+    {
+      label: "Owner stores",
+      value: storeRows.length
+        ? `${storeUp} up · ${storeDown} down · ${storeSame} unchanged`
+        : String(result.owner_sync ? "No store changes" : "Not configured"),
+    },
+    {
+      label: "Entry files",
+      value: entries.skipped
+        ? String(entries.skipped)
+        : `${cloudSyncNumber(entries.pushed)} up · ` +
+          `${cloudSyncNumber(entries.pulled)} down · ` +
+          `${cloudSyncNumber(entries.in_sync)} unchanged`,
+    },
+    {
+      label: "Capture reviews",
+      value: reviews.skipped
+        ? String(reviews.skipped)
+        : `${cloudSyncNumber(reviews.read)} read · ` +
+          `${cloudSyncNumber(reviews.merged)} merged · ` +
+          `${cloudSyncNumber(reviews.pushed)} pushed · ` +
+          `${cloudSyncNumber(reviews.conflicts)} conflicts`,
+    },
+  ];
+  const errors = [];
+  const rememberError = (value) => {
+    const text = String(value || "").trim();
+    if (text && !errors.includes(text)) errors.push(text);
+  };
+  rememberError(result.error);
+  for (const value of Array.isArray(result.errors) ? result.errors : [])
+    rememberError(value);
+  for (const store of storeRows) {
+    if (store.error) rememberError(`${store.name}: ${store.error}`);
+    if (store.guard) rememberError(`${store.name}: ${store.guard}`);
+  }
+  rememberError(entries.error && `entry files: ${entries.error}`);
+  for (const value of Array.isArray(reviews.errors) ? reviews.errors : [])
+    rememberError(value);
+  return { facts, stores: storeRows, errors };
+}
+
+function cloudSyncDisplayName(value) {
+  const text = String(value || "").replace(/[-_]+/g, " ").trim();
+  return text ? text.replace(/\b\w/g, (letter) => letter.toUpperCase()) : "Store";
+}
+
+function renderCloudSyncTerminal(sync) {
+  const terminal = el("cloud-sync-terminal");
+  if (!terminal) return;
+  const result = sync && sync.last_result;
+  terminal.hidden = !result;
+  if (!result) return;
+  const model = cloudSyncTerminalModel(result);
+  const facts = el("cloud-sync-terminal-facts");
+  facts.replaceChildren();
+  for (const fact of model.facts) {
+    const row = document.createElement("div");
+    const term = document.createElement("dt");
+    const value = document.createElement("dd");
+    term.textContent = fact.label;
+    value.textContent = fact.value;
+    row.append(term, value);
+    facts.appendChild(row);
+  }
+
+  const stores = el("cloud-sync-store-list");
+  const storeSection = el("cloud-sync-store-section");
+  stores.replaceChildren();
+  for (const store of model.stores) {
+    const row = document.createElement("li");
+    const name = document.createElement("span");
+    const counts = document.createElement("span");
+    name.className = "cloud-sync-store-name";
+    counts.className = "cloud-sync-store-counts";
+    name.textContent = `${cloudSyncDisplayName(store.name)}: `;
+    counts.textContent = `${store.up} up (${store.pushed} pushed, ` +
+      `${store.tombstoned} tombstoned) · ${store.down} down ` +
+      `(${store.pulled} pulled, ${store.deleted} deleted) · ` +
+      `${store.inSync} unchanged`;
+    row.append(name, counts);
+    stores.appendChild(row);
+  }
+  storeSection.hidden = model.stores.length === 0;
+
+  const errors = el("cloud-sync-error-list");
+  const errorSection = el("cloud-sync-error-section");
+  errors.replaceChildren();
+  for (const error of model.errors) {
+    const row = document.createElement("li");
+    row.textContent = error;
+    errors.appendChild(row);
+  }
+  errorSection.hidden = model.errors.length === 0;
+}
+
+function renderCloudSyncRecent(sync) {
+  const host = el("cloud-sync-recent");
+  const empty = el("cloud-sync-no-items");
+  if (!host || !empty) return;
+  const items = [...cloudSyncItems(sync)].sort((a, b) =>
+    cloudSyncNumber(b.sequence) - cloudSyncNumber(a.sequence));
+  host.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement("li");
+    const outcome = String(item.outcome || "").toLowerCase();
+    row.className = "cloud-sync-item";
+    row.dataset.outcome = outcome;
+    const add = (cls, text) => {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = text;
+      row.appendChild(span);
+    };
+    add("cloud-sync-item-outcome", cloudSyncOutcomeLabel(outcome));
+    add("cloud-sync-item-title",
+      String(item.title || item.capture_id || "Untitled capture"));
+    add("cloud-sync-item-detail",
+      cloudSyncItemDetail(item) ||
+      (item.capture_id ? `Capture ${String(item.capture_id).slice(0, 8)}` : ""));
+    add("cloud-sync-item-time", cloudSyncClock(item.completed_at));
+    host.appendChild(row);
+  }
+  empty.hidden = items.length !== 0;
+}
+
+function renderCloudSyncStatus(sync) {
+  const panel = el("cloud-sync-progress");
+  if (!panel || !sync) return;
+  const recent = cloudSyncItems(sync);
+  const result = sync.last_result;
+  const hasRun = !!(sync.running || cloudSyncRunKey(sync) || result ||
+    recent.length);
+  panel.hidden = !hasRun;
+  if (!hasRun) return;
+  const failed = !sync.running && result && result.ok === false;
+  panel.dataset.state = sync.running ? "running" : failed ? "error" : "done";
+  panel.setAttribute("aria-busy", String(!!sync.running));
+
+  const stage = failed
+    ? `Failed · ${cloudSyncFailureHeadline(sync)}`
+    : sync.running ? cloudSyncStageText(sync) : "Complete";
+  const stageNode = el("cloud-sync-stage");
+  if (stageNode.textContent !== stage) stageNode.textContent = stage;
+
+  const values = cloudSyncMeterModel(sync);
+  const meter = el("cloud-sync-meter");
+  meter.max = values.max;
+  if (values.indeterminate) meter.removeAttribute("value");
+  else meter.value = values.value;
+  meter.setAttribute("aria-valuetext", values.label);
+  el("cloud-sync-counts").textContent = values.label;
+
+  const current = cloudSyncCurrent(sync);
+  const currentBox = el("cloud-sync-current");
+  currentBox.hidden = !sync.running || !current;
+  if (!currentBox.hidden) {
+    el("cloud-sync-current-title").textContent =
+      String(current.title || current.capture_id || "Untitled capture");
+    const bits = [];
+    const index = cloudSyncNumber(current.index);
+    const total = cloudSyncNumber(current.total || values.total);
+    if (index || total) bits.push(`${index || "?"} of ${total || "?"}`);
+    if (current.capture_id)
+      bits.push(`capture ${String(current.capture_id).slice(0, 8)}`);
+    const photos = cloudSyncNumber(current.photo_count);
+    if (photos) bits.push(`${photos} photo${photos === 1 ? "" : "s"}`);
+    el("cloud-sync-current-meta").textContent = bits.join(" · ");
+  }
+
+  const startedAt = String(sync.started_at || "");
+  const updatedAt = String(sync.updated_at || sync.last_run || "");
+  el("cloud-sync-run-id").textContent = String(sync.run_id || "—");
+  el("cloud-sync-run-id").title = String(sync.run_id || "");
+  el("cloud-sync-started").textContent = cloudSyncClock(startedAt) || "—";
+  el("cloud-sync-started").title = startedAt;
+  el("cloud-sync-updated").textContent = cloudSyncClock(updatedAt) || "—";
+  el("cloud-sync-updated").title = updatedAt;
+  el("cloud-sync-timing").textContent = sync.running
+    ? (startedAt ? `Started ${cloudSyncClock(startedAt)}` : "In progress")
+    : (updatedAt ? `Finished ${cloudSyncClock(updatedAt)}` : "");
+  el("cloud-sync-outcome-summary").textContent =
+    `${values.imported} imported · ${values.skipped} skipped · ` +
+    `${values.failed} failed`;
+  renderCloudSyncTerminal(sync);
+  renderCloudSyncRecent(sync);
+}
+
+function cloudSyncNextPaint() {
+  if (document.hidden) return Promise.resolve();
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+async function revealCloudSyncItems(sync) {
+  const items = [...cloudSyncItems(sync)].sort((a, b) =>
+    cloudSyncNumber(a.sequence) - cloudSyncNumber(b.sequence));
+  for (const item of items) {
+    const key = cloudSyncItemKey(sync, item);
+    if (cloudSyncUi.seenItems.has(key)) continue;
+    if (String(item.outcome || "").toLowerCase() === "imported") {
+      // `entry_id` is emitted only after the manual entry is durably saved.
+      // Await each targeted load so two events observed together still paint
+      // as two catalog additions, in event order.
+      const revealed = await loadManual({
+        entryId: String(item.entry_id || ""),
+        captureId: String(item.capture_id || ""),
+      });
+      if (!revealed) break;                    // retry in event order
+      // mergeCloudManualEntry schedules the table repaint. Let that frame
+      // commit before fetching the next observed book so a burst of retained
+      // events still arrives as individual rows rather than one DOM rebuild.
+      await cloudSyncNextPaint();
+    }
+    cloudSyncUi.seenItems.add(key);
+  }
+}
+
+async function finalizeCloudSync(sync) {
+  const r = sync.last_result || {};
+  if (r.imported) await loadManual();          // terminal safety reconciliation
+  await loadCollections();                     // names/origins may have changed
+  const stores = r.stores || {};
+  const sum = (key) => Object.values(stores)
+    .reduce((number, store) => number + (store[key] || 0), 0);
+  const up = sum("pushed") + sum("tombstoned");
+  const down = sum("pulled") + sum("deleted");
+  if (((stores.builds || {}).pulled || 0) +
+      ((stores.builds || {}).deleted || 0)) {
+    await loadBuilds();
+    renderBuildsList();
+  }
+  if (((stores.corrections || {}).pulled || 0) +
+      ((stores.corrections || {}).deleted || 0)) {
+    await loadWhlRows(true);
+    renderWhlTop();
+  }
+  if (r.ok === false) {
+    statusCrit("CLOUD SYNC FAILED :: " +
+      (r.error || (r.errors || []).join("; ") || "?"));
+  } else if (r.owner_sync) {
+    const dropped = (r.errors || []).length;
+    const entries = r.entries || {};
+    status(`CLOUD SYNC :: ${r.imported || 0} imported / ` +
+      `${r.books_pushed || 0} books pushed / stores ${up} up ${down} down` +
+      (entries.pushed || entries.pulled
+        ? ` / files ${entries.pushed || 0} up ${entries.pulled || 0} down`
+        : "") +
+      (dropped ? ` / ${dropped} errors` : ""), dropped ? "error" : undefined);
+  } else {
+    status(`PHONE SYNC :: ${r.imported || 0} imported / ` +
+      `${r.skipped || 0} already present`);
+  }
+}
+
+function scheduleCloudSyncPoll(delay) {
+  clearTimeout(_cloudPoll);
+  _cloudPoll = setTimeout(pollCloudSyncStatus, Math.max(0, delay || 0));
+}
+
+async function applyCloudSyncStatus(sync) {
+  if (cloudSyncUi.commandPending) {
+    const statusRunId = String(sync.run_id || "");
+    // During settings flush + POST, an ordinary idle poll is not evidence that
+    // the command failed. Keep the provisional panel/button state until /run
+    // gives us the exact run identity and status returns that same run.
+    if (!cloudSyncUi.pendingRunId ||
+        statusRunId !== cloudSyncUi.pendingRunId)
+      return false;
+    cloudSyncUi.commandPending = false;
+    cloudSyncUi.pendingRunId = "";
+  }
+  const runId = cloudSyncRunKey(sync);
+  const revision = Number(sync.revision);
+  if (runId && runId === cloudSyncUi.runId &&
+      Number.isFinite(revision) && revision < cloudSyncUi.revision)
+    return false;
+  if (runId && runId !== cloudSyncUi.runId) {
+    cloudSyncUi.runId = runId;
+    cloudSyncUi.seenItems.clear();
+    cloudSyncUi.revision = -1;
+  }
+  if (Number.isFinite(revision)) cloudSyncUi.revision = revision;
+  renderCloudSyncStatus(sync);
+  await revealCloudSyncItems(sync);
+  const button = el("cloud-sync-btn");
+  const busy = !!sync.running || cloudSyncUi.commandPending;
+  button.disabled = busy;
+  button.setAttribute("aria-busy", String(busy));
+  if (!sync.running) {
+    const terminalKey = String(sync.run_id || sync.last_run || "");
+    if (terminalKey && terminalKey !== cloudSyncUi.terminalKey) {
+      cloudSyncUi.terminalKey = terminalKey;
+      await finalizeCloudSync(sync);
+    }
+  }
+  cloudSyncUi.lastStatus = sync;
+  return true;
+}
+
+async function pollCloudSyncStatus() {
+  if (cloudSyncUi.polling) {
+    scheduleCloudSyncPoll(100);
+    return;
+  }
+  cloudSyncUi.polling = true;
+  const commandGeneration = cloudSyncUi.commandGeneration;
+  let running = cloudSyncUi.commandPending ||
+    !!(cloudSyncUi.lastStatus && cloudSyncUi.lastStatus.running);
+  try {
+    const response = await fetch("/api/cloudsync/status");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const sync = await response.json();
+    // A GET that began before a manual start POST may contain the old idle
+    // snapshot. Ignore it instead of regressing the new job and waiting five
+    // seconds for the next poll.
+    if (commandGeneration !== cloudSyncUi.commandGeneration) {
+      running = true;
+      return;
+    }
+    cloudSyncUi.connectionFailures = 0;
+    const accepted = await applyCloudSyncStatus(sync);
+    running = cloudSyncUi.commandPending || !!sync.running;
+    if (!accepted && cloudSyncUi.commandPending) running = true;
+  } catch (error) {
+    cloudSyncUi.connectionFailures += 1;
+    if (running && cloudSyncUi.connectionFailures === 1)
+      statusErr("CLOUD SYNC :: reconnecting to job status");
+  } finally {
+    cloudSyncUi.polling = false;
+    // One conditional timeout observes clicks, scheduled runs, and an in-flight
+    // job adopted after reload without accumulating overlapping intervals.
+    scheduleCloudSyncPoll(running ? 750 : 5000);
+  }
+}
+
+function initCloudSync() {
+  el("cloud-sync-btn").addEventListener("click", runCloudSync);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") scheduleCloudSyncPoll(0);
+  });
+  scheduleCloudSyncPoll(0);
+}
 
 async function runCloudSync() {
-  const btn = el("cloud-sync-btn");
+  const button = el("cloud-sync-btn");
+  if (cloudSyncUi.commandPending) return;
+  cloudSyncUi.commandGeneration += 1;
+  cloudSyncUi.commandPending = true;
+  cloudSyncUi.pendingRunId = "";
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  // Keep the prior completion visible until the server assigns the new run.
+  // This provisional state changes only the compact headline and meter.
+  renderCloudSyncStatus({
+    running: true,
+    run_id: cloudSyncUi.runId,
+    stage: "starting",
+    stage_label: "Starting",
+    progress: {
+      completed: 0, total: 0, imported: 0, skipped: 0, failed: 0,
+    },
+    events: cloudSyncUi.lastStatus &&
+      Array.isArray(cloudSyncUi.lastStatus.events)
+      ? cloudSyncUi.lastStatus.events : [],
+    recent_items: cloudSyncUi.lastStatus &&
+      Array.isArray(cloudSyncUi.lastStatus.recent_items)
+      ? cloudSyncUi.lastStatus.recent_items : [],
+  });
   try {
-    await flushClientState();   // the engine reads settings server-side — push first
-    const r = await (await fetch("/api/cloudsync/run", { method: "POST" })).json();
-    if (!r.ok) { statusErr("CLOUD SYNC :: " + (r.error || "failed to start")); return; }
-  } catch (e) { statusCrit("CLOUD SYNC :: server unreachable"); return; }
-  btn.disabled = true;
+    await flushClientState();
+    const response = await fetch("/api/cloudsync/run", { method: "POST" });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      cloudSyncUi.commandPending = false;
+      cloudSyncUi.pendingRunId = "";
+      button.disabled = false;
+      button.setAttribute("aria-busy", "false");
+      statusErr("CLOUD SYNC :: " + (result.error || "failed to start"));
+      scheduleCloudSyncPoll(0);
+      return;
+    }
+    cloudSyncUi.pendingRunId = String(result.run_id || "");
+    // Compatibility with servers predating run identities: their command has
+    // no safe bind point, so resume ordinary status adoption after POST.
+    if (!cloudSyncUi.pendingRunId) cloudSyncUi.commandPending = false;
+  } catch (error) {
+    cloudSyncUi.commandPending = false;
+    cloudSyncUi.pendingRunId = "";
+    button.disabled = false;
+    button.setAttribute("aria-busy", "false");
+    statusCrit("CLOUD SYNC :: server unreachable");
+    scheduleCloudSyncPoll(0);
+    return;
+  }
   status("CLOUD SYNC :: RUNNING");
-  clearInterval(_cloudPoll);
-  _cloudPoll = setInterval(async () => {
-    let st = null;
-    try { st = await (await fetch("/api/cloudsync/status")).json(); }
-    catch (e) { return; }                      // transient; keep polling
-    if (st.running) return;
-    clearInterval(_cloudPoll);
-    _cloudPoll = null;
-    btn.disabled = false;
-    const r = st.last_result || {};
-    if (r.imported) await loadManual();        // new entries -> refresh the table
-    await loadCollections();                   // current names/origins may have changed
-    // stores that pulled records changed local files -> refresh their views
-    const stores = r.stores || {};
-    const sum = (k) => Object.values(stores).reduce((n, s) => n + (s[k] || 0), 0);
-    const up = sum("pushed") + sum("tombstoned");
-    const down = sum("pulled") + sum("deleted");
-    if (((stores.builds || {}).pulled || 0) + ((stores.builds || {}).deleted || 0)) {
-      await loadBuilds();
-      renderBuildsList();
-    }
-    if (((stores.corrections || {}).pulled || 0) + ((stores.corrections || {}).deleted || 0)) {
-      await loadWhlRows(true);
-      renderWhlTop();
-    }
-    if (r.ok === false) {
-      statusCrit("CLOUD SYNC FAILED :: " +
-        (r.error || (r.errors || []).join("; ") || "?"));
-    } else if (r.owner_sync) {
-      // a sync that finished but dropped rows is an error, not a success
-      const dropped = (r.errors || []).length;
-      const en = r.entries || {};
-      status(`CLOUD SYNC :: ${r.imported || 0} imported / ${r.books_pushed || 0} books pushed` +
-        ` / stores ${up} up ${down} down` +
-        (en.pushed || en.pulled ? ` / files ${en.pushed || 0} up ${en.pulled || 0} down` : "") +
-        (dropped ? ` / ${dropped} errors` : ""), dropped ? "error" : undefined);
-    } else {
-      status(`PHONE SYNC :: ${r.imported || 0} imported / ${r.skipped || 0} already present`);
-    }
-  }, 1500);
+  // `started: false` means the server already had a run. Do not reset any
+  // event cursor here; the next status response binds us to that run_id.
+  scheduleCloudSyncPoll(0);
 }
 
 async function deleteManualById(id) {
@@ -21204,6 +21821,33 @@ function jobTypeLabel(kind) {
 function jobStatusText(r) {
   if (r.state === "queued") return "Queued";
   if (r.state === "running") {
+    if (r.kind === "cloudsync") {
+      const progress = r.progress || {};
+      const counts = r.counts || {};
+      const done = cloudSyncNumber(progress.completed || r.done);
+      const total = cloudSyncNumber(progress.total || r.total);
+      const imported = cloudSyncNumber(counts.imported || progress.imported);
+      const skipped = cloudSyncNumber(counts.skipped || progress.skipped);
+      const failed = cloudSyncNumber(counts.failed || progress.failed);
+      const current = String(progress.current_book ||
+        progress.current_capture || "").trim();
+      const captureDone = cloudSyncNumber(
+        progress.capture_completed ?? done);
+      const captureTotal = cloudSyncNumber(
+        progress.capture_total ?? total);
+      const beforeCapture = ["starting", "collections", "capture_discovery"]
+        .includes(String(progress.phase || ""));
+      const captureProgress = progress.phase === "capture_import" && total
+        ? `${done}/${total} captures`
+        : beforeCapture ? "discovering captures"
+          : captureTotal
+            ? `${captureDone}/${captureTotal} captures processed`
+            : `${captureDone} captures processed`;
+      return `${r.note || "Cloud sync"} · ` +
+        captureProgress +
+        ` · ${imported} imported · ${skipped} skipped · ${failed} failed` +
+        (current ? ` · ${current}` : "");
+    }
     if ((r.kind === "download" || r.kind === "publish") && r.total) {
       return `${r.note || "Running"} — ` +
         `${Math.round(((r.done || 0) / r.total) * 100)}%`;
@@ -25367,6 +26011,7 @@ function init() {
   boot("tabs", initTabs);
   boot("activity icons", initActivityIcons);
   boot("jobs", initJobs);
+  boot("cloud sync", initCloudSync);
   boot("tooltips", initTooltips);
   boot("pane tabs", initPaneTabs);
   boot("actor header", installActorHeader);   // before any write goes out
@@ -25453,7 +26098,6 @@ function init() {
 
   // checked-tab find bar
   el("sync-master-btn").addEventListener("click", syncMasterList);
-  el("cloud-sync-btn").addEventListener("click", runCloudSync);
   // Debounce the render: update state synchronously so the box stays live, but
   // rebuild the (potentially thousands-of-node) tables only ~150ms after typing
   // pauses, instead of tearing them down on every keystroke.

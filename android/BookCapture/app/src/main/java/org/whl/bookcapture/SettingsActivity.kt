@@ -201,7 +201,7 @@ class SettingsActivity : AppCompatActivity() {
                 pendingFields = cloudPending,
             )
             if (Auth.signedIn(this) || transport != "cloud") {
-                UploadWorker.enqueue(this)  // local LAN works without an account
+                UploadWorker.restartExplicitSyncAfterSettingsChange(this)
             }
             if (cloudPending.isNotEmpty()) {
                 ProfileSyncWorker.enqueue(this)
@@ -227,7 +227,9 @@ class SettingsActivity : AppCompatActivity() {
                     SupabaseClient(this@SettingsActivity).testConnection()
                 }
                 binding.msg.text = err ?: getString(R.string.connection_ok)
-                if (err == null) UploadWorker.enqueue(this@SettingsActivity)
+                if (err == null) UploadWorker.restartExplicitSyncAfterSettingsChange(
+                    this@SettingsActivity,
+                )
             }
         }
 

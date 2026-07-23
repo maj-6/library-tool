@@ -46,13 +46,13 @@ internal sealed interface LastCommittedPhotoUndoResult {
  *
  *   "start"  -> a new entry (UUID) begins collecting photos
  *   "photo"  -> the next shot joins the current entry
- *   "done"   -> the entry is sealed into the upload queue
+ *   "done"   -> the entry is sealed locally and becomes eligible for manual sync
  *   "cancel" -> the entry and its photos are discarded
  *
  * Photos land under filesDir/queue/<entryId>/photo_N.jpg; "done" writes a
- * manifest.json marking the folder ready, and UploadWorker drains ready
- * folders whenever the network allows — nothing is lost if WiFi is out of
- * reach in the stacks.
+ * manifest.json marking the folder ready. The folder stays local until the
+ * user explicitly starts a sync; nothing is lost if WiFi is out of reach or
+ * if the user wants to edit the capture first.
  *
  * The open entry survives the Activity: its id is persisted (Prefs), and a
  * fresh CaptureSession RESTORES it from disk. So a rotation, a dark-mode flip,
@@ -100,6 +100,7 @@ class CaptureSession(private val ctx: Context) {
         // callback. Delete only temporaries that no live callback still owns;
         // after process death the registry is empty and all leftovers are safe.
         deleteCaptureTemps(dir)
+        cleanupCommittedThumbnailDeletes(dir)
         entryId = id
         creator = creatorFor(dir)
         provenance = readProvenance(dir)
@@ -142,6 +143,7 @@ class CaptureSession(private val ctx: Context) {
     /** Reserve a unique temporary and final path before CameraX submission. */
     fun reservePhoto(pageNumber: Int): PhotoReservation? {
         val id = entryId ?: return null
+        if (!cleanupCommittedThumbnailDeletes(entryDir(id))) return null
         refreshPhotoCount()
         if (pageNumber <= photoCount) return null
         val dir = entryDir(id)
@@ -184,7 +186,11 @@ class CaptureSession(private val ctx: Context) {
             )
         }
         ActiveCaptureWrites.unregister(reservation.tempFile)
-        photoCount += 1
+        // commitPhoto can run on the capture-commit executor. A resumed
+        // Activity may reconcile the same renamed file while the photo
+        // contract is being persisted, so publish the idempotent reserved page
+        // number instead of incrementing a shared count a second time.
+        photoCount = reservation.pageNumber
         return true
     }
 
@@ -234,6 +240,9 @@ class CaptureSession(private val ctx: Context) {
             if (ActiveCaptureWrites.hasAny(dir)) {
                 return@withLock LastCommittedPhotoUndoResult.CaptureWriteInProgress
             }
+            if (!cleanupCommittedThumbnailDeletes(dir)) {
+                return@withLock LastCommittedPhotoUndoResult.StorageFailure
+            }
             val committed = dir.listFiles { file ->
                 file.isFile && file.name.matches(PHOTO_NAME)
             }?.size ?: 0
@@ -270,12 +279,13 @@ class CaptureSession(private val ctx: Context) {
         }
     }
 
-    /** Seal the current entry for upload; returns its id, or null if empty.
+    /** Seal the current entry for later manual sync; returns its id, or null if empty.
      *  A failed manifest write (disk full) also returns null but leaves the
      *  entry OPEN — check [active] to tell "dropped, empty" from "try again". */
     fun done(): String? {
         val id = entryId ?: return null
         if (ActiveCaptureWrites.hasAny(entryDir(id))) return null
+        if (!cleanupCommittedThumbnailDeletes(entryDir(id))) return null
         refreshPhotoCount()
         if (photoCount == 0 && CaptureNotes.read(entryDir(id)).notes.isNotEmpty()) {
             // A note belongs to a photographed book. Keep the entry open so a
@@ -311,7 +321,7 @@ class CaptureSession(private val ctx: Context) {
         val id = entryId ?: return null
         // Do not clear the persisted live-entry pointer until its directory is
         // verifiably outside the upload queue. Otherwise a failed delete/move
-        // becomes an orphan that recoverOrphans() can seal and upload later.
+        // becomes an orphan that a later manual sync can recover and deliver.
         if (!moveToTrash(id)) return null
         entryId = null
         creator = null
@@ -375,19 +385,45 @@ class CaptureSession(private val ctx: Context) {
         queueRoot().listFiles { f -> f.isDirectory && File(f, "manifest.json").isFile }
             ?.sortedBy { it.name } ?: emptyList()
 
+    /**
+     * Snapshot everything eligible when the user presses Sync. Besides sealed
+     * entries this includes non-live folders containing committed photos after
+     * a crash. [UploadWorker] seals only those snapshotted orphan ids before it
+     * evaluates the batch; captures made later cannot join it implicitly.
+     */
+    fun manualSyncCandidates(): List<File> = CaptureQueueLifecycle.exclusive {
+        val live = Prefs.currentEntryId(ctx)
+        queueRoot().listFiles { dir ->
+            if (!dir.isDirectory || dir.name == live) return@listFiles false
+            File(dir, "manifest.json").isFile ||
+                dir.listFiles { file -> file.isFile && file.name.matches(PHOTO_NAME) }
+                    ?.isNotEmpty() == true
+        }?.sortedBy { it.name } ?: emptyList()
+    }
+
     /** Seal folders orphaned by a crash so their pages upload instead of
      *  leaking; folders with no photos at all are deleted. The live entry is
      *  identified solely by the persisted id (which a fresh session re-adopts,
      *  see [restore]), so this NEVER touches an entry that is being captured
      *  into — no matter how long the user has paused mid-book. Runs off the UI
-     *  thread (UploadWorker). Returns how many entries were rescued. */
+     *  thread after an explicit sync request. Returns how many entries were rescued. */
     fun recoverOrphans(): Int = CaptureQueueLifecycle.exclusive {
+        recoverOrphansLocked(null)
+    }
+
+    fun recoverOrphans(eligibleIds: Set<String>): Int = CaptureQueueLifecycle.exclusive {
+        recoverOrphansLocked(eligibleIds)
+    }
+
+    private fun recoverOrphansLocked(eligibleIds: Set<String>?): Int {
         val live = Prefs.currentEntryId(ctx)
         var sealed = 0
         for (dir in queueRoot().listFiles { f -> f.isDirectory } ?: emptyArray()) {
             if (dir.name == live) continue                   // the open entry, hands off
+            if (eligibleIds != null && dir.name !in eligibleIds) continue
             if (File(dir, "manifest.json").isFile) continue
             deleteCaptureTemps(dir)
+            if (!cleanupCommittedThumbnailDeletes(dir)) continue
             val photos = dir.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }
                 ?.sortedBy { photoNumber(it.name) }
                 ?.map { it.name } ?: emptyList()
@@ -396,7 +432,7 @@ class CaptureSession(private val ctx: Context) {
                 ?: System.currentTimeMillis()
             if (writeManifest(dir, photos, newest, creatorFor(dir), readProvenance(dir))) sealed++
         }
-        sealed
+        return sealed
     }
 
     /** A sidecar freezes ownership before the first photo. Missing/corrupt

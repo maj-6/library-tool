@@ -136,9 +136,7 @@ class ResourceContractTest {
     fun chromeTextActionsUseSemanticMaterialButtons() {
         val expected = mapOf(
             "src/main/res/layout/activity_home.xml" to
-                listOf(
-                    "deleteSelected", "cancelSelection", "tabScans", "tabCollections",
-                ),
+                listOf("tabScans", "tabCollections"),
         )
         for ((path, ids) in expected) {
             val layout = xml(path)
@@ -163,10 +161,14 @@ class ResourceContractTest {
 
         val preview = elementById(capture, "lastBookPreview")
         val primary = elementById(capture, "lastBookPrimary")
+        val previewThumb = elementById(capture, "lastBookThumb")
+        assertEquals("no", preview.getAttributeNS(androidNs, "importantForAccessibility"))
+        assertEquals("no", previewThumb.getAttributeNS(androidNs, "importantForAccessibility"))
         assertEquals("true", primary.getAttributeNS(androidNs, "clickable"))
         assertNotNull(elementById(capture, "lastBookTitle"))
         assertNotNull(elementById(capture, "lastBookAuthor"))
         assertNotNull(elementById(capture, "lastBookYear"))
+        assertNotNull(elementById(capture, "lastBookAttention"))
 
         val thumbs = elementById(capture, "thumbs_scroll")
         assertEquals(
@@ -299,9 +301,26 @@ class ResourceContractTest {
         val session = File("src/main/java/org/whl/bookcapture/CaptureSession.kt").readText()
         assertTrue(main.contains("if (!captureQueue.busy) discardAllCaptureRequests()"))
         assertTrue(main.contains("finishAfterAcceptedCaptures"))
+        assertTrue(main.contains("if (captureQueue.busy || captureMutationInFlight)"))
+        val finishGate = main.substringAfter("private fun finishAfterAcceptedCapturesIfReady()")
+            .substringBefore("private fun showUndoDiscard")
+        assertTrue(finishGate.contains("captureMutationInFlight"))
+        val updateUi = main.substringAfter("private fun updateUi()")
+            .substringBefore("private fun refreshLastCapturedBook")
+        assertTrue(updateUi.contains("finishAfterAcceptedCapturesIfReady()"))
         assertTrue(session.contains("ActiveCaptureWrites.register"))
         assertTrue(session.contains("filterNot(ActiveCaptureWrites::isActive)"))
         assertTrue(session.contains("fun refreshPhotoCount()"))
+
+        val thumbnail = File(
+            "src/main/java/org/whl/bookcapture/CaptureBookPreview.kt",
+        ).readText()
+        assertTrue(thumbnail.contains(
+            "CaptureQueueLifecycle.exclusive { cleanupCommittedThumbnailDeletesLocked(dir) }",
+        ))
+        assertTrue(thumbnail.contains(
+            "CaptureThumbnailDeleteResult = CaptureQueueLifecycle.exclusive",
+        ))
 
         val manifest = xml("src/main/AndroidManifest.xml")
         val activities = manifest.getElementsByTagName("activity")

@@ -315,32 +315,40 @@ private const val PHOTO_PROCESSING_REQUESTED = "requested"
 private const val PHOTO_PROCESSING_DISABLED = "disabled"
 
 internal object PhotoAssetStore {
-    private val monitor = Any()
+    // Photo contracts are independent per entry. A small striped lock set
+    // preserves in-entry atomicity without making a Home thumbnail read wait
+    // behind hashing or upload preparation for an unrelated capture.
+    private val entryMonitors = Array(32) { Any() }
 
-    fun read(dir: File): CapturePhotoAssets = synchronized(monitor) {
+    private fun monitorFor(dir: File): Any {
+        val path = dir.absolutePath
+        return entryMonitors[(path.hashCode() and Int.MAX_VALUE) % entryMonitors.size]
+    }
+
+    fun read(dir: File): CapturePhotoAssets = synchronized(monitorFor(dir)) {
         readCurrent(dir) ?: legacyContract(dir)
     }
 
-    fun descriptors(dir: File): List<EntryPhotoDescriptor> = synchronized(monitor) {
+    fun descriptors(dir: File): List<EntryPhotoDescriptor> = synchronized(monitorFor(dir)) {
         val contract = reconcileContract(dir, readCurrent(dir) ?: legacyContract(dir))
         contract.orderedAssets().mapNotNull { asset -> descriptor(dir, asset) }
     }
 
-    fun descriptor(dir: File, photo: File): EntryPhotoDescriptor? = synchronized(monitor) {
+    fun descriptor(dir: File, photo: File): EntryPhotoDescriptor? = synchronized(monitorFor(dir)) {
         descriptors(dir).firstOrNull { descriptor ->
             sameFile(descriptor.captureFile, photo) || sameFile(descriptor.displayFile, photo) ||
                 sameFile(descriptor.rawFile, photo)
         }
     }
 
-    fun detailHero(dir: File): EntryPhotoDescriptor? = synchronized(monitor) {
+    fun detailHero(dir: File): EntryPhotoDescriptor? = synchronized(monitorFor(dir)) {
         val contract = reconcileContract(dir, readCurrent(dir) ?: legacyContract(dir))
         val descriptors = contract.orderedAssets().mapNotNull { descriptor(dir, it) }
         val selected = contract.resolvedPrimaryTitleAsset()?.assetId
         descriptors.firstOrNull { it.assetId == selected } ?: descriptors.firstOrNull()
     }
 
-    fun thumbnail(dir: File): EntryPhotoDescriptor? = synchronized(monitor) {
+    fun thumbnail(dir: File): EntryPhotoDescriptor? = synchronized(monitorFor(dir)) {
         val contract = reconcileContract(dir, readCurrent(dir) ?: legacyContract(dir))
         val descriptors = contract.orderedAssets().mapNotNull { descriptor(dir, it) }
         val selected = contract.resolvedThumbnailAsset()?.assetId
@@ -361,7 +369,7 @@ internal object PhotoAssetStore {
     fun removeFinalCommittedPhoto(
         dir: File,
         pageNumber: Int,
-    ): FinalCommittedPhotoRemoval = synchronized(monitor) {
+    ): FinalCommittedPhotoRemoval = synchronized(monitorFor(dir)) {
         if (!dir.isDirectory || File(dir, "manifest.json").exists()) {
             return@synchronized FinalCommittedPhotoRemoval.InvalidContract
         }
@@ -530,7 +538,7 @@ internal object PhotoAssetStore {
      * makes preservation cheap on Android's internal filesystem; copy is a
      * fallback. Checksums/dimensions are completed later on the IO worker. */
     fun registerCapturedPhoto(dir: File, photo: File, captureOrder: Int): CapturePhotoAssets =
-        synchronized(monitor) {
+        synchronized(monitorFor(dir)) {
             val current = readCurrent(dir) ?: legacyContract(dir)
             val id = stablePhotoAssetId(dir.name, photo.name)
             val originalName = originalFileName(id)
@@ -580,7 +588,7 @@ internal object PhotoAssetStore {
 
     /** Ensure an immutable source exists and fill its checksum/image facts.
      * False means callers must leave the display file untouched. */
-    fun prepareForProcessing(dir: File, photo: File): Boolean = synchronized(monitor) {
+    fun prepareForProcessing(dir: File, photo: File): Boolean = synchronized(monitorFor(dir)) {
         var current = readCurrent(dir) ?: legacyContract(dir)
         var asset = current.assets.firstOrNull { it.captureFile == photo.name }
             ?: legacyAsset(dir.name, photo, photoNumber(photo.name)).also {
@@ -631,7 +639,7 @@ internal object PhotoAssetStore {
         recipe: String,
         recipeVersion: String,
         homography: List<Double>? = null,
-    ): Boolean = synchronized(monitor) {
+    ): Boolean = synchronized(monitorFor(dir)) {
         val current = readCurrent(dir) ?: legacyContract(dir)
         val asset = current.assets.firstOrNull { it.captureFile == photo.name } ?: return@synchronized false
         val hash = runCatching { sha256(photo) }.getOrDefault("")
@@ -683,7 +691,7 @@ internal object PhotoAssetStore {
         dir: File,
         assetId: String,
         profile: PostProcessingProfile,
-    ): Boolean = synchronized(monitor) {
+    ): Boolean = synchronized(monitorFor(dir)) {
         if (!safeToken(assetId) || !validPostProcessingProfile(profile)) {
             return@synchronized false
         }
@@ -743,7 +751,7 @@ internal object PhotoAssetStore {
 
     /** Complete upload lineage facts only. This must not mark an unprocessed
      * asset completed: cloud post-processing is merely requested elsewhere. */
-    fun completeForUpload(dir: File, photos: List<File>) = synchronized(monitor) {
+    fun completeForUpload(dir: File, photos: List<File>) = synchronized(monitorFor(dir)) {
         for (photo in photos.sortedBy { photoNumber(it.name) }) {
             prepareForProcessing(dir, photo)
         }
@@ -751,7 +759,7 @@ internal object PhotoAssetStore {
 
     /** A missing/geometry-less OCR result is deliberately a no-op. */
     fun mergeGeometry(dir: File, photo: File, draft: OcrGeometryDraft?): Boolean =
-        synchronized(monitor) {
+        synchronized(monitorFor(dir)) {
             if (draft == null || draft.regions.isEmpty()) return@synchronized false
             val current = readCurrent(dir) ?: return@synchronized false
             val asset = current.assets.firstOrNull { it.captureFile == photo.name } ?: return@synchronized false
@@ -769,7 +777,7 @@ internal object PhotoAssetStore {
         dir: File,
         target: CloudDisplayReocrTarget,
         draft: OcrGeometryDraft?,
-    ): Boolean = synchronized(monitor) {
+    ): Boolean = synchronized(monitorFor(dir)) {
         if (draft == null || draft.regions.isEmpty()) return@synchronized false
         val current = readCurrent(dir) ?: return@synchronized false
         val asset = current.assets.firstOrNull { it.assetId == target.assetId }
@@ -830,7 +838,7 @@ internal object PhotoAssetStore {
     }
 
     fun applyBibliographicSuggestions(dir: File, metadata: JSONObject): Boolean =
-        synchronized(monitor) {
+        synchronized(monitorFor(dir)) {
             val current = readCurrent(dir) ?: return@synchronized false
             val evidence = current.orderedAssets().map { asset ->
                 val text = File(dir, "${asset.captureFile}.txt")
@@ -913,7 +921,7 @@ internal object PhotoAssetStore {
         }
 
     fun setManualRole(dir: File, assetId: String, role: PhotoRole?): Boolean =
-        synchronized(monitor) {
+        synchronized(monitorFor(dir)) {
             val current = readCurrent(dir) ?: return@synchronized false
             val asset = current.assets.firstOrNull { it.assetId == assetId } ?: return@synchronized false
             val next = asset.copy(role = asset.role.copy(
@@ -933,7 +941,7 @@ internal object PhotoAssetStore {
         select(dir, assetId, primary = false)
 
     private fun select(dir: File, assetId: String, primary: Boolean): Boolean =
-        synchronized(monitor) {
+        synchronized(monitorFor(dir)) {
             val current = readCurrent(dir) ?: return@synchronized false
             if (current.assets.none { it.assetId == assetId }) return@synchronized false
             val old = if (primary) current.selections.primaryTitle else current.selections.thumbnail
@@ -950,7 +958,8 @@ internal object PhotoAssetStore {
 
     /** Future download boundary: merge a returned contract without allowing a
      * stale checksum/revision to replace newer local state. */
-    fun mergeIncoming(dir: File, incomingJson: JSONObject): Boolean = synchronized(monitor) {
+    fun mergeIncoming(dir: File, incomingJson: JSONObject): Boolean =
+        synchronized(monitorFor(dir)) {
         val incoming = capturePhotoAssetsFromJson(incomingJson, dir.name) ?: return@synchronized false
         val local = readCurrent(dir) ?: legacyContract(dir)
         val merged = reconcileContract(dir, mergePhotoAssetContracts(local, incoming))
@@ -961,7 +970,7 @@ internal object PhotoAssetStore {
      * completed row as installed. Completion is written only by
      * [installCloudDisplayDerivative] after byte verification. */
     fun recordCloudJobState(dir: File, job: CloudPhotoProcessingJob): Boolean =
-        synchronized(monitor) {
+        synchronized(monitorFor(dir)) {
             val state = cloudLifecycleForRemoteState(job.state) ?: return@synchronized false
             val error = when (state) {
                 PhotoAssetLifecycle.FAILED -> job.lastError.ifEmpty {
@@ -981,7 +990,7 @@ internal object PhotoAssetStore {
         dir: File,
         job: CloudPhotoProcessingJob,
         error: String = "Cloud display download will retry",
-    ): Boolean = synchronized(monitor) {
+    ): Boolean = synchronized(monitorFor(dir)) {
         recordCloudLifecycle(dir, job, PhotoAssetLifecycle.RETRYING, error)
     }
 
@@ -991,7 +1000,7 @@ internal object PhotoAssetStore {
         dir: File,
         job: CloudPhotoProcessingJob,
         error: String,
-    ): Boolean = synchronized(monitor) {
+    ): Boolean = synchronized(monitorFor(dir)) {
         recordCloudLifecycle(dir, job, PhotoAssetLifecycle.FAILED, error)
     }
 
@@ -1000,7 +1009,7 @@ internal object PhotoAssetStore {
     fun hasVerifiedCloudDisplay(
         dir: File,
         plan: CloudDisplayInstallPlan,
-    ): Boolean = synchronized(monitor) {
+    ): Boolean = synchronized(monitorFor(dir)) {
         val current = readCurrent(dir) ?: return@synchronized false
         val asset = current.assets.firstOrNull { it.assetId == plan.job.assetId }
             ?: return@synchronized false
@@ -1023,7 +1032,7 @@ internal object PhotoAssetStore {
      * installation transaction as the new display contract, so scheduling can
      * be recovered by a later cloud poll without guessing from stale pixels. */
     fun pendingCloudDisplayReocrTargets(dir: File): List<CloudDisplayReocrTarget> =
-        synchronized(monitor) {
+        synchronized(monitorFor(dir)) {
             val current = readCurrent(dir) ?: return@synchronized emptyList()
             current.orderedAssets().mapNotNull { asset ->
                 cloudDisplayReocrTarget(current, asset)?.takeIf { target ->
@@ -1040,7 +1049,7 @@ internal object PhotoAssetStore {
     fun cloudDisplayReocrFile(
         dir: File,
         target: CloudDisplayReocrTarget,
-    ): File? = synchronized(monitor) {
+    ): File? = synchronized(monitorFor(dir)) {
         val current = readCurrent(dir) ?: return@synchronized null
         val asset = current.assets.firstOrNull { it.assetId == target.assetId }
             ?: return@synchronized null
@@ -1096,7 +1105,7 @@ internal object PhotoAssetStore {
         proposed: CloudDisplayInstallPlan,
         downloaded: File,
         receipt: PrivateObjectDownload,
-    ): Boolean = synchronized(monitor) {
+    ): Boolean = synchronized(monitorFor(dir)) {
         if (!dir.isDirectory || downloaded.parentFile != dir) return@synchronized false
         val current = readCurrent(dir) ?: return@synchronized false
         val checked = when (val decision = validateCloudPhotoResult(
@@ -1226,7 +1235,8 @@ internal object PhotoAssetStore {
         saved
     }
 
-    fun payload(dir: File, manifest: JSONObject? = null): JSONObject = synchronized(monitor) {
+    fun payload(dir: File, manifest: JSONObject? = null): JSONObject =
+        synchronized(monitorFor(dir)) {
         val current = readCurrent(dir, manifest) ?: legacyContract(dir)
         current.toJson()
     }

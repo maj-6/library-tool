@@ -70,6 +70,19 @@ class ProcessingContractTest {
     }
 
     @Test
+    fun processingRecoversInterruptedThumbnailDeletesBeforeReadingPhotos() {
+        val worker = source("ProcessWorker")
+        val lock = worker.indexOf("EntryOperationLocks.withLock(dir.name)")
+        val recovery = worker.indexOf("cleanupCommittedThumbnailDeletes(dir)", lock)
+        val processing = worker.indexOf("processDirectory(", recovery)
+
+        assertTrue(lock >= 0)
+        assertTrue(recovery > lock)
+        assertTrue(processing > recovery)
+        assertTrue(worker.contains("DirectoryOutcome(\n                        retry = true,"))
+    }
+
+    @Test
     fun spineTitleIsRequestedParsedMergedAndCountedAsMetadata() {
         assertTrue("spine_title" in Pipeline.FIELDS)
         val response = JSONObject().apply {
