@@ -20,12 +20,37 @@ import os
 import pathlib
 import re
 import time
+import urllib.error
+import urllib.request
 from urllib.parse import SplitResult, urlsplit
 
 OUT = pathlib.Path(__file__).resolve().parents[2] / "website" / "assets" / "config.js"
 MODES = ("development", "production", "fixture-preview")
 PUBLISHABLE_KEY_RE = re.compile(r"sb_publishable_[A-Za-z0-9_-]+")
 BASE64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
+PROBE_TIMEOUT_SECONDS = 15.0
+PROBE_RESPONSE_LIMIT = 64 * 1024
+PUBLIC_READ_PROBES = (
+    ("volumes", "slug"),
+    ("volume_texts", "slug"),
+    ("volume_pages", "slug"),
+    ("volume_notes", "slug"),
+    ("author_pages", "author"),
+    ("author_index", "author"),
+    ("releases", "platform"),
+)
+
+
+class LiveProbeError(RuntimeError):
+    """The configured public API is not ready to serve the website."""
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_PROBE_OPENER = urllib.request.build_opener(_RejectRedirects)
 
 
 def _append_summary(text: str) -> None:
@@ -145,6 +170,83 @@ def validate_public_key(key: str) -> str:
     return "legacy anon JWT"
 
 
+def _open_probe(request: urllib.request.Request, timeout: float):
+    return _PROBE_OPENER.open(request, timeout=timeout)
+
+
+def probe_live_configuration(
+    url: str,
+    key: str,
+    *,
+    timeout: float = PROBE_TIMEOUT_SECONDS,
+) -> None:
+    """Prove that every public website resource is reachable with this key."""
+    started = time.monotonic()
+    for table, column in PUBLIC_READ_PROBES:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise LiveProbeError(
+                f"timed out before checking public resource {table!r}."
+            )
+
+        endpoint = (
+            f"{url.rstrip('/')}/rest/v1/{table}"
+            f"?select={column}&limit=1"
+        )
+        request = urllib.request.Request(
+            endpoint,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {key}",
+                "apikey": key,
+            },
+            method="GET",
+        )
+        response = None
+        try:
+            response = _open_probe(request, min(5.0, remaining))
+            status = getattr(response, "status", None)
+            if status is None:
+                status = response.getcode()
+            if not 200 <= status < 300:
+                raise LiveProbeError(
+                    f"public resource {table!r} returned HTTP {status}."
+                )
+            final_url = response.geturl()
+            if final_url != endpoint:
+                raise LiveProbeError(
+                    f"public resource {table!r} redirected away from its "
+                    "configured endpoint."
+                )
+            body = response.read(PROBE_RESPONSE_LIMIT + 1)
+            if len(body) > PROBE_RESPONSE_LIMIT:
+                raise LiveProbeError(
+                    f"public resource {table!r} returned an oversized response."
+                )
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise LiveProbeError(
+                    f"public resource {table!r} did not return valid JSON."
+                ) from exc
+            if not isinstance(payload, list):
+                raise LiveProbeError(
+                    f"public resource {table!r} did not return a JSON array."
+                )
+        except urllib.error.HTTPError as exc:
+            raise LiveProbeError(
+                f"public resource {table!r} returned HTTP {exc.code}."
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise LiveProbeError(
+                f"public resource {table!r} was unreachable: {reason}."
+            ) from exc
+        finally:
+            if response is not None:
+                response.close()
+
+
 def _write(output: pathlib.Path, content: str) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
@@ -161,11 +263,17 @@ def write_live_config(
     url: str,
     key: str,
     mode: str,
+    probed: bool = False,
 ) -> None:
+    validation = (
+        "live endpoint and public reads probed"
+        if probed
+        else "configuration syntax validated; connectivity not probed"
+    )
     _write(
         output,
         "// Written by .github/scripts/write_config.py. Not committed.\n"
-        f"// Deployment mode: {mode}; live cloud configuration validated.\n"
+        f"// Deployment mode: {mode}; {validation}.\n"
         "window.WHL_CONFIG = {\n"
         f"  deploymentMode: {json.dumps(mode)},\n"
         f"  supabaseUrl: {json.dumps(url)},\n"
@@ -200,12 +308,23 @@ def parse_args() -> argparse.Namespace:
         default=OUT,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--probe-live",
+        action="store_true",
+        help="verify every public website resource before writing production config",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     announce_mode(args.mode)
+
+    if args.probe_live and args.mode != "production":
+        die("--probe-live is valid only in production mode.")
+    if args.mode == "production":
+        # A failed rerun must not leave a formerly valid deployment config behind.
+        args.output.unlink(missing_ok=True)
 
     url = os.environ.get("SUPABASE_URL", "").strip()
     key = os.environ.get("SUPABASE_ANON_KEY", "").strip()
@@ -243,10 +362,25 @@ def main() -> None:
 
     parts = validate_url(url)
     key_kind = validate_public_key(key)
-    write_live_config(args.output, url=url, key=key, mode=args.mode)
+    if args.probe_live:
+        try:
+            probe_live_configuration(url, key)
+        except LiveProbeError as exc:
+            die(f"live Supabase probe failed: {exc}")
+    write_live_config(
+        args.output,
+        url=url,
+        key=key,
+        mode=args.mode,
+        probed=args.probe_live,
+    )
+    live_status = (
+        " and all public website reads succeeded" if args.probe_live else ""
+    )
     notice(
         "notice",
-        f"config.js written for {parts.netloc} with a validated {key_kind}.",
+        f"config.js written for {parts.netloc} with a validated {key_kind}"
+        f"{live_status}.",
     )
 
 

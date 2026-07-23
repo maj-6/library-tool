@@ -27,9 +27,11 @@ name: release
 #                                      (Android refuses to update an install
 #                                      whose signing key changed, so a debug-
 #                                      signed APK is unpublishable) — the desktop
-#                                      release is independent and still ships. A
-#                                      workflow_dispatch dry run may omit them and
-#                                      gets a clearly-labelled debug-signed APK.
+#                                      release cannot publish a requested
+#                                      product without its verified artifact. A
+#                                      workflow_dispatch dry run may omit them
+#                                      and gets a clearly-labelled debug-signed
+#                                      APK.
 
 on:
   push:
@@ -177,8 +179,30 @@ jobs:
           node --experimental-default-type=module --check website/assets/read.js
           node --test
 
-  android:
+  android_validation:
+    name: Android validation gates
     needs: [preflight, validation]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android/BookCapture
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Unit, lint, and debug assembly gates
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest lintDebug lintRelease assembleDebug
+
+  android:
+    needs: [preflight, validation, android_validation]
     if: needs.preflight.outputs.android_release == 'true'
     runs-on: ubuntu-latest
     outputs:
@@ -220,8 +244,8 @@ jobs:
             # A tagged build is published and must stay updatable. The debug key
             # is ephemeral and Android rejects updates whose signer changed, so
             # refuse to build a debug-signed release here — before it can be
-            # uploaded. Failing this job drops only Android; the desktop release
-            # is independent and still ships (see the publish job's guard).
+            # uploaded. A tagged release that requested Android must keep this
+            # job green before anything is published.
             echo "::error::Tagged Android release requires the persistent signing keystore, but ANDROID_KEYSTORE_B64 is not set. Refusing to build a debug-signed APK that cannot update installs. Add the ANDROID_KEYSTORE_* secrets (docs/releasing.md) and re-run."
             exit 1
           else
@@ -255,7 +279,7 @@ jobs:
             esac
           fi
           chmod +x gradlew
-          ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease
+          ./gradlew --no-daemon assembleRelease
 
       - name: Name the APK after its versionName
         id: ver
@@ -351,7 +375,7 @@ jobs:
 
   desktop:
     if: ${{ !startsWith(github.ref_name, 'android-v') }}
-    needs: [preflight, validation]
+    needs: [preflight, validation, android_validation]
     runs-on: windows-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -463,17 +487,25 @@ jobs:
           if-no-files-found: error
 
   # Tag pushes only (a dispatch run is a dry run and stops at the artifacts).
-  # Publishes whichever app(s) actually built: the two are versioned and
-  # released independently, so a broken Android signing config must not block a
-  # good desktop release (or vice versa). Runs when EITHER build succeeded, and
-  # each publish step below is guarded on its artifact being present.
+  # Each app remains independently versioned, but every product selected by
+  # preflight must build successfully before this tag becomes public. Android
+  # may be deliberately skipped only when its version identity did not advance.
   publish:
     if: |
       !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
       needs.preflight.result == 'success' &&
       needs.validation.result == 'success' &&
-      (needs.desktop.result == 'success' || needs.android.result == 'success')
-    needs: [preflight, validation, android, desktop]
+      needs.android_validation.result == 'success' &&
+      (startsWith(github.ref_name, 'android-v') || needs.desktop.result == 'success') &&
+      (
+        needs.android.result == 'success' ||
+        (
+          !startsWith(github.ref_name, 'android-v') &&
+          needs.preflight.outputs.android_release != 'true' &&
+          needs.android.result == 'skipped'
+        )
+      )
+    needs: [preflight, validation, android_validation, android, desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload its assets

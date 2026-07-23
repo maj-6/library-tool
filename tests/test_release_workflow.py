@@ -21,7 +21,8 @@ def _job(name: str, next_name: str) -> str:
 
 def test_release_tag_version_preflight_gates_every_publish_path():
     preflight = _job("preflight", "validation")
-    validation = _job("validation", "android")
+    validation = _job("validation", "android_validation")
+    android_validation = _job("android_validation", "android")
     android = _job("android", "desktop")
     desktop = _job("desktop", "publish")
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
@@ -35,11 +36,20 @@ def test_release_tag_version_preflight_gates_every_publish_path():
     assert "python -m ruff check ." in validation
     assert "python -m pytest -q" in validation
     assert "node --test" in validation
-    assert "needs: [preflight, validation]" in android
-    assert "needs: [preflight, validation]" in desktop
+    assert "needs: [preflight, validation]" in android_validation
+    assert (
+        "./gradlew --no-daemon testDebugUnitTest lintDebug lintRelease assembleDebug"
+        in android_validation
+    )
+    assert "needs: [preflight, validation, android_validation]" in android
+    assert "needs: [preflight, validation, android_validation]" in desktop
     assert "needs.preflight.result == 'success'" in publish
     assert "needs.validation.result == 'success'" in publish
-    assert "needs: [preflight, validation, android, desktop]" in publish
+    assert "needs.android_validation.result == 'success'" in publish
+    assert (
+        "needs: [preflight, validation, android_validation, android, desktop]"
+        in publish
+    )
 
 
 def test_android_is_released_only_after_its_version_identity_changes():
@@ -75,7 +85,7 @@ def test_public_tags_reject_unknown_prerelease_channels():
     assert '"${release_metadata_args[@]}"' in publish
 
 
-def test_publish_runs_after_failures_or_skips_but_never_after_cancellation():
+def test_publish_requires_every_requested_product_and_never_runs_after_cancellation():
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
 
     condition = publish[: publish.index("    needs:")]
@@ -83,9 +93,14 @@ def test_publish_runs_after_failures_or_skips_but_never_after_cancellation():
     assert "always()" not in condition
     assert "needs.preflight.result == 'success'" in condition
     assert "needs.validation.result == 'success'" in condition
+    assert "needs.android_validation.result == 'success'" in condition
+    assert "startsWith(github.ref_name, 'android-v')" in condition
+    assert "needs.desktop.result == 'success'" in condition
+    assert "needs.android.result == 'success'" in condition
     assert (
-        "needs.desktop.result == 'success' || needs.android.result == 'success'"
-        in condition
+        "!startsWith(github.ref_name, 'android-v')" in condition
+        and "needs.preflight.outputs.android_release != 'true'" in condition
+        and "needs.android.result == 'skipped'" in condition
     )
 
 
@@ -170,18 +185,18 @@ def test_tagged_android_release_requires_public_cloud_config():
         "SUPABASE_ANON_KEY"
     ) in android
     assert "SUPABASE_URL must be an https URL" in android
-    assert "./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease" in android
+    assert "./gradlew --no-daemon assembleRelease" in android
 
 
 def test_partial_release_metadata_comes_from_collected_artifacts():
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
 
-    # Preserve independent app releases, but title and qualify a one-sided
-    # GitHub Release from the files that were actually downloaded.
-    assert (
-        "needs.desktop.result == 'success' || needs.android.result == 'success'"
-        in publish
-    )
+    # Preserve independent version schedules, but never turn a failed requested
+    # product into a partial public release.
+    condition = publish[: publish.index("    needs:")]
+    assert "needs.android.result == 'success'" in condition
+    assert "needs.desktop.result == 'success'" in condition
+    assert "needs.preflight.outputs.android_release != 'true'" in condition
     assert "mapfile -t desktop_assets" in publish
     assert "mapfile -t android_assets" in publish
     assert "(desktop only)" in publish
@@ -314,7 +329,7 @@ def test_ci_uses_cross_platform_node_test_discovery():
 
 def test_all_javascript_workflow_steps_use_electron_43_node_baseline():
     preflight = _job("preflight", "validation")
-    validation = _job("validation", "android")
+    validation = _job("validation", "android_validation")
     desktop = _job("desktop", "publish")
 
     assert 'node-version: "22.12"' in CI_WORKFLOW

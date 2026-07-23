@@ -1,16 +1,22 @@
 import base64
+import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github" / "scripts" / "write_config.py"
+SPEC = importlib.util.spec_from_file_location("pages_write_config", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+PAGES_CONFIG = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PAGES_CONFIG)
 WORKFLOW = (ROOT / ".github" / "workflows" / "pages.yml").read_text(
     encoding="utf-8"
 )
@@ -220,6 +226,103 @@ def test_local_development_without_credentials_removes_stale_generated_config(
     assert "**Selected mode:** `development`" in summary.read_text(encoding="utf-8")
 
 
+class _ProbeResponse:
+    def __init__(
+        self,
+        url: str,
+        *,
+        body: bytes = b"[]",
+        status: int = 200,
+        final_url: str | None = None,
+    ):
+        self.url = url
+        self.body = body
+        self.status = status
+        self.final_url = final_url or url
+        self.closed = False
+
+    def getcode(self) -> int:
+        return self.status
+
+    def geturl(self) -> str:
+        return self.final_url
+
+    def read(self, amount: int) -> bytes:
+        return self.body[:amount]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_live_probe_checks_every_public_website_resource(monkeypatch):
+    calls = []
+
+    def open_probe(request, timeout):
+        calls.append((request, timeout))
+        return _ProbeResponse(request.full_url)
+
+    monkeypatch.setattr(PAGES_CONFIG, "_open_probe", open_probe)
+    key = "sb_publishable_public_browser_key"
+
+    PAGES_CONFIG.probe_live_configuration(
+        "https://project.supabase.co",
+        key,
+    )
+
+    assert [
+        urlsplit(request.full_url).path.removeprefix("/rest/v1/")
+        for request, _ in calls
+    ] == [table for table, _ in PAGES_CONFIG.PUBLIC_READ_PROBES]
+    assert all(0 < timeout <= 5 for _, timeout in calls)
+    for request, _ in calls:
+        headers = {name.casefold(): value for name, value in request.header_items()}
+        assert headers["apikey"] == key
+        assert headers["authorization"] == f"Bearer {key}"
+
+
+def test_live_probe_rejects_redirected_endpoint(monkeypatch):
+    def redirect_probe(request, timeout):
+        return _ProbeResponse(
+            request.full_url,
+            final_url="https://attacker.invalid/rest/v1/volumes",
+        )
+
+    monkeypatch.setattr(PAGES_CONFIG, "_open_probe", redirect_probe)
+
+    with pytest.raises(PAGES_CONFIG.LiveProbeError, match="redirected away"):
+        PAGES_CONFIG.probe_live_configuration(
+            "https://project.supabase.co",
+            "sb_publishable_public_browser_key",
+        )
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    (
+        (b"<html>not json</html>", "valid JSON"),
+        (b'{"unexpected": true}', "JSON array"),
+        (b"x" * (64 * 1024 + 1), "oversized"),
+    ),
+    ids=("invalid-json", "wrong-shape", "oversized"),
+)
+def test_live_probe_rejects_unusable_public_response(
+    monkeypatch,
+    body: bytes,
+    error: str,
+):
+    monkeypatch.setattr(
+        PAGES_CONFIG,
+        "_open_probe",
+        lambda request, timeout: _ProbeResponse(request.full_url, body=body),
+    )
+
+    with pytest.raises(PAGES_CONFIG.LiveProbeError, match=error):
+        PAGES_CONFIG.probe_live_configuration(
+            "https://project.supabase.co",
+            "sb_publishable_public_browser_key",
+        )
+
+
 def _job(name: str, next_name: str | None = None) -> str:
     start = WORKFLOW.index(f"  {name}:\n")
     if next_name is None:
@@ -230,11 +333,13 @@ def _job(name: str, next_name: str | None = None) -> str:
 def test_pages_workflow_gates_production_before_every_artifact_action():
     deploy = _job("deploy", "fixture-preview")
 
-    validation = deploy.index("write_config.py --mode production")
+    validation = deploy.index("write_config.py")
     configure = deploy.index("actions/configure-pages@")
     upload = deploy.index("actions/upload-pages-artifact@")
     publish = deploy.index("actions/deploy-pages@")
     assert validation < configure < upload < publish
+    assert "--mode production" in deploy
+    assert "--probe-live" in deploy
     assert "SUPABASE_URL: ${{ vars.SUPABASE_URL }}" in deploy
     assert "SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}" in deploy
     assert "name: github-pages" in deploy

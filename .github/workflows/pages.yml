@@ -47,13 +47,17 @@ jobs:
         uses: actions/checkout@v4
 
       # Variables, not secrets: publishable/anon keys are public by design.
-      # The validator rejects missing, malformed, expired, or privileged keys.
+      # The validator rejects missing, malformed, expired, or privileged keys,
+      # then proves every website resource is readable through the live API.
       # Keep this before configure-pages and every artifact/deployment action.
       - name: Require live Supabase configuration
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
-        run: python3 .github/scripts/write_config.py --mode production
+        run: >-
+          python3 .github/scripts/write_config.py
+          --mode production
+          --probe-live
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

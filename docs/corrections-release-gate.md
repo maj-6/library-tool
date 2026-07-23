@@ -1,19 +1,29 @@
 # Corrections release gate
 
-The final Corrections gate is executable at the engine/browser-contract level:
+The final Corrections gate includes a live headless production-transport flow:
 
 ```text
-python -m pytest -q tests/test_corrections_release_gate.py
+python -m pytest -q tests/test_corrections_release_gate.py tests/test_corrections_server_bridge.py
 node --test tests/corrections_release_gate_behavior.test.js
 ```
 
-The Python gate composes the durable review repository, transform store, job
-manager, and worker without Flask. It proves that a host-owned transform keeps
-running while the first Corrections window is discarded, a reopened window
-resolves and reopens the review, OCR fails independently after the image
-commit, and verified roles, captions, and text survive. It also covers
-pre-commit cancellation, process-restart interruption, exact terminal replay,
-a successful new-operation restart, and immutable original bytes.
+The representative flow runs the real `EngineClient` over loopback HTTP against
+the production Flask composition and filesystem engine. It opens an
+attention-marked captured book with two Mistral regions, reads Books and
+Artifacts, assigns an image category and the canonical `marginalia`/`figure`
+roles (`MAR`/`ILL` in the UI), edits a caption, moves the screen-nearest quad
+corner, changes Image Adjust brightness, requests OCR, and submits Space. The
+filesystem commit is deliberately held while the first client is discarded and
+a new client resolves and reopens the review. After release, the new client
+observes the corrected rendition and OCR proposal and verifies the human
+category, roles, and caption survived. The same fixture seals and re-reads the
+capture's current `.lib/3` association.
+
+The lower-level Python gate separately composes the durable review repository,
+transform store, job manager, and worker. It proves OCR failure remains
+independent after an image commit and covers pre-commit cancellation,
+process-restart interruption, exact terminal replay, a successful new-operation
+restart, and immutable original bytes.
 
 The JavaScript gate exercises the actual editor, Image Adjust, Books, and
 Artifacts contract modules. It proves that Space retry retains one serialized
@@ -31,8 +41,13 @@ Performance fixture budgets come from
 - A burst of 100 screen-nearest pointer updates must begin and complete its
   synchronous local feedback in less than 100 ms.
 
-These tests deliberately make no claim about a live browser, screen reader,
-physical Android device, network provider, or signed packaged binary. Those
-remain separate release-validation gates; the repository-wide test command
-continues to own existing Replica, legacy `.lib`, Android v1, updater, and
-resource-window compatibility smoke coverage.
+The release workflow also runs Android unit tests, debug/release lint, and a
+debug assembly before packaging. Those tests consume current/stale/malformed
+association confirmations and assert the accessible confirmed-marker states;
+the signed packaging job then verifies the release APK certificate.
+
+These tests deliberately make no claim about a live Chromium renderer, a real
+screen reader, a physical Android device, an external OCR provider, or a signed
+installer exercise. Those remain separate manual or packaging validations; the
+repository-wide test command continues to own existing Replica, legacy `.lib`,
+Android v1, updater, and resource-window compatibility smoke coverage.

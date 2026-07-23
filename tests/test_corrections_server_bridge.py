@@ -5,11 +5,28 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import shutil
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
 from PIL import Image
+from werkzeug.serving import make_server
+
+from librarytool.adapters.filesystem import FilesystemCorrectionTransformStore
+from librarytool.engine import CORRECTION_TRANSFORM_SERVICE
+from librarytool.engine.correction_transforms import (
+    OcrFollowupOutcome,
+    OcrFollowupState,
+)
+
+
+BOOK_ID = "b-11111111111111111111111111111111"
+CAPTURE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _jpeg_bytes() -> bytes:
@@ -52,18 +69,19 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
     builds_path = output / "whl_builds.json"
     entries_dir = output / "entries"
     captures_dir = tmp_path / "captures"
-    capture_dir = captures_dir / "capture-1"
+    capture_dir = captures_dir / CAPTURE_ID
     capture_dir.mkdir(parents=True)
     entries_dir.mkdir(parents=True)
 
     content = _jpeg_bytes()
     digest = hashlib.sha256(content).hexdigest()
     (capture_dir / "original_asset-1.jpg").write_bytes(content)
+    (capture_dir / "orig_1.jpg").write_bytes(content)
     (capture_dir / "photo_1.jpg").write_bytes(content)
     manifest = {
         "schema": "org.whl.bookcapture.photo-assets",
         "version": 1,
-        "capture_id": "capture-1",
+        "capture_id": CAPTURE_ID,
         "legacy_fallback": False,
         "assets": [
             {
@@ -94,7 +112,47 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
                     "manual_revision": 1,
                     "manual_updated_at": 1,
                 },
-                "geometry": [],
+                "geometry": [
+                    {
+                        "asset_id": "asset-1",
+                        "source_sha256": digest,
+                        "source_revision": 1,
+                        "display_revision": 1,
+                        "coordinate_space": "display_normalized",
+                        "width": 7,
+                        "height": 11,
+                        "orientation": 0,
+                        "engine": "mistral",
+                        "model": "mistral-ocr-latest",
+                        "engine_version": "release-e2e",
+                        "regions": [
+                            {
+                                "id": "margin-1",
+                                "type": "text",
+                                "text": "Materia medica",
+                                "confidence": 0.97,
+                                "polygon": [
+                                    [0.05, 0.12],
+                                    [0.31, 0.12],
+                                    [0.31, 0.42],
+                                    [0.05, 0.42],
+                                ],
+                            },
+                            {
+                                "id": "illustration-1",
+                                "type": "image",
+                                "text": "Botanical plate",
+                                "confidence": 0.94,
+                                "polygon": [
+                                    [0.38, 0.18],
+                                    [0.91, 0.18],
+                                    [0.91, 0.88],
+                                    [0.38, 0.88],
+                                ],
+                            },
+                        ],
+                    }
+                ],
                 "processing_request": {},
             }
         ],
@@ -108,10 +166,10 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
     server.lib.save_json(
         builds_path,
         {
-            "book-one": {
-                "id": "book-one",
+            BOOK_ID: {
+                "id": BOOK_ID,
                 "title": "Captured Herbal",
-                "capture_id": "capture-1",
+                "capture_id": CAPTURE_ID,
             }
         },
     )
@@ -132,14 +190,14 @@ def test_production_bridge_lists_and_serves_capture_artifacts(
     corrections_workspace,
 ):
     collection = client.get(
-        "/api/v1/items/book-one/raster-artifacts"
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts"
         "?representation_id=capture"
     )
 
     assert collection.status_code == 200
     body = collection.get_json()
     assert body["schema"] == "librarytool.raster-artifacts/1"
-    capture_namespace = _opaque_identity("capture", "capture-1", "asset-1")
+    capture_namespace = _opaque_identity("capture", CAPTURE_ID, "asset-1")
     display_id = f"{capture_namespace}:display"
     original_id = f"{capture_namespace}:original"
     assert [
@@ -158,7 +216,7 @@ def test_production_bridge_lists_and_serves_capture_artifacts(
 
     resource = display["resource"]
     response = client.get(
-        "/api/v1/items/book-one/raster-artifacts/"
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/"
         f"{display_id}/resource?"
         + urlencode({"revision": resource["revision"]})
     )
@@ -175,11 +233,11 @@ def test_production_bridge_mutations_converge_across_clients(
     corrections_workspace,
 ):
     del corrections_workspace
-    capture_namespace = _opaque_identity("capture", "capture-1", "asset-1")
+    capture_namespace = _opaque_identity("capture", CAPTURE_ID, "asset-1")
     display_id = f"{capture_namespace}:display"
-    path = f"/api/v1/items/book-one/raster-artifacts/{display_id}/category"
+    path = f"/api/v1/items/{BOOK_ID}/raster-artifacts/{display_id}/category"
     original = client.get(
-        f"/api/v1/items/book-one/raster-artifacts/{display_id}"
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/{display_id}"
     ).get_json()["artifact"]
     headers = {
         "Idempotency-Key": "bridge-category-op",
@@ -193,7 +251,7 @@ def test_production_bridge_mutations_converge_across_clients(
     )
     second_client = client.application.test_client()
     observed = second_client.get(
-        f"/api/v1/items/book-one/raster-artifacts/{display_id}"
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/{display_id}"
     )
     stale = second_client.put(
         path,
@@ -232,7 +290,7 @@ def test_production_review_bridge_composes_index_and_reconciles_cas(
         "_auth_doc",
         lambda: {"session": {"user_id": "user-bridge"}},
     )
-    review_path = "/api/v1/items/book-one/corrections/review"
+    review_path = f"/api/v1/items/{BOOK_ID}/corrections/review"
     initial_detail = client.get(review_path)
     initial_index = client.get(
         "/api/v1/corrections/index?workspace_id=workspace-1"
@@ -243,7 +301,7 @@ def test_production_review_bridge_composes_index_and_reconciles_cas(
     initial_review = initial_detail.get_json()["review"]
     index_body = initial_index.get_json()
     assert index_body["schema"] == "librarytool.corrections-index/1"
-    assert [book["id"] for book in index_body["books"]] == ["book-one"]
+    assert [book["id"] for book in index_body["books"]] == [BOOK_ID]
     assert [
         capture["artifact_id"].endswith(":display")
         for capture in index_body["books"][0]["captures"]
@@ -295,6 +353,126 @@ def test_production_review_bridge_composes_index_and_reconciles_cas(
     assert reconciled["attention"][0]["review"]["latest_event"][
         "actor_id"
     ] == "user-bridge"
+
+
+def test_representative_flow_crosses_ui_client_flask_engine_and_worker(
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    class SuccessfulOcr:
+        def run_ocr_followup(self, request, _hooks):
+            return OcrFollowupOutcome(
+                OcrFollowupState.SUCCEEDED,
+                source=request.source,
+                proposal_ref="ocr-proposal-release-e2e",
+            )
+
+    transform_service = server._library_engine().require_service(
+        CORRECTION_TRANSFORM_SERVICE
+    )
+    transform_worker = getattr(transform_service._executor, "__self__", None)
+    assert transform_worker is not None
+    monkeypatch.setattr(transform_worker, "_ocr", SuccessfulOcr())
+
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+    original_commit = FilesystemCorrectionTransformStore.commit_transform
+
+    def blocking_commit(instance, draft):
+        commit_started.set()
+        if not release_commit.wait(15):
+            raise RuntimeError("release E2E did not reopen before commit")
+        return original_commit(instance, draft)
+
+    monkeypatch.setattr(
+        FilesystemCorrectionTransformStore,
+        "commit_transform",
+        blocking_commit,
+    )
+
+    association = server._ensure_capture_archive(
+        CAPTURE_ID,
+        {
+            "id": BOOK_ID,
+            "book_id": BOOK_ID,
+            "capture_id": CAPTURE_ID,
+            "title": "Captured Herbal",
+        },
+    )
+    assert association.capture_id == CAPTURE_ID
+    assert association.book_id == BOOK_ID
+    assert association.state.value == "current"
+
+    class ReleaseHandler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self.path != "/release":
+                self.send_error(404)
+                return
+            release_commit.set()
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    flask_server = make_server("127.0.0.1", 0, server.app, threaded=True)
+    control_server = ThreadingHTTPServer(("127.0.0.1", 0), ReleaseHandler)
+    flask_thread = threading.Thread(
+        target=flask_server.serve_forever,
+        daemon=True,
+        name="corrections-release-e2e-flask",
+    )
+    control_thread = threading.Thread(
+        target=control_server.serve_forever,
+        daemon=True,
+        name="corrections-release-e2e-control",
+    )
+    flask_thread.start()
+    control_thread.start()
+    node = shutil.which("node")
+    assert node, "the release E2E requires the workflow's Node runtime"
+    script = Path(__file__).with_name("corrections_live_bridge_e2e.test.js")
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "WHL_CORRECTIONS_E2E_BASE_URL": (
+                f"http://127.0.0.1:{flask_server.server_port}/api"
+            ),
+            "WHL_CORRECTIONS_E2E_CONTROL_URL": (
+                f"http://127.0.0.1:{control_server.server_port}/release"
+            ),
+            "WHL_CORRECTIONS_E2E_ITEM_ID": BOOK_ID,
+        }
+    )
+    try:
+        completed = subprocess.run(
+            [node, "--test", str(script)],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+    finally:
+        release_commit.set()
+        flask_server.shutdown()
+        control_server.shutdown()
+        flask_server.server_close()
+        control_server.server_close()
+        flask_thread.join(timeout=5)
+        control_thread.join(timeout=5)
+
+    assert completed.returncode == 0, (
+        "live Corrections EngineClient flow failed\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+    assert commit_started.is_set()
+    assert server._capture_archive_association(CAPTURE_ID) == association
 
 
 def test_production_bridge_preserves_not_found_semantics(

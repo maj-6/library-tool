@@ -52,8 +52,9 @@ python3 tools/cloud_setup.py fixture
 
 That fallback is for local development only. The production Pages workflow
 runs `.github/scripts/write_config.py --mode production`, which stops before
-artifact upload unless both public cloud variables are present and valid. A
-manual `fixture-preview` dispatch produces a short-lived artifact named
+artifact upload unless both public cloud variables are present and safe, the
+live API is reachable, and its anon key can read every website resource listed
+below. A manual `fixture-preview` dispatch produces a short-lived artifact named
 `fixture-preview-NOT-FOR-PRODUCTION-…`; it never enters the `github-pages`
 environment or the Pages deployment action.
 
