@@ -263,6 +263,36 @@
     });
   }
 
+  function normalizeCorrection(value, summary) {
+    if (!isObject(value)) return null;
+    const digest = text(value.source_sha256 || value.sourceSha256, 64).toLowerCase();
+    return Object.freeze({
+      item_id: portableId(
+        value.item_id || value.itemId || summary.itemId,
+        "correction item id",
+      ),
+      artifact_id: portableId(
+        value.artifact_id || value.artifactId || summary.id,
+        "correction artifact id",
+      ),
+      artifact_revision: text(
+        value.artifact_revision || value.artifactRevision || summary.revision,
+        512,
+      ),
+      source_revision: text(
+        value.source_revision || value.sourceRevision ||
+          summary.source.representationRevision,
+        512,
+      ),
+      source_sha256: /^[0-9a-f]{64}$/.test(digest) ? digest : "",
+      proposal: freezeJson(safeBoundedJson(
+        value.proposal || value.page_boundary_proposal ||
+          value.pageBoundaryProposal,
+        null,
+      )),
+    });
+  }
+
   function normalizeSource(value) {
     if (!isObject(value)) return Object.freeze({});
     const result = {
@@ -407,7 +437,8 @@
       kind,
       label: text(raw.label || raw.name || id, 512),
       mediaType: text(raw.media_type || raw.mediaType, 128).toLowerCase(),
-      resourceState: resourceState === "available" && !resourceRef && family === "image"
+      resourceState: resourceState === "available" && !resourceRef &&
+        ["image", "text"].includes(family)
         ? "unavailable" : resourceState,
       freshness: normalizeFreshness(raw),
       generated: raw.generated === true ||
@@ -462,6 +493,30 @@
       revision: text(value.revision, 512),
       items: Object.freeze(items),
       nextCursor: nextCursor == null || nextCursor === "" ? null : text(nextCursor, 1024),
+    });
+  }
+
+  function decodeArtifactDetail(raw) {
+    const summary = decodeArtifactSummary(raw);
+    const selector = freezeJson(safeBoundedJson(raw.selector || raw.polygon, null));
+    const dimensions = freezeJson(safeBoundedJson(raw.dimensions, null));
+    const extensions = freezeJson(safeBoundedJson(raw.extensions, {}));
+    const regions = freezeJson(safeBoundedJson(
+      raw.regions || raw.annotations || [], []));
+    return Object.freeze({
+      ...summary,
+      selector,
+      dimensions,
+      extensions,
+      regions,
+      correction: normalizeCorrection(
+        raw.correction || raw.correction_transform || raw.correctionTransform,
+        summary,
+      ),
+      previewText: text(
+        raw.preview_text || raw.previewText || raw.excerpt || "",
+        MAX_JSON_STRING,
+      ),
     });
   }
 
@@ -613,9 +668,11 @@
     buildArtifactTreeRows,
     buildLinkIndex,
     classifyArtifactGroup,
+    decodeArtifactDetail,
     decodeArtifactPage,
     decodeArtifactSummary,
     mergeArtifactItems,
+    normalizeCorrection,
     virtualArtifactWindow,
   };
 });
