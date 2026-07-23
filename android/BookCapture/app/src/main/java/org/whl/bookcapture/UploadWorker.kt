@@ -110,6 +110,7 @@ internal data class ConfirmedDelivery(
     val entryId: String,
     val photoCount: Int,
     val remotePaths: List<String>,
+    val captureLibConfirmation: CaptureLibConfirmation? = null,
 )
 
 /** Validate the whole manifest photo set before starting any network writes.
@@ -971,6 +972,13 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             "delivery receipt does not match local entry"
         }
         try {
+            delivery.captureLibConfirmation?.let { confirmation ->
+                when (CaptureLibAssociationStore.apply(dir, confirmation)) {
+                    CaptureLibApplyResult.APPLIED, CaptureLibApplyResult.UNCHANGED -> Unit
+                    CaptureLibApplyResult.STALE, CaptureLibApplyResult.CONFLICT ->
+                        throw IOException("archive confirmation conflicts with local state")
+                }
+            }
             val manifestFile = File(dir, "manifest.json")
             val manifest = JSONObject(manifestFile.readText())
                 .put("uploaded_at", System.currentTimeMillis())
@@ -1121,10 +1129,23 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             ?: JSONObject(), dir), prepared.captureNotes)
         val captureReview = CaptureMetadataStore.readReview(dir)?.current
             ?.let(::captureReviewLanBody)
-        client.uploadCapture(id, device, manifest.optString("note", ""),
-                             createdAt, ocr, meta,
-                             prepared.photoAssets, captureReview, photos)
-        return ConfirmedDelivery(id, photos.size, photos.map { it.first })
+        val confirmation = client.uploadCapture(
+            id,
+            device,
+            manifest.optString("note", ""),
+            createdAt,
+            ocr,
+            meta,
+            prepared.photoAssets,
+            captureReview,
+            photos,
+        )
+        return ConfirmedDelivery(
+            id,
+            photos.size,
+            photos.map { it.first },
+            confirmation,
+        )
     }
 
     /** Read the entry's frozen provenance and fold it into the outgoing meta —
@@ -1200,8 +1221,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
         val waitingForImport = sent.filter { isRemoteImportPending(it.cloudStatus) }
         var importQueryFailed = false
-        val statuses = if (waitingForImport.isEmpty()) emptyMap() else try {
-            client.captureStatuses(waitingForImport.map { it.id })
+        val importStates = if (waitingForImport.isEmpty()) emptyMap() else try {
+            client.captureImportStates(waitingForImport.map { it.id })
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -1209,18 +1230,30 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             emptyMap()
         }
         for (entry in waitingForImport) {
-            val status = statuses[entry.id]?.let(::normalizeRemoteImportStatus) ?: continue
-            if (status == normalizeRemoteImportStatus(entry.cloudStatus)) continue
+            val remote = importStates[entry.id] ?: continue
+            val status = normalizeRemoteImportStatus(remote.status)
+            if (status == normalizeRemoteImportStatus(entry.cloudStatus) &&
+                remote.confirmation == null
+            ) continue
             try {
                 EntryOperationLocks.withLock(entry.id) {
                     val manifestFile = File(entry.dir, "manifest.json")
                     if (!manifestFile.isFile) return@withLock
-                    Entries.atomicWrite(
-                        manifestFile,
-                        JSONObject(manifestFile.readText())
-                            .put("cloud_status", status)
-                            .toString(),
-                    )
+                    remote.confirmation?.let { confirmation ->
+                        if (CaptureLibAssociationStore.apply(
+                                entry.dir,
+                                confirmation,
+                            ) == CaptureLibApplyResult.CONFLICT
+                        ) return@withLock
+                    }
+                    if (status != normalizeRemoteImportStatus(entry.cloudStatus)) {
+                        Entries.atomicWrite(
+                            manifestFile,
+                            JSONObject(manifestFile.readText())
+                                .put("cloud_status", status)
+                                .toString(),
+                        )
+                    }
                 }
             } catch (_: Exception) { }
         }

@@ -1,11 +1,54 @@
 package org.whl.bookcapture
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HomeListPresentationTest {
+    private fun libConfirmation(
+        state: CaptureLibAssociationState,
+    ): CaptureLibConfirmation = CaptureLibConfirmation(
+        captureId = "11111111-2222-4333-8444-555555555555",
+        streamId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        revision = 1,
+        updatedAt = "2026-07-23T12:35:00+00:00",
+        association = CaptureLibAssociation(
+            captureId = "11111111-2222-4333-8444-555555555555",
+            bookId = "b-" + "a".repeat(32),
+            archiveSha256 = "b".repeat(64),
+            archiveBytes = 12_345,
+            formatVersion = "3.0",
+            state = state,
+            generatedAt = "2026-07-23T12:34:56+00:00",
+            sourceRevision = "sha256:" + "c".repeat(64),
+            sourceFingerprint = "d".repeat(64),
+        ),
+    )
+
+    @Test
+    fun archiveMarkerIsCurrentOnlyAndIndependentOfUploadPresentation() {
+        val current = captureLibMarkerPresentation(
+            libConfirmation(CaptureLibAssociationState.CURRENT),
+            "Local library archive confirmed",
+        )
+        assertTrue(current.visible)
+        assertEquals("Local library archive confirmed", current.accessibilityLabel)
+
+        assertFalse(captureLibMarkerPresentation(
+            libConfirmation(CaptureLibAssociationState.STALE),
+            "Local library archive confirmed",
+        ).visible)
+        assertFalse(captureLibMarkerPresentation(
+            null,
+            "Local library archive confirmed",
+        ).visible)
+        assertEquals(
+            HomeStatusAdornment.UPLOADED,
+            homeStatusPresentation("imported").adornment,
+        )
+    }
 
     private data class Scan(val id: String, val collectionId: String?, val collection: String)
 

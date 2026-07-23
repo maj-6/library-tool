@@ -1347,6 +1347,14 @@ class HomeActivity : AppCompatActivity() {
             for (e in page.items) {
                 val item = checkNotNull(itemById[e.id])
                 val row = inflater.inflate(R.layout.item_home, list, false)
+                val libMarker = captureLibMarkerPresentation(
+                    e.captureLibConfirmation,
+                    getString(R.string.capture_lib_confirmed),
+                )
+                row.findViewById<ImageView>(R.id.captureLibConfirmed).apply {
+                    visibility = if (libMarker.visible) View.VISIBLE else View.GONE
+                    contentDescription = libMarker.accessibilityLabel
+                }
                 row.findViewById<TextView>(R.id.title).text = item.titleLabel
                 row.findViewById<TextView>(R.id.sub).text =
                     listOf(
@@ -1606,6 +1614,7 @@ class HomeActivity : AppCompatActivity() {
         markAttention: () -> Unit,
     ) {
         val summaryIds = listOf(
+            R.id.captureLibConfirmed,
             R.id.title,
             R.id.sub,
             R.id.state,

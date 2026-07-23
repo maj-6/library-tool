@@ -118,6 +118,7 @@ object Entries {
         val provenance: CaptureProvenance? = null,  // null for pre-collections captures
         val desktopBook: DesktopBookMetadata? = null,
         val captureReview: CaptureReviewMetadata? = null,
+        val captureLibConfirmation: CaptureLibConfirmation? = null,
     ) {
         val collectionName: String get() = provenance?.collectionName ?: ""
         val from: String get() = provenance?.from ?: ""
@@ -418,6 +419,7 @@ object Entries {
             provenance = readProvenance(dir),
             desktopBook = CaptureMetadataStore.readDesktopBook(dir),
             captureReview = CaptureMetadataStore.readReview(dir)?.current,
+            captureLibConfirmation = CaptureLibAssociationStore.read(dir),
         )
     }
 

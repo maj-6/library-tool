@@ -52,6 +52,8 @@ COLLECTION_TAG_RESERVATION_HARDENING = SQL[
 COLLECTION_TAG_RESERVATION_HARDENING_FLAT = " ".join(
     COLLECTION_TAG_RESERVATION_HARDENING.split()
 )
+CAPTURE_LIB_ASSOCIATION = SQL["020_capture_lib_association"]
+CAPTURE_LIB_ASSOCIATION_FLAT = " ".join(CAPTURE_LIB_ASSOCIATION.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -436,6 +438,119 @@ def test_capture_phone_sync_retrofits_partial_tables_and_revokes_public():
     assert CAPTURE_PHONE_SYNC.count(
         "owner_id = (select auth.uid())",
     ) == 5
+
+
+# --- 020: trusted capture -> .lib association acknowledgement -------------------
+
+def test_capture_lib_association_is_nullable_revisioned_capture_state():
+    schema = cloud_setup.expected_schema(CAPTURE_LIB_ASSOCIATION)
+    assert schema["captures"] == {
+        "lib_association",
+        "lib_association_revision",
+        "lib_association_updated_at",
+    }
+    assert "lib_association_revision bigint not null default 0" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "captures_lib_association_state_check" in CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "lib_association is null and lib_association_revision = 0" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert ("lib_association is not null and lib_association_revision > 0" in
+            CAPTURE_LIB_ASSOCIATION_FLAT)
+
+
+def test_capture_lib_association_trigger_freezes_and_validates_the_v1_wire():
+    required = {
+        "schema", "version", "capture_id", "book_id", "archive_sha256",
+        "archive_bytes", "format_version", "state", "generated_at",
+        "source_revision", "source_fingerprint",
+    }
+    assert all(f"'{field}'" in CAPTURE_LIB_ASSOCIATION for field in required)
+    assert "org.whl.capture-lib-association" in CAPTURE_LIB_ASSOCIATION
+    assert "association ->> 'state' not in ('current', 'stale')" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "association ->> 'capture_id' <> new.id::text" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "octet_length(association::text) > 8192" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "(association ->> 'archive_bytes')::numeric > 262144000" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "capture archive associations become stale, not null" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert ("([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+            "(\\.[0-9]{1,9})?" in CAPTURE_LIB_ASSOCIATION)
+    assert ("(Z|[+-]((0[0-9]|1[0-3]):[0-5][0-9]|14:00))$" in
+            CAPTURE_LIB_ASSOCIATION)
+    assert "strpos(association ->> 'source_revision', '/') > 0" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+
+
+def test_capture_lib_association_revision_is_server_owned_and_replay_safe():
+    assert "security invoker" in CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "set search_path = ''" in CAPTURE_LIB_ASSOCIATION_FLAT
+    assert "current_user not in ('postgres', 'service_role')" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert ("association is not distinct from old.lib_association" in
+            CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert ("new.lib_association_revision = old.lib_association_revision;" in
+            CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert ("new.lib_association_revision = old.lib_association_revision + 1;"
+            in CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert "old.lib_association_updated_at + interval '1 microsecond'" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert ("revoke all on function private.prepare_capture_lib_association() "
+            "from public, anon, authenticated, service_role;" in
+            CAPTURE_LIB_ASSOCIATION_FLAT)
+    trigger = CAPTURE_LIB_ASSOCIATION_FLAT.split(
+        "create trigger captures_prepare_lib_association", 1,
+    )[1].split("for each row execute function", 1)[0]
+    assert "before insert or update of id, lib_association," in trigger
+
+
+def test_capture_lib_association_retrofits_partial_transport_metadata_before_check():
+    drop_check = CAPTURE_LIB_ASSOCIATION_FLAT.index(
+        "drop constraint if exists captures_lib_association_state_check",
+    )
+    repair_null = CAPTURE_LIB_ASSOCIATION_FLAT.index(
+        "set lib_association_revision = 0, lib_association_updated_at = null",
+    )
+    repair_document = CAPTURE_LIB_ASSOCIATION_FLAT.index(
+        "set lib_association_revision = 1",
+    )
+    validate_documents = CAPTURE_LIB_ASSOCIATION_FLAT.index(
+        "set lib_association = lib_association",
+    )
+    add_check = CAPTURE_LIB_ASSOCIATION_FLAT.index(
+        "add constraint captures_lib_association_state_check",
+    )
+    assert drop_check < repair_null < repair_document < validate_documents < add_check
+
+
+def test_capture_lib_association_grants_block_phone_forgery_and_keep_rls_reads():
+    assert "alter table public.captures enable row level security;" in \
+        CAPTURE_LIB_ASSOCIATION_FLAT
+    assert ("revoke all on public.captures from public, anon;" in
+            CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert ("revoke insert, update, delete on public.captures from authenticated;"
+            in CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert ("grant insert ( id, created_at, device, status, photos, note, "
+            "created_by, contributor, ocr, meta ) on public.captures to "
+            "authenticated;" in CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert ("grant update ( device, status, photos, note, contributor, ocr, "
+            "meta ) on public.captures to authenticated;" in
+            CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert ("grant select on public.captures to authenticated;" in
+            CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert ("grant select, insert, update, delete on public.captures to "
+            "service_role;" in CAPTURE_LIB_ASSOCIATION_FLAT)
+    # The inherited SELECT policy is owner-or-assigned-ingester. Merely being
+    # authenticated never exposes another contributor's association.
+    select_policy = BASELINE_FLAT.split(
+        "create policy captures_select_authorized on captures", 1,
+    )[1].split(";", 1)[0]
+    assert "for select to authenticated using" in select_policy
+    assert "created_by = (select auth.uid())" in select_policy
+    assert "grant_row.ingester_id = (select auth.uid())" in select_policy
+    assert "grant_row.contributor_id = captures.created_by" in select_policy
 
 
 # --- 009: shared collections ------------------------------------------------------

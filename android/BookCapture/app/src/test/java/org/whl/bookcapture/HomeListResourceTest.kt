@@ -275,6 +275,58 @@ class HomeListResourceTest {
         )
     }
 
+    @Test
+    fun confirmedLibMarkerLeadsTitlesAndIsAccessibleAndDistinct() {
+        val home = xml("src/main/res/layout/item_home.xml")
+        val homeMarker = elementById(home, "captureLibConfirmed")
+        val homeTitle = elementById(home, "title")
+        assertEquals(homeTitle.parentNode, homeMarker.parentNode)
+        val titleRow = homeTitle.parentNode.childNodes
+        val orderedIds = (0 until titleRow.length)
+            .mapNotNull { titleRow.item(it) as? Element }
+            .map { it.getAttributeNS(androidNs, "id") }
+        assertTrue(
+            orderedIds.indexOf("@+id/captureLibConfirmed") <
+                orderedIds.indexOf("@+id/title"),
+        )
+        assertEquals("@drawable/ic_lib_confirmed", homeMarker.getAttributeNS(androidNs, "src"))
+        assertEquals("gone", homeMarker.getAttributeNS(androidNs, "visibility"))
+        assertEquals(
+            "@string/capture_lib_confirmed",
+            homeMarker.getAttributeNS(androidNs, "contentDescription"),
+        )
+        assertFalse(
+            homeMarker.getAttributeNS(androidNs, "src") in
+                setOf("@drawable/ic_cloud_done", "@drawable/ic_archive_available"),
+        )
+
+        val detail = xml("src/main/res/layout/activity_entry_detail.xml")
+        val detailMarker = elementById(detail, "captureLibConfirmed")
+        val detailTitle = elementById(detail, "title")
+        assertEquals(detailTitle.parentNode, detailMarker.parentNode)
+        assertEquals("@drawable/ic_lib_confirmed", detailMarker.getAttributeNS(androidNs, "src"))
+
+        val icon = xml("src/main/res/drawable/ic_lib_confirmed.xml")
+        assertTrue(icon.getElementsByTagName("path").length >= 3)
+        val iconText = File("src/main/res/drawable/ic_lib_confirmed.xml").readText()
+        assertTrue(iconText.contains("@color/whl_green"))
+        assertTrue(iconText.contains("@color/whl_face_hi"))
+
+        val homeSource = source("HomeActivity")
+        assertTrue(homeSource.contains("R.id.captureLibConfirmed"))
+        assertTrue(homeSource.contains("captureLibMarkerPresentation("))
+        val summary = homeSource.substringAfter("val summaryIds = listOf(")
+            .substringBefore(")")
+        assertTrue(summary.contains("R.id.captureLibConfirmed"))
+        val detailSource = source("EntryDetailActivity")
+        assertTrue(detailSource.contains("binding.captureLibConfirmed"))
+        assertTrue(detailSource.contains("captureLibMarkerPresentation("))
+        assertTrue(
+            File("src/main/res/values/strings.xml").readText()
+                .contains("Local library archive confirmed"),
+        )
+    }
+
     private fun source(name: String): String =
         File("src/main/java/org/whl/bookcapture/$name.kt").readText()
 

@@ -466,7 +466,7 @@ class CloudPhotoProcessingTest {
         assertTrue(clientSource.contains("/rest/v1/photo_processing_jobs"))
         assertTrue(workerSource.contains("client.photoProcessingJobs(sent.map { it.id })"))
         assertTrue(workerSource.indexOf("client.photoProcessingJobs(sent.map { it.id })") <
-            workerSource.indexOf("client.captureStatuses(waitingForImport.map { it.id })"))
+            workerSource.indexOf("client.captureImportStates(waitingForImport.map { it.id })"))
         assertTrue(workerSource.contains("CloudDisplayReocrWorker.enqueuePending(ctx, entry.id)"))
         assertTrue(settingsSource.contains("CloudDisplayReocrWorker.enqueueAllPending(this)"))
         assertTrue(reocrSource.contains("Pipeline.ocrResult(display, mistralKey)"))

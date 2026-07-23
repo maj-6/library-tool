@@ -91,6 +91,7 @@
     <string name="home_status_waiting">Waiting</string>
     <string name="home_status_uploaded">Uploaded</string>
     <string name="home_status_imported">Imported</string>
+    <string name="capture_lib_confirmed">Local library archive confirmed</string>
     <plurals name="capture_count">
         <item quantity="one">%1$d page photo</item>
         <item quantity="other">%1$d page photos</item>

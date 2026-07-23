@@ -158,6 +158,27 @@ class CaptureSyncTest {
     }
 
     @Test
+    fun archiveConfirmationIsPersistedBeforeImportedStatusOrLanMove() {
+        val upload = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        val delivered = upload.substringAfter("private fun markDelivered(")
+            .substringBefore("// --- LAN transport")
+        val associationWrite = delivered.indexOf("CaptureLibAssociationStore.apply(")
+        val manifestWrite = delivered.indexOf("Entries.atomicWrite(manifestFile")
+        val move = delivered.indexOf("dir.renameTo(target)")
+        assertTrue(associationWrite >= 0)
+        assertTrue(manifestWrite > associationWrite)
+        assertTrue(move > manifestWrite)
+
+        val poll = upload.substringAfter("private suspend fun pollImports(")
+            .substringBefore("private suspend fun syncCloudPhotoJob(")
+        assertTrue(poll.contains("client.captureImportStates(waitingForImport.map { it.id })"))
+        assertTrue(
+            poll.indexOf("CaptureLibAssociationStore.apply(") <
+                poll.indexOf(".put(\"cloud_status\", status)"),
+        )
+    }
+
+    @Test
     fun everyContinuationRecoversDeliveredAccountingBeforeSelectingItsNextCapture() {
         val upload = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
             .replace("\r\n", "\n")

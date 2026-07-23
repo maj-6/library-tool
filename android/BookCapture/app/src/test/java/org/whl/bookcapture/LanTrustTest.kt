@@ -1,6 +1,8 @@
 package org.whl.bookcapture
 
 import java.net.InetAddress
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -33,5 +35,38 @@ class LanTrustTest {
         assertFalse(isValidCaptureReceipt("entry-1", 200, "other", "imported", "entry-1"))
         assertFalse(isValidCaptureReceipt("entry-1", 200, "whl-capture", "ok", "entry-1"))
         assertFalse(isValidCaptureReceipt("entry-1", 200, "whl-capture", "imported", "entry-2"))
+    }
+
+    @Test
+    fun archiveConfirmationEnvelopeIsCaptureBoundAndPathFree() {
+        val captureId = "11111111-2222-4333-8444-555555555555"
+        val envelope = JSONObject()
+            .put("schema", "org.whl.capture-lib-confirmation")
+            .put("version", 1)
+            .put("capture_id", captureId)
+            .put("stream_id", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+            .put("revision", 1)
+            .put("updated_at", "2026-07-23T12:35:00+00:00")
+            .put("association", JSONObject()
+                .put("schema", "org.whl.capture-lib-association")
+                .put("version", 1)
+                .put("capture_id", captureId)
+                .put("book_id", "b-" + "a".repeat(32))
+                .put("archive_sha256", "b".repeat(64))
+                .put("archive_bytes", 12345)
+                .put("format_version", "3.0")
+                .put("state", "current")
+                .put("generated_at", "2026-07-23T12:34:56+00:00")
+                .put("source_revision", "sha256:" + "c".repeat(64))
+                .put("source_fingerprint", "d".repeat(64)))
+        val parsed = captureLibConfirmationFromJson(envelope, captureId)!!
+        assertTrue(parsed.confirmed)
+        assertEquals(captureId, parsed.captureId)
+        assertFalse(envelope.toString().contains("path", ignoreCase = true))
+        assertFalse(envelope.toString().contains("credential", ignoreCase = true))
+        assertTrue(captureLibConfirmationFromJson(
+            JSONObject(envelope.toString()).put("capture_id", parsed.streamId),
+            captureId,
+        ) == null)
     }
 }

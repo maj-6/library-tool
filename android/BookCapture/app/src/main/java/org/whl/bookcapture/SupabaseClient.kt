@@ -19,6 +19,7 @@ private val SAFE_CLOUD_FILTER_TOKEN = Regex("[A-Za-z0-9._-]+")
 private const val DEFAULT_SUPABASE_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 private const val SUPABASE_ERROR_RESPONSE_MAX_BYTES = 16 * 1024
 private const val CAPTURE_REVIEW_RESPONSE_MAX_BYTES = 128 * 1024
+private const val CAPTURE_IMPORT_ROW_MAX_BYTES = 12 * 1024
 
 private class SupabaseResponseTooLarge : IOException("Supabase response is too large")
 
@@ -233,15 +234,59 @@ class SupabaseClient(
 
     /** status per capture id for OUR rows (RLS scopes the select) — how the
      *  recent list learns "uploaded" became "imported". */
-    fun captureStatuses(ids: List<String>): Map<String, String> {
-        if (ids.isEmpty()) return emptyMap()
-        val list = ids.joinToString(",")
-        val conn = open("GET", "$baseUrl/rest/v1/captures?id=in.($list)&select=id,status", null)
-        val rows = JSONArray(finish(conn).ifEmpty { "[]" })
-        return (0 until rows.length()).associate {
-            rows.getJSONObject(it).let { r -> r.getString("id") to r.optString("status") }
+    internal fun captureImportStates(ids: List<String>): Map<String, CaptureImportState> {
+        val out = linkedMapOf<String, CaptureImportState>()
+        for (batch in safeCaptureSyncIds(ids).chunked(CAPTURE_METADATA_BATCH_SIZE)) {
+            fetchCaptureImportStatesIsolated(batch, out)
+        }
+        return out
+    }
+
+    /** Split a malformed or oversized response down to one row. A corrupt
+     * association remains unconfirmed without suppressing unrelated imports. */
+    private fun fetchCaptureImportStatesIsolated(
+        batch: List<String>,
+        out: MutableMap<String, CaptureImportState>,
+    ) {
+        if (batch.isEmpty()) return
+        try {
+            val filter = batch.joinToString(",") {
+                URLEncoder.encode(it, Charsets.UTF_8.name())
+            }
+            val select = "id,status,created_by,lib_association," +
+                "lib_association_revision,lib_association_updated_at"
+            val conn = open(
+                "GET",
+                "$baseUrl/rest/v1/captures?id=in.($filter)&select=$select&order=id.asc",
+                null,
+            )
+            val maximum = batch.size * CAPTURE_IMPORT_ROW_MAX_BYTES + 8 * 1024
+            val rows = try {
+                JSONArray(finish(conn, maximum).ifEmpty { "[]" })
+            } catch (e: org.json.JSONException) {
+                throw InvalidResponse("invalid capture import response")
+            }
+            for (index in 0 until rows.length()) {
+                val parsed = rows.optJSONObject(index)
+                    ?.let { captureImportStateFromJson(it, ownerId) }
+                    ?: throw InvalidResponse("invalid capture import row")
+                if (parsed.captureId !in batch || parsed.captureId in out) {
+                    throw InvalidResponse("duplicate or out-of-scope capture import row")
+                }
+                out[parsed.captureId] = parsed
+            }
+        } catch (e: Exception) {
+            if (e !is InvalidResponse && e !is SupabaseResponseTooLarge) throw e
+            if (batch.size == 1) return
+            val midpoint = batch.size / 2
+            fetchCaptureImportStatesIsolated(batch.subList(0, midpoint), out)
+            fetchCaptureImportStatesIsolated(batch.subList(midpoint, batch.size), out)
         }
     }
+
+    @Deprecated("Use captureImportStates so status and association stay coupled")
+    fun captureStatuses(ids: List<String>): Map<String, String> =
+        captureImportStates(ids).mapValues { it.value.status }
 
     /** Desktop-authored projections for this account's retained captures.
      * The table's RLS is owner-only; checking owner_id again fails closed if a
