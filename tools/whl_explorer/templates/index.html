@@ -58,6 +58,9 @@
           <button class="menu-item" data-cmd="run-scans" type="button">Run scans</button>
           <button class="menu-item" data-cmd="scrape" type="button">Scrape WHL</button>
           <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="corrections" type="button">Open Corrections</button>
+          <button class="menu-item" data-cmd="corrections-new" type="button">Open New Corrections Window</button>
+          <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="opt-auto-ia" type="button"><span class="menu-check"></span>Auto-download IA scans</button>
           <button class="menu-item" data-cmd="opt-expand-sets" type="button"><span class="menu-check"></span>Expand multi-volume sets</button>
         </div>
@@ -2596,6 +2599,7 @@
   </div>
 
   <script src="{{ url_for('static', filename='engine-client.js') }}?v={{ engine_v }}"></script>
+  <script src="{{ url_for('static', filename='workbench-launch.js') }}?v={{ workbench_launch_v }}"></script>
   <script src="{{ url_for('static', filename='app.js') }}?v={{ app_v }}"></script>
 </body>
 </html>
