@@ -24,6 +24,14 @@ from librarytool.engine.errors import (
     RepositoryError,
     ValidationError,
 )
+from librarytool.engine.corrections import (
+    AssignImageCategoryCommand,
+    AssignRegionRoleCommand,
+    ClearImageCategoryCommand,
+    ClearRegionRoleCommand,
+    CorrectionCommandResult,
+    CorrectionService,
+)
 from librarytool.engine.raster_artifacts import (
     RasterArtifactKey,
     RasterArtifactProjectorPort,
@@ -32,6 +40,7 @@ from librarytool.engine.raster_artifacts import (
     ResourceState,
 )
 from librarytool.engine.runtime import (
+    CORRECTION_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
     LibraryEngine,
@@ -44,6 +53,7 @@ from librarytool.engine.spatial_annotations import (
 
 
 ARTIFACT_PAGE_LIMIT = 512
+CORRECTION_MUTATION_MAX_BYTES = 64 * 1024
 _CURSOR_SCHEMA = "librarytool.corrections-cursor/1"
 _RASTER_GROUP_KINDS = {
     "source-images": frozenset(
@@ -78,6 +88,8 @@ def _raster_group(value: RasterArtifactView) -> str:
 
 
 def _error_status(error: EngineError) -> int:
+    if error.code == "correction_mutation_too_large":
+        return 413
     if isinstance(error, NotFoundError):
         return 404
     if isinstance(error, PreconditionRequiredError):
@@ -153,6 +165,264 @@ def _spatial_service(
         engine_for_request,
         SPATIAL_ANNOTATION_QUERY_SERVICE,
         "spatial annotation",
+    )
+
+
+def _correction_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_SERVICE,
+        "correction command",
+    )
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _mutation_document(fields: frozenset[str]) -> Mapping[str, Any]:
+    length = request.content_length
+    if length is not None and length > CORRECTION_MUTATION_MAX_BYTES:
+        raise ValidationError(
+            "the correction mutation document is too large",
+            code="correction_mutation_too_large",
+            details={"maximum_bytes": CORRECTION_MUTATION_MAX_BYTES},
+        )
+    if request.mimetype != "application/json":
+        raise ValidationError(
+            "the correction mutation must use application/json",
+            code="invalid_correction_mutation_document",
+            details={"content_type": str(request.content_type or "")},
+        )
+    charset = request.mimetype_params.get("charset", "utf-8").casefold()
+    if charset not in {"utf-8", "utf8"} or request.content_encoding:
+        raise ValidationError(
+            "the correction mutation must use unencoded UTF-8 JSON",
+            code="invalid_correction_mutation_document",
+            details={"content_type": str(request.content_type or "")},
+        )
+    encoded = request.stream.read(CORRECTION_MUTATION_MAX_BYTES + 1)
+    if len(encoded) > CORRECTION_MUTATION_MAX_BYTES:
+        raise ValidationError(
+            "the correction mutation document is too large",
+            code="correction_mutation_too_large",
+            details={"maximum_bytes": CORRECTION_MUTATION_MAX_BYTES},
+        )
+    try:
+        value = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda _token: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")
+            ),
+        )
+    except (RecursionError, TypeError, UnicodeError, ValueError) as error:
+        raise ValidationError(
+            "the correction mutation document is invalid JSON",
+            code="invalid_correction_mutation_document",
+            details={"cause_type": type(error).__name__},
+        ) from error
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValidationError(
+            "the correction mutation fields do not match the schema",
+            code="invalid_correction_mutation_envelope",
+            details={"fields": sorted(fields)},
+        )
+    return value
+
+
+def _operation_id() -> str:
+    value = request.headers.get("Idempotency-Key")
+    if value is None or value == "":
+        raise PreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={"header": "Idempotency-Key"},
+        )
+    return value
+
+
+def _strong_revision(header: str) -> str:
+    raw = request.headers.get(header)
+    if raw is None or raw == "":
+        raise PreconditionRequiredError(
+            f"{header} is required",
+            code="correction_target_revision_required",
+            details={"header": header},
+        )
+    token = raw[1:-1] if len(raw) >= 2 else ""
+    if (
+        raw != raw.strip()
+        or raw.startswith("W/")
+        or len(raw) < 3
+        or raw[0] != '"'
+        or raw[-1] != '"'
+        or len(token) > 512
+        or any(
+            not 0x21 <= ord(character) <= 0x7E or character in {'"', "\\"}
+            for character in token
+        )
+    ):
+        raise ValidationError(
+            f"{header} must contain one strong quoted revision",
+            code="invalid_correction_target_revision",
+            details={"header": header},
+        )
+    return token
+
+
+def _optional_linked_revision(linked_artifact_id: str) -> str:
+    raw = request.headers.get("If-Linked-Artifact-Match")
+    if linked_artifact_id:
+        return _strong_revision("If-Linked-Artifact-Match")
+    if raw not in (None, ""):
+        raise ValidationError(
+            "a linked-artifact revision requires a linked artifact",
+            code="unexpected_linked_artifact_revision",
+            details={"header": "If-Linked-Artifact-Match"},
+        )
+    return ""
+
+
+def _string_field(
+    document: Mapping[str, Any],
+    name: str,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    value = document[name]
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise ValidationError(
+            f"{name} must be a string",
+            code="invalid_correction_mutation_document",
+            details={"field": name},
+        )
+    return value
+
+
+def _mutation_response(result: CorrectionCommandResult) -> Response:
+    if not isinstance(result, CorrectionCommandResult):
+        raise RepositoryError(
+            "the correction service returned an invalid result",
+            code="invalid_correction_mutation_result",
+        )
+    response = jsonify(
+        {
+            "ok": True,
+            "schema": "librarytool.correction-mutation-receipt/1",
+            **result.as_dict(),
+        }
+    )
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Aggregate-Revision"] = result.receipt.after_aggregate_revision
+    return response
+
+
+def _assign_category(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Artifact-Match")
+    document = _mutation_document(frozenset({"category"}))
+    return _mutation_response(
+        _correction_service(engine_for_request).assign_category(
+            AssignImageCategoryCommand(
+                item_id=item_id,
+                artifact_id=artifact_id,
+                expected_artifact_revision=expected_revision,
+                category=_string_field(document, "category"),
+                operation_id=operation_id,
+            )
+        )
+    )
+
+
+def _clear_category(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Artifact-Match")
+    _mutation_document(frozenset())
+    return _mutation_response(
+        _correction_service(engine_for_request).clear_category(
+            ClearImageCategoryCommand(
+                item_id=item_id,
+                artifact_id=artifact_id,
+                expected_artifact_revision=expected_revision,
+                operation_id=operation_id,
+            )
+        )
+    )
+
+
+def _assign_role(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    annotation_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Annotation-Match")
+    document = _mutation_document(frozenset({"role", "linked_artifact_id"}))
+    linked_artifact_id = _string_field(
+        document,
+        "linked_artifact_id",
+        allow_empty=True,
+    )
+    return _mutation_response(
+        _correction_service(engine_for_request).assign_region_role(
+            AssignRegionRoleCommand(
+                item_id=item_id,
+                annotation_id=annotation_id,
+                expected_annotation_revision=expected_revision,
+                role=_string_field(document, "role"),
+                operation_id=operation_id,
+                linked_artifact_id=linked_artifact_id,
+                expected_linked_artifact_revision=(
+                    _optional_linked_revision(linked_artifact_id)
+                ),
+            )
+        )
+    )
+
+
+def _clear_role(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    annotation_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Annotation-Match")
+    document = _mutation_document(frozenset({"linked_artifact_id"}))
+    linked_artifact_id = _string_field(
+        document,
+        "linked_artifact_id",
+        allow_empty=True,
+    )
+    return _mutation_response(
+        _correction_service(engine_for_request).clear_region_role(
+            ClearRegionRoleCommand(
+                item_id=item_id,
+                annotation_id=annotation_id,
+                expected_annotation_revision=expected_revision,
+                operation_id=operation_id,
+                linked_artifact_id=linked_artifact_id,
+                expected_linked_artifact_revision=(
+                    _optional_linked_revision(linked_artifact_id)
+                ),
+            )
+        )
     )
 
 
@@ -401,13 +671,14 @@ def _raster_detail(
             code="invalid_raster_artifact_projection",
             details=key.as_dict(),
         )
+    body = {
+        "ok": True,
+        "schema": "librarytool.raster-artifact/1",
+        "artifact": value.as_dict(),
+    }
     return _conditional_json(
-        {
-            "ok": True,
-            "schema": "librarytool.raster-artifact/1",
-            "artifact": value.as_dict(),
-        },
-        value.revision,
+        body,
+        _collection_revision("rad-", (body,)),
     )
 
 
@@ -466,13 +737,14 @@ def _spatial_detail(
             code="invalid_spatial_annotation_projection",
             details=key.as_dict(),
         )
+    body = {
+        "ok": True,
+        "schema": "librarytool.spatial-annotation/1",
+        "annotation": value.as_dict(),
+    }
     return _conditional_json(
-        {
-            "ok": True,
-            "schema": "librarytool.spatial-annotation/1",
-            "annotation": value.as_dict(),
-        },
-        value.revision,
+        body,
+        _collection_revision("sad-", (body,)),
     )
 
 
@@ -670,10 +942,57 @@ def create_corrections_blueprint(
         except EngineError as error:
             return _error_response(error)
 
+    @blueprint.put("/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/category")
+    def assign_image_category(item_id: str, artifact_id: str):
+        try:
+            return _assign_category(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.delete("/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/category")
+    def clear_image_category(item_id: str, artifact_id: str):
+        try:
+            return _clear_category(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.put("/api/v1/items/<item_id>/spatial-annotations/<annotation_id>/role")
+    def assign_region_role(item_id: str, annotation_id: str):
+        try:
+            return _assign_role(
+                engine_for_request,
+                item_id,
+                annotation_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.delete(
+        "/api/v1/items/<item_id>/spatial-annotations/<annotation_id>/role"
+    )
+    def clear_region_role(item_id: str, annotation_id: str):
+        try:
+            return _clear_role(
+                engine_for_request,
+                item_id,
+                annotation_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
     return blueprint
 
 
 __all__ = [
     "ARTIFACT_PAGE_LIMIT",
+    "CORRECTION_MUTATION_MAX_BYTES",
     "create_corrections_blueprint",
 ]

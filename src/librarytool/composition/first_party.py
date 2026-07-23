@@ -22,6 +22,7 @@ from ..engine.raster_artifacts import (
 from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
+    CORRECTION_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -53,6 +54,12 @@ from ..engine.workbench_policies import (
     TextLayerWorkbenchPolicy,
     TranslationWorkbenchPolicy,
 )
+
+
+RASTER_ARTIFACTS_CLASSIFY_CAPABILITY = CapabilityRef(
+    "library.raster-artifacts.classify"
+)
+SPATIAL_ANNOTATIONS_EDIT_CAPABILITY = CapabilityRef("library.spatial-annotations.edit")
 
 
 FIRST_PARTY_MODULE_MANIFESTS = (
@@ -128,6 +135,18 @@ FIRST_PARTY_MODULE_MANIFESTS = (
             SPATIAL_ANNOTATIONS_READ_CAPABILITY,
         ),
         requires=(CapabilityRef("library.items.read"),),
+    ),
+    ModuleManifest(
+        "library.corrections.commands",
+        "1.0.0",
+        provides=(
+            RASTER_ARTIFACTS_CLASSIFY_CAPABILITY,
+            SPATIAL_ANNOTATIONS_EDIT_CAPABILITY,
+        ),
+        requires=(
+            RASTER_ARTIFACTS_READ_CAPABILITY,
+            SPATIAL_ANNOTATIONS_READ_CAPABILITY,
+        ),
     ),
     ModuleManifest(
         "library.text-layers",
@@ -237,7 +256,11 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             RASTER_ARTIFACTS_READ_CAPABILITY,
             SPATIAL_ANNOTATIONS_READ_CAPABILITY,
         ),
-        enhances=(CapabilityRef("library.jobs"),),
+        enhances=(
+            CapabilityRef("library.jobs"),
+            RASTER_ARTIFACTS_CLASSIFY_CAPABILITY,
+            SPATIAL_ANNOTATIONS_EDIT_CAPABILITY,
+        ),
     ),
 )
 
@@ -377,6 +400,20 @@ def first_party_module_contributions(
                     ),
                 ),
                 workbenches=(workbenches[CORRECTIONS_WORKBENCH_ID],),
+            )
+        )
+
+    if graph.correction_commands is not None:
+        contributions.append(
+            ModuleContribution(
+                modules["library.corrections.commands"],
+                bindings=(
+                    ServiceBinding(
+                        CORRECTION_SERVICE,
+                        graph.correction_commands,
+                        modules["library.corrections.commands"].provides,
+                    ),
+                ),
             )
         )
 

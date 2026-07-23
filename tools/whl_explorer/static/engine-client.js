@@ -934,6 +934,126 @@
       receipt.tombstone.restored_item_revision === receipt.restored_item_revision;
   }
 
+  const CORRECTION_ACTIONS = new Set([
+    "category.assign",
+    "category.clear",
+    "role.assign",
+    "role.clear",
+  ]);
+
+  function isCorrectionTarget(value) {
+    return hasExactKeys(value, [
+      "kind", "target_id", "before_revision", "after_revision",
+    ]) && ["artifact", "annotation", "review"].includes(value.kind) &&
+      isPortableIdentifier(value.target_id) &&
+      isArtifactRevision(value.before_revision) &&
+      isArtifactRevision(value.after_revision) &&
+      value.before_revision !== value.after_revision;
+  }
+
+  function sameCorrectionTargets(left, right) {
+    return Array.isArray(left) && Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) =>
+        isCorrectionTarget(value) && isCorrectionTarget(right[index]) &&
+        value.kind === right[index].kind &&
+        value.target_id === right[index].target_id &&
+        value.before_revision === right[index].before_revision &&
+        value.after_revision === right[index].after_revision);
+  }
+
+  function isCorrectionInversePayload(inverse, expected) {
+    const payload = inverse.payload;
+    if (!isBoundedArtifactJson(payload)) return false;
+    const artifact = expected.targets.find((value) =>
+      value.kind === "artifact");
+    const annotation = expected.targets.find((value) =>
+      value.kind === "annotation");
+    if (expected.action.startsWith("category.")) {
+      if (!artifact || annotation ||
+          !["category.assign", "category.clear"].includes(inverse.action) ||
+          (expected.action === "category.clear" &&
+            inverse.action !== "category.assign")) {
+        return false;
+      }
+      if (inverse.action === "category.clear") {
+        return hasExactKeys(payload, ["artifact_id"]) &&
+          payload.artifact_id === artifact.targetId;
+      }
+      return hasExactKeys(payload, ["artifact_id", "assignment"]) &&
+        payload.artifact_id === artifact.targetId &&
+        isCategoryAssignment(payload.assignment) &&
+        payload.assignment.origin === "manual";
+    }
+    if (!annotation ||
+        !["role.assign", "role.clear"].includes(inverse.action) ||
+        (expected.action === "role.clear" &&
+          inverse.action !== "role.assign")) return false;
+    const fields = inverse.action === "role.assign"
+      ? [
+          "annotation_id", "assignment", "linked_artifact_id",
+          "linked_assignment",
+        ]
+      : [
+          "annotation_id", "linked_artifact_id", "linked_assignment",
+        ];
+    if (!hasExactKeys(payload, fields) ||
+        payload.annotation_id !== annotation.targetId ||
+        payload.linked_artifact_id !== (artifact ? artifact.targetId : "") ||
+        (!artifact && payload.linked_assignment !== null) ||
+        (payload.linked_assignment !== null &&
+          (!isRoleAssignment(payload.linked_assignment) ||
+            payload.linked_assignment.origin !== "manual"))) return false;
+    return inverse.action === "role.clear" ||
+      isRoleAssignment(payload.assignment) &&
+      payload.assignment.origin === "manual";
+  }
+
+  function isCorrectionReceipt(receipt, expected) {
+    if (!hasExactKeys(receipt, [
+      "action", "operation_id", "item_id",
+      "before_aggregate_revision", "after_aggregate_revision",
+      "targets", "inverse",
+    ]) || receipt.action !== expected.action ||
+        !CORRECTION_ACTIONS.has(receipt.action) ||
+        receipt.operation_id !== expected.operationId ||
+        receipt.item_id !== expected.itemId ||
+        !isArtifactRevision(receipt.before_aggregate_revision) ||
+        !isArtifactRevision(receipt.after_aggregate_revision) ||
+        receipt.before_aggregate_revision === receipt.after_aggregate_revision ||
+        !Array.isArray(receipt.targets) ||
+        receipt.targets.length !== expected.targets.length ||
+        !receipt.targets.every(isCorrectionTarget)) return false;
+
+    const identities = receipt.targets.map((value) =>
+      `${value.kind}\u0000${value.target_id}`);
+    if (new Set(identities).size !== identities.length ||
+        identities.some((value, index) =>
+          index > 0 && value <= identities[index - 1])) return false;
+    for (const target of expected.targets) {
+      const actual = receipt.targets.find((value) =>
+        value.kind === target.kind && value.target_id === target.targetId);
+      if (!actual || actual.before_revision !== target.beforeRevision) {
+        return false;
+      }
+    }
+
+    const inverse = receipt.inverse;
+    return hasExactKeys(inverse, [
+      "action", "expected_aggregate_revision", "expected_targets", "payload",
+    ]) && typeof inverse.action === "string" &&
+      [
+        ...CORRECTION_ACTIONS,
+        "caption.set", "caption.clear", "metadata.assert",
+        "attention.mark", "attention.resolve", "attention.reopen",
+        "attention.clear",
+      ].includes(inverse.action) &&
+      inverse.expected_aggregate_revision ===
+        receipt.after_aggregate_revision &&
+      sameCorrectionTargets(inverse.expected_targets, receipt.targets) &&
+      isCorrectionInversePayload(inverse, expected);
+  }
+
   function fallbackCode(status) {
     if (status === 409) return "conflict";
     if (status === 428) return "precondition-required";
@@ -1025,6 +1145,16 @@
       this.spatialAnnotations = Object.freeze({
         list: (args) => this._spatialAnnotationList(args),
         get: (args) => this._spatialAnnotationGet(args),
+      });
+      this.corrections = Object.freeze({
+        assignImageCategory: (args) =>
+          this._correctionAssignImageCategory(args),
+        clearImageCategory: (args) =>
+          this._correctionClearImageCategory(args),
+        assignRegionRole: (args) =>
+          this._correctionAssignRegionRole(args),
+        clearRegionRole: (args) =>
+          this._correctionClearRegionRole(args),
       });
       this.itemTombstones = Object.freeze({
         list: (args) => this._itemTombstonesList(args),
@@ -1742,6 +1872,188 @@
         }
         return body;
       });
+    }
+
+    _correctionAssignImageCategory({ itemId, artifactId,
+      expectedArtifactRevision, category, idempotencyKey, signal } = {}) {
+      if (!ARTIFACT_CATEGORIES.has(category)) {
+        throw new TypeError("category is not a supported image category");
+      }
+      return this._correctionMutation({
+        action: "category.assign",
+        method: "PUT",
+        itemId,
+        targetId: artifactId,
+        targetKind: "artifact",
+        expectedTargetRevision: expectedArtifactRevision,
+        idempotencyKey,
+        pathSuffix: "raster-artifacts",
+        mutationSuffix: "category",
+        revisionHeader: "If-Artifact-Match",
+        body: { category },
+        signal,
+      });
+    }
+
+    _correctionClearImageCategory({ itemId, artifactId,
+      expectedArtifactRevision, idempotencyKey, signal } = {}) {
+      return this._correctionMutation({
+        action: "category.clear",
+        method: "DELETE",
+        itemId,
+        targetId: artifactId,
+        targetKind: "artifact",
+        expectedTargetRevision: expectedArtifactRevision,
+        idempotencyKey,
+        pathSuffix: "raster-artifacts",
+        mutationSuffix: "category",
+        revisionHeader: "If-Artifact-Match",
+        body: {},
+        signal,
+      });
+    }
+
+    _correctionAssignRegionRole({ itemId, annotationId,
+      expectedAnnotationRevision, role, linkedArtifactId = "",
+      expectedLinkedArtifactRevision = "", idempotencyKey, signal } = {}) {
+      const assignedRole = portableIdentifier(role, "role");
+      return this._correctionRoleMutation({
+        action: "role.assign",
+        method: "PUT",
+        itemId,
+        annotationId,
+        expectedAnnotationRevision,
+        role: assignedRole,
+        linkedArtifactId,
+        expectedLinkedArtifactRevision,
+        idempotencyKey,
+        signal,
+      });
+    }
+
+    _correctionClearRegionRole({ itemId, annotationId,
+      expectedAnnotationRevision, linkedArtifactId = "",
+      expectedLinkedArtifactRevision = "", idempotencyKey, signal } = {}) {
+      return this._correctionRoleMutation({
+        action: "role.clear",
+        method: "DELETE",
+        itemId,
+        annotationId,
+        expectedAnnotationRevision,
+        linkedArtifactId,
+        expectedLinkedArtifactRevision,
+        idempotencyKey,
+        signal,
+      });
+    }
+
+    _correctionRoleMutation({ action, method, itemId, annotationId,
+      expectedAnnotationRevision, role, linkedArtifactId,
+      expectedLinkedArtifactRevision, idempotencyKey, signal }) {
+      const linkedId = linkedArtifactId === ""
+        ? ""
+        : portableIdentifier(linkedArtifactId, "linkedArtifactId");
+      if (Boolean(linkedId) !== Boolean(expectedLinkedArtifactRevision)) {
+        throw new TypeError(
+          "linkedArtifactId and expectedLinkedArtifactRevision " +
+          "must be supplied together");
+      }
+      if (linkedId && !isArtifactRevision(expectedLinkedArtifactRevision)) {
+        throw new TypeError(
+          "expectedLinkedArtifactRevision is not a valid correction revision");
+      }
+      const linkedRevision = linkedId
+        ? expectedLinkedArtifactRevision
+        : "";
+      const headers = linkedId
+        ? {
+            "If-Linked-Artifact-Match": quoteRevision(
+              linkedRevision, "expectedLinkedArtifactRevision"),
+          }
+        : {};
+      const targets = [{
+        kind: "annotation",
+        targetId: annotationId,
+        beforeRevision: expectedAnnotationRevision,
+      }];
+      if (linkedId) {
+        targets.push({
+          kind: "artifact",
+          targetId: linkedId,
+          beforeRevision: linkedRevision,
+        });
+      }
+      targets.sort((left, right) => {
+        const leftIdentity = `${left.kind}\u0000${left.targetId}`;
+        const rightIdentity = `${right.kind}\u0000${right.targetId}`;
+        return leftIdentity.localeCompare(rightIdentity);
+      });
+      const body = { linked_artifact_id: linkedId };
+      if (action === "role.assign") body.role = role;
+      return this._correctionMutation({
+        action,
+        method,
+        itemId,
+        targetId: annotationId,
+        targetKind: "annotation",
+        expectedTargetRevision: expectedAnnotationRevision,
+        idempotencyKey,
+        pathSuffix: "spatial-annotations",
+        mutationSuffix: "role",
+        revisionHeader: "If-Annotation-Match",
+        headers,
+        body,
+        targets,
+        signal,
+      });
+    }
+
+    async _correctionMutation({ action, method, itemId, targetId, targetKind,
+      expectedTargetRevision, idempotencyKey, pathSuffix, mutationSuffix,
+      revisionHeader, headers = {}, body, targets = null, signal }) {
+      const item = portableIdentifier(itemId, "itemId");
+      const target = portableIdentifier(targetId, `${targetKind}Id`);
+      if (!isArtifactRevision(expectedTargetRevision)) {
+        throw new TypeError(
+          `expected${targetKind[0].toUpperCase()}${targetKind.slice(1)}` +
+          "Revision is not a valid correction revision");
+      }
+      const operationId = operationKey(idempotencyKey, "idempotencyKey");
+      const path = `/v1/items/${encodePart(item)}/${pathSuffix}/` +
+        `${encodePart(target)}/${mutationSuffix}`;
+      const expectedTargets = targets || [{
+        kind: targetKind,
+        targetId: target,
+        beforeRevision: expectedTargetRevision,
+      }];
+      const { body: response, status } = await this._requestJson(method, path, {
+        headers: {
+          "Idempotency-Key": operationId,
+          [revisionHeader]: quoteRevision(
+            expectedTargetRevision, "expectedTargetRevision"),
+          ...headers,
+        },
+        body,
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      });
+      if (status !== 200 || !hasExactKeys(response, [
+        "ok", "schema", "replayed", "receipt",
+      ]) || response.ok !== true ||
+          response.schema !== "librarytool.correction-mutation-receipt/1" ||
+          typeof response.replayed !== "boolean" ||
+          !isCorrectionReceipt(response.receipt, {
+            action,
+            operationId,
+            itemId: item,
+            targets: expectedTargets,
+          }) || containsCommandFingerprint(response)) {
+        this._invalidResponse(
+          "Engine returned an invalid correction mutation receipt",
+          method, path, null, undefined, status);
+      }
+      return response;
     }
 
     _itemReadiness({ itemId, signal } = {}) {

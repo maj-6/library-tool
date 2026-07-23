@@ -42,6 +42,8 @@ from .corrections import (
     ClearImageCategoryCommand,
     ClearManualCaptionCommand,
     ClearRegionRoleCommand,
+    CORRECTION_LINK_AUTHORITY_EXTENSION,
+    CORRECTION_TARGET_AUTHORITY_EXTENSION,
     CorrectionAction,
     CorrectionAggregateSnapshot,
     CorrectionAuditEvent,
@@ -64,6 +66,11 @@ from .corrections import (
     ReviewAuditAction,
     ReviewState,
     SetManualCaptionCommand,
+)
+from .correction_projection import (
+    CorrectionAggregateProjector,
+    CorrectionProjectionService,
+    reconcile_correction_aggregates,
 )
 from .correction_transforms import (
     CORRECTION_OUTPUT_KINDS,
@@ -372,6 +379,8 @@ from .translations import (
 from .workbench_policies import standard_workbench_policies
 
 __all__ = [
+    "CORRECTION_LINK_AUTHORITY_EXTENSION",
+    "CORRECTION_TARGET_AUTHORITY_EXTENSION",
     "CORRECTION_OUTPUT_KINDS",
     "CORRECTION_TRANSFORM_JOB_KIND",
     "CANVAS_PREPARATION_SERVICE",
@@ -409,12 +418,14 @@ __all__ = [
     "CommittedCorrectionOutput",
     "CorrectionAction",
     "CorrectionAggregateSnapshot",
+    "CorrectionAggregateProjector",
     "CorrectionAuditEvent",
     "CorrectionCommand",
     "CorrectionCommandResult",
     "CorrectionHumanAssertions",
     "CorrectionInverse",
     "CorrectionMutationReceipt",
+    "CorrectionProjectionService",
     "CorrectionOutputDraft",
     "CorrectionRepositoryPort",
     "CorrectionReviewSnapshot",
@@ -451,6 +462,7 @@ __all__ = [
     "ReviewAuditAction",
     "ReviewState",
     "SetManualCaptionCommand",
+    "reconcile_correction_aggregates",
     "ArtifactFreshness",
     "ArtifactProvenance",
     "AssignmentOrigin",

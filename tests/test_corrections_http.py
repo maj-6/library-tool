@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from flask import Flask
 
+from librarytool.adapters.filesystem import (
+    FilesystemCorrectionRepository,
+    RecoverableWriteSet,
+)
+from librarytool.engine.correction_projection import (
+    CorrectionAggregateProjector,
+    CorrectionProjectionService,
+    reconcile_correction_aggregates,
+)
+from librarytool.engine.corrections import CorrectionService
 from librarytool.engine.raster_artifacts import (
     ArtifactFreshness,
     ArtifactProvenance,
     RasterArtifactKey,
+    RasterLineageRef,
     RasterArtifactView,
     RasterDimensions,
     RasterResourceRef,
@@ -18,6 +29,7 @@ from librarytool.engine.raster_artifacts import (
     ResourceState,
 )
 from librarytool.engine.runtime import (
+    CORRECTION_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
 )
@@ -134,11 +146,13 @@ class _SpatialProjector:
 
 
 class _Engine:
-    def __init__(self, raster, spatial):
+    def __init__(self, raster, spatial, corrections=None):
         self.services = {
             RASTER_ARTIFACT_QUERY_SERVICE: raster,
             SPATIAL_ANNOTATION_QUERY_SERVICE: spatial,
         }
+        if corrections is not None:
+            self.services[CORRECTION_SERVICE] = corrections
 
     def get_service(self, key):
         return self.services.get(key)
@@ -181,6 +195,55 @@ def _app(engine, resolver=None):
         )
     )
     return app
+
+
+class _Revisions:
+    def __init__(self):
+        self.value = 0
+
+    def __call__(self, kind, target_id):
+        self.value += 1
+        return f"{kind}-{target_id}-mutation-{self.value}"
+
+
+def _mutation_app(
+    tmp_path,
+    *,
+    linked_artifact_ids=("figure-1",),
+):
+    return _projected_app(
+        tmp_path,
+        (
+            _raster("image-1"),
+            _raster("figure-1", kind="extracted-figure"),
+        ),
+        (
+            replace(
+                _annotation("region-1"),
+                linked_artifact_ids=linked_artifact_ids,
+            ),
+        ),
+    )
+
+
+def _projected_app(tmp_path, raster_rows, spatial_rows):
+    rasters = _RasterProjector(raster_rows)
+    spatial = _SpatialProjector(spatial_rows)
+    aggregate = CorrectionAggregateProjector(rasters, spatial)
+    repository = FilesystemCorrectionRepository(
+        RecoverableWriteSet(tmp_path / "workspace"),
+        load_aggregate=aggregate.project,
+        reconcile_aggregate=reconcile_correction_aggregates,
+        revision_factory=_Revisions(),
+        recover=False,
+    )
+    projected = CorrectionProjectionService(
+        rasters,
+        spatial,
+        repository,
+    )
+    corrections = CorrectionService(repository)
+    return _app(_Engine(projected, projected, corrections))
 
 
 def test_raster_list_is_versioned_filterable_and_revision_paged():
@@ -396,3 +459,242 @@ def test_invalid_resolver_result_closes_its_owned_stream():
     assert response.status_code == 500
     assert response.get_json()["code"] == "invalid_raster_resource_resolution"
     assert stream.closed is True
+
+
+def test_category_mutation_replays_and_converges_through_query_projection(
+    tmp_path,
+):
+    client = _mutation_app(tmp_path).test_client()
+    headers = {
+        "Idempotency-Key": "category-op-1",
+        "If-Artifact-Match": '"artifact-image-1-r1"',
+    }
+
+    first = client.put(
+        "/api/v1/items/book-1/raster-artifacts/image-1/category",
+        json={"category": "title_page"},
+        headers=headers,
+    )
+    replay = client.put(
+        "/api/v1/items/book-1/raster-artifacts/image-1/category",
+        json={"category": "title_page"},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert first.headers["Cache-Control"] == "no-store"
+    body = first.get_json()
+    assert body["schema"] == "librarytool.correction-mutation-receipt/1"
+    assert body["replayed"] is False
+    assert "command_sha256" not in body["receipt"]
+    assert replay.status_code == 200
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["receipt"] == body["receipt"]
+
+    detail = client.get("/api/v1/items/book-1/raster-artifacts/image-1").get_json()[
+        "artifact"
+    ]
+    assert detail["effective_category"] == "title_page"
+    assert detail["revision"] == body["receipt"]["targets"][0]["after_revision"]
+
+    stale = client.put(
+        "/api/v1/items/book-1/raster-artifacts/image-1/category",
+        json={"category": "cover"},
+        headers={
+            "Idempotency-Key": "category-op-2",
+            "If-Artifact-Match": '"artifact-image-1-r1"',
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "artifact_revision_conflict"
+
+
+def test_inherited_category_changes_detail_etag_without_changing_child_cas(
+    tmp_path,
+):
+    source = _raster("source-1")
+    child = replace(
+        _raster("child-1", kind="processed-image"),
+        lineage=(
+            RasterLineageRef(
+                "source-1",
+                source.revision,
+                "processed_from",
+            ),
+        ),
+    )
+    client = _projected_app(
+        tmp_path,
+        (source, child),
+        (),
+    ).test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/child-1"
+    before = client.get(endpoint)
+    child_revision = before.get_json()["artifact"]["revision"]
+
+    mutation = client.put(
+        "/api/v1/items/book-1/raster-artifacts/source-1/category",
+        json={"category": "cover"},
+        headers={
+            "Idempotency-Key": "source-category-op",
+            "If-Artifact-Match": f'"{source.revision}"',
+        },
+    )
+    after = client.get(
+        endpoint,
+        headers={"If-None-Match": before.headers["ETag"]},
+    )
+
+    assert mutation.status_code == 200
+    assert after.status_code == 200
+    assert after.headers["ETag"] != before.headers["ETag"]
+    assert after.get_json()["artifact"]["effective_category"] == "cover"
+    assert after.get_json()["artifact"]["revision"] == child_revision
+
+
+def test_linked_region_role_mutates_annotation_and_artifact_atomically(
+    tmp_path,
+):
+    client = _mutation_app(tmp_path).test_client()
+
+    response = client.put(
+        "/api/v1/items/book-1/spatial-annotations/region-1/role",
+        json={"role": "figure", "linked_artifact_id": "figure-1"},
+        headers={
+            "Idempotency-Key": "role-op-1",
+            "If-Annotation-Match": '"annotation-region-1-r1"',
+            "If-Linked-Artifact-Match": '"artifact-figure-1-r1"',
+        },
+    )
+
+    assert response.status_code == 200
+    receipt = response.get_json()["receipt"]
+    assert [(target["kind"], target["target_id"]) for target in receipt["targets"]] == [
+        ("annotation", "region-1"),
+        ("artifact", "figure-1"),
+    ]
+    annotation = client.get(
+        "/api/v1/items/book-1/spatial-annotations/region-1"
+    ).get_json()["annotation"]
+    assert annotation["effective_role"] == "figure"
+    assert annotation["revision"] == receipt["targets"][0]["after_revision"]
+
+
+def test_introduced_figure_link_survives_refresh_and_clears_atomically(
+    tmp_path,
+):
+    client = _mutation_app(
+        tmp_path,
+        linked_artifact_ids=(),
+    ).test_client()
+    assign = client.put(
+        "/api/v1/items/book-1/spatial-annotations/region-1/role",
+        json={"role": "figure", "linked_artifact_id": "figure-1"},
+        headers={
+            "Idempotency-Key": "role-introduce-op",
+            "If-Annotation-Match": '"annotation-region-1-r1"',
+            "If-Linked-Artifact-Match": '"artifact-figure-1-r1"',
+        },
+    )
+    assert assign.status_code == 200
+
+    annotation = client.get(
+        "/api/v1/items/book-1/spatial-annotations/region-1"
+    ).get_json()["annotation"]
+    figure = client.get("/api/v1/items/book-1/raster-artifacts/figure-1").get_json()[
+        "artifact"
+    ]
+    assert annotation["linked_artifact_ids"] == ["figure-1"]
+    clear = client.delete(
+        "/api/v1/items/book-1/spatial-annotations/region-1/role",
+        json={"linked_artifact_id": "figure-1"},
+        headers={
+            "Idempotency-Key": "role-clear-op",
+            "If-Annotation-Match": f'"{annotation["revision"]}"',
+            "If-Linked-Artifact-Match": f'"{figure["revision"]}"',
+        },
+    )
+
+    assert clear.status_code == 200
+    assert [
+        (target["kind"], target["target_id"])
+        for target in clear.get_json()["receipt"]["targets"]
+    ] == [
+        ("annotation", "region-1"),
+        ("artifact", "figure-1"),
+    ]
+    refreshed = client.get(
+        "/api/v1/items/book-1/spatial-annotations/region-1"
+    ).get_json()["annotation"]
+    assert refreshed["effective_role"] == ""
+    assert refreshed["linked_artifact_ids"] == ["figure-1"]
+
+
+def test_ambiguous_region_links_are_readable_but_not_mutable(tmp_path):
+    client = _mutation_app(
+        tmp_path,
+        linked_artifact_ids=("image-1", "figure-1"),
+    ).test_client()
+    detail = client.get("/api/v1/items/book-1/spatial-annotations/region-1")
+    assert detail.status_code == 200
+    assert detail.get_json()["annotation"]["linked_artifact_ids"] == [
+        "figure-1",
+        "image-1",
+    ]
+
+    mutation = client.put(
+        "/api/v1/items/book-1/spatial-annotations/region-1/role",
+        json={"role": "figure", "linked_artifact_id": "figure-1"},
+        headers={
+            "Idempotency-Key": "ambiguous-role-op",
+            "If-Annotation-Match": '"annotation-region-1-r1"',
+            "If-Linked-Artifact-Match": '"artifact-figure-1-r1"',
+        },
+    )
+
+    assert mutation.status_code == 409
+    assert mutation.get_json()["code"] == "linked_artifact_authority_conflict"
+
+
+def test_correction_mutation_transport_rejects_ambiguous_documents(tmp_path):
+    client = _mutation_app(tmp_path).test_client()
+    path = "/api/v1/items/book-1/raster-artifacts/image-1/category"
+
+    missing_operation = client.put(
+        path,
+        data='{"category":"cover"}',
+        content_type="application/json",
+        headers={"If-Artifact-Match": '"artifact-image-1-r1"'},
+    )
+    missing_revision = client.put(
+        path,
+        data='{"category":"cover"}',
+        content_type="application/json",
+        headers={"Idempotency-Key": "category-op-missing-revision"},
+    )
+    duplicate = client.put(
+        path,
+        data='{"category":"cover","category":"spine"}',
+        content_type="application/json",
+        headers={
+            "Idempotency-Key": "category-op-duplicate",
+            "If-Artifact-Match": '"artifact-image-1-r1"',
+        },
+    )
+    extra = client.put(
+        path,
+        json={"category": "cover", "provenance": {"origin": "forged"}},
+        headers={
+            "Idempotency-Key": "category-op-extra",
+            "If-Artifact-Match": '"artifact-image-1-r1"',
+        },
+    )
+
+    assert missing_operation.status_code == 428
+    assert missing_operation.get_json()["code"] == "idempotency_key_required"
+    assert missing_revision.status_code == 428
+    assert missing_revision.get_json()["code"] == "correction_target_revision_required"
+    assert duplicate.status_code == 400
+    assert duplicate.get_json()["code"] == "invalid_correction_mutation_document"
+    assert extra.status_code == 400
+    assert extra.get_json()["code"] == "invalid_correction_mutation_envelope"

@@ -130,8 +130,48 @@
         artifactId.endsWith(":display");
     }
 
+    function correctionCommandPort(client) {
+      const corrections = client && client.corrections;
+      if (!corrections || typeof corrections !== "object") return null;
+      const commands = {};
+      if (typeof corrections.assignImageCategory === "function") {
+        commands.assignImageCategory = ({
+          operationId, ...payload
+        } = {}) => corrections.assignImageCategory({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.clearImageCategory === "function") {
+        commands.clearImageCategory = ({
+          operationId, ...payload
+        } = {}) => corrections.clearImageCategory({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.assignRegionRole === "function") {
+        commands.assignRegionRole = ({
+          operationId, ...payload
+        } = {}) => corrections.assignRegionRole({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.clearRegionRole === "function") {
+        commands.clearRegionRole = ({
+          operationId, ...payload
+        } = {}) => corrections.clearRegionRole({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      return Object.keys(commands).length ? Object.freeze(commands) : null;
+    }
+
     function createCorrectionsEnginePorts(engineClient) {
       const client = requireEngineClient(engineClient);
+      const commands = correctionCommandPort(client);
 
       async function listRasterGroup({ context, group, cursor, limit, signal }) {
         if (!RASTER_GROUPS.has(group)) {
@@ -261,6 +301,7 @@
           },
           listRegions,
         }),
+        ...(commands ? { commands } : {}),
       });
 
       return Object.freeze({ artifacts });

@@ -11,7 +11,9 @@ same service graph without introducing a second locking or recovery domain.
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from inspect import getattr_static
 from pathlib import Path
@@ -28,6 +30,7 @@ from ..adapters.filesystem import (
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
+    FilesystemCorrectionRepository,
     FilesystemCorrectionsArtifactRepository,
     FilesystemInterchangeRepository,
     FilesystemItemCommandRepository,
@@ -46,6 +49,12 @@ from ..engine.canvas_commands import (
     CanvasPreparationRepresentationSnapshot,
     CanvasPreparationService,
 )
+from ..engine.correction_projection import (
+    CorrectionAggregateProjector,
+    CorrectionProjectionService,
+    reconcile_correction_aggregates,
+)
+from ..engine.corrections import CorrectionService
 from ..engine.canvases import CanvasQueryService
 from ..engine.errors import RepositoryError
 from ..engine.interchange import (
@@ -88,6 +97,7 @@ from ..engine.secret_store import (
 from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
+    CORRECTION_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -608,6 +618,31 @@ class _CanvasAuthority:
         return None if value is None else value.revision
 
 
+class _ReentrantContextFactory:
+    """Make one injected lock domain safely nestable on the owning thread."""
+
+    def __init__(self, factory: Callable[[], ContextManager[Any]]) -> None:
+        self._factory = factory
+        self._state = threading.local()
+
+    @contextmanager
+    def __call__(self):
+        depth = int(getattr(self._state, "depth", 0))
+        if depth:
+            self._state.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._state.depth = depth
+            return
+        with self._factory():
+            self._state.depth = 1
+            try:
+                yield
+            finally:
+                self._state.depth = 0
+
+
 @dataclass(frozen=True, slots=True)
 class FilesystemEngineResources:
     """Shared, already-initialized process resources.
@@ -643,6 +678,7 @@ class FilesystemServiceGraph:
     text_layer_aggregate: TextLayerAggregateService | None = None
     secret_store: SecretStoreService | None = None
     provider_discovery: ProviderDiscoveryService | None = None
+    correction_commands: CorrectionService | None = None
     raster_artifacts: RasterArtifactProjectorPort | None = None
     spatial_annotations: SpatialAnnotationProjectorPort | None = None
 
@@ -670,6 +706,11 @@ class FilesystemServiceGraph:
             raise TypeError(
                 "provider_discovery must be a ProviderDiscoveryService or None"
             )
+        if self.correction_commands is not None and not isinstance(
+            self.correction_commands,
+            CorrectionService,
+        ):
+            raise TypeError("correction_commands must be a CorrectionService or None")
 
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
@@ -687,6 +728,7 @@ class FilesystemServiceGraph:
             (TEXT_LAYER_AGGREGATE_SERVICE, self.text_layer_aggregate),
             (SECRET_STORE_SERVICE, self.secret_store),
             (PROVIDER_DISCOVERY_SERVICE, self.provider_discovery),
+            (CORRECTION_SERVICE, self.correction_commands),
             (RASTER_ARTIFACT_QUERY_SERVICE, self.raster_artifacts),
             (
                 SPATIAL_ANNOTATION_QUERY_SERVICE,
@@ -790,8 +832,10 @@ def compose_filesystem_engine(
     )
 
     corrections_artifacts = None
+    correction_commands = None
     if corrections is not None:
-        corrections_artifacts = FilesystemCorrectionsArtifactRepository(
+        corrections_lock = _ReentrantContextFactory(corrections.lock_context_for)
+        corrections_base = FilesystemCorrectionsArtifactRepository(
             resources.write_set,
             item_exists=corrections.item_exists_for,
             capture_id_for=corrections.capture_id_for,
@@ -801,7 +845,24 @@ def compose_filesystem_engine(
             representation_revision_for=(
                 corrections.representation_revision_for
             ),
-            lock_context_for=corrections.lock_context_for,
+            lock_context_for=corrections_lock,
+        )
+        aggregate_projector = CorrectionAggregateProjector(
+            corrections_base,
+            corrections_base,
+        )
+        correction_repository = FilesystemCorrectionRepository(
+            resources.write_set,
+            load_aggregate=aggregate_projector.project,
+            reconcile_aggregate=reconcile_correction_aggregates,
+            lock_context_for=corrections_lock,
+            recover=False,
+        )
+        correction_commands = CorrectionService(correction_repository)
+        corrections_artifacts = CorrectionProjectionService(
+            corrections_base,
+            corrections_base,
+            correction_repository,
         )
 
     canvas_query = None
@@ -1003,6 +1064,7 @@ def compose_filesystem_engine(
         text_layer_aggregate=native_text_layers,
         secret_store=secret_store,
         provider_discovery=(None if providers is None else providers.service),
+        correction_commands=correction_commands,
         raster_artifacts=corrections_artifacts,
         spatial_annotations=corrections_artifacts,
     )

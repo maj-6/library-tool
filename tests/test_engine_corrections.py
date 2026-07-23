@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from librarytool.engine.corrections import (
+    CORRECTION_TARGET_AUTHORITY_EXTENSION,
     AnnotationCorrectionSnapshot,
     ArtifactCorrectionSnapshot,
     ArtifactMetadataAssertion,
@@ -60,6 +61,7 @@ def _artifact(
     captions=(),
     roles=(),
     metadata=(),
+    extensions=None,
 ):
     return ArtifactCorrectionSnapshot(
         key=RasterArtifactKey("book-1", artifact_id),
@@ -69,15 +71,17 @@ def _artifact(
         caption_assertions=captions,
         role_assignments=roles,
         metadata_assertions=metadata,
+        extensions=extensions or {},
     )
 
 
-def _annotation(*, revision="region-r1", roles=()):
+def _annotation(*, revision="region-r1", roles=(), extensions=None):
     return AnnotationCorrectionSnapshot(
         key=SpatialAnnotationKey("book-1", "region-1"),
         revision=revision,
         linked_artifact_id="crop-1",
         role_assignments=roles,
+        extensions=extensions or {},
     )
 
 
@@ -506,6 +510,63 @@ def test_stale_target_revision_and_missing_operation_id_are_typed():
             )
         )
     assert missing.value.code == "operation_id_required"
+
+
+def test_unavailable_authoritative_targets_cannot_be_mutated():
+    aggregate = _aggregate()
+    source = replace(
+        aggregate.artifact("source-1"),
+        revision="source-unavailable-r2",
+        extensions={
+            CORRECTION_TARGET_AUTHORITY_EXTENSION: {"state": "missing"},
+        },
+    )
+    region = replace(
+        aggregate.annotation("region-1"),
+        revision="region-unavailable-r2",
+        extensions={
+            CORRECTION_TARGET_AUTHORITY_EXTENSION: {"state": "missing"},
+        },
+    )
+    unavailable = replace(
+        aggregate,
+        revision="aggregate-unavailable-r2",
+        artifacts=tuple(
+            source if value.key.artifact_id == "source-1" else value
+            for value in aggregate.artifacts
+        ),
+        annotations=(region,),
+    )
+
+    category_repository = _MemoryRepository(unavailable)
+    with pytest.raises(ConflictError) as category:
+        CorrectionService(category_repository).assign_category(
+            AssignImageCategoryCommand(
+                "book-1",
+                "source-1",
+                source.revision,
+                "cover",
+                "unavailable-category-op",
+            )
+        )
+    assert category.value.code == "correction_target_authority_conflict"
+    assert category_repository.stages == 0
+
+    role_repository = _MemoryRepository(unavailable)
+    with pytest.raises(ConflictError) as role:
+        CorrectionService(role_repository).assign_region_role(
+            AssignRegionRoleCommand(
+                "book-1",
+                "region-1",
+                region.revision,
+                "MAR",
+                "unavailable-role-op",
+                linked_artifact_id="crop-1",
+                expected_linked_artifact_revision="crop-1-r1",
+            )
+        )
+    assert role.value.code == "correction_target_authority_conflict"
+    assert role_repository.stages == 0
 
 
 def test_manual_caption_set_and_clear_preserve_machine_assertion():
