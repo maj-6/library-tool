@@ -126,6 +126,27 @@ def test_raster_view_exposes_revisioned_source_lineage_and_assertions():
         view.revision = "artifact-r2"
 
 
+def test_caption_language_matches_the_first_party_client_contract():
+    caption = CaptionAssertion(
+        "A caption",
+        "manual",
+        "caption-r1",
+        language="zh-Hant-TW",
+    )
+    assert caption.language == "zh-Hant-TW"
+
+    overlong_language = "en-" + "-".join(["abcdef"] * 10)
+    assert len(overlong_language) > 64
+    with pytest.raises(ValidationError) as caught:
+        CaptionAssertion(
+            "A caption",
+            "manual",
+            "caption-r1",
+            language=overlong_language,
+        )
+    assert caught.value.code == "invalid_caption_assertion"
+
+
 @pytest.mark.parametrize(
     "resource_id",
     (

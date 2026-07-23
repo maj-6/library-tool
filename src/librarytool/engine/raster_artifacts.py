@@ -47,6 +47,7 @@ _EMPTY_MAPPING: JsonMapping = MappingProxyType({})
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+MAX_CAPTION_LANGUAGE_LENGTH = 64
 _MEDIA_TYPE_RE = re.compile(
     r"^image/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$",
     re.IGNORECASE,
@@ -731,7 +732,12 @@ class CaptionAssertion:
         )
         object.__setattr__(self, "origin", _enum(self.origin, CaptionOrigin, "origin"))
         object.__setattr__(self, "revision", _revision(self.revision, "revision"))
-        if self.language and not _LANGUAGE_RE.fullmatch(self.language):
+        if (
+            not isinstance(self.language, str)
+            or len(self.language) > MAX_CAPTION_LANGUAGE_LENGTH
+            or self.language
+            and not _LANGUAGE_RE.fullmatch(self.language)
+        ):
             raise _validation(
                 "language must be an empty string or a language tag",
                 code="invalid_caption_assertion",
