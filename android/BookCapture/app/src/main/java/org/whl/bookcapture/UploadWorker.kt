@@ -50,6 +50,11 @@ internal fun normalizeRemoteImportStatus(status: String): String =
 internal fun isRemoteImportPending(status: String): Boolean =
     normalizeRemoteImportStatus(status) !in REMOTE_IMPORT_TERMINAL_STATUSES
 
+internal fun sentEntryNeedsLocalRetention(
+    cloudStatus: String,
+    hasPendingCloudPhotoWork: Boolean,
+): Boolean = isRemoteImportPending(cloudStatus) || hasPendingCloudPhotoWork
+
 /** User-facing label for a final cloud import outcome, or null while pending. */
 internal fun remoteImportTerminalLabel(status: String): String? =
     when (normalizeRemoteImportStatus(status)) {
@@ -625,7 +630,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             }
         } else {
             if (!hadError) Prefs.setLastUploadError(ctx, null)
-            if (hasPendingImports(ctx)) scheduleImportPolling(ctx) else Entries.pruneSent(ctx)
+            if (hasPendingImports(ctx)) scheduleImportPolling(ctx)
+            Entries.pruneSent(ctx, ::retainSentEntryLocally)
             Prefs.setCaptureSyncPhase(
                 ctx,
                 syncRequestId,
@@ -1137,26 +1143,36 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         markDelivered(ctx, dir, delivery, "imported", syncRequestId, "lan")
     }
 
-    private fun hasPendingImports(ctx: Context): Boolean = Entries.recent(ctx).any { entry ->
-        entry.uploaded && (
-            isRemoteImportPending(entry.cloudStatus) ||
-                cloudPhotoWorkPending(PhotoAssetStore.read(entry.dir))
-            )
-    }
+    private fun hasPendingImportOrPhotoWork(entry: Entries.Entry): Boolean = runCatching {
+        sentEntryNeedsLocalRetention(
+            entry.cloudStatus,
+            cloudPhotoWorkPending(PhotoAssetStore.read(entry.dir)),
+        )
+    }.getOrDefault(true)
+
+    private fun retainSentEntryLocally(entry: Entries.Entry): Boolean = runCatching {
+        CaptureMetadataStore.hasPendingReviewSync(entry.dir) ||
+            hasPendingImportOrPhotoWork(entry)
+    }.getOrDefault(true)
+
+    private fun hasPendingImports(ctx: Context): Boolean =
+        Entries.recent(ctx).any { it.uploaded && hasPendingImportOrPhotoWork(it) }
 
     /** A delayed poll never drains uploads or changes upload-error state. Its
      * only job is to synchronize already-sent cloud rows. The persisted chain
      * provides later attempts, so a failed cosmetic poll may finish normally. */
     private suspend fun pollImportsOnly(ctx: Context): Result {
-        if (!Prefs.configured(ctx) || !Auth.signedIn(ctx)) return Result.success()
-        val waiting = try {
-            pollImports(ctx, SupabaseClient(ctx))
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            true
+        if (Prefs.configured(ctx) && Auth.signedIn(ctx)) {
+            try {
+                pollImports(ctx, SupabaseClient(ctx))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Known-terminal entries are still safe to prune below. Any
+                // unknown status remains protected for the next bounded poll.
+            }
         }
-        if (!waiting) Entries.pruneSent(ctx)
+        Entries.pruneSent(ctx, ::retainSentEntryLocally)
         return Result.success()
     }
 

@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -85,6 +86,30 @@ class RemoteUiCatalogTest {
             "3 pages",
             formatRemoteUiText(Locale.US, "%q pages", "%d pages", 3),
         )
+    }
+
+    @Test
+    fun derivedValueCacheReusesAndInvalidatesByRevisionAndConfiguration() {
+        val cache = RemoteUiValueCache<Pair<Long, String>, Any>()
+        var builds = 0
+        fun value(key: Pair<Long, String>): Any = cache.getOrBuild(key) {
+            builds += 1
+            Any()
+        }
+
+        val initial = value(4L to "en-US")
+        assertSame(initial, value(4L to "en-US"))
+        assertEquals(1, builds)
+
+        value(5L to "en-US")
+        assertEquals(2, builds)
+
+        value(5L to "fr-FR")
+        assertEquals(3, builds)
+
+        cache.clear()
+        value(5L to "fr-FR")
+        assertEquals(4, builds)
     }
 
     @Test

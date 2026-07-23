@@ -24,6 +24,8 @@ import com.google.android.material.tabs.TabLayout
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityEntryDetailBinding
 import java.io.File
@@ -43,7 +45,10 @@ class EntryDetailActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityEntryDetailBinding
     private var photoJob: Job? = null
-    private var viewerJob: Job? = null
+    private var workerRefreshJob: Job? = null
+    private val comparisonDecodeGate = Semaphore(permits = 1)
+    private var photoRenderGeneration = 0
+    private var viewerDecodeGeneration = 0
     private var viewerDialog: Dialog? = null
     private var ocrExpanded = false
     private var diagnosticsExpanded = false
@@ -76,17 +81,15 @@ class EntryDetailActivity : AppCompatActivity() {
         }
         configureDiagnosticsPanel()
         val entryId = intent.getStringExtra(EXTRA_ID).orEmpty()
-        for (workName in listOf(
-            ProcessWorker.UNIQUE_WORK_NAME,
-            ProcessWorker.BACKLOG_WORK_NAME,
-            ProcessWorker.workNameForEntry(entryId),
-            CaptureMetadataSyncWorker.WORK_NAME,
-            CaptureMetadataSyncWorker.PULL_WORK_NAME,
-        )) {
-            WorkManager.getInstance(this)
-                .getWorkInfosForUniqueWorkLiveData(workName)
-                .observe(this) { render() }
-        }
+        WorkManager.getInstance(this)
+            .getWorkInfosLiveData(activeUniqueWorkQuery(
+                ProcessWorker.UNIQUE_WORK_NAME,
+                ProcessWorker.BACKLOG_WORK_NAME,
+                ProcessWorker.workNameForEntry(entryId),
+                CaptureMetadataSyncWorker.WORK_NAME,
+                CaptureMetadataSyncWorker.PULL_WORK_NAME,
+            ))
+            .observe(this) { scheduleWorkerRefresh() }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -102,13 +105,31 @@ class EntryDetailActivity : AppCompatActivity() {
         render()
     }
 
+    override fun onStop() {
+        photoRenderGeneration++
+        photoJob?.cancel()
+        binding.heroPhoto.onOriginalHoldChanged = null
+        workerRefreshJob?.cancel()
+        workerRefreshJob = null
+        viewerDialog?.dismiss()
+        super.onStop()
+    }
+
     override fun onDestroy() {
         photoJob?.cancel()
+        workerRefreshJob?.cancel()
         diagnosticsJob?.cancel()
-        viewerJob?.cancel()
         viewerDialog?.dismiss()
         viewerDialog = null
         super.onDestroy()
+    }
+
+    private fun scheduleWorkerRefresh() {
+        if (workerRefreshJob?.isActive == true) return
+        workerRefreshJob = lifecycleScope.launch {
+            kotlinx.coroutines.delay(200)
+            render()
+        }
     }
 
     private fun render() {
@@ -405,8 +426,10 @@ class EntryDetailActivity : AppCompatActivity() {
     }
 
     private fun renderPhotos(entry: Entries.Entry) {
+        val renderGeneration = ++photoRenderGeneration
         photoJob?.cancel()
         binding.photos.removeAllViews()
+        binding.heroPhoto.onOriginalHoldChanged = null
         binding.heroPhoto.setPhotoBitmap(null)
         val descriptors = entry.photoDescriptors()
         val heroFile = entry.detailHeroPhoto()
@@ -424,44 +447,58 @@ class EntryDetailActivity : AppCompatActivity() {
         }
 
         photoJob = lifecycleScope.launch {
-            val (heroBitmap, heroOriginal) = withContext(Dispatchers.IO) {
-                val display = decodeSampledOriented(
-                    hero.displayFile,
-                    maxWidth = 1800,
-                    maxHeight = 1800,
-                )
-                val original = if (hero.originalPreserved && hero.rawFile.isFile) {
-                    decodeSampledOriented(hero.rawFile, maxWidth = 1800, maxHeight = 1800)
-                } else null
-                display to original
-            }
-            if (heroBitmap != null) {
-                binding.heroPhoto.setPhotoBitmap(heroBitmap)
-                installOriginalHold(binding.heroPhoto, hero, heroBitmap, heroOriginal)
-            }
-            applyOverlay(binding.heroPhoto, hero)
-
-            others.forEach { descriptor ->
-                val (bitmap, original) = withContext(Dispatchers.IO) {
-                    val decoded = decodeSampledOriented(
-                        descriptor.displayFile,
-                        maxWidth = 420,
-                        maxHeight = 420,
-                    ) ?: return@withContext null to null
-                    val display = if (descriptor.postProcessingPending) {
-                        softenedThumbnail(decoded)
-                    } else decoded
-                    val raw = if (descriptor.originalPreserved && descriptor.rawFile.isFile) {
-                        decodeSampledOriented(
-                            descriptor.rawFile,
-                            maxWidth = 420,
-                            maxHeight = 420,
+            var ownedHeroBitmap: Bitmap? = null
+            try {
+                withContext(Dispatchers.IO) {
+                    if (renderGeneration == photoRenderGeneration) {
+                        ownedHeroBitmap = decodeSampledOriented(
+                            hero.displayFile,
+                            maxWidth = 1800,
+                            maxHeight = 1800,
                         )
-                    } else null
-                    display to raw
+                    }
                 }
-                bitmap ?: return@forEach
-                addThumbnail(descriptor, bitmap, original)
+                val heroBitmap = ownedHeroBitmap
+                if (heroBitmap != null && renderGeneration == photoRenderGeneration) {
+                    binding.heroPhoto.setPhotoBitmap(heroBitmap)
+                    ownedHeroBitmap = null
+                    installOriginalHold(
+                        binding.heroPhoto,
+                        hero,
+                        heroBitmap,
+                        maxWidth = 1800,
+                        maxHeight = 1800,
+                        renderGeneration = renderGeneration,
+                    )
+                }
+                if (renderGeneration != photoRenderGeneration) return@launch
+                applyOverlay(binding.heroPhoto, hero)
+
+                others.forEach { descriptor ->
+                    var ownedBitmap: Bitmap? = null
+                    try {
+                        withContext(Dispatchers.IO) {
+                            if (renderGeneration != photoRenderGeneration) return@withContext
+                            val decoded = decodeSampledOriented(
+                                descriptor.displayFile,
+                                maxWidth = 420,
+                                maxHeight = 420,
+                            ) ?: return@withContext
+                            ownedBitmap = decoded
+                            if (descriptor.postProcessingPending) {
+                                ownedBitmap = softenedThumbnail(decoded)
+                            }
+                        }
+                        val bitmap = ownedBitmap ?: return@forEach
+                        if (renderGeneration != photoRenderGeneration) return@forEach
+                        addThumbnail(descriptor, bitmap, renderGeneration)
+                        ownedBitmap = null
+                    } finally {
+                        ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
+                    }
+                }
+            } finally {
+                ownedHeroBitmap?.takeIf { !it.isRecycled }?.recycle()
             }
         }
     }
@@ -469,7 +506,7 @@ class EntryDetailActivity : AppCompatActivity() {
     private fun addThumbnail(
         descriptor: EntryPhotoDescriptor,
         bitmap: Bitmap,
-        original: Bitmap?,
+        renderGeneration: Int,
     ) {
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -497,7 +534,14 @@ class EntryDetailActivity : AppCompatActivity() {
             }
         }
         applyOverlay(image, descriptor)
-        installOriginalHold(image, descriptor, bitmap, original)
+        installOriginalHold(
+            image,
+            descriptor,
+            bitmap,
+            maxWidth = 420,
+            maxHeight = 420,
+            renderGeneration = renderGeneration,
+        )
         column.addView(image)
         column.addView(TextView(this).apply {
             text = photoStatusLabel(descriptor, descriptor.order)
@@ -517,15 +561,55 @@ class EntryDetailActivity : AppCompatActivity() {
         view: ZoomablePhotoView,
         descriptor: EntryPhotoDescriptor,
         display: Bitmap,
-        original: Bitmap?,
+        maxWidth: Int,
+        maxHeight: Int,
+        renderGeneration: Int,
     ) {
-        view.onOriginalHoldChanged = original?.let { raw ->
-            { showingOriginal ->
-                view.setPhotoBitmap(if (showingOriginal) raw else display)
-                if (showingOriginal) {
-                    view.setOverlayRegions(emptyList())
-                } else {
-                    applyOverlay(view, descriptor)
+        val canCompare = descriptor.originalPreserved &&
+            descriptor.rawFile.isFile &&
+            descriptor.rawFile.canonicalPath != descriptor.displayFile.canonicalPath
+        if (!canCompare) {
+            view.onOriginalHoldChanged = null
+            return
+        }
+
+        var requestGeneration = 0
+        var displayedOriginal: Bitmap? = null
+        view.onOriginalHoldChanged = { showingOriginal ->
+            val generation = ++requestGeneration
+            if (!showingOriginal) {
+                view.setPhotoBitmap(display)
+                applyOverlay(view, descriptor)
+                displayedOriginal?.recycle()
+                displayedOriginal = null
+            } else {
+                lifecycleScope.launch {
+                    var ownedRaw: Bitmap? = null
+                    try {
+                        withContext(Dispatchers.IO) {
+                            comparisonDecodeGate.withPermit {
+                                if (photoRenderGeneration != renderGeneration ||
+                                    requestGeneration != generation) return@withPermit
+                                ownedRaw = decodeSampledOriented(
+                                    descriptor.rawFile,
+                                    maxWidth = maxWidth,
+                                    maxHeight = maxHeight,
+                                )
+                            }
+                        }
+                        val raw = ownedRaw ?: return@launch
+                        if (photoRenderGeneration != renderGeneration ||
+                            requestGeneration != generation ||
+                            !view.isAttachedToWindow) return@launch
+                        val previous = displayedOriginal
+                        view.setPhotoBitmap(raw)
+                        displayedOriginal = raw
+                        ownedRaw = null
+                        previous?.takeIf { !it.isRecycled }?.recycle()
+                        view.setOverlayRegions(emptyList())
+                    } finally {
+                        ownedRaw?.takeIf { !it.isRecycled }?.recycle()
+                    }
                 }
             }
         }
@@ -549,7 +633,7 @@ class EntryDetailActivity : AppCompatActivity() {
     }
 
     private fun showPhotoViewer(descriptor: EntryPhotoDescriptor, label: String) {
-        viewerJob?.cancel()
+        viewerDecodeGeneration++
         viewerDialog?.dismiss()
         val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
         val root = android.widget.FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
@@ -606,6 +690,7 @@ class EntryDetailActivity : AppCompatActivity() {
         ))
 
         var showingOriginal = false
+        var displayedBitmap: Bitmap? = null
         fun show(original: Boolean) {
             if (!canCompare && original) return
             showingOriginal = original
@@ -614,15 +699,33 @@ class EntryDetailActivity : AppCompatActivity() {
             )
             RemoteUiCatalog.apply(compare)
             val target = if (original) descriptor.rawFile else descriptor.displayFile
-            viewerJob?.cancel()
-            viewerJob = lifecycleScope.launch {
-                val bitmap = withContext(Dispatchers.IO) {
-                    decodeSampledOriented(target, maxWidth = 3000, maxHeight = 3000)
-                } ?: return@launch
-                if (dialog.isShowing) {
+            val generation = ++viewerDecodeGeneration
+            lifecycleScope.launch {
+                var ownedBitmap: Bitmap? = null
+                try {
+                    withContext(Dispatchers.IO) {
+                        comparisonDecodeGate.withPermit {
+                            if (generation != viewerDecodeGeneration) return@withPermit
+                            ownedBitmap = decodeSampledOriented(
+                                target,
+                                maxWidth = 3000,
+                                maxHeight = 3000,
+                            )
+                        }
+                    }
+                    val bitmap = ownedBitmap ?: return@launch
+                    if (generation != viewerDecodeGeneration || !dialog.isShowing) {
+                        return@launch
+                    }
+                    photo.setPhotoBitmap(null)
+                    displayedBitmap?.takeIf { !it.isRecycled }?.recycle()
+                    displayedBitmap = bitmap
+                    ownedBitmap = null
                     photo.setPhotoBitmap(bitmap)
                     if (original) photo.setOverlayRegions(emptyList())
                     else applyOverlay(photo, descriptor)
+                } finally {
+                    ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
                 }
             }
         }
@@ -630,7 +733,10 @@ class EntryDetailActivity : AppCompatActivity() {
         photo.onOriginalHoldChanged = if (canCompare) { original -> show(original) } else null
         dialog.setContentView(root)
         dialog.setOnDismissListener {
-            viewerJob?.cancel()
+            viewerDecodeGeneration++
+            photo.setPhotoBitmap(null)
+            displayedBitmap?.takeIf { !it.isRecycled }?.recycle()
+            displayedBitmap = null
             if (viewerDialog === dialog) viewerDialog = null
         }
         viewerDialog = dialog

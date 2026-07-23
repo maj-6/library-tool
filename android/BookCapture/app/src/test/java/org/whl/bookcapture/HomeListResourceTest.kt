@@ -104,8 +104,9 @@ class HomeListResourceTest {
         assertTrue(home.contains("groupScansByCollection("))
         assertTrue(home.contains("initiallyExpandedScanGroup("))
         assertTrue(home.contains("Prefs.compactScanList(this)"))
-        assertTrue(home.contains("e.thumbnailPhoto()?.let"))
-        assertTrue(home.contains("e.photoDescriptor(photo)?.postProcessingPending"))
+        assertTrue(home.contains("thumbnail = entry.thumbnailDescriptor()"))
+        assertTrue(home.contains("item.thumbnail?.let"))
+        assertTrue(home.contains("descriptor.postProcessingPending"))
         assertTrue(home.contains("softenPendingThumbnail(decoded)"))
         assertFalse(home.contains("e.photos().firstOrNull()?.let"))
     }
