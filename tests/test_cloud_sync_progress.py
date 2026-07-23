@@ -3,11 +3,21 @@ from __future__ import annotations
 
 import copy
 import contextlib
+import hashlib
+import io
 import threading
 
 import libcommon as lib
 import pytest
 import server
+from PIL import Image
+
+
+def _jpeg(seed: str) -> bytes:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    stream = io.BytesIO()
+    Image.new("RGB", (2, 1), tuple(digest[:3])).save(stream, format="JPEG")
+    return stream.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +69,156 @@ def test_import_publishes_durable_book_before_cloud_acknowledgement(
     assert "cloud acknowledgement failed" in result["sync_error"]
 
 
+def test_zero_photo_cloud_capture_fails_before_ingest_or_acknowledgement(
+        monkeypatch, tmp_path):
+    manual_path = tmp_path / "manual_entries.json"
+    monkeypatch.setattr(lib, "MANUAL_ENTRIES_PATH", manual_path)
+    calls = []
+    monkeypatch.setattr(
+        server.sbase,
+        "download_photo",
+        lambda *_args: calls.append("download"),
+    )
+    monkeypatch.setattr(
+        server,
+        "ingest_capture",
+        lambda *_args, **_kwargs: calls.append("ingest"),
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "mark_capture",
+        lambda *_args: calls.append("acknowledge"),
+    )
+
+    with pytest.raises(ValueError, match="at least one photo"):
+        server._import_capture(
+            {"url": "cloud"},
+            {"id": "capture-empty", "photos": []},
+            "",
+            False,
+        )
+
+    assert calls == []
+    assert lib.load_json(manual_path, {}) in ({}, None)
+
+
+@pytest.mark.parametrize(
+    ("paths", "payloads", "limits", "message", "download_count"),
+    [
+        (
+            ["one.jpg", "two.jpg"],
+            [b"a", b"b"],
+            {"CAPTURE_MAX_PHOTOS": 1},
+            "photo limit",
+            0,
+        ),
+        (
+            ["one.jpg"],
+            [b""],
+            {},
+            "photo is empty",
+            1,
+        ),
+        (
+            ["one.jpg"],
+            [b"abcd"],
+            {"CAPTURE_MAX_PHOTO_BYTES": 3},
+            "per-photo size limit",
+            1,
+        ),
+        (
+            ["one.jpg", "two.jpg"],
+            [b"abc", b"def"],
+            {
+                "CAPTURE_MAX_PHOTO_BYTES": 4,
+                "CAPTURE_MAX_TOTAL_PHOTO_BYTES": 5,
+            },
+            "aggregate size limit",
+            2,
+        ),
+    ],
+)
+def test_cloud_photo_download_enforces_ingest_envelope(
+        monkeypatch, paths, payloads, limits, message, download_count):
+    for name, value in limits.items():
+        monkeypatch.setattr(server, name, value)
+    calls = []
+
+    def download(_cfg, path):
+        calls.append(path)
+        return payloads[len(calls) - 1]
+
+    monkeypatch.setattr(server.sbase, "download_photo", download)
+
+    with pytest.raises(ValueError, match=message):
+        server._download_cloud_capture_photos({"url": "cloud"}, paths)
+
+    assert len(calls) == download_count
+
+
+def test_supabase_photo_download_reads_only_one_byte_past_bound(monkeypatch):
+    reads = []
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, maximum=None):
+            reads.append(maximum)
+            return b"x" * int(maximum)
+
+    monkeypatch.setattr(
+        server.sbase.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(server.sbase.SyncError, match="download limit"):
+        server.sbase.download_photo(
+            {"url": "https://example.test", "key": "test"},
+            "oversize.jpg",
+            maximum_bytes=4,
+        )
+
+    assert reads == [5]
+
+
+def test_supabase_photo_download_caps_http_error_detail(monkeypatch):
+    reads = []
+
+    class ErrorBody(io.BytesIO):
+        def read(self, maximum=-1):
+            reads.append(maximum)
+            return super().read(maximum)
+
+    error = server.sbase.urllib.error.HTTPError(
+        "https://example.test/storage/photo.jpg",
+        413,
+        "too large",
+        {},
+        ErrorBody(b"x" * 1_000),
+    )
+
+    def reject(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(server.sbase.urllib.request, "urlopen", reject)
+
+    with pytest.raises(server.sbase.SyncError, match="HTTP 413"):
+        server.sbase.download_photo(
+            {"url": "https://example.test", "key": "test"},
+            "oversize.jpg",
+            maximum_bytes=4,
+        )
+
+    assert reads == [301]
+
+
 def test_same_capture_lan_cloud_race_has_one_asset_writer_and_one_row(
         monkeypatch, tmp_path):
     manual_path = tmp_path / "manual_entries.json"
@@ -76,7 +236,7 @@ def test_same_capture_lan_cloud_race_has_one_asset_writer_and_one_row(
         entered.set()
         assert release.wait(2)
         return {
-            "photos": [b"processed"],
+            "photos": [_jpeg("processed")],
             "ocr_text": "",
             "fields": {"title": "Serialized Capture"},
             "extra": {},
@@ -91,7 +251,7 @@ def test_same_capture_lan_cloud_race_has_one_asset_writer_and_one_row(
     def ingest(transport):
         try:
             results.append(server.ingest_capture(
-                cap, [transport.encode()], "", ["photo_1.jpg"],
+                cap, [_jpeg(transport)], "", ["photo_1.jpg"],
                 transport=transport,
             ))
         except Exception as exc:  # pragma: no cover - assertion reports detail
@@ -125,7 +285,7 @@ def test_same_capture_lan_cloud_race_has_one_asset_writer_and_one_row(
         False, True,
     ]
     assert (captures_path / "shared-capture" / "photo_1.jpg").read_bytes() == \
-        b"processed"
+        _jpeg("processed")
 
 
 def test_cloud_run_reports_each_capture_and_compatibility_views(monkeypatch):

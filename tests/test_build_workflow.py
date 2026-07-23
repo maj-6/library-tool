@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 
+import libcommon as lib
 import server
+from PIL import Image
 
 
 def test_build_api_preserves_volume_group_metadata(client):
@@ -31,15 +34,40 @@ def test_verified_build_without_folder_is_listed_for_ocr(client):
     assert entries[created["id"]]["ocr"] == []
 
 
-def test_captured_metadata_survives_build_creation_and_manifest(client, data_root):
-    photo = data_root / "captures" / "capture-01" / "photo_1.jpg"
-    photo.parent.mkdir(parents=True, exist_ok=True)
-    photo.write_bytes(b"captured-photo")
+def test_captured_metadata_survives_build_creation_and_manifest(
+        client, data_root, monkeypatch):
+    stream = io.BytesIO()
+    Image.new("RGB", (3, 2), (42, 84, 126)).save(stream, format="JPEG")
+    captured_photo = stream.getvalue()
+    monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
+    monkeypatch.setattr(server, "_entry_checks", lambda _entry: {})
+    capture_id = "capture-01"
+    entry_id, errors = server.ingest_capture(
+        {
+            "id": capture_id,
+            "meta": {
+                "title": "Captured Work",
+                "extra": {
+                    "binding": {"material": "cloth"},
+                    "copy_count": 2,
+                },
+            },
+        },
+        [captured_photo],
+        "",
+        ["photo_1.jpg"],
+        transport="lan",
+    )
+    assert entry_id
+    assert errors == []
+    assert lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id][
+        "capture_id"
+    ] == capture_id
 
     response = client.post("/api/builds", json={"build": {
         "title": "Captured Work",
         "status": "ready",
-        "capture_id": "capture-01",
+        "capture_id": capture_id,
         "images": [
             "captures/capture-01/photo_1.jpg",
             "captures/capture-01/photo_1.jpg",
@@ -68,13 +96,13 @@ def test_captured_metadata_survives_build_creation_and_manifest(client, data_roo
     assert manifest["captured_images"] == [{
         "name": "photo_1.jpg",
         "path": "captures/capture-01/photo_1.jpg",
-        "size": len(b"captured-photo"),
+        "size": len(captured_photo),
         "available": True,
     }]
     served = client.get(
         "/api/capture/image?path=captures%2Fcapture-01%2Fphoto_1.jpg")
     assert served.status_code == 200
-    assert served.data == b"captured-photo"
+    assert served.data == captured_photo
 
 
 def test_full_text_manifest_disambiguates_root_and_directory_files(client):

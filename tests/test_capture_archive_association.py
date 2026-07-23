@@ -740,7 +740,7 @@ def test_stale_transition_is_idempotent_and_preserves_historical_replay(
     assert replayed.receipt == created.receipt
     assert duplicate.receipt.disposition is CaptureArchiveDisposition.EXISTING
     assert duplicate.receipt.association == stale
-    assert materializer.calls == 2
+    assert materializer.calls == 1
 
 
 def test_failed_stale_transition_rolls_back_to_current(tmp_path):

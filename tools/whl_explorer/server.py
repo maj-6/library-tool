@@ -1238,10 +1238,12 @@ def _repoint_collection_aliases(aliases: dict[str, str]) -> int:
     if not aliases:
         return 0
     changed = 0
+    stale_capture_ids: set[str] = set()
     with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
-        dirty = False
-        for entry in entries.values():
+        entries_before = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        entries_after = copy.deepcopy(entries_before)
+        manual_dirty = False
+        for entry in entries_after.values():
             extra = entry.get("extra") if isinstance(entry, dict) else None
             old_id = (str(extra.get("scan_collection_id") or "")
                       if isinstance(extra, dict) else "")
@@ -1249,13 +1251,15 @@ def _repoint_collection_aliases(aliases: dict[str, str]) -> int:
             if old_id and new_id != old_id:
                 entry["extra"] = dict(extra, scan_collection_id=new_id)
                 changed += 1
-                dirty = True
-        if dirty:
-            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+                manual_dirty = True
+                capture_id = _capture_archive_id(entry.get("capture_id"))
+                if capture_id:
+                    stale_capture_ids.add(capture_id)
     with _client_state_lock:
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}
-        dirty = False
-        checked = state.get("checked")
+        state_before = lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}
+        state_after = copy.deepcopy(state_before)
+        client_dirty = False
+        checked = state_after.get("checked")
         if isinstance(checked, list):
             for pair in checked:
                 value = pair[1] if isinstance(pair, list) and len(pair) == 2 else None
@@ -1267,10 +1271,31 @@ def _repoint_collection_aliases(aliases: dict[str, str]) -> int:
                 if old_id and new_id != old_id:
                     book["extra"] = dict(extra, scan_collection_id=new_id)
                     changed += 1
-                    dirty = True
-        if dirty:
-            state["updated_at"] = datetime.now(timezone.utc).isoformat()
-            lib.save_json(lib.CLIENT_STATE_PATH, state)
+                    client_dirty = True
+        if client_dirty:
+            state_after["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    # No canonical row changes until every affected association is durably
+    # stale. A failed transition leaves the unchanged aliases safely retryable.
+    for capture_id in sorted(stale_capture_ids):
+        _mark_capture_archive_stale(capture_id)
+
+    if manual_dirty:
+        with _manual_lock:
+            current = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+            if current != entries_before:
+                raise RuntimeError(
+                    "manual entries changed while collection aliases were applied"
+                )
+            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries_after)
+    if client_dirty:
+        with _client_state_lock:
+            current = lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}
+            if current != state_before:
+                raise RuntimeError(
+                    "client state changed while collection aliases were applied"
+                )
+            lib.save_json(lib.CLIENT_STATE_PATH, state_after)
     return changed
 
 
@@ -1951,6 +1976,26 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 # between. Locks here are threading.Lock — the sidecar is a single process,
 # so cross-process coordination is deliberately out of scope.
 _builds_lock = threading.Lock()
+_LIB_ITEM_IDENTITY_LOCKS = tuple(threading.RLock() for _ in range(128))
+
+
+def _lib_item_identity_lock(item_id: str) -> threading.RLock:
+    """Bounded per-item serialization for catalogue and ``lib-id`` identity."""
+
+    digest = hashlib.sha256(str(item_id).encode("utf-8")).digest()
+    index = int.from_bytes(digest[:2], "big") % len(_LIB_ITEM_IDENTITY_LOCKS)
+    return _LIB_ITEM_IDENTITY_LOCKS[index]
+
+
+def _serialize_lib_item_identity(function):
+    """Hold an item's identity authority across one legacy route mutation."""
+
+    @functools.wraps(function)
+    def wrapped(build_id: str, *args, **kwargs):
+        with _lib_item_identity_lock(build_id):
+            return function(build_id, *args, **kwargs)
+
+    return wrapped
 
 
 @contextlib.contextmanager
@@ -2115,6 +2160,14 @@ _BUILD_REPRESENTATION_FIELDS = frozenset({
     "pdf_file", "pdf_sources", "representation_manifest",
 })
 _BUILD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CAPTURE_ID_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9_-])?$"
+)
+_CAPTURE_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
 
 # The structured exceptions to the str() coercion below. `categories` (flat
 # text) is deprecated in favour of category_ids — kept as display fallback.
@@ -2199,30 +2252,129 @@ def api_builds():
     return response
 
 
+_CAPTURE_PROMOTION_SOURCE_FIELDS = {
+    "title": "title",
+    "subtitle": "subtitle",
+    "authors": "author",
+    "year": "year",
+    "publisher": "publisher",
+    "publisher_city": "city",
+    "edition": "edition",
+    "volume": "volume",
+    "language": "language",
+    "pages": "pages",
+    "categories": "categories",
+    "notes": "notes",
+}
+
+
+def _capture_manual_source(capture_id: str) -> dict | None:
+    """Return the one committed compatibility row behind an association."""
+
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        matches = [
+            copy.deepcopy(entry)
+            for entry in entries.values()
+            if (
+                isinstance(entry, dict)
+                and _capture_archive_id(entry.get("capture_id"))
+                == capture_id
+            )
+        ] if isinstance(entries, dict) else []
+    if len(matches) > 1:
+        raise ValueError("capture identity is assigned to multiple entries")
+    return matches[0] if matches else None
+
+
+def _capture_promotion_changes_source(
+        build: Mapping, source: Mapping, *,
+        explicit_fields: set[str] | frozenset[str] = frozenset()) -> bool:
+    """Whether a promoted catalogue row adds to the sealed capture snapshot."""
+
+    expected = {
+        build_field: str(source.get(source_field) or "").strip()
+        for build_field, source_field
+        in _CAPTURE_PROMOTION_SOURCE_FIELDS.items()
+    }
+    expected.update({
+        "category_ids": list(source.get("category_ids") or []),
+        "description": "",
+        "source_url": "",
+        "images": list(source.get("images") or []),
+        "extra": dict(source.get("extra") or {}),
+    })
+    return any(
+        # Promotion can attach an older, sparsely populated catalogue draft to
+        # a richer capture snapshot.  An omitted/empty value does not contradict
+        # that snapshot; a non-empty divergent value does and therefore makes
+        # the historical archive explicitly stale.
+        (
+            field in explicit_fields
+            or build.get(field) not in (None, "", [], {})
+        )
+        and build.get(field) != value
+        for field, value in expected.items()
+    )
+
+
 def _create_build(seed: dict) -> tuple[dict | None, str]:
     """Mint one build record from a seed through the standard field cleaning:
     (build, "") on success, (None, error) on refusal. The core of POST
     /api/builds, shared with the .lib open flow so a book minted from a
     manifest passes exactly the same scrubbing as a hand-created one."""
+    raw_capture_id = seed.get("capture_id")
+    capture_id = _capture_archive_id(raw_capture_id)
+    if raw_capture_id not in (None, "") and not capture_id:
+        return None, "capture_id is not a portable identity"
+    capture_association = (
+        _capture_archive_association(capture_id)
+        if capture_id
+        else None
+    )
+    if capture_id and capture_association is None:
+        return None, "capture_id has no verified archive association"
+    capture_source = (
+        _capture_manual_source(capture_id)
+        if capture_id
+        else None
+    )
+    if capture_id and capture_source is None:
+        return None, "capture_id has no committed capture source"
+    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
+             if f not in _BUILD_STRUCTURED_FIELDS}
+    # Source attachment is a separate versioned aggregate. The browser
+    # creates catalogue state first, then attaches any seed source through
+    # the representation command service under dual CAS preconditions.
+    build["pdf_file"] = ""
+    build["pdf_sources"] = []
+    build["category_ids"] = _clean_category_ids(
+        seed.get("category_ids"),
+        lib.load_taxonomy()["nodes"],
+    )
+    build["bundle"] = _clean_bundle(seed.get("bundle"))
+    build["images"] = _clean_images(seed.get("images"))
+    build["extra"] = _clean_extra(seed.get("extra"))
+    build["capture_id"] = capture_id
+    if capture_association:
+        build["capture_book_id"] = capture_association.book_id
+    if build["status"] not in _BUILD_STATUSES:
+        build["status"] = "draft"
+    if build["rights"] not in _BUILD_RIGHTS:
+        return None, f"unknown rights value {build['rights']!r}"
+    if (
+         capture_id
+         and capture_source is not None
+         and _capture_promotion_changes_source(
+             build,
+             capture_source,
+             explicit_fields=set(seed),
+         )
+    ):
+        _mark_capture_archive_stale(capture_id)
+
     with _builds_lock:
         builds = lib.load_json(BUILDS_PATH, {})
-        build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
-                 if f not in _BUILD_STRUCTURED_FIELDS}
-        # Source attachment is a separate versioned aggregate. The browser
-        # creates catalogue state first, then attaches any seed source through
-        # the representation command service under dual CAS preconditions.
-        build["pdf_file"] = ""
-        build["pdf_sources"] = []
-        build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
-                                                    lib.load_taxonomy()["nodes"])
-        build["bundle"] = _clean_bundle(seed.get("bundle"))
-        build["images"] = _clean_images(seed.get("images"))
-        build["extra"] = _clean_extra(seed.get("extra"))
-        build["capture_id"] = _clean_capture_id(seed.get("capture_id"))
-        if build["status"] not in _BUILD_STATUSES:
-            build["status"] = "draft"
-        if build["rights"] not in _BUILD_RIGHTS:
-            return None, f"unknown rights value {build['rights']!r}"
         build["id"] = lib.gen_id(set(builds))
         build["created_at"] = _build_updated_at()
         build["updated_at"] = build["created_at"]
@@ -2269,27 +2421,79 @@ def api_builds_create():
 
 
 @app.route("/api/builds/<build_id>", methods=["PATCH"])
+@_serialize_lib_item_identity
 def api_builds_update(build_id: str):
+    payload = request.get_json(silent=True) or {}
+    managed_sources = sorted(set(payload) & _BUILD_REPRESENTATION_FIELDS)
+    if managed_sources:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "PDF sources must be changed through the representation "
+                "command resource"
+            ),
+            "code": "representation_command_required",
+            "fields": managed_sources,
+        }), 409
+    if str(payload.get("rights") or "").strip() not in _BUILD_RIGHTS:
+        return jsonify({
+            "ok": False,
+            "error": f"unknown rights value {payload['rights']!r}",
+        }), 400
+
+    requested_capture_id = None
+    requested_association = None
+    requested_capture_source = None
+    if "capture_id" in payload:
+        raw_capture_id = payload.get("capture_id")
+        requested_capture_id = _capture_archive_id(raw_capture_id)
+        if raw_capture_id not in (None, "") and not requested_capture_id:
+            return jsonify({
+                "ok": False,
+                "error": "capture_id is not a portable identity",
+                "code": "invalid_capture_identity",
+            }), 400
+        if requested_capture_id:
+            requested_association = _capture_archive_association(
+                requested_capture_id
+            )
+            if requested_association is None:
+                return jsonify({
+                    "ok": False,
+                    "error": "capture_id has no verified archive association",
+                    "code": "capture_archive_association_required",
+                }), 409
+            requested_capture_source = _capture_manual_source(
+                requested_capture_id
+            )
+            if requested_capture_source is None:
+                return jsonify({
+                    "ok": False,
+                    "error": "capture_id has no committed capture source",
+                    "code": "capture_source_required",
+                }), 409
+            stored_book_id = _lib_stored_book_id(build_id)
+            if (
+                stored_book_id
+                and stored_book_id != requested_association.book_id
+            ):
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "the item already carries another portable book "
+                        "identity"
+                    ),
+                    "code": "capture_book_identity_conflict",
+                }), 409
+
     stale_capture_ids: set[str] = set()
+    snapshot_revision = ""
+    candidate = None
+    was = ""
     with _builds_lock:
         builds = lib.load_json(BUILDS_PATH, {})
         if build_id not in builds:
             abort(404)
-        payload = request.get_json(silent=True) or {}
-        managed_sources = sorted(set(payload) & _BUILD_REPRESENTATION_FIELDS)
-        if managed_sources:
-            return jsonify({
-                "ok": False,
-                "error": (
-                    "PDF sources must be changed through the representation "
-                    "command resource"
-                ),
-                "code": "representation_command_required",
-                "fields": managed_sources,
-            }), 409
-        if str(payload.get("rights") or "").strip() not in _BUILD_RIGHTS:
-            return jsonify({"ok": False,
-                            "error": f"unknown rights value {payload['rights']!r}"}), 400
         b = builds[build_id]
         before_capture_id = _clean_capture_id(b.get("capture_id"))
         # optimistic concurrency: an editor that loaded the record before
@@ -2298,42 +2502,89 @@ def api_builds_update(build_id: str):
         if expect and expect != str(b.get("updated_at") or ""):
             return jsonify({"ok": False, "error": "changed elsewhere",
                             "build": b}), 409
+        snapshot_revision = str(b.get("updated_at") or "")
         was = b.get("status")
+        candidate = copy.deepcopy(b)
         for f in _BUILD_FIELDS:
             if f not in payload:
                 continue
             if f == "pdf_sources":
-                b[f] = _clean_pdf_sources(payload[f])
+                candidate[f] = _clean_pdf_sources(payload[f])
             elif f == "category_ids":
-                b[f] = _clean_category_ids(payload[f], lib.load_taxonomy()["nodes"])
+                candidate[f] = _clean_category_ids(
+                    payload[f],
+                    lib.load_taxonomy()["nodes"],
+                )
             elif f == "bundle":
-                b[f] = _clean_bundle(payload[f])
+                candidate[f] = _clean_bundle(payload[f])
             elif f == "images":
-                b[f] = _clean_images(payload[f])
+                candidate[f] = _clean_images(payload[f])
             elif f == "extra":
-                b[f] = _clean_extra(payload[f])
+                candidate[f] = _clean_extra(payload[f])
             elif f == "capture_id":
-                b[f] = _clean_capture_id(payload[f])
+                candidate[f] = requested_capture_id or ""
             else:
-                b[f] = str(payload[f] or "").strip()
-        if b.get("status") not in _BUILD_STATUSES:
-            b["status"] = "draft"
-        b["updated_at"] = _build_updated_at(b.get("updated_at"))
-        after_capture_id = _clean_capture_id(b.get("capture_id"))
-        if set(payload) & (
-            _CAPTURE_ARCHIVE_BUILD_FIELDS | {"capture_id"}
+                candidate[f] = str(payload[f] or "").strip()
+        if candidate.get("status") not in _BUILD_STATUSES:
+            candidate["status"] = "draft"
+        after_capture_id = _clean_capture_id(candidate.get("capture_id"))
+        if before_capture_id and after_capture_id != before_capture_id:
+            return jsonify({
+                "ok": False,
+                "error": "a captured item cannot be detached or reassigned",
+                "code": "capture_identity_conflict",
+            }), 409
+        if (
+            not before_capture_id
+            and after_capture_id
+            and requested_association is None
         ):
-            stale_capture_ids.update(
-                capture_id
-                for capture_id in (before_capture_id, after_capture_id)
-                if capture_id
-            )
-        lib.save_json(BUILDS_PATH, builds)
-    # Retrying the same canonical PATCH must also retry a stale transition that
-    # failed after the catalogue write. A no-op retry is therefore
-    # conservatively invalidating, while status-only PATCHes remain unrelated.
+            return jsonify({
+                "ok": False,
+                "error": "capture_id has no verified archive association",
+                "code": "capture_archive_association_required",
+            }), 409
+        if requested_association is not None:
+            candidate["capture_book_id"] = requested_association.book_id
+        if (
+            not before_capture_id
+            and after_capture_id
+            and requested_capture_source is not None
+             and _capture_promotion_changes_source(
+                 candidate,
+                 requested_capture_source,
+                 explicit_fields=set(payload),
+             )
+        ):
+            stale_capture_ids.add(after_capture_id)
+        if before_capture_id and any(
+            candidate.get(field) != b.get(field)
+            for field in _CAPTURE_ARCHIVE_BUILD_FIELDS
+        ):
+            stale_capture_ids.add(before_capture_id)
+
+    # Invalidate before committing catalogue state. A failed publication leaves
+    # the matched catalogue revision untouched, so the same CAS can retry it.
     for stale_capture_id in sorted(stale_capture_ids):
         _mark_capture_archive_stale(stale_capture_id)
+
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        current = builds.get(build_id)
+        if (
+            not isinstance(current, dict)
+            or str(current.get("updated_at") or "") != snapshot_revision
+        ):
+            return jsonify({
+                "ok": False,
+                "error": "changed elsewhere",
+                "build": current,
+            }), 409
+        assert candidate is not None
+        candidate["updated_at"] = _build_updated_at(snapshot_revision)
+        builds[build_id] = candidate
+        lib.save_json(BUILDS_PATH, builds)
+        b = candidate
     # only the status transition is worth a feed entry; every keystroke is not
     if b["status"] != was and b["status"] in ("ready", "uploaded"):
         activity("uploaded" if b["status"] == "uploaded" else "verified", "book",
@@ -2873,36 +3124,42 @@ def _remap_category_ids(fn) -> int:
     and checked books; returns how many records changed. Used by node delete
     and merge so assignments never dangle locally."""
     changed = 0
+    stale_capture_ids: set[str] = set()
 
     with _builds_lock:
-        builds = lib.load_json(BUILDS_PATH, {})
-        dirty = False
-        for b in builds.values():
+        builds_before = lib.load_json(BUILDS_PATH, {})
+        builds_after = copy.deepcopy(builds_before)
+        builds_dirty = False
+        for b in builds_after.values():
             old = b.get("category_ids") or []
             new = fn(list(old))
             if new != old:
                 b["category_ids"] = new
                 b["updated_at"] = _build_updated_at(b.get("updated_at"))
-                dirty, changed = True, changed + 1
-        if dirty:
-            lib.save_json(BUILDS_PATH, builds)
+                builds_dirty, changed = True, changed + 1
+                capture_id = _capture_archive_id(b.get("capture_id"))
+                if capture_id:
+                    stale_capture_ids.add(capture_id)
 
     with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        dirty = False
-        for e in entries.values():
+        entries_before = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        entries_after = copy.deepcopy(entries_before)
+        entries_dirty = False
+        for e in entries_after.values():
             old = e.get("category_ids") or []
             new = fn(list(old))
             if new != old:
                 e["category_ids"] = new
-                dirty, changed = True, changed + 1
-        if dirty:
-            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+                entries_dirty, changed = True, changed + 1
+                capture_id = _capture_archive_id(e.get("capture_id"))
+                if capture_id:
+                    stale_capture_ids.add(capture_id)
 
     with _client_state_lock:
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {})
-        dirty = False
-        for pair in state.get("checked") or []:
+        state_before = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        state_after = copy.deepcopy(state_before)
+        state_dirty = False
+        for pair in state_after.get("checked") or []:
             book = (pair[1] or {}).get("book") if len(pair) == 2 else None
             if not isinstance(book, dict):
                 continue
@@ -2910,11 +3167,36 @@ def _remap_category_ids(fn) -> int:
             new = fn(list(old))
             if new != old:
                 book["category_ids"] = new
-                dirty, changed = True, changed + 1
-        if dirty:
-            state["updated_at"] = _tax_ts()
-            lib.save_json(lib.CLIENT_STATE_PATH, state)
+                state_dirty, changed = True, changed + 1
+        if state_dirty:
+            state_after["updated_at"] = _tax_ts()
 
+    # Invalidate every changed captured record before any canonical category
+    # assignment is published. Failure leaves all three stores unchanged.
+    for capture_id in sorted(stale_capture_ids):
+        _mark_capture_archive_stale(capture_id)
+
+    if builds_dirty:
+        with _builds_lock:
+            if lib.load_json(BUILDS_PATH, {}) != builds_before:
+                raise RuntimeError(
+                    "builds changed while category ids were remapped"
+                )
+            lib.save_json(BUILDS_PATH, builds_after)
+    if entries_dirty:
+        with _manual_lock:
+            if lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) != entries_before:
+                raise RuntimeError(
+                    "manual entries changed while category ids were remapped"
+                )
+            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries_after)
+    if state_dirty:
+        with _client_state_lock:
+            if lib.load_json(lib.CLIENT_STATE_PATH, {}) != state_before:
+                raise RuntimeError(
+                    "client state changed while category ids were remapped"
+                )
+            lib.save_json(lib.CLIENT_STATE_PATH, state_after)
     return changed
 
 
@@ -6430,6 +6712,11 @@ def api_v1_item_update(item_id: str):
         operation_id = _item_command_operation_id(item_id=item_id)
         expected_revision = _item_command_record_match(item_id)
         patch = _item_command_patch()
+        _invalidate_capture_archive_before_item_update(
+            item_id,
+            expected_revision=expected_revision,
+            patch=patch,
+        )
         result = _item_command_engine().update(UpdateItemCommand(
             item_id=item_id,
             expected_revision=expected_revision,
@@ -7225,14 +7512,17 @@ def _lib_id_path(build_id: str):
     return _entry_dir(build_id) / "ocr" / "lib-id.json"
 
 
+def _lib_stored_book_id(build_id: str) -> str:
+    doc = lib.load_json(_lib_id_path(build_id), None)
+    value = str(doc.get("book_id") or "") if isinstance(doc, dict) else ""
+    return value if re.fullmatch(r"b-[0-9a-f]{32}", value) else ""
+
+
 def _lib_book_id(build_id: str) -> str:
     """The book's stable UUID (docs/lib-format.md §2.4), minted on first
     export. Imported identities are persisted; older local builds use a
     deterministic fallback so a read-only export never mutates the store."""
-    doc = lib.load_json(_lib_id_path(build_id), None)
-    if isinstance(doc, dict) and re.fullmatch(
-            r"b-[0-9a-f]{32}", str(doc.get("book_id") or "")):
-        return str(doc["book_id"])
+    stored_book_id = _lib_stored_book_id(build_id)
     builds = lib.load_json(BUILDS_PATH, {}) or {}
     build = builds.get(build_id) if isinstance(builds, dict) else None
     capture_id = (
@@ -7241,11 +7531,41 @@ def _lib_book_id(build_id: str) -> str:
         else ""
     )
     if capture_id:
-        # Promoting a manual capture changes its projection, not its logical
-        # identity. Capture associations use this same namespace-derived id;
-        # computing it here also avoids taking the workspace lease while the
-        # caller owns the Replica merge lock.
-        return capture_book_id(capture_id)
+        capture_identity = capture_book_id(capture_id)
+        linked_identity = str(build.get("capture_book_id") or "")
+        if linked_identity and not re.fullmatch(
+            r"b-[0-9a-f]{32}", linked_identity
+        ):
+            raise EngineRepositoryError(
+                "the captured item identity is invalid",
+                code="invalid_capture_book_identity",
+                details={"item_id": build_id, "capture_id": capture_id},
+            )
+        conflicting_identity = (
+            linked_identity
+            if linked_identity and linked_identity != capture_identity
+            else (
+                stored_book_id
+                if stored_book_id and stored_book_id != capture_identity
+                else ""
+            )
+        )
+        if conflicting_identity:
+            raise EngineConflictError(
+                "the capture and imported archive identities conflict",
+                code="capture_book_identity_conflict",
+                details={
+                    "item_id": build_id,
+                    "capture_id": capture_id,
+                    "capture_book_id": capture_identity,
+                    "stored_book_id": conflicting_identity,
+                },
+            )
+        # New links persist this exact identity in the catalogue transaction;
+        # legacy rows retain the same namespace-derived fallback.
+        return linked_identity or capture_identity
+    if stored_book_id:
+        return stored_book_id
     return "b-" + uuid.uuid5(
         uuid.NAMESPACE_URL,
         f"https://librarytool.local/items/{build_id}").hex
@@ -7257,6 +7577,74 @@ def _lib_store_book_id(build_id: str, book_id: str) -> None:
         return
     _lib_id_path(build_id).parent.mkdir(parents=True, exist_ok=True)
     lib.save_json(_lib_id_path(build_id), {"book_id": book_id})
+
+
+def _lib_import_identity_state(
+        build_id: str, incoming_book_id: str
+        ) -> tuple[str, tuple[dict, int] | None]:
+    """Re-read capture and sidecar identity at the import commit boundary."""
+
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {}) or {}
+        build = (
+            copy.deepcopy(builds.get(build_id))
+            if isinstance(builds, dict)
+            and isinstance(builds.get(build_id), dict)
+            else None
+        )
+    if build is None:
+        return "", ({"ok": False, "error": "item no longer exists"}, 404)
+    capture_id = _capture_archive_id(build.get("capture_id"))
+    linked_book_id = str(build.get("capture_book_id") or "")
+    if capture_id and not linked_book_id:
+        linked_book_id = capture_book_id(capture_id)
+    if linked_book_id and not re.fullmatch(
+        r"b-[0-9a-f]{32}", linked_book_id
+    ):
+        return "", ({
+            "ok": False,
+            "error": "the captured item has an invalid stable book identity",
+            "conflict": "book_identity_mismatch",
+        }, 409)
+    stored_book_id = _lib_stored_book_id(build_id)
+    if (
+        linked_book_id
+        and stored_book_id
+        and linked_book_id != stored_book_id
+    ):
+        return "", ({
+            "ok": False,
+            "error": "the item carries conflicting stable book identities",
+            "conflict": "book_identity_mismatch",
+        }, 409)
+    local_book_id = linked_book_id or stored_book_id
+    if (
+        incoming_book_id
+        and local_book_id
+        and incoming_book_id != local_book_id
+    ):
+        return "", ({
+            "ok": False,
+            "error": "this .lib belongs to a different book",
+            "conflict": "book_identity_mismatch",
+        }, 409)
+    return local_book_id, None
+
+
+@contextlib.contextmanager
+def _lib_import_commit_scope(build_id: str, incoming_book_id: str):
+    """Lock identity, revalidate it, then serialize the legacy OCR write."""
+
+    with _lib_item_identity_lock(build_id):
+        local_book_id, error = _lib_import_identity_state(
+            build_id,
+            incoming_book_id,
+        )
+        if error is not None:
+            yield local_book_id, error
+            return
+        with _ocr_merge_lock:
+            yield local_book_id, None
 
 
 def _lib_book_instructions(build_id: str) -> str:
@@ -7456,6 +7844,7 @@ def api_build_replica_instructions(build_id: str):
 
 
 @app.route("/api/builds/<build_id>/replica-export")
+@_serialize_lib_item_identity
 def api_build_replica_export(build_id: str):
     """Seal one source's Replica working store into a .lib — a plain zip:
 
@@ -7975,14 +8364,6 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
     incoming_book_id = str(book.get("book_id") or "")
     if fmt[0] >= 2 and not re.fullmatch(r"b-[0-9a-f]{32}", incoming_book_id):
         return {"ok": False, "error": "the .lib has no valid stable book_id"}, 400
-    local_id_doc = lib.load_json(_lib_id_path(build_id), None)
-    local_book_id = str(local_id_doc.get("book_id") or "") \
-        if isinstance(local_id_doc, dict) else ""
-    if (incoming_book_id and local_book_id and
-            incoming_book_id != local_book_id):
-        return {"ok": False, "error":
-                "this .lib belongs to a different book",
-                "conflict": "book_identity_mismatch"}, 409
 
     # Nothing is dropped silently: every coercion and skip below is named in
     # the receipt's warnings[] with its location and reason (§2.6).
@@ -8100,7 +8481,12 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     applied, skipped, protected, tpls_added = [], [], [], []
     sheet = "none"
-    with _ocr_merge_lock:
+    with _lib_import_commit_scope(
+        build_id,
+        incoming_book_id,
+    ) as (local_book_id, identity_error):
+        if identity_error is not None:
+            return identity_error
         meta = lib.load_json(meta_path, {})
         pmap = meta.setdefault("regions", {}).setdefault(src, {})
         for n, rec in sorted(incoming.items()):
@@ -8202,6 +8588,46 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
             "translations_added": trans_added, "warnings": warnings}, 200
 
 
+def _lib_archive_book_id_for_preflight(archive: bytes) -> str:
+    """Best validated incoming identity; the engine remains the final parser."""
+
+    try:
+        document = libformat.read_lib(archive)
+    except libformat.LibError:
+        return ""
+    value = str(document.book_id or "")
+    return value if re.fullmatch(r"b-[0-9a-f]{32}", value) else ""
+
+
+def _import_lib_for_item(command: ImportLibCommand):
+    """Run native interchange under capture-aware item identity authority."""
+
+    incoming_book_id = _lib_archive_book_id_for_preflight(command.archive)
+    # Archive parsing happens before this lock.  The final capture/build and
+    # lib-id reads happen inside it, before the engine obtains its workspace
+    # lease. Promotion takes the same item lock, closing both sequential
+    # poisoning and the import-vs-promotion race without reversing lock order.
+    with _lib_item_identity_lock(command.item_id):
+        _local_book_id, identity_error = _lib_import_identity_state(
+            command.item_id,
+            incoming_book_id,
+        )
+        if identity_error is not None:
+            body, status = identity_error
+            if status == 404:
+                raise EngineNotFoundError(
+                    str(body.get("error") or "no such item"),
+                    code="item_not_found",
+                    details={"item_id": command.item_id},
+                )
+            raise EngineConflictError(
+                str(body.get("error") or "book identity mismatch"),
+                code="book_identity_mismatch",
+                details={"item_id": command.item_id},
+            )
+        return _interchange_engine().import_lib(command)
+
+
 @app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
 def api_build_replica_import(build_id: str):
     """The other half of .lib interchange: unpack an exported archive into
@@ -8228,7 +8654,7 @@ def api_build_replica_import(build_id: str):
     if not operation_id:
         operation_id = uuid.uuid4().hex
     try:
-        receipt = _interchange_engine().import_lib(ImportLibCommand(
+        receipt = _import_lib_for_item(ImportLibCommand(
             item_id=build_id,
             source_id=src,
             archive=raw,
@@ -8303,7 +8729,7 @@ def api_v1_replica_lib_import(item_id: str):
         ))
 
     try:
-        receipt = _interchange_engine().import_lib(ImportLibCommand(
+        receipt = _import_lib_for_item(ImportLibCommand(
             item_id=item_id,
             source_id=source_id,
             archive=archive,
@@ -12619,8 +13045,17 @@ def _clean_images(v) -> list[str]:
 
 
 def _clean_capture_id(v) -> str:
-    """The phone capture identifier used for provenance, never as a path."""
-    return re.sub(r"[^A-Za-z0-9-]", "", str(v or ""))[:64]
+    """Return one exact portable capture identity without rewriting aliases."""
+
+    if not isinstance(v, str):
+        return ""
+    value = v
+    if (
+        not _CAPTURE_ID_RE.fullmatch(value)
+        or value.split(".", 1)[0] in _CAPTURE_DEVICE_NAMES
+    ):
+        return ""
+    return value
 
 
 @app.route("/api/manual", methods=["POST"])
@@ -12671,42 +13106,68 @@ def api_manual_update(entry_id: str):
     a local scan PDF)."""
     payload = request.get_json(silent=True) or {}
     stale_capture_id = ""
+    snapshot = None
+    candidate = None
+    archive_fields = (
+        set(lib.MANUAL_ENTRY_FIELDS)
+        - {"local_pdf", "attention"}
+    ) | {"extra", "images", "category_ids"}
     with _manual_lock:
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         if entry_id not in entries:
             abort(404)
-        e = entries[entry_id]
-        archive_fields = (*lib.MANUAL_ENTRY_FIELDS, "extra", "images",
-                          "category_ids")
+        snapshot = copy.deepcopy(entries[entry_id])
+        candidate = copy.deepcopy(snapshot)
         for f in lib.MANUAL_ENTRY_FIELDS:
             if f in payload:
-                e[f] = str(payload[f] or "").strip()
+                candidate[f] = str(payload[f] or "").strip()
         # non-column metadata: only replaced when explicitly sent (survives edits)
         if "extra" in payload:
-            e["extra"] = _manual_extra_patch(payload.get("extra"), e.get("extra"))
+            candidate["extra"] = _manual_extra_patch(
+                payload.get("extra"),
+                candidate.get("extra"),
+            )
         if "images" in payload:
-            e["images"] = _clean_images(payload.get("images"))
+            candidate["images"] = _clean_images(payload.get("images"))
         if "category_ids" in payload:
-            e["category_ids"] = _clean_category_ids(
+            candidate["category_ids"] = _clean_category_ids(
                 payload.get("category_ids"), lib.load_taxonomy()["nodes"])
-        if not e.get("title"):
+        if not candidate.get("title"):
             return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
         if payload.get("_edited"):
-            e["edited"] = True
+            candidate["edited"] = True
         if not payload.get("_preserve"):
-            e["checks"] = _entry_checks(e)
+            candidate["checks"] = _entry_checks(candidate)
             # Metadata changed: stored matches and their verifications are stale.
-            e.pop("scans", None)
-            e.pop("verify", None)
-            e.pop("manual_urls", None)
-        if set(payload) & set(archive_fields):
-            stale_capture_id = _clean_capture_id(e.get("capture_id"))
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
-    # A retry with the already-persisted values still repairs a stale-state
-    # publication failure from the first request.
+            candidate.pop("scans", None)
+            candidate.pop("verify", None)
+            candidate.pop("manual_urls", None)
+        if any(
+            candidate.get(field) != snapshot.get(field)
+            for field in archive_fields
+        ):
+            stale_capture_id = _clean_capture_id(
+                candidate.get("capture_id")
+            )
+
+    # Invalidate first: a failed stale publication leaves the manual row
+    # untouched and therefore safely retryable.
     if stale_capture_id:
         _mark_capture_archive_stale(stale_capture_id)
-    return jsonify({"ok": True, "entry": e})
+
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        current = entries.get(entry_id)
+        if current != snapshot:
+            return jsonify({
+                "ok": False,
+                "error": "changed elsewhere",
+                "entry": current,
+            }), 409
+        assert candidate is not None
+        entries[entry_id] = candidate
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    return jsonify({"ok": True, "entry": candidate})
 
 
 @app.route("/api/manual/restore", methods=["POST"])
@@ -19406,15 +19867,15 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
             "fields": fields, "extra": extra, "errors": errors}
 
 
-_CAPTURE_INGEST_LOCKS = tuple(threading.Lock() for _ in range(64))
-_CAPTURE_ARCHIVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_CAPTURE_INGEST_LOCKS = tuple(threading.RLock() for _ in range(64))
+_CAPTURE_ASSET_SCRATCH_LOCK = threading.RLock()
+_CAPTURE_ACTIVE_ATTEMPTS: set[Path] = set()
 
 
 def _capture_archive_id(value) -> str:
     """Return the explorer's portable capture id, or empty when unusable."""
 
-    normalized = _clean_capture_id(value)
-    return normalized if _CAPTURE_ARCHIVE_ID_RE.fullmatch(normalized) else ""
+    return _clean_capture_id(value)
 
 
 def _capture_ingest_lock(capture_id: str) -> threading.Lock:
@@ -19425,27 +19886,274 @@ def _capture_ingest_lock(capture_id: str) -> threading.Lock:
     return _CAPTURE_INGEST_LOCKS[index]
 
 
-def _capture_asset_directory(capture_id: str) -> Path:
-    """Create or verify one non-redirecting capture asset directory."""
+def _capture_path_is_redirecting(path: Path) -> bool:
+    """Whether one existing path is a symlink, junction, or other reparse point."""
 
-    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
-    root_info = CAPTURES_DIR.lstat()
-    if not stat.S_ISDIR(root_info.st_mode) or CAPTURES_DIR.is_symlink():
-        raise ValueError("capture asset root is redirecting or invalid")
-    directory = CAPTURES_DIR / capture_id
-    if os.path.lexists(directory):
-        info = directory.lstat()
-        if not stat.S_ISDIR(info.st_mode) or directory.is_symlink():
-            raise ValueError("capture asset directory is redirecting or invalid")
-    else:
-        directory.mkdir()
+    info = path.lstat()
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(
+        path.is_symlink()
+        or getattr(info, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _verify_capture_asset_directory(directory: Path, *, empty: bool = False) -> None:
+    """Reject redirecting/non-regular capture members before any publication."""
+
+    info = directory.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or _capture_path_is_redirecting(directory)
+    ):
+        raise ValueError("capture asset directory is redirecting or invalid")
+    children = list(directory.iterdir())
+    if empty and children:
+        raise ValueError("capture asset attempt directory is not empty")
+    for child in children:
+        child_info = child.lstat()
+        if (
+            not stat.S_ISREG(child_info.st_mode)
+            or _capture_path_is_redirecting(child)
+        ):
+            raise ValueError("capture asset member is redirecting or invalid")
+
+
+def _fsync_capture_directory(directory: Path) -> None:
+    """Best-effort directory barrier around generation renames."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = -1
     try:
-        directory.resolve(strict=True).relative_to(
-            CAPTURES_DIR.resolve(strict=True)
+        descriptor = os.open(directory, flags)
+        os.fsync(descriptor)
+    except OSError:
+        # Windows does not permit opening directories through ``os.open``.
+        # Atomic rename still protects process-crash retries there.
+        if os.name != "nt":
+            raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _remove_capture_asset_scratch(directory: Path) -> None:
+    """Remove one validated flat private scratch tree, never a live capture."""
+
+    if not os.path.lexists(directory):
+        return
+    if (
+        directory.parent != CAPTURES_DIR
+        or not directory.name.startswith(
+            (".capture-attempt-", ".capture-orphan-")
         )
-    except (OSError, ValueError) as exc:
-        raise ValueError("capture asset directory escaped its authority") from exc
-    return directory
+    ):
+        raise ValueError("capture scratch cleanup escaped its authority")
+    _verify_capture_asset_directory(directory)
+    for child in directory.iterdir():
+        child.unlink()
+    directory.rmdir()
+    _fsync_capture_directory(CAPTURES_DIR)
+
+
+def _remove_uncommitted_capture_assets(capture_id: str) -> None:
+    """Remove one exact live generation before any row can reference it."""
+
+    if _capture_archive_id(capture_id) != capture_id:
+        raise ValueError("capture cleanup identity is not portable")
+    directory = CAPTURES_DIR / capture_id
+    with _CAPTURE_ASSET_SCRATCH_LOCK:
+        if not os.path.lexists(directory):
+            return
+        if directory.parent != CAPTURES_DIR:
+            raise ValueError("capture cleanup escaped its authority")
+        _verify_capture_asset_directory(directory)
+        for child in directory.iterdir():
+            child.unlink()
+        directory.rmdir()
+        _fsync_capture_directory(CAPTURES_DIR)
+
+
+def _scavenge_capture_asset_scratch() -> None:
+    """Clean generations left by a prior process crash, excluding live attempts."""
+
+    for child in CAPTURES_DIR.iterdir():
+        if (
+            child.name.startswith(
+                (".capture-attempt-", ".capture-orphan-")
+            )
+            and child not in _CAPTURE_ACTIVE_ATTEMPTS
+        ):
+            _remove_capture_asset_scratch(child)
+
+
+def _capture_asset_attempt_directory() -> Path:
+    """Create an isolated generation which is invisible until atomically moved."""
+
+    with _CAPTURE_ASSET_SCRATCH_LOCK:
+        CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+        root_info = CAPTURES_DIR.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or _capture_path_is_redirecting(CAPTURES_DIR)
+        ):
+            raise ValueError("capture asset root is redirecting or invalid")
+        _scavenge_capture_asset_scratch()
+        directory = CAPTURES_DIR / f".capture-attempt-{uuid.uuid4().hex}"
+        directory.mkdir()
+        _verify_capture_asset_directory(directory, empty=True)
+        _CAPTURE_ACTIVE_ATTEMPTS.add(directory)
+        return directory
+
+
+def _release_capture_asset_attempt(directory: Path) -> None:
+    """Forget and remove one unpublished attempt after success or failure."""
+
+    with _CAPTURE_ASSET_SCRATCH_LOCK:
+        _CAPTURE_ACTIVE_ATTEMPTS.discard(directory)
+        _remove_capture_asset_scratch(directory)
+
+
+def _write_capture_asset(directory: Path, name: str, payload: bytes) -> None:
+    """Create one attempt member exclusively, without following an old child."""
+
+    if (
+        not isinstance(name, str)
+        or not _phone_asset_token(name)
+        or not isinstance(payload, bytes)
+    ):
+        raise ValueError("capture asset member is invalid")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(directory / name, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise ValueError("capture asset member could not be written safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _publish_capture_asset_generation(
+        capture_id: str, attempt: Path) -> Path:
+    """Atomically replace an uncommitted capture attempt as one complete tree."""
+
+    with _CAPTURE_ASSET_SCRATCH_LOCK:
+        _verify_capture_asset_directory(attempt)
+        _fsync_capture_directory(attempt)
+        directory = CAPTURES_DIR / capture_id
+        orphan = None
+        if os.path.lexists(directory):
+            _verify_capture_asset_directory(directory)
+            orphan = (
+                CAPTURES_DIR
+                / f".capture-orphan-{capture_id}-{uuid.uuid4().hex}"
+            )
+            os.replace(directory, orphan)
+            _fsync_capture_directory(CAPTURES_DIR)
+        try:
+            os.replace(attempt, directory)
+            _fsync_capture_directory(CAPTURES_DIR)
+        except OSError:
+            if (
+                orphan is not None
+                and not os.path.lexists(directory)
+                and os.path.lexists(orphan)
+            ):
+                os.replace(orphan, directory)
+                _fsync_capture_directory(CAPTURES_DIR)
+            raise
+        _verify_capture_asset_directory(directory)
+        if orphan is not None:
+            _remove_capture_asset_scratch(orphan)
+        return directory
+
+
+def _publish_capture_assets(
+        capture_id: str, *, result: Mapping, raw_photos: list[bytes],
+        capture_notes: Mapping | None, photo_contract: Mapping | None,
+        transported_assets: list[Mapping]) -> list[str]:
+    """Stage every sidecar/image and publish or clean the attempt as one unit."""
+
+    attempt = _capture_asset_attempt_directory()
+    try:
+        if capture_notes:
+            _write_capture_asset(
+                attempt,
+                "capture_notes.json",
+                (
+                    json.dumps(capture_notes, indent=2, ensure_ascii=False)
+                    + "\n"
+                ).encode("utf-8"),
+            )
+        images = []
+        for index, jpg in enumerate(result["photos"], 1):
+            _write_capture_asset(attempt, f"photo_{index}.jpg", jpg)
+            images.append(f"captures/{capture_id}/photo_{index}.jpg")
+        for index, raw in enumerate(raw_photos, 1):
+            _write_capture_asset(attempt, f"orig_{index}.jpg", raw)
+        if photo_contract:
+            import_assets = []
+            for index, raw in enumerate(raw_photos, 1):
+                derivative = result["photos"][index - 1]
+                source_asset = transported_assets[index - 1]
+                import_assets.append({
+                    "order": index - 1,
+                    "asset_id": source_asset["asset_id"],
+                    "raw_ref": f"orig_{index}.jpg",
+                    "display_ref": f"photo_{index}.jpg",
+                    "source_checksum": hashlib.sha256(raw).hexdigest(),
+                    "derivative_checksum": hashlib.sha256(derivative).hexdigest(),
+                    "transport_representation": "original",
+                    "recipe": "desktop_perspective_standardize_v1",
+                    "lifecycle": "failed" if any(
+                        error.startswith(f"photo {index}:")
+                        for error in result["errors"]
+                    ) else "completed",
+                })
+            stored_contract = dict(photo_contract)
+            stored_contract["desktop_import"] = {
+                "version": 1,
+                "imported_at": datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                "assets": import_assets,
+            }
+            _write_capture_asset(
+                attempt,
+                "photo_assets.json",
+                (
+                    json.dumps(
+                        stored_contract,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+        if result["ocr_text"]:
+            _write_capture_asset(
+                attempt,
+                "ocr.txt",
+                str(result["ocr_text"]).encode(
+                    "utf-8",
+                    errors="replace",
+                ),
+            )
+        _publish_capture_asset_generation(capture_id, attempt)
+        return images
+    finally:
+        _release_capture_asset_attempt(attempt)
 
 
 def _capture_archive_service() -> CaptureArchiveService:
@@ -19479,7 +20187,44 @@ def _mark_capture_archive_stale(
     normalized = _capture_archive_id(capture_id)
     if not normalized:
         return None
-    return _capture_archive_service().mark_stale(normalized)
+    with _capture_ingest_lock(normalized):
+        return _capture_archive_service().mark_stale(normalized)
+
+
+def _invalidate_capture_archive_before_item_update(
+        item_id: str, *, expected_revision: str, patch: ItemPatch) -> None:
+    """Conservatively invalidate a matched capture before catalogue commit.
+
+    Item commands publish catalogue state and their receipt together, while a
+    capture association is a separate immutable snapshot.  Invalidating first
+    guarantees that an archive can never remain ``current`` after a successful
+    canonical edit.  A concurrent command may make this attempt unnecessary,
+    but a conservative stale state is safe and explicit.
+    """
+
+    changed_fields = (
+        set(patch.metadata_set)
+        | set(patch.metadata_remove)
+    )
+    if (
+        patch.title is None
+        and not changed_fields.intersection(_CAPTURE_ARCHIVE_BUILD_FIELDS)
+    ):
+        return
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {}) or {}
+        build = builds.get(item_id) if isinstance(builds, dict) else None
+        if (
+            not isinstance(build, dict)
+            or _engine_build_record_revision(item_id, build)
+            != expected_revision
+        ):
+            # Exact command replay and ordinary CAS conflict are resolved by
+            # the item service.  Only the still-matched writer can commit.
+            return
+        capture_id = _capture_archive_id(build.get("capture_id"))
+    if capture_id:
+        _mark_capture_archive_stale(capture_id)
 
 
 def _ensure_capture_archive(
@@ -19489,16 +20234,43 @@ def _ensure_capture_archive(
     capture_id = _capture_archive_id(capture_id)
     if not capture_id:
         raise ValueError("capture id is not portable")
-    service = _capture_archive_service()
-    association = service.get(capture_id)
-    if association is not None:
-        return association
-    command = capture_lib_compat.build_capture_archive_command(
-        capture_id,
-        entry,
-        CAPTURES_DIR / capture_id,
-    )
-    return service.associate(command).receipt.association
+    with _capture_ingest_lock(capture_id):
+        # The committed manual row is authoritative when available. Loading it
+        # inside the same stripe used by publication means a concurrent manual,
+        # taxonomy, or collection edit either enters this source snapshot or
+        # marks the just-published association stale.
+        with _manual_lock:
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+            matches = [
+                candidate
+                for candidate in entries.values()
+                if (
+                    isinstance(candidate, dict)
+                    and _capture_archive_id(candidate.get("capture_id"))
+                    == capture_id
+                )
+            ] if isinstance(entries, dict) else []
+        if len(matches) > 1:
+            raise ValueError("capture identity is assigned to multiple entries")
+        authoritative_entry = (
+            copy.deepcopy(matches[0]) if matches else entry
+        )
+        service = _capture_archive_service()
+        existing = service.get(capture_id)
+        if (
+            existing is not None
+            and existing.state.value == "stale"
+        ):
+            # The immutable archive has already been verified by ``get``.
+            # Later catalogue or sidecar edits are exactly why it is stale and
+            # must not prevent a lost delivery acknowledgement from converging.
+            return existing
+        command = capture_lib_compat.build_capture_archive_command(
+            capture_id,
+            authoritative_entry,
+            CAPTURES_DIR / capture_id,
+        )
+        return service.associate(command).receipt.association
 
 
 def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
@@ -19558,48 +20330,14 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
     # transport key cannot make an otherwise unprocessed capture look extracted.
     capture_notes = _capture_notes(cap)
 
-    cdir = _capture_asset_directory(cap_id)
-    if capture_notes:
-        (cdir / "capture_notes.json").write_text(
-            json.dumps(capture_notes, indent=2, ensure_ascii=False) + "\n",
-            "utf-8",
-        )
-    images = []
-    for i, jpg in enumerate(result["photos"], 1):
-        (cdir / f"photo_{i}.jpg").write_bytes(jpg)
-        images.append(f"captures/{cap_id}/photo_{i}.jpg")
-    for i, raw in enumerate(raw_photos, 1):       # originals: re-OCR stays possible
-        (cdir / f"orig_{i}.jpg").write_bytes(raw)
-    if photo_contract:
-        import_assets = []
-        for index, raw in enumerate(raw_photos, 1):
-            derivative = result["photos"][index - 1]
-            source_asset = transported_assets[index - 1]
-            import_assets.append({
-                "order": index - 1,
-                "asset_id": source_asset["asset_id"],
-                "raw_ref": f"orig_{index}.jpg",
-                "display_ref": f"photo_{index}.jpg",
-                "source_checksum": hashlib.sha256(raw).hexdigest(),
-                "derivative_checksum": hashlib.sha256(derivative).hexdigest(),
-                "transport_representation": "original",
-                "recipe": "desktop_perspective_standardize_v1",
-                "lifecycle": "failed" if any(
-                    error.startswith(f"photo {index}:") for error in result["errors"]
-                ) else "completed",
-            })
-        photo_contract = dict(photo_contract)
-        photo_contract["desktop_import"] = {
-            "version": 1,
-            "imported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "assets": import_assets,
-        }
-        (cdir / "photo_assets.json").write_text(
-            json.dumps(photo_contract, indent=2, ensure_ascii=False) + "\n",
-            "utf-8",
-        )
-    if result["ocr_text"]:
-        (cdir / "ocr.txt").write_text(result["ocr_text"], "utf-8", errors="replace")
+    images = _publish_capture_assets(
+        cap_id,
+        result=result,
+        raw_photos=raw_photos,
+        capture_notes=capture_notes,
+        photo_contract=photo_contract,
+        transported_assets=transported_assets,
+    )
 
     fields = result["fields"]
     entry = {f: "" for f in lib.MANUAL_ENTRY_FIELDS}
@@ -19631,6 +20369,20 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
         if transport in ("cloud", "lan") else "unknown"
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     entry["checks"] = _entry_checks(entry)
+    # Validate the complete compatibility projection while the manual-row
+    # commit is still reversible. This expensive image/source read deliberately
+    # stays outside the global manual-entry lock so unrelated captures can
+    # finish concurrently. The commit boundary below re-resolves collection
+    # aliases, and _ensure_capture_archive revalidates that authoritative row.
+    try:
+        capture_lib_compat.build_capture_archive_command(
+            cap_id,
+            entry,
+            CAPTURES_DIR / cap_id,
+        )
+    except Exception:
+        _remove_uncommitted_capture_assets(cap_id)
+        raise
     with _manual_lock:
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         # Cloud and paired-LAN delivery can race after both initial duplicate
@@ -19703,6 +20455,42 @@ def _cloud_capture_photo_paths(cap: dict) -> list:
         except json.JSONDecodeError:
             value = []
     return list(value) if isinstance(value, list) else []
+
+
+CAPTURE_MAX_PHOTOS = 64
+CAPTURE_MAX_PHOTO_BYTES = sbase.CAPTURE_PHOTO_MAX_BYTES
+CAPTURE_MAX_TOTAL_PHOTO_BYTES = 256 * 1024 * 1024
+
+
+def _download_cloud_capture_photos(cfg: dict, photo_paths: list) -> list[bytes]:
+    """Download one capture without exceeding the desktop ingest envelope."""
+
+    if not photo_paths:
+        raise ValueError("cloud capture must include at least one photo")
+    if len(photo_paths) > CAPTURE_MAX_PHOTOS:
+        raise ValueError(
+            f"cloud capture exceeds the {CAPTURE_MAX_PHOTOS}-photo limit"
+        )
+    photos = []
+    total = 0
+    for path in photo_paths:
+        photo = sbase.download_photo(cfg, path)
+        if not isinstance(photo, (bytes, bytearray, memoryview)):
+            raise ValueError("cloud capture photo is not binary data")
+        payload = bytes(photo)
+        if not payload:
+            raise ValueError("cloud capture photo is empty")
+        if len(payload) > CAPTURE_MAX_PHOTO_BYTES:
+            raise ValueError(
+                "cloud capture photo exceeds the per-photo size limit"
+            )
+        total += len(payload)
+        if total > CAPTURE_MAX_TOTAL_PHOTO_BYTES:
+            raise ValueError(
+                "cloud capture photos exceed the aggregate size limit"
+            )
+        photos.append(payload)
+    return photos
 
 
 def _cloud_capture_title(cap: dict) -> str:
@@ -19793,7 +20581,7 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
                 pass
         return result
     try:
-        raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
+        raw_photos = _download_cloud_capture_photos(cfg, photo_paths)
     except sbase.SyncError as exc:
         if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
             # the photos are gone — this row can never import; stop retrying it
@@ -21342,9 +22130,9 @@ _LAN_ID_PATH = lib.DATA_ROOT / "lan_desktop_id.txt"
 _lan_identity_lock = threading.Lock()
 LAN_METADATA_MAX_REQUEST_BYTES = 512 * 1024
 LAN_CONTROL_MAX_REQUEST_BYTES = 8 * 1024
-LAN_CAPTURE_MAX_REQUEST_BYTES = 256 * 1024 * 1024
-LAN_CAPTURE_MAX_PHOTOS = 64
-LAN_CAPTURE_MAX_PHOTO_BYTES = 32 * 1024 * 1024
+LAN_CAPTURE_MAX_REQUEST_BYTES = CAPTURE_MAX_TOTAL_PHOTO_BYTES
+LAN_CAPTURE_MAX_PHOTOS = CAPTURE_MAX_PHOTOS
+LAN_CAPTURE_MAX_PHOTO_BYTES = CAPTURE_MAX_PHOTO_BYTES
 LAN_SNAPSHOT_MAX_ENTRIES = 2_000
 
 
@@ -21713,6 +22501,9 @@ def _lan_capture():
         abort(400)
     if not isinstance(cap, dict):
         abort(400)
+    capture_id = _capture_archive_id(cap.get("id"))
+    if not capture_id:
+        return jsonify(error="capture id is not a portable identity"), 400
     files = request.files.getlist("photo")
     if not files or len(files) > LAN_CAPTURE_MAX_PHOTOS:
         abort(413 if files else 400)
@@ -21731,13 +22522,14 @@ def _lan_capture():
     except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500
-    capture_id = str(cap.get("id") or "")
-    association = _capture_archive_association(_clean_capture_id(capture_id))
-    portable = (
-        {"lib_association": association.as_dict()}
-        if association is not None
-        else {}
-    )
+    association = _capture_archive_association(capture_id)
+    if association is None:
+        log.error(
+            "LAN capture returned without a durable archive: capture=%s",
+            capture_id,
+        )
+        return jsonify(error="capture archive association is unavailable"), 500
+    portable = {"lib_association": association.as_dict()}
     if entry_id is None:
         # Idempotent retry. Echo the submitted capture id so Android can prove
         # that this receipt belongs to the entry it is about to move to sent/.

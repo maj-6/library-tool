@@ -1,7 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+
+from PIL import Image
+
+
+def _jpeg(seed: str = "capture") -> bytes:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    stream = io.BytesIO()
+    Image.new("RGB", (1, 1), tuple(digest[:3])).save(stream, format="JPEG")
+    return stream.getvalue()
 
 
 def _android_photo_contract(capture_id: str, raw: bytes) -> dict:
@@ -149,7 +159,7 @@ def test_phone_collection_and_origin_reach_the_entry(monkeypatch, data_root):
         },
     }
 
-    entry_id, errors = server.ingest_capture(cap, [b"image"], "")
+    entry_id, errors = server.ingest_capture(cap, [_jpeg("collection")], "")
     entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
 
     assert errors == []
@@ -230,11 +240,12 @@ def test_notes_merge_only_after_desktop_ocr_selection_and_keep_raw_sidecar(
         "meta": {server.PHONE_CAPTURE_NOTES_KEY: notes},
     }
 
-    entry_id, errors = server.ingest_capture(cap, [b"image"], "desktop-key")
+    raw = _jpeg("notes")
+    entry_id, errors = server.ingest_capture(cap, [raw], "desktop-key")
     entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
 
     assert errors == []
-    assert called == [([b"image"], "desktop-key")]
+    assert called == [([raw], "desktop-key")]
     assert entry["title"] == "Desktop Read This"
     assert entry["extra"] == {
         "binding": "cloth",
@@ -257,9 +268,10 @@ def test_ingest_preserves_versioned_photo_contract_and_desktop_lineage(
         monkeypatch, data_root):
     import server
 
-    monkeypatch.setattr(server.capture, "process_photo", lambda raw: b"corrected-" + raw)
+    corrected = _jpeg("corrected")
+    monkeypatch.setattr(server.capture, "process_photo", lambda _raw: corrected)
     monkeypatch.setattr(server, "_entry_checks", lambda entry: {})
-    raw = b"raw-image"
+    raw = _jpeg("raw")
     capture_id = "aa7f0ec0-fb63-4b8d-850e-d88f7054c113"
     contract = _android_photo_contract(capture_id, raw)
     cap = {
@@ -371,7 +383,7 @@ def test_malformed_wire_provenance_is_ignored_as_non_string_metadata(
             "scan_collection": ["not", "flat"],
             "scan_from": 42,
         },
-    }, [b"image"], "")
+    }, [_jpeg("malformed-provenance")], "")
 
     entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
     assert errors == []
@@ -433,7 +445,7 @@ def test_provenance_survives_the_desktop_ocr_fallback(monkeypatch, data_root):
         },
     }
 
-    entry_id, _ = server.ingest_capture(cap, [b"image"], "")
+    entry_id, _ = server.ingest_capture(cap, [_jpeg("desktop-fallback")], "")
     entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
 
     assert entry["title"] == "Desktop Read This"       # the fallback really ran
@@ -480,7 +492,7 @@ def test_ingest_reresolves_collection_alias_at_final_save(monkeypatch, data_root
             "scan_collection": "Old snapshot",
             "scan_from": "Office",
         },
-    }, [b"image"], "")
+    }, [_jpeg("collection-alias")], "")
 
     extra = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]["extra"]
     assert calls == [old, old]  # before processing, then inside final _manual_lock
@@ -551,7 +563,7 @@ def test_scan_provenance_outranks_a_same_named_extracted_field(monkeypatch, data
         },
     }
 
-    entry_id, _ = server.ingest_capture(cap, [b"image"], "")
+    entry_id, _ = server.ingest_capture(cap, [_jpeg("provenance-wins")], "")
     entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
 
     assert entry["extra"]["scan_collection"] == "Blue crate"
@@ -568,7 +580,11 @@ def test_unknown_phone_metadata_does_not_create_table_fields(monkeypatch, data_r
         "meta": {"title": "A Book", "binding": "full calf"},
     }
 
-    entry_id, errors = server.ingest_capture(cap, [b"image"], "")
+    entry_id, errors = server.ingest_capture(
+        cap,
+        [_jpeg("unknown-metadata")],
+        "",
+    )
     entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
 
     assert errors == []
@@ -592,7 +608,11 @@ def test_spine_title_is_retained_as_distinct_manual_metadata(monkeypatch, data_r
         },
     }
 
-    entry_id, errors = server.ingest_capture(cap, [b"image"], "")
+    entry_id, errors = server.ingest_capture(
+        cap,
+        [_jpeg("spine-title")],
+        "",
+    )
     entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
 
     assert errors == []

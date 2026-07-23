@@ -37,6 +37,7 @@ _MANAGED_FIELDS = frozenset(
         "artifacts",
         "relevance",
         "capture_id",
+        "capture_book_id",
         "published_slug",
         "ocr_active",
         "ocr_verified",
@@ -89,7 +90,14 @@ _RIGHTS = frozenset(
     }
 )
 _CATEGORY_ID_RE = re.compile(r"^\w{1,12}$")
-_CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9-]{0,64}$")
+_CAPTURE_ID_RE = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9_-])?)?$"
+)
+_CAPTURE_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
 _LANGUAGE_ID_RE = re.compile(r"^[a-z-]{1,12}$")
 _RECORD_REVISION_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$"
@@ -271,8 +279,18 @@ class WhlCatalogueItemCodec:
         if "capture_id" in raw and (
             not isinstance(raw["capture_id"], str)
             or not _CAPTURE_ID_RE.fullmatch(raw["capture_id"])
+            or (
+                raw["capture_id"]
+                and raw["capture_id"].split(".", 1)[0]
+                in _CAPTURE_DEVICE_NAMES
+            )
         ):
             raise ValueError("build capture_id is invalid")
+        if "capture_book_id" in raw and (
+            not isinstance(raw["capture_book_id"], str)
+            or not re.fullmatch(r"(?:b-[0-9a-f]{32})?", raw["capture_book_id"])
+        ):
+            raise ValueError("build capture_book_id is invalid")
         self._validate_representation_manifest(raw)
 
     def decode(
