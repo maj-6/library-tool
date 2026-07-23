@@ -100,17 +100,23 @@
          came from. A collection must be chosen before a book scan can start. -->
     <string name="home_tab_scans">Scans</string>
     <string name="home_tab_collections">Collections</string>
+    <string name="home_tab_inspect">Inspect</string>
     <string name="collections_new">New collection</string>
     <string name="collections_edit">Edit</string>
     <string name="collections_delete">Delete</string>
     <string name="collections_edit_description">Edit %1$s</string>
+    <string name="collections_retag_retired_description">Retag retired collection %1$s</string>
     <string name="collections_delete_description">Delete %1$s</string>
     <string name="collections_cancel_edit_description">Cancel collection changes</string>
     <string name="collections_save_edit_description">Save collection</string>
     <string name="collections_empty">No collections</string>
     <string name="collections_add_title">New collection</string>
     <string name="collections_edit_title">Edit collection</string>
+    <string name="collections_retag_retired_title">Retag retired collection</string>
     <string name="collections_field_name">Collection</string>
+    <string name="collections_field_tag_id">Tag ID</string>
+    <string name="collections_hint_tag_id">FUNGI_1</string>
+    <string name="collections_tag_id_help">Printed on the box and encoded in its QR label. A new collection gets a short ID automatically.</string>
     <string name="collections_field_parent">Parent</string>
     <string name="collections_parent_none">No parent</string>
     <string name="collections_parent_unavailable">Unavailable parent</string>
@@ -121,6 +127,10 @@
     <string name="collections_save">Save</string>
     <string name="collections_error_name_required">Give the collection a name.</string>
     <string name="collections_error_name_taken">There is already a collection with that name.</string>
+    <string name="collections_error_tag_id_taken">There is already a collection with that tag ID.</string>
+    <string name="collections_error_retag_required">Choose a different tag ID to resolve this retired-box conflict.</string>
+    <string name="collections_sync_tag_conflict">Tag ID %1$s is already used in the shared library. Edit that collection’s Tag ID to resume sync; the app will not silently invalidate a printed label.</string>
+    <string name="selection_selected_state">Selected</string>
     <string name="collections_error_parent_invalid">Choose a valid parent collection.</string>
     <string name="collections_error_missing">That collection no longer exists.</string>
     <string name="collections_error_save">The collection could not be saved. Free storage and try again.</string>
@@ -129,16 +139,18 @@
     <string name="collections_delete_failed">The collection could not be deleted. Free storage and try again.</string>
     <string name="collections_current">Scanning into %1$s</string>
     <string name="collections_current_state">Current collection</string>
+    <string name="collections_retired_tag_conflict">%1$s (retired tag conflict)</string>
+    <string name="collections_retired_conflict_state">Retired tag conflict</string>
     <string name="collections_current_from">Scanning into %1$s · from %2$s</string>
     <string name="collections_none_selected">No collection selected</string>
     <string name="collections_choose_first">Choose a collection before scanning a book.</string>
     <string name="collections_row_from">from %1$s</string>
     <string name="collections_row_no_from">no origin recorded</string>
-    <!-- Deliberately "on this phone", not a total: the recent list prunes
-         uploaded scans, so a plain count would shrink as books are delivered. -->
+    <!-- The durable inventory retains summaries after delivered scan media is
+         pruned, so this count does not shrink as books are delivered. -->
     <plurals name="collections_row_books">
-        <item quantity="one">%1$d on this phone</item>
-        <item quantity="other">%1$d on this phone</item>
+        <item quantity="one">%1$d recorded on this device</item>
+        <item quantity="other">%1$d recorded on this device</item>
     </plurals>
     <string name="home_group_unfiled">No collection</string>
     <plurals name="home_group_scan_count">
@@ -147,6 +159,43 @@
     </plurals>
     <string name="home_group_expand">%1$s, %2$s. Expand group</string>
     <string name="home_group_collapse">%1$s, %2$s. Collapse group</string>
+
+    <!-- Inspect keeps lightweight bibliographic summaries after delivered scan
+         media is pruned. It never implies that the tag is the collection UUID. -->
+    <string name="inspect_scan_box">Scan box QR</string>
+    <string name="inspect_summary">%1$s &#183; %2$s recorded on this device</string>
+    <plurals name="inspect_collection_count">
+        <item quantity="one">%1$d collection</item>
+        <item quantity="other">%1$d collections</item>
+    </plurals>
+    <plurals name="inspect_book_count">
+        <item quantity="one">%1$d book</item>
+        <item quantity="other">%1$d books</item>
+    </plurals>
+    <string name="inspect_collection_chip">%1$s\n%2$s &#183; %3$s</string>
+    <string name="inspect_collection_description">Inspect %1$s, tag %2$s, %3$s</string>
+    <string name="inspect_collection_meta">%1$s &#183; %2$s%3$s</string>
+    <string name="inspect_mode_tiles">Tiles</string>
+    <string name="inspect_mode_content">Content</string>
+    <string name="inspect_mode_icons">Icons</string>
+    <string name="inspect_empty_collections">Create a collection before inspecting a box.</string>
+    <string name="inspect_empty_books">No books have been recorded in this collection yet.</string>
+    <string name="inspect_show_more">Show %1$d more</string>
+    <string name="inspect_book_untitled">Untitled book</string>
+    <plurals name="inspect_book_pages">
+        <item quantity="one">%1$d page photographed</item>
+        <item quantity="other">%1$d pages photographed</item>
+    </plurals>
+    <string name="inspect_book_archived">Summary retained after local scan media was cleared</string>
+    <string name="inspect_book_unavailable">The book summary is available, but its local photos and detail view have been cleared.</string>
+    <string name="inspect_scan_unknown">No collection uses tag ID %1$s.</string>
+    <string name="inspect_scan_invalid">That QR code does not contain a valid collection tag ID.</string>
+    <string name="inspect_scan_matched">Inspecting %1$s (%2$s)</string>
+    <string name="qr_scanner_title">Scan a box label</string>
+    <string name="qr_scanner_help">Center the collection QR code inside the frame.</string>
+    <string name="qr_scanner_close">Close QR scanner</string>
+    <string name="qr_scanner_permission_denied">Camera access is needed to scan a box QR code.</string>
+    <string name="qr_scanner_unavailable">The QR scanner could not start on this device.</string>
 
     <string name="detail_from">From</string>
     <string name="detail_from_edit">Change</string>

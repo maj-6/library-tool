@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.MessageDigest
@@ -369,7 +370,7 @@ class CollectionSyncTest {
     }
 
     @Test
-    fun parentlessRowsKeepTheirVersionTwoContentHash() {
+    fun tagIdsParticipateInContentHashAlongsideParents() {
         val unchanged = row("Blue crate", "2026-07-19T10:00:00Z")
         val canonical = listOf(
             unchanged.id,
@@ -377,6 +378,7 @@ class CollectionSyncTest {
             unchanged.from,
             unchanged.deleted.toString(),
             unchanged.mergedInto.orEmpty(),
+            "tag:${unchanged.tagId}",
         ).joinToString("\u0000")
         val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray())
         val legacyHash = digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
@@ -386,6 +388,95 @@ class CollectionSyncTest {
             legacyHash == collectionContentHash(
                 unchanged.copy(parentId = "00000000-0000-0000-0000-000000000002"),
             ),
+        )
+        assertFalse(
+            legacyHash == collectionContentHash(unchanged.copy(tagId = "BLUE_CRATE_2")),
+        )
+    }
+
+    @Test
+    fun neverSyncedLocalTombstoneStillAttemptsToReserveItsPrintedTag() {
+        val retired = row(
+            name = "Retired crate",
+            updatedAt = "2026-07-19T12:00:00Z",
+            deleted = true,
+        ).copy(tagId = "RETIRED_1")
+
+        val merge = mergeCollections(
+            local = listOf(retired),
+            cloud = emptyList(),
+            shadow = emptyMap(),
+            dirty = setOf(retired.id),
+        )
+
+        assertEquals(listOf(retired), merge.collections)
+        assertEquals(retired, merge.writes.single().row)
+        assertTrue(retired.id in merge.dirty)
+    }
+
+    @Test
+    fun crossDeviceTagCollisionSurvivesPersistenceWithoutSilentRelabeling() {
+        val baselineA = row(
+            name = "Fungi",
+            updatedAt = "2026-07-19T10:00:00Z",
+            id = "00000000-0000-0000-0000-000000000001",
+        ).copy(tagId = "FUNGI_1")
+        val baselineB = row(
+            name = "Herbs",
+            updatedAt = "2026-07-19T10:00:00Z",
+            id = "00000000-0000-0000-0000-000000000002",
+        ).copy(tagId = "HERBS_1")
+        val localA = baselineA.copy(
+            tagId = "SHARED_1",
+            updatedAt = "2026-07-19T11:00:00Z",
+        )
+        val cloudB = baselineB.copy(
+            tagId = "SHARED_1",
+            updatedAt = "2026-07-19T12:00:00Z",
+        )
+        val shadow = listOf(baselineA, baselineB).associate { baseline ->
+            baseline.id to CollectionSyncShadow(
+                collectionContentHash(baseline),
+                baseline.updatedAt,
+            )
+        }
+
+        val merged = mergeCollections(
+            local = listOf(localA, baselineB),
+            cloud = listOf(baselineA, cloudB),
+            shadow = shadow,
+            dirty = setOf(localA.id),
+        )
+        val reparsed = collectionStoreFromJson(
+            collectionStoreToJson(
+                CollectionStore(merged.collections, merged.shadow, merged.dirty),
+            ),
+        )
+
+        assertEquals(listOf("SHARED_1", "SHARED_1"), reparsed.collections.map { it.tagId })
+        assertFalse(collectionTagIdsAreUnique(reparsed.collections))
+        assertNull(findCollectionByTagId(reparsed.collections, "SHARED_1"))
+        assertEquals(localA, merged.writes.single().row)
+    }
+
+    @Test
+    fun duplicateTagNeedsHumanResolutionOnlyWhenAMatchingCollectionIsLive() {
+        val live = row(
+            name = "Live crate",
+            updatedAt = "2026-07-19T12:00:00Z",
+            id = "00000000-0000-0000-0000-000000000001",
+        ).copy(tagId = "SHARED_1")
+        val retired = row(
+            name = "Retired crate",
+            updatedAt = "2026-07-19T11:00:00Z",
+            deleted = true,
+            id = "00000000-0000-0000-0000-000000000002",
+        ).copy(tagId = "SHARED_1")
+
+        assertEquals("SHARED_1", conflictingLiveCollectionTagId(listOf(live, retired)))
+        assertEquals(
+            null,
+            conflictingLiveCollectionTagId(listOf(retired, retired.copy(id = "retired-2"))),
         )
     }
 
@@ -408,6 +499,7 @@ class CollectionSyncTest {
                 .put("id", "a")
                 .put("name", "Blue crate")
                 .put("from_place", "Storage")
+                .put("tag_id", " blue crate 7 ")
                 .put("updated_at", "2026-07-19T12:00:00Z")
                 .put("deleted", true)
                 .put("merged_into", "b")
@@ -422,6 +514,7 @@ class CollectionSyncTest {
                 true,
                 "b",
                 "parent",
+                "BLUE_CRATE_7",
             ),
             parsed,
         )
@@ -479,12 +572,77 @@ class CollectionSyncTest {
     }
 
     @Test
+    fun collectionPaginationPreservesExplicitTagConflictsAndAllocatesOnlyLegacyTags() {
+        val rows = JSONArray()
+            .put(
+                JSONObject()
+                    .put("id", "a")
+                    .put("name", "Fungi")
+                    .put("tag_id", " fungi-1 "),
+            )
+            .put(
+                JSONObject()
+                    .put("id", "b")
+                    .put("name", "Mushrooms")
+                    .put("tag_id", "FUNGI_1"),
+            )
+            .put(
+                JSONObject()
+                    .put("id", "c")
+                    .put("name", "Fungi")
+                    .put("tag_id", JSONObject.NULL),
+            )
+
+        val loaded = collectCollectionPages { afterId ->
+            if (afterId == null) rows else JSONArray()
+        }
+
+        assertEquals(listOf("a", "b", "c"), loaded.map { it.id })
+        assertEquals(listOf("FUNGI_1", "FUNGI_1", "FUNGI_2"), loaded.map { it.tagId })
+        assertFalse(collectionTagIdsAreUnique(loaded))
+    }
+
+    @Test
     fun opportunisticWorkCoalescesButMutationsAppend() {
         assertEquals(ExistingWorkPolicy.KEEP, collectionSyncWorkPolicy(guaranteed = false))
         assertEquals(
             ExistingWorkPolicy.APPEND_OR_REPLACE,
             collectionSyncWorkPolicy(guaranteed = true),
         )
+    }
+
+    @Test
+    fun uniqueConflictRequiresHumanRetaggingInsteadOfAutomaticRelabeling() {
+        val tagConflict = SupabaseClient.HttpException(
+            409,
+            "conflict",
+            """{"code":"23505","message":"duplicate key value violates unique constraint \"collections_tag_id_key\""}""",
+        )
+        val otherUnique = SupabaseClient.HttpException(
+            409,
+            "conflict",
+            """{"code":"23505","message":"duplicate key value violates unique constraint \"collections_pkey\""}""",
+        )
+        val permanentlyReserved = SupabaseClient.HttpException(
+            409,
+            "conflict",
+            """{"code":"23505","message":"duplicate key value violates unique constraint \"collection_tag_reservations_pkey\""}""",
+        )
+
+        assertTrue(isCollectionTagConflict(tagConflict))
+        assertTrue(isCollectionTagConflict(permanentlyReserved))
+        assertFalse(isCollectionTagConflict(otherUnique))
+        assertFalse(isCollectionTagConflict(SupabaseClient.HttpException(400, "bad request")))
+        val worker = java.io.File(
+            "src/main/java/org/whl/bookcapture/CollectionSyncWorker.kt",
+        ).readText()
+        assertTrue(worker.contains("Collections.conflictingLiveTagId(ctx)"))
+        assertTrue(worker.contains("Prefs.setCollectionTagConflict(ctx, tagId)"))
+        val collections = java.io.File(
+            "src/main/java/org/whl/bookcapture/Collections.kt",
+        ).readText()
+        assertTrue(collections.contains("internal fun retagRetired("))
+        assertTrue(collections.contains("CollectionSyncWorker.enqueue(ctx)"))
     }
 
     @Test

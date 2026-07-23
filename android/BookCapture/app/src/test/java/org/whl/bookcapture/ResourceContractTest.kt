@@ -136,7 +136,7 @@ class ResourceContractTest {
     fun chromeTextActionsUseSemanticMaterialButtons() {
         val expected = mapOf(
             "src/main/res/layout/activity_home.xml" to
-                listOf("tabScans", "tabCollections"),
+                listOf("tabScans", "tabCollections", "tabInspect"),
         )
         for ((path, ids) in expected) {
             val layout = xml(path)
@@ -233,7 +233,7 @@ class ResourceContractTest {
     }
 
     /**
-     * Home's chrome is the app mark plus the two tabs. Settings moved into a
+     * Home's chrome is the app mark plus the three tabs. Settings moved into a
      * menu behind the mark, so Home must carry no gear of its own — the capture
      * screen keeps its own, which is why this checks the file and not the app.
      */

@@ -94,17 +94,32 @@ to disagree and the UI must not pretend otherwise.
 
 | File | Role |
 |---|---|
-| `Collections.kt` | `BookCollection(id, name, from)`, pure edit/validate functions, `filesDir/collections.json` via `Entries.atomicWrite` |
+| `Collections.kt` | `BookCollection(id, name, tagId, from)`, pure edit/validate functions, `filesDir/collections.json` via `Entries.atomicWrite` |
 | `Prefs.kt` | `current_collection` — a pointer only |
 | `CaptureSession.kt` | freezes `CaptureProvenance` per entry into `collection.json`; `applyProvenance` (manifest, nested, keeps the id) and `applyProvenanceToPayload` (wire, flat strings) |
 | `UploadWorker.kt` | folds provenance into the outgoing `meta` for both transports |
 
-**Wire.** Provenance rides inside the capture's `meta` as `scan_collection` and
-`scan_from`.
+`BookCollection.tagId` is the short, QR-facing physical-box label. It is
+separate from the durable UUID `id`: QR inspection resolves `tagId` to the
+current collection row, while hierarchy, synchronization, and book provenance
+continue to use the UUID. Android also keeps a photo-free
+`collection_inventory.json` summary before old sent media is pruned so the
+Inspect tab does not collapse back to the 15-entry recent list.
+
+Migration 018 contains the database-side `tag_id` backfill, uniqueness,
+canonical-format constraint, legacy-client allocator, narrow grants, and a
+private permanent-reservation ledger so an edited tag cannot later move to a
+different collection UUID. Migration 019 adds the ledger owner index and an
+explicit deny policy for API roles. Both were deployed database-first on
+2026-07-22 and verified before building Book Capture 0.5.1-alpha.10 (version
+code 29).
+
+**Wire.** Provenance rides inside the capture's `meta` as
+`scan_collection_id`, `scan_collection`, and `scan_from`.
 
 **Desktop.** `tools/whl_explorer/server.py`
 
-- `PHONE_PROVENANCE_KEYS = {"scan_collection", "scan_from"}`
+- `PHONE_PROVENANCE_KEYS = {"scan_collection_id", "scan_collection", "scan_from"}`
 - `_capture_provenance(cap)` merges them into `entry["extra"]` on **both**
   import paths
 - `_phone_result` excludes them from its `has_metadata` test
@@ -117,22 +132,15 @@ to disagree and the UI must not pretend otherwise.
 > `tests/test_phone_capture.py` and `CollectionsTest`. Renaming these keys means
 > changing both sides in the same commit.
 
-So today a collection reaches the desktop only as two untyped strings inside a
-generic `extra` blob, rendered as "scan collection" / "scan from".
+The desktop preserves all three snapshots in the generic `extra` blob, promotes
+`Collection` and `From` to read-only catalogue columns and filters, and manages
+current collection rows through the shared collection API.
 
-## Gap: the wire carries no collection id
+## Wire compatibility
 
-`applyProvenanceToPayload` sends the collection **name** only. The manifest keeps
-the id (`applyProvenance`), but it never leaves the phone.
-
-Without an id the desktop cannot tell a renamed collection from a different one,
-so it cannot link an entry to a synced collection row, count books per
-collection reliably, or filter by collection across a rename.
-
-**Required change:** add `scan_collection_id` to the wire payload and to
-`PHONE_PROVENANCE_KEYS`, keeping `scan_collection` (the name snapshot) as well.
-Both are needed: the id links, the name records what the book was actually filed
-under at the time.
+`applyProvenanceToPayload` now sends both the durable collection UUID and the
+frozen name snapshot. `PHONE_PROVENANCE_KEYS` recognizes both so provenance
+never suppresses desktop OCR on a capture that has no extracted metadata.
 
 Entries imported before this change have a name but no id. Treat a missing id as
 "unlinked" — match by name only as a display convenience, never as identity.
@@ -264,10 +272,10 @@ counterpart. This is the same shape as the anonymous-capture claim flow in
   an id-keyed dict written under `_manual_lock` and needs a forward-compatible
   read (absent key ⇒ empty string), not a rewrite.
 
-## Test plan
+## Verification coverage
 
-Mirror the existing two-sided pattern — a test on each side that names the
-other, as `test_phone_capture.py` and `CollectionsTest` already do.
+The implementation mirrors the existing two-sided pattern — a test on each
+side names the other, as `test_phone_capture.py` and `CollectionsTest` do.
 
 - **Migration**: `tests/test_cloud_migrations.py` covers the migrations
   directory; the new file must satisfy it (idempotent, registers itself).
@@ -285,9 +293,9 @@ other, as `test_phone_capture.py` and `CollectionsTest` already do.
   from `has_metadata`. This is the highest-severity regression in this area and
   it has already happened once.
 
-## Suggested staging
+## Implementation stages
 
-Each stage is shippable alone.
+All four stages are implemented together. Each remains independently testable:
 
 1. **Wire the id.** Add `scan_collection_id` on the phone and to
    `PHONE_PROVENANCE_KEYS`. No schema, no UI. Unblocks everything else and is
