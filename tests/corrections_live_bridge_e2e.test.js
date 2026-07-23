@@ -289,6 +289,8 @@ test("production EngineClient completes the representative Corrections flow", {
 
   const corrected = await reopened.rasterArtifacts.list({
     itemId,
+    representationId: display.source.representation_id,
+    canvasId: display.source.canvas_id,
     group: "processed-images",
   });
   assert.ok(
@@ -298,6 +300,40 @@ test("production EngineClient completes the representative Corrections flow", {
     "corrected rendition was not projected back through the production bridge: " +
       JSON.stringify(corrected),
   );
+  const correctedDisplay = corrected.artifacts.find(
+    (value) => value.kind === "corrected-image");
+  assert.ok(correctedDisplay, "corrected display was not projected");
+  assert.equal(
+    correctedDisplay.source.representation_id,
+    display.source.representation_id,
+  );
+  assert.equal(correctedDisplay.source.canvas_id, display.source.canvas_id);
+  assert.equal(
+    correctedDisplay.source.canvas_revision,
+    correctedDisplay.revision,
+  );
+  assert.equal(correctedDisplay.freshness, "untracked");
+  const mappedAnnotations = await reopened.spatialAnnotations.list({
+    itemId,
+    representationId: correctedDisplay.source.representation_id,
+    canvasId: correctedDisplay.source.canvas_id,
+    canvasRevision: correctedDisplay.source.canvas_revision,
+  });
+  assert.ok(mappedAnnotations.annotations.length >= 1);
+  const mappedIllustration = mappedAnnotations.annotations.find(
+    (value) => value.extensions &&
+      value.extensions.correction_transform &&
+      value.extensions.correction_transform.source_annotation_id ===
+        illustration.key.annotation_id,
+  );
+  assert.ok(
+    mappedIllustration,
+    "mapped illustration annotation was not projected",
+  );
+  assert.equal(mappedIllustration.effective_role, "figure");
+  assert.deepEqual(mappedIllustration.linked_artifact_ids, [
+    correctedDisplay.key.artifact_id,
+  ]);
   const preserved = (await reopened.rasterArtifacts.get({
     itemId,
     artifactId: displayId,

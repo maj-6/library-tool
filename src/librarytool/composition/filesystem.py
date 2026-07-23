@@ -134,7 +134,11 @@ from ..engine.raster_artifacts import (
     RasterArtifactView,
     RasterResourceRef,
 )
-from ..engine.spatial_annotations import SpatialAnnotationProjectorPort
+from ..engine.spatial_annotations import (
+    SpatialAnnotationKey,
+    SpatialAnnotationProjectorPort,
+    SpatialAnnotationView,
+)
 from ..engine.text_layer_aggregate import (
     TextLayerAggregateService,
     TextLayerSourceSnapshot,
@@ -662,8 +666,8 @@ class _ReentrantContextFactory:
                 self._state.depth = 0
 
 
-class _RasterArtifactProjectionUnion:
-    """Combine live source artifacts with immutable correction outputs."""
+class _CorrectionProjectionUnion:
+    """Combine live source evidence with immutable correction outputs."""
 
     def __init__(
         self,
@@ -752,6 +756,50 @@ class _RasterArtifactProjectionUnion:
             if not callable(resolver):
                 return None
             return resolver(item_id, resource)
+
+    def list_spatial_annotations(
+        self,
+        item_id: str,
+        *,
+        representation_id: str = "",
+        canvas_id: str = "",
+    ) -> tuple[SpatialAnnotationView, ...]:
+        with self._read_context():
+            values = (
+                *self._base.list_spatial_annotations(
+                    item_id,
+                    representation_id=representation_id,
+                    canvas_id=canvas_id,
+                ),
+                *self._transforms.list_spatial_annotations(
+                    item_id,
+                    representation_id=representation_id,
+                    canvas_id=canvas_id,
+                ),
+            )
+        identities = [value.key.annotation_id.casefold() for value in values]
+        if len(identities) != len(set(identities)):
+            raise RepositoryError(
+                "a correction transform output reuses a spatial identity",
+                code="invalid_correction_transform_storage",
+                details={"item_id": item_id},
+            )
+        return tuple(sorted(values, key=lambda value: value.key.annotation_id))
+
+    def get_spatial_annotation(
+        self,
+        key: SpatialAnnotationKey,
+    ) -> SpatialAnnotationView | None:
+        if not isinstance(key, SpatialAnnotationKey):
+            raise TypeError("key must be a SpatialAnnotationKey")
+        return next(
+            (
+                value
+                for value in self.list_spatial_annotations(key.item_id)
+                if value.key == key
+            ),
+            None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -989,15 +1037,15 @@ def compose_filesystem_engine(
             lock_context_for=corrections_lock,
             recover=False,
         )
-        raster_projection = _RasterArtifactProjectionUnion(
+        correction_projection = _CorrectionProjectionUnion(
             corrections_base,
             correction_transform_store,
             write_set=resources.write_set,
             lock_context_for=corrections_lock,
         )
         aggregate_projector = CorrectionAggregateProjector(
-            raster_projection,
-            corrections_base,
+            correction_projection,
+            correction_projection,
         )
         correction_repository = FilesystemCorrectionRepository(
             resources.write_set,
@@ -1008,8 +1056,8 @@ def compose_filesystem_engine(
         )
         correction_commands = CorrectionService(correction_repository)
         corrections_artifacts = CorrectionProjectionService(
-            raster_projection,
-            corrections_base,
+            correction_projection,
+            correction_projection,
             correction_repository,
         )
         correction_source_reader = FilesystemCorrectionSourceSnapshotReader(

@@ -54,19 +54,24 @@ def _artifact(
     )
 
 
-def _annotation() -> SpatialAnnotationView:
+def _annotation(
+    *,
+    annotation_id: str = "region-1",
+    representation_revision: str = "capture-r1",
+    canvas_revision: str = "canvas-r1",
+) -> SpatialAnnotationView:
     return SpatialAnnotationView(
-        key=SpatialAnnotationKey("book-1", "region-1"),
+        key=SpatialAnnotationKey("book-1", annotation_id),
         revision="region-r1",
         source=SpatialSourceRef(
             "capture",
-            "capture-r1",
+            representation_revision,
             "canvas-1",
-            "canvas-r1",
+            canvas_revision,
         ),
         selector=NormalizedPolygonSelector(
             "canvas-normalized",
-            "canvas-r1",
+            canvas_revision,
             (
                 NormalizedPoint(0.1, 0.1),
                 NormalizedPoint(0.9, 0.1),
@@ -164,6 +169,26 @@ def test_reader_does_not_apply_page_space_annotations_to_crop_bytes() -> None:
 
     assert snapshot.annotations == ()
     assert spatial.calls == []
+
+
+def test_reader_uses_only_the_artifact_coordinate_revision() -> None:
+    content = b"immutable-raster-source"
+    artifact = _artifact(content)
+    current = _annotation()
+    other_revision = _annotation(
+        annotation_id="region-other-revision",
+        representation_revision="capture-r2",
+        canvas_revision="canvas-r2",
+    )
+    reader = FilesystemCorrectionSourceSnapshotReader(
+        _Raster(artifact),
+        _Spatial((current, other_revision)),
+        _Resolver(artifact, content),
+    )
+
+    snapshot = reader(artifact.key)
+
+    assert snapshot.annotations == (current,)
 
 
 def test_reader_rejects_changed_bytes_and_closes_the_snapshot_stream() -> None:

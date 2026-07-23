@@ -13,6 +13,9 @@ import pytest
 from PIL import Image
 
 from librarytool.adapters.filesystem import (
+    correction_transform_store as transform_store_module,
+)
+from librarytool.adapters.filesystem import (
     FilesystemCorrectionTransformStore,
     RecoverableWriteSet,
     WriteSetError,
@@ -28,6 +31,7 @@ from librarytool.engine.correction_transforms import (
 )
 from librarytool.engine.errors import ConflictError, RepositoryError
 from librarytool.engine.raster_artifacts import (
+    ArtifactFreshness,
     CaptionAssertion,
     CategoryAssignment,
     RasterArtifactKey,
@@ -288,6 +292,10 @@ def test_store_publishes_four_immutable_outputs_and_full_human_assertions(
         assert committed.content_sha256 == staged.content_sha256
 
     publication = json.loads(_publication_path(tmp_path).read_text("ascii"))
+    assert publication["version"] == 2
+    assert publication["source"]["raster_source"] == (
+        source.artifact.source.as_dict()
+    )
     assert publication["human_assertion_policy"] == ("carry-separately-never-overwrite")
     assert [
         value["category"]
@@ -333,11 +341,46 @@ def test_store_projects_persisted_raster_outputs_and_verified_resources(
         "corrected-display"
     ).artifact_id
     assert corrected.kind == "corrected-image"
+    assert corrected.freshness is ArtifactFreshness.UNTRACKED
+    assert corrected.source.representation_id == "capture"
+    assert corrected.source.canvas_id == "canvas-1"
+    assert corrected.source.representation_revision == corrected.revision
+    assert corrected.source.canvas_revision == corrected.revision
     assert corrected.lineage[0].artifact_id == "source-image"
     assert corrected.lineage[0].artifact_revision == "artifact-r1"
     assert corrected.category_assignments == ()
     assert corrected.caption_assertions == ()
     assert corrected.resource is not None
+    assert corrected.extensions["corrections_ui"]["annotation_frame"] == (
+        "canvas"
+    )
+
+    mapped = restarted.list_spatial_annotations(
+        "book-1",
+        representation_id="capture",
+        canvas_id="canvas-1",
+    )
+    assert len(mapped) == 1
+    projected_annotation = mapped[0]
+    assert projected_annotation.key.annotation_id != "region-1"
+    assert projected_annotation.key.annotation_id.startswith("ctr-ann-")
+    assert projected_annotation.source.representation_id == "capture"
+    assert projected_annotation.source.canvas_id == "canvas-1"
+    assert projected_annotation.source.canvas_revision == corrected.revision
+    assert (
+        projected_annotation.selector.coordinate_space_revision
+        == corrected.revision
+    )
+    assert projected_annotation.linked_artifact_ids == (
+        corrected.key.artifact_id,
+    )
+    assert projected_annotation.effective_role == "marginalia"
+    assert projected_annotation.caption_assertions[-1].text == (
+        "Reviewed region caption"
+    )
+    assert projected_annotation.extensions["correction_transform"][
+        "source_annotation_id"
+    ] == "region-1"
 
     resolved = restarted.resolve_raster_resource(
         "book-1",
@@ -362,6 +405,10 @@ def test_store_projects_persisted_raster_outputs_and_verified_resources(
         for value in source.annotations[0].role_assignments
         if value.origin.value == "manual"
     ] == ["marginalia"]
+    assert source.annotations[0].key.annotation_id == "region-1"
+    assert source.annotations[0].caption_assertions[-1].text == (
+        "Reviewed region caption"
+    )
 
 
 def test_output_projection_rejects_tampered_immutable_resources(
@@ -381,6 +428,197 @@ def test_output_projection_rejects_tampered_immutable_resources(
 
     assert raised.value.code == "invalid_correction_transform_storage"
     assert raised.value.details["artifact"] == "corrected-display"
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ("publication", "receipt"),
+)
+def test_projection_requires_exact_receipt_publication_parity(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(_draft(source))
+    target = (
+        _publication_path(tmp_path)
+        if missing == "publication"
+        else _receipt_path(tmp_path)
+    )
+    target.unlink()
+    authority.fail = True
+
+    with pytest.raises(RepositoryError) as raised:
+        store.list_raster_artifacts("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == (
+        "correction_transform_authority"
+    )
+
+
+def test_projection_rejects_hard_linked_authority_documents(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    receipt = _receipt_path(tmp_path)
+    alias = receipt.with_name(f"{'f' * 64}.json")
+    os.link(receipt, alias)
+
+    try:
+        with pytest.raises(RepositoryError) as raised:
+            store.list_raster_artifacts("book-1")
+        assert raised.value.code == "invalid_correction_transform_storage"
+        assert raised.value.details["artifact"] == (
+            "correction_transform_receipts"
+        )
+    finally:
+        alias.unlink(missing_ok=True)
+
+
+def test_projection_enforces_the_transform_document_entry_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    monkeypatch.setattr(
+        transform_store_module,
+        "_MAX_TRANSFORM_DOCUMENTS",
+        0,
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        store.list_raster_artifacts("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == (
+        "correction_transform_publications"
+    )
+
+
+def test_projection_rejects_symlinked_authority_documents(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    receipt = _receipt_path(tmp_path)
+    alias = receipt.with_name(f"{'e' * 64}.json")
+    try:
+        os.symlink(receipt, alias)
+    except OSError:
+        pytest.skip("file symlinks are unavailable")
+
+    try:
+        with pytest.raises(RepositoryError) as raised:
+            store.list_raster_artifacts("book-1")
+        assert raised.value.code == "invalid_correction_transform_storage"
+        assert raised.value.details["artifact"] == (
+            "correction_transform_receipts"
+        )
+    finally:
+        alias.unlink(missing_ok=True)
+
+
+def test_projection_fails_closed_for_legacy_publication_without_source_scope(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    publication_path = _publication_path(tmp_path)
+    publication = json.loads(publication_path.read_text("ascii"))
+    publication["version"] = 1
+    del publication["source"]["raster_source"]
+    publication_payload = _canonical_document(publication)
+    publication_path.write_bytes(publication_payload)
+    receipt_path = _receipt_path(tmp_path)
+    receipt = json.loads(receipt_path.read_text("ascii"))
+    receipt["publication_sha256"] = hashlib.sha256(
+        publication_payload
+    ).hexdigest()
+    receipt_path.write_bytes(_canonical_document(receipt))
+
+    with pytest.raises(RepositoryError) as raised:
+        store.list_raster_artifacts("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == (
+        "correction_transform_publication"
+    )
+
+
+def test_projection_rejects_mapped_geometry_that_drops_human_assertions(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    publication_path = _publication_path(tmp_path)
+    publication = json.loads(publication_path.read_text("ascii"))
+    mapped = publication["mapped_annotations"][0]
+    mapped["role_assignments"] = [
+        value
+        for value in mapped["role_assignments"]
+        if value["origin"] != "manual"
+    ]
+    publication_payload = _canonical_document(publication)
+    publication_path.write_bytes(publication_payload)
+    receipt_path = _receipt_path(tmp_path)
+    receipt = json.loads(receipt_path.read_text("ascii"))
+    receipt["publication_sha256"] = hashlib.sha256(
+        publication_payload
+    ).hexdigest()
+    receipt_path.write_bytes(_canonical_document(receipt))
+
+    with pytest.raises(RepositoryError) as raised:
+        store.list_spatial_annotations("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == (
+        "correction_transform_publication"
+    )
+
+
+def test_projection_keeps_multiple_transform_history_distinct_and_untracked(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    first = store.commit_transform(_draft(source))
+    second_command = _command(source, operation_id="transform-op-2")
+    second = store.commit_transform(_draft(source, second_command))
+
+    restarted = _store(tmp_path, _Authority(source))
+    rasters = restarted.list_raster_artifacts("book-1")
+    annotations = restarted.list_spatial_annotations("book-1")
+
+    assert len(rasters) == 6
+    assert len({value.key.artifact_id for value in rasters}) == 6
+    assert all(
+        value.freshness is ArtifactFreshness.UNTRACKED
+        for value in rasters
+    )
+    corrected_ids = {
+        first.output("corrected-display").artifact_id,
+        second.output("corrected-display").artifact_id,
+    }
+    assert {
+        value.linked_artifact_ids[0] for value in annotations
+    } == corrected_ids
+    assert len({value.key.annotation_id for value in annotations}) == 2
+    assert len(
+        {
+            value.source.canvas_revision
+            for value in annotations
+        }
+    ) == 2
 
 
 def test_exact_replay_survives_restart_without_querying_stale_authority(

@@ -42,6 +42,7 @@ from ...engine.errors import (
 from ...engine.raster_artifacts import (
     ArtifactFreshness,
     ArtifactProvenance,
+    CaptionAssertion,
     RasterArtifactKey,
     RasterArtifactView,
     RasterDimensions,
@@ -49,6 +50,14 @@ from ...engine.raster_artifacts import (
     RasterResourceRef,
     RasterSourceRef,
     ResourceState,
+)
+from ...engine.spatial_annotations import (
+    NormalizedPoint,
+    NormalizedPolygonSelector,
+    SpatialAnnotationKey,
+    SpatialAnnotationView,
+    SpatialRoleAssignment,
+    SpatialSourceRef,
 )
 from .corrections_artifact_repository import (
     ResolvedRasterResource,
@@ -71,7 +80,7 @@ SourceSnapshotLookup: TypeAlias = Callable[
 LockContextFactory: TypeAlias = Callable[[], ContextManager[Any]]
 
 CORRECTION_TRANSFORM_PUBLICATION_SCHEMA = "librarytool.correction-transform-publication"
-CORRECTION_TRANSFORM_PUBLICATION_VERSION = 1
+CORRECTION_TRANSFORM_PUBLICATION_VERSION = 2
 CORRECTION_TRANSFORM_RECEIPT_SCHEMA = "librarytool.correction-transform-receipt"
 CORRECTION_TRANSFORM_RECEIPT_VERSION = 1
 
@@ -82,8 +91,8 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_PUBLICATION_BYTES = 128 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
-_MAX_PUBLICATIONS = 100_000
-_PUBLICATION_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
+_MAX_TRANSFORM_DOCUMENTS = 100_000
+_TRANSFORM_DOCUMENT_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
 _PROJECTED_RASTER_OUTPUTS = {
     "corrected-display": ("corrected-image", "Corrected display", "display"),
     "ocr-ready": ("processed-source", "OCR-ready image", "ocr"),
@@ -127,6 +136,18 @@ _PUBLICATION_SOURCE_FIELDS = frozenset(
         "source_revision",
         "source_sha256",
         "dependent_revision_pins",
+        "raster_source",
+    }
+)
+_RASTER_SOURCE_FIELDS = frozenset(
+    {"representation_id", "representation_revision"}
+)
+_RASTER_CANVAS_SOURCE_FIELDS = frozenset(
+    {
+        "representation_id",
+        "representation_revision",
+        "canvas_id",
+        "canvas_revision",
     }
 )
 _PUBLICATION_OUTPUT_FIELDS = frozenset(
@@ -157,6 +178,50 @@ _PROVENANCE_FIELDS = frozenset(
         "extensions",
     }
 )
+_MAPPED_ANNOTATION_FIELDS = frozenset(
+    {
+        "annotation_id",
+        "source_revision",
+        "coordinate_space",
+        "points",
+        "order",
+        "label",
+        "role_assignments",
+        "caption_assertions",
+        "linked_artifact_ids",
+    }
+)
+_POINT_FIELDS = frozenset({"x", "y"})
+_ROLE_FIELDS = frozenset(
+    {
+        "role",
+        "origin",
+        "revision",
+        "confidence",
+        "provenance",
+        "extensions",
+    }
+)
+_CAPTION_FIELDS = frozenset(
+    {
+        "text",
+        "origin",
+        "revision",
+        "language",
+        "source_annotation_id",
+        "confidence",
+        "provenance",
+        "extensions",
+    }
+)
+_PRESERVED_SPATIAL_FIELDS = frozenset(
+    {
+        "annotation_id",
+        "annotation_revision",
+        "roles",
+        "captions",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +236,7 @@ class _TransformResourceCandidate:
 @dataclass(frozen=True, slots=True)
 class _TransformProjection:
     raster_artifacts: tuple[RasterArtifactView, ...]
+    spatial_annotations: tuple[SpatialAnnotationView, ...]
     resources: Mapping[
         tuple[str, str, str],
         _TransformResourceCandidate,
@@ -477,6 +543,62 @@ class FilesystemCorrectionTransformStore:
             None,
         )
 
+    def list_spatial_annotations(
+        self,
+        item_id: str,
+        *,
+        representation_id: str = "",
+        canvas_id: str = "",
+    ) -> tuple[SpatialAnnotationView, ...]:
+        """Project immutable mapped geometry for corrected display outputs."""
+
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    values = self._project_locked(item_id).spatial_annotations
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction transform workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except (NotFoundError, RepositoryError):
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction transform projection is unavailable",
+                code="correction_transform_projection_unavailable",
+                cause=exc,
+                retryable=True,
+            ) from exc
+        return tuple(
+            value
+            for value in values
+            if (
+                not representation_id
+                or value.source.representation_id == representation_id
+            )
+            and (not canvas_id or value.source.canvas_id == canvas_id)
+        )
+
+    def get_spatial_annotation(
+        self,
+        key: SpatialAnnotationKey,
+    ) -> SpatialAnnotationView | None:
+        if not isinstance(key, SpatialAnnotationKey):
+            raise TypeError("key must be a SpatialAnnotationKey")
+        return next(
+            (
+                value
+                for value in self.list_spatial_annotations(key.item_id)
+                if value.key == key
+            ),
+            None,
+        )
+
     def resolve_raster_resource(
         self,
         item_id: str,
@@ -520,15 +642,18 @@ class FilesystemCorrectionTransformStore:
         # Validate the public scope even when no publication exists.
         RasterArtifactKey(item_id, "correction-transform-projection")
         values: list[RasterArtifactView] = []
+        spatial: list[SpatialAnnotationView] = []
         resources: dict[
             tuple[str, str, str],
             _TransformResourceCandidate,
         ] = {}
         identities: set[str] = set()
-        for path in self._publication_paths():
+        spatial_identities: set[str] = set()
+        for path in self._committed_publication_paths():
             command, result, publication = self._validated_publication(path)
             if command.item_id != item_id:
                 continue
+            source_scope = self._raster_source_from_publication(publication)
             for committed, raw_output in zip(
                 result.outputs,
                 publication["outputs"],
@@ -569,6 +694,22 @@ class FilesystemCorrectionTransformStore:
                     committed.artifact_revision,
                     variant,
                 )
+                source = self._projected_raster_source(
+                    source_scope,
+                    committed.artifact_revision,
+                )
+                extensions: dict[str, Any] = {
+                    "correction_transform": {
+                        "operation_id": command.operation_id,
+                        "output_kind": committed.kind,
+                        "source_revision": command.source_revision,
+                        "source_scope": source_scope.as_dict(),
+                    }
+                }
+                if committed.kind == "corrected-display" and source.canvas_id:
+                    extensions["corrections_ui"] = {
+                        "annotation_frame": "canvas",
+                    }
                 view = RasterArtifactView(
                     key=RasterArtifactKey(item_id, committed.artifact_id),
                     revision=committed.artifact_revision,
@@ -576,14 +717,14 @@ class FilesystemCorrectionTransformStore:
                     media_type=raw_output["media_type"],
                     content_sha256=committed.content_sha256,
                     dimensions=dimensions,
-                    source=RasterSourceRef(
-                        "correction-transform",
-                        command.fingerprint,
-                    ),
+                    source=source,
                     resource_state=ResourceState.AVAILABLE,
                     resource=resource,
                     label=label,
-                    freshness=ArtifactFreshness.CURRENT,
+                    # The private publication proves immutable bytes, not that
+                    # its lineage is still the live authority.  The public
+                    # correction projection may later refine this state.
+                    freshness=ArtifactFreshness.UNTRACKED,
                     lineage=(
                         RasterLineageRef(
                             command.artifact_id,
@@ -592,13 +733,7 @@ class FilesystemCorrectionTransformStore:
                         ),
                     ),
                     provenance=provenance,
-                    extensions={
-                        "correction_transform": {
-                            "operation_id": command.operation_id,
-                            "output_kind": committed.kind,
-                            "source_revision": command.source_revision,
-                        }
-                    },
+                    extensions=extensions,
                 )
                 key = (
                     resource.resource_id,
@@ -619,39 +754,89 @@ class FilesystemCorrectionTransformStore:
                     resource.revision,
                 )
                 values.append(view)
+            for annotation in self._mapped_annotation_views(
+                command,
+                result,
+                publication,
+                source_scope,
+            ):
+                identity = annotation.key.annotation_id.casefold()
+                if identity in spatial_identities:
+                    raise _repository_error(
+                        "a mapped correction annotation identity is duplicated",
+                        code="invalid_correction_transform_storage",
+                        artifact="correction_transform_publication",
+                    )
+                spatial_identities.add(identity)
+                spatial.append(annotation)
         return _TransformProjection(
             tuple(sorted(values, key=lambda value: value.key.artifact_id)),
+            tuple(
+                sorted(
+                    spatial,
+                    key=lambda value: value.key.annotation_id,
+                )
+            ),
             resources,
         )
 
-    def _publication_paths(self) -> tuple[Path, ...]:
-        directory = self._target(_PUBLICATION_ROOT)
-        self._safe_target(directory, artifact="correction_transform_publications")
+    def _committed_publication_paths(self) -> tuple[Path, ...]:
+        publications = self._authority_document_paths(
+            _PUBLICATION_ROOT,
+            artifact="correction_transform_publications",
+        )
+        receipts = self._authority_document_paths(
+            _RECEIPT_ROOT,
+            artifact="correction_transform_receipts",
+        )
+        if publications.keys() != receipts.keys():
+            raise _repository_error(
+                "correction transform receipts and publications do not match",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_authority",
+            )
+        return tuple(publications[name] for name in sorted(publications))
+
+    def _authority_document_paths(
+        self,
+        relative: PurePosixPath,
+        *,
+        artifact: str,
+    ) -> dict[str, Path]:
+        directory = self._target(relative)
+        self._safe_target(directory, artifact=artifact)
         if not os.path.lexists(directory):
-            return ()
+            return {}
         try:
             before = directory.lstat()
             if (
                 not stat.S_ISDIR(before.st_mode)
                 or _is_redirecting_path(directory)
             ):
-                raise ValueError("publication authority is not a directory")
-            paths: list[Path] = []
+                raise ValueError("transform authority is not a directory")
+            paths: dict[str, Path] = {}
+            count = 0
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if len(paths) >= _MAX_PUBLICATIONS:
+                    count += 1
+                    if count > _MAX_TRANSFORM_DOCUMENTS:
                         raise ValueError(
-                            "publication authority exceeds its entry budget"
+                            "transform authority exceeds its entry budget"
                         )
+                    path = directory / entry.name
+                    named = path.lstat()
                     if (
-                        _PUBLICATION_NAME_RE.fullmatch(entry.name) is None
+                        _TRANSFORM_DOCUMENT_NAME_RE.fullmatch(entry.name) is None
                         or not entry.is_file(follow_symlinks=False)
+                        or not stat.S_ISREG(named.st_mode)
+                        or named.st_nlink != 1
                         or entry.is_symlink()
+                        or _is_redirecting_path(path)
                     ):
                         raise ValueError(
-                            "publication authority contains an invalid entry"
+                            "transform authority contains an invalid entry"
                         )
-                    paths.append(directory / entry.name)
+                    paths[entry.name] = path
             after = directory.lstat()
             if (
                 _is_redirecting_path(directory)
@@ -661,14 +846,14 @@ class FilesystemCorrectionTransformStore:
                 != _stable_stat_identity(after)
             ):
                 raise ValueError(
-                    "publication authority changed while it was inspected"
+                    "transform authority changed while it was inspected"
                 )
-            return tuple(sorted(paths, key=lambda path: path.name))
+            return paths
         except (OSError, ValueError) as exc:
             raise _repository_error(
-                "the correction transform publication authority is invalid",
+                "the correction transform document authority is invalid",
                 code="invalid_correction_transform_storage",
-                artifact="correction_transform_publication",
+                artifact=artifact,
                 cause=exc,
             ) from exc
 
@@ -724,6 +909,398 @@ class FilesystemCorrectionTransformStore:
                 artifact="correction_transform_publication",
                 cause=exc,
             ) from exc
+
+    @staticmethod
+    def _raster_source_from_publication(
+        publication: Mapping[str, Any],
+    ) -> RasterSourceRef:
+        source = _strict_object(
+            publication["source"],
+            fields=_PUBLICATION_SOURCE_FIELDS,
+            artifact="correction_transform_source",
+        )
+        raw = source["raster_source"]
+        if not isinstance(raw, Mapping):
+            raise ValueError("publication raster source must be an object")
+        fields = frozenset(raw)
+        if fields not in {
+            _RASTER_SOURCE_FIELDS,
+            _RASTER_CANVAS_SOURCE_FIELDS,
+        }:
+            raise ValueError(
+                "publication raster source must contain its exact schema fields"
+            )
+        return RasterSourceRef(**raw)
+
+    @staticmethod
+    def _projected_raster_source(
+        source: RasterSourceRef,
+        output_revision: str,
+    ) -> RasterSourceRef:
+        # Keep the source representation/canvas identities so item-scoped UI
+        # filters retain the derivative.  The immutable output revision names
+        # its new coordinate frame; the exact parent scope remains in lineage
+        # and the correction_transform extension.
+        if source.canvas_id:
+            return RasterSourceRef(
+                source.representation_id,
+                output_revision,
+                source.canvas_id,
+                output_revision,
+            )
+        return RasterSourceRef(
+            source.representation_id,
+            output_revision,
+        )
+
+    @staticmethod
+    def _provenance_from_document(
+        raw: Any,
+        *,
+        artifact: str,
+    ) -> ArtifactProvenance:
+        return ArtifactProvenance(
+            **_strict_object(
+                raw,
+                fields=_PROVENANCE_FIELDS,
+                artifact=artifact,
+            )
+        )
+
+    @classmethod
+    def _role_from_document(cls, raw: Any) -> SpatialRoleAssignment:
+        value = dict(
+            _strict_object(
+                raw,
+                fields=_ROLE_FIELDS,
+                artifact="correction_transform_mapped_role",
+            )
+        )
+        value["provenance"] = cls._provenance_from_document(
+            value["provenance"],
+            artifact="correction_transform_mapped_role_provenance",
+        )
+        return SpatialRoleAssignment(**value)
+
+    @classmethod
+    def _caption_from_document(cls, raw: Any) -> CaptionAssertion:
+        value = dict(
+            _strict_object(
+                raw,
+                fields=_CAPTION_FIELDS,
+                artifact="correction_transform_mapped_caption",
+            )
+        )
+        value["provenance"] = cls._provenance_from_document(
+            value["provenance"],
+            artifact="correction_transform_mapped_caption_provenance",
+        )
+        return CaptionAssertion(**value)
+
+    @classmethod
+    def _preserved_spatial_assertions(
+        cls,
+        publication: Mapping[str, Any],
+    ) -> dict[
+        str,
+        tuple[
+            str,
+            tuple[SpatialRoleAssignment, ...],
+            tuple[CaptionAssertion, ...],
+        ],
+    ]:
+        human = _strict_object(
+            publication["human_assertions"],
+            fields=_HUMAN_ASSERTION_FIELDS,
+            artifact="correction_transform_human_assertions",
+        )
+        values = cls._require_sequence(
+            human["spatial"],
+            field="human_assertions.spatial",
+        )
+        result: dict[
+            str,
+            tuple[
+                str,
+                tuple[SpatialRoleAssignment, ...],
+                tuple[CaptionAssertion, ...],
+            ],
+        ] = {}
+        for raw in values:
+            preserved = _strict_object(
+                raw,
+                fields=_PRESERVED_SPATIAL_FIELDS,
+                artifact="correction_transform_preserved_spatial",
+            )
+            annotation_id = preserved["annotation_id"]
+            annotation_revision = preserved["annotation_revision"]
+            if (
+                not isinstance(annotation_id, str)
+                or not isinstance(annotation_revision, str)
+                or annotation_id in result
+            ):
+                raise ValueError(
+                    "preserved spatial assertions have invalid source pins"
+                )
+            roles = tuple(
+                cls._role_from_document(value)
+                for value in cls._require_sequence(
+                    preserved["roles"],
+                    field="human_assertions.spatial.roles",
+                )
+            )
+            captions = tuple(
+                cls._caption_from_document(value)
+                for value in cls._require_sequence(
+                    preserved["captions"],
+                    field="human_assertions.spatial.captions",
+                )
+            )
+            if (
+                len({value.origin for value in roles}) != len(roles)
+                or len({value.origin for value in captions})
+                != len(captions)
+            ):
+                raise ValueError(
+                    "preserved human assertions must have unique origins"
+                )
+            result[annotation_id] = (
+                annotation_revision,
+                roles,
+                captions,
+            )
+        return result
+
+    @staticmethod
+    def _mapped_annotation_identity(
+        command_sha256: str,
+        source_annotation_id: str,
+        target_artifact_id: str,
+    ) -> str:
+        payload = (
+            f"{command_sha256}\0{source_annotation_id}\0"
+            f"{target_artifact_id}\0mapped-annotation"
+        ).encode("utf-8")
+        return "ctr-ann-" + hashlib.sha256(payload).hexdigest()[:40]
+
+    @staticmethod
+    def _mapped_annotation_revision(
+        command_sha256: str,
+        target_revision: str,
+        raw: Mapping[str, Any],
+    ) -> str:
+        payload = (
+            command_sha256.encode("ascii")
+            + b"\0"
+            + target_revision.encode("ascii")
+            + b"\0"
+            + _canonical_json(
+                raw,
+                artifact="correction_transform_mapped_annotation",
+            )
+        )
+        return "ctr-ann:" + hashlib.sha256(payload).hexdigest()
+
+    def _mapped_annotation_views(
+        self,
+        command: CorrectionTransformCommand,
+        result: CorrectionTransformCommitResult,
+        publication: Mapping[str, Any],
+        source_scope: RasterSourceRef,
+    ) -> tuple[SpatialAnnotationView, ...]:
+        raw_values = self._require_sequence(
+            publication["mapped_annotations"],
+            field="mapped_annotations",
+        )
+        dropped = self._require_sequence(
+            publication["dropped_annotation_ids"],
+            field="dropped_annotation_ids",
+        )
+        source = _strict_object(
+            publication["source"],
+            fields=_PUBLICATION_SOURCE_FIELDS,
+            artifact="correction_transform_source",
+        )
+        pins = self._validate_dependent_revision_pins(
+            source["dependent_revision_pins"]
+        )["spatial_annotations"]
+        preserved_assertions = self._preserved_spatial_assertions(
+            publication
+        )
+        if raw_values and not source_scope.canvas_id:
+            raise ValueError(
+                "mapped correction annotations require a source canvas"
+            )
+        target = result.output("corrected-display")
+        source_for_target = (
+            SpatialSourceRef(
+                source_scope.representation_id,
+                target.artifact_revision,
+                source_scope.canvas_id,
+                target.artifact_revision,
+            )
+            if source_scope.canvas_id
+            else None
+        )
+        values: list[SpatialAnnotationView] = []
+        mapped_ids: set[str] = set()
+        for raw in raw_values:
+            mapped = _strict_object(
+                raw,
+                fields=_MAPPED_ANNOTATION_FIELDS,
+                artifact="correction_transform_mapped_annotation",
+            )
+            annotation_id = mapped["annotation_id"]
+            source_revision = mapped["source_revision"]
+            SpatialAnnotationKey(command.item_id, annotation_id)
+            if (
+                annotation_id in mapped_ids
+                or pins.get(annotation_id) != source_revision
+            ):
+                raise ValueError(
+                    "mapped annotation is not bound to a unique source pin"
+                )
+            mapped_ids.add(annotation_id)
+            if mapped["coordinate_space"] != "corrected-output-normalized":
+                raise ValueError(
+                    "mapped annotation coordinate space is invalid"
+                )
+            points_raw = self._require_sequence(
+                mapped["points"],
+                field="mapped_annotation.points",
+            )
+            points = tuple(
+                NormalizedPoint(
+                    **_strict_object(
+                        point,
+                        fields=_POINT_FIELDS,
+                        artifact="correction_transform_mapped_point",
+                    )
+                )
+                for point in points_raw
+            )
+            if source_for_target is None:
+                raise ValueError(
+                    "mapped correction annotation source is unavailable"
+                )
+            selector = NormalizedPolygonSelector(
+                "corrected-output-normalized",
+                target.artifact_revision,
+                points,
+            )
+            roles_raw = self._require_sequence(
+                mapped["role_assignments"],
+                field="mapped_annotation.role_assignments",
+            )
+            captions_raw = self._require_sequence(
+                mapped["caption_assertions"],
+                field="mapped_annotation.caption_assertions",
+            )
+            roles = tuple(
+                self._role_from_document(value)
+                for value in roles_raw
+            )
+            captions = tuple(
+                self._caption_from_document(value)
+                for value in captions_raw
+            )
+            preserved = preserved_assertions.get(annotation_id)
+            if preserved is not None:
+                preserved_revision, preserved_roles, preserved_captions = (
+                    preserved
+                )
+                if (
+                    preserved_revision != source_revision
+                    or any(value not in roles for value in preserved_roles)
+                    or any(
+                        value not in captions
+                        for value in preserved_captions
+                    )
+                ):
+                    raise ValueError(
+                        "mapped annotation drops preserved human assertions"
+                    )
+            links_raw = self._require_sequence(
+                mapped["linked_artifact_ids"],
+                field="mapped_annotation.linked_artifact_ids",
+            )
+            source_links: list[str] = []
+            for linked_artifact_id in links_raw:
+                RasterArtifactKey(command.item_id, linked_artifact_id)
+                source_links.append(linked_artifact_id)
+            if (
+                len(source_links) > 64
+                or len({value.casefold() for value in source_links})
+                != len(source_links)
+            ):
+                raise ValueError(
+                    "mapped annotation source links must be bounded and unique"
+                )
+            identity = self._mapped_annotation_identity(
+                command.fingerprint,
+                annotation_id,
+                target.artifact_id,
+            )
+            revision = self._mapped_annotation_revision(
+                command.fingerprint,
+                target.artifact_revision,
+                mapped,
+            )
+            values.append(
+                SpatialAnnotationView(
+                    key=SpatialAnnotationKey(command.item_id, identity),
+                    revision=revision,
+                    source=source_for_target,
+                    selector=selector,
+                    order=mapped["order"],
+                    label=mapped["label"],
+                    freshness=ArtifactFreshness.UNTRACKED,
+                    role_assignments=roles,
+                    caption_assertions=captions,
+                    linked_artifact_ids=(target.artifact_id,),
+                    provenance=ArtifactProvenance(
+                        origin="transform",
+                        recipe_revision="correction-transform-v1",
+                        operation_id=command.operation_id,
+                    ),
+                    extensions={
+                        "correction_transform": {
+                            "operation_id": command.operation_id,
+                            "source_annotation_id": annotation_id,
+                            "source_annotation_revision": source_revision,
+                            "source_linked_artifact_ids": source_links,
+                            "source_scope": source_scope.as_dict(),
+                            "target_artifact_id": target.artifact_id,
+                            "target_artifact_revision": (
+                                target.artifact_revision
+                            ),
+                        }
+                    },
+                )
+            )
+        dropped_ids: set[str] = set()
+        for annotation_id in dropped:
+            SpatialAnnotationKey(command.item_id, annotation_id)
+            if annotation_id in dropped_ids:
+                raise ValueError(
+                    "dropped annotation identities must be unique"
+                )
+            dropped_ids.add(annotation_id)
+        if (
+            mapped_ids & dropped_ids
+            or (mapped_ids | dropped_ids) != set(pins)
+        ):
+            raise ValueError(
+                "mapped and dropped annotations do not cover source pins"
+            )
+        if any(
+            pins.get(annotation_id) != preserved[0]
+            for annotation_id, preserved in preserved_assertions.items()
+        ):
+            raise ValueError(
+                "preserved human assertions are not bound to source pins"
+            )
+        return tuple(values)
 
     def _snapshot_resource(
         self,
@@ -877,6 +1454,19 @@ class FilesystemCorrectionTransformStore:
     ) -> None:
         operation_id = draft.command.operation_id
         publication = self._publication_document(draft, result)
+        try:
+            self._validate_publication_document(
+                publication,
+                command=draft.command,
+                result=result,
+            )
+        except (EngineError, KeyError, TypeError, ValueError) as exc:
+            raise _repository_error(
+                "the correction transform publication draft is invalid",
+                code="invalid_correction_transform_draft",
+                artifact="correction_transform_publication",
+                cause=exc,
+            ) from exc
         publication_payload = _canonical_json(
             publication,
             artifact="correction_transform_publication",
@@ -999,6 +1589,7 @@ class FilesystemCorrectionTransformStore:
             "source": {
                 **_source_pins(draft.source),
                 "dependent_revision_pins": (draft.source.dependent_revision_pins),
+                "raster_source": draft.source.artifact.source.as_dict(),
             },
             "result": result.as_dict(),
             "outputs": outputs,
@@ -1241,6 +1832,7 @@ class FilesystemCorrectionTransformStore:
         }:
             raise ValueError("publication source is not bound to its command")
         self._validate_dependent_revision_pins(source["dependent_revision_pins"])
+        raster_source = self._raster_source_from_publication(publication)
 
         publication_result = self._result_from_document(
             publication["result"],
@@ -1313,29 +1905,30 @@ class FilesystemCorrectionTransformStore:
         )
         for field in _HUMAN_ASSERTION_FIELDS:
             self._require_sequence(human_assertions[field], field=field)
-        self._require_sequence(
-            publication["mapped_annotations"],
-            field="mapped_annotations",
+        self._mapped_annotation_views(
+            command,
+            result,
+            publication,
+            raster_source,
         )
-        dropped = self._require_sequence(
-            publication["dropped_annotation_ids"],
-            field="dropped_annotation_ids",
-        )
-        if any(not isinstance(value, str) for value in dropped):
-            raise ValueError("dropped annotation identities must be strings")
 
-    def _validate_dependent_revision_pins(self, raw: Any) -> None:
+    def _validate_dependent_revision_pins(
+        self,
+        raw: Any,
+    ) -> dict[str, dict[str, str]]:
         pins = _strict_object(
             raw,
             fields=frozenset({"spatial_annotations", "human_text_assertions"}),
             artifact="correction_transform_dependent_revision_pins",
         )
+        result: dict[str, dict[str, str]] = {}
         for field, identity_field in (
             ("spatial_annotations", "annotation_id"),
             ("human_text_assertions", "assertion_id"),
         ):
             values = self._require_sequence(pins[field], field=field)
-            identities: list[str] = []
+            identities: dict[str, str] = {}
+            normalized_identities: set[str] = set()
             for value in values:
                 pin = _strict_object(
                     value,
@@ -1347,9 +1940,24 @@ class FilesystemCorrectionTransformStore:
                     str,
                 ):
                     raise ValueError("dependent revision pin values must be strings")
-                identities.append(pin[identity_field])
-            if len(set(identities)) != len(identities):
-                raise ValueError("dependent revision pin identities must be unique")
+                identity = pin[identity_field]
+                if field == "spatial_annotations":
+                    SpatialAnnotationKey("correction-transform-pin", identity)
+                else:
+                    RasterArtifactKey("correction-transform-pin", identity)
+                RasterLineageRef(
+                    "correction-transform-pin",
+                    pin["revision"],
+                )
+                normalized = identity.casefold()
+                if normalized in normalized_identities:
+                    raise ValueError(
+                        "dependent revision pin identities must be unique"
+                    )
+                normalized_identities.add(normalized)
+                identities[identity] = pin["revision"]
+            result[field] = identities
+        return result
 
     @staticmethod
     def _require_sequence(raw: Any, *, field: str) -> Sequence[Any]:
