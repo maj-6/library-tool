@@ -37,6 +37,12 @@ from ...engine.errors import (
     RepositoryError,
 )
 from ...engine.raster_artifacts import RasterArtifactKey
+from .corrections_artifact_repository import (
+    _AuthorityDirectorySnapshot,
+    _AuthoritySnapshot,
+    _finish_verified_regular,
+    _open_verified_regular,
+)
 from .recoverable_write_set import (
     RecoverableWriteSet,
     WriteSetError,
@@ -295,10 +301,9 @@ class FilesystemCorrectionTransformStore:
                                 details={"operation_id": draft.command.operation_id},
                             )
                         self._validate_replay_publication(
-                            draft.command.operation_id,
+                            draft,
                             result,
                             publication_sha256=publication_sha256,
-                            source_artifact_id=draft.command.artifact_id,
                         )
                         return result
 
@@ -630,14 +635,20 @@ class FilesystemCorrectionTransformStore:
 
     def _validate_replay_publication(
         self,
-        operation_id: str,
+        draft: CorrectionTransformCommitDraft,
         result: CorrectionTransformCommitResult,
         *,
         publication_sha256: str,
-        source_artifact_id: str,
     ) -> None:
+        expected_result = _commit_result_for(draft)
+        if result != expected_result:
+            raise _repository_error(
+                "the correction transform receipt result is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_receipt",
+            )
         artifact_ids = tuple(output.artifact_id for output in result.outputs)
-        if source_artifact_id.casefold() in {
+        if draft.command.artifact_id.casefold() in {
             artifact_id.casefold() for artifact_id in artifact_ids
         } or len({artifact_id.casefold() for artifact_id in artifact_ids}) != len(
             artifact_ids
@@ -648,7 +659,7 @@ class FilesystemCorrectionTransformStore:
                 artifact="correction_transform_receipt",
             )
         publication_payload, _ = self._read_regular(
-            self._publication_path(operation_id),
+            self._publication_path(draft.command.operation_id),
             maximum=_MAX_PUBLICATION_BYTES,
             artifact="correction_transform_publication",
             collect=True,
@@ -656,6 +667,16 @@ class FilesystemCorrectionTransformStore:
         if _sha256(publication_payload) != publication_sha256:
             raise _repository_error(
                 "the correction transform publication checksum is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_publication",
+            )
+        expected_publication = _canonical_json(
+            self._publication_document(draft, expected_result),
+            artifact="correction_transform_publication",
+        )
+        if publication_payload != expected_publication:
+            raise _repository_error(
+                "the correction transform publication does not match its receipt",
                 code="invalid_correction_transform_storage",
                 artifact="correction_transform_publication",
             )
@@ -710,26 +731,21 @@ class FilesystemCorrectionTransformStore:
         artifact: str,
         collect: bool,
     ) -> tuple[bytes, str]:
-        self._safe_target(path, artifact=artifact)
         descriptor = -1
         try:
-            named_before = path.stat(follow_symlinks=False)
+            authority = self._authority_snapshot(path, artifact=artifact)
+            named_before = path.lstat()
             if (
                 not stat.S_ISREG(named_before.st_mode)
                 or named_before.st_nlink != 1
                 or _is_redirecting_path(path)
             ):
                 raise ValueError("target is not a private regular file")
-            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(path, flags)
-            opened_before = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened_before.st_mode)
-                or opened_before.st_nlink != 1
-                or not os.path.samestat(named_before, opened_before)
-            ):
-                raise ValueError("target identity changed while opening")
+            descriptor, opened_before = _open_verified_regular(
+                path,
+                named_before,
+                authority=authority,
+            )
             digest = hashlib.sha256()
             chunks: list[bytes] = []
             total = 0
@@ -743,18 +759,13 @@ class FilesystemCorrectionTransformStore:
                 digest.update(block)
                 if collect:
                     chunks.append(block)
-            opened_after = os.fstat(descriptor)
-            named_after = path.stat(follow_symlinks=False)
-            if (
-                not os.path.samestat(opened_before, opened_after)
-                or not os.path.samestat(opened_after, named_after)
-                or opened_after.st_nlink != 1
-                or named_after.st_nlink != 1
-                or self._stat_evidence(opened_before)
-                != self._stat_evidence(opened_after)
-                or _is_redirecting_path(path)
-            ):
-                raise ValueError("target changed while it was read")
+            _finish_verified_regular(
+                path,
+                descriptor,
+                named_before=named_before,
+                opened_before=opened_before,
+            )
+            self._authority_snapshot(path, artifact=artifact)
             return (b"".join(chunks), digest.hexdigest())
         except (OSError, TypeError, ValueError) as exc:
             raise _repository_error(
@@ -767,17 +778,73 @@ class FilesystemCorrectionTransformStore:
             if descriptor >= 0:
                 os.close(descriptor)
 
-    @staticmethod
-    def _stat_evidence(value: os.stat_result) -> tuple[int, ...]:
-        return (
-            value.st_mode,
-            value.st_size,
-            value.st_mtime_ns,
-            value.st_ctime_ns,
-            value.st_ino,
-            value.st_dev,
-            value.st_nlink,
-        )
+    def _authority_snapshot(
+        self,
+        path: Path,
+        *,
+        artifact: str,
+    ) -> _AuthoritySnapshot:
+        target = self._safe_target(path, artifact=artifact)
+        root = self._write_set.root
+        relative = target.relative_to(root)
+        try:
+            named_root = root.lstat()
+            resolved_root = root.resolve(strict=True)
+        except OSError as exc:
+            raise _repository_error(
+                "the correction transform authority root cannot be inspected",
+                code="unsafe_correction_transform_path",
+                artifact=artifact,
+                cause=exc,
+            ) from exc
+        if _is_redirecting_path(root) or not stat.S_ISDIR(named_root.st_mode):
+            raise _repository_error(
+                "the correction transform authority root is unsafe",
+                code="unsafe_correction_transform_path",
+                artifact=artifact,
+            )
+
+        directories: list[_AuthorityDirectorySnapshot] = []
+        current = root
+        for part in relative.parts[:-1]:
+            current /= part
+            if _is_redirecting_path(current):
+                raise _repository_error(
+                    "a correction transform target crosses a redirecting path",
+                    code="unsafe_correction_transform_path",
+                    artifact=artifact,
+                )
+            try:
+                named_directory = current.lstat()
+            except FileNotFoundError:
+                named_directory = None
+            except OSError as exc:
+                raise _repository_error(
+                    "a correction transform authority path cannot be inspected",
+                    code="unsafe_correction_transform_path",
+                    artifact=artifact,
+                    cause=exc,
+                ) from exc
+            if named_directory is not None and not stat.S_ISDIR(
+                named_directory.st_mode
+            ):
+                raise _repository_error(
+                    "a correction transform authority component is not a directory",
+                    code="unsafe_correction_transform_path",
+                    artifact=artifact,
+                )
+            directories.append(_AuthorityDirectorySnapshot(current, named_directory))
+
+        try:
+            target.resolve(strict=False).relative_to(resolved_root)
+        except (OSError, ValueError) as exc:
+            raise _repository_error(
+                "a correction transform target escapes its workspace",
+                code="unsafe_correction_transform_path",
+                artifact=artifact,
+                cause=exc,
+            ) from exc
+        return _AuthoritySnapshot(root, named_root, tuple(directories))
 
     def _path_exists(
         self,

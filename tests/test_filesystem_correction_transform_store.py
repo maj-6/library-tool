@@ -244,6 +244,16 @@ def _object_path(root: Path, artifact_id: str) -> Path:
     return root / ".engine" / "correction-transforms" / "objects" / f"{digest}.bin"
 
 
+def _canonical_document(value) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
 def _managed_files(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
@@ -476,3 +486,150 @@ def test_replay_refuses_a_hard_linked_private_object(tmp_path: Path) -> None:
         assert raised.value.code == "invalid_correction_transform_storage"
     finally:
         outside_alias.unlink(missing_ok=True)
+
+
+def test_replay_refuses_a_receipt_result_not_bound_to_its_publication(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(draft)
+    receipt_path = _receipt_path(tmp_path)
+    receipt = json.loads(receipt_path.read_text("ascii"))
+    receipt["result"]["outputs"][0]["artifact_revision"] = "tampered-r1"
+    receipt_path.write_bytes(_canonical_document(receipt))
+    authority.fail = True
+
+    with pytest.raises(RepositoryError) as raised:
+        store.commit_transform(draft)
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == "correction_transform_receipt"
+
+
+def test_replay_refuses_a_publication_not_bound_to_the_original_draft(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(draft)
+    publication_path = _publication_path(tmp_path)
+    publication = json.loads(publication_path.read_text("ascii"))
+    publication["human_assertion_policy"] = "tampered-policy"
+    publication_payload = _canonical_document(publication)
+    publication_path.write_bytes(publication_payload)
+    receipt_path = _receipt_path(tmp_path)
+    receipt = json.loads(receipt_path.read_text("ascii"))
+    receipt["publication_sha256"] = hashlib.sha256(publication_payload).hexdigest()
+    receipt_path.write_bytes(_canonical_document(receipt))
+    authority.fail = True
+
+    with pytest.raises(RepositoryError) as raised:
+        store.commit_transform(draft)
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == "correction_transform_publication"
+
+
+def test_replay_rejects_an_ancestor_redirect_after_authority_snapshot(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(draft)
+    receipt_path = _receipt_path(tmp_path)
+    receipt_directory = receipt_path.parent
+    backup = receipt_directory.with_name(f"{receipt_directory.name}.original")
+    external = tmp_path.parent / f"{tmp_path.name}-external-receipts"
+    external.mkdir()
+    external_receipt = external / receipt_path.name
+    external_receipt.write_bytes(receipt_path.read_bytes())
+    real_snapshot = store._authority_snapshot
+    swapped = False
+
+    def swapping_snapshot(path, *, artifact):
+        nonlocal swapped
+        snapshot = real_snapshot(path, artifact=artifact)
+        if Path(path) == receipt_path and not swapped:
+            swapped = True
+            receipt_directory.replace(backup)
+            try:
+                os.symlink(
+                    external,
+                    receipt_directory,
+                    target_is_directory=True,
+                )
+            except OSError:
+                if receipt_directory.is_symlink():
+                    receipt_directory.unlink()
+                backup.replace(receipt_directory)
+                pytest.skip("directory symlinks are unavailable")
+        return snapshot
+
+    monkeypatch.setattr(store, "_authority_snapshot", swapping_snapshot)
+    authority.fail = True
+
+    try:
+        with pytest.raises(RepositoryError) as raised:
+            store.commit_transform(draft)
+        assert raised.value.code == "invalid_correction_transform_storage"
+    finally:
+        if swapped and backup.exists():
+            if receipt_directory.is_symlink():
+                receipt_directory.unlink()
+            backup.replace(receipt_directory)
+        external_receipt.unlink(missing_ok=True)
+        external.rmdir()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo"),
+    reason="POSIX FIFO semantics",
+)
+def test_replay_non_regular_name_swap_is_nonblocking(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(draft)
+    receipt_path = _receipt_path(tmp_path)
+    backup = receipt_path.with_name(f"{receipt_path.name}.original")
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        candidate = Path(path)
+        if (
+            not swapped
+            and candidate.name == receipt_path.name
+            and (candidate == receipt_path or "dir_fd" in kwargs)
+        ):
+            assert flags & os.O_NONBLOCK
+            swapped = True
+            receipt_path.replace(backup)
+            os.mkfifo(receipt_path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    authority.fail = True
+
+    try:
+        with pytest.raises(RepositoryError) as raised:
+            store.commit_transform(draft)
+        assert raised.value.code == "invalid_correction_transform_storage"
+        assert swapped is True
+    finally:
+        if swapped:
+            receipt_path.unlink(missing_ok=True)
+            backup.replace(receipt_path)
