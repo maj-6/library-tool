@@ -268,6 +268,9 @@ app.register_blueprint(
         raster_resource_resolver_for_request=(
             lambda: _ensure_engine_session().raster_resource_resolver
         ),
+        correction_actor_id_for_request=(
+            lambda: _local_correction_actor_id()
+        ),
         correction_transform_submitter=(
             lambda service, command, queued: _submit_correction_transform(
                 service,
@@ -604,6 +607,19 @@ def _auth_doc() -> dict:
     # with it every activity-logging request — block behind a token refresh's
     # network round-trip. Read-modify-write sequences still take the lock.
     return lib.load_json(AUTH_SESSION_PATH, {}) or {}
+
+
+def _local_correction_actor_id() -> str:
+    """Return a server-owned audit identity without refreshing over network."""
+
+    session = _auth_doc().get("session")
+    value = session.get("user_id") if isinstance(session, dict) else None
+    if isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+        value,
+    ):
+        return value
+    return "local-desktop"
 
 
 def _auth_cfg() -> dict | None:

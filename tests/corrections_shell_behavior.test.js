@@ -8,11 +8,18 @@ const {
   resourceFamily,
 } = require("../tools/whl_explorer/static/corrections/editor-registry");
 const {
+  CorrectionsIndexStore,
+} = require("../tools/whl_explorer/static/corrections/books");
+const {
+  EngineClient,
+} = require("../tools/whl_explorer/static/engine-client");
+const {
   CorrectionsProfileStore,
   PROFILE_SCHEMA,
   validateProfileKey,
 } = require("../tools/whl_explorer/static/corrections/ui-profile");
 const {
+  createImageAdjustTool,
   normalizeImageAdjustProfile,
 } = require("../tools/whl_explorer/static/corrections/image-adjust-tool");
 const {
@@ -789,6 +796,176 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
   );
   assert.equal(correctionsRuntimePorts({}, null), null);
 });
+
+test("standalone shell resolves reviews through the real engine client adapter",
+  async () => {
+    let state = "needs_attention";
+    let reviewRevision = "review-r1";
+    let indexRevision = 1;
+    const calls = [];
+    const latestEvent = () => {
+      if (state === "resolved") {
+        return {
+          operation_id: "shell-resolve-op",
+          action: "attention.resolve",
+          actor_id: "local-desktop",
+          occurred_at: "2026-07-23T18:01:00Z",
+          before_state: "needs_attention",
+          after_state: "resolved",
+          reason: "Check the title leaf",
+          comment: "Verified",
+        };
+      }
+      return {
+        operation_id: "shell-mark-op",
+        action: "attention.mark",
+        actor_id: "local-desktop",
+        occurred_at: "2026-07-23T18:00:00Z",
+        before_state: "clear",
+        after_state: "needs_attention",
+        reason: "Check the title leaf",
+        comment: "",
+      };
+    };
+    const reviewSummary = () => ({
+      revision: reviewRevision,
+      state,
+      reason: "Check the title leaf",
+      history_count: state === "resolved" ? 2 : 1,
+      latest_event: latestEvent(),
+    });
+    const indexBody = () => ({
+      ok: true,
+      schema: "librarytool.corrections-index/1",
+      revision: `index-r${indexRevision}`,
+      books: [{
+        id: "book-1",
+        revision: `book-r${indexRevision}`,
+        title: "A Herbal",
+        import_state: "ready",
+        issues: [],
+        review: reviewSummary(),
+        captures: [],
+      }],
+      attention: [{
+        key: "attention:book-1",
+        target: { kind: "book", item_id: "book-1" },
+        review: reviewSummary(),
+      }],
+    });
+    const response = (body) => ({
+      ok: true,
+      status: 200,
+      json: async () => body,
+    });
+    const engineClient = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        if (url.startsWith("/api/v1/corrections/index")) {
+          return response(indexBody());
+        }
+        if (url.endsWith("/corrections/review/resolve")) {
+          const beforeReview = reviewRevision;
+          state = "resolved";
+          reviewRevision = "review-r2";
+          indexRevision += 1;
+          return response({
+            ok: true,
+            schema: "librarytool.correction-mutation-receipt/1",
+            replayed: false,
+            receipt: {
+              action: "attention.resolve",
+              operation_id: "shell-resolve-op",
+              item_id: "book-1",
+              before_aggregate_revision: "aggregate-r1",
+              after_aggregate_revision: "aggregate-r2",
+              targets: [{
+                kind: "review",
+                target_id: "book-1",
+                before_revision: beforeReview,
+                after_revision: reviewRevision,
+              }],
+              inverse: {
+                action: "attention.reopen",
+                expected_aggregate_revision: "aggregate-r2",
+                expected_targets: [{
+                  kind: "review",
+                  target_id: "book-1",
+                  before_revision: beforeReview,
+                  after_revision: reviewRevision,
+                }],
+                payload: {
+                  reason: "Check the title leaf",
+                  append_audit: true,
+                },
+              },
+            },
+          });
+        }
+        throw new Error(`unexpected transport: ${init.method} ${url}`);
+      },
+    });
+    const documentRef = miniDocument();
+    const windowRef = {
+      engineClient,
+      localStorage: new MemoryStorage(),
+    };
+    documentRef.defaultView = windowRef;
+    const rootElement = {
+      dataset: {},
+      ownerDocument: documentRef,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    const shell = new CorrectionsShell({
+      root: rootElement,
+      documentRef,
+      windowRef,
+      imageAdjustTool: createImageAdjustTool(),
+      editorRegistry: createDefaultEditorRegistry({ documentRef }),
+      layoutController: {
+        getState: () => ({ ...DEFAULT_LAYOUT }),
+        replaceState() {},
+      },
+      classificationController: false,
+      booksFeature: false,
+      artifactsFeature: false,
+    });
+
+    assert.equal(shell.booksApi, shell.engineCorrections.books);
+    assert.equal(shell.booksApi.trustedActor, true);
+    const store = new CorrectionsIndexStore({ api: shell.booksApi });
+    await store.openWorkspace("workspace-1");
+    const result = await store.transitionReview("resolve", {
+      entry: store.index.attention[0],
+      operationId: "shell-resolve-op",
+      comment: "Verified",
+    });
+
+    assert.equal(result.entry.review.state, "resolved");
+    assert.equal(store.index.books[0].review.state, "resolved");
+    assert.deepEqual(calls.map(({ url, init }) => [
+      init.method,
+      url,
+      init.body === undefined ? null : JSON.parse(init.body),
+    ]), [
+      [
+        "GET",
+        "/api/v1/corrections/index?workspace_id=workspace-1",
+        null,
+      ],
+      [
+        "POST",
+        "/api/v1/items/book-1/corrections/review/resolve",
+        { comment: "Verified" },
+      ],
+      [
+        "GET",
+        "/api/v1/corrections/index?workspace_id=workspace-1",
+        null,
+      ],
+    ]);
+  });
 
 
 test("late currentContext results cannot overwrite a newer pushed context", async () => {

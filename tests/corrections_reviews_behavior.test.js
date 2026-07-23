@@ -332,6 +332,52 @@ test("resolve and reopen send CAS revisions, actor, operation, and comment", asy
   assert.equal(store.index.revision, "index-r9");
 });
 
+test("trusted engine reviews do not require or transmit a renderer actor",
+  async () => {
+    const data = fixture();
+    const resolved = transitionedEntry(
+      data.attention[0], "resolve", "review-book-r3");
+    let mutation;
+    const api = {
+      trustedActor: true,
+      loadIndex: async () => data,
+      async resolveReview(options) {
+        mutation = options;
+        return mutationResult(resolved, "index-r8");
+      },
+      reopenReview: async () => {
+        throw new Error("not expected");
+      },
+    };
+    const store = new CorrectionsIndexStore({ api });
+    await store.openWorkspace("workspace-1");
+    const controller = new ReviewsPanelController({
+      root: { ownerDocument: {}, querySelector: () => null },
+      documentRef: {},
+      store,
+      operationIdFactory: () => "trusted-resolve-op",
+    });
+
+    assert.deepEqual(controller.actionCapability(), {
+      enabled: true,
+      reason: "",
+    });
+    await controller.transition(
+      store.index.attention[0],
+      "resolve",
+      "Verified locally",
+    );
+    assert.deepEqual(mutation, {
+      target: data.attention[0].target,
+      expectedRevision: "review-book-r2",
+      operationId: "trusted-resolve-op",
+      comment: "Verified locally",
+      signal: undefined,
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(mutation, "actorId"),
+      false);
+  });
+
 
 test("a CAS conflict refreshes the queue instead of overwriting newer state", async () => {
   const data = fixture();

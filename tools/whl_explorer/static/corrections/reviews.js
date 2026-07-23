@@ -171,7 +171,7 @@
           typeof this.store.api.reopenReview !== "function") {
         return { enabled: false, reason: "Review actions are unavailable." };
       }
-      if (!this.actorIdProvider) {
+      if (!this.actorIdProvider && this.store.api.trustedActor !== true) {
         return {
           enabled: false,
           reason: "Review actions require an actor identity.",
@@ -218,9 +218,11 @@
         `${action === "resolve" ? "Resolving" : "Reopening"} ${entry.key}…`);
       this.render(this.store.snapshot());
       try {
+        const trustedActor = this.store.api &&
+          this.store.api.trustedActor === true;
         const result = await this.store.transitionReview(action, {
           entry,
-          actorId: await this.actorId(),
+          ...(trustedActor ? {} : { actorId: await this.actorId() }),
           operationId: this.operationIdFactory(action, entry),
           comment,
         });

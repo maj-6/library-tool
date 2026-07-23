@@ -11,8 +11,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+from urllib.parse import quote
 
 from flask import Blueprint, Response, jsonify, request, send_file
 
@@ -32,12 +34,14 @@ from librarytool.engine.corrections import (
     ClearImageCategoryCommand,
     ClearRegionRoleCommand,
     CorrectionCommandResult,
+    CorrectionReviewSnapshot,
     CorrectionService,
     MarkAttentionCommand,
     ReopenCorrectionsCommand,
     ResolveCorrectionsCommand,
     SetManualCaptionCommand,
 )
+from librarytool.engine.items import ItemQueryService, ItemView
 from librarytool.engine.correction_transforms import (
     CorrectionTransformCommand,
     CorrectionTransformService,
@@ -53,6 +57,7 @@ from librarytool.engine.raster_artifacts import (
 from librarytool.engine.runtime import (
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    ITEM_QUERY_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
     LibraryEngine,
@@ -69,7 +74,10 @@ CORRECTION_MUTATION_MAX_BYTES = 64 * 1024
 CORRECTION_TRANSFORM_QUEUE_SCHEMA = (
     "librarytool.correction-transform-queue-receipt/1"
 )
+CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/1"
+CORRECTIONS_REVIEW_SCHEMA = "librarytool.corrections-review/1"
 _CURSOR_SCHEMA = "librarytool.corrections-cursor/1"
+_CORRECTION_ACTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TRANSFORM_COMMAND_FIELDS = frozenset(
     {
         "schema",
@@ -198,6 +206,29 @@ def _spatial_service(
     )
 
 
+def _item_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> ItemQueryService:
+    return _query_service(
+        engine_for_request,
+        ITEM_QUERY_SERVICE,
+        "item query",
+    )
+
+
+def _review_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> Any:
+    service = _raster_service(engine_for_request)
+    if not callable(getattr(service, "get_correction_review", None)):
+        raise EngineError(
+            "the correction review module is unavailable",
+            code="correction_review_module_unavailable",
+            retryable=True,
+        )
+    return service
+
+
 def _correction_service(
     engine_for_request: Callable[[], LibraryEngine],
 ) -> CorrectionService:
@@ -216,6 +247,27 @@ def _correction_transform_service(
         CORRECTION_TRANSFORM_SERVICE,
         "correction transform",
     )
+
+
+def _correction_actor_id(
+    actor_id_for_request: Callable[[], str],
+) -> str:
+    try:
+        value = actor_id_for_request()
+    except EngineError:
+        raise
+    except Exception as exc:
+        raise RepositoryError(
+            "the local correction actor is unavailable",
+            code="correction_actor_unavailable",
+            retryable=True,
+        ) from exc
+    if not isinstance(value, str) or not _CORRECTION_ACTOR_RE.fullmatch(value):
+        raise RepositoryError(
+            "the local correction actor is invalid",
+            code="invalid_correction_actor",
+        )
+    return value
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -644,20 +696,19 @@ def _assert_artifact_metadata(
 
 def _mark_attention(
     engine_for_request: Callable[[], LibraryEngine],
+    actor_id_for_request: Callable[[], str],
     item_id: str,
 ) -> Response:
     operation_id = _operation_id()
     expected_revision = _strong_revision("If-Review-Match")
-    document = _mutation_document(
-        frozenset({"reason", "actor_id", "comment"})
-    )
+    document = _mutation_document(frozenset({"reason", "comment"}))
     return _mutation_response(
         _correction_service(engine_for_request).mark_attention(
             MarkAttentionCommand(
                 item_id=item_id,
                 expected_review_revision=expected_revision,
                 reason=_string_field(document, "reason"),
-                actor_id=_string_field(document, "actor_id"),
+                actor_id=_correction_actor_id(actor_id_for_request),
                 operation_id=operation_id,
                 comment=_string_field(document, "comment", allow_empty=True),
             )
@@ -667,17 +718,18 @@ def _mark_attention(
 
 def _resolve_corrections(
     engine_for_request: Callable[[], LibraryEngine],
+    actor_id_for_request: Callable[[], str],
     item_id: str,
 ) -> Response:
     operation_id = _operation_id()
     expected_revision = _strong_revision("If-Review-Match")
-    document = _mutation_document(frozenset({"actor_id", "comment"}))
+    document = _mutation_document(frozenset({"comment"}))
     return _mutation_response(
         _correction_service(engine_for_request).resolve(
             ResolveCorrectionsCommand(
                 item_id=item_id,
                 expected_review_revision=expected_revision,
-                actor_id=_string_field(document, "actor_id"),
+                actor_id=_correction_actor_id(actor_id_for_request),
                 operation_id=operation_id,
                 comment=_string_field(document, "comment", allow_empty=True),
             )
@@ -687,17 +739,18 @@ def _resolve_corrections(
 
 def _reopen_corrections(
     engine_for_request: Callable[[], LibraryEngine],
+    actor_id_for_request: Callable[[], str],
     item_id: str,
 ) -> Response:
     operation_id = _operation_id()
     expected_revision = _strong_revision("If-Review-Match")
-    document = _mutation_document(frozenset({"actor_id", "comment"}))
+    document = _mutation_document(frozenset({"comment"}))
     return _mutation_response(
         _correction_service(engine_for_request).reopen(
             ReopenCorrectionsCommand(
                 item_id=item_id,
                 expected_review_revision=expected_revision,
-                actor_id=_string_field(document, "actor_id"),
+                actor_id=_correction_actor_id(actor_id_for_request),
                 operation_id=operation_id,
                 comment=_string_field(document, "comment", allow_empty=True),
             )
@@ -721,6 +774,265 @@ def _conditional_json(body: Mapping[str, Any], revision: str) -> Response:
     response.set_etag(revision, weak=False)
     response.cache_control.no_cache = True
     return response.make_conditional(request)
+
+
+def _review_snapshot(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> CorrectionReviewSnapshot:
+    value = _review_service(engine_for_request).get_correction_review(item_id)
+    if not isinstance(value, CorrectionReviewSnapshot):
+        raise RepositoryError(
+            "the correction review projector returned an invalid view",
+            code="invalid_correction_review_projection",
+            details={"item_id": item_id},
+        )
+    return value
+
+
+def _review_summary(review: CorrectionReviewSnapshot) -> dict[str, Any]:
+    latest = review.history[-1].as_dict() if review.history else None
+    return {
+        "revision": review.revision,
+        "state": review.state.value,
+        "reason": review.reason,
+        "history_count": len(review.history),
+        "latest_event": latest,
+    }
+
+
+def _capture_import_state(value: RasterArtifactView) -> str:
+    if value.resource_state is ResourceState.MISSING:
+        return "missing"
+    if value.resource_state is ResourceState.UNAVAILABLE:
+        return "unavailable"
+    return "ready"
+
+
+def _capture_rank(value: RasterArtifactView) -> tuple[int, str]:
+    resource_variant = value.resource.variant if value.resource is not None else ""
+    display = (
+        resource_variant == "display"
+        or value.key.artifact_id.endswith(":display")
+    )
+    return (0 if display else 1, value.key.artifact_id)
+
+
+def _capture_rows(
+    item_id: str,
+    values: Sequence[RasterArtifactView],
+) -> list[dict[str, Any]]:
+    by_order: dict[int, list[RasterArtifactView]] = {}
+    for value in values:
+        order = value.extensions.get("capture_order")
+        if (
+            isinstance(order, bool)
+            or not isinstance(order, int)
+            or order < 0
+        ):
+            continue
+        by_order.setdefault(order, []).append(value)
+
+    rows: list[dict[str, Any]] = []
+    for order in sorted(by_order):
+        value = min(by_order[order], key=_capture_rank)
+        source = value.source
+        row: dict[str, Any] = {
+            "artifact_id": value.key.artifact_id,
+            "revision": value.revision,
+            "capture_order": order,
+            "label": value.label,
+            "effective_category": value.effective_category,
+            "resource_state": value.resource_state.value,
+            "import_state": _capture_import_state(value),
+            "freshness": value.freshness.value,
+            "thumbnail": None,
+        }
+        if source.representation_id:
+            row["representation_id"] = source.representation_id
+        if source.canvas_id:
+            row["canvas_id"] = source.canvas_id
+        if (
+            value.resource_state is ResourceState.AVAILABLE
+            and value.resource is not None
+        ):
+            row["thumbnail"] = {
+                "url": (
+                    f"/api/v1/items/{quote(item_id, safe='')}/"
+                    f"raster-artifacts/"
+                    f"{quote(value.key.artifact_id, safe='')}/resource?"
+                    f"revision={quote(value.resource.revision, safe='')}"
+                ),
+                "alt": value.label or f"Capture {order + 1}",
+                "width": value.dimensions.width,
+                "height": value.dimensions.height,
+            }
+        rows.append(row)
+    return rows
+
+
+def _book_import_state(captures: Sequence[Mapping[str, Any]]) -> str:
+    if not captures:
+        return "ready"
+    states = [value["import_state"] for value in captures]
+    if all(value == "missing" for value in states):
+        return "missing"
+    if all(value == "unavailable" for value in states):
+        return "unavailable"
+    if any(value != "ready" for value in states):
+        return "partial"
+    return "ready"
+
+
+def _book_issues(
+    item: ItemView,
+    captures: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    issues = list(item.workbench_state.issues)
+    missing = sum(
+        value["resource_state"] == "missing" for value in captures
+    )
+    unavailable = sum(
+        value["resource_state"] == "unavailable" for value in captures
+    )
+    if missing:
+        issues.append(
+            f"{missing} captured image{' is' if missing == 1 else 's are'} missing"
+        )
+    if unavailable:
+        issues.append(
+            f"{unavailable} captured image"
+            f"{' is' if unavailable == 1 else 's are'} unavailable"
+        )
+    return list(dict.fromkeys(issues))
+
+
+def _validated_items(value: Any) -> list[ItemView]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise RepositoryError(
+            "the item query returned an invalid collection",
+            code="invalid_corrections_index_projection",
+        )
+    rows = list(value)
+    if any(not isinstance(item, ItemView) for item in rows):
+        raise RepositoryError(
+            "the item query returned an invalid view",
+            code="invalid_corrections_index_projection",
+        )
+    identities = [item.item_id.casefold() for item in rows]
+    if len(identities) != len(set(identities)):
+        raise RepositoryError(
+            "the item query returned duplicate identities",
+            code="invalid_corrections_index_projection",
+        )
+    return rows
+
+
+def _corrections_index(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> Response:
+    workspace_id = request.args.get("workspace_id", "")
+    if workspace_id and (
+        len(workspace_id) > 256
+        or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}",
+            workspace_id,
+        )
+    ):
+        raise ValidationError(
+            "workspace_id must be a portable identifier",
+            code="invalid_corrections_workspace",
+            details={"field": "workspace_id"},
+        )
+
+    review_service = _review_service(engine_for_request)
+    raster_service = _raster_service(engine_for_request)
+    books: list[dict[str, Any]] = []
+    attention: list[dict[str, Any]] = []
+    items = _validated_items(_item_service(engine_for_request).list_items())
+    for item in items:
+        if item.kind.casefold() != "book":
+            continue
+        review = review_service.get_correction_review(item.item_id)
+        if not isinstance(review, CorrectionReviewSnapshot):
+            raise RepositoryError(
+                "the correction review projector returned an invalid view",
+                code="invalid_correction_review_projection",
+                details={"item_id": item.item_id},
+            )
+        rasters = _validated_rasters(
+            raster_service.list_raster_artifacts(item.item_id),
+            item_id=item.item_id,
+        )
+        captures = _capture_rows(item.item_id, rasters)
+        review_summary = _review_summary(review)
+        book_without_revision = {
+            "id": item.item_id,
+            "title": item.title,
+            "import_state": _book_import_state(captures),
+            "issues": _book_issues(item, captures),
+            "review": review_summary,
+            "captures": captures,
+        }
+        book = {
+            "id": item.item_id,
+            "revision": _collection_revision(
+                "crb-",
+                (
+                    {
+                        "item_revision": item.revision,
+                        **book_without_revision,
+                    },
+                ),
+            ),
+            **{key: value for key, value in book_without_revision.items()
+               if key != "id"},
+        }
+        books.append(book)
+        if review.state.value != "clear":
+            attention.append(
+                {
+                    "key": f"attention:{item.item_id}",
+                    "target": {
+                        "kind": "book",
+                        "item_id": item.item_id,
+                    },
+                    "review": review_summary,
+                }
+            )
+
+    books.sort(key=lambda value: (value["title"].casefold(), value["id"]))
+    attention.sort(key=lambda value: value["key"])
+    revision = _collection_revision(
+        "cri-",
+        ({"books": books, "attention": attention},),
+    )
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": CORRECTIONS_INDEX_SCHEMA,
+            "revision": revision,
+            "books": books,
+            "attention": attention,
+        },
+        revision,
+    )
+
+
+def _correction_review_detail(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    review = _review_snapshot(engine_for_request, item_id)
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": CORRECTIONS_REVIEW_SCHEMA,
+            "target": {"kind": "book", "item_id": item_id},
+            "review": review.as_dict(),
+        },
+        review.revision,
+    )
 
 
 def _limit() -> int:
@@ -1152,6 +1464,7 @@ def create_corrections_blueprint(
     engine_for_request: Callable[[], LibraryEngine],
     *,
     raster_resource_resolver_for_request: Callable[[], Any] | None = None,
+    correction_actor_id_for_request: Callable[[], str] | None = None,
     correction_transform_submitter: Callable[
         [
             CorrectionTransformService,
@@ -1174,14 +1487,40 @@ def create_corrections_blueprint(
             "raster_resource_resolver_for_request must be callable or None"
         )
     if (
+        correction_actor_id_for_request is not None
+        and not callable(correction_actor_id_for_request)
+    ):
+        raise TypeError(
+            "correction_actor_id_for_request must be callable or None"
+        )
+    if (
         correction_transform_submitter is not None
         and not callable(correction_transform_submitter)
     ):
         raise TypeError(
             "correction_transform_submitter must be callable or None"
         )
+    actor_id_for_request = (
+        correction_actor_id_for_request
+        if correction_actor_id_for_request is not None
+        else lambda: "local-desktop"
+    )
 
     blueprint = Blueprint("librarytool_corrections", __name__)
+
+    @blueprint.get("/api/v1/corrections/index")
+    def get_corrections_index():
+        try:
+            return _corrections_index(engine_for_request)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get("/api/v1/items/<item_id>/corrections/review")
+    def get_correction_review(item_id: str):
+        try:
+            return _correction_review_detail(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
 
     @blueprint.get("/api/v1/items/<item_id>/raster-artifacts")
     def list_raster_artifacts(item_id: str):
@@ -1337,21 +1676,33 @@ def create_corrections_blueprint(
     @blueprint.put("/api/v1/items/<item_id>/corrections/review/attention")
     def mark_attention(item_id: str):
         try:
-            return _mark_attention(engine_for_request, item_id)
+            return _mark_attention(
+                engine_for_request,
+                actor_id_for_request,
+                item_id,
+            )
         except EngineError as error:
             return _error_response(error)
 
     @blueprint.post("/api/v1/items/<item_id>/corrections/review/resolve")
     def resolve_corrections(item_id: str):
         try:
-            return _resolve_corrections(engine_for_request, item_id)
+            return _resolve_corrections(
+                engine_for_request,
+                actor_id_for_request,
+                item_id,
+            )
         except EngineError as error:
             return _error_response(error)
 
     @blueprint.post("/api/v1/items/<item_id>/corrections/review/reopen")
     def reopen_corrections(item_id: str):
         try:
-            return _reopen_corrections(engine_for_request, item_id)
+            return _reopen_corrections(
+                engine_for_request,
+                actor_id_for_request,
+                item_id,
+            )
         except EngineError as error:
             return _error_response(error)
 
@@ -1360,6 +1711,8 @@ def create_corrections_blueprint(
 
 __all__ = [
     "ARTIFACT_PAGE_LIMIT",
+    "CORRECTIONS_INDEX_SCHEMA",
+    "CORRECTIONS_REVIEW_SCHEMA",
     "CORRECTION_MUTATION_MAX_BYTES",
     "CORRECTION_TRANSFORM_QUEUE_SCHEMA",
     "create_corrections_blueprint",

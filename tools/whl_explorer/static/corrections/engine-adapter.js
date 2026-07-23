@@ -240,9 +240,95 @@
       return Object.keys(commands).length ? Object.freeze(commands) : null;
     }
 
+    function correctionBooksPort(client) {
+      const corrections = client && client.corrections;
+      if (!corrections || typeof corrections.index !== "function" ||
+          typeof corrections.getReview !== "function") return null;
+      let workspaceId = null;
+
+      function itemIdForTarget(target) {
+        if (!target || target.kind !== "book" ||
+            typeof target.item_id !== "string" || !target.item_id) {
+          throw capabilityError("non-book correction reviews");
+        }
+        return target.item_id;
+      }
+
+      async function refreshMutationEntry(target, signal) {
+        if (!workspaceId) {
+          throw new Error("The Corrections workspace has not been opened");
+        }
+        const index = await corrections.index({ workspaceId, signal });
+        const entry = index.attention.find((candidate) =>
+          candidate.target && candidate.target.kind === "book" &&
+          candidate.target.item_id === target.item_id);
+        if (!entry) {
+          const error = new Error(
+            "Engine review mutation did not return an attention entry");
+          error.code = "invalid-corrections-review-result";
+          throw error;
+        }
+        return Object.freeze({
+          schema: "librarytool.corrections-review-result/1",
+          index_revision: index.revision,
+          entry,
+        });
+      }
+
+      const books = {
+        trustedActor: true,
+        async loadIndex({ workspaceId: nextWorkspaceId, signal } = {}) {
+          const index = await corrections.index({
+            workspaceId: nextWorkspaceId,
+            signal,
+          });
+          workspaceId = nextWorkspaceId;
+          return index;
+        },
+        getReview({ target, signal } = {}) {
+          return corrections.getReview({
+            itemId: itemIdForTarget(target),
+            signal,
+          });
+        },
+      };
+      if (typeof corrections.resolveCorrections === "function") {
+        books.resolveReview = async ({
+          target, expectedRevision, operationId, comment = "", signal,
+        } = {}) => {
+          const itemId = itemIdForTarget(target);
+          await corrections.resolveCorrections({
+            itemId,
+            expectedReviewRevision: expectedRevision,
+            idempotencyKey: operationId,
+            comment,
+            signal,
+          });
+          return refreshMutationEntry(target, signal);
+        };
+      }
+      if (typeof corrections.reopenCorrections === "function") {
+        books.reopenReview = async ({
+          target, expectedRevision, operationId, comment = "", signal,
+        } = {}) => {
+          const itemId = itemIdForTarget(target);
+          await corrections.reopenCorrections({
+            itemId,
+            expectedReviewRevision: expectedRevision,
+            idempotencyKey: operationId,
+            comment,
+            signal,
+          });
+          return refreshMutationEntry(target, signal);
+        };
+      }
+      return Object.freeze(books);
+    }
+
     function createCorrectionsEnginePorts(engineClient) {
       const client = requireEngineClient(engineClient);
       const commands = correctionCommandPort(client);
+      const books = correctionBooksPort(client);
 
       async function listRasterGroup({ context, group, cursor, limit, signal }) {
         if (!RASTER_GROUPS.has(group)) {
@@ -386,6 +472,7 @@
         : null;
       return Object.freeze({
         artifacts,
+        ...(books ? { books } : {}),
         ...(invokeCommand ? { invokeCommand } : {}),
       });
     }

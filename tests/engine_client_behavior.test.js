@@ -238,6 +238,67 @@ function correctionMutationResult({
   };
 }
 
+function correctionAuditEvent(overrides = {}) {
+  return {
+    operation_id: "review:mark:1",
+    action: "attention.mark",
+    actor_id: "local-desktop",
+    occurred_at: "2026-07-23T18:00:00Z",
+    before_state: "clear",
+    after_state: "needs_attention",
+    reason: "Check the title leaf",
+    comment: "",
+    ...overrides,
+  };
+}
+
+function correctionsIndex(overrides = {}) {
+  const event = correctionAuditEvent();
+  const review = {
+    revision: "review-r2",
+    state: "needs_attention",
+    reason: event.reason,
+    history_count: 1,
+    latest_event: event,
+  };
+  return {
+    ok: true,
+    schema: "librarytool.corrections-index/1",
+    revision: "index-r2",
+    books: [{
+      id: "book:one",
+      revision: "book-r2",
+      title: "A Herbal",
+      import_state: "ready",
+      issues: [],
+      review,
+      captures: [],
+    }],
+    attention: [{
+      key: "attention:book:one",
+      target: { kind: "book", item_id: "book:one" },
+      review: copyJson(review),
+    }],
+    ...overrides,
+  };
+}
+
+function correctionReviewDocument(overrides = {}) {
+  const event = correctionAuditEvent();
+  return {
+    ok: true,
+    schema: "librarytool.corrections-review/1",
+    target: { kind: "book", item_id: "book:one" },
+    review: {
+      revision: "review-r2",
+      state: "needs_attention",
+      reason: event.reason,
+      history: [event],
+    },
+    ...overrides,
+  };
+}
+
 function correctionTransformCommand(overrides = {}) {
   return {
     schema: "org.whl.correction-transform-command",
@@ -369,6 +430,8 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
   assert.equal(typeof client.spatialAnnotations.list, "function");
   assert.equal(typeof client.spatialAnnotations.get, "function");
+  assert.equal(typeof client.corrections.index, "function");
+  assert.equal(typeof client.corrections.getReview, "function");
   assert.equal(typeof client.corrections.assignImageCategory, "function");
   assert.equal(typeof client.corrections.clearImageCategory, "function");
   assert.equal(typeof client.corrections.assignRegionRole, "function");
@@ -514,6 +577,46 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
   }), "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/resource" +
     "?revision=resource-r1");
 });
+
+test("EngineClient validates the server-composed Corrections review index",
+  async () => {
+    const bodies = [correctionsIndex(), correctionReviewDocument()];
+    const calls = [];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, bodies.shift());
+      },
+    });
+
+    const index = await client.corrections.index({
+      workspaceId: "workspace:one",
+    });
+    const detail = await client.corrections.getReview({
+      itemId: "book:one",
+    });
+
+    assert.equal(index.schema, "librarytool.corrections-index/1");
+    assert.equal(index.ok, undefined);
+    assert.equal(index.attention[0].review.latest_event.actor_id,
+      "local-desktop");
+    assert.equal(detail.schema, "librarytool.corrections-review/1");
+    assert.equal(detail.ok, undefined);
+    assert.deepEqual(calls.map(({ url, init }) => [
+      init.method, url, init.cache,
+    ]), [
+      [
+        "GET",
+        "/api/v1/corrections/index?workspace_id=workspace%3Aone",
+        "no-cache",
+      ],
+      [
+        "GET",
+        "/api/v1/items/book%3Aone/corrections/review",
+        "no-cache",
+      ],
+    ]);
+  });
 
 test("EngineClient rejects malformed or path-leaking Corrections views", async () => {
   const malformed = rasterArtifact({
@@ -886,21 +989,18 @@ test("caption metadata and review commands own exact conditional transport",
       itemId: "book:one",
       expectedReviewRevision: "review-r1",
       reason: "Caption needs checking",
-      actorId: "curator:one",
       comment: "Found during QA",
       idempotencyKey: "attention:mark:1",
     });
     await client.corrections.resolveCorrections({
       itemId: "book:one",
       expectedReviewRevision: "review-r2",
-      actorId: "curator:one",
       comment: "Caption corrected",
       idempotencyKey: "attention:resolve:1",
     });
     await client.corrections.reopenCorrections({
       itemId: "book:one",
       expectedReviewRevision: "review-r3",
-      actorId: "curator:two",
       comment: "Second look requested",
       idempotencyKey: "attention:reopen:1",
     });
@@ -957,7 +1057,6 @@ test("caption metadata and review commands own exact conditional transport",
           "If-Review-Match": "\"review-r1\"",
         },
         {
-          actor_id: "curator:one",
           comment: "Found during QA",
           reason: "Caption needs checking",
         },
@@ -971,7 +1070,7 @@ test("caption metadata and review commands own exact conditional transport",
           "Idempotency-Key": "attention:resolve:1",
           "If-Review-Match": "\"review-r2\"",
         },
-        { actor_id: "curator:one", comment: "Caption corrected" },
+        { comment: "Caption corrected" },
       ],
       [
         "POST",
@@ -982,7 +1081,7 @@ test("caption metadata and review commands own exact conditional transport",
           "Idempotency-Key": "attention:reopen:1",
           "If-Review-Match": "\"review-r3\"",
         },
-        { actor_id: "curator:two", comment: "Second look requested" },
+        { comment: "Second look requested" },
       ],
     ]);
   });

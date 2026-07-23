@@ -22,6 +22,7 @@ from librarytool.engine.correction_transforms import (
     CorrectionTransformService,
 )
 from librarytool.engine.jobs import JobManager
+from librarytool.engine.items import ItemView, WorkbenchState
 from librarytool.engine.raster_artifacts import (
     ArtifactFreshness,
     ArtifactProvenance,
@@ -38,6 +39,7 @@ from librarytool.engine.raster_artifacts import (
 from librarytool.engine.runtime import (
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    ITEM_QUERY_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
 )
@@ -57,6 +59,7 @@ def _raster(
     content: bytes = b"png",
     canvas_id: str = "page-1",
     kind: str = "capture",
+    extensions=None,
 ) -> RasterArtifactView:
     revision = f"artifact-{artifact_id}-r1"
     digest = hashlib.sha256(content).hexdigest()
@@ -81,6 +84,7 @@ def _raster(
         label=f"Capture {artifact_id}",
         freshness=ArtifactFreshness.CURRENT,
         provenance=ArtifactProvenance(origin="capture"),
+        extensions=extensions or {},
     )
 
 
@@ -153,8 +157,41 @@ class _SpatialProjector:
         return next((row for row in self.rows if row.key == key), None)
 
 
+class _Items:
+    def __init__(self, rows):
+        self.rows = tuple(rows)
+
+    def list_items(self):
+        return self.rows
+
+
+def _item(item_id="book-1", title="A Herbal"):
+    return ItemView(
+        item_id=item_id,
+        revision=f"{item_id}-r1",
+        record_revision=f"{item_id}-record-r1",
+        kind="book",
+        title=title,
+        metadata={},
+        representations=(),
+        artifacts=(),
+        workbench_state=WorkbenchState(
+            item_id,
+            f"{item_id}-workbench-r1",
+            {},
+        ),
+    )
+
+
 class _Engine:
-    def __init__(self, raster, spatial, corrections=None, transforms=None):
+    def __init__(
+        self,
+        raster,
+        spatial,
+        corrections=None,
+        transforms=None,
+        items=None,
+    ):
         self.services = {
             RASTER_ARTIFACT_QUERY_SERVICE: raster,
             SPATIAL_ANNOTATION_QUERY_SERVICE: spatial,
@@ -163,6 +200,8 @@ class _Engine:
             self.services[CORRECTION_SERVICE] = corrections
         if transforms is not None:
             self.services[CORRECTION_TRANSFORM_SERVICE] = transforms
+        if items is not None:
+            self.services[ITEM_QUERY_SERVICE] = items
 
     def get_service(self, key):
         return self.services.get(key)
@@ -194,7 +233,12 @@ class _Resolver:
         )
 
 
-def _app(engine, resolver=None, transform_submitter=None):
+def _app(
+    engine,
+    resolver=None,
+    transform_submitter=None,
+    actor_id_for_request=None,
+):
     app = Flask(__name__)
     app.register_blueprint(
         create_corrections_blueprint(
@@ -203,6 +247,7 @@ def _app(engine, resolver=None, transform_submitter=None):
                 None if resolver is None else lambda: resolver
             ),
             correction_transform_submitter=transform_submitter,
+            correction_actor_id_for_request=actor_id_for_request,
         )
     )
     return app
@@ -246,7 +291,14 @@ def _projected_app(tmp_path, raster_rows, spatial_rows):
     return app
 
 
-def _projected_harness(tmp_path, raster_rows, spatial_rows):
+def _projected_harness(
+    tmp_path,
+    raster_rows,
+    spatial_rows,
+    *,
+    items=None,
+    actor_id_for_request=None,
+):
     rasters = _RasterProjector(raster_rows)
     spatial = _SpatialProjector(spatial_rows)
     aggregate = CorrectionAggregateProjector(rasters, spatial)
@@ -263,7 +315,15 @@ def _projected_harness(tmp_path, raster_rows, spatial_rows):
         repository,
     )
     corrections = CorrectionService(repository)
-    return _app(_Engine(projected, projected, corrections)), repository
+    return _app(
+        _Engine(
+            projected,
+            projected,
+            corrections,
+            items=items,
+        ),
+        actor_id_for_request=actor_id_for_request,
+    ), repository
 
 
 def test_raster_list_is_versioned_filterable_and_revision_paged():
@@ -713,7 +773,12 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         _RasterProjector(rows),
         _SpatialProjector(spatial),
     ).project("book-1")
-    app, repository = _projected_harness(tmp_path, rows, spatial)
+    app, repository = _projected_harness(
+        tmp_path,
+        rows,
+        spatial,
+        actor_id_for_request=lambda: "trusted-local-curator",
+    )
     client = app.test_client()
     endpoint = "/api/v1/items/book-1/corrections/review"
 
@@ -721,11 +786,26 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         "Idempotency-Key": "review-mark-op",
         "If-Review-Match": f'"{base.review.revision}"',
     }
+    spoofed = client.put(
+        f"{endpoint}/attention",
+        json={
+            "reason": "Caption needs checking",
+            "actor_id": "renderer-supplied",
+            "comment": "",
+        },
+        headers={
+            **mark_headers,
+            "Idempotency-Key": "review-spoof-op",
+        },
+    )
+    assert spoofed.status_code == 400
+    assert spoofed.get_json()["code"] == (
+        "invalid_correction_mutation_envelope"
+    )
     marked = client.put(
         f"{endpoint}/attention",
         json={
             "reason": "Caption needs checking",
-            "actor_id": "curator-1",
             "comment": "Found during QA",
         },
         headers=mark_headers,
@@ -734,7 +814,6 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         f"{endpoint}/attention",
         json={
             "reason": "Caption needs checking",
-            "actor_id": "curator-1",
             "comment": "Found during QA",
         },
         headers=mark_headers,
@@ -747,7 +826,7 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
 
     resolved = client.post(
         f"{endpoint}/resolve",
-        json={"actor_id": "curator-1", "comment": "Caption corrected"},
+        json={"comment": "Caption corrected"},
         headers={
             "Idempotency-Key": "review-resolve-op",
             "If-Review-Match": (
@@ -761,7 +840,7 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
 
     reopened = client.post(
         f"{endpoint}/reopen",
-        json={"actor_id": "curator-2", "comment": "Second review requested"},
+        json={"comment": "Second review requested"},
         headers={
             "Idempotency-Key": "review-reopen-op",
             "If-Review-Match": (
@@ -783,10 +862,13 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         "attention.resolve",
         "attention.reopen",
     ]
+    assert {
+        event.actor_id for event in aggregate.review.history
+    } == {"trusted-local-curator"}
 
     stale = client.post(
         f"{endpoint}/resolve",
-        json={"actor_id": "curator-3", "comment": ""},
+        json={"comment": ""},
         headers={
             "Idempotency-Key": "review-stale-op",
             "If-Review-Match": f'"{base.review.revision}"',
@@ -794,6 +876,81 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     )
     assert stale.status_code == 409
     assert stale.get_json()["code"] == "review_revision_conflict"
+
+
+def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
+    rows = (
+        _raster(
+            "capture:asset-1:original",
+            extensions={"capture_order": 1},
+        ),
+        _raster(
+            "capture:asset-1:display",
+            extensions={"capture_order": 1},
+        ),
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        rows,
+        (),
+        items=_Items((_item(title="Captured Herbal"),)),
+        actor_id_for_request=lambda: "account-42",
+    )
+    client = app.test_client()
+
+    initial = client.get(
+        "/api/v1/corrections/index?workspace_id=workspace-1"
+    )
+    assert initial.status_code == 200
+    body = initial.get_json()
+    assert body["schema"] == "librarytool.corrections-index/1"
+    assert body["attention"] == []
+    assert len(body["books"]) == 1
+    book = body["books"][0]
+    assert book["title"] == "Captured Herbal"
+    assert [
+        capture["artifact_id"] for capture in book["captures"]
+    ] == ["capture:asset-1:display"]
+    capture = book["captures"][0]
+    assert capture["capture_order"] == 1
+    assert capture["thumbnail"]["url"].startswith(
+        "/api/v1/items/book-1/raster-artifacts/"
+    )
+    assert "workspace" not in initial.get_data(as_text=True).casefold()
+
+    detail = client.get("/api/v1/items/book-1/corrections/review")
+    assert detail.status_code == 200
+    review = detail.get_json()["review"]
+    assert review["state"] == "clear"
+    assert review["history"] == []
+    cached = client.get(
+        "/api/v1/items/book-1/corrections/review",
+        headers={"If-None-Match": detail.headers["ETag"]},
+    )
+    assert cached.status_code == 304
+
+    marked = client.put(
+        "/api/v1/items/book-1/corrections/review/attention",
+        json={"reason": "Check the title leaf", "comment": ""},
+        headers={
+            "Idempotency-Key": "index-review-mark",
+            "If-Review-Match": f'"{review["revision"]}"',
+        },
+    )
+    assert marked.status_code == 200
+    updated = client.get(
+        "/api/v1/corrections/index?workspace_id=workspace-1"
+    ).get_json()
+    assert updated["revision"] != body["revision"]
+    assert updated["books"][0]["revision"] != book["revision"]
+    assert updated["books"][0]["review"]["state"] == "needs_attention"
+    assert updated["attention"][0]["target"] == {
+        "kind": "book",
+        "item_id": "book-1",
+    }
+    assert updated["attention"][0]["review"]["latest_event"][
+        "actor_id"
+    ] == "account-42"
 
 
 def test_inherited_category_changes_detail_etag_without_changing_child_cas(

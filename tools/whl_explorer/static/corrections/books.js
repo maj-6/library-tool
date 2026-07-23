@@ -669,7 +669,10 @@
         throw new TypeError("review action must be resolve or reopen");
       }
       const entry = normalizeAttentionEntry(options.entry, "$.entry");
-      const actorId = identifier(options.actorId, "$.actor_id");
+      const trustedActor = this.api && this.api.trustedActor === true;
+      const actorId = trustedActor
+        ? null
+        : identifier(options.actorId, "$.actor_id");
       const operationId = identifier(options.operationId, "$.operation_id");
       const comment = safeText(options.comment || "", "$.comment", 8192);
       const methodName = action === "resolve" ? "resolveReview" : "reopenReview";
@@ -677,14 +680,15 @@
         throw new Error(`${action === "resolve" ? "Resolve" : "Reopen"} is unavailable`);
       }
       try {
-        const value = await this.api[methodName]({
+        const request = {
           target: entry.target,
           expectedRevision: entry.review.revision,
-          actorId,
           operationId,
           comment,
           signal: options.signal,
-        });
+        };
+        if (!trustedActor) request.actorId = actorId;
+        const value = await this.api[methodName](request);
         const result = normalizeReviewMutationResult(value);
         if (result.entry.key !== entry.key ||
             targetIdentity(result.entry.target) !== targetIdentity(entry.target)) {

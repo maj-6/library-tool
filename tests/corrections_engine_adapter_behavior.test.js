@@ -652,3 +652,142 @@ test("caption metadata and review commands delegate operation IDs", async () => 
     }],
   ]);
 });
+test("engine books port owns review translation and trusted actor identity",
+  async () => {
+    const calls = [];
+    let state = "needs_attention";
+    let revision = "review-r1";
+    let indexRevision = 1;
+    const target = { kind: "book", item_id: "book-1" };
+    const summary = () => {
+      const action = state === "resolved"
+        ? "attention.resolve"
+        : revision === "review-r3"
+          ? "attention.reopen"
+          : "attention.mark";
+      const beforeState = action === "attention.mark"
+        ? "clear"
+        : action === "attention.resolve"
+          ? "needs_attention"
+          : "resolved";
+      return {
+        revision,
+        state,
+        reason: "Check the title leaf",
+        history_count: revision === "review-r1" ? 1
+          : revision === "review-r2" ? 2 : 3,
+        latest_event: {
+        operation_id: `${action}:op`,
+        action,
+        actor_id: "local-desktop",
+        occurred_at: "2026-07-23T18:00:00Z",
+        before_state: beforeState,
+        after_state: state,
+        reason: "Check the title leaf",
+        comment: "",
+        },
+      };
+    };
+    const index = () => ({
+      schema: "librarytool.corrections-index/1",
+      revision: `index-r${indexRevision}`,
+      books: [{
+        id: "book-1",
+        revision: `book-r${indexRevision}`,
+        title: "A Herbal",
+        import_state: "ready",
+        issues: [],
+        review: summary(),
+        captures: [],
+      }],
+      attention: [{
+        key: "attention:book-1",
+        target,
+        review: summary(),
+      }],
+    });
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index(payload) {
+          calls.push(["index", payload]);
+          return index();
+        },
+        async getReview(payload) {
+          calls.push(["getReview", payload]);
+          return {
+            schema: "librarytool.corrections-review/1",
+            target,
+            review: {
+              revision,
+              state,
+              reason: "Check the title leaf",
+              history: [],
+            },
+          };
+        },
+        async resolveCorrections(payload) {
+          calls.push(["resolveCorrections", payload]);
+          state = "resolved";
+          revision = "review-r2";
+          indexRevision += 1;
+          return { receipt: { action: "attention.resolve" } };
+        },
+        async reopenCorrections(payload) {
+          calls.push(["reopenCorrections", payload]);
+          state = "needs_attention";
+          revision = "review-r3";
+          indexRevision += 1;
+          return { receipt: { action: "attention.reopen" } };
+        },
+      },
+    });
+    const { books } = createCorrectionsEnginePorts(engineClient);
+    const signal = new AbortController().signal;
+
+    assert.equal(books.trustedActor, true);
+    await books.loadIndex({ workspaceId: "workspace-1", signal });
+    await books.getReview({ target, signal });
+    const resolved = await books.resolveReview({
+      target,
+      expectedRevision: "review-r1",
+      operationId: "resolve-op",
+      comment: "Corrected",
+      signal,
+    });
+    const reopened = await books.reopenReview({
+      target,
+      expectedRevision: "review-r2",
+      operationId: "reopen-op",
+      comment: "Second look",
+      signal,
+    });
+
+    assert.equal(resolved.schema,
+      "librarytool.corrections-review-result/1");
+    assert.equal(resolved.entry.review.state, "resolved");
+    assert.equal(reopened.entry.review.state, "needs_attention");
+    assert.deepEqual(calls, [
+      ["index", { workspaceId: "workspace-1", signal }],
+      ["getReview", { itemId: "book-1", signal }],
+      ["resolveCorrections", {
+        itemId: "book-1",
+        expectedReviewRevision: "review-r1",
+        idempotencyKey: "resolve-op",
+        comment: "Corrected",
+        signal,
+      }],
+      ["index", { workspaceId: "workspace-1", signal }],
+      ["reopenCorrections", {
+        itemId: "book-1",
+        expectedReviewRevision: "review-r2",
+        idempotencyKey: "reopen-op",
+        comment: "Second look",
+        signal,
+      }],
+      ["index", { workspaceId: "workspace-1", signal }],
+    ]);
+    assert.equal(
+      JSON.stringify(calls).includes("actorId"),
+      false,
+    );
+  });
