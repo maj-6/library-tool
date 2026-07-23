@@ -714,14 +714,20 @@ class FilesystemCorrectionTransformStore:
         descriptor = -1
         try:
             named_before = path.stat(follow_symlinks=False)
-            if not stat.S_ISREG(named_before.st_mode) or _is_redirecting_path(path):
+            if (
+                not stat.S_ISREG(named_before.st_mode)
+                or named_before.st_nlink != 1
+                or _is_redirecting_path(path)
+            ):
                 raise ValueError("target is not a private regular file")
             flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(path, flags)
             opened_before = os.fstat(descriptor)
-            if not stat.S_ISREG(opened_before.st_mode) or not os.path.samestat(
-                named_before, opened_before
+            if (
+                not stat.S_ISREG(opened_before.st_mode)
+                or opened_before.st_nlink != 1
+                or not os.path.samestat(named_before, opened_before)
             ):
                 raise ValueError("target identity changed while opening")
             digest = hashlib.sha256()
@@ -742,6 +748,8 @@ class FilesystemCorrectionTransformStore:
             if (
                 not os.path.samestat(opened_before, opened_after)
                 or not os.path.samestat(opened_after, named_after)
+                or opened_after.st_nlink != 1
+                or named_after.st_nlink != 1
                 or self._stat_evidence(opened_before)
                 != self._stat_evidence(opened_after)
                 or _is_redirecting_path(path)
@@ -768,6 +776,7 @@ class FilesystemCorrectionTransformStore:
             value.st_ctime_ns,
             value.st_ino,
             value.st_dev,
+            value.st_nlink,
         )
 
     def _path_exists(
@@ -788,7 +797,11 @@ class FilesystemCorrectionTransformStore:
                 artifact=artifact,
                 cause=exc,
             ) from exc
-        if not stat.S_ISREG(info.st_mode) or _is_redirecting_path(path):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or _is_redirecting_path(path)
+        ):
             raise _repository_error(
                 "a correction transform storage target is unsafe",
                 code="invalid_correction_transform_storage",

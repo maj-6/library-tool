@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from dataclasses import replace
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
@@ -456,3 +457,22 @@ def test_replay_refuses_a_missing_or_modified_immutable_object(
         store.commit_transform(draft)
 
     assert raised.value.code == "invalid_correction_transform_storage"
+
+
+def test_replay_refuses_a_hard_linked_private_object(tmp_path: Path) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    result = store.commit_transform(draft)
+    target = _object_path(tmp_path, result.output("thumbnail").artifact_id)
+    outside_alias = tmp_path.parent / f"{tmp_path.name}-thumbnail-alias.bin"
+    os.link(target, outside_alias)
+    authority.fail = True
+
+    try:
+        with pytest.raises(RepositoryError) as raised:
+            store.commit_transform(draft)
+        assert raised.value.code == "invalid_correction_transform_storage"
+    finally:
+        outside_alias.unlink(missing_ok=True)
