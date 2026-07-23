@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 from pathlib import Path
 
 import capture_lib
 import libformat
+from PIL import Image
 from librarytool.adapters.capture_lib import Lib3CaptureArchiveMaterializer
 from librarytool.adapters.filesystem.capture_archive_repository import (
     FilesystemCaptureArchiveRepository,
@@ -37,12 +39,12 @@ def _entry(capture_id: str, *, book_id: str = "") -> dict:
 def _assets(root: Path, capture_id: str) -> Path:
     directory = root / capture_id
     directory.mkdir(parents=True)
-    (directory / "orig_1.jpg").write_bytes(
-        f"immutable-original-{capture_id}".encode()
-    )
-    (directory / "photo_1.jpg").write_bytes(
-        f"display-rendition-{capture_id}".encode()
-    )
+    original = io.BytesIO()
+    Image.new("RGB", (7, 11), (38, 92, 57)).save(original, format="JPEG")
+    display = io.BytesIO()
+    Image.new("RGB", (5, 9), (57, 38, 92)).save(display, format="JPEG")
+    (directory / "orig_1.jpg").write_bytes(original.getvalue())
+    (directory / "photo_1.jpg").write_bytes(display.getvalue())
     return directory
 
 
