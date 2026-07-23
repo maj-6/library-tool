@@ -662,6 +662,45 @@
       !/["\\]/.test(value);
   }
 
+  function correctionText(value, name, maximum, allowEmpty = true) {
+    if (typeof value !== "string" || value.length > maximum ||
+        (!allowEmpty && !value.trim()) ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\ud800-\udfff]/u
+          .test(value)) {
+      throw new TypeError(`${name} must be a bounded safe string`);
+    }
+    return value;
+  }
+
+  function correctionLanguage(value) {
+    const language = correctionText(value, "language", 64);
+    if (language && !/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(language)) {
+      throw new TypeError("language must be empty or a language tag");
+    }
+    return language;
+  }
+
+  function correctionMetadata(assertions, clearNames) {
+    if (!isObject(assertions) || !isBoundedArtifactJson(assertions)) {
+      throw new TypeError("assertions must be bounded portable metadata");
+    }
+    const assertedNames = Object.keys(assertions);
+    if (assertedNames.length > 128 ||
+        !assertedNames.every(isPortableIdentifier) ||
+        !Array.isArray(clearNames) || clearNames.length > 128 ||
+        !clearNames.every(isPortableIdentifier) ||
+        new Set(clearNames).size !== clearNames.length ||
+        clearNames.some((name) => assertedNames.includes(name)) ||
+        assertedNames.length === 0 && clearNames.length === 0) {
+      throw new TypeError(
+        "metadata assertions and clears must be bounded, disjoint, and non-empty");
+    }
+    return {
+      assertions,
+      clear_names: [...clearNames],
+    };
+  }
+
   function isArtifactProvenance(value) {
     return hasExactKeys(value, [
       "origin", "provider_id", "model", "recipe_revision", "operation_id",
@@ -719,6 +758,16 @@
         value.confidence >= 0 && value.confidence <= 1) &&
       isArtifactProvenance(value.provenance) &&
       isBoundedArtifactJson(value.extensions);
+  }
+
+  function isArtifactMetadataAssertion(value) {
+    return hasExactKeys(value, [
+      "name", "value", "origin", "revision", "provenance",
+    ]) && isPortableIdentifier(value.name) &&
+      ["manual", "machine", "imported"].includes(value.origin) &&
+      isArtifactRevision(value.revision) &&
+      isArtifactProvenance(value.provenance) &&
+      isBoundedArtifactJson(value.value);
   }
 
   function isCategoryAssignment(value) {
@@ -939,6 +988,12 @@
     "category.clear",
     "role.assign",
     "role.clear",
+    "caption.set",
+    "caption.clear",
+    "metadata.assert",
+    "attention.mark",
+    "attention.resolve",
+    "attention.reopen",
   ]);
 
   function isCorrectionTarget(value) {
@@ -969,8 +1024,10 @@
       value.kind === "artifact");
     const annotation = expected.targets.find((value) =>
       value.kind === "annotation");
+    const review = expected.targets.find((value) =>
+      value.kind === "review");
     if (expected.action.startsWith("category.")) {
-      if (!artifact || annotation ||
+      if (!artifact || annotation || review ||
           !["category.assign", "category.clear"].includes(inverse.action) ||
           (expected.action === "category.clear" &&
             inverse.action !== "category.assign")) {
@@ -985,28 +1042,78 @@
         isCategoryAssignment(payload.assignment) &&
         payload.assignment.origin === "manual";
     }
-    if (!annotation ||
+    if (expected.action.startsWith("role.")) {
+      if (!annotation || review ||
         !["role.assign", "role.clear"].includes(inverse.action) ||
-        (expected.action === "role.clear" &&
-          inverse.action !== "role.assign")) return false;
-    const fields = inverse.action === "role.assign"
-      ? [
-          "annotation_id", "assignment", "linked_artifact_id",
-          "linked_assignment",
-        ]
-      : [
-          "annotation_id", "linked_artifact_id", "linked_assignment",
-        ];
-    if (!hasExactKeys(payload, fields) ||
-        payload.annotation_id !== annotation.targetId ||
-        payload.linked_artifact_id !== (artifact ? artifact.targetId : "") ||
-        (!artifact && payload.linked_assignment !== null) ||
-        (payload.linked_assignment !== null &&
-          (!isRoleAssignment(payload.linked_assignment) ||
-            payload.linked_assignment.origin !== "manual"))) return false;
-    return inverse.action === "role.clear" ||
-      isRoleAssignment(payload.assignment) &&
-      payload.assignment.origin === "manual";
+          (expected.action === "role.clear" &&
+            inverse.action !== "role.assign")) return false;
+      const fields = inverse.action === "role.assign"
+        ? [
+            "annotation_id", "assignment", "linked_artifact_id",
+            "linked_assignment",
+          ]
+        : [
+            "annotation_id", "linked_artifact_id", "linked_assignment",
+          ];
+      if (!hasExactKeys(payload, fields) ||
+          payload.annotation_id !== annotation.targetId ||
+          payload.linked_artifact_id !== (artifact ? artifact.targetId : "") ||
+          (!artifact && payload.linked_assignment !== null) ||
+          (payload.linked_assignment !== null &&
+            (!isRoleAssignment(payload.linked_assignment) ||
+              payload.linked_assignment.origin !== "manual"))) return false;
+      return inverse.action === "role.clear" ||
+        isRoleAssignment(payload.assignment) &&
+        payload.assignment.origin === "manual";
+    }
+    if (expected.action.startsWith("caption.")) {
+      if (!artifact || annotation || review ||
+          !["caption.set", "caption.clear"].includes(inverse.action) ||
+          (expected.action === "caption.clear" &&
+            inverse.action !== "caption.set")) return false;
+      if (inverse.action === "caption.clear") {
+        return hasExactKeys(payload, ["artifact_id"]) &&
+          payload.artifact_id === artifact.targetId;
+      }
+      return hasExactKeys(payload, ["artifact_id", "assertion"]) &&
+        payload.artifact_id === artifact.targetId &&
+        isArtifactCaption(payload.assertion) &&
+        payload.assertion.origin === "manual";
+    }
+    if (expected.action === "metadata.assert") {
+      if (!artifact || annotation || review ||
+          inverse.action !== "metadata.assert" ||
+          !hasExactKeys(payload, [
+            "artifact_id", "restore_assertions", "clear_names",
+          ]) ||
+          payload.artifact_id !== artifact.targetId ||
+          !Array.isArray(payload.restore_assertions) ||
+          payload.restore_assertions.length > 128 ||
+          !payload.restore_assertions.every((value) =>
+            isArtifactMetadataAssertion(value) &&
+            value.origin === "manual") ||
+          !isSortedUnique(payload.restore_assertions,
+            (value) => value.name) ||
+          !Array.isArray(payload.clear_names) ||
+          payload.clear_names.length > 128 ||
+          !payload.clear_names.every(isPortableIdentifier) ||
+          !isSortedUnique(payload.clear_names)) return false;
+      const restored = new Set(payload.restore_assertions.map(
+        (value) => value.name));
+      return !payload.clear_names.some((name) => restored.has(name));
+    }
+    if (!review || artifact || annotation ||
+        !expected.action.startsWith("attention.") ||
+        !hasExactKeys(payload, ["reason", "append_audit"]) ||
+        typeof payload.reason !== "string" ||
+        payload.reason.length < 1 || payload.reason.length > 2048 ||
+        payload.append_audit !== true) return false;
+    const expectedInverse = {
+      "attention.mark": "attention.clear",
+      "attention.resolve": "attention.reopen",
+      "attention.reopen": "attention.resolve",
+    }[expected.action];
+    return inverse.action === expectedInverse;
   }
 
   function isCorrectionReceipt(receipt, expected) {
@@ -1267,6 +1374,18 @@
           this._correctionClearRegionRole(args),
         queueTransform: (args) =>
           this._correctionQueueTransform(args),
+        setManualCaption: (args) =>
+          this._correctionSetManualCaption(args),
+        clearManualCaption: (args) =>
+          this._correctionClearManualCaption(args),
+        assertArtifactMetadata: (args) =>
+          this._correctionAssertArtifactMetadata(args),
+        markAttention: (args) =>
+          this._correctionMarkAttention(args),
+        resolveCorrections: (args) =>
+          this._correctionResolve(args),
+        reopenCorrections: (args) =>
+          this._correctionReopen(args),
       });
       this.itemTombstones = Object.freeze({
         list: (args) => this._itemTombstonesList(args),
@@ -2025,6 +2144,65 @@
       });
     }
 
+    _correctionSetManualCaption({ itemId, artifactId,
+      expectedArtifactRevision, text, language = "",
+      idempotencyKey, signal } = {}) {
+      return this._correctionMutation({
+        action: "caption.set",
+        method: "PUT",
+        itemId,
+        targetId: artifactId,
+        targetKind: "artifact",
+        expectedTargetRevision: expectedArtifactRevision,
+        idempotencyKey,
+        pathSuffix: "raster-artifacts",
+        mutationSuffix: "caption",
+        revisionHeader: "If-Artifact-Match",
+        body: {
+          text: correctionText(text, "text", 16384, false),
+          language: correctionLanguage(language),
+        },
+        signal,
+      });
+    }
+
+    _correctionClearManualCaption({ itemId, artifactId,
+      expectedArtifactRevision, idempotencyKey, signal } = {}) {
+      return this._correctionMutation({
+        action: "caption.clear",
+        method: "DELETE",
+        itemId,
+        targetId: artifactId,
+        targetKind: "artifact",
+        expectedTargetRevision: expectedArtifactRevision,
+        idempotencyKey,
+        pathSuffix: "raster-artifacts",
+        mutationSuffix: "caption",
+        revisionHeader: "If-Artifact-Match",
+        body: {},
+        signal,
+      });
+    }
+
+    _correctionAssertArtifactMetadata({ itemId, artifactId,
+      expectedArtifactRevision, assertions = {}, clearNames = [],
+      idempotencyKey, signal } = {}) {
+      return this._correctionMutation({
+        action: "metadata.assert",
+        method: "PATCH",
+        itemId,
+        targetId: artifactId,
+        targetKind: "artifact",
+        expectedTargetRevision: expectedArtifactRevision,
+        idempotencyKey,
+        pathSuffix: "raster-artifacts",
+        mutationSuffix: "metadata",
+        revisionHeader: "If-Artifact-Match",
+        body: correctionMetadata(assertions, clearNames),
+        signal,
+      });
+    }
+
     _correctionAssignRegionRole({ itemId, annotationId,
       expectedAnnotationRevision, role, linkedArtifactId = "",
       expectedLinkedArtifactRevision = "", idempotencyKey, signal } = {}) {
@@ -2055,6 +2233,79 @@
         linkedArtifactId,
         expectedLinkedArtifactRevision,
         idempotencyKey,
+        signal,
+      });
+    }
+
+    _correctionMarkAttention({ itemId, expectedReviewRevision,
+      reason, actorId, comment = "", idempotencyKey, signal } = {}) {
+      return this._correctionReviewMutation({
+        action: "attention.mark",
+        method: "PUT",
+        mutationSuffix: "attention",
+        itemId,
+        expectedReviewRevision,
+        reason,
+        actorId,
+        comment,
+        idempotencyKey,
+        signal,
+      });
+    }
+
+    _correctionResolve({ itemId, expectedReviewRevision,
+      actorId, comment = "", idempotencyKey, signal } = {}) {
+      return this._correctionReviewMutation({
+        action: "attention.resolve",
+        method: "POST",
+        mutationSuffix: "resolve",
+        itemId,
+        expectedReviewRevision,
+        actorId,
+        comment,
+        idempotencyKey,
+        signal,
+      });
+    }
+
+    _correctionReopen({ itemId, expectedReviewRevision,
+      actorId, comment = "", idempotencyKey, signal } = {}) {
+      return this._correctionReviewMutation({
+        action: "attention.reopen",
+        method: "POST",
+        mutationSuffix: "reopen",
+        itemId,
+        expectedReviewRevision,
+        actorId,
+        comment,
+        idempotencyKey,
+        signal,
+      });
+    }
+
+    _correctionReviewMutation({ action, method, mutationSuffix, itemId,
+      expectedReviewRevision, reason, actorId, comment,
+      idempotencyKey, signal }) {
+      const body = {
+        actor_id: portableIdentifier(actorId, "actorId"),
+        comment: correctionText(comment, "comment", 8192),
+      };
+      if (action === "attention.mark") {
+        body.reason = correctionText(reason, "reason", 2048, false);
+      }
+      return this._correctionMutation({
+        action,
+        method,
+        itemId,
+        targetId: itemId,
+        targetKind: "review",
+        expectedTargetRevision: expectedReviewRevision,
+        idempotencyKey,
+        pathSuffix: "corrections/review",
+        mutationSuffix,
+        revisionHeader: "If-Review-Match",
+        body,
+        omitTargetInPath: true,
         signal,
       });
     }
@@ -2122,7 +2373,8 @@
 
     async _correctionMutation({ action, method, itemId, targetId, targetKind,
       expectedTargetRevision, idempotencyKey, pathSuffix, mutationSuffix,
-      revisionHeader, headers = {}, body, targets = null, signal }) {
+      revisionHeader, headers = {}, body, targets = null,
+      omitTargetInPath = false, signal }) {
       const item = portableIdentifier(itemId, "itemId");
       const target = portableIdentifier(targetId, `${targetKind}Id`);
       if (!isArtifactRevision(expectedTargetRevision)) {
@@ -2132,7 +2384,8 @@
       }
       const operationId = operationKey(idempotencyKey, "idempotencyKey");
       const path = `/v1/items/${encodePart(item)}/${pathSuffix}/` +
-        `${encodePart(target)}/${mutationSuffix}`;
+        (omitTargetInPath ? mutationSuffix :
+          `${encodePart(target)}/${mutationSuffix}`);
       const expectedTargets = targets || [{
         kind: targetKind,
         targetId: target,

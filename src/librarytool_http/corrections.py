@@ -25,12 +25,18 @@ from librarytool.engine.errors import (
     ValidationError,
 )
 from librarytool.engine.corrections import (
+    AssertArtifactMetadataCommand,
     AssignImageCategoryCommand,
     AssignRegionRoleCommand,
+    ClearManualCaptionCommand,
     ClearImageCategoryCommand,
     ClearRegionRoleCommand,
     CorrectionCommandResult,
     CorrectionService,
+    MarkAttentionCommand,
+    ReopenCorrectionsCommand,
+    ResolveCorrectionsCommand,
+    SetManualCaptionCommand,
 )
 from librarytool.engine.correction_transforms import (
     CorrectionTransformCommand,
@@ -341,6 +347,36 @@ def _string_field(
     return value
 
 
+def _mapping_field(
+    document: Mapping[str, Any],
+    name: str,
+) -> Mapping[str, Any]:
+    value = document[name]
+    if not isinstance(value, Mapping):
+        raise ValidationError(
+            f"{name} must be an object",
+            code="invalid_correction_mutation_document",
+            details={"field": name},
+        )
+    return value
+
+
+def _string_array_field(
+    document: Mapping[str, Any],
+    name: str,
+) -> tuple[str, ...]:
+    value = document[name]
+    if not isinstance(value, list) or any(
+        not isinstance(entry, str) or not entry for entry in value
+    ):
+        raise ValidationError(
+            f"{name} must be an array of non-empty strings",
+            code="invalid_correction_mutation_document",
+            details={"field": name},
+        )
+    return tuple(value)
+
+
 def _mutation_response(result: CorrectionCommandResult) -> Response:
     if not isinstance(result, CorrectionCommandResult):
         raise RepositoryError(
@@ -530,6 +566,140 @@ def _clear_role(
                 expected_linked_artifact_revision=(
                     _optional_linked_revision(linked_artifact_id)
                 ),
+            )
+        )
+    )
+
+
+def _set_manual_caption(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Artifact-Match")
+    document = _mutation_document(frozenset({"text", "language"}))
+    return _mutation_response(
+        _correction_service(engine_for_request).set_manual_caption(
+            SetManualCaptionCommand(
+                item_id=item_id,
+                artifact_id=artifact_id,
+                expected_artifact_revision=expected_revision,
+                text=_string_field(document, "text"),
+                operation_id=operation_id,
+                language=_string_field(document, "language", allow_empty=True),
+            )
+        )
+    )
+
+
+def _clear_manual_caption(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Artifact-Match")
+    _mutation_document(frozenset())
+    return _mutation_response(
+        _correction_service(engine_for_request).clear_manual_caption(
+            ClearManualCaptionCommand(
+                item_id=item_id,
+                artifact_id=artifact_id,
+                expected_artifact_revision=expected_revision,
+                operation_id=operation_id,
+            )
+        )
+    )
+
+
+def _assert_artifact_metadata(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Artifact-Match")
+    document = _mutation_document(frozenset({"assertions", "clear_names"}))
+    try:
+        command = AssertArtifactMetadataCommand(
+            item_id=item_id,
+            artifact_id=artifact_id,
+            expected_artifact_revision=expected_revision,
+            operation_id=operation_id,
+            assertions=_mapping_field(document, "assertions"),
+            clear_names=_string_array_field(document, "clear_names"),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValidationError(
+            "the metadata assertion document is invalid",
+            code="invalid_correction_mutation_document",
+        ) from error
+    return _mutation_response(
+        _correction_service(engine_for_request).assert_artifact_metadata(
+            command
+        )
+    )
+
+
+def _mark_attention(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Review-Match")
+    document = _mutation_document(
+        frozenset({"reason", "actor_id", "comment"})
+    )
+    return _mutation_response(
+        _correction_service(engine_for_request).mark_attention(
+            MarkAttentionCommand(
+                item_id=item_id,
+                expected_review_revision=expected_revision,
+                reason=_string_field(document, "reason"),
+                actor_id=_string_field(document, "actor_id"),
+                operation_id=operation_id,
+                comment=_string_field(document, "comment", allow_empty=True),
+            )
+        )
+    )
+
+
+def _resolve_corrections(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Review-Match")
+    document = _mutation_document(frozenset({"actor_id", "comment"}))
+    return _mutation_response(
+        _correction_service(engine_for_request).resolve(
+            ResolveCorrectionsCommand(
+                item_id=item_id,
+                expected_review_revision=expected_revision,
+                actor_id=_string_field(document, "actor_id"),
+                operation_id=operation_id,
+                comment=_string_field(document, "comment", allow_empty=True),
+            )
+        )
+    )
+
+
+def _reopen_corrections(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Review-Match")
+    document = _mutation_document(frozenset({"actor_id", "comment"}))
+    return _mutation_response(
+        _correction_service(engine_for_request).reopen(
+            ReopenCorrectionsCommand(
+                item_id=item_id,
+                expected_review_revision=expected_revision,
+                actor_id=_string_field(document, "actor_id"),
+                operation_id=operation_id,
+                comment=_string_field(document, "comment", allow_empty=True),
             )
         )
     )
@@ -1103,6 +1273,43 @@ def create_corrections_blueprint(
         except EngineError as error:
             return _error_response(error)
 
+    @blueprint.put("/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/caption")
+    def set_manual_caption(item_id: str, artifact_id: str):
+        try:
+            return _set_manual_caption(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.delete(
+        "/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/caption"
+    )
+    def clear_manual_caption(item_id: str, artifact_id: str):
+        try:
+            return _clear_manual_caption(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.patch(
+        "/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/metadata"
+    )
+    def assert_artifact_metadata(item_id: str, artifact_id: str):
+        try:
+            return _assert_artifact_metadata(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
     @blueprint.put("/api/v1/items/<item_id>/spatial-annotations/<annotation_id>/role")
     def assign_region_role(item_id: str, annotation_id: str):
         try:
@@ -1124,6 +1331,27 @@ def create_corrections_blueprint(
                 item_id,
                 annotation_id,
             )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.put("/api/v1/items/<item_id>/corrections/review/attention")
+    def mark_attention(item_id: str):
+        try:
+            return _mark_attention(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.post("/api/v1/items/<item_id>/corrections/review/resolve")
+    def resolve_corrections(item_id: str):
+        try:
+            return _resolve_corrections(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.post("/api/v1/items/<item_id>/corrections/review/reopen")
+    def reopen_corrections(item_id: str):
+        try:
+            return _reopen_corrections(engine_for_request, item_id)
         except EngineError as error:
             return _error_response(error)
 
