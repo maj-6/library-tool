@@ -548,6 +548,34 @@ test("Space gates modal, repeat, invalid pins, and an active pointer gesture", a
   valid.dispose();
 });
 
+test("a mounted hidden command palette does not block perspective Space", async () => {
+  const calls = [];
+  const harness = renderHarness({
+    initialTool: TOOLS.PERSPECTIVE,
+    invokeCommand: async (...args) => {
+      calls.push(args);
+      return { job_id: "job-hidden-palette" };
+    },
+  });
+  const palette = new FakeNode("dialog", harness.documentRef);
+  palette.hidden = true;
+  palette.setAttribute("role", "dialog");
+  palette.setAttribute("aria-modal", "true");
+  harness.documentRef.querySelectorAll = () => [palette];
+  harness.controller.canvas.focus();
+
+  const event = harness.controller.surface.emit("keydown", {
+    key: " ",
+    code: "Space",
+    target: harness.controller.canvas,
+  });
+  await nextTurn();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(calls.length, 1);
+  harness.dispose();
+});
+
 
 test("Escape uses cancel, tool-exit, and host-selection rungs in order", () => {
   let clears = 0;

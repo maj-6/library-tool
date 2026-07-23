@@ -1798,21 +1798,33 @@ def _check_provenance(issues: list[Issue], value, loc: str, *,
             issues, f"{loc}/origin", "origin must be a portable identifier"
         )
     provider = value.get("provider_id", "")
-    if provider and not _valid_id(provider):
+    if (
+        "provider_id" in value
+        and provider != ""
+        and not _valid_id(provider)
+    ):
         _graph_issue(
             issues,
             f"{loc}/provider_id",
             "provider_id must be a portable identifier",
         )
     operation = value.get("operation_id", "")
-    if operation and not _valid_id(operation):
+    if (
+        "operation_id" in value
+        and operation != ""
+        and not _valid_id(operation)
+    ):
         _graph_issue(
             issues,
             f"{loc}/operation_id",
             "operation_id must be a portable identifier",
         )
     recipe = value.get("recipe_revision", "")
-    if recipe and not _valid_revision(recipe):
+    if (
+        "recipe_revision" in value
+        and recipe != ""
+        and not _valid_revision(recipe)
+    ):
         _graph_issue(
             issues, f"{loc}/recipe_revision", "recipe_revision is invalid"
         )
@@ -1856,19 +1868,21 @@ def _check_source(issues: list[Issue], value, loc: str) -> None:
             f"{loc}/representation_revision",
             "representation_revision is invalid",
         )
-    canvas_id = value.get("canvas_id", "")
-    canvas_revision = value.get("canvas_revision", "")
-    if bool(canvas_id) != bool(canvas_revision):
+    has_canvas_id = "canvas_id" in value
+    has_canvas_revision = "canvas_revision" in value
+    canvas_id = value.get("canvas_id")
+    canvas_revision = value.get("canvas_revision")
+    if has_canvas_id != has_canvas_revision:
         _graph_issue(
             issues,
             loc,
             "canvas_id and canvas_revision must be supplied together",
         )
-    if canvas_id and not _valid_id(canvas_id):
+    if has_canvas_id and not _valid_id(canvas_id):
         _graph_issue(
             issues, f"{loc}/canvas_id", "canvas_id is not portable"
         )
-    if canvas_revision and not _valid_revision(canvas_revision):
+    if has_canvas_revision and not _valid_revision(canvas_revision):
         _graph_issue(
             issues, f"{loc}/canvas_revision", "canvas_revision is invalid"
         )
@@ -2013,14 +2027,21 @@ def _check_assertions(issues: list[Issue], record: dict, loc: str) -> None:
             _graph_issue(
                 issues, f"{here}/revision", "category revision is invalid"
             )
-        inherited = assignment.get("inherited_from_artifact_id", "")
-        if origin == "inherited" and not _valid_id(inherited):
+        has_inherited = "inherited_from_artifact_id" in assignment
+        inherited = assignment.get("inherited_from_artifact_id")
+        if has_inherited and not _valid_id(inherited):
+            _graph_issue(
+                issues,
+                f"{here}/inherited_from_artifact_id",
+                "inherited artifact identity is not portable",
+            )
+        if origin == "inherited" and not has_inherited:
             _graph_issue(
                 issues,
                 f"{here}/inherited_from_artifact_id",
                 "inherited category must name an artifact",
             )
-        elif origin != "inherited" and inherited:
+        elif origin != "inherited" and has_inherited:
             _graph_issue(
                 issues,
                 f"{here}/inherited_from_artifact_id",
@@ -2088,15 +2109,18 @@ def _check_assertions(issues: list[Issue], record: dict, loc: str) -> None:
             _graph_issue(
                 issues, f"{here}/revision", "caption revision is invalid"
             )
-        language = assertion.get("language", "")
-        if language and (
+        language = assertion.get("language")
+        if "language" in assertion and (
             not isinstance(language, str) or not LANGUAGE_RE.fullmatch(language)
         ):
             _graph_issue(
                 issues, f"{here}/language", "caption language tag is invalid"
             )
-        annotation = assertion.get("source_annotation_id", "")
-        if annotation and not _valid_id(annotation):
+        annotation = assertion.get("source_annotation_id")
+        if (
+            "source_annotation_id" in assertion
+            and not _valid_id(annotation)
+        ):
             _graph_issue(
                 issues,
                 f"{here}/source_annotation_id",
@@ -2236,7 +2260,7 @@ def _lib3_graph_issues(
             f"more than {MAX_PAGES} pages",
         )
     declared_page_set: set[int] = set()
-    for index, page_number in enumerate(pages):
+    for index, page_number in enumerate(pages[: MAX_PAGES + 1]):
         loc = f"book.json/pages[{index}]"
         if isinstance(page_number, bool) or not isinstance(page_number, int):
             _graph_issue(issues, loc, "page number must be an integer")

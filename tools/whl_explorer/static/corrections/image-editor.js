@@ -22,6 +22,7 @@
     resolveEscape,
     serializeCorrectionTransformCommand,
     sourcePinsValid,
+    visibleModal,
   } = stateApi;
 
   const TOOL_DEFINITIONS = Object.freeze([
@@ -97,13 +98,6 @@
       },
       proposal: correction.proposal || null,
     };
-  }
-
-  function defaultModalQuery(documentRef) {
-    if (!documentRef || typeof documentRef.querySelector !== "function") return false;
-    return Boolean(documentRef.querySelector(
-      "dialog[open], [role='dialog'][aria-modal='true']",
-    ));
   }
 
   function defaultOperationId(windowRef, sequence) {
@@ -427,7 +421,7 @@
       const windowRef = documentRef.defaultView || null;
       const modalOpen = () => typeof options.isModalOpen === "function"
         ? options.isModalOpen(documentRef) === true
-        : defaultModalQuery(documentRef);
+        : visibleModal(documentRef);
       const hostHasSelection = () => typeof options.hasSelection === "function"
         ? options.hasSelection(resource) === true
         : state.selectionPresent;

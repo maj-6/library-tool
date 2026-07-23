@@ -15,6 +15,7 @@
     isFormControlTarget,
     normalizeManualAdjustment,
     sourcePinsValid,
+    visibleModal,
   } = stateApi;
 
   const IMAGE_ADJUST_PROFILE_KEY = "imageAdjust";
@@ -197,13 +198,6 @@
         adjustment.contrast_percent,
       ),
     };
-  }
-
-  function defaultModalQuery(documentRef) {
-    if (!documentRef || typeof documentRef.querySelector !== "function") return false;
-    return Boolean(documentRef.querySelector(
-      "dialog[open], [role='dialog'][aria-modal='true']",
-    ));
   }
 
   function plainShortcut(event, key) {
@@ -473,7 +467,7 @@
     modalOpen(documentRef) {
       return typeof this.options.isModalOpen === "function"
         ? this.options.isModalOpen(documentRef) === true
-        : defaultModalQuery(documentRef);
+        : visibleModal(documentRef);
     }
 
     eventContext(event, controller, resource) {

@@ -251,6 +251,25 @@ test("profile value is pure, bounded, and stable under serialization", () => {
   assert.deepEqual(tool.serializeProfile(), { lastAppliedBrightness: 18 });
 });
 
+test("a mounted hidden command palette does not block the A shortcut", () => {
+  const harness = mountedHarness();
+  const palette = new FakeNode("dialog", harness.documentRef);
+  palette.hidden = true;
+  palette.setAttribute("role", "dialog");
+  palette.setAttribute("aria-modal", "true");
+  harness.documentRef.querySelectorAll = () => [palette];
+  harness.canvas.focus();
+
+  const event = harness.surface.emit("keydown", {
+    key: "a",
+    target: harness.canvas,
+  });
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(harness.controller.getState().tool, TOOLS.IMAGE_ADJUST);
+  harness.cleanup();
+});
+
 
 test("canonical recipe and threshold exactly match the production wire contract", () => {
   assert.equal(DEFAULT_CONTRAST, 100);

@@ -817,6 +817,54 @@
     return contentEditable;
   }
 
+  function visibleModal(documentRef) {
+    if (!documentRef) return false;
+    const candidates = [];
+    const seen = new Set();
+    for (const selector of [
+      "dialog",
+      "[aria-modal='true']",
+      "[data-corrections-modal='true']",
+    ]) {
+      let matches = [];
+      try {
+        if (typeof documentRef.querySelectorAll === "function") {
+          matches = Array.from(documentRef.querySelectorAll(selector));
+        } else if (typeof documentRef.querySelector === "function") {
+          const match = documentRef.querySelector(selector);
+          if (match) matches = [match];
+        }
+      } catch (error) {
+        // Minimal DOM test doubles may implement only a subset of selectors.
+      }
+      for (const match of matches) {
+        if (!seen.has(match)) {
+          seen.add(match);
+          candidates.push(match);
+        }
+      }
+    }
+    return candidates.some((candidate) => {
+      let cursor = candidate;
+      while (cursor) {
+        if (cursor.hidden === true ||
+            typeof cursor.getAttribute === "function" &&
+            cursor.getAttribute("aria-hidden") === "true") return false;
+        cursor = cursor.parentNode;
+      }
+      const tagName = String(
+        candidate.tagName || candidate.nodeName || "",
+      ).toUpperCase();
+      const attribute = (name) => typeof candidate.getAttribute === "function"
+        ? candidate.getAttribute(name) : null;
+      if (tagName === "DIALOG" &&
+          candidate.open !== true &&
+          attribute("open") == null &&
+          attribute("aria-modal") !== "true") return false;
+      return true;
+    });
+  }
+
   function canQueueTransform(state, pins) {
     return Boolean(
       state &&
@@ -902,5 +950,6 @@
     serializeCorrectionTransformCommand,
     sourcePinsValid,
     validatePerspectiveQuad,
+    visibleModal,
   };
 });

@@ -546,7 +546,10 @@ def test_current_item_import_rejects_other_undeclared_lib3_members():
             "representations": [],
             "artifacts": [],
         },
-        extra_members={"notes/private.bin": b"must not be dropped"},
+        extra_members={
+            "pages/1.json": b'{"page":1,"items":[]}',
+            "notes/private.bin": b"must not be dropped",
+        },
     )
     with pytest.raises(ValidationError) as caught:
         _planner().plan(
@@ -558,6 +561,73 @@ def test_current_item_import_rejects_other_undeclared_lib3_members():
         )
     assert caught.value.code == "undeclared_lib3_member"
     assert caught.value.details == {"member": "notes/private.bin"}
+
+
+@pytest.mark.parametrize(
+    ("pages", "remove_pages", "page_members", "location_fragment"),
+    [
+        (None, True, {}, "book.json/pages"),
+        ("not-an-array", False, {}, "book.json/pages"),
+        ([True], False, {}, "book.json/pages[0]"),
+        ([0], False, {}, "book.json/pages[0]"),
+        ([100000], False, {}, "book.json/pages[0]"),
+        ([1, 1], False, {"pages/1.json": b"{}"}, "book.json/pages[1]"),
+        ([1], False, {}, "pages/1.json"),
+        ([], False, {"pages/1.json": b"{}"}, "pages/1.json"),
+        ([2], False, {"pages/1.json": b"{}"}, "pages/"),
+        (
+            [1],
+            False,
+            {"pages/1.json": b"{}", "pages/01.json": b"{}"},
+            "pages/01.json",
+        ),
+        ([], False, {"pages/00000.json": b"{}"}, "pages/00000.json"),
+        ([], False, {"pages/not-a-page.json": b"{}"}, "pages/not-a-page.json"),
+    ],
+    ids=[
+        "missing-pages",
+        "pages-not-array",
+        "boolean-page",
+        "page-below-range",
+        "page-above-range",
+        "duplicate-declaration",
+        "declared-member-missing",
+        "member-not-declared",
+        "declaration-member-mismatch",
+        "physical-page-alias",
+        "physical-page-out-of-range",
+        "malformed-page-member",
+    ],
+)
+def test_current_item_import_validates_lib3_page_manifest_before_planning(
+    pages,
+    remove_pages,
+    page_members,
+    location_fragment,
+):
+    manifest, resources = _capture_manifest_and_resources()
+    if remove_pages:
+        manifest.pop("pages")
+    else:
+        manifest["pages"] = pages
+    archive = _archive_bytes(
+        manifest,
+        resources,
+        extra_members=page_members,
+    )
+    with pytest.raises(ValidationError) as caught:
+        _planner().plan(
+            archive,
+            ImportDestinationSnapshot(item_id="destination"),
+            source_id="primary",
+            overwrite=False,
+            archive_sha256=hashlib.sha256(archive).hexdigest(),
+        )
+    assert caught.value.code == "invalid_lib3_graph"
+    assert any(
+        location_fragment in issue["loc"]
+        for issue in caught.value.details["issues"]
+    )
 
 
 def test_lib3_rejects_traversal_private_locators_and_checksum_mismatch(tmp_path):
@@ -1000,6 +1070,87 @@ def test_lib3_optional_nested_objects_are_validated_when_present(
     )
     with pytest.raises(libformat.LibError) as write_error:
         libformat.write_lib(document, tmp_path / "invalid-nested-object.lib")
+    assert write_error.value.code == "invalid_lib3_graph"
+
+
+@pytest.mark.parametrize(
+    ("artifact_index", "field_path", "empty_string_allowed"),
+    [
+        (0, ("provenance", "provider_id"), True),
+        (0, ("provenance", "operation_id"), True),
+        (0, ("provenance", "recipe_revision"), True),
+        (0, ("provenance", "model"), True),
+        (0, ("provenance", "generated_at"), True),
+        (0, ("source", "canvas_id"), False),
+        (0, ("source", "canvas_revision"), False),
+        (
+            1,
+            ("category_assignments", 0, "inherited_from_artifact_id"),
+            False,
+        ),
+        (3, ("caption_assertions", 0, "language"), False),
+        (3, ("caption_assertions", 0, "source_annotation_id"), False),
+    ],
+    ids=[
+        "provider-id",
+        "operation-id",
+        "recipe-revision",
+        "model",
+        "generated-at",
+        "canvas-id",
+        "canvas-revision",
+        "inherited-artifact-id",
+        "caption-language",
+        "source-annotation-id",
+    ],
+)
+@pytest.mark.parametrize(
+    "falsey_value",
+    [None, False, 0, [], {}, ""],
+    ids=[
+        "null",
+        "false",
+        "zero",
+        "empty-array",
+        "empty-object",
+        "empty-string",
+    ],
+)
+def test_lib3_present_falsey_string_fields_follow_schema(
+    artifact_index,
+    field_path,
+    empty_string_allowed,
+    falsey_value,
+    tmp_path,
+):
+    manifest, resources = _capture_manifest_and_resources()
+    artifact = manifest["artifacts"][artifact_index]
+    target = artifact
+    for segment in field_path[:-1]:
+        target = target[segment]
+    target[field_path[-1]] = falsey_value
+    archive = _archive_bytes(manifest, resources)
+
+    document = _capture_document()
+    document.artifacts[artifact_index] = libformat.LibArtifact.from_dict(
+        artifact
+    )
+    empty_is_valid = falsey_value == "" and empty_string_allowed
+    if empty_is_valid:
+        opened = libformat.read_lib(archive)
+        assert libformat.validate(opened) == []
+        assert libformat.validate(document) == []
+        libformat.write_lib(document, tmp_path / "valid-empty-string.lib")
+        return
+
+    with pytest.raises(libformat.LibError) as read_error:
+        libformat.read_lib(archive)
+    assert read_error.value.code == "invalid_lib3_graph"
+    assert any(
+        issue.level == "error" for issue in libformat.validate(document)
+    )
+    with pytest.raises(libformat.LibError) as write_error:
+        libformat.write_lib(document, tmp_path / "invalid-falsey-string.lib")
     assert write_error.value.code == "invalid_lib3_graph"
 
 

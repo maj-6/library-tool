@@ -181,6 +181,7 @@ class ExistingItemLibArchivePlanner:
                 code="invalid_lib_book_id",
             )
         if fmt[0] >= 3:
+            self._validate_lib3_pages(book, decoded.members)
             representations = book.get("representations")
             artifacts = book.get("artifacts")
             graph_members = [
@@ -334,6 +335,103 @@ class ExistingItemLibArchivePlanner:
             instructions_disposition=instructions_disposition,
             warnings=tuple(warnings),
         )
+
+    def _validate_lib3_pages(
+        self,
+        book: Mapping[str, Any],
+        members: Mapping[str, bytes],
+    ) -> None:
+        """Require exact lib/3 page declaration/member parity.
+
+        The legacy page planner intentionally tolerates and reports several
+        lib/1 and lib/2 irregularities. lib/3 is sealed against its schema, so
+        applying that permissive path before checking ``book.pages`` could
+        silently import a different page set than the manifest declares.
+        """
+
+        issues: list[dict[str, str]] = []
+
+        def issue(location: str, message: str) -> None:
+            issues.append({
+                "level": "error",
+                "loc": location,
+                "msg": message,
+            })
+
+        raw_pages = book.get("pages")
+        declared_pages: set[int] = set()
+        if "pages" not in book:
+            issue("book.json/pages", "pages is required")
+        elif not isinstance(raw_pages, list):
+            issue("book.json/pages", "pages must be an array")
+        else:
+            if len(raw_pages) > self._limits.max_pages:
+                issue(
+                    "book.json/pages",
+                    f"more than {self._limits.max_pages} pages",
+                )
+            for index, page_number in enumerate(
+                raw_pages[: self._limits.max_pages + 1]
+            ):
+                location = f"book.json/pages[{index}]"
+                if (
+                    isinstance(page_number, bool)
+                    or not isinstance(page_number, int)
+                ):
+                    issue(location, "page number must be an integer")
+                    continue
+                if not 1 <= page_number <= 99999:
+                    issue(
+                        location,
+                        "page number must be between 1 and 99999",
+                    )
+                    continue
+                if page_number in declared_pages:
+                    issue(location, "page number is duplicated")
+                    continue
+                declared_pages.add(page_number)
+
+        physical_pages: dict[int, str] = {}
+        for name in members:
+            match = _PAGE_MEMBER.fullmatch(name)
+            if match is None:
+                if name.startswith("pages/"):
+                    issue(name, "page member name is invalid")
+                continue
+            page_number = int(match.group(1))
+            if not 1 <= page_number <= 99999:
+                issue(
+                    name,
+                    "page member number must be between 1 and 99999",
+                )
+                continue
+            previous = physical_pages.get(page_number)
+            if previous is not None:
+                issue(
+                    name,
+                    f"page member resolves to the same page as {previous}",
+                )
+                continue
+            physical_pages[page_number] = name
+
+        physical_page_numbers = set(physical_pages)
+        for page_number in sorted(declared_pages - physical_page_numbers):
+            issue(
+                f"pages/{page_number}.json",
+                "page is declared in book.json but its member is missing",
+            )
+        for page_number in sorted(physical_page_numbers - declared_pages):
+            issue(
+                physical_pages[page_number],
+                "page member is not declared in book.json/pages",
+            )
+
+        if issues:
+            raise ValidationError(
+                "invalid lib/3 page declarations",
+                code="invalid_lib3_graph",
+                details={"issues": issues},
+            )
 
     def _decode(self, archive: bytes) -> _DecodedArchive:
         limits = self._limits
