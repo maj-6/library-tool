@@ -14,6 +14,7 @@ from .canvas_preparation_repository import (
     FilesystemCanvasPreparationRepository,
 )
 from .canvas_query_repository import FilesystemCanvasQueryRepository
+from .capture_archive_repository import FilesystemCaptureArchiveRepository
 from .correction_repository import FilesystemCorrectionRepository
 from .correction_transform_store import FilesystemCorrectionTransformStore
 from .correction_source_snapshot import (
@@ -71,6 +72,7 @@ __all__ = [
     "FilesystemCanvasObservation",
     "FilesystemCanvasPreparationRepository",
     "FilesystemCanvasQueryRepository",
+    "FilesystemCaptureArchiveRepository",
     "FilesystemCorrectionRepository",
     "FilesystemCorrectionTransformStore",
     "FilesystemCorrectionSourceSnapshotReader",

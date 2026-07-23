@@ -8,8 +8,9 @@ docs/lib-format.md). This module is that format's single source of truth:
   - the sanitizers (`sanitize_page_items`/`sanitize_dims`/`sanitize_styles`/
     `sanitize_figure`) the server's export/import routes call, so the app and
     any external program scrub identically — no drift;
-  - `read_lib`/`write_lib`/`validate`, the standalone Python API a tool author
-    (or CI) uses to round-trip and lint a `.lib` with no Flask in sight;
+  - `read_lib`/`write_lib`/`seal_lib`/`validate`, the standalone Python API a
+    tool author (or CI) uses to round-trip and lint a `.lib` with no Flask in
+    sight;
   - the self-description `lib/2` and capture-aware `lib/3` files ship:
     `INSTRUCTIONS.md` generated from the live vocabulary and `schema.json`, so
     the artifact teaches its reader.
@@ -27,6 +28,7 @@ import math
 import os
 import re
 import stat
+import tempfile
 import uuid
 import zipfile
 from collections.abc import Mapping
@@ -2874,6 +2876,25 @@ def _preflight_sealed_archive(
         )
 
 
+def _write_deterministic_member(
+    archive: zipfile.ZipFile,
+    name: str,
+    payload: str | bytes,
+) -> None:
+    """Write one member without leaking wall-clock or host mode metadata."""
+
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.create_system = 3
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = (stat.S_IFREG | 0o600) << 16
+    archive.writestr(
+        info,
+        payload,
+        compress_type=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    )
+
+
 def _write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
                book_id: str = "", instructions_book: str = "") -> None:
     """Seal a document as lib/2 or capture-aware lib/3.
@@ -2975,17 +2996,31 @@ def _write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
         # Seal beside the destination and publish with one replace. A late
         # serialization/ZIP failure therefore preserves an existing archive.
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("book.json", json.dumps(
-                manifest, indent=1, ensure_ascii=False, allow_nan=False))
-            z.writestr("INSTRUCTIONS.md",
-                       render_instructions(manifest["meta"],
-                                           per_book=effective_instructions,
-                                           format_version=(
-                                               CAPTURE_FORMAT_VERSION
-                                               if capture_aware
-                                               else FORMAT_VERSION
-                                           )))
-            z.writestr(
+            _write_deterministic_member(
+                z,
+                "book.json",
+                json.dumps(
+                    manifest,
+                    indent=1,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+            )
+            _write_deterministic_member(
+                z,
+                "INSTRUCTIONS.md",
+                render_instructions(
+                    manifest["meta"],
+                    per_book=effective_instructions,
+                    format_version=(
+                        CAPTURE_FORMAT_VERSION
+                        if capture_aware
+                        else FORMAT_VERSION
+                    ),
+                ),
+            )
+            _write_deterministic_member(
+                z,
                 "schema.json",
                 json.dumps(SCHEMA_V3 if capture_aware else SCHEMA, indent=1),
             )
@@ -2998,19 +3033,42 @@ def _write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
                 ext = sanitize_ext(p.ext, f"pages/{p.page}.json.ext")
                 if ext:
                     body["ext"] = ext
-                z.writestr(f"pages/{p.page}.json", json.dumps(
-                    body, indent=1, ensure_ascii=False, allow_nan=False))
+                _write_deterministic_member(
+                    z,
+                    f"pages/{p.page}.json",
+                    json.dumps(
+                        body,
+                        indent=1,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ),
+                )
             for lang, td in doc.translations.items():
                 if RID_RE.fullmatch(lang) and isinstance(td, dict):
-                    z.writestr(f"translations/{lang}.json", json.dumps(
-                        td, ensure_ascii=False, allow_nan=False))
+                    _write_deterministic_member(
+                        z,
+                        f"translations/{lang}.json",
+                        json.dumps(
+                            td,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                    )
             for name in manifest["figures"]:
                 blob = doc.assets.get(name)
                 if isinstance(blob, (bytes, bytearray)):
-                    z.writestr(f"assets/img/{name}", bytes(blob))
+                    _write_deterministic_member(
+                        z,
+                        f"assets/img/{name}",
+                        bytes(blob),
+                    )
             if capture_aware:
                 for member in sorted(doc.resources):
-                    z.writestr(member, doc.resources[member])
+                    _write_deterministic_member(
+                        z,
+                        member,
+                        doc.resources[member],
+                    )
             sealed_infos = tuple(z.infolist())
         _preflight_sealed_archive(temporary, sealed_infos)
         os.replace(temporary, destination)
@@ -3046,6 +3104,22 @@ def write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
             code="invalid_lib_document",
             details={"reason": "json_nesting_too_deep"},
         ) from exc
+
+
+def seal_lib(doc: LibDocument, *, generator: str = "library-tool/dev",
+             book_id: str = "", instructions_book: str = "") -> bytes:
+    """Return the exact deterministic bytes that :func:`write_lib` publishes."""
+
+    with tempfile.TemporaryDirectory(prefix="librarytool-lib-seal-") as directory:
+        destination = Path(directory) / "sealed.lib"
+        write_lib(
+            doc,
+            destination,
+            generator=generator,
+            book_id=book_id,
+            instructions_book=instructions_book,
+        )
+        return destination.read_bytes()
 
 
 # --- the linter ------------------------------------------------------------
