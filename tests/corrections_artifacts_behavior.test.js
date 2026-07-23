@@ -224,8 +224,8 @@ test("image selection resolves only display data until full resolution is explic
   const variants = [];
   const revoked = [];
   const resources = {
-    async resolveRaster({ resourceRef, variant }) {
-      variants.push({ id: resourceRef.id, variant });
+    async resolveRaster({ itemId, artifactId, resourceRef, variant }) {
+      variants.push({ itemId, artifactId, id: resourceRef.id, variant });
       return {
         url: `/resource/${resourceRef.id}/${variant}`,
         revoke: () => revoked.push(`${resourceRef.id}:${variant}`),
@@ -260,6 +260,8 @@ test("image selection resolves only display data until full resolution is explic
   await feature.select("artifact:capture-1");
 
   assert.deepEqual(variants, [{
+    itemId: "book-1",
+    artifactId: "capture-1",
     id: "capture-1-resource",
     variant: "display",
   }]);
@@ -273,12 +275,89 @@ test("image selection resolves only display data until full resolution is explic
 
   const full = await display.requestFull();
   assert.equal(full.url, "/resource/capture-1-resource/full");
-  assert.deepEqual(variants.map((entry) => entry.variant), ["display", "full"]);
+  assert.deepEqual(variants, [
+    {
+      itemId: "book-1",
+      artifactId: "capture-1",
+      id: "capture-1-resource",
+      variant: "display",
+    },
+    {
+      itemId: "book-1",
+      artifactId: "capture-1",
+      id: "capture-1-resource",
+      variant: "full",
+    },
+  ]);
   feature.destroy();
   assert.deepEqual(revoked.sort(), [
     "capture-1-resource:display",
     "capture-1-resource:full",
   ]);
+});
+
+
+test("engine-backed images page same-canvas annotations into the editor overlay", async () => {
+  const regionCalls = [];
+  const region = (id) => ({
+    key: { item_id: "book-1", annotation_id: id },
+    annotation_id: id,
+    object_type: "spatial-annotation",
+    revision: `${id}-r1`,
+    label: id,
+    selector: {
+      type: "polygon",
+      coordinate_space: "canvas-normalized",
+      coordinate_space_revision: "page-r1",
+      points: [
+        { x: 0.1, y: 0.1 },
+        { x: 0.3, y: 0.1 },
+        { x: 0.3, y: 0.3 },
+      ],
+    },
+  });
+  const { feature, published } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() { return { items: [raster("capture-1")] }; },
+      async get() {
+        return raster("capture-1", "captured-image", {
+          extensions: { corrections_ui: { paged_regions: true } },
+        });
+      },
+    },
+    resources: {
+      async resolveRaster() { return { url: "/safe/display.jpg" }; },
+      async listRegions({ representationId, canvasId, cursor, limit }) {
+        regionCalls.push({ representationId, canvasId, cursor, limit });
+        return cursor
+          ? { items: [region("region-2")], nextCursor: null }
+          : { items: [region("region-1")], nextCursor: "regions-2" };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select("artifact:capture-1");
+
+  assert.deepEqual(regionCalls, [
+    {
+      representationId: "scan-1",
+      canvasId: "page-1",
+      cursor: null,
+      limit: 200,
+    },
+    {
+      representationId: "scan-1",
+      canvasId: "page-1",
+      cursor: "regions-2",
+      limit: 200,
+    },
+  ]);
+  assert.deepEqual(
+    published.at(-1).regions.map((value) => value.annotation_id),
+    ["region-1", "region-2"],
+  );
 });
 
 
@@ -443,6 +522,7 @@ test("all #234 modules install through the browser LibraryToolCorrections namesp
   const context = vm.createContext({});
   for (const name of [
     "artifact-model.js",
+    "engine-adapter.js",
     "artifact-editors.js",
     "properties.js",
     "artifacts.js",
@@ -453,6 +533,7 @@ test("all #234 modules install through the browser LibraryToolCorrections namesp
   }
   const exported = context.LibraryToolCorrections;
   assert.equal(typeof exported.decodeArtifactSummary, "function");
+  assert.equal(typeof exported.createCorrectionsEnginePorts, "function");
   assert.equal(typeof exported.registerArtifactEditors, "function");
   assert.equal(typeof exported.createPropertiesInspector, "function");
   assert.equal(typeof exported.createArtifactsFeature, "function");

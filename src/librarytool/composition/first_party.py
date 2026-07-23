@@ -15,6 +15,10 @@ from ..engine.capabilities import (
     ModuleManifest,
     WorkbenchManifest,
 )
+from ..engine.raster_artifacts import (
+    CORRECTIONS_WORKBENCH_ID,
+    RASTER_ARTIFACTS_READ_CAPABILITY,
+)
 from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
@@ -25,9 +29,11 @@ from ..engine.runtime import (
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
     PROVIDER_DISCOVERY_SERVICE,
+    RASTER_ARTIFACT_QUERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
     SECRET_STORE_SERVICE,
+    SPATIAL_ANNOTATION_QUERY_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -35,6 +41,9 @@ from ..engine.runtime import (
     ModuleContribution,
     ServiceBinding,
     WorkbenchPolicyBinding,
+)
+from ..engine.spatial_annotations import (
+    SPATIAL_ANNOTATIONS_READ_CAPABILITY,
 )
 from ..engine.workbench_policies import (
     CatalogueCommandWorkbenchPolicy,
@@ -110,6 +119,15 @@ FIRST_PARTY_MODULE_MANIFESTS = (
             CapabilityRef("library.items.read"),
             CapabilityRef("library.representations"),
         ),
+    ),
+    ModuleManifest(
+        "library.corrections.artifacts",
+        "1.0.0",
+        provides=(
+            RASTER_ARTIFACTS_READ_CAPABILITY,
+            SPATIAL_ANNOTATIONS_READ_CAPABILITY,
+        ),
+        requires=(CapabilityRef("library.items.read"),),
     ),
     ModuleManifest(
         "library.text-layers",
@@ -211,6 +229,15 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             CapabilityRef("library.canvases.read"),
             CapabilityRef("library.canvases.prepare"),
         ),
+    ),
+    WorkbenchManifest(
+        CORRECTIONS_WORKBENCH_ID,
+        "1.0.0",
+        requires=(
+            RASTER_ARTIFACTS_READ_CAPABILITY,
+            SPATIAL_ANNOTATIONS_READ_CAPABILITY,
+        ),
+        enhances=(CapabilityRef("library.jobs"),),
     ),
 )
 
@@ -329,6 +356,27 @@ def first_party_module_contributions(
                         (CapabilityRef("library.canvases.prepare"),),
                     ),
                 ),
+            )
+        )
+
+    if graph.raster_artifacts is not None:
+        assert graph.spatial_annotations is not None
+        contributions.append(
+            ModuleContribution(
+                modules["library.corrections.artifacts"],
+                bindings=(
+                    ServiceBinding(
+                        RASTER_ARTIFACT_QUERY_SERVICE,
+                        graph.raster_artifacts,
+                        (RASTER_ARTIFACTS_READ_CAPABILITY,),
+                    ),
+                    ServiceBinding(
+                        SPATIAL_ANNOTATION_QUERY_SERVICE,
+                        graph.spatial_annotations,
+                        (SPATIAL_ANNOTATIONS_READ_CAPABILITY,),
+                    ),
+                ),
+                workbenches=(workbenches[CORRECTIONS_WORKBENCH_ID],),
             )
         )
 

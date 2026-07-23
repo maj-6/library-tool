@@ -98,11 +98,13 @@ from librarytool.adapters.windows.secret_store import (  # noqa: E402
     WindowsDpapiSecretStoreRepository,
 )
 from librarytool_http import (  # noqa: E402
+    create_corrections_blueprint,
     create_provider_discovery_blueprint,
     create_text_layer_blueprint,
 )
 from librarytool.composition.filesystem import (  # noqa: E402
     CatalogueBindings,
+    CorrectionsBindings,
     FilesystemEnginePaths,
     InterchangeBindings,
     ItemLifecycleBindings,
@@ -241,6 +243,14 @@ app.register_blueprint(
     create_provider_discovery_blueprint(lambda: _library_engine())
 )
 app.register_blueprint(create_text_layer_blueprint(lambda: _library_engine()))
+app.register_blueprint(
+    create_corrections_blueprint(
+        lambda: _library_engine(),
+        raster_resource_resolver_for_request=(
+            lambda: _ensure_engine_session().raster_resource_resolver
+        ),
+    )
+)
 # Jinja compiles index.html once and caches it when debug is off, while static/
 # is read from disk on every request. Editing the template therefore served a NEW
 # app.js against an OLD DOM until someone restarted the server -- and one missing
@@ -1852,6 +1862,10 @@ def corrections_workbench():
         ui_profile_v=_asset_v("corrections/ui-profile.js"),
         layout_controller_v=_asset_v("corrections/layout-controller.js"),
         artifact_model_v=_asset_v("corrections/artifact-model.js"),
+        corrections_engine_client_v=_asset_v("engine-client.js"),
+        corrections_engine_adapter_v=_asset_v(
+            "corrections/engine-adapter.js"
+        ),
         artifact_editors_v=_asset_v("corrections/artifact-editors.js"),
         corrections_properties_v=_asset_v("corrections/properties.js"),
         corrections_artifacts_v=_asset_v("corrections/artifacts.js"),
@@ -5215,6 +5229,39 @@ def _translation_item_exists(item_id: str) -> bool:
     return isinstance(builds, dict) and isinstance(builds.get(item_id), dict)
 
 
+def _corrections_capture_id(item_id: str) -> str | None:
+    """Return the live capture authority linked from one catalogue item."""
+
+    builds = lib.load_json(BUILDS_PATH, {})
+    build = builds.get(item_id) if isinstance(builds, dict) else None
+    if not isinstance(build, dict):
+        return None
+    capture_id = build.get("capture_id")
+    if capture_id in (None, ""):
+        return None
+    # The filesystem projector validates the persisted identity instead of
+    # accepting a sanitized alias. Keeping that validation at the repository
+    # boundary makes corrupt catalogue state observable rather than silently
+    # hiding its capture artifacts.
+    return capture_id
+
+
+def _corrections_representation_revision(
+    item_id: str,
+    representation_id: str,
+) -> str | None:
+    """Resolve a Mistral source against the live representation authority."""
+
+    builds = lib.load_json(BUILDS_PATH, {})
+    build = builds.get(item_id) if isinstance(builds, dict) else None
+    if not isinstance(build, dict):
+        return None
+    for representation in _engine_item_representations(item_id, dict(build)):
+        if representation["id"] == representation_id:
+            return str(representation["revision"])
+    return None
+
+
 @contextlib.contextmanager
 def _engine_workspace_locks(_item_id: str):
     """Bridge legacy writers into the workspace lease's lock order."""
@@ -5333,6 +5380,18 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             source_reference_for=lambda source: _translation_document_name(
                 source.layer_id
             ),
+        ),
+        corrections=CorrectionsBindings(
+            item_exists_for=_translation_item_exists,
+            capture_id_for=_corrections_capture_id,
+            capture_authority_root=CAPTURES_DIR,
+            capture_directory_for=lambda capture_id: (
+                CAPTURES_DIR / capture_id
+            ),
+            representation_revision_for=(
+                _corrections_representation_revision
+            ),
+            lock_context_for=lambda: _engine_workspace_locks(""),
         ),
         workspace_lock_context_for=_engine_workspace_locks,
         recovery_lock_context=_engine_recovery_locks,

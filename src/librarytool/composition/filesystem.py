@@ -28,6 +28,7 @@ from ..adapters.filesystem import (
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
+    FilesystemCorrectionsArtifactRepository,
     FilesystemInterchangeRepository,
     FilesystemItemCommandRepository,
     FilesystemItemLifecycleRepository,
@@ -94,9 +95,11 @@ from ..engine.runtime import (
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
     PROVIDER_DISCOVERY_SERVICE,
+    RASTER_ARTIFACT_QUERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
     SECRET_STORE_SERVICE,
+    SPATIAL_ANNOTATION_QUERY_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -107,6 +110,8 @@ from ..engine.runtime import (
     ServiceKey,
     ServiceRegistryError,
 )
+from ..engine.raster_artifacts import RasterArtifactProjectorPort
+from ..engine.spatial_annotations import SpatialAnnotationProjectorPort
 from ..engine.text_layer_aggregate import (
     TextLayerAggregateService,
     TextLayerSourceSnapshot,
@@ -160,6 +165,10 @@ CanvasMediaInspector = Callable[
     FilesystemCanvasInspection,
 ]
 CanvasIdAllocator = Callable[[frozenset[str]], str]
+CorrectionsItemMembership = Callable[[str], bool]
+CorrectionsCaptureIdentity = Callable[[str], str | None]
+CorrectionsCaptureDirectory = Callable[[str], Path]
+CorrectionsRepresentationRevision = Callable[[str, str], str | None]
 TextLayerItemMembership = Callable[[str], bool]
 TextLayerSourceSnapshotLoader = Callable[
     [str, str], TextLayerSourceSnapshot | None
@@ -380,6 +389,46 @@ class CanvasBindings:
 
 
 @dataclass(frozen=True, slots=True)
+class CorrectionsBindings:
+    """Read authority for capture and Mistral Corrections projections.
+
+    Capture files may live outside the engine write-set (the desktop stores
+    them beside ``output``). ``capture_authority_root`` explicitly confines
+    that borrowed read authority without moving the write-set or its recovery
+    journals. Entry artifacts remain confined by the common entries resolver.
+    """
+
+    item_exists_for: CorrectionsItemMembership
+    capture_id_for: CorrectionsCaptureIdentity
+    capture_directory_for: CorrectionsCaptureDirectory
+    capture_authority_root: Path
+    representation_revision_for: CorrectionsRepresentationRevision
+    lock_context_for: CatalogueLockFactory
+
+    def __post_init__(self) -> None:
+        capture_authority_root = Path(self.capture_authority_root)
+        if not capture_authority_root.is_absolute():
+            raise ValueError("capture_authority_root must be absolute")
+        object.__setattr__(
+            self,
+            "capture_authority_root",
+            capture_authority_root,
+        )
+        for callback, name in (
+            (self.item_exists_for, "item_exists_for"),
+            (self.capture_id_for, "capture_id_for"),
+            (self.capture_directory_for, "capture_directory_for"),
+            (
+                self.representation_revision_for,
+                "representation_revision_for",
+            ),
+            (self.lock_context_for, "lock_context_for"),
+        ):
+            if not callable(callback):
+                raise TypeError(f"{name} must be callable")
+
+
+@dataclass(frozen=True, slots=True)
 class TextLayerAggregateBindings:
     """Complete authority and persistence seams for native text layers.
 
@@ -594,11 +643,20 @@ class FilesystemServiceGraph:
     text_layer_aggregate: TextLayerAggregateService | None = None
     secret_store: SecretStoreService | None = None
     provider_discovery: ProviderDiscoveryService | None = None
+    raster_artifacts: RasterArtifactProjectorPort | None = None
+    spatial_annotations: SpatialAnnotationProjectorPort | None = None
 
     def __post_init__(self) -> None:
         if (self.canvas_query is None) != (self.canvas_preparation is None):
             raise ValueError(
                 "canvas query and preparation services must be installed together"
+            )
+        if (self.raster_artifacts is None) != (
+            self.spatial_annotations is None
+        ):
+            raise ValueError(
+                "raster artifact and spatial annotation projectors must be "
+                "installed together"
             )
         if self.secret_store is not None and not isinstance(
             self.secret_store,
@@ -629,6 +687,11 @@ class FilesystemServiceGraph:
             (TEXT_LAYER_AGGREGATE_SERVICE, self.text_layer_aggregate),
             (SECRET_STORE_SERVICE, self.secret_store),
             (PROVIDER_DISCOVERY_SERVICE, self.provider_discovery),
+            (RASTER_ARTIFACT_QUERY_SERVICE, self.raster_artifacts),
+            (
+                SPATIAL_ANNOTATION_QUERY_SERVICE,
+                self.spatial_annotations,
+            ),
             (TRANSLATION_SERVICE, self.translations),
             (
                 TRANSLATION_PROVENANCE_SERVICE,
@@ -657,6 +720,7 @@ def compose_filesystem_engine(
     translation: TranslationBindings,
     contribution_factory: ContributionFactory,
     canvases: CanvasBindings | None = None,
+    corrections: CorrectionsBindings | None = None,
     text_layer_aggregate: TextLayerAggregateBindings | None = None,
     secrets: SecretStoreBindings | None = None,
     providers: ProviderDiscoveryBindings | None = None,
@@ -673,6 +737,13 @@ def compose_filesystem_engine(
         raise TypeError("contribution_factory must be callable")
     if canvases is not None and not isinstance(canvases, CanvasBindings):
         raise TypeError("canvases must be a CanvasBindings bundle or None")
+    if corrections is not None and not isinstance(
+        corrections,
+        CorrectionsBindings,
+    ):
+        raise TypeError(
+            "corrections must be a CorrectionsBindings bundle or None"
+        )
     if text_layer_aggregate is not None and not isinstance(
         text_layer_aggregate,
         TextLayerAggregateBindings,
@@ -717,6 +788,21 @@ def compose_filesystem_engine(
         resources.write_set.root,
         entries_path,
     )
+
+    corrections_artifacts = None
+    if corrections is not None:
+        corrections_artifacts = FilesystemCorrectionsArtifactRepository(
+            resources.write_set,
+            item_exists=corrections.item_exists_for,
+            capture_id_for=corrections.capture_id_for,
+            entry_directory_for=entry_directory_for,
+            capture_directory_for=corrections.capture_directory_for,
+            capture_authority_root=corrections.capture_authority_root,
+            representation_revision_for=(
+                corrections.representation_revision_for
+            ),
+            lock_context_for=corrections.lock_context_for,
+        )
 
     canvas_query = None
     canvas_preparation = None
@@ -917,6 +1003,8 @@ def compose_filesystem_engine(
         text_layer_aggregate=native_text_layers,
         secret_store=secret_store,
         provider_discovery=(None if providers is None else providers.service),
+        raster_artifacts=corrections_artifacts,
+        spatial_annotations=corrections_artifacts,
     )
     try:
         contributions = tuple(contribution_factory(graph))
@@ -965,6 +1053,7 @@ def compose_filesystem_engine(
 __all__ = [
     "CanvasBindings",
     "CatalogueBindings",
+    "CorrectionsBindings",
     "FilesystemEnginePaths",
     "FilesystemEngineResources",
     "FilesystemServiceGraph",

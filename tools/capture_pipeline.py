@@ -25,10 +25,31 @@ the wrapper still performs image processing and skips OCR.
 from __future__ import annotations
 
 import base64
+import importlib
 import io
 import json
 import re
+import sys
 import urllib.request
+from pathlib import Path
+
+
+def _load_raster_processing():
+    try:
+        return importlib.import_module("librarytool.processing")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"librarytool", "librarytool.processing"}:
+            raise
+        # Keep ``python tools/capture_pipeline.py`` working from a source
+        # checkout, matching the explorer's direct-launch path setup.
+        source_root = Path(__file__).resolve().parents[1] / "src"
+        source_root_text = str(source_root)
+        if source_root_text not in sys.path:
+            sys.path.insert(0, source_root_text)
+        return importlib.import_module("librarytool.processing")
+
+
+_raster_processing = _load_raster_processing()
 
 MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 MISTRAL_CHAT_URL = "https://api.mistral.ai/v1/chat/completions"
@@ -47,83 +68,20 @@ FIELDS = ("title", "subtitle", "author", "volume", "edition",
 
 def _order_quad(pts):
     """Order 4 points as tl, tr, br, bl."""
-    import numpy as np
-    pts = np.asarray(pts, dtype="float32").reshape(4, 2)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
-    return np.array([pts[s.argmin()], pts[d.argmin()],
-                     pts[s.argmax()], pts[d.argmax()]], dtype="float32")
+    return _raster_processing.order_capture_quad(pts)
 
 
 def find_page_quad(img_bytes: bytes):
     """The page's 4-corner outline in full-res pixel coords, or None."""
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return None
-    arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return None
-    h, w = img.shape[:2]
-    scale = 1000.0 / max(h, w)
-    small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1 else img.copy()
-    sh, sw = small.shape[:2]
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_area = 0.0
-    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4 or not cv2.isContourConvex(approx):
-            continue
-        area = cv2.contourArea(approx)
-        if area > best_area:
-            best, best_area = approx, area
-    # demand a confident page: at least a quarter of the frame
-    if best is None or best_area < 0.25 * sh * sw:
-        return None
-    quad = _order_quad(best.reshape(4, 2))
-    # a page on a desk is much brighter inside the quad than outside; a
-    # decorative border box INSIDE a full-frame page is not — warping to that
-    # box would crop away real content, so require the contrast
-    mask = np.zeros((sh, sw), np.uint8)
-    cv2.fillPoly(mask, [quad.astype(np.int32)], 255)
-    gray2 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    inside = cv2.mean(gray2, mask=mask)[0]
-    outside_mask = cv2.bitwise_not(mask)
-    if cv2.countNonZero(outside_mask) > 0.02 * sh * sw:
-        outside = cv2.mean(gray2, mask=outside_mask)[0]
-        if inside - outside < 25:
-            return None
-    if scale < 1:
-        quad = quad / scale
-    return quad
+    return _raster_processing.find_capture_page_quad(img_bytes)
 
 
 def perspective_correct(img_bytes: bytes, quality: int = 92) -> bytes:
     """Warp the detected page flat; the original bytes when detection fails."""
-    quad = find_page_quad(img_bytes)
-    if quad is None:
-        return img_bytes
-    import cv2
-    import numpy as np
-    img = cv2.imdecode(np.frombuffer(img_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-    (tl, tr, br, bl) = quad
-    w = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-    h = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-    if w < 200 or h < 200:                     # degenerate quad — keep original
-        return img_bytes
-    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype="float32")
-    m = cv2.getPerspectiveTransform(quad, dst)
-    warped = cv2.warpPerspective(img, m, (w, h))
-    ok, out = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    return out.tobytes() if ok else img_bytes
+    return _raster_processing.apply_capture_perspective_compat(
+        img_bytes,
+        quality=quality,
+    )
 
 
 # --- 2. standard scale/compression ---------------------------------------------

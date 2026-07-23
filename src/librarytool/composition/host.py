@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, ContextManager
 
 from ..adapters.filesystem import (
+    FilesystemRasterResourceResolverPort,
     FilesystemJobHistoryRepository,
     RecoverableWriteSet,
     RecoveryResult,
@@ -31,7 +32,7 @@ from ..adapters.filesystem import (
 )
 from ..engine.errors import RepositoryError
 from ..engine.jobs import JobManager
-from ..engine.runtime import LibraryEngine
+from ..engine.runtime import RASTER_ARTIFACT_QUERY_SERVICE, LibraryEngine
 from ..engine.translations import TranslationProvenanceService
 from ._filesystem_paths import (
     resolve_workspace_path,
@@ -41,6 +42,7 @@ from .filesystem import (
     CanvasBindings,
     CatalogueBindings,
     ContributionFactory,
+    CorrectionsBindings,
     FilesystemEnginePaths,
     FilesystemEngineResources,
     InterchangeBindings,
@@ -151,6 +153,7 @@ class FilesystemHostBindings:
     jobs: JobHistoryBindings = field(default_factory=JobHistoryBindings)
     recovery_lock_context: RecoveryLockFactory = _null_recovery_lock
     canvases: CanvasBindings | None = None
+    corrections: CorrectionsBindings | None = None
     text_layer_aggregate: TextLayerAggregateBindings | None = None
     secrets: SecretStoreBindings | None = None
     providers: ProviderDiscoveryBindings | None = None
@@ -170,6 +173,11 @@ class FilesystemHostBindings:
             CanvasBindings,
         ):
             raise TypeError("canvases has an invalid binding bundle")
+        if self.corrections is not None and not isinstance(
+            self.corrections,
+            CorrectionsBindings,
+        ):
+            raise TypeError("corrections has an invalid binding bundle")
         if self.text_layer_aggregate is not None and not isinstance(
             self.text_layer_aggregate,
             TextLayerAggregateBindings,
@@ -285,6 +293,22 @@ class FilesystemEngineSession:
         with self._guard:
             self._require_open()
             return self._provenance
+
+    @property
+    def raster_resource_resolver(
+        self,
+    ) -> FilesystemRasterResourceResolverPort | None:
+        """Return the trusted resolver paired with the active raster projector."""
+
+        self._require_owner_process()
+        with self._guard:
+            self._require_open()
+            service = self._engine.get_service(
+                RASTER_ARTIFACT_QUERY_SERVICE
+            )
+            if isinstance(service, FilesystemRasterResourceResolverPort):
+                return service
+            return None
 
     def close(self) -> None:
         """Release bootstrap ownership without guessing worker policy."""
@@ -405,6 +429,7 @@ def open_filesystem_engine(
             translation=bindings.translation,
             contribution_factory=contribute_modules,
             canvases=bindings.canvases,
+            corrections=bindings.corrections,
             text_layer_aggregate=bindings.text_layer_aggregate,
             secrets=bindings.secrets,
             providers=bindings.providers,

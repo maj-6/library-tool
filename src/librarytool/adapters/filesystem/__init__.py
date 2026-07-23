@@ -14,6 +14,12 @@ from .canvas_preparation_repository import (
     FilesystemCanvasPreparationRepository,
 )
 from .canvas_query_repository import FilesystemCanvasQueryRepository
+from .correction_repository import FilesystemCorrectionRepository
+from .corrections_artifact_repository import (
+    FilesystemCorrectionsArtifactRepository,
+    FilesystemRasterResourceResolverPort,
+    ResolvedRasterResource,
+)
 from .job_history import FilesystemJobHistoryRepository
 from .item_command_repository import FilesystemItemCommandRepository
 from .item_lifecycle_repository import (
@@ -61,6 +67,9 @@ __all__ = [
     "FilesystemCanvasObservation",
     "FilesystemCanvasPreparationRepository",
     "FilesystemCanvasQueryRepository",
+    "FilesystemCorrectionRepository",
+    "FilesystemCorrectionsArtifactRepository",
+    "FilesystemRasterResourceResolverPort",
     "FilesystemItemCommandRepository",
     "FilesystemItemLifecycleRepository",
     "FilesystemItemLifecycleReservationRepository",
@@ -73,6 +82,7 @@ __all__ = [
     "FilesystemTranslationRepository",
     "FilesystemTextLayerAggregateRepository",
     "RecoverableWriteSet",
+    "ResolvedRasterResource",
     "RecoveryResult",
     "RecoveryRequiredError",
     "UnsafeTargetError",

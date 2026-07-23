@@ -1,0 +1,636 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import io
+import json
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+import libformat
+from librarytool.adapters.filesystem.corrections_artifact_repository import (
+    FilesystemCorrectionsArtifactRepository,
+    FilesystemRasterResourceResolverPort,
+)
+from librarytool.adapters.filesystem.recoverable_write_set import RecoverableWriteSet
+from librarytool.engine.errors import NotFoundError
+from librarytool.engine.raster_artifacts import (
+    RasterArtifactKey,
+    RasterArtifactProjectorPort,
+    ResourceState,
+)
+from librarytool.engine.spatial_annotations import (
+    SpatialAnnotationKey,
+    SpatialAnnotationProjectorPort,
+)
+
+
+ITEM_ID = "book-1"
+CAPTURE_ID = "capture-1"
+
+
+def _jpeg_bytes(color: tuple[int, int, int], size: tuple[int, int]) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size, color).save(output, format="JPEG")
+    return output.getvalue()
+
+
+def _png_bytes(color: tuple[int, int, int], size: tuple[int, int]) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size, color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _entry(root: Path, item_id: str = ITEM_ID) -> Path:
+    return root / "entries" / item_id
+
+
+def _capture(root: Path, capture_id: str = CAPTURE_ID) -> Path:
+    return root / "captures" / capture_id
+
+
+def _snapshot(*directories: Path) -> dict[str, tuple[bytes, int]]:
+    values: dict[str, tuple[bytes, int]] = {}
+    for directory in directories:
+        if not directory.exists():
+            continue
+        for candidate in directory.rglob("*"):
+            if candidate.is_file():
+                values[str(candidate)] = (
+                    candidate.read_bytes(),
+                    candidate.stat().st_mtime_ns,
+                )
+    return values
+
+
+def _repository(
+    root: Path,
+    *,
+    capture_ids: dict[str, str] | None = None,
+    representation_revisions: dict[tuple[str, str], str] | None = None,
+) -> FilesystemCorrectionsArtifactRepository:
+    captures = capture_ids if capture_ids is not None else {ITEM_ID: CAPTURE_ID}
+    revisions = (
+        representation_revisions
+        if representation_revisions is not None
+        else {(ITEM_ID, "primary"): "rep-primary-r1"}
+    )
+    write_set = RecoverableWriteSet(root)
+    # The workspace lease owns a process-level lock file. Prime that global
+    # resource before tests compare the managed capture/entry trees.
+    with write_set.workspace_lease():
+        pass
+
+    @contextmanager
+    def lock():
+        yield
+
+    return FilesystemCorrectionsArtifactRepository(
+        write_set,
+        item_exists=lambda item_id: item_id in {ITEM_ID, "book-2"},
+        capture_id_for=lambda item_id: captures.get(item_id),
+        entry_directory_for=lambda item_id: _entry(root, item_id),
+        capture_directory_for=lambda capture_id: _capture(root, capture_id),
+        representation_revision_for=lambda item_id, representation_id: revisions.get(
+            (item_id, representation_id)
+        ),
+        lock_context_for=lock,
+    )
+
+
+def _photo_manifest(
+    original: bytes,
+    display: bytes,
+    *,
+    role: dict | None = None,
+) -> dict:
+    return {
+        "schema": "org.whl.bookcapture.photo-assets",
+        "version": 1,
+        "capture_id": CAPTURE_ID,
+        "legacy_fallback": False,
+        "assets": [
+            {
+                "asset_id": "asset-1",
+                "capture_order": 1,
+                "capture_file": "photo_1.jpg",
+                "original": {
+                    "reference": "original_asset-1.jpg",
+                    "sha256": _digest(original),
+                    "revision": 3,
+                    "width": 2,
+                    "height": 2,
+                    "orientation": 90,
+                    "future": {"source": "camera"},
+                },
+                "display": {
+                    "reference": "photo_1.jpg",
+                    "sha256": _digest(display),
+                    "revision": 4,
+                    "width": 2,
+                    "height": 2,
+                    "orientation": 0,
+                    "recipe": "android-standardize",
+                    "recipe_version": "1",
+                },
+                "lifecycle": {"state": "completed"},
+                "role": role
+                or {
+                    "suggested": "title_page",
+                    "confidence": 0.8,
+                    "algorithm": "android-bibliographic-title-page",
+                    "algorithm_version": "1",
+                    "manual_override": "cover",
+                    "manual_revision": 2,
+                    "manual_updated_at": 1234,
+                },
+                "geometry": [],
+                "future": {"lens": "macro"},
+            }
+        ],
+        "selections": {
+            "primary_title": {"asset_id": "asset-1"},
+            "thumbnail": {"asset_id": "asset-1"},
+        },
+        "transport": {"representation": "original", "version": 1},
+        "desktop_import": {
+            "version": 1,
+            "assets": [
+                {
+                    "order": 0,
+                    "asset_id": "asset-1",
+                    "raw_ref": "orig_1.jpg",
+                    "display_ref": "photo_1.jpg",
+                    "source_checksum": _digest(original),
+                    "derivative_checksum": _digest(display),
+                    "transport_representation": "original",
+                    "recipe": "desktop_perspective_standardize_v1",
+                    "lifecycle": "completed",
+                }
+            ],
+        },
+    }
+
+
+def _write_photo_manifest(root: Path, manifest: dict) -> Path:
+    directory = _capture(root)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "photo_assets.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return path
+
+
+def _write_layout(root: Path, layout: dict) -> Path:
+    directory = _entry(root) / "ocr"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "layout.json"
+    path.write_text(json.dumps(layout, indent=2), encoding="utf-8")
+    return path
+
+
+def test_android_capture_projection_is_stable_safe_and_read_only(tmp_path):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((120, 20, 30), (17, 23))
+    display = _jpeg_bytes((20, 120, 30), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _photo_manifest(original, display)
+    path = _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+    before = _snapshot(directory, _entry(root))
+
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+
+    assert isinstance(repository, RasterArtifactProjectorPort)
+    assert isinstance(repository, SpatialAnnotationProjectorPort)
+    assert isinstance(repository, FilesystemRasterResourceResolverPort)
+    assert [artifact.key.artifact_id for artifact in artifacts] == [
+        "capture:asset-1:display",
+        "capture:asset-1:original",
+    ]
+    display_view, original_view = artifacts
+    assert display_view.kind == "processed-image"
+    assert display_view.media_type == "image/jpeg"
+    assert display_view.dimensions.as_dict() == {
+        "width": 19,
+        "height": 29,
+        "orientation": 1,
+    }
+    assert original_view.dimensions.as_dict() == {
+        "width": 17,
+        "height": 23,
+        "orientation": 6,
+    }
+    assert display_view.effective_category == "cover"
+    assert [value.origin.value for value in display_view.category_assignments] == [
+        "suggested",
+        "manual",
+    ]
+    assert display_view.lineage[0].artifact_id == original_view.key.artifact_id
+    assert display_view.extensions["android"]["future"]["lens"] == "macro"
+    assert original_view.extensions["rendition"]["future"]["source"] == "camera"
+    assert display_view.resource is not None
+    assert display_view.resource.resource_id.startswith("raster:")
+    assert str(root) not in json.dumps([value.as_dict() for value in artifacts])
+    resolved = repository.resolve_raster_resource(
+        ITEM_ID,
+        display_view.resource,
+    )
+    assert resolved is not None
+    assert resolved.stream.read() == display
+    resolved.stream.close()
+    assert resolved.media_type == "image/jpeg"
+    assert resolved.size == len(display)
+    assert resolved.content_sha256 == _digest(display)
+    assert _snapshot(directory, _entry(root)) == before
+
+    first_ids = [value.key.artifact_id for value in artifacts]
+    first_resources = [value.resource for value in artifacts]
+    changed = copy.deepcopy(manifest)
+    changed["assets"][0]["role"]["manual_override"] = "spine"
+    changed["assets"][0]["role"]["manual_revision"] = 3
+    path.write_text(json.dumps(changed, indent=2), encoding="utf-8")
+
+    after = repository.list_raster_artifacts(ITEM_ID)
+    assert [value.key.artifact_id for value in after] == first_ids
+    assert [value.resource for value in after] == first_resources
+    assert all(value.effective_category == "spine" for value in after)
+
+
+def test_capture_projection_supports_an_explicit_external_authority_root(
+    tmp_path,
+):
+    workspace = tmp_path / "workspace"
+    capture_root = tmp_path / "phone-captures"
+    directory = capture_root / CAPTURE_ID
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    (directory / "photo_assets.json").write_text(
+        json.dumps(_photo_manifest(original, display)),
+        encoding="utf-8",
+    )
+    write_set = RecoverableWriteSet(workspace)
+
+    @contextmanager
+    def lock():
+        yield
+
+    repository = FilesystemCorrectionsArtifactRepository(
+        write_set,
+        item_exists=lambda item_id: item_id == ITEM_ID,
+        capture_id_for=lambda _item_id: CAPTURE_ID,
+        entry_directory_for=lambda item_id: _entry(workspace, item_id),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _representation_id: None,
+        lock_context_for=lock,
+    )
+
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+
+    assert {value.key.artifact_id for value in artifacts} == {
+        "capture:asset-1:display",
+        "capture:asset-1:original",
+    }
+    assert all(value.resource_state is ResourceState.AVAILABLE for value in artifacts)
+
+
+def test_capture_resources_report_missing_private_and_stale_states(tmp_path):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((80, 40, 20), (11, 13))
+    display = _jpeg_bytes((20, 40, 80), (7, 9))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _photo_manifest(original, display)
+    _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    artifacts = {
+        value.key.artifact_id: value
+        for value in repository.list_raster_artifacts(ITEM_ID)
+    }
+    assert artifacts["capture:asset-1:original"].resource_state is ResourceState.MISSING
+    assert artifacts["capture:asset-1:original"].resource is None
+    assert artifacts["capture:asset-1:display"].resource_state is ResourceState.AVAILABLE
+
+    unsafe = copy.deepcopy(manifest)
+    unsafe["desktop_import"]["assets"][0]["raw_ref"] = "../private.jpg"
+    unsafe["desktop_import"]["assets"][0]["display_ref"] = "photo_1.jpg"
+    unsafe["desktop_import"]["assets"][0]["derivative_checksum"] = "ab" * 32
+    _write_photo_manifest(root, unsafe)
+    artifacts = {
+        value.key.artifact_id: value
+        for value in repository.list_raster_artifacts(ITEM_ID)
+    }
+    assert (
+        artifacts["capture:asset-1:original"].resource_state
+        is ResourceState.UNAVAILABLE
+    )
+    display_view = artifacts["capture:asset-1:display"]
+    assert display_view.resource_state is ResourceState.UNAVAILABLE
+    assert display_view.freshness.value == "stale"
+    assert display_view.resource is None
+
+
+def test_opaque_resolver_rejects_stale_and_cross_item_grants(tmp_path):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((10, 20, 30), (8, 10))
+    display = _jpeg_bytes((30, 20, 10), (9, 12))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    display_path = directory / "photo_1.jpg"
+    display_path.write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+    repository = _repository(root)
+    view = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, "capture:asset-1:display")
+    )
+    assert view is not None and view.resource is not None
+    resource = view.resource
+
+    assert repository.resolve_raster_resource("book-2", resource) is None
+
+    resolved = repository.resolve_raster_resource(ITEM_ID, resource)
+    assert resolved is not None
+    display_path.write_bytes(_jpeg_bytes((1, 2, 3), (9, 12)))
+    assert resolved.stream.read() == display
+    resolved.stream.close()
+    assert repository.resolve_raster_resource(ITEM_ID, resource) is None
+
+
+def _layout(figure_sha256: str) -> dict:
+    return {
+        "regions": {
+            "primary": {
+                "3": {
+                    "doc": "compiled.txt",
+                    "dims": {"w": 1000, "h": 2000, "dpi": 200},
+                    "origin": "machine",
+                    "items": [
+                        {
+                            "id": "r7",
+                            "rid": "stable-region-7",
+                            "role": "marginalia",
+                            "order": 4,
+                            "box": {"x": 0.1, "y": 0.2, "w": 0.2, "h": 0.1},
+                            "text": "A gloss ![plant](p3-fig.png)",
+                            "norm": "A gloss",
+                            "confidence": 0.75,
+                            "future": {"provider_block": "block-9"},
+                        },
+                        {
+                            # A read must not call ensure_rids or otherwise
+                            # treat this reorderable display id as identity.
+                            "id": "r8",
+                            "role": "body",
+                            "order": 5,
+                            "box": {"x": 0.3, "y": 0.4, "w": 0.4, "h": 0.2},
+                            "text": "Anonymous legacy region",
+                        },
+                    ],
+                }
+            }
+        },
+        "images": {
+            "p3-fig.png": {
+                "page": 3,
+                "src_key": "primary",
+                "x": 0.3,
+                "y": 0.4,
+                "w": 0.2,
+                "h": 0.1,
+                "sha256": figure_sha256,
+                "caption": "A medicinal plant",
+                "ext": {"future": {"palette": "green"}},
+            }
+        },
+        "future": {"provider": "mistral"},
+    }
+
+
+def test_mistral_regions_and_figure_crops_project_without_rewriting(tmp_path):
+    root = tmp_path / "library"
+    figure = _png_bytes((20, 130, 50), (41, 37))
+    image_dir = _entry(root) / "ocr" / "images"
+    image_dir.mkdir(parents=True)
+    figure_path = image_dir / "p3-fig.png"
+    figure_path.write_bytes(figure)
+    layout = _layout(_digest(figure))
+    layout_path = _write_layout(root, layout)
+    repository = _repository(root, capture_ids={})
+    before = _snapshot(_entry(root))
+
+    raster = repository.list_raster_artifacts(ITEM_ID)
+    spatial = repository.list_spatial_annotations(ITEM_ID)
+
+    assert [value.key.artifact_id for value in raster] == ["figure:p3-fig.png"]
+    figure_view = raster[0]
+    assert figure_view.kind == "extracted-figure"
+    assert figure_view.media_type == "image/png"
+    assert figure_view.content_sha256 == _digest(figure)
+    assert figure_view.dimensions.as_dict() == {
+        "width": 41,
+        "height": 37,
+        "orientation": 1,
+    }
+    assert figure_view.source.as_dict() == {
+        "representation_id": "primary",
+        "representation_revision": "rep-primary-r1",
+        "canvas_id": "page:3",
+        "canvas_revision": figure_view.source.canvas_revision,
+    }
+    assert figure_view.effective_caption is not None
+    assert figure_view.effective_caption.text == "A medicinal plant"
+    assert figure_view.extensions["extension_metadata"]["future"]["palette"] == "green"
+    assert figure_view.resource is not None
+    resolved = repository.resolve_raster_resource(ITEM_ID, figure_view.resource)
+    assert resolved is not None and resolved.stream.read() == figure
+    resolved.stream.close()
+
+    assert [value.key.annotation_id for value in spatial] == [
+        "figure-box:primary:3:p3-fig.png",
+        "region:stable-region-7",
+    ]
+    figure_box, region = spatial
+    assert figure_box.effective_role == "figure"
+    assert figure_box.linked_artifact_ids == ("figure:p3-fig.png",)
+    assert figure_box.selector.points[0].as_dict() == {"x": 0.3, "y": 0.4}
+    assert region.effective_role == "marginalia"
+    assert region.selector.points[-1].x == pytest.approx(0.1)
+    assert region.selector.points[-1].y == pytest.approx(0.3)
+    assert region.linked_artifact_ids == ("figure:p3-fig.png",)
+    assert region.extensions["legacy"]["future"]["provider_block"] == "block-9"
+    assert repository.get_spatial_annotation(region.key) == region
+    assert repository.list_spatial_annotations(
+        ITEM_ID,
+        representation_id="primary",
+        canvas_id="page:3",
+    ) == tuple(spatial)
+    assert _snapshot(_entry(root)) == before
+
+    first_ids = [value.key.annotation_id for value in spatial]
+    changed = copy.deepcopy(layout)
+    changed["regions"]["primary"]["3"]["items"][0]["text"] = "Corrected gloss"
+    layout_path.write_text(json.dumps(changed, indent=2), encoding="utf-8")
+    after = repository.list_spatial_annotations(ITEM_ID)
+    assert [value.key.annotation_id for value in after] == first_ids
+    assert next(
+        value for value in after if value.key == SpatialAnnotationKey(
+            ITEM_ID,
+            "region:stable-region-7",
+        )
+    ).revision != region.revision
+    persisted = json.loads(layout_path.read_text(encoding="utf-8"))
+    assert "rid" not in persisted["regions"]["primary"]["3"]["items"][1]
+
+
+def test_missing_figure_keeps_manifest_identity_and_safe_state(tmp_path):
+    root = tmp_path / "library"
+    expected_sha256 = "cd" * 32
+    _write_layout(root, _layout(expected_sha256))
+    repository = _repository(root, capture_ids={})
+
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+
+    assert len(artifacts) == 1
+    figure = artifacts[0]
+    assert figure.key.artifact_id == "figure:p3-fig.png"
+    assert figure.resource_state is ResourceState.MISSING
+    assert figure.resource is None
+    # The current layout retains the page dimensions and normalized crop, so
+    # the absent crop still has a truthful expected pixel extent.
+    assert figure.dimensions.as_dict() == {
+        "width": 200,
+        "height": 200,
+        "orientation": 1,
+    }
+    assert figure.content_sha256 == expected_sha256
+
+
+def test_region_rid_survives_canonical_save_reorder_and_page_move(
+    tmp_path,
+):
+    root = tmp_path / "library"
+    layout = _layout("ab" * 32)
+    page = layout["regions"]["primary"]["3"]
+    stable = copy.deepcopy(page["items"][0])
+    other = {
+        "id": "old-display-id",
+        "rid": "other-stable-region",
+        "role": "body",
+        "order": 0,
+        "box": {"x": 0.5, "y": 0.5, "w": 0.2, "h": 0.2},
+        "text": "Earlier reading-order region",
+    }
+    stable["order"] = 10
+    page["items"] = [stable]
+    path = _write_layout(root, layout)
+    repository = _repository(root, capture_ids={})
+
+    before = repository.list_spatial_annotations(ITEM_ID)
+    stable_before = next(
+        value
+        for value in before
+        if value.key.annotation_id
+        == "region:stable-region-7"
+    )
+
+    page["items"] = libformat.sanitize_page_items(
+        [stable, other],
+        src_type="human",
+    )
+    saved_stable = next(
+        value
+        for value in page["items"]
+        if value["rid"] == "stable-region-7"
+    )
+    assert saved_stable["id"] == "r1"
+    page["items"] = [
+        value
+        for value in page["items"]
+        if value["rid"] != "stable-region-7"
+    ]
+    layout["regions"]["primary"]["4"] = {
+        **page,
+        "items": [saved_stable],
+    }
+    path.write_text(json.dumps(layout, indent=2), encoding="utf-8")
+
+    after = repository.list_spatial_annotations(ITEM_ID)
+    stable_after = next(
+        value
+        for value in after
+        if value.key.annotation_id
+        == "region:stable-region-7"
+    )
+    assert stable_after.key == stable_before.key
+    assert stable_after.selector == stable_before.selector
+    assert stable_before.source.canvas_id == "page:3"
+    assert stable_after.source.canvas_id == "page:4"
+
+
+def test_pixel_legacy_rectangle_is_normalized_and_identity_is_persisted(tmp_path):
+    root = tmp_path / "library"
+    layout = {
+        "regions": {
+            "primary": {
+                "2": {
+                    "doc": "compiled.txt",
+                    "dims": {"w": 1000, "h": 2000},
+                    "origin": "machine",
+                    "items": [
+                        {
+                            "id": "r0",
+                            "rid": "pixel-region",
+                            "role": "figure",
+                            "box": {"x": 100, "y": 400, "w": 300, "h": 500},
+                            "text": "",
+                        }
+                    ],
+                }
+            }
+        },
+        "images": {},
+    }
+    _write_layout(root, layout)
+    repository = _repository(root, capture_ids={})
+
+    annotation = repository.list_spatial_annotations(ITEM_ID)[0]
+
+    assert annotation.key.annotation_id == "region:pixel-region"
+    assert [point.as_dict() for point in annotation.selector.points] == [
+        {"x": 0.1, "y": 0.2},
+        {"x": 0.4, "y": 0.2},
+        {"x": 0.4, "y": 0.45},
+        {"x": 0.1, "y": 0.45},
+    ]
+
+
+@pytest.mark.parametrize(
+    "method",
+    (
+        "list_raster_artifacts",
+        "list_spatial_annotations",
+    ),
+)
+def test_missing_item_is_an_explicit_engine_error(tmp_path, method):
+    root = tmp_path / "library"
+    repository = _repository(root)
+
+    with pytest.raises(NotFoundError) as caught:
+        getattr(repository, method)("missing")
+    assert getattr(caught.value, "code", "") == "item_not_found"

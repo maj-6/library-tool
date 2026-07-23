@@ -921,6 +921,8 @@
       async resolveRaster(detail, variant, selectionGeneration) {
         if (!detail.resourceRef) throw capabilityError("raster resource reference");
         const value = await this.resources.resolveRaster({
+          itemId: detail.itemId || this.context && this.context.itemId,
+          artifactId: detail.id,
           resourceRef: detail.resourceRef,
           variant,
           signal: this.selectionAbort && this.selectionAbort.signal,
@@ -942,6 +944,7 @@
         }
         if (detail.family === "image") {
           const display = await this.resolveRaster(detail, "display", selectionGeneration);
+          const regions = await this.imageRegions(detail, selectionGeneration);
           const resource = {
             id: detail.id,
             label: resourceLabel(detail),
@@ -953,7 +956,7 @@
             freshness: detail.freshness,
             correction: detail.correction,
             dimensions: detail.dimensions,
-            regions: detail.regions,
+            regions,
             coordinateSpace: detail.extensions &&
               (detail.extensions.coordinate_space ||
                 detail.extensions.coordinateSpace) || "",
@@ -992,6 +995,44 @@
           detail,
           summary: detail,
         });
+      }
+
+      async imageRegions(detail, selectionGeneration) {
+        const correctionsUi = detail.extensions &&
+          detail.extensions.corrections_ui || {};
+        const source = detail.source || {};
+        if (correctionsUi.paged_regions !== true || !source.canvasId ||
+            !this.resources || typeof this.resources.listRegions !== "function") {
+          return detail.regions;
+        }
+        const rows = [];
+        let cursor = null;
+        try {
+          for (let pageIndex = 0; pageIndex < MAX_REGION_PAGES; pageIndex += 1) {
+            const page = regionPage(await this.resources.listRegions({
+              context: this.context,
+              representationId: source.representationId,
+              canvasId: source.canvasId,
+              cursor,
+              limit: REGION_PAGE_LIMIT,
+              signal: this.selectionAbort && this.selectionAbort.signal,
+            }));
+            if (selectionGeneration !== this.selectionGeneration || this.destroyed) {
+              const error = new Error("Spatial annotation response is stale");
+              error.name = "AbortError";
+              throw error;
+            }
+            rows.push(...page.items);
+            const nextCursor = page.nextCursor === cursor ? null : page.nextCursor;
+            cursor = nextCursor;
+            if (!cursor || rows.length >= 512) break;
+          }
+          return Object.freeze(rows.slice(0, 512));
+        } catch (error) {
+          if (isAbort(error)) throw error;
+          this.onStatus("Image loaded without spatial annotations", true, error);
+          return detail.regions;
+        }
       }
 
       async openText(detail, selectionGeneration) {

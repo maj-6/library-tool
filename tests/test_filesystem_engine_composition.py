@@ -21,12 +21,14 @@ from librarytool.adapters.filesystem import (
     FilesystemCanvasEvidence,
     FilesystemCanvasInspection,
     FilesystemCanvasObservation,
+    FilesystemRasterResourceResolverPort,
     RecoverableWriteSet,
     RecoveryRequiredError,
 )
 from librarytool.composition.filesystem import (
     CanvasBindings,
     CatalogueBindings,
+    CorrectionsBindings,
     FilesystemEnginePaths,
     FilesystemEngineResources,
     InterchangeBindings,
@@ -88,9 +90,11 @@ from librarytool.engine.runtime import (
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
     PROVIDER_DISCOVERY_SERVICE,
+    RASTER_ARTIFACT_QUERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
     SECRET_STORE_SERVICE,
+    SPATIAL_ANNOTATION_QUERY_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -640,6 +644,7 @@ def _composition(
     lifecycle: ItemLifecycleBindings | None = None,
     item_command_policy=None,
     canvases: CanvasBindings | None = None,
+    corrections: CorrectionsBindings | None = None,
     text_layer_aggregate: TextLayerAggregateBindings | None = None,
     secrets: SecretStoreBindings | None = None,
     providers: ProviderDiscoveryBindings | None = None,
@@ -733,6 +738,7 @@ def _composition(
         ),
         contribution_factory=contribution_factory,
         canvases=canvases,
+        corrections=corrections,
         text_layer_aggregate=text_layer_aggregate,
         secrets=secrets,
         providers=providers,
@@ -870,6 +876,75 @@ def test_canvas_vertical_is_absent_by_default_and_never_half_advertised(tmp_path
         CANVAS_QUERY_SERVICE,
         CANVAS_PREPARATION_SERVICE,
     } & set(engine.services.keys)
+
+
+def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+    )["engine"]
+    document = engine.discovery_document()
+
+    assert engine.get_service(RASTER_ARTIFACT_QUERY_SERVICE) is None
+    assert engine.get_service(SPATIAL_ANNOTATION_QUERY_SERVICE) is None
+    assert "library.corrections.artifacts" not in {
+        row["id"] for row in document["modules"]
+    }
+    assert "corrections" not in {
+        row["id"] for row in document["workbenches"]
+    }
+    assert {
+        "library.raster-artifacts.read",
+        "library.spatial-annotations.read",
+    }.isdisjoint(row["id"] for row in document["capabilities"])
+
+
+def test_complete_corrections_bindings_install_one_projector_and_workbench(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda _item_id: None,
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+
+    raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    spatial = engine.require_service(SPATIAL_ANNOTATION_QUERY_SERVICE)
+    assert raster is spatial
+    assert isinstance(raster, FilesystemRasterResourceResolverPort)
+    assert raster.list_raster_artifacts("book-one") == ()
+    assert spatial.list_spatial_annotations("book-one") == ()
+
+    document = engine.discovery_document()
+    module = next(
+        row
+        for row in document["modules"]
+        if row["id"] == "library.corrections.artifacts"
+    )
+    assert module["status"] == "available"
+    assert module["provides"] == [
+        {"id": "library.raster-artifacts.read", "version": 1},
+        {"id": "library.spatial-annotations.read", "version": 1},
+    ]
+    workbench = next(
+        row
+        for row in document["workbenches"]
+        if row["id"] == "corrections"
+    )
+    assert workbench["visible"] is True
+    assert workbench["status"] == "available"
+    assert workbench["requires"] == module["provides"]
 
 
 def test_native_text_layer_vertical_is_absent_without_complete_bindings(

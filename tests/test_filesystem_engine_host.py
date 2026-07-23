@@ -21,6 +21,7 @@ from librarytool.adapters.filesystem import (
 )
 from librarytool.composition import (
     CatalogueBindings,
+    CorrectionsBindings,
     EngineSessionClosedError,
     EngineSessionForkedError,
     FilesystemEngineConfig,
@@ -53,7 +54,9 @@ from librarytool.engine.providers import (
 )
 from librarytool.engine.runtime import (
     PROVIDER_DISCOVERY_SERVICE,
+    RASTER_ARTIFACT_QUERY_SERVICE,
     SECRET_STORE_SERVICE,
+    SPATIAL_ANNOTATION_QUERY_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     ModuleContribution,
     ServiceBinding,
@@ -156,6 +159,7 @@ def _host_inputs(
     read_jobs=None,
     secrets: SecretStoreBindings | None = None,
     providers: ProviderDiscoveryBindings | None = None,
+    corrections: CorrectionsBindings | None = None,
 ):
     descriptors = _Descriptors()
     policies = cast(ReplicaPolicyPort, object())
@@ -234,6 +238,7 @@ def _host_inputs(
         recovery_lock_context=recovery_lock,
         secrets=secrets,
         providers=providers,
+        corrections=corrections,
     )
     return config, bindings, factory
 
@@ -319,6 +324,62 @@ def test_open_composes_one_headless_graph_and_close_is_explicit(tmp_path):
         contribute_modules=modules,
     )
     reopened.close()
+
+
+def test_host_exposes_only_the_active_corrections_resource_resolver(tmp_path):
+    capture_root = tmp_path / "captures"
+    corrections = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda _item_id: None,
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+    config, bindings, modules = _host_inputs(
+        tmp_path / "workspace",
+        corrections=corrections,
+    )
+
+    with open_filesystem_engine(
+        config=config,
+        bindings=bindings,
+        contribute_modules=modules,
+    ) as session:
+        raster = session.engine.require_service(
+            RASTER_ARTIFACT_QUERY_SERVICE
+        )
+        assert raster is session.engine.require_service(
+            SPATIAL_ANNOTATION_QUERY_SERVICE
+        )
+        assert session.raster_resource_resolver is raster
+        assert raster.list_raster_artifacts("book-one") == ()
+
+    with pytest.raises(EngineSessionClosedError):
+        _ = session.raster_resource_resolver
+
+
+def test_host_omits_and_validates_optional_corrections_bindings(tmp_path):
+    config, bindings, modules = _host_inputs(tmp_path / "workspace")
+
+    with open_filesystem_engine(
+        config=config,
+        bindings=bindings,
+        contribute_modules=modules,
+    ) as session:
+        assert session.raster_resource_resolver is None
+        assert (
+            session.engine.get_service(RASTER_ARTIFACT_QUERY_SERVICE) is None
+        )
+        assert (
+            session.engine.get_service(SPATIAL_ANNOTATION_QUERY_SERVICE)
+            is None
+        )
+
+    with pytest.raises(TypeError, match="corrections"):
+        replace(bindings, corrections=object())
 
 
 def test_native_text_layer_vertical_uses_only_host_owned_recovery(

@@ -128,6 +128,86 @@ function copyJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function artifactProvenance(overrides = {}) {
+  return {
+    origin: "capture",
+    provider_id: "",
+    model: "",
+    recipe_revision: "",
+    operation_id: "",
+    generated_at: "",
+    extensions: {},
+    ...overrides,
+  };
+}
+
+function rasterArtifact(overrides = {}) {
+  return {
+    key: { item_id: "book:one", artifact_id: "image:one" },
+    revision: "artifact-r1",
+    kind: "capture",
+    label: "Cover capture",
+    media_type: "image/png",
+    content_sha256: "a".repeat(64),
+    dimensions: { width: 1200, height: 1600, orientation: 1 },
+    source: {
+      representation_id: "capture:one",
+      representation_revision: "capture-r1",
+      canvas_id: "page:one",
+      canvas_revision: "canvas-r1",
+    },
+    resource_state: "available",
+    resource: {
+      id: "capture:image:one",
+      revision: "resource-r1",
+      variant: "display",
+    },
+    freshness: "current",
+    lineage: [],
+    category_assignments: [],
+    effective_category: "other",
+    caption_assertions: [],
+    effective_caption: null,
+    provenance: artifactProvenance(),
+    extensions: {},
+    ...overrides,
+  };
+}
+
+function spatialAnnotation(overrides = {}) {
+  return {
+    key: { item_id: "book:one", annotation_id: "region:one" },
+    revision: "annotation-r1",
+    source: {
+      representation_id: "capture:one",
+      representation_revision: "capture-r1",
+      canvas_id: "page:one",
+      canvas_revision: "canvas-r1",
+    },
+    selector: {
+      type: "polygon",
+      coordinate_space: "canvas-normalized",
+      coordinate_space_revision: "canvas-r1",
+      points: [
+        { x: 0.1, y: 0.1 },
+        { x: 0.9, y: 0.1 },
+        { x: 0.9, y: 0.9 },
+        { x: 0.1, y: 0.9 },
+      ],
+    },
+    order: 0,
+    label: "Illustration",
+    freshness: "current",
+    role_assignments: [],
+    effective_role: "",
+    caption_assertions: [],
+    linked_artifact_ids: ["image:one"],
+    provenance: artifactProvenance({ origin: "mistral" }),
+    extensions: {},
+    ...overrides,
+  };
+}
+
 test("EngineClient exposes the complete Replica compatibility surface", () => {
   const { client } = harness();
   assert.equal(typeof client.capabilities, "function");
@@ -149,6 +229,11 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.items.detachRepresentation, "function");
   assert.equal(typeof client.items.artifacts, "function");
   assert.equal(typeof client.items.readiness, "function");
+  assert.equal(typeof client.rasterArtifacts.list, "function");
+  assert.equal(typeof client.rasterArtifacts.get, "function");
+  assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
+  assert.equal(typeof client.spatialAnnotations.list, "function");
+  assert.equal(typeof client.spatialAnnotations.get, "function");
   assert.equal(typeof client.itemTombstones.list, "function");
   assert.equal(typeof client.itemTombstones.get, "function");
   assert.equal(typeof client.itemTombstones.restore, "function");
@@ -201,6 +286,115 @@ test("EngineClient exposes versioned capability discovery", async () => {
   assert.equal(result.schema, "librarytool.capabilities/1");
   assert.equal(calls[0].url, "/api/v1/capabilities");
   assert.equal(calls[0].init.method, "GET");
+});
+
+test("EngineClient validates versioned Corrections artifact reads", async () => {
+  const raster = rasterArtifact();
+  const annotation = spatialAnnotation();
+  const bodies = [
+    {
+      ok: true,
+      schema: "librarytool.raster-artifacts/1",
+      item_id: "book:one",
+      revision: "rac-r1",
+      artifacts: [raster],
+      next_cursor: "next-page",
+      total: 2,
+    },
+    {
+      ok: true,
+      schema: "librarytool.raster-artifact/1",
+      artifact: raster,
+    },
+    {
+      ok: true,
+      schema: "librarytool.spatial-annotations/1",
+      item_id: "book:one",
+      revision: "sac-r1",
+      annotations: [annotation],
+      next_cursor: null,
+      total: 1,
+    },
+    {
+      ok: true,
+      schema: "librarytool.spatial-annotation/1",
+      annotation,
+    },
+  ];
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, bodies.shift());
+    },
+  });
+
+  assert.equal((await client.rasterArtifacts.list({
+    itemId: "book:one",
+    representationId: "capture:one",
+    canvasId: "page:one",
+    limit: 1,
+  })).artifacts[0].key.artifact_id, "image:one");
+  assert.equal((await client.rasterArtifacts.get({
+    itemId: "book:one",
+    artifactId: "image:one",
+  })).artifact.revision, "artifact-r1");
+  assert.equal((await client.spatialAnnotations.list({
+    itemId: "book:one",
+    representationId: "capture:one",
+    canvasId: "page:one",
+    limit: 200,
+  })).annotations[0].key.annotation_id, "region:one");
+  assert.equal((await client.spatialAnnotations.get({
+    itemId: "book:one",
+    annotationId: "region:one",
+  })).annotation.revision, "annotation-r1");
+  assert.deepEqual(calls.map(({ url }) => url), [
+    "/api/v1/items/book%3Aone/raster-artifacts" +
+      "?representation_id=capture%3Aone&canvas_id=page%3Aone&limit=1",
+    "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone",
+    "/api/v1/items/book%3Aone/spatial-annotations" +
+      "?representation_id=capture%3Aone&canvas_id=page%3Aone&limit=200",
+    "/api/v1/items/book%3Aone/spatial-annotations/region%3Aone",
+  ]);
+  assert.equal(client.rasterArtifacts.resourceUrl({
+    itemId: "book:one",
+    artifactId: "image:one",
+    revision: "resource-r1",
+  }), "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/resource" +
+    "?revision=resource-r1");
+});
+
+test("EngineClient rejects malformed or path-leaking Corrections views", async () => {
+  const malformed = rasterArtifact({
+    extensions: { localPath: "C:/private/scan.png" },
+  });
+  const client = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifacts/1",
+      item_id: "book:one",
+      revision: "rac-r1",
+      artifacts: [malformed],
+      next_cursor: null,
+      total: 1,
+    }),
+  });
+  await assert.rejects(
+    client.rasterArtifacts.list({ itemId: "book:one" }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  assert.throws(() => client.rasterArtifacts.resourceUrl({
+    itemId: "book:one",
+    artifactId: "image:one",
+    revision: "bad revision",
+  }), TypeError);
+  assert.throws(() => client.spatialAnnotations.list({
+    itemId: "book:one",
+    limit: 513,
+  }), TypeError);
 });
 
 test("secret reads expose only versioned masked status", async () => {

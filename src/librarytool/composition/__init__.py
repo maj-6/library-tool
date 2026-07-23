@@ -3,6 +3,7 @@
 from .filesystem import (
     CanvasBindings,
     CatalogueBindings,
+    CorrectionsBindings,
     FilesystemEnginePaths,
     FilesystemEngineResources,
     FilesystemServiceGraph,
@@ -35,6 +36,7 @@ from .host import (
 __all__ = [
     "CanvasBindings",
     "CatalogueBindings",
+    "CorrectionsBindings",
     "FIRST_PARTY_MODULE_MANIFESTS",
     "FIRST_PARTY_WORKBENCH_MANIFESTS",
     "FilesystemEnginePaths",

@@ -112,6 +112,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.representation.commands": "1.0.0",
         "library.item-lifecycle.commands": "1.0.0",
         "library.canvases": "1.0.0",
+        "library.corrections.artifacts": "1.0.0",
         "library.text-layers": "1.0.0",
         "library.secrets": "1.0.0",
         "library.providers": "1.0.0",
@@ -158,6 +159,14 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.items.read", 1),
         ("library.representations", 1),
     }
+    corrections = modules["library.corrections.artifacts"]
+    assert _capabilities(corrections.provides) == {
+        ("library.raster-artifacts.read", 1),
+        ("library.spatial-annotations.read", 1),
+    }
+    assert _capabilities(corrections.requires) == {
+        ("library.items.read", 1),
+    }
     native_text_layers = modules["library.text-layers"]
     assert _capabilities(native_text_layers.provides) == {
         ("library.text-layers.read", 1),
@@ -199,7 +208,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     workbenches = {
         manifest.id: manifest for manifest in FIRST_PARTY_WORKBENCH_MANIFESTS
     }
-    assert set(workbenches) == {"catalog", "replica"}
+    assert set(workbenches) == {"catalog", "corrections", "replica"}
     assert _capabilities(workbenches["catalog"].requires) == {
         ("library.items", 1),
     }
@@ -228,6 +237,13 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.jobs", 1),
         ("library.canvases.read", 1),
         ("library.canvases.prepare", 1),
+    }
+    assert _capabilities(workbenches["corrections"].requires) == {
+        ("library.raster-artifacts.read", 1),
+        ("library.spatial-annotations.read", 1),
+    }
+    assert _capabilities(workbenches["corrections"].enhances) == {
+        ("library.jobs", 1),
     }
 
 
