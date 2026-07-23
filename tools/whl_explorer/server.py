@@ -66,6 +66,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tools"))
 import capture_pipeline as capture  # noqa: E402
+import capture_lib as capture_lib_compat  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
 import layout_roles  # noqa: E402
@@ -84,6 +85,12 @@ import whl_scrape  # noqa: E402
 from librarytool.adapters.lib_archive import (  # noqa: E402
     ExistingItemLibArchivePlanner,
     LibArchiveLimits,
+)
+from librarytool.adapters.capture_lib import (  # noqa: E402
+    Lib3CaptureArchiveMaterializer,
+)
+from librarytool.adapters.filesystem.capture_archive_repository import (  # noqa: E402
+    FilesystemCaptureArchiveRepository,
 )
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
@@ -130,6 +137,11 @@ from librarytool.engine.contracts import (  # noqa: E402
     RecompileRegionPagesCommand,
     ReplaceRegionPageCommand,
     ReviewRegionProposalCommand,
+)
+from librarytool.engine.capture_archives import (  # noqa: E402
+    CaptureArchiveAssociation,
+    CaptureArchiveService,
+    capture_book_id,
 )
 from librarytool.engine.errors import (  # noqa: E402
     ConflictError as EngineConflictError,
@@ -2079,6 +2091,26 @@ _BUILD_FIELDS = ("published_slug",
                  "title_pages", "thumbnail_source", "attention",
                  "images", "extra", "capture_id")
 
+_CAPTURE_ARCHIVE_BUILD_FIELDS = frozenset({
+    "title",
+    "subtitle",
+    "authors",
+    "year",
+    "publisher",
+    "publisher_city",
+    "edition",
+    "volume",
+    "language",
+    "pages",
+    "categories",
+    "category_ids",
+    "description",
+    "source_url",
+    "notes",
+    "images",
+    "extra",
+})
+
 _BUILD_REPRESENTATION_FIELDS = frozenset({
     "pdf_file", "pdf_sources", "representation_manifest",
 })
@@ -2238,6 +2270,7 @@ def api_builds_create():
 
 @app.route("/api/builds/<build_id>", methods=["PATCH"])
 def api_builds_update(build_id: str):
+    stale_capture_ids: set[str] = set()
     with _builds_lock:
         builds = lib.load_json(BUILDS_PATH, {})
         if build_id not in builds:
@@ -2258,6 +2291,7 @@ def api_builds_update(build_id: str):
             return jsonify({"ok": False,
                             "error": f"unknown rights value {payload['rights']!r}"}), 400
         b = builds[build_id]
+        before_capture_id = _clean_capture_id(b.get("capture_id"))
         # optimistic concurrency: an editor that loaded the record before
         # another writer touched it gets the current record back, not a merge
         expect = str(payload.get("expect_updated_at") or "")
@@ -2285,7 +2319,21 @@ def api_builds_update(build_id: str):
         if b.get("status") not in _BUILD_STATUSES:
             b["status"] = "draft"
         b["updated_at"] = _build_updated_at(b.get("updated_at"))
+        after_capture_id = _clean_capture_id(b.get("capture_id"))
+        if set(payload) & (
+            _CAPTURE_ARCHIVE_BUILD_FIELDS | {"capture_id"}
+        ):
+            stale_capture_ids.update(
+                capture_id
+                for capture_id in (before_capture_id, after_capture_id)
+                if capture_id
+            )
         lib.save_json(BUILDS_PATH, builds)
+    # Retrying the same canonical PATCH must also retry a stale transition that
+    # failed after the catalogue write. A no-op retry is therefore
+    # conservatively invalidating, while status-only PATCHes remain unrelated.
+    for stale_capture_id in sorted(stale_capture_ids):
+        _mark_capture_archive_stale(stale_capture_id)
     # only the status transition is worth a feed entry; every keystroke is not
     if b["status"] != was and b["status"] in ("ready", "uploaded"):
         activity("uploaded" if b["status"] == "uploaded" else "verified", "book",
@@ -7185,6 +7233,19 @@ def _lib_book_id(build_id: str) -> str:
     if isinstance(doc, dict) and re.fullmatch(
             r"b-[0-9a-f]{32}", str(doc.get("book_id") or "")):
         return str(doc["book_id"])
+    builds = lib.load_json(BUILDS_PATH, {}) or {}
+    build = builds.get(build_id) if isinstance(builds, dict) else None
+    capture_id = (
+        _clean_capture_id(build.get("capture_id"))
+        if isinstance(build, dict)
+        else ""
+    )
+    if capture_id:
+        # Promoting a manual capture changes its projection, not its logical
+        # identity. Capture associations use this same namespace-derived id;
+        # computing it here also avoids taking the workspace lease while the
+        # caller owns the Replica merge lock.
+        return capture_book_id(capture_id)
     return "b-" + uuid.uuid5(
         uuid.NAMESPACE_URL,
         f"https://librarytool.local/items/{build_id}").hex
@@ -12609,11 +12670,14 @@ def api_manual_update(entry_id: str):
     that don't alter the book's identity (title parsing migration, attaching
     a local scan PDF)."""
     payload = request.get_json(silent=True) or {}
+    stale_capture_id = ""
     with _manual_lock:
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         if entry_id not in entries:
             abort(404)
         e = entries[entry_id]
+        archive_fields = (*lib.MANUAL_ENTRY_FIELDS, "extra", "images",
+                          "category_ids")
         for f in lib.MANUAL_ENTRY_FIELDS:
             if f in payload:
                 e[f] = str(payload[f] or "").strip()
@@ -12635,7 +12699,13 @@ def api_manual_update(entry_id: str):
             e.pop("scans", None)
             e.pop("verify", None)
             e.pop("manual_urls", None)
+        if set(payload) & set(archive_fields):
+            stale_capture_id = _clean_capture_id(e.get("capture_id"))
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    # A retry with the already-persisted values still repairs a stale-state
+    # publication failure from the first request.
+    if stale_capture_id:
+        _mark_capture_archive_stale(stale_capture_id)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -19347,6 +19417,76 @@ def _capture_ingest_lock(capture_id: str) -> threading.Lock:
     return _CAPTURE_INGEST_LOCKS[index]
 
 
+def _capture_asset_directory(capture_id: str) -> Path:
+    """Create or verify one non-redirecting capture asset directory."""
+
+    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+    root_info = CAPTURES_DIR.lstat()
+    if not stat.S_ISDIR(root_info.st_mode) or CAPTURES_DIR.is_symlink():
+        raise ValueError("capture asset root is redirecting or invalid")
+    directory = CAPTURES_DIR / capture_id
+    if os.path.lexists(directory):
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or directory.is_symlink():
+            raise ValueError("capture asset directory is redirecting or invalid")
+    else:
+        directory.mkdir()
+    try:
+        directory.resolve(strict=True).relative_to(
+            CAPTURES_DIR.resolve(strict=True)
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError("capture asset directory escaped its authority") from exc
+    return directory
+
+
+def _capture_archive_service() -> CaptureArchiveService:
+    """Compose the capture association service over the process workspace."""
+
+    repository = FilesystemCaptureArchiveRepository(
+        _ensure_engine_session().write_set,
+        recover=False,
+    )
+    materializer = Lib3CaptureArchiveMaterializer(
+        libformat,
+        generator=f"library-tool/{_app_version()}",
+    )
+    return CaptureArchiveService(repository, materializer)
+
+
+def _capture_archive_association(
+        capture_id: str) -> CaptureArchiveAssociation | None:
+    """Load and verify the portable association, never a local archive path."""
+
+    return _capture_archive_service().get(capture_id)
+
+
+def _mark_capture_archive_stale(
+        capture_id: str) -> CaptureArchiveAssociation | None:
+    """Invalidate the sealed snapshot without treating it as the live store."""
+
+    normalized = _clean_capture_id(capture_id)
+    if not normalized:
+        return None
+    return _capture_archive_service().mark_stale(normalized)
+
+
+def _ensure_capture_archive(
+        capture_id: str, entry: Mapping) -> CaptureArchiveAssociation:
+    """Seal the durable capture snapshot before an import can report success."""
+
+    service = _capture_archive_service()
+    association = service.get(capture_id)
+    if association is not None:
+        return association
+    command = capture_lib_compat.build_capture_archive_command(
+        capture_id,
+        entry,
+        CAPTURES_DIR / capture_id,
+    )
+    return service.associate(command).receipt.association
+
+
 def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
                    photo_paths: list | None = None, *,
                    transport: str = "unknown"):
@@ -19381,6 +19521,7 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
             if isinstance(entry, dict) and entry.get("capture_id") == cap_id
         ), None)
     if duplicate is not None:
+        _ensure_capture_archive(cap_id, duplicate[1])
         if phone_review:
             entry_id, entry = duplicate
             target = {
@@ -19403,8 +19544,7 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
     # transport key cannot make an otherwise unprocessed capture look extracted.
     capture_notes = _capture_notes(cap)
 
-    cdir = CAPTURES_DIR / cap_id
-    cdir.mkdir(parents=True, exist_ok=True)
+    cdir = _capture_asset_directory(cap_id)
     if capture_notes:
         (cdir / "capture_notes.json").write_text(
             json.dumps(capture_notes, indent=2, ensure_ascii=False) + "\n",
@@ -19508,6 +19648,7 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
             lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
     if duplicate_entry is not None:
+        _ensure_capture_archive(cap_id, duplicate_entry)
         if phone_review:
             target = {
                 "kind": "row", "id": duplicate_id, "record": duplicate_entry,
@@ -19518,6 +19659,12 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
             _merge_phone_review_into_target(target, phone_review)
             _remember_pending_capture_review(phone_review)
         return None, None
+
+    # The manual row is intentionally the compatibility projection, while the
+    # archive association is the portable commit point.  A failure here leaves
+    # the remote capture pending; the durable row/assets make the next retry
+    # cheap, and the duplicate branch above completes the same association.
+    _ensure_capture_archive(cap_id, entry)
 
     # a phone capture is attributed to whoever photographed it (the signed-in
     # contributor), not to whoever ran the sync; device name is the fallback
@@ -19566,18 +19713,30 @@ def _cloud_capture_title(cap: dict) -> str:
     return f"Capture {capture_id[:8]}" if capture_id else "Phone capture"
 
 
-def _manual_capture_identity(capture_id: str) -> tuple[str, str]:
-    """Return the durable local entry id/title for one capture, if present."""
+def _manual_capture_record(
+        capture_id: str) -> tuple[str, str, dict | None]:
+    """Return the durable local entry identity and detached record."""
 
     with _manual_lock:
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
         for entry_id, entry in entries.items():
             if (isinstance(entry, dict) and
                     str(entry.get("capture_id") or "") == capture_id):
-                return str(entry_id), str(
-                    entry.get("title") or f"Capture {capture_id[:8]}"
-                )[:240]
-    return "", ""
+                return (
+                    str(entry_id),
+                    str(
+                        entry.get("title") or f"Capture {capture_id[:8]}"
+                    )[:240],
+                    copy.deepcopy(entry),
+                )
+    return "", "", None
+
+
+def _manual_capture_identity(capture_id: str) -> tuple[str, str]:
+    """Return the durable local entry id/title for one capture, if present."""
+
+    entry_id, title, _entry = _manual_capture_record(capture_id)
+    return entry_id, title
 
 
 def _import_capture(cfg: dict, cap: dict, mistral_key: str,
@@ -19596,12 +19755,14 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
             "warnings": [],
         }
     photo_paths = _cloud_capture_photo_paths(cap)
-    book_id, title = _manual_capture_identity(cap_id)
+    book_id, title, existing_entry = _manual_capture_record(cap_id)
     if book_id:
+        association = _ensure_capture_archive(cap_id, existing_entry or {})
         result = {
             "status": "skipped", "capture_id": cap_id, "book_id": book_id,
             "title": title, "message": "Already present on this desktop",
             "warnings": [],
+            "lib_association": association.as_dict(),
         }
         try:
             # Idempotently repair a lost acknowledgement from an earlier run.
@@ -19644,6 +19805,9 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
         ),
         "warnings": warnings,
     }
+    association = _capture_archive_association(cap_id)
+    if association is not None:
+        result["lib_association"] = association.as_dict()
     if new_id and on_persisted is not None:
         on_persisted(dict(result))
     try:
@@ -21554,16 +21718,31 @@ def _lan_capture():
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500
     capture_id = str(cap.get("id") or "")
+    association = _capture_archive_association(_clean_capture_id(capture_id))
+    portable = (
+        {"lib_association": association.as_dict()}
+        if association is not None
+        else {}
+    )
     if entry_id is None:
         # Idempotent retry. Echo the submitted capture id so Android can prove
         # that this receipt belongs to the entry it is about to move to sent/.
-        return jsonify(app="whl-capture", status="duplicate",
-                       id=capture_id), 200
+        return jsonify({
+            "app": "whl-capture",
+            "status": "duplicate",
+            "id": capture_id,
+            **portable,
+        }), 200
     # ``ingest_capture`` returns the desktop's generated manual-entry id, but
     # Android's delivery contract is keyed by the phone capture id. Echo that
     # submitted id in ``id`` and expose the local id separately for diagnostics.
-    return jsonify(app="whl-capture", status="imported", id=capture_id,
-                   entry_id=entry_id), 200
+    return jsonify({
+        "app": "whl-capture",
+        "status": "imported",
+        "id": capture_id,
+        "entry_id": entry_id,
+        **portable,
+    }), 200
 
 
 @app.get("/api/lan_info")

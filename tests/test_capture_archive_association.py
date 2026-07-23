@@ -710,6 +710,68 @@ def test_operation_and_source_revision_conflicts_fail_closed(tmp_path):
     assert reseal_error.value.code == "capture_archive_reseal_required"
 
 
+def test_stale_transition_is_idempotent_and_preserves_historical_replay(
+    tmp_path,
+):
+    service, _repository, materializer = _service(tmp_path)
+    command = AssociateCaptureArchiveCommand(
+        _source(),
+        "operation-import-1",
+    )
+    created = service.associate(command)
+
+    stale = service.mark_stale("capture-1")
+    repeated = service.mark_stale("capture-1")
+    replayed = service.associate(command)
+    duplicate = service.associate(
+        AssociateCaptureArchiveCommand(
+            command.source,
+            "operation-import-2",
+        )
+    )
+
+    assert stale is not None
+    assert stale.state is CaptureArchiveState.STALE
+    assert repeated == stale
+    assert service.get("capture-1") == stale
+    assert stale.archive_sha256 == created.receipt.association.archive_sha256
+    assert stale.book_id == created.receipt.association.book_id
+    assert replayed.replayed is True
+    assert replayed.receipt == created.receipt
+    assert duplicate.receipt.disposition is CaptureArchiveDisposition.EXISTING
+    assert duplicate.receipt.association == stale
+    assert materializer.calls == 2
+
+
+def test_failed_stale_transition_rolls_back_to_current(tmp_path):
+    armed = False
+
+    def fail(index: int, _path: Path) -> None:
+        if armed and index == 0:
+            raise RuntimeError("injected stale transition failure")
+
+    write_set = RecoverableWriteSet(tmp_path, publish_hook=fail)
+    service, _repository, _materializer = _service(
+        tmp_path,
+        write_set=write_set,
+        recover=False,
+    )
+    service.associate(
+        AssociateCaptureArchiveCommand(
+            _source(),
+            "operation-import-1",
+        )
+    )
+    armed = True
+
+    with pytest.raises(RepositoryError):
+        service.mark_stale("capture-1")
+
+    association = service.get("capture-1")
+    assert association is not None
+    assert association.state is CaptureArchiveState.CURRENT
+
+
 @pytest.mark.parametrize("failure_slot", [0, 1, 2])
 def test_ordinary_publication_failure_rolls_back_every_target(
     tmp_path,

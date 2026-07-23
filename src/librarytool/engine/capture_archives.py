@@ -951,6 +951,11 @@ class CaptureArchiveRepositoryPort(Protocol):
 
     def get(self, capture_id: str) -> CaptureArchiveAssociation | None: ...
 
+    def mark_stale(
+        self,
+        capture_id: str,
+    ) -> CaptureArchiveAssociation | None: ...
+
 
 class CaptureArchiveService:
     """Seal and atomically associate the first canonical archive for a capture."""
@@ -1051,6 +1056,35 @@ class CaptureArchiveService:
         ):
             raise RepositoryError(
                 "the capture archive repository returned another identity",
+                code="invalid_capture_archive_storage",
+            )
+        return association
+
+    def mark_stale(
+        self,
+        capture_id: str,
+    ) -> CaptureArchiveAssociation | None:
+        """Mark a sealed snapshot stale after a later canonical edit."""
+
+        normalized = _identifier(capture_id, "capture_id")
+        try:
+            association = self._repository.mark_stale(normalized)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the capture archive association could not be marked stale",
+                code="capture_archive_stale_transition_failed",
+                details={"cause": type(exc).__name__},
+                retryable=True,
+            ) from exc
+        if association is not None and (
+            association.capture_id != normalized
+            or association.book_id != capture_book_id(normalized)
+            or association.state is not CaptureArchiveState.STALE
+        ):
+            raise RepositoryError(
+                "the capture archive repository returned an invalid stale state",
                 code="invalid_capture_archive_storage",
             )
         return association
