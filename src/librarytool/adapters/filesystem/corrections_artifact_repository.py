@@ -527,15 +527,28 @@ def _open_authorized_descriptor(
             or not os.path.samestat(root_opened, authority.named_root)
         ):
             raise OSError("authority root identity changed")
-        for part in relative.parts[:-1]:
+        directory_parts = relative.parts[:-1]
+        if len(directory_parts) != len(authority.directories):
+            raise OSError("authority path snapshot is incomplete")
+        for part, directory in zip(
+            directory_parts,
+            authority.directories,
+            strict=True,
+        ):
+            if directory.named is None:
+                raise OSError("authority path component appeared during read")
             current = os.open(
                 part,
                 directory_flags,
                 dir_fd=current,
             )
             descriptors.append(current)
-            if not stat.S_ISDIR(os.fstat(current).st_mode):
-                raise OSError("authority path component is not a directory")
+            opened_directory = os.fstat(current)
+            if (
+                not stat.S_ISDIR(opened_directory.st_mode)
+                or not os.path.samestat(opened_directory, directory.named)
+            ):
+                raise OSError("authority path component identity changed")
         return os.open(
             relative.parts[-1],
             file_flags,
