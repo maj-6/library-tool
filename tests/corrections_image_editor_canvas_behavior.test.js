@@ -326,6 +326,7 @@ test("renderer exposes strict resource pins, safe raster URLs, and accessible nu
   assert.equal(byClass(container, "perspective-validation-status")[0]
     .getAttribute("aria-live"), "polite");
   assert.equal(controller.canvas.tabIndex, 0);
+  assert.equal(controller.canvas.dataset.classificationCanvas, "true");
   assert.match(controller.canvas.getAttribute("aria-label"), /four-corner/i);
   assert.ok(controller.canvas.drawCalls.some(([name]) => name === "fillText"));
   dispose();
@@ -545,6 +546,34 @@ test("Space gates modal, repeat, invalid pins, and an active pointer gesture", a
   assert.equal(calls.length, 0);
   valid.controller.canvas.emit("pointercancel", { pointerId: 8 });
   valid.dispose();
+});
+
+test("a mounted hidden command palette does not block perspective Space", async () => {
+  const calls = [];
+  const harness = renderHarness({
+    initialTool: TOOLS.PERSPECTIVE,
+    invokeCommand: async (...args) => {
+      calls.push(args);
+      return { job_id: "job-hidden-palette" };
+    },
+  });
+  const palette = new FakeNode("dialog", harness.documentRef);
+  palette.hidden = true;
+  palette.setAttribute("role", "dialog");
+  palette.setAttribute("aria-modal", "true");
+  harness.documentRef.querySelectorAll = () => [palette];
+  harness.controller.canvas.focus();
+
+  const event = harness.controller.surface.emit("keydown", {
+    key: " ",
+    code: "Space",
+    target: harness.controller.canvas,
+  });
+  await nextTurn();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(calls.length, 1);
+  harness.dispose();
 });
 
 

@@ -12,17 +12,21 @@
 
   function resourceFamily(resource) {
     if (!resource || resource.missing === true) return "missing";
+    const declaredFamily = String(resource.family || "").trim().toLowerCase();
+    if (RESOURCE_FAMILIES.has(declaredFamily)) return declaredFamily;
     const kind = String(resource.kind || resource.type || "").trim().toLowerCase();
     const mediaType = String(resource.media_type || resource.mediaType || "")
       .trim().toLowerCase();
     if (kind === "spatial-annotations" || kind === "spatial-annotation" ||
-        kind === "regions" || kind === "region-list" ||
-        Array.isArray(resource.annotations) || Array.isArray(resource.regions)) {
+        kind === "regions" || kind === "region-list") {
       return "regions";
     }
     if (mediaType.startsWith("image/") ||
         /(?:^|[-_])(image|raster|figure|illustration)(?:$|[-_])/.test(`-${kind}-`)) {
       return "image";
+    }
+    if (Array.isArray(resource.annotations) || Array.isArray(resource.regions)) {
+      return "regions";
     }
     if (mediaType === "application/json" || mediaType.endsWith("+json") ||
         ["metadata", "generated-metadata", "structured-metadata"].includes(kind)) {

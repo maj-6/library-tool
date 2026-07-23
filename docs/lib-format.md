@@ -1,9 +1,9 @@
-# The `.lib` book file — format spec and the `lib/2` revision plan
+# The `.lib` book file — format specification (`lib/1`, `lib/2`, and `lib/3`)
 
-Status: **design draft** (2026-07-17). The `.lib` exporter/importer ships on the
-`facsimile` branch as format `lib/1`; this document specifies the `lib/2`
-revision and the surrounding surface (Python API, docs, desktop integration).
-Implementation lands on/after the `facsimile` merge — `lib/1` code is the base.
+Status: **implemented through `lib/3.0`** (2026-07-22). The legacy Replica
+exporter deliberately remains `lib/2`; the Flask-free `libformat` core reads
+and writes capture-aware `lib/3`. `lib/1` and `lib/2` imports retain their
+existing semantics.
 
 Design goal, in one sentence: **a `.lib` file must carry everything an external
 tool — including an AI assistant with no prior knowledge of Library Tool —
@@ -184,11 +184,14 @@ doc.pages[7].items[0].norm = "…"
 libformat.write_lib(doc, "herbal-edited.lib")   # seals + validates
 
 libformat.ROLE_VOCAB      # role -> {furniture, note}
-libformat.FORMAT_VERSION  # "2.0"
+libformat.FORMAT_VERSION          # "2.0" (legacy Replica writer)
+libformat.CAPTURE_FORMAT_VERSION  # "3.0"
 ```
 
 - `read_lib`/`write_lib` own the zip layout, caps, and `INSTRUCTIONS.md`/
   `schema.json` generation.
+- A `LibDocument(format=(3, 0))` exposes `representations`,
+  `artifacts`, and `resources[member]` without any Flask dependency.
 - The `_rw_sanitize_*` functions move here from `server.py` (routes become thin
   wrappers) — one sanitizer, no drift between the API and the app.
 - Depends only on the standard library + `libcommon` + `layout_roles`; safe for
@@ -268,3 +271,241 @@ and colorize the illustrations."* The assistant:
 5. Desktop: fileAssociations + open-file flow + create-new-book-from-`.lib`.
 6. Website `api.html` + sample fixture; per-book instructions field in the
    Replica tab.
+
+## 8. `lib/3` — capture-aware representation and artifact graph (normative)
+
+`lib/2` remains the page/region interchange format. It cannot safely describe
+a capture-only book whose primary evidence is a set of phone photographs and
+derived artifacts. `lib/3.0` adds first-class `representations[]` and
+`artifacts[]` to `book.json` while retaining every `lib/2` page, figure,
+translation, template, role, and extension member.
+
+The archive layout is:
+
+```text
+book.lib
+├─ book.json
+├─ INSTRUCTIONS.md
+├─ schema.json
+├─ representations/<portable segments>   # immutable source/rendition bytes
+├─ artifacts/<portable segments>         # generated/extracted/review bytes
+├─ pages/<N>.json                         # optional legacy Replica pages
+├─ assets/img/<name>                      # optional legacy figures
+└─ translations/<bcp47>.json              # optional legacy translations
+```
+
+A capture-only book has `pages: []`. It is valid when it has at least one
+representation. An archive must not use an empty graph and an empty page list
+as a content-free shell.
+
+### 8.1 Representation record
+
+```json
+{
+  "id": "rep-capture-original",
+  "revision": "capture-r1",
+  "role": "capture-original",
+  "media_type": "image/jpeg",
+  "member": "representations/capture-original.jpg",
+  "content_sha256": "…64 lowercase hex characters…",
+  "dimensions": {
+    "width": 3024,
+    "height": 4032,
+    "orientation": 6
+  },
+  "lineage": [],
+  "ext": {}
+}
+```
+
+- `id` is stable, opaque identity; a filename, list position, or display label
+  is never identity.
+- `revision` pins the exact state being exported.
+- `role` distinguishes such states as `capture-original`,
+  `capture-display`, and `corrected-rendition`. It is extensible through the
+  portable identifier syntax.
+- `member` is the only portable resource address. It must be below
+  `representations/`, use portable path segments, exist exactly once in the
+  ZIP, and match `content_sha256`.
+- Raster media require positive pixel dimensions and EXIF orientation 1–8.
+- `lineage[]` contains `{representation_id, representation_revision,
+  relation}`. Every local target and target revision must exist in the sealed
+  archive. Corrections use relations such as `derived-from` or `rework-of`.
+
+Original representation members are immutable. A crop, perspective
+correction, binary adjustment, or other rendition is a new representation
+with new bytes, identity/revision, checksum, and revision-pinned lineage.
+
+### 8.2 Artifact record
+
+```json
+{
+  "id": "artifact-box-4",
+  "revision": "box-r5",
+  "kind": "spatial-annotation",
+  "media_type": "application/json",
+  "member": "artifacts/mistral-box-4.json",
+  "content_sha256": "…64 lowercase hex characters…",
+  "source": {
+    "representation_id": "rep-corrected",
+    "representation_revision": "capture-r4",
+    "canvas_id": "canvas-corrected",
+    "canvas_revision": "canvas-r3"
+  },
+  "provenance": {
+    "origin": "ocr",
+    "provider_id": "mistral",
+    "model": "mistral-ocr",
+    "generated_at": "2026-07-22T12:00:00Z",
+    "ext": {}
+  },
+  "category_assignments": [],
+  "caption_assertions": [],
+  "role_assignments": [],
+  "selector": {
+    "type": "polygon",
+    "coordinate_space": "canvas-normalized",
+    "coordinate_space_revision": "canvas-r3",
+    "points": [
+      {"x": 0.1, "y": 0.2},
+      {"x": 0.8, "y": 0.2},
+      {"x": 0.8, "y": 0.6},
+      {"x": 0.1, "y": 0.6}
+    ]
+  },
+  "relationships": [],
+  "ext": {}
+}
+```
+
+The four primary artifact classes required by Corrections are:
+
+1. `generated-metadata`;
+2. `ocr-text`;
+3. `spatial-annotation` (OCR/Mistral boxes and polygons);
+4. `raster-image` (captured, processed, corrected, extracted, or generated).
+
+The open `kind` vocabulary also carries reusable `transform-recipe` and
+`correction-review` artifacts. It may grow additively without changing the
+graph machinery.
+
+Every artifact has stable `id`/`revision`, one declared member and checksum,
+an exact source representation/revision, provenance, optional raster
+dimensions, bounded `ext`, and revision-pinned `relationships[]` of the form
+`{artifact_id, artifact_revision, relation}`. Relations such as
+`extracted-from`, `derived-from`, and `rework-of` preserve parent/rework
+history. A relationship may not point to itself or to a missing/mismatched
+local revision.
+
+A captured image is represented by two graph records without duplicating its
+bytes: the representation owns the immutable physical member, and a
+`raster-image` artifact over that same member owns category, caption, and
+other assertions. This is the only shared-member exception. The artifact must
+pin the owning representation's exact ID and revision and must have identical
+media type, checksum, and dimensions. Representation-to-representation
+sharing, artifact-only sharing, mismatched aliases, and case-only member
+aliases are invalid.
+
+A polygon selector uses normalized 0–1 coordinates. Its
+`coordinate_space_revision` must pin the source canvas revision when one is
+present, otherwise the source representation revision. Spatial-annotation
+artifacts require a selector. Legacy `{x,y,w,h}` page regions remain in their
+unchanged `pages/<N>.json` representation.
+
+### 8.3 Human and machine assertions
+
+Image categories use the separate canonical vocabulary:
+`title_page`, `cover`, `spine`, `content_specimen`, and `other`.
+`category_assignments[]` records category, origin (`manual`, `inherited`, or
+`suggested`), assertion revision, optional confidence/provenance, and the
+inherited source when applicable.
+
+`caption_assertions[]` retains machine, imported, inherited, and manual
+captions as separate revisioned evidence. A manual caption overrides the
+effective display value without deleting the machine caption. Clearing the
+manual assertion reveals retained evidence.
+
+`role_assignments[]` similarly retains machine/imported/manual spatial roles.
+The stored canonical values are `marginalia` and `figure`; `MAR` and `ILL` are
+UI aliases and never enter the archive as new roles.
+
+External tools must preserve all manual assertions and all machine evidence.
+Rerunning OCR may add new machine artifacts/assertions but must not overwrite
+human values.
+
+### 8.4 Review export policy and excluded runtime state
+
+`book.json.review_policy.mode` is one of:
+
+- `all-durable`: include active attention and resolved audit history;
+- `active-only`: include only active attention records;
+- `none`: include no `correction-review` artifacts.
+
+Resolved review history, when exported, is a normal revisioned artifact.
+Active job state, progress, cancellation tokens, credentials, resource grants,
+local paths, UI layout, shortcuts, window state, and remembered image-adjust
+brightness are never portable archive data.
+
+### 8.5 Extension and resource safety
+
+`lib/3` fails closed before accepting graph bytes:
+
+- no absolute paths, drive paths, backslashes, `.`/`..` segments, symbolic
+  links, duplicate members, case-insensitive aliases, encryption, or
+  undeclared members;
+- `book.json.pages` contains unique integer page numbers from 1 through 99999,
+  and it matches the physical `pages/<N>.json` members exactly;
+- representation members stay below `representations/`; artifact-owned
+  members stay below `artifacts/`. A byte-identical `raster-image` assertion
+  artifact may instead reference its source representation's exact
+  `representations/` member under the rules in §8.2;
+- each physical resource exists once, is bounded, and matches every permitted
+  declaration's SHA-256;
+- `book.json.pages` is a unique, bounded list of valid page numbers and must
+  exactly match the physical `pages/<N>.json` members;
+- the archive, member count, individual resources, and total declared
+  inflation are capped before decompression;
+- graph fields and nested `ext` data may not contain local paths, URLs,
+  filenames, storage keys/locators, opaque live resource references, or other
+  private locators;
+- non-finite JSON, duplicate object keys, invalid revisions/selectors, missing
+  relationship targets, and unbounded extension data are errors.
+- Required graph arrays and `ext` objects must be present even when empty.
+  Omission is distinct from an empty array/object, and `null` is never a
+  substitute. Optional structured fields such as `dimensions`, `selector`,
+  assertion provenance, and nested `ext` are validated whenever present.
+- Optional string fields are likewise validated whenever present. Empty
+  strings are accepted only where the schema explicitly uses
+  `optionalPortableId` or `optionalRevision` (and for unconstrained strings);
+  `null`, booleans, numbers, arrays, and objects are not omission.
+
+`LibError.code` and `LibError.details` provide a framework-neutral failure
+receipt. The engine archive planner exposes the equivalent typed
+`ValidationError` codes. Neither path needs Flask.
+
+### 8.6 Version and import behavior
+
+- Reading `lib/1` still produces version `(1, 0)` and the existing importer
+  assigns its compatibility book/region identities exactly as before.
+- Sealing a `lib/1` or `lib/2` `LibDocument` still writes `lib/2.0`.
+- No `lib/2` document is implicitly promoted to `lib/3`; attaching a capture
+  graph to an older document is an error. This prevents older readers from
+  silently dropping capture evidence.
+- A reader may inspect additive `3.x` manifests it understands, but this
+  `3.0` writer refuses to re-seal a higher minor as `3.0`; it will not erase
+  additions it cannot promise to preserve.
+- A `LibDocument(format=(3, 0))` reads/writes the complete graph through
+  `LibRepresentation`, `LibArtifact`, and `resources[member]`.
+- The current existing-item importer has no canonical raster/spatial
+  persistence adapter. It therefore rejects every non-empty `lib/3` graph,
+  including graph resource members that are undeclared by empty arrays, with
+  `lib3_capture_graph_import_unsupported` before applying pages or discarding
+  bytes. Other undeclared `lib/3` members fail with
+  `undeclared_lib3_member`. The Flask-free format core can still validate and
+  round-trip the archive. A future adapter must consume the exposed parsed
+  graph and replace this explicit refusal; it must not route the graph into a
+  browser-owned or legacy sidecar.
+
+`INSTRUCTIONS.md` generated for `lib/3` repeats these invariants for external
+tools: preserve originals, stable identities, provenance, source revisions,
+lineage, checksums, extension data, and human overrides.

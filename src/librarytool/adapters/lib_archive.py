@@ -3,7 +3,9 @@
 The planner is intentionally independent of Flask and filesystem layout.  The
 composition root supplies the format sanitizers and Replica policies while
 this adapter owns hostile-ZIP handling, merge decisions, and construction of
-the engine's immutable import plan.
+the engine's immutable import plan.  A non-empty lib/3 capture graph is
+rejected explicitly until a canonical representation/artifact import adapter
+can consume it; accepting and silently dropping that graph is forbidden.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import io
 import hashlib
 import json
 import re
+import stat
 import zipfile
 import zlib
 from collections.abc import Callable, Mapping
@@ -37,6 +40,27 @@ _TRANSLATION_MEMBER = re.compile(
     r"translations/([a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\.json"
 )
 _BOOK_ID = re.compile(r"b-[0-9a-f]{32}")
+_MAX_JSON_NESTING = 128
+
+
+def _safe_archive_member(name: object, *, directory: bool = False) -> bool:
+    if not isinstance(name, str) or not name or len(name) > 1024:
+        return False
+    if "\\" in name or "\x00" in name or name.startswith("/"):
+        return False
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        return False
+    if re.match(r"^[A-Za-z]:", name):
+        return False
+    candidate = name[:-1] if directory and name.endswith("/") else name
+    return bool(candidate) and all(
+        part not in ("", ".", "..") for part in candidate.split("/")
+    )
+
+
+def _is_symlink(info: zipfile.ZipInfo) -> bool:
+    mode = (int(info.external_attr) >> 16) & 0xFFFF
+    return bool(mode) and stat.S_ISLNK(mode)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -48,7 +72,37 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _json_nesting_exceeds(
+    payload: bytes,
+    maximum: int = _MAX_JSON_NESTING,
+) -> bool:
+    """Check structural JSON depth without counting delimiters inside strings."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == 0x5C:
+                escaped = True
+            elif value == 0x22:
+                in_string = False
+            continue
+        if value == 0x22:
+            in_string = True
+        elif value in (0x7B, 0x5B):
+            depth += 1
+            if depth > maximum:
+                return True
+        elif value in (0x7D, 0x5D):
+            depth -= 1
+    return False
+
+
 def _strict_json(payload: bytes) -> Any:
+    if _json_nesting_exceeds(payload):
+        raise ValueError("JSON nesting is too deep")
     try:
         text = payload.decode("utf-8")
         return json.loads(
@@ -58,7 +112,7 @@ def _strict_json(payload: bytes) -> Any:
                 ValueError(f"non-finite JSON number {value}")
             ),
         )
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError, RecursionError) as exc:
         raise ValueError("invalid strict JSON") from exc
 
 
@@ -157,6 +211,70 @@ class ExistingItemLibArchivePlanner:
                 "the .lib has no valid stable book_id",
                 code="invalid_lib_book_id",
             )
+        if fmt[0] >= 3:
+            self._validate_lib3_pages(book, decoded.members)
+            representations = book.get("representations")
+            artifacts = book.get("artifacts")
+            graph_members = [
+                name
+                for name in decoded.members
+                if (
+                    name.startswith("representations/")
+                    or name.startswith("artifacts/")
+                )
+            ]
+            graph_present = (
+                not isinstance(representations, list)
+                or not isinstance(artifacts, list)
+                or bool(representations)
+                or bool(artifacts)
+                or bool(graph_members)
+            )
+            if graph_present:
+                raise ValidationError(
+                    "capture-aware .lib/3 graphs require the canonical "
+                    "representation/artifact import adapter",
+                    code="lib3_capture_graph_import_unsupported",
+                    details={
+                        "format_version": f"{fmt[0]}.{fmt[1]}",
+                        "representations": (
+                            len(representations)
+                            if isinstance(representations, list)
+                            else None
+                        ),
+                        "artifacts": (
+                            len(artifacts)
+                            if isinstance(artifacts, list)
+                            else None
+                        ),
+                        "accepted": False,
+                        "data_discarded": False,
+                        "required_adapter": (
+                            "canonical-representation-artifact-import"
+                        ),
+                    },
+                )
+            known_members = {
+                "book.json",
+                "INSTRUCTIONS.md",
+                "schema.json",
+            }
+            undeclared_members = [
+                name
+                for name in decoded.members
+                if (
+                    name not in known_members
+                    and _PAGE_MEMBER.fullmatch(name) is None
+                    and _ASSET_MEMBER.fullmatch(name) is None
+                    and _TRANSLATION_MEMBER.fullmatch(name) is None
+                )
+            ]
+            if undeclared_members:
+                raise ValidationError(
+                    "the .lib/3 contains an undeclared archive member",
+                    code="undeclared_lib3_member",
+                    details={"member": sorted(undeclared_members)[0]},
+                )
 
         warnings: list[ImportWarning] = []
 
@@ -249,6 +367,103 @@ class ExistingItemLibArchivePlanner:
             warnings=tuple(warnings),
         )
 
+    def _validate_lib3_pages(
+        self,
+        book: Mapping[str, Any],
+        members: Mapping[str, bytes],
+    ) -> None:
+        """Require exact lib/3 page declaration/member parity.
+
+        The legacy page planner intentionally tolerates and reports several
+        lib/1 and lib/2 irregularities. lib/3 is sealed against its schema, so
+        applying that permissive path before checking ``book.pages`` could
+        silently import a different page set than the manifest declares.
+        """
+
+        issues: list[dict[str, str]] = []
+
+        def issue(location: str, message: str) -> None:
+            issues.append({
+                "level": "error",
+                "loc": location,
+                "msg": message,
+            })
+
+        raw_pages = book.get("pages")
+        declared_pages: set[int] = set()
+        if "pages" not in book:
+            issue("book.json/pages", "pages is required")
+        elif not isinstance(raw_pages, list):
+            issue("book.json/pages", "pages must be an array")
+        else:
+            if len(raw_pages) > self._limits.max_pages:
+                issue(
+                    "book.json/pages",
+                    f"more than {self._limits.max_pages} pages",
+                )
+            for index, page_number in enumerate(
+                raw_pages[: self._limits.max_pages + 1]
+            ):
+                location = f"book.json/pages[{index}]"
+                if (
+                    isinstance(page_number, bool)
+                    or not isinstance(page_number, int)
+                ):
+                    issue(location, "page number must be an integer")
+                    continue
+                if not 1 <= page_number <= 99999:
+                    issue(
+                        location,
+                        "page number must be between 1 and 99999",
+                    )
+                    continue
+                if page_number in declared_pages:
+                    issue(location, "page number is duplicated")
+                    continue
+                declared_pages.add(page_number)
+
+        physical_pages: dict[int, str] = {}
+        for name in members:
+            match = _PAGE_MEMBER.fullmatch(name)
+            if match is None:
+                if name.startswith("pages/"):
+                    issue(name, "page member name is invalid")
+                continue
+            page_number = int(match.group(1))
+            if not 1 <= page_number <= 99999:
+                issue(
+                    name,
+                    "page member number must be between 1 and 99999",
+                )
+                continue
+            previous = physical_pages.get(page_number)
+            if previous is not None:
+                issue(
+                    name,
+                    f"page member resolves to the same page as {previous}",
+                )
+                continue
+            physical_pages[page_number] = name
+
+        physical_page_numbers = set(physical_pages)
+        for page_number in sorted(declared_pages - physical_page_numbers):
+            issue(
+                f"pages/{page_number}.json",
+                "page is declared in book.json but its member is missing",
+            )
+        for page_number in sorted(physical_page_numbers - declared_pages):
+            issue(
+                physical_pages[page_number],
+                "page member is not declared in book.json/pages",
+            )
+
+        if issues:
+            raise ValidationError(
+                "invalid lib/3 page declarations",
+                code="invalid_lib3_graph",
+                details={"issues": issues},
+            )
+
     def _decode(self, archive: bytes) -> _DecodedArchive:
         limits = self._limits
         if len(archive) > limits.max_archive_bytes:
@@ -269,6 +484,22 @@ class ExistingItemLibArchivePlanner:
                         raise ValidationError(
                             f"duplicate archive member {info.filename!r}",
                             code="duplicate_lib_member",
+                        )
+                    if not _safe_archive_member(
+                        info.filename,
+                        directory=info.is_dir(),
+                    ):
+                        raise ValidationError(
+                            f"unsafe archive member {info.filename!r}",
+                            code="unsafe_lib_member",
+                            details={"member": info.filename},
+                        )
+                    if _is_symlink(info):
+                        raise ValidationError(
+                            f"symbolic-link archive member "
+                            f"{info.filename!r} is forbidden",
+                            code="unsafe_lib_member",
+                            details={"member": info.filename},
                         )
                     names.add(info.filename)
                     if info.filename == "book.json":

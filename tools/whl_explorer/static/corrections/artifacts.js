@@ -952,6 +952,11 @@
             resourceRef: detail.resourceRef,
             freshness: detail.freshness,
             correction: detail.correction,
+            dimensions: detail.dimensions,
+            regions: detail.regions,
+            coordinateSpace: detail.extensions &&
+              (detail.extensions.coordinate_space ||
+                detail.extensions.coordinateSpace) || "",
             summary: detail,
             requestFull: () => this.resolveRaster(
               detail, "full", this.selectionGeneration),

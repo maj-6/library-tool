@@ -103,6 +103,7 @@ class MiniNode {
   constructor(tagName, documentRef = null) {
     this.tagName = tagName.toUpperCase();
     this.ownerDocument = documentRef;
+    this.parentNode = null;
     this.children = [];
     this.attributes = new Map();
     this.listeners = new Map();
@@ -112,8 +113,28 @@ class MiniNode {
     this.className = "";
     this.value = "";
   }
-  append(...nodes) { this.children.push(...nodes); }
-  replaceChildren(...nodes) { this.children = nodes; }
+  append(...nodes) {
+    for (const node of nodes) {
+      node.parentNode = this;
+      this.children.push(node);
+    }
+  }
+  replaceChildren(...nodes) {
+    const active = this.ownerDocument && this.ownerDocument.activeElement;
+    if (active && this.contains(active)) {
+      active.emit("blur");
+      if (this.ownerDocument.activeElement === active) {
+        this.ownerDocument.activeElement = null;
+      }
+    }
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+    this.append(...nodes);
+  }
+  contains(node) {
+    if (node === this) return true;
+    return this.children.some((child) => child.contains(node));
+  }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) || null; }
   addEventListener(type, callback) {
@@ -134,11 +155,35 @@ class MiniNode {
     for (const listener of this.listeners.get(type) || []) listener(event);
     return event;
   }
+  focus() {
+    const active = this.ownerDocument && this.ownerDocument.activeElement;
+    if (active && active !== this) active.emit("blur");
+    if (this.ownerDocument) this.ownerDocument.activeElement = this;
+    this.emit("focus");
+  }
+  matches(selector) {
+    const attribute = selector.match(/^\[data-([a-z-]+)\]$/);
+    if (attribute) {
+      const name = attribute[1].replace(/-([a-z])/g,
+        (_match, letter) => letter.toUpperCase());
+      return Object.prototype.hasOwnProperty.call(this.dataset, name);
+    }
+    return this.tagName === selector.toUpperCase();
+  }
+  querySelectorAll(selector) {
+    const result = [];
+    for (const child of this.children) {
+      if (child.matches(selector)) result.push(child);
+      result.push(...child.querySelectorAll(selector));
+    }
+    return result;
+  }
 }
 
 
 function miniHarness() {
   const documentRef = {
+    activeElement: null,
     createElement(name) { return new MiniNode(name, documentRef); },
   };
   const count = new MiniNode("span", documentRef);
@@ -418,6 +463,113 @@ test("Books panel renders honest states, accessible chips, and keyboard-focusabl
     harness.filter.emit("keydown", { key: "Escape" });
     assert.equal(harness.filter.value, "");
     assert.equal(harness.list.children.length, 4);
+    controller.destroy();
+  });
+
+
+test("capture rerenders restore focused selection and blur reads the live selection",
+  async () => {
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const targets = [];
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      onSelectionTarget: (target, detail) => targets.push({ target, detail }),
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const captureButton = (artifactId) => descendants(harness.list, "button")
+      .find((button) => button.dataset.artifactId === artifactId);
+    const titleAddress = {
+      itemId: "book-herbarium",
+      representationId: "scan-herbarium",
+      canvasId: "canvas-title",
+      artifactId: "capture-title",
+      annotationId: null,
+    };
+    store.setSelection(titleAddress, { ownedByFeature: true });
+    const selectedTitle = captureButton("capture-title");
+    const nonselectedCover = captureButton("capture-cover");
+    nonselectedCover.focus();
+    nonselectedCover.emit("blur");
+    assert.equal(targets.at(-1).target.artifactId, "capture-title",
+      "blurring another capture must restore the live selected capture");
+    assert.equal(targets.at(-1).detail.element, selectedTitle);
+    assert.equal(targets.at(-1).detail.focused, false);
+
+    const original = nonselectedCover;
+    original.focus();
+    original.emit("click");
+    const replacement = captureButton("capture-cover");
+    assert.notEqual(replacement, original, "selection rerenders the capture row");
+    assert.equal(harness.documentRef.activeElement, replacement,
+      "the replacement for the selected capture recovers DOM focus");
+    assert.equal(replacement.getAttribute("aria-pressed"), "true");
+    assert.equal(replacement.dataset.itemId, "book-herbarium");
+    assert.equal(targets.at(-1).target.artifactId, "capture-cover");
+    assert.equal(targets.at(-1).detail.focused, true);
+
+    const legacyFocusCalls = [];
+    controller.restoreCaptureFocus({
+      querySelectorAll: () => [{
+        dataset: {
+          itemId: "book-herbarium",
+          artifactId: "capture-title",
+        },
+        focus(options) {
+          legacyFocusCalls.push(options);
+          if (options) throw new TypeError("focus options unsupported");
+        },
+      }],
+    }, titleAddress);
+    assert.equal(legacyFocusCalls.length, 2);
+    assert.equal(legacyFocusCalls[1], undefined,
+      "focus restoration falls back for browsers without focus options");
+    controller.destroy();
+  });
+
+
+test("Books rerenders preserve a still-present focused nonselected capture",
+  async () => {
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const targets = [];
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      onSelectionTarget: (target, detail) => targets.push({ target, detail }),
+    }).mount();
+    await store.openWorkspace("workspace-1");
+    store.setSelection({
+      itemId: "book-herbarium",
+      representationId: "scan-herbarium",
+      canvasId: "canvas-title",
+      artifactId: "capture-title",
+      annotationId: null,
+    }, { ownedByFeature: true });
+
+    const captureButton = (artifactId) => descendants(harness.list, "button")
+      .find((button) => button.dataset.artifactId === artifactId);
+    const original = captureButton("capture-cover");
+    original.focus();
+    assert.equal(original.getAttribute("aria-pressed"), "false");
+
+    controller.render(store.snapshot());
+    const replacement = captureButton("capture-cover");
+    assert.notEqual(replacement, original);
+    assert.equal(harness.documentRef.activeElement, replacement);
+    assert.equal(replacement.getAttribute("aria-pressed"), "false");
+    assert.equal(store.snapshot().selection.artifactId, "capture-title",
+      "restoring focus must not change the selected capture");
+    assert.equal(targets.at(-1).target.artifactId, "capture-cover");
+    assert.equal(targets.at(-1).detail.focused, true);
     controller.destroy();
   });
 

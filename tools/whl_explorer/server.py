@@ -1842,6 +1842,12 @@ def corrections_workbench():
         corrections_image_editor_css_v=_asset_v(
             "corrections/image-editor.css"
         ),
+        corrections_classification_css_v=_asset_v(
+            "corrections/classification.css"
+        ),
+        corrections_image_adjust_css_v=_asset_v(
+            "corrections/image-adjust-tool.css"
+        ),
         editor_registry_v=_asset_v("corrections/editor-registry.js"),
         ui_profile_v=_asset_v("corrections/ui-profile.js"),
         layout_controller_v=_asset_v("corrections/layout-controller.js"),
@@ -1851,7 +1857,18 @@ def corrections_workbench():
         corrections_artifacts_v=_asset_v("corrections/artifacts.js"),
         corrections_books_v=_asset_v("corrections/books.js"),
         corrections_reviews_v=_asset_v("corrections/reviews.js"),
+        corrections_commands_v=_asset_v("corrections/commands.js"),
+        corrections_keymap_v=_asset_v("corrections/keymap.js"),
+        corrections_artifact_overlay_v=_asset_v(
+            "corrections/artifact-overlay.js"
+        ),
+        corrections_classification_controls_v=_asset_v(
+            "corrections/classification-controls.js"
+        ),
         image_editor_state_v=_asset_v("corrections/image-editor-state.js"),
+        corrections_image_adjust_v=_asset_v(
+            "corrections/image-adjust-tool.js"
+        ),
         corrections_image_editor_v=_asset_v("corrections/image-editor.js"),
         corrections_shell_v=_asset_v("corrections/shell.js"),
     )

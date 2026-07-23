@@ -5,7 +5,12 @@
     ...require("./layout-controller"),
     ...require("./reviews"),
     ...require("./artifacts"),
+    ...require("./commands"),
+    ...require("./keymap"),
+    ...require("./artifact-overlay"),
+    ...require("./classification-controls"),
     ...require("./image-editor"),
+    ...require("./image-adjust-tool"),
   } : root.LibraryToolCorrections;
   const api = factory(dependencies);
   if (typeof module === "object" && module.exports) module.exports = api;
@@ -269,6 +274,57 @@
     if (node) node.textContent = String(value);
   }
 
+  function normalizeClassificationProfile(value) {
+    const source = isPlainObject(value) && isPlainObject(value.bindings)
+      ? value.bindings : {};
+    const bindings = {};
+    const occupied = new Set();
+    const definitions = Array.isArray(deps.DEFAULT_CLASSIFICATION_COMMANDS)
+      ? deps.DEFAULT_CLASSIFICATION_COMMANDS : [];
+    for (const command of definitions) {
+      const supplied = Object.prototype.hasOwnProperty.call(source, command.id)
+        ? source[command.id] : command.defaultBinding;
+      let binding = "";
+      try {
+        binding = typeof deps.normalizeKeyBinding === "function"
+          ? deps.normalizeKeyBinding(supplied) : "";
+      } catch (error) {
+        binding = command.defaultBinding || "";
+      }
+      if (binding && occupied.has(binding)) binding = "";
+      if (binding) occupied.add(binding);
+      bindings[command.id] = binding;
+    }
+    return { bindings };
+  }
+
+  function classificationProfile(controller) {
+    if (!controller || !controller.registry ||
+        typeof controller.registry.bindingFor !== "function") {
+      return normalizeClassificationProfile(null);
+    }
+    const bindings = {};
+    for (const command of deps.DEFAULT_CLASSIFICATION_COMMANDS || []) {
+      bindings[command.id] = controller.registry.bindingFor(command.id);
+    }
+    return normalizeClassificationProfile({ bindings });
+  }
+
+  function targetKey(value) {
+    if (!value || typeof value !== "object") return "";
+    const key = String(value.key || "");
+    if (key.includes(":")) return key;
+    const objectType = String(
+      value.objectType || value.object_type || value.type || "").toLowerCase();
+    const id = value.annotationId || value.annotation_id ||
+      value.artifactId || value.artifact_id || value.id || "";
+    if (!id) return "";
+    return objectType.includes("annotation") ||
+        ["region", "mistral-box", "spatial-annotation"].includes(
+          String(value.kind || "").toLowerCase())
+      ? `annotation:${id}` : `artifact:${id}`;
+  }
+
   function nextTrayTab(current, key) {
     const currentIndex = TRAY_TABS.indexOf(current);
     if (currentIndex < 0) return null;
@@ -300,6 +356,9 @@
       this.contextGeneration = 0;
       this.featureContextGeneration = 0;
       this.unsubscribeContext = null;
+      this.unsubscribeTransformResults = null;
+      this.unsubscribeClassificationBindings = null;
+      this.restoringProfile = false;
       this.destroyed = false;
       this.activeTrayTab = "reviews";
       const desktopCorrections = this.desktop && this.desktop.corrections || null;
@@ -311,18 +370,82 @@
         : desktopCorrections && typeof desktopCorrections.invokeCommand === "function"
           ? desktopCorrections.invokeCommand.bind(desktopCorrections)
           : null;
+      const imageAdjustOptions = isPlainObject(options.imageAdjustOptions)
+        ? options.imageAdjustOptions : {};
+      this.imageAdjustTool = options.imageAdjustTool ||
+        typeof deps.createImageAdjustTool === "function" &&
+          deps.createImageAdjustTool({
+            ...imageAdjustOptions,
+            profile: null,
+            onProfileChange: (value, detail) => {
+              if (typeof imageAdjustOptions.onProfileChange === "function") {
+                imageAdjustOptions.onProfileChange(value, detail);
+              }
+              this.persistProfile();
+            },
+            onOcrOutcome: (outcome, detail) => {
+              if (typeof imageAdjustOptions.onOcrOutcome === "function") {
+                imageAdjustOptions.onOcrOutcome(outcome, detail);
+              }
+              const state = outcome && outcome.state;
+              this.setStatus(
+                state === "failed"
+                  ? "Image applied; OCR follow-up failed"
+                  : state === "cancelled"
+                    ? "Image applied; OCR follow-up cancelled"
+                    : "Image applied; OCR follow-up completed",
+                state === "failed",
+              );
+            },
+          });
+      this.subscribeTransformResults =
+        typeof options.subscribeTransformResults === "function"
+          ? options.subscribeTransformResults
+          : desktopCorrections && desktopCorrections.transforms &&
+              typeof desktopCorrections.transforms.subscribeResults === "function"
+            ? desktopCorrections.transforms.subscribeResults.bind(
+              desktopCorrections.transforms)
+            : null;
+      let imageRendererOptions = {
+        invokeCommand,
+        initialTool: deps.TOOLS && deps.TOOLS.PERSPECTIVE,
+        hasSelection: () => Boolean(
+          this.state.selection.artifactId || this.state.selection.annotationId),
+        clearSelection: () => this.clearResourceSelection(),
+        onCommandError: (error) => this.setStatus(
+          error && error.message || "The transform could not be queued", true),
+        onQueueResult: (_result, command) => this.setStatus(
+          command && command.adjustment
+            ? "Image adjustment queued"
+            : "Perspective transform queued"),
+        onStateChange: (state) => {
+          if (!this.classificationController ||
+              typeof this.classificationController.setCanvasOwner !== "function") {
+            return;
+          }
+          this.classificationController.setCanvasOwner(
+            state && state.gesture
+              ? {
+                active: true,
+                tool: state.tool,
+                ownsKeyboard: true,
+              }
+              : null,
+          );
+        },
+        onMount: (controller, resource) =>
+          this.mountArtifactOverlay(controller, resource),
+      };
+      if (this.imageAdjustTool &&
+          typeof deps.composeImageAdjustRendererOptions === "function") {
+        imageRendererOptions = deps.composeImageAdjustRendererOptions(
+          this.imageAdjustTool,
+          imageRendererOptions,
+        );
+      }
       const imageOverlayRenderer = options.imageOverlayRenderer ||
         typeof deps.createPerspectiveImageRenderer === "function" &&
-          deps.createPerspectiveImageRenderer({
-            invokeCommand,
-            initialTool: deps.TOOLS && deps.TOOLS.PERSPECTIVE,
-            hasSelection: () => Boolean(
-              this.state.selection.artifactId || this.state.selection.annotationId),
-            clearSelection: () => this.clearResourceSelection(),
-            onCommandError: (error) => this.setStatus(
-              error && error.message || "The transform could not be queued", true),
-            onQueueResult: () => this.setStatus("Perspective transform queued"),
-          });
+          deps.createPerspectiveImageRenderer(imageRendererOptions);
       this.editorRegistry = options.editorRegistry || deps.createDefaultEditorRegistry({
         documentRef: this.documentRef,
         imageOverlayRenderer,
@@ -338,8 +461,20 @@
         storage: options.storage || safeStorage(this.windowRef),
         normalizeLayout: deps.normalizeLayoutState,
         normalizeEditors: (value) => this.editorRegistry.validateChoices(value),
+        normalizeTools: (value) => ({
+          imageAdjust: typeof deps.normalizeImageAdjustProfile === "function"
+            ? deps.normalizeImageAdjustProfile(
+              isPlainObject(value) ? value.imageAdjust : null)
+            : {},
+          classification: normalizeClassificationProfile(
+            isPlainObject(value) ? value.classification : null),
+        }),
       });
       const profile = this.profileStore.load(this.profileKey);
+      if (this.imageAdjustTool &&
+          typeof this.imageAdjustTool.restoreProfile === "function") {
+        this.imageAdjustTool.restoreProfile(profile.tools && profile.tools.imageAdjust);
+      }
       this.editorRegistry.restoreChoices(profile.editors);
       this.layout = options.layoutController || new deps.LayoutController({
         root: this.root,
@@ -348,10 +483,178 @@
         initialState: profile.layout,
         onChange: () => this.persistProfile(),
       });
+      this.classificationController = options.classificationController === false
+        ? null
+        : options.classificationController ||
+          this.createClassificationFeature(options, profile);
+      this.classificationControls = null;
+      if (this.classificationController &&
+          this.classificationController.registry &&
+          typeof this.classificationController.registry.subscribe === "function") {
+        this.unsubscribeClassificationBindings =
+          this.classificationController.registry.subscribe((change) => {
+            if (!this.restoringProfile && change.type === "remapped") {
+              this.persistProfile();
+            }
+          });
+      }
+      this.restoreClassificationProfile(
+        profile.tools && profile.tools.classification,
+      );
       this.booksFeature = options.booksFeature === false ? null :
         options.booksFeature || this.createBooksFeature(options);
       this.artifactsFeature = options.artifactsFeature === false ? null :
         options.artifactsFeature || this.createArtifactsFeature(options);
+    }
+
+    createClassificationFeature(options, profile) {
+      if (options.features === false ||
+          typeof deps.createClassificationController !== "function") return null;
+      const classification = profile && profile.tools &&
+        profile.tools.classification || normalizeClassificationProfile(null);
+      return deps.createClassificationController({
+        scope: this.root,
+        documentRef: this.documentRef,
+        windowRef: this.windowRef,
+        port: this.artifactPorts && this.artifactPorts.commands,
+        bindings: classification.bindings,
+        history: options.correctionHistory,
+        operationIdFactory: options.correctionOperationIdFactory,
+        isEventEligible: (event, command, context) =>
+          this.classificationEventEligible(event, command, context),
+        resolveLinkedArtifact: (_target, detail = {}) =>
+          this.resolveLinkedArtifact(detail.linkedKey),
+        refreshTarget: (target) => this.refreshClassificationTarget(target),
+        promoteSoftTarget: (target) => this.promoteClassificationTarget(target),
+        onChanged: (_result, detail) =>
+          this.refreshClassificationTarget(detail && detail.target),
+        onConflict: (error) => this.setStatus(
+          error && error.message ||
+            "The classification target changed; its latest revision was loaded",
+          true,
+        ),
+        onStatus: (message, error) => this.setStatus(message, error),
+        onError: (error) => this.setStatus(
+          error && error.message || "The classification could not be applied",
+          true,
+        ),
+      });
+    }
+
+    classificationEventEligible(event, _command, _context = {}) {
+      return this.classificationSurfaceEligible(event, [
+        "booksList",
+        "artifactsTree",
+        "editorHost",
+        "classificationControls",
+        "classificationToolbar",
+      ]);
+    }
+
+    classificationContextMenuEligible(event) {
+      return Boolean(this.classificationContextMenuTarget(event));
+    }
+
+    classificationContextMenuOwner(event) {
+      let capture = null;
+      let artifact = null;
+      let overlay = null;
+      let canvas = null;
+      let node = event && event.target || null;
+      while (node) {
+        const dataset = node.dataset || {};
+        if (!capture && dataset.itemId && dataset.artifactId) {
+          capture = {
+            kind: "book-capture",
+            node,
+            itemId: dataset.itemId,
+            artifactId: dataset.artifactId,
+          };
+        }
+        if (!artifact && dataset.artifactKey) {
+          artifact = {
+            kind: "artifact",
+            node,
+            key: dataset.artifactKey,
+          };
+        }
+        if (!overlay && dataset.overlayKey) {
+          overlay = {
+            kind: "overlay",
+            node,
+            key: dataset.overlayKey,
+          };
+        }
+        if (!canvas &&
+            Object.prototype.hasOwnProperty.call(dataset, "classificationCanvas")) {
+          canvas = { kind: "editor-canvas", node };
+        }
+        if (Object.prototype.hasOwnProperty.call(dataset, "booksList")) {
+          return capture;
+        }
+        if (Object.prototype.hasOwnProperty.call(dataset, "artifactsTree")) {
+          return artifact;
+        }
+        if (Object.prototype.hasOwnProperty.call(dataset, "editorHost")) {
+          return overlay || canvas;
+        }
+        if (node === this.root) break;
+        node = node.parentElement || node.parentNode || null;
+      }
+      return null;
+    }
+
+    classificationStateTarget(key) {
+      const controller = this.classificationController;
+      const snapshot = controller &&
+        typeof controller.stateSnapshot === "function"
+        ? controller.stateSnapshot() : null;
+      if (!snapshot) return null;
+      return [
+        snapshot.selectionFocused && snapshot.selectionTarget,
+        snapshot.selectionTarget,
+        snapshot.hotTarget,
+      ].find((target) => targetKey(target) === key) || null;
+    }
+
+    classificationContextMenuTarget(event) {
+      const owner = this.classificationContextMenuOwner(event);
+      if (!owner) return null;
+      if (owner.kind === "book-capture") {
+        const books = this.booksFeature &&
+          (this.booksFeature.books || this.booksFeature);
+        if (!books ||
+            typeof books.commandTargetForSelection !== "function") return null;
+        return books.commandTargetForSelection({
+          itemId: owner.itemId,
+          artifactId: owner.artifactId,
+        });
+      }
+      if (owner.kind === "artifact") {
+        return this.artifactsFeature && this.artifactsFeature.items &&
+          this.artifactsFeature.items.get(owner.key) || null;
+      }
+      if (owner.kind === "overlay") {
+        return this.classificationStateTarget(owner.key) ||
+          this.artifactsFeature && this.artifactsFeature.items &&
+            this.artifactsFeature.items.get(owner.key) || null;
+      }
+      const resource = this.state && this.state.resource;
+      return resource && (resource.summary || resource) || null;
+    }
+
+    classificationSurfaceEligible(event, names) {
+      const accepted = new Set(names);
+      let node = event && event.target || null;
+      while (node) {
+        const dataset = node.dataset || {};
+        for (const name of accepted) {
+          if (Object.prototype.hasOwnProperty.call(dataset, name)) return true;
+        }
+        if (node === this.root) break;
+        node = node.parentElement || node.parentNode || null;
+      }
+      return false;
     }
 
     createBooksFeature(options) {
@@ -365,6 +668,18 @@
         operationIdFactory: options.reviewOperationIdFactory,
         advanceOnResolve: options.advanceOnResolve,
         onNavigate: (address, metadata) => this.selectAddress(address, metadata),
+        onSelectionTarget: (target, detail) => {
+          if (this.classificationController &&
+              typeof this.classificationController.setSelectionTarget === "function") {
+            this.classificationController.setSelectionTarget(target, detail);
+          }
+        },
+        onHotTarget: (target, detail) => {
+          if (this.classificationController &&
+              typeof this.classificationController.setHotTarget === "function") {
+            this.classificationController.setHotTarget(target, detail);
+          }
+        },
         onSelectionInvalidated: () => this.clearSelection(),
         onStatus: (message, error) => this.setStatus(message, error),
       });
@@ -397,14 +712,243 @@
         ],
         onResource: (resource) => this.setResource(resource),
         onSelection: (item) => {
+          if (this.classificationController &&
+              typeof this.classificationController.setSelectionTarget === "function") {
+            this.classificationController.setSelectionTarget(item, {
+              element: this.artifactTreeElement(targetKey(item)),
+              focused: true,
+              source: "artifacts",
+            });
+          }
           const address = artifactSelection(item, this.state.selection);
           if (address) this.selectAddress(address, { source: "artifacts" });
         },
         onHotTarget: (item) => {
           this.root.dataset.hotArtifactKey = item && item.key || "";
+          if (this.classificationController &&
+              typeof this.classificationController.setHotTarget === "function") {
+            this.classificationController.setHotTarget(item, {
+              element: this.artifactTreeElement(targetKey(item)),
+              source: "artifacts",
+            });
+          }
         },
         onStatus: (message, error) => this.setStatus(message, error),
       });
+    }
+
+    artifactTreeElement(key) {
+      if (!key) return null;
+      const tree = this.root.querySelector("[data-artifacts-tree]");
+      if (!tree || typeof tree.querySelectorAll !== "function") return null;
+      return Array.from(tree.querySelectorAll("[data-artifact-key]"))
+        .find((node) => node.dataset && node.dataset.artifactKey === key) || null;
+    }
+
+    async resolveLinkedArtifact(key) {
+      if (!key || !String(key).startsWith("artifact:") ||
+          !this.artifactsFeature) return null;
+      const cached = this.artifactsFeature.items &&
+        this.artifactsFeature.items.get(key);
+      if (cached && cached.revision) return cached;
+      if (typeof this.artifactsFeature.loadDetail !== "function") return null;
+      try {
+        return await this.artifactsFeature.loadDetail(key, { force: true });
+      } catch (error) {
+        this.setStatus(
+          error && error.message || "The linked artifact could not be loaded",
+          true,
+        );
+        return null;
+      }
+    }
+
+    async refreshClassificationTarget(target) {
+      const key = targetKey(target);
+      let refreshed = null;
+      if (key && this.artifactsFeature &&
+          typeof this.artifactsFeature.reloadDetail === "function") {
+        try {
+          refreshed = await this.artifactsFeature.reloadDetail(key);
+        } catch (error) {
+          this.setStatus(
+            error && error.message || "The latest artifact revision could not be loaded",
+            true,
+          );
+        }
+      }
+      if (this.booksFeature && typeof this.booksFeature.refresh === "function") {
+        try {
+          await this.booksFeature.refresh("classification");
+        } catch (error) {
+          this.setStatus(
+            error && error.message || "The Books panel could not be refreshed",
+            true,
+          );
+        }
+      }
+      return refreshed || target || null;
+    }
+
+    async promoteClassificationTarget(target) {
+      const key = targetKey(target);
+      if (key && this.artifactsFeature) {
+        let selected = null;
+        if (this.artifactsFeature.items && this.artifactsFeature.items.has(key) &&
+            typeof this.artifactsFeature.select === "function") {
+          selected = await this.artifactsFeature.select(key, { focus: true });
+        } else if (typeof this.artifactsFeature.openDeepLink === "function") {
+          selected = await this.artifactsFeature.openDeepLink(key);
+        }
+        if (selected) return selected;
+      }
+      const address = artifactSelection(target, this.state.selection);
+      if (address) this.selectAddress(address, { source: "classification" });
+      return target;
+    }
+
+    mountArtifactOverlay(controller, resource) {
+      if (!controller || !controller.image ||
+          typeof deps.createArtifactOverlay !== "function") return null;
+      const stage = controller.image.parentNode;
+      if (!stage || typeof stage.append !== "function") return null;
+      const summary = resource && resource.summary || {};
+      const rawRegions = Array.isArray(resource && resource.regions)
+        ? resource.regions : [];
+      const regions = rawRegions.map((raw) => {
+        const value = isPlainObject(raw) ? raw : {};
+        const objectType = value.objectType || value.object_type ||
+          value.type || "spatial-annotation";
+        const id = value.annotationId || value.annotation_id || value.id || "";
+        const normalized = {
+          ...value,
+          objectType,
+          itemId: value.itemId || value.item_id || summary.itemId || "",
+          id,
+          revision: value.revision || value.annotationRevision ||
+            value.annotation_revision || "",
+        };
+        return { ...normalized, key: targetKey(normalized) };
+      });
+      const dimensions = resource && resource.dimensions ||
+        summary.dimensions || {};
+      const overlay = deps.createArtifactOverlay({
+        root: stage,
+        documentRef: this.documentRef,
+        ResizeObserver: this.windowRef && this.windowRef.ResizeObserver,
+        getViewport: () => ({
+          width: Number(stage.clientWidth) || Number(controller.image.clientWidth) || 1,
+          height: Number(stage.clientHeight) || Number(controller.image.clientHeight) || 1,
+        }),
+        onSoftTarget: (target, detail) => {
+          if (this.classificationController &&
+              typeof this.classificationController.setHotTarget === "function") {
+            this.classificationController.setHotTarget(target, {
+              ...detail,
+              source: "editor-overlay",
+            });
+          }
+        },
+        onFocusTarget: (target, detail) => {
+          if (target && this.classificationController &&
+              typeof this.classificationController.setSelectionTarget === "function") {
+            this.classificationController.setSelectionTarget(target, {
+              ...detail,
+              focused: true,
+              source: "editor-overlay",
+            });
+          } else if (!target) {
+            this.demoteClassificationFocus();
+          }
+        },
+        onActivate: (target) => {
+          void this.promoteClassificationTarget(target);
+        },
+      }).mount();
+      const sync = () => {
+        const sourceWidth = Number(
+          dimensions.width || dimensions.pixel_width ||
+          controller.image.naturalWidth || controller.image.width) || 1;
+        const sourceHeight = Number(
+          dimensions.height || dimensions.pixel_height ||
+          controller.image.naturalHeight || controller.image.height) || 1;
+        const declaredOrientation = Number(
+          dimensions.orientation || dimensions.exif_orientation ||
+          summary.orientation || 1) || 1;
+        const coordinatesAreOriented = rawRegions.some((region) => {
+          const selector = region && (region.selector || region.polygon) || region;
+          const coordinateSpace = String(
+            selector && (selector.coordinate_space || selector.coordinateSpace) ||
+            resource && resource.coordinateSpace || "").toLowerCase();
+          return coordinateSpace.includes("canvas-normalized") ||
+            coordinateSpace.includes("exif_oriented");
+        });
+        const orientation = coordinatesAreOriented ? 1 : declaredOrientation;
+        overlay.setView({ sourceWidth, sourceHeight, orientation });
+        overlay.setRegions(regions, {
+          sourceWidth,
+          sourceHeight,
+          coordinateSpace: resource && resource.coordinateSpace,
+        });
+      };
+      controller.image.addEventListener("load", sync);
+      sync();
+      return () => {
+        controller.image.removeEventListener("load", sync);
+        overlay.destroy();
+      };
+    }
+
+    demoteClassificationFocus() {
+      const controller = this.classificationController;
+      if (!controller) return;
+      if (typeof controller.setSelectionFocus === "function") {
+        controller.setSelectionFocus(false);
+        return;
+      }
+      if (typeof controller.stateSnapshot !== "function" ||
+          typeof controller.setSelectionTarget !== "function") return;
+      const snapshot = controller.stateSnapshot();
+      if (!snapshot || !snapshot.selectionTarget) return;
+      controller.setSelectionTarget(snapshot.selectionTarget, {
+        focused: false,
+        source: "editor-overlay-blur",
+      });
+    }
+
+    mountClassificationControls() {
+      if (!this.classificationController) return;
+      if (typeof this.classificationController.mount === "function") {
+        this.classificationController.mount();
+      }
+      const host = this.root.querySelector("[data-classification-controls]");
+      const registry = this.classificationController.registry;
+      const presenterReady = registry &&
+        typeof registry.get === "function" &&
+        typeof registry.subscribe === "function" &&
+        typeof registry.bindingFor === "function" &&
+        typeof registry.remap === "function" &&
+        typeof registry.resetBinding === "function" &&
+        typeof this.classificationController.bindControl === "function" &&
+        typeof this.classificationController.invoke === "function";
+      if (!host || !presenterReady ||
+          typeof deps.createClassificationControls !== "function") return;
+      this.classificationControls = deps.createClassificationControls({
+        root: host,
+        documentRef: this.documentRef,
+        windowRef: this.windowRef,
+        toolbarRoot: this.root.querySelector("[data-classification-toolbar]"),
+        paletteTrigger: this.root.querySelector(
+          "[data-classification-palette-trigger]"),
+        contextScope: this.root,
+        isContextMenuEvent: (event) =>
+          this.classificationContextMenuTarget(event),
+        controller: this.classificationController,
+        onError: (error) => this.setStatus(
+          error && error.message || "The classification command failed",
+          true,
+        ),
+      }).mount();
     }
 
     listen(target, type, handler, options) {
@@ -418,12 +962,26 @@
       this.bindLayoutReset();
       this.bindWindowControls();
       this.bindTrayTabs();
+      this.mountClassificationControls();
+      this.listen(this.windowRef, "blur", () => {
+        if (this.classificationController &&
+            typeof this.classificationController.setScopeActive === "function") {
+          this.classificationController.setScopeActive(false);
+        }
+      });
+      this.listen(this.windowRef, "focus", () => {
+        if (this.classificationController &&
+            typeof this.classificationController.setScopeActive === "function") {
+          this.classificationController.setScopeActive(true);
+        }
+      });
       if (this.booksFeature && typeof this.booksFeature.mount === "function") {
         this.booksFeature.mount();
       }
       if (this.artifactsFeature && typeof this.artifactsFeature.mount === "function") {
         this.artifactsFeature.mount();
       }
+      this.connectTransformResults();
       this.renderEditor();
       if (!this.artifactsFeature) this.renderProperties();
       this.updateProfileLabel();
@@ -436,6 +994,21 @@
       this.selectionListeners.add(listener);
       listener({ ...this.state.selection });
       return () => this.selectionListeners.delete(listener);
+    }
+
+    connectTransformResults() {
+      if (!this.imageAdjustTool || !this.subscribeTransformResults ||
+          this.unsubscribeTransformResults) return;
+      try {
+        const release = this.subscribeTransformResults((result, command = null) => {
+          if (this.destroyed ||
+              typeof this.imageAdjustTool.observeTransformResult !== "function") return;
+          this.imageAdjustTool.observeTransformResult(result, command);
+        });
+        if (typeof release === "function") this.unsubscribeTransformResults = release;
+      } catch (error) {
+        this.setStatus("Transform result updates are unavailable", true);
+      }
     }
 
     emitSelection(metadata = {}) {
@@ -475,6 +1048,10 @@
         artifactId: null,
         annotationId: null,
       }, { source: "editor", forceContext: true });
+      if (this.classificationController &&
+          typeof this.classificationController.setHotTarget === "function") {
+        this.classificationController.setHotTarget(null);
+      }
       this.setResource(null);
       return selection;
     }
@@ -484,6 +1061,14 @@
         source: "selection-invalidated",
         forceContext: true,
       });
+      if (this.classificationController) {
+        if (typeof this.classificationController.setSelectionTarget === "function") {
+          this.classificationController.setSelectionTarget(null);
+        }
+        if (typeof this.classificationController.setHotTarget === "function") {
+          this.classificationController.setHotTarget(null);
+        }
+      }
       this.setResource(null);
       return selection;
     }
@@ -506,10 +1091,15 @@
         this.profileStore.clear(this.profileKey);
         this.layout.reset(false);
         this.editorRegistry.resetChoices();
+        if (this.imageAdjustTool &&
+            typeof this.imageAdjustTool.restoreProfile === "function") {
+          this.imageAdjustTool.restoreProfile(null);
+        }
+        this.restoreClassificationProfile(null);
         this.refreshEditorSelector();
         this.renderEditor();
         this.persistProfile();
-        this.setStatus("Layout and editor choices reset");
+        this.setStatus("Layout, editor choices, and tool settings reset");
       });
     }
 
@@ -656,9 +1246,41 @@
       this.profileKey = profile.profile_key;
       this.layout.replaceState(profile.layout, false);
       this.editorRegistry.restoreChoices(profile.editors);
+      if (this.imageAdjustTool &&
+          typeof this.imageAdjustTool.restoreProfile === "function") {
+        this.imageAdjustTool.restoreProfile(profile.tools && profile.tools.imageAdjust);
+      }
+      this.restoreClassificationProfile(
+        profile.tools && profile.tools.classification,
+      );
       this.refreshEditorSelector();
       this.renderEditor();
       this.updateProfileLabel();
+    }
+
+    restoreClassificationProfile(value) {
+      const controller = this.classificationController;
+      const registry = controller && controller.registry;
+      if (!registry || typeof registry.get !== "function" ||
+          typeof registry.remap !== "function") return;
+      const profile = normalizeClassificationProfile(value);
+      const definitions = Array.isArray(deps.DEFAULT_CLASSIFICATION_COMMANDS)
+        ? deps.DEFAULT_CLASSIFICATION_COMMANDS : [];
+      this.restoringProfile = true;
+      try {
+        for (const command of definitions) {
+          if (!registry.get(command.id)) continue;
+          registry.remap(command.id, "", { replaceConflicts: true });
+        }
+        for (const command of definitions) {
+          if (!registry.get(command.id)) continue;
+          registry.remap(command.id, profile.bindings[command.id] || "", {
+            replaceConflicts: false,
+          });
+        }
+      } finally {
+        this.restoringProfile = false;
+      }
     }
 
     persistProfile() {
@@ -666,6 +1288,13 @@
       this.profileStore.save(this.profileKey, {
         layout: this.layout.getState(),
         editors: this.editorRegistry.serializeChoices(),
+        tools: {
+          imageAdjust: this.imageAdjustTool &&
+              typeof this.imageAdjustTool.serializeProfile === "function"
+            ? this.imageAdjustTool.serializeProfile()
+            : {},
+          classification: classificationProfile(this.classificationController),
+        },
       });
       this.updateProfileLabel();
     }
@@ -771,6 +1400,24 @@
       this.featureContextGeneration += 1;
       if (typeof this.unsubscribeContext === "function") this.unsubscribeContext();
       this.unsubscribeContext = null;
+      if (typeof this.unsubscribeTransformResults === "function") {
+        this.unsubscribeTransformResults();
+      }
+      this.unsubscribeTransformResults = null;
+      if (typeof this.unsubscribeClassificationBindings === "function") {
+        this.unsubscribeClassificationBindings();
+      }
+      this.unsubscribeClassificationBindings = null;
+      if (this.classificationControls &&
+          typeof this.classificationControls.destroy === "function") {
+        this.classificationControls.destroy();
+      }
+      this.classificationControls = null;
+      if (this.classificationController &&
+          typeof this.classificationController.destroy === "function") {
+        this.classificationController.destroy();
+      }
+      this.classificationController = null;
       if (this.booksFeature && typeof this.booksFeature.destroy === "function") {
         this.booksFeature.destroy();
       }
@@ -783,6 +1430,11 @@
       if (this.editorRegistry && typeof this.editorRegistry.destroy === "function") {
         this.editorRegistry.destroy();
       }
+      if (this.imageAdjustTool &&
+          typeof this.imageAdjustTool.destroy === "function") {
+        this.imageAdjustTool.destroy();
+      }
+      this.imageAdjustTool = null;
       this.layout.destroy();
       for (const remove of this.listeners.splice(0)) remove();
     }
