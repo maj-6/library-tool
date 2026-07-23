@@ -17,11 +17,13 @@ from .raster import (
     PerspectiveTransformResult,
     RasterInputError,
     RasterLimits,
+    apply_capture_pixel_perspective_compat,
     apply_manual_binary_adjust,
     apply_pixel_perspective_transform,
     apply_perspective_transform,
     normalize_pixel_homography,
     order_pixel_quad,
+    page_boundary_proposal_from_pixel_quad,
     validate_normalized_quad,
 )
 
@@ -36,6 +38,7 @@ __all__ = [
     "PerspectiveTransformResult",
     "RasterInputError",
     "RasterLimits",
+    "apply_capture_pixel_perspective_compat",
     "apply_capture_perspective_compat",
     "apply_manual_binary_adjust",
     "apply_pixel_perspective_transform",
@@ -44,6 +47,7 @@ __all__ = [
     "normalize_pixel_homography",
     "order_capture_quad",
     "order_pixel_quad",
+    "page_boundary_proposal_from_pixel_quad",
     "propose_capture_page_boundary",
     "validate_normalized_quad",
 ]

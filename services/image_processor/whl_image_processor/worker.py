@@ -170,6 +170,11 @@ def _result_payload(
                 "revision": request.source.original_revision,
                 "coordinate_space": "exif_oriented_normalized",
             },
+            "page_boundary_proposal": (
+                None
+                if processed.page_boundary_proposal is None
+                else processed.page_boundary_proposal.as_dict()
+            ),
             "output": {
                 "representation": "corrected_display",
                 "sha256": processed.display_sha256,

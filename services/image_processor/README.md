@@ -25,6 +25,10 @@ Android uploads originals + capture row
   immutable Android SHA-256 before processing.
 - Applies EXIF orientation, page-boundary detection, padded perspective
   correction, and display-safe illumination/contrast cleanup.
+- Publishes a detected boundary as the shared
+  `org.whl.page-boundary-proposal` contract, pinned to the immutable source
+  hash in EXIF-oriented normalized coordinates. This additive metadata does
+  not change derivative pixels or Android's existing contrast semantics.
 - Uses the Android date preset exactly: newer books receive stronger
   normalization; older books retain more paper tone and page-edge context.
 - Runs an actual cubic-sheet page-curvature pass with `page-dewarp` when text

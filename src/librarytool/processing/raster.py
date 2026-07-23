@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import math
+import numbers
 import warnings
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
@@ -46,7 +47,7 @@ class RasterInputError(ValueError):
 
 
 def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, numbers.Real) and not isinstance(value, bool)
 
 
 def _cross(a: NormalizedPoint, b: NormalizedPoint, c: NormalizedPoint) -> float:
@@ -216,6 +217,82 @@ class PageBoundaryProposal:
         }
 
 
+def page_boundary_proposal_from_pixel_quad(
+    quad: Iterable[Iterable[float]],
+    *,
+    source_width: int,
+    source_height: int,
+    confidence: float,
+    detector: str,
+    detector_version: str,
+    source_revision: str,
+) -> PageBoundaryProposal:
+    """Publish a detector's pixel quad in the shared normalized contract.
+
+    Pixel coordinates use inclusive image endpoints, so ``width - 1`` and
+    ``height - 1`` map exactly to normalized coordinate ``1``.  Detectors keep
+    ownership of their pixel-space ordering and confidence calculation; this
+    adapter centralizes the coordinate conversion and contract validation.
+    """
+
+    for name, value in (
+        ("source_width", source_width),
+        ("source_height", source_height),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 2:
+            raise ValueError(f"{name} must be an integer of at least 2")
+    try:
+        pixel_points = tuple(tuple(point) for point in quad)
+    except TypeError as exc:
+        raise RasterInputError("quad must contain four coordinate pairs") from exc
+    if len(pixel_points) != 4:
+        raise RasterInputError(
+            "quad must contain exactly four points in TL/TR/BR/BL order"
+        )
+    normalized_points: list[NormalizedPoint] = []
+    for index, point in enumerate(pixel_points):
+        if len(point) != 2:
+            raise RasterInputError(
+                f"{POINT_ORDER[index]} must contain exactly x and y"
+            )
+        x, y = point
+        if not _is_number(x) or not _is_number(y):
+            raise RasterInputError(
+                f"{POINT_ORDER[index]} pixel coordinates must be numbers"
+            )
+        x_float, y_float = float(x), float(y)
+        if not math.isfinite(x_float) or not math.isfinite(y_float):
+            raise RasterInputError(
+                f"{POINT_ORDER[index]} pixel coordinates must be finite"
+            )
+        if not 0.0 <= x_float <= source_width - 1:
+            raise RasterInputError(
+                f"{POINT_ORDER[index]} x must be within source pixel bounds"
+            )
+        if not 0.0 <= y_float <= source_height - 1:
+            raise RasterInputError(
+                f"{POINT_ORDER[index]} y must be within source pixel bounds"
+            )
+        normalized_points.append(
+            (
+                x_float / float(source_width - 1),
+                y_float / float(source_height - 1),
+            )
+        )
+    return PageBoundaryProposal(
+        quad=(
+            normalized_points[0],
+            normalized_points[1],
+            normalized_points[2],
+            normalized_points[3],
+        ),
+        confidence=confidence,
+        detector=detector,
+        detector_version=detector_version,
+        source_revision=source_revision,
+    )
+
+
 def _bounded_integer(value: object, *, name: str, minimum: int, maximum: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer from {minimum} through {maximum}")
@@ -306,6 +383,65 @@ class PixelPerspectiveResult:
     source_to_output_pixel_homography: Any
     output_width: int
     output_height: int
+
+
+def apply_capture_pixel_perspective_compat(
+    image_bytes: bytes,
+    quad: object,
+    *,
+    quality: int = 92,
+) -> bytes:
+    """Apply the historical desktop capture warp without changing its bytes.
+
+    The desktop recipe predates the bounded cloud and lossless correction
+    recipes. Its maximum-edge sizing, linear interpolation, black border, and
+    JPEG encoder settings are observable compatibility behavior. Keeping that
+    recipe here makes the live capture entry point a wrapper over the shared
+    raster kernel while retaining byte-for-byte output.
+    """
+
+    import cv2
+    import numpy as np
+
+    image = cv2.imdecode(
+        np.frombuffer(image_bytes, dtype=np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+    if image is None:
+        return image_bytes
+    ordered = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    top_left, top_right, bottom_right, bottom_left = ordered
+    width = int(
+        max(
+            np.linalg.norm(bottom_right - bottom_left),
+            np.linalg.norm(top_right - top_left),
+        )
+    )
+    height = int(
+        max(
+            np.linalg.norm(top_right - bottom_right),
+            np.linalg.norm(top_left - bottom_left),
+        )
+    )
+    if width < 200 or height < 200:
+        return image_bytes
+    destination = np.array(
+        [
+            [0, 0],
+            [width - 1, 0],
+            [width - 1, height - 1],
+            [0, height - 1],
+        ],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(ordered, destination)
+    warped = cv2.warpPerspective(image, matrix, (width, height))
+    encoded, output = cv2.imencode(
+        ".jpg",
+        warped,
+        [cv2.IMWRITE_JPEG_QUALITY, quality],
+    )
+    return output.tobytes() if encoded else image_bytes
 
 
 def order_pixel_quad(points: object) -> Any:
