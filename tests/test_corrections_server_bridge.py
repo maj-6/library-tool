@@ -72,6 +72,9 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
     capture_dir = captures_dir / CAPTURE_ID
     capture_dir.mkdir(parents=True)
     entries_dir.mkdir(parents=True)
+    identity_dir = entries_dir / BOOK_ID / "ocr"
+    identity_dir.mkdir(parents=True)
+    server.lib.save_json(identity_dir / "lib-id.json", {"book_id": BOOK_ID})
 
     content = _jpeg_bytes()
     digest = hashlib.sha256(content).hexdigest()

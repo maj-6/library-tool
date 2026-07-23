@@ -100,9 +100,12 @@ test("production EngineClient completes the representative Corrections flow", {
       value.extensions.capture_asset.variant === "display");
   if (!display) {
     display = rasters.artifacts.find(
-      (value) => value.resource && value.resource.media_type === "image/jpeg");
+      (value) => value.resource && value.resource.variant === "display");
   }
-  assert.ok(display, "capture display artifact was not projected");
+  assert.ok(
+    display,
+    `capture display artifact was not projected: ${JSON.stringify(rasters)}`,
+  );
   const displayId = display.key.artifact_id;
 
   const category = await firstClient.corrections.assignImageCategory({
@@ -142,13 +145,16 @@ test("production EngineClient completes the representative Corrections flow", {
   assert.equal(annotations.annotations.length, 2);
   const margin = annotationForRegion(annotations, "margin-1");
   const illustration = annotationForRegion(annotations, "illustration-1");
-  await firstClient.corrections.assignRegionRole({
+  const marginRole = await firstClient.corrections.assignRegionRole({
     itemId,
     annotationId: margin.key.annotation_id,
     expectedAnnotationRevision: margin.revision,
     role: "marginalia",
+    linkedArtifactId: displayId,
+    expectedLinkedArtifactRevision: display.revision,
     idempotencyKey: "release-e2e-role-mar",
   });
+  display.revision = operationRevision(marginRole, "artifact", displayId);
   await firstClient.corrections.assignRegionRole({
     itemId,
     annotationId: illustration.key.annotation_id,
@@ -206,6 +212,10 @@ test("production EngineClient completes the representative Corrections flow", {
     ],
   });
   assert.equal(editorState.validation.valid, true);
+  editorState = reduceImageEditorState(editorState, {
+    type: "SET_TOOL",
+    tool: TOOLS.IMAGE_ADJUST,
+  });
 
   const imageAdjust = createImageAdjustTool({
     profile: { lastAppliedBrightness: -3 },
@@ -271,15 +281,22 @@ test("production EngineClient completes the representative Corrections flow", {
   }
   assert.ok(job, "transform job was not observable");
   assert.equal(job.state, "done");
-  assert.equal(job.errors, 0);
+  assert.equal(job.error, null);
+  assert.equal(job.progress.completed, job.progress.total);
   assert.ok(job.outputs.some((value) => value.kind === "corrected-display"));
   assert.ok(job.outputs.some((value) => value.kind === "ocr-ready"));
   assert.ok(job.outputs.some((value) => value.kind === "ocr-proposal"));
 
-  const corrected = await reopened.rasterArtifacts.list({ itemId });
+  const corrected = await reopened.rasterArtifacts.list({
+    itemId,
+    group: "processed-images",
+  });
   assert.ok(
-    corrected.artifacts.some((value) => value.group === "processed-images"),
-    "corrected rendition was not projected back through the production bridge",
+    corrected.artifacts.some((value) =>
+      ["corrected-image", "perspective-corrected", "processed-image",
+        "processed-source"].includes(value.kind)),
+    "corrected rendition was not projected back through the production bridge: " +
+      JSON.stringify(corrected),
   );
   const preserved = (await reopened.rasterArtifacts.get({
     itemId,
@@ -303,5 +320,5 @@ test("production EngineClient completes the representative Corrections flow", {
   );
   const finalReview = await reopened.corrections.getReview({ itemId });
   assert.equal(finalReview.review.state, "needs_attention");
-  assert.equal(finalReview.review.history_count, 3);
+  assert.equal(finalReview.review.history.length, 3);
 });
