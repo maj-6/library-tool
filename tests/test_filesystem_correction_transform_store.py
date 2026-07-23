@@ -307,6 +307,82 @@ def test_store_publishes_four_immutable_outputs_and_full_human_assertions(
     assert source.content == _png()
 
 
+def test_store_projects_persisted_raster_outputs_and_verified_resources(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    result = _store(tmp_path, authority).commit_transform(draft)
+    authority.fail = True
+
+    restarted = _store(tmp_path, authority)
+    projected = restarted.list_raster_artifacts("book-1")
+    by_output_kind = {
+        value.extensions["correction_transform"]["output_kind"]: value
+        for value in projected
+    }
+
+    assert set(by_output_kind) == {
+        "corrected-display",
+        "ocr-ready",
+        "thumbnail",
+    }
+    corrected = by_output_kind["corrected-display"]
+    assert corrected.key.artifact_id == result.output(
+        "corrected-display"
+    ).artifact_id
+    assert corrected.kind == "corrected-image"
+    assert corrected.lineage[0].artifact_id == "source-image"
+    assert corrected.lineage[0].artifact_revision == "artifact-r1"
+    assert corrected.category_assignments == ()
+    assert corrected.caption_assertions == ()
+    assert corrected.resource is not None
+
+    resolved = restarted.resolve_raster_resource(
+        "book-1",
+        corrected.resource,
+    )
+    assert resolved is not None
+    try:
+        assert resolved.stream.read() == draft.output(
+            "corrected-display"
+        ).content
+        assert resolved.media_type == "image/png"
+        assert resolved.content_sha256 == corrected.content_sha256
+        assert resolved.revision == corrected.resource.revision
+    finally:
+        resolved.stream.close()
+
+    # Projection never rewrites the source's durable human-owned state.
+    assert source.artifact.effective_category == "title_page"
+    assert source.artifact.effective_caption.text == "Reviewed title"
+    assert [
+        value.role
+        for value in source.annotations[0].role_assignments
+        if value.origin.value == "manual"
+    ] == ["marginalia"]
+
+
+def test_output_projection_rejects_tampered_immutable_resources(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    result = store.commit_transform(_draft(source))
+    target = _object_path(
+        tmp_path,
+        result.output("corrected-display").artifact_id,
+    )
+    target.write_bytes(b"tampered")
+
+    with pytest.raises(RepositoryError) as raised:
+        store.list_raster_artifacts("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == "corrected-display"
+
+
 def test_exact_replay_survives_restart_without_querying_stale_authority(
     tmp_path: Path,
 ) -> None:

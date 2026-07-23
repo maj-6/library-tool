@@ -45,6 +45,7 @@ from ..adapters.filesystem import (
     FilesystemTextLayerAggregateRepository,
     FilesystemTranslationRepository,
     RecoverableWriteSet,
+    WriteSetError,
 )
 from ..engine.canvas_commands import (
     CanvasPreparationItemSnapshot,
@@ -127,7 +128,12 @@ from ..engine.runtime import (
     ServiceKey,
     ServiceRegistryError,
 )
-from ..engine.raster_artifacts import RasterArtifactProjectorPort
+from ..engine.raster_artifacts import (
+    RasterArtifactKey,
+    RasterArtifactProjectorPort,
+    RasterArtifactView,
+    RasterResourceRef,
+)
 from ..engine.spatial_annotations import SpatialAnnotationProjectorPort
 from ..engine.text_layer_aggregate import (
     TextLayerAggregateService,
@@ -656,6 +662,98 @@ class _ReentrantContextFactory:
                 self._state.depth = 0
 
 
+class _RasterArtifactProjectionUnion:
+    """Combine live source artifacts with immutable correction outputs."""
+
+    def __init__(
+        self,
+        base: RasterArtifactProjectorPort,
+        transforms: FilesystemCorrectionTransformStore,
+        *,
+        write_set: RecoverableWriteSet,
+        lock_context_for: CatalogueLockFactory,
+    ) -> None:
+        if not isinstance(write_set, RecoverableWriteSet):
+            raise TypeError("write_set must be a RecoverableWriteSet")
+        if not callable(lock_context_for):
+            raise TypeError("lock_context_for must be callable")
+        self._base = base
+        self._transforms = transforms
+        self._write_set = write_set
+        self._lock_context_for = lock_context_for
+
+    @contextmanager
+    def _read_context(self):
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    yield
+        except WriteSetError as exc:
+            raise RepositoryError(
+                "the correction raster workspace is unavailable",
+                code=exc.code,
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+
+    def list_raster_artifacts(
+        self,
+        item_id: str,
+    ) -> tuple[RasterArtifactView, ...]:
+        with self._read_context():
+            # The base lookup is first so missing-item semantics remain owned
+            # by the catalogue/capture authority rather than the private
+            # output store.
+            values = (
+                *self._base.list_raster_artifacts(item_id),
+                *self._transforms.list_raster_artifacts(item_id),
+            )
+        identities = [value.key.artifact_id.casefold() for value in values]
+        if len(identities) != len(set(identities)):
+            raise RepositoryError(
+                "a correction transform output reuses a raster identity",
+                code="invalid_correction_transform_storage",
+                details={"item_id": item_id},
+            )
+        return tuple(sorted(values, key=lambda value: value.key.artifact_id))
+
+    def get_raster_artifact(
+        self,
+        key: RasterArtifactKey,
+    ) -> RasterArtifactView | None:
+        if not isinstance(key, RasterArtifactKey):
+            raise TypeError("key must be a RasterArtifactKey")
+        return next(
+            (
+                value
+                for value in self.list_raster_artifacts(key.item_id)
+                if value.key == key
+            ),
+            None,
+        )
+
+    def resolve_raster_resource(
+        self,
+        item_id: str,
+        resource: RasterResourceRef,
+    ) -> Any:
+        if not isinstance(resource, RasterResourceRef):
+            raise TypeError("resource must be a RasterResourceRef")
+        with self._read_context():
+            if resource.resource_id.startswith("correction-raster:"):
+                # Recheck item membership under the same authority lock as
+                # the immutable-object snapshot.
+                self._base.list_raster_artifacts(item_id)
+                return self._transforms.resolve_raster_resource(
+                    item_id,
+                    resource,
+                )
+            resolver = getattr(self._base, "resolve_raster_resource", None)
+            if not callable(resolver):
+                return None
+            return resolver(item_id, resource)
+
+
 @dataclass(frozen=True, slots=True)
 class FilesystemEngineResources:
     """Shared, already-initialized process resources.
@@ -870,8 +968,35 @@ def compose_filesystem_engine(
             ),
             lock_context_for=corrections_lock,
         )
-        aggregate_projector = CorrectionAggregateProjector(
+        correction_source_reader: (
+            FilesystemCorrectionSourceSnapshotReader | None
+        ) = None
+
+        def correction_source_snapshot_for(
+            key: RasterArtifactKey,
+        ):
+            if correction_source_reader is None:
+                raise RepositoryError(
+                    "the correction source reader is not bound",
+                    code="correction_transform_authority_unavailable",
+                    retryable=True,
+                )
+            return correction_source_reader(key)
+
+        correction_transform_store = FilesystemCorrectionTransformStore(
+            resources.write_set,
+            source_snapshot_for=correction_source_snapshot_for,
+            lock_context_for=corrections_lock,
+            recover=False,
+        )
+        raster_projection = _RasterArtifactProjectionUnion(
             corrections_base,
+            correction_transform_store,
+            write_set=resources.write_set,
+            lock_context_for=corrections_lock,
+        )
+        aggregate_projector = CorrectionAggregateProjector(
+            raster_projection,
             corrections_base,
         )
         correction_repository = FilesystemCorrectionRepository(
@@ -883,7 +1008,7 @@ def compose_filesystem_engine(
         )
         correction_commands = CorrectionService(correction_repository)
         corrections_artifacts = CorrectionProjectionService(
-            corrections_base,
+            raster_projection,
             corrections_base,
             correction_repository,
         )
@@ -891,12 +1016,6 @@ def compose_filesystem_engine(
             corrections_artifacts,
             corrections_artifacts,
             corrections_artifacts,
-        )
-        correction_transform_store = FilesystemCorrectionTransformStore(
-            resources.write_set,
-            source_snapshot_for=correction_source_reader,
-            lock_context_for=corrections_lock,
-            recover=False,
         )
         correction_transform_worker = CorrectionTransformWorker(
             resources.jobs,

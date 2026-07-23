@@ -18,7 +18,9 @@ import json
 import os
 import re
 import stat
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, ContextManager, TypeAlias
 
@@ -38,15 +40,23 @@ from ...engine.errors import (
     RepositoryError,
 )
 from ...engine.raster_artifacts import (
+    ArtifactFreshness,
     ArtifactProvenance,
     RasterArtifactKey,
+    RasterArtifactView,
     RasterDimensions,
+    RasterLineageRef,
+    RasterResourceRef,
+    RasterSourceRef,
+    ResourceState,
 )
 from .corrections_artifact_repository import (
+    ResolvedRasterResource,
     _AuthorityDirectorySnapshot,
     _AuthoritySnapshot,
     _finish_verified_regular,
     _open_verified_regular,
+    _stable_stat_identity,
 )
 from .recoverable_write_set import (
     RecoverableWriteSet,
@@ -72,6 +82,13 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_PUBLICATION_BYTES = 128 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
+_MAX_PUBLICATIONS = 100_000
+_PUBLICATION_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
+_PROJECTED_RASTER_OUTPUTS = {
+    "corrected-display": ("corrected-image", "Corrected display", "display"),
+    "ocr-ready": ("processed-source", "OCR-ready image", "ocr"),
+    "thumbnail": ("processed-image", "Correction thumbnail", "thumbnail"),
+}
 _RECEIPT_FIELDS = frozenset(
     {
         "schema",
@@ -140,6 +157,24 @@ _PROVENANCE_FIELDS = frozenset(
         "extensions",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _TransformResourceCandidate:
+    path: Path
+    media_type: str
+    content_sha256: str
+    size: int
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TransformProjection:
+    raster_artifacts: tuple[RasterArtifactView, ...]
+    resources: Mapping[
+        tuple[str, str, str],
+        _TransformResourceCandidate,
+    ]
 
 
 def _repository_error(
@@ -397,6 +432,348 @@ class FilesystemCorrectionTransformStore:
                 cause=exc,
                 retryable=True,
             ) from exc
+
+    def list_raster_artifacts(
+        self,
+        item_id: str,
+    ) -> tuple[RasterArtifactView, ...]:
+        """Project durable image outputs without exposing private storage."""
+
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    return self._project_locked(item_id).raster_artifacts
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction transform workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except (NotFoundError, RepositoryError):
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction transform projection is unavailable",
+                code="correction_transform_projection_unavailable",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    def get_raster_artifact(
+        self,
+        key: RasterArtifactKey,
+    ) -> RasterArtifactView | None:
+        if not isinstance(key, RasterArtifactKey):
+            raise TypeError("key must be a RasterArtifactKey")
+        return next(
+            (
+                value
+                for value in self.list_raster_artifacts(key.item_id)
+                if value.key == key
+            ),
+            None,
+        )
+
+    def resolve_raster_resource(
+        self,
+        item_id: str,
+        resource: RasterResourceRef,
+    ) -> ResolvedRasterResource | None:
+        if not isinstance(resource, RasterResourceRef):
+            raise TypeError("resource must be a RasterResourceRef")
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    candidate = self._project_locked(item_id).resources.get(
+                        (
+                            resource.resource_id,
+                            resource.revision,
+                            resource.variant,
+                        )
+                    )
+                    if candidate is None:
+                        return None
+                    return self._snapshot_resource(candidate)
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction transform workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except RepositoryError:
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction transform resource is unavailable",
+                code="correction_transform_resource_unavailable",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    def _project_locked(self, item_id: str) -> _TransformProjection:
+        # Validate the public scope even when no publication exists.
+        RasterArtifactKey(item_id, "correction-transform-projection")
+        values: list[RasterArtifactView] = []
+        resources: dict[
+            tuple[str, str, str],
+            _TransformResourceCandidate,
+        ] = {}
+        identities: set[str] = set()
+        for path in self._publication_paths():
+            command, result, publication = self._validated_publication(path)
+            if command.item_id != item_id:
+                continue
+            for committed, raw_output in zip(
+                result.outputs,
+                publication["outputs"],
+                strict=True,
+            ):
+                public = _PROJECTED_RASTER_OUTPUTS.get(committed.kind)
+                if public is None:
+                    continue
+                kind, label, variant = public
+                artifact_identity = committed.artifact_id.casefold()
+                if artifact_identity in identities:
+                    raise _repository_error(
+                        "a correction transform output identity is duplicated",
+                        code="invalid_correction_transform_storage",
+                        artifact="correction_transform_publication",
+                    )
+                identities.add(artifact_identity)
+                dimensions = RasterDimensions(
+                    **_strict_object(
+                        raw_output["dimensions"],
+                        fields=_DIMENSION_FIELDS,
+                        artifact="correction_transform_output_dimensions",
+                    )
+                )
+                provenance = ArtifactProvenance(
+                    **_strict_object(
+                        raw_output["provenance"],
+                        fields=_PROVENANCE_FIELDS,
+                        artifact="correction_transform_output_provenance",
+                    )
+                )
+                resource_id = self._resource_id(
+                    item_id,
+                    committed.artifact_id,
+                )
+                resource = RasterResourceRef(
+                    resource_id,
+                    committed.artifact_revision,
+                    variant,
+                )
+                view = RasterArtifactView(
+                    key=RasterArtifactKey(item_id, committed.artifact_id),
+                    revision=committed.artifact_revision,
+                    kind=kind,
+                    media_type=raw_output["media_type"],
+                    content_sha256=committed.content_sha256,
+                    dimensions=dimensions,
+                    source=RasterSourceRef(
+                        "correction-transform",
+                        command.fingerprint,
+                    ),
+                    resource_state=ResourceState.AVAILABLE,
+                    resource=resource,
+                    label=label,
+                    freshness=ArtifactFreshness.CURRENT,
+                    lineage=(
+                        RasterLineageRef(
+                            command.artifact_id,
+                            command.artifact_revision,
+                            "processed_from",
+                        ),
+                    ),
+                    provenance=provenance,
+                    extensions={
+                        "correction_transform": {
+                            "operation_id": command.operation_id,
+                            "output_kind": committed.kind,
+                            "source_revision": command.source_revision,
+                        }
+                    },
+                )
+                key = (
+                    resource.resource_id,
+                    resource.revision,
+                    resource.variant,
+                )
+                if key in resources:
+                    raise _repository_error(
+                        "a correction transform resource identity is duplicated",
+                        code="invalid_correction_transform_storage",
+                        artifact="correction_transform_publication",
+                    )
+                resources[key] = _TransformResourceCandidate(
+                    self._object_path(committed.artifact_id),
+                    raw_output["media_type"],
+                    committed.content_sha256,
+                    raw_output["bytes"],
+                    resource.revision,
+                )
+                values.append(view)
+        return _TransformProjection(
+            tuple(sorted(values, key=lambda value: value.key.artifact_id)),
+            resources,
+        )
+
+    def _publication_paths(self) -> tuple[Path, ...]:
+        directory = self._target(_PUBLICATION_ROOT)
+        self._safe_target(directory, artifact="correction_transform_publications")
+        if not os.path.lexists(directory):
+            return ()
+        try:
+            before = directory.lstat()
+            if (
+                not stat.S_ISDIR(before.st_mode)
+                or _is_redirecting_path(directory)
+            ):
+                raise ValueError("publication authority is not a directory")
+            paths: list[Path] = []
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if len(paths) >= _MAX_PUBLICATIONS:
+                        raise ValueError(
+                            "publication authority exceeds its entry budget"
+                        )
+                    if (
+                        _PUBLICATION_NAME_RE.fullmatch(entry.name) is None
+                        or not entry.is_file(follow_symlinks=False)
+                        or entry.is_symlink()
+                    ):
+                        raise ValueError(
+                            "publication authority contains an invalid entry"
+                        )
+                    paths.append(directory / entry.name)
+            after = directory.lstat()
+            if (
+                _is_redirecting_path(directory)
+                or not stat.S_ISDIR(after.st_mode)
+                or not os.path.samestat(before, after)
+                or _stable_stat_identity(before)
+                != _stable_stat_identity(after)
+            ):
+                raise ValueError(
+                    "publication authority changed while it was inspected"
+                )
+            return tuple(sorted(paths, key=lambda path: path.name))
+        except (OSError, ValueError) as exc:
+            raise _repository_error(
+                "the correction transform publication authority is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_publication",
+                cause=exc,
+            ) from exc
+
+    def _validated_publication(
+        self,
+        path: Path,
+    ) -> tuple[
+        CorrectionTransformCommand,
+        CorrectionTransformCommitResult,
+        Mapping[str, Any],
+    ]:
+        raw = self._read_json(
+            path,
+            maximum=_MAX_PUBLICATION_BYTES,
+            artifact="correction_transform_publication",
+        )
+        try:
+            publication = _strict_object(
+                raw,
+                fields=_PUBLICATION_FIELDS,
+                artifact="correction_transform_publication",
+            )
+            command = CorrectionTransformCommand.from_dict(
+                publication["command"]
+            )
+            if (
+                publication["operation_id"] != command.operation_id
+                or path != self._publication_path(command.operation_id)
+            ):
+                raise ValueError(
+                    "publication path is not bound to its operation"
+                )
+            receipt = self._read_receipt(command.operation_id)
+            if receipt is None:
+                raise ValueError("publication receipt is missing")
+            command_sha256, publication_sha256, result = receipt
+            if command_sha256 != command.fingerprint:
+                raise ValueError(
+                    "publication command is not bound to its receipt"
+                )
+            validated = self._validate_replay_publication(
+                command,
+                result,
+                publication_sha256=publication_sha256,
+            )
+            return command, result, validated
+        except RepositoryError:
+            raise
+        except (EngineError, KeyError, TypeError, ValueError) as exc:
+            raise _repository_error(
+                "the correction transform publication is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_publication",
+                cause=exc,
+            ) from exc
+
+    def _snapshot_resource(
+        self,
+        candidate: _TransformResourceCandidate,
+    ) -> ResolvedRasterResource:
+        try:
+            snapshot = tempfile.TemporaryFile(mode="w+b")
+        except OSError as exc:
+            raise _repository_error(
+                "a correction transform resource cannot be resolved",
+                code="correction_transform_resource_unavailable",
+                artifact="correction_transform_output",
+                cause=exc,
+                retryable=True,
+            ) from exc
+        try:
+            _payload, digest, size = self._read_regular(
+                candidate.path,
+                maximum=_MAX_OUTPUT_BYTES,
+                artifact="correction_transform_output",
+                collect=False,
+                sink=snapshot,
+            )
+            if (
+                size != candidate.size
+                or digest != candidate.content_sha256
+            ):
+                raise _repository_error(
+                    "a correction transform resource does not match its pins",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_output",
+                )
+            snapshot.seek(0)
+            return ResolvedRasterResource(
+                snapshot,
+                candidate.media_type,
+                candidate.content_sha256,
+                candidate.size,
+                candidate.revision,
+            )
+        except BaseException:
+            snapshot.close()
+            raise
+
+    @staticmethod
+    def _resource_id(item_id: str, artifact_id: str) -> str:
+        digest = hashlib.sha256(
+            f"{item_id}\0{artifact_id}".encode("utf-8")
+        ).hexdigest()
+        return f"correction-raster:{digest[:40]}"
 
     def _load_source_locked(
         self,
@@ -721,7 +1098,7 @@ class FilesystemCorrectionTransformStore:
         result: CorrectionTransformCommitResult,
         *,
         publication_sha256: str,
-    ) -> None:
+    ) -> Mapping[str, Any]:
         artifact_ids = tuple(output.artifact_id for output in result.outputs)
         if command.artifact_id.casefold() in {
             artifact_id.casefold() for artifact_id in artifact_ids
@@ -812,6 +1189,7 @@ class FilesystemCorrectionTransformStore:
                     code="invalid_correction_transform_storage",
                     artifact=committed.kind,
                 )
+        return publication
 
     def _validate_publication_document(
         self,
@@ -1018,7 +1396,10 @@ class FilesystemCorrectionTransformStore:
         maximum: int,
         artifact: str,
         collect: bool,
+        sink: Any = None,
     ) -> tuple[bytes, str, int]:
+        if sink is not None and not callable(getattr(sink, "write", None)):
+            raise TypeError("sink must expose write()")
         descriptor = -1
         try:
             authority = self._authority_snapshot(path, artifact=artifact)
@@ -1047,6 +1428,8 @@ class FilesystemCorrectionTransformStore:
                 digest.update(block)
                 if collect:
                     chunks.append(block)
+                if sink is not None:
+                    sink.write(block)
             _finish_verified_regular(
                 path,
                 descriptor,
