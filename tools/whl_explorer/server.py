@@ -139,6 +139,11 @@ from librarytool.engine.errors import (  # noqa: E402
     RepositoryError as EngineRepositoryError,
     ValidationError as EngineValidationError,
 )
+from librarytool.engine.correction_transforms import (  # noqa: E402
+    CorrectionTransformCommand,
+    CorrectionTransformService,
+    QueuedCorrectionTransform,
+)
 from librarytool.engine.jobs import (  # noqa: E402
     ACTIVE_JOB_STATES,
     PUBLIC_JOB_FIELDS,
@@ -221,6 +226,8 @@ _translation_provenance: TranslationProvenanceService | None = None
 _jobs: dict | None = None
 _jobs_events: dict | None = None
 _jobs_lock: threading.Lock | None = None
+_correction_transform_runs: set[str] = set()
+_correction_transform_runs_lock = threading.Lock()
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
 # registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
@@ -248,6 +255,13 @@ app.register_blueprint(
         lambda: _library_engine(),
         raster_resource_resolver_for_request=(
             lambda: _ensure_engine_session().raster_resource_resolver
+        ),
+        correction_transform_submitter=(
+            lambda service, command, queued: _submit_correction_transform(
+                service,
+                command,
+                queued,
+            )
         ),
     )
 )
@@ -5528,6 +5542,63 @@ def _library_engine() -> LibraryEngine:
     """Return the engine owned by the process-lifetime filesystem session."""
 
     return _ensure_engine_session().engine
+
+
+def _submit_correction_transform(
+    service: CorrectionTransformService,
+    command: CorrectionTransformCommand,
+    queued: QueuedCorrectionTransform,
+) -> None:
+    """Start one process-owned worker independent of the Corrections window."""
+
+    if not isinstance(service, CorrectionTransformService):
+        raise TypeError("service must be CorrectionTransformService")
+    if not isinstance(command, CorrectionTransformCommand):
+        raise TypeError("command must be CorrectionTransformCommand")
+    if not isinstance(queued, QueuedCorrectionTransform):
+        raise TypeError("queued must be QueuedCorrectionTransform")
+    if not service.executable:
+        raise EngineRepositoryError(
+            "the correction transform executor is unavailable",
+            code="correction_transform_executor_unavailable",
+            retryable=True,
+        )
+
+    job_id = queued.job_id
+    with _correction_transform_runs_lock:
+        if job_id in _correction_transform_runs:
+            return
+        _correction_transform_runs.add(job_id)
+
+    def run() -> None:
+        try:
+            service.execute_queued(command)
+        except EngineConflictError as exc:
+            if exc.code != "correction_job_already_claimed":
+                log.exception(
+                    "Correction transform conflicted: job=%s",
+                    job_id,
+                )
+        except Exception:
+            # The worker records pre-commit failures on the shared JobManager;
+            # logging here is the process-level diagnostic, not a second state
+            # transition.
+            log.exception("Correction transform failed: job=%s", job_id)
+        finally:
+            with _correction_transform_runs_lock:
+                _correction_transform_runs.discard(job_id)
+
+    worker = threading.Thread(
+        target=run,
+        daemon=True,
+        name=f"correction-transform-{job_id}",
+    )
+    try:
+        worker.start()
+    except BaseException:
+        with _correction_transform_runs_lock:
+            _correction_transform_runs.discard(job_id)
+        raise
 
 
 def _replica_engine() -> ReplicaApplicationService:

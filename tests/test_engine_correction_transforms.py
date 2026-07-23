@@ -375,6 +375,33 @@ def test_queue_is_idempotent_and_operation_reuse_conflicts() -> None:
     assert conflict.value.code == "correction_operation_conflict"
 
 
+def test_service_executes_a_queued_command_through_its_injected_runner() -> None:
+    source = _source()
+    command = _command(source)
+    jobs = JobManager(checkpoint_interval=0)
+    store = MemoryStore(source)
+    worker = CorrectionTransformWorker(jobs, store)
+    service = CorrectionTransformService(jobs, executor=worker.run)
+    queued = service.queue(command)
+
+    result = service.execute_queued(command)
+
+    assert service.executable is True
+    assert result.job_id == queued.job_id
+    assert jobs.view(queued.job_id).state.value == "done"
+    assert len(store.commits) == 1
+
+
+def test_queue_only_service_reports_that_no_executor_was_composed() -> None:
+    service = CorrectionTransformService(JobManager())
+    command = _command()
+    service.queue(command)
+
+    assert service.executable is False
+    with pytest.raises(RuntimeError, match="executor is unavailable"):
+        service.execute_queued(command)
+
+
 def test_queue_rejects_an_unrelated_job_at_the_deterministic_identity() -> None:
     command = _command()
     jobs = JobManager()

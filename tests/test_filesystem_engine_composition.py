@@ -52,6 +52,7 @@ from librarytool.engine.canvases import CanvasExtent
 from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.correction_projection import CorrectionProjectionService
 from librarytool.engine.corrections import CorrectionService
+from librarytool.engine.correction_transforms import CorrectionTransformService
 from librarytool.engine.errors import ConflictError, RepositoryError, ValidationError
 from librarytool.engine.interchange import (
     LibImportPlan,
@@ -86,6 +87,7 @@ from librarytool.engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -891,6 +893,7 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
     assert engine.get_service(RASTER_ARTIFACT_QUERY_SERVICE) is None
     assert engine.get_service(SPATIAL_ANNOTATION_QUERY_SERVICE) is None
     assert engine.get_service(CORRECTION_SERVICE) is None
+    assert engine.get_service(CORRECTION_TRANSFORM_SERVICE) is None
     assert "library.corrections.artifacts" not in {
         row["id"] for row in document["modules"]
     }
@@ -900,6 +903,7 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
     assert {
         "library.raster-artifacts.read",
         "library.raster-artifacts.classify",
+        "library.corrections.transforms.queue",
         "library.spatial-annotations.read",
         "library.spatial-annotations.edit",
     }.isdisjoint(row["id"] for row in document["capabilities"])
@@ -928,9 +932,12 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
     spatial = engine.require_service(SPATIAL_ANNOTATION_QUERY_SERVICE)
     corrections = engine.require_service(CORRECTION_SERVICE)
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
     assert raster is spatial
     assert isinstance(raster, CorrectionProjectionService)
     assert isinstance(corrections, CorrectionService)
+    assert isinstance(transforms, CorrectionTransformService)
+    assert transforms.executable is True
     assert isinstance(raster, FilesystemRasterResourceResolverPort)
     assert raster.list_raster_artifacts("book-one") == ()
     assert spatial.list_spatial_annotations("book-one") == ()
@@ -955,6 +962,15 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     assert commands["provides"] == [
         {"id": "library.raster-artifacts.classify", "version": 1},
         {"id": "library.spatial-annotations.edit", "version": 1},
+    ]
+    transform_module = next(
+        row
+        for row in document["modules"]
+        if row["id"] == "library.corrections.transforms"
+    )
+    assert transform_module["status"] == "available"
+    assert transform_module["provides"] == [
+        {"id": "library.corrections.transforms.queue", "version": 1},
     ]
     workbench = next(
         row

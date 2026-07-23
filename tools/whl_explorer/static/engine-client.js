@@ -1054,6 +1054,116 @@
       isCorrectionInversePayload(inverse, expected);
   }
 
+  const CORRECTION_TRANSFORM_COMMAND_FIELDS = [
+    "schema", "version", "item_id", "artifact_id", "artifact_revision",
+    "source_revision", "source_sha256", "quad", "adjustment", "rerun_ocr",
+    "operation_id",
+  ];
+  const CORRECTION_ADJUSTMENT_FIELDS = [
+    "schema", "version", "algorithm", "contrast_percent",
+    "brightness_percent", "threshold", "threshold_rule", "comparison",
+  ];
+  const CORRECTION_JOB_STATES = new Set([
+    "queued", "running", "cancelling", "cancelled", "failed", "done",
+    "interrupted",
+  ]);
+
+  function correctionThreshold(brightness) {
+    return Math.max(0, Math.min(255, Math.floor(
+      127.5 - brightness * 1.275 + 0.5,
+    )));
+  }
+
+  function isCorrectionAdjustment(value) {
+    if (value === null) return true;
+    if (!hasExactKeys(value, CORRECTION_ADJUSTMENT_FIELDS)) return false;
+    const contrast = value.contrast_percent;
+    const brightness = value.brightness_percent;
+    return value.schema === "org.whl.raster.manual-binary-adjust" &&
+      value.version === 1 && Number.isSafeInteger(value.version) &&
+      value.algorithm === "grayscale-threshold-blend-v1" &&
+      Number.isSafeInteger(contrast) && contrast >= 0 && contrast <= 100 &&
+      Number.isSafeInteger(brightness) &&
+      brightness >= -100 && brightness <= 100 &&
+      value.threshold === correctionThreshold(brightness) &&
+      value.threshold_rule ===
+        "round_half_up(127.5 - brightness_percent * 1.275), clamped_0_255" &&
+      value.comparison === "grayscale_value > threshold";
+  }
+
+  function isCorrectionTransformCommand(value) {
+    return hasExactKeys(value, CORRECTION_TRANSFORM_COMMAND_FIELDS) &&
+      value.schema === "org.whl.correction-transform-command" &&
+      value.version === 1 && Number.isSafeInteger(value.version) &&
+      isPortableIdentifier(value.item_id) &&
+      isPortableIdentifier(value.artifact_id) &&
+      isArtifactRevision(value.artifact_revision) &&
+      isArtifactRevision(value.source_revision) &&
+      typeof value.source_sha256 === "string" &&
+      /^[0-9a-f]{64}$/.test(value.source_sha256) &&
+      Array.isArray(value.quad) && value.quad.length === 4 &&
+      value.quad.every((point) =>
+        Array.isArray(point) && point.length === 2 &&
+        point.every((coordinate) =>
+          typeof coordinate === "number" && Number.isFinite(coordinate) &&
+          coordinate >= 0 && coordinate <= 1)) &&
+      isCorrectionAdjustment(value.adjustment) &&
+      typeof value.rerun_ocr === "boolean" &&
+      isPortableIdentifier(value.operation_id);
+  }
+
+  function isCorrectionTransformJob(value, command) {
+    if (!hasExactKeys(value, [
+      "id", "kind", "state", "subject", "progress", "cancellable",
+      "revision", "created_at", "updated_at", "finished_at", "note", "error",
+      "input_revisions", "outputs",
+    ]) || !isPortableIdentifier(value.id) ||
+        value.kind !== "correction.transform" ||
+        !CORRECTION_JOB_STATES.has(value.state) ||
+        !hasExactKeys(value.subject, ["item_id", "source_id"]) ||
+        value.subject.item_id !== command.item_id ||
+        value.subject.source_id !== command.artifact_id ||
+        !hasExactKeys(value.progress, [
+          "completed", "total", "unit", "phase",
+        ]) ||
+        !Number.isSafeInteger(value.progress.completed) ||
+        value.progress.completed < 0 ||
+        !Number.isSafeInteger(value.progress.total) ||
+        value.progress.total < value.progress.completed ||
+        typeof value.progress.unit !== "string" ||
+        typeof value.progress.phase !== "string" ||
+        typeof value.cancellable !== "boolean" ||
+        !Number.isSafeInteger(value.revision) || value.revision < 1 ||
+        typeof value.created_at !== "string" ||
+        typeof value.updated_at !== "string" ||
+        typeof value.finished_at !== "string" ||
+        typeof value.note !== "string" ||
+        !isObject(value.input_revisions) ||
+        !Array.isArray(value.outputs) ||
+        containsCommandFingerprint(value)) return false;
+    const inputs = value.input_revisions;
+    const inputKeys = Object.keys(inputs);
+    const allowedInputKeys = new Set([
+      "artifact_id", "artifact_revision", "source_revision", "source_sha256",
+      "operation_id", "dependent_assertions",
+    ]);
+    if (!inputKeys.every((key) => allowedInputKeys.has(key)) ||
+        inputs.artifact_id !== command.artifact_id ||
+        inputs.artifact_revision !== command.artifact_revision ||
+        inputs.source_revision !== command.source_revision ||
+        inputs.source_sha256 !== command.source_sha256 ||
+        inputs.operation_id !== command.operation_id) return false;
+    if (value.error !== null &&
+        (!isObject(value.error) || typeof value.error.code !== "string" ||
+          typeof value.error.message !== "string" ||
+          typeof value.error.retryable !== "boolean")) return false;
+    return value.outputs.every((output) =>
+      hasExactKeys(output, ["kind", "ref", "partial"]) &&
+      isPortableIdentifier(output.kind) &&
+      isPortableIdentifier(output.ref) &&
+      typeof output.partial === "boolean");
+  }
+
   function fallbackCode(status) {
     if (status === 409) return "conflict";
     if (status === 428) return "precondition-required";
@@ -1155,6 +1265,8 @@
           this._correctionAssignRegionRole(args),
         clearRegionRole: (args) =>
           this._correctionClearRegionRole(args),
+        queueTransform: (args) =>
+          this._correctionQueueTransform(args),
       });
       this.itemTombstones = Object.freeze({
         list: (args) => this._itemTombstonesList(args),
@@ -2054,6 +2166,42 @@
           method, path, null, undefined, status);
       }
       return response;
+    }
+
+    async _correctionQueueTransform({ command, signal } = {}) {
+      if (!isCorrectionTransformCommand(command)) {
+        throw new TypeError(
+          "command must be a canonical correction transform command");
+      }
+      const path = `/v1/items/${encodePart(command.item_id)}/` +
+        `raster-artifacts/${encodePart(command.artifact_id)}/transforms`;
+      const { body, status } = await this._requestJson("POST", path, {
+        headers: {
+          "Idempotency-Key": command.operation_id,
+          "If-Artifact-Match": quoteRevision(
+            command.artifact_revision, "artifactRevision"),
+        },
+        body: command,
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      });
+      const expectedStatus = body && body.replayed === true ? 200 : 202;
+      if (status !== expectedStatus || !hasExactKeys(body, [
+        "ok", "schema", "replayed", "operation_id", "job_id", "job",
+      ]) || body.ok !== true ||
+          body.schema !==
+            "librarytool.correction-transform-queue-receipt/1" ||
+          typeof body.replayed !== "boolean" ||
+          body.operation_id !== command.operation_id ||
+          !isCorrectionTransformJob(body.job, command) ||
+          body.job_id !== body.job.id ||
+          containsCommandFingerprint(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid correction transform queue receipt",
+          "POST", path, null, undefined, status);
+      }
+      return body;
     }
 
     _itemReadiness({ itemId, signal } = {}) {

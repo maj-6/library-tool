@@ -30,6 +30,7 @@ from librarytool.engine.item_lifecycle import (
     RestoreItemCommand,
 )
 from librarytool.engine.runtime import (
+    CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -374,6 +375,9 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
         SPATIAL_ANNOTATION_QUERY_SERVICE
     )
     assert server._engine_session.raster_resource_resolver is raster_artifacts
+    assert engine.require_service(
+        CORRECTION_TRANSFORM_SERVICE
+    ).executable is True
     assert engine.items is not None
     assert engine.item_commands._allow_legacy_delete is False
     assert {

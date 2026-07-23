@@ -55,10 +55,28 @@
     }
 
     function decorateRasterArtifact(value) {
+      const extensions = value && value.extensions || {};
+      const correctionsUi = extensions && extensions.corrections_ui;
+      const proposal = extensions.page_boundary_proposal ||
+        correctionsUi && correctionsUi.page_boundary_proposal || null;
+      const resource = value && value.resource;
+      const correction = value && value.resource_state === "available" &&
+          resource && typeof resource.revision === "string" &&
+          /^[0-9a-f]{64}$/.test(value.content_sha256 || "")
+        ? Object.freeze({
+            item_id: value.key && value.key.item_id,
+            artifact_id: value.key && value.key.artifact_id,
+            artifact_revision: value.revision,
+            source_revision: resource.revision,
+            source_sha256: value.content_sha256,
+            proposal,
+          })
+        : null;
       const decorated = {
         ...value,
         artifact_id: value && value.key && value.key.artifact_id,
         object_type: "raster-artifact",
+        correction,
       };
       const summary = deps.decodeArtifactSummary(decorated);
       return Object.freeze({
@@ -165,6 +183,11 @@
           ...payload,
           idempotencyKey: operationId,
         });
+      }
+      if (typeof corrections.queueTransform === "function") {
+        commands.queueTransform = ({
+          command, signal,
+        } = {}) => corrections.queueTransform({ command, signal });
       }
       return Object.keys(commands).length ? Object.freeze(commands) : null;
     }
@@ -304,7 +327,19 @@
         ...(commands ? { commands } : {}),
       });
 
-      return Object.freeze({ artifacts });
+      const invokeCommand = commands &&
+          typeof commands.queueTransform === "function"
+        ? (commandId, payload = {}) => {
+            if (commandId !== "corrections.transform.queue") {
+              return Promise.reject(capabilityError(commandId));
+            }
+            return commands.queueTransform(payload);
+          }
+        : null;
+      return Object.freeze({
+        artifacts,
+        ...(invokeCommand ? { invokeCommand } : {}),
+      });
     }
 
     return {

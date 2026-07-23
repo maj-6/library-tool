@@ -892,6 +892,16 @@ class OcrFollowupOutcomePort(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class CorrectionTransformExecutorPort(Protocol):
+    """Execute one command already registered by the transform service."""
+
+    def __call__(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> CorrectionTransformRunResult: ...
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedCorrectionTransform:
     job: JobView
@@ -911,10 +921,23 @@ class QueuedCorrectionTransform:
 
 
 class CorrectionTransformService:
-    """Register exactly one logical JobManager job per operation ID."""
+    """Register one logical job and expose an injected headless executor.
 
-    def __init__(self, jobs: JobManager) -> None:
+    Queue registration remains synchronous and deterministic. A process host
+    decides where and when to call :meth:`execute_queued`, so browser/window
+    lifetime never owns the worker.
+    """
+
+    def __init__(
+        self,
+        jobs: JobManager,
+        *,
+        executor: CorrectionTransformExecutorPort | None = None,
+    ) -> None:
+        if executor is not None and not callable(executor):
+            raise TypeError("executor must be callable or None")
         self._jobs = jobs
+        self._executor = executor
         self._lock = threading.Lock()
 
     @staticmethod
@@ -966,6 +989,24 @@ class CorrectionTransformService:
             if view is None:  # pragma: no cover - JobManager invariant
                 raise RuntimeError("tracked correction job is unavailable")
             return QueuedCorrectionTransform(view, command.fingerprint, created)
+
+    @property
+    def executable(self) -> bool:
+        return self._executor is not None
+
+    def execute_queued(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> CorrectionTransformRunResult:
+        if not isinstance(command, CorrectionTransformCommand):
+            raise TypeError("command must be CorrectionTransformCommand")
+        executor = self._executor
+        if executor is None:
+            raise RuntimeError("the correction transform executor is unavailable")
+        result = executor(command)
+        if not isinstance(result, CorrectionTransformRunResult):
+            raise TypeError("correction transform executor returned an invalid result")
+        return result
 
     @staticmethod
     def _replayed(
@@ -1635,6 +1676,7 @@ __all__ = [
     "CorrectionTransformCommand",
     "CorrectionTransformCommitDraft",
     "CorrectionTransformCommitResult",
+    "CorrectionTransformExecutorPort",
     "CorrectionTransformHooksPort",
     "CorrectionTransformRunResult",
     "CorrectionTransformService",

@@ -32,6 +32,11 @@ from librarytool.engine.corrections import (
     CorrectionCommandResult,
     CorrectionService,
 )
+from librarytool.engine.correction_transforms import (
+    CorrectionTransformCommand,
+    CorrectionTransformService,
+    QueuedCorrectionTransform,
+)
 from librarytool.engine.raster_artifacts import (
     RasterArtifactKey,
     RasterArtifactProjectorPort,
@@ -41,6 +46,7 @@ from librarytool.engine.raster_artifacts import (
 )
 from librarytool.engine.runtime import (
     CORRECTION_SERVICE,
+    CORRECTION_TRANSFORM_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
     LibraryEngine,
@@ -54,7 +60,25 @@ from librarytool.engine.spatial_annotations import (
 
 ARTIFACT_PAGE_LIMIT = 512
 CORRECTION_MUTATION_MAX_BYTES = 64 * 1024
+CORRECTION_TRANSFORM_QUEUE_SCHEMA = (
+    "librarytool.correction-transform-queue-receipt/1"
+)
 _CURSOR_SCHEMA = "librarytool.corrections-cursor/1"
+_TRANSFORM_COMMAND_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "item_id",
+        "artifact_id",
+        "artifact_revision",
+        "source_revision",
+        "source_sha256",
+        "quad",
+        "adjustment",
+        "rerun_ocr",
+        "operation_id",
+    }
+)
 _RASTER_GROUP_KINDS = {
     "source-images": frozenset(
         {"capture", "captured-image", "page-image", "scan", "source-image"}
@@ -175,6 +199,16 @@ def _correction_service(
         engine_for_request,
         CORRECTION_SERVICE,
         "correction command",
+    )
+
+
+def _correction_transform_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionTransformService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_TRANSFORM_SERVICE,
+        "correction transform",
     )
 
 
@@ -324,6 +358,81 @@ def _mutation_response(result: CorrectionCommandResult) -> Response:
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Aggregate-Revision"] = result.receipt.after_aggregate_revision
     return response
+
+
+def _queue_transform(
+    engine_for_request: Callable[[], LibraryEngine],
+    submitter: Callable[
+        [
+            CorrectionTransformService,
+            CorrectionTransformCommand,
+            QueuedCorrectionTransform,
+        ],
+        None,
+    ]
+    | None,
+    item_id: str,
+    artifact_id: str,
+) -> tuple[Response, int]:
+    operation_id = _operation_id()
+    expected_revision = _strong_revision("If-Artifact-Match")
+    command = CorrectionTransformCommand.from_dict(
+        _mutation_document(_TRANSFORM_COMMAND_FIELDS)
+    )
+    mismatched = []
+    if command.item_id != item_id:
+        mismatched.append("item_id")
+    if command.artifact_id != artifact_id:
+        mismatched.append("artifact_id")
+    if command.artifact_revision != expected_revision:
+        mismatched.append("artifact_revision")
+    if command.operation_id != operation_id:
+        mismatched.append("operation_id")
+    if mismatched:
+        raise ValidationError(
+            "the correction transform envelope does not match its command",
+            code="correction_transform_envelope_mismatch",
+            details={"mismatched": mismatched},
+        )
+    if submitter is None:
+        raise RepositoryError(
+            "the correction transform executor is unavailable",
+            code="correction_transform_executor_unavailable",
+            retryable=True,
+        )
+
+    service = _correction_transform_service(engine_for_request)
+    queued = service.queue(command)
+    if queued.job.state.value in {"queued", "cancelling"}:
+        try:
+            submitter(service, command, queued)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the correction transform executor is unavailable",
+                code="correction_transform_executor_unavailable",
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+    job = queued.job.as_dict()
+    input_revisions = dict(job["input_revisions"])
+    input_revisions.pop("command_sha256", None)
+    job["input_revisions"] = input_revisions
+    response = jsonify(
+        {
+            "ok": True,
+            "schema": CORRECTION_TRANSFORM_QUEUE_SCHEMA,
+            "replayed": not queued.created,
+            "operation_id": command.operation_id,
+            "job_id": queued.job_id,
+            "job": job,
+        }
+    )
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Location"] = f"/api/v1/jobs/{queued.job_id}"
+    return response, 202 if queued.created else 200
 
 
 def _assign_category(
@@ -873,6 +982,15 @@ def create_corrections_blueprint(
     engine_for_request: Callable[[], LibraryEngine],
     *,
     raster_resource_resolver_for_request: Callable[[], Any] | None = None,
+    correction_transform_submitter: Callable[
+        [
+            CorrectionTransformService,
+            CorrectionTransformCommand,
+            QueuedCorrectionTransform,
+        ],
+        None,
+    ]
+    | None = None,
 ) -> Blueprint:
     """Create the optional Corrections read transport."""
 
@@ -884,6 +1002,13 @@ def create_corrections_blueprint(
     ):
         raise TypeError(
             "raster_resource_resolver_for_request must be callable or None"
+        )
+    if (
+        correction_transform_submitter is not None
+        and not callable(correction_transform_submitter)
+    ):
+        raise TypeError(
+            "correction_transform_submitter must be callable or None"
         )
 
     blueprint = Blueprint("librarytool_corrections", __name__)
@@ -916,6 +1041,20 @@ def create_corrections_blueprint(
             return _resource_response(
                 engine_for_request,
                 raster_resource_resolver_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.post(
+        "/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/transforms"
+    )
+    def queue_correction_transform(item_id: str, artifact_id: str):
+        try:
+            return _queue_transform(
+                engine_for_request,
+                correction_transform_submitter,
                 item_id,
                 artifact_id,
             )
@@ -994,5 +1133,6 @@ def create_corrections_blueprint(
 __all__ = [
     "ARTIFACT_PAGE_LIMIT",
     "CORRECTION_MUTATION_MAX_BYTES",
+    "CORRECTION_TRANSFORM_QUEUE_SCHEMA",
     "create_corrections_blueprint",
 ]
