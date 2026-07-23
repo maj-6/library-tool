@@ -52,6 +52,20 @@ function artifact(overrides = {}) {
       text: "Human caption",
       language: "en",
     },
+    role_assignments: [
+      {
+        origin: "manual",
+        revision: "role-manual-r1",
+        role: "figure",
+      },
+      {
+        origin: "machine",
+        revision: "role-machine-r1",
+        role: "text",
+        confidence: 0.73,
+      },
+    ],
+    effective_role: "figure",
     provenance: {
       origin: "ocr",
       provider_id: "mistral",
@@ -87,6 +101,10 @@ test("Properties visibly separates immutable machine facts from human assertions
   assert.match(cards[0].textContent, /Machine and source facts/);
   assert.match(cards[0].textContent, /Mistral/i);
   assert.match(cards[0].textContent, /Machine caption/);
+  assert.match(cards[0].textContent, /Machine roletext/);
+  assert.match(cards[0].textContent, /Machine role confidence0\.73/);
+  assert.match(cards[0].textContent, /Human role overridefigure/);
+  assert.match(cards[0].textContent, /Human caption overrideHuman caption/);
   assert.match(cards[1].textContent, /Human assertions/);
   assert.match(cards[1].textContent, /Manual caption/);
   assert.match(cards[1].textContent, /Human assertion at caption-manual-r1/);

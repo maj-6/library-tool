@@ -16,7 +16,6 @@ const {
 } = require("../tools/whl_explorer/static/corrections/artifact-overlay");
 const {
   FakeNode,
-  fakeDocument,
 } = require("./fixtures/corrections_fake_dom");
 
 
@@ -69,6 +68,34 @@ function region(overrides = {}) {
     source: { representationRevision: "scan-r4" },
     ...overrides,
   };
+}
+
+
+function focusAwareDocument() {
+  let documentRef = null;
+  class FocusAwareNode extends FakeNode {
+    contains(node) {
+      if (node === this) return true;
+      return this.children.some((child) =>
+        child && typeof child.contains === "function" && child.contains(node));
+    }
+
+    replaceChildren(...nodes) {
+      const active = documentRef.activeElement;
+      if (active && this.contains(active)) {
+        active.emit("blur");
+        if (documentRef.activeElement === active) documentRef.activeElement = null;
+      }
+      super.replaceChildren(...nodes);
+    }
+  }
+  documentRef = {
+    activeElement: null,
+    createElement(name) {
+      return new FocusAwareNode(name, documentRef);
+    },
+  };
+  return documentRef;
 }
 
 
@@ -195,7 +222,7 @@ test("concise overlay codes and metadata retain machine evidence and human overr
 
 
 test("overlay renderer exposes named focusable polygons and recomputes on resize", () => {
-  const documentRef = fakeDocument();
+  const documentRef = focusAwareDocument();
   const root = new FakeNode("div", documentRef);
   root.clientWidth = 200;
   root.clientHeight = 100;
@@ -246,10 +273,11 @@ test("overlay renderer exposes named focusable polygons and recomputes on resize
   marker.emit("pointerenter");
   assert.equal(wrapper.dataset.hot, "true");
   assert.equal(soft.at(-1)[0], "annotation:region-1");
-  marker.emit("focus");
+  marker.focus();
   assert.equal(wrapper.dataset.focused, "true");
   assert.equal(wrapper.getAttribute("aria-current"), "true");
   assert.equal(focused.at(-1)[0], "annotation:region-1");
+  assert.equal(documentRef.activeElement, marker);
   marker.emit("click");
   assert.deepEqual(activated, ["annotation:region-1"]);
 
@@ -257,8 +285,36 @@ test("overlay renderer exposes named focusable polygons and recomputes on resize
   root.clientHeight = 200;
   observerCallback();
   const resized = root.querySelector("[data-overlay-key]");
+  const resizedMarker = resized.querySelector(
+    ".corrections-artifact-overlay-shape");
   assert.equal(resized.style.left, "40.000px");
   assert.equal(resized.style.width, "200.000px");
+  assert.notEqual(resizedMarker, marker);
+  assert.equal(documentRef.activeElement, resizedMarker,
+    "ResizeObserver rerenders restore the surviving focused marker");
+  assert.equal(overlay.focusedKey, "annotation:region-1");
+  assert.equal(resized.dataset.focused, "true");
+
+  const softCount = soft.length;
+  const focusedCount = focused.length;
+  overlay.setRegions([region({
+    key: "annotation:region-2",
+    id: "region-2",
+    label: "Replacement plate",
+  })]);
+  assert.equal(overlay.hotKey, "");
+  assert.equal(overlay.focusedKey, "");
+  assert.equal(soft.length, softCount + 1);
+  assert.equal(focused.length, focusedCount + 1);
+  assert.equal(soft.at(-1)[0], null,
+    "a removed hot region emits an explicit null target");
+  assert.equal(focused.at(-1)[0], null,
+    "a removed focused region emits an explicit null target");
+  assert.equal(documentRef.activeElement, null);
+  assert.equal(
+    root.querySelector("[data-overlay-key]").dataset.overlayKey,
+    "annotation:region-2",
+  );
 
   overlay.destroy();
   assert.equal(disconnected, true);

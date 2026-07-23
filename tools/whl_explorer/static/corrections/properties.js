@@ -31,6 +31,12 @@
       return assertions.find((assertion) => assertion.origin === origin) || null;
     }
 
+    function roleAssertionByOrigin(detail, origin) {
+      const assertions = Array.isArray(detail && detail.roleAssignments)
+        ? detail.roleAssignments : [];
+      return assertions.find((assertion) => assertion.origin === origin) || null;
+    }
+
     function effectiveCaption(detail) {
       if (detail && detail.effectiveCaption) return detail.effectiveCaption;
       for (const origin of ["manual", "imported", "inherited", "machine"]) {
@@ -102,8 +108,13 @@
 
     let operationCounter = 0;
     function defaultOperationId() {
+      const cryptoRef = typeof globalThis !== "undefined" && globalThis.crypto;
+      if (cryptoRef && typeof cryptoRef.randomUUID === "function") {
+        return `caption-${cryptoRef.randomUUID()}`;
+      }
       operationCounter += 1;
-      return `caption-${Date.now().toString(36)}-${operationCounter.toString(36)}`;
+      return `caption-${Date.now().toString(36)}-${Math.random()
+        .toString(36).slice(2)}-${operationCounter.toString(36)}`;
     }
 
     class PropertiesInspector {
@@ -182,7 +193,10 @@
 
       machineRows() {
         const detail = this.detail;
-        const machine = assertionByOrigin(detail, "machine");
+        const machineCaption = assertionByOrigin(detail, "machine");
+        const manualCaption = assertionByOrigin(detail, "manual");
+        const machineRole = roleAssertionByOrigin(detail, "machine");
+        const manualRole = roleAssertionByOrigin(detail, "manual");
         const effective = effectiveCaption(detail);
         const provenance = detail && detail.provenance || {};
         const source = detail && detail.source || {};
@@ -197,9 +211,16 @@
           ["Effective role", detail.effectiveRole || "unlabeled"],
           ["Effective caption", effective ? effective.text : "—"],
           ["Effective caption source", effective ? effective.origin : "—"],
-          ["Machine caption", machine ? machine.text : "—"],
-          ["Machine confidence", machine && machine.confidence != null
-            ? machine.confidence : "—"],
+          ["Machine role", machineRole ? machineRole.role : "—"],
+          ["Machine role confidence",
+            machineRole && machineRole.confidence != null
+              ? machineRole.confidence : "—"],
+          ["Human role override", manualRole ? manualRole.role : "—"],
+          ["Machine caption", machineCaption ? machineCaption.text : "—"],
+          ["Machine caption confidence",
+            machineCaption && machineCaption.confidence != null
+              ? machineCaption.confidence : "—"],
+          ["Human caption override", manualCaption ? manualCaption.text : "—"],
           ["Provider", provenance.provider_id || provenance.providerId || "—"],
           ["Model", provenance.model || "—"],
           ["Origin", provenance.origin || "—"],

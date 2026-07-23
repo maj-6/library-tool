@@ -817,6 +817,18 @@
     }
   }
 
+  function nodeInside(root, node) {
+    if (!root || !node) return false;
+    if (root === node) return true;
+    if (typeof root.contains === "function") return root.contains(node);
+    let cursor = node;
+    while (cursor) {
+      if (cursor === root) return true;
+      cursor = cursor.parentNode;
+    }
+    return false;
+  }
+
   function captureState(capture) {
     if (capture.import_state === "pending") return "Pending import";
     if (capture.resource_state === "missing" || capture.import_state === "missing") {
@@ -970,9 +982,49 @@
       });
     }
 
+    focusedCapture(list) {
+      const active = this.documentRef && this.documentRef.activeElement;
+      if (!active || !nodeInside(list, active)) return null;
+      let owner = active;
+      while (owner && owner !== list) {
+        const dataset = owner.dataset || {};
+        if (dataset.itemId && dataset.artifactId) {
+          return Object.freeze({
+            itemId: dataset.itemId,
+            artifactId: dataset.artifactId,
+          });
+        }
+        owner = owner.parentNode;
+      }
+      return null;
+    }
+
+    captureElement(list, capture) {
+      if (!capture || !list ||
+          typeof list.querySelectorAll !== "function") return null;
+      return Array.from(list.querySelectorAll("[data-artifact-id]"))
+        .find((candidate) => {
+          const dataset = candidate.dataset || {};
+          return dataset.itemId === capture.itemId &&
+            dataset.artifactId === capture.artifactId;
+        }) || null;
+    }
+
+    restoreCaptureFocus(list, capture) {
+      const button = this.captureElement(list, capture);
+      if (button && typeof button.focus === "function") {
+        try {
+          button.focus({ preventScroll: true });
+        } catch (error) {
+          button.focus();
+        }
+      }
+    }
+
     render(snapshot) {
-      for (const remove of this.rowListeners.splice(0)) remove();
       const list = this.root.querySelector("[data-books-list]");
+      const focusedCapture = this.focusedCapture(list);
+      for (const remove of this.rowListeners.splice(0)) remove();
       const count = this.root.querySelector("[data-books-count]");
       if (!list || !this.documentRef) return;
       const books = this.visibleBooks(snapshot);
@@ -1019,6 +1071,7 @@
         return;
       }
       for (const book of books) list.append(this.renderBook(book, snapshot));
+      this.restoreCaptureFocus(list, focusedCapture);
     }
 
     renderMessage(list, title, message, error = false) {
@@ -1088,6 +1141,7 @@
           addressEqual(snapshot.selection, captureAddress(book, capture));
         setAttribute(button, "aria-pressed", captureSelected ? "true" : "false");
         if (button.dataset) {
+          button.dataset.itemId = book.id;
           button.dataset.artifactId = capture.artifact_id;
           button.dataset.category = capture.effective_category;
           button.dataset.resourceState = capture.resource_state;
@@ -1126,12 +1180,16 @@
             focused: true,
             source: "books",
           }));
-        this.listenRow(button, "blur", () =>
-          this.onSelectionTarget(captureSelected ? commandTarget : null, {
-            element: button,
+        this.listenRow(button, "blur", () => {
+          const selection = this.store.snapshot().selection;
+          const selectedTarget = this.commandTargetForSelection(selection);
+          const list = this.root.querySelector("[data-books-list]");
+          this.onSelectionTarget(selectedTarget, {
+            element: this.captureElement(list, selection),
             focused: false,
             source: "books",
-          }));
+          });
+        });
         this.listenRow(button, "click", () => {
           this.onSelectionTarget(commandTarget, {
             element: button,

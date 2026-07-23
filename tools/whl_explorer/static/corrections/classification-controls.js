@@ -40,6 +40,32 @@
       });
     }
 
+    function nodeInside(root, node) {
+      if (!root || !node) return false;
+      if (root === node) return true;
+      if (typeof root.contains === "function") return root.contains(node);
+      let cursor = node;
+      while (cursor) {
+        if (cursor === root) return true;
+        cursor = cursor.parentNode;
+      }
+      return false;
+    }
+
+    function removeNode(node) {
+      if (!node) return;
+      if (typeof node.remove === "function") node.remove();
+      else if (node.parentNode && typeof node.parentNode.removeChild === "function") {
+        node.parentNode.removeChild(node);
+      }
+    }
+
+    function rememberNode(map, key, node) {
+      const nodes = map.get(key) || [];
+      nodes.push(node);
+      map.set(key, nodes);
+    }
+
     class ClassificationControls {
       constructor(options = {}) {
         if (!options.root || typeof options.root.replaceChildren !== "function") {
@@ -55,6 +81,14 @@
         this.documentRef = options.documentRef || this.root.ownerDocument;
         this.controller = options.controller;
         this.registry = this.controller.registry;
+        this.toolbarRoot = options.toolbarRoot || null;
+        this.contextScope = options.contextScope || this.controller.scope || null;
+        this.paletteTrigger = options.paletteTrigger || null;
+        this.windowRef = options.windowRef ||
+          this.documentRef && this.documentRef.defaultView || null;
+        this.isContextMenuEvent =
+          typeof options.isContextMenuEvent === "function"
+            ? options.isContextMenuEvent : () => false;
         this.onError = typeof options.onError === "function"
           ? options.onError : () => {};
         this.onBindingsChanged = typeof options.onBindingsChanged === "function"
@@ -69,6 +103,13 @@
         this.status = null;
         this.unsubscribeRegistry = null;
         this.unsubscribeController = null;
+        this.contextMenu = null;
+        this.contextMenuEntries = Object.freeze([]);
+        this.contextMenuReturnFocus = null;
+        this.palette = null;
+        this.paletteList = null;
+        this.paletteSearch = null;
+        this.paletteEntries = Object.freeze([]);
         this.mounted = false;
         this.destroyed = false;
       }
@@ -125,6 +166,9 @@
         const shortcutEditor = this.shortcutEditor();
         surface.append(title, hint, toolbar, shortcutEditor);
         this.root.append(surface);
+        this.mountWorkspaceToolbar();
+        this.mountContextMenu();
+        this.mountPalette();
         this.unsubscribeRegistry = this.registry.subscribe((change) => {
           this.refresh();
           if (change.type === "remapped") {
@@ -138,11 +182,13 @@
         return this;
       }
 
-      commandButton(command) {
+      commandButton(command, options = {}) {
+        const compact = options.compact === true;
         const button = element(
           this.documentRef,
           "button",
-          "classification-command-button",
+          `classification-command-button${
+            compact ? " classification-command-button-compact" : ""}`,
         );
         button.type = "button";
         button.dataset.classificationCommand = command.id;
@@ -160,21 +206,400 @@
           "classification-command-label",
           command.shortLabel,
         );
+        if (compact) label.className += " sr-only";
         const key = element(
           this.documentRef,
           "kbd",
           "classification-command-key",
         );
+        if (compact) key.className += " sr-only";
         key.setAttribute("aria-hidden", "true");
         button.append(code, label, key);
-        this.commandButtons.set(command.id, button);
-        this.commandKeys.set(command.id, key);
+        rememberNode(this.commandButtons, command.id, button);
+        rememberNode(this.commandKeys, command.id, key);
         this.controlBindings.push(this.controller.bindControl(
           command.id,
           button,
           { onError: (error) => this.handleCommandError(error, command) },
         ));
         return button;
+      }
+
+      mountWorkspaceToolbar() {
+        if (!this.toolbarRoot ||
+            typeof this.toolbarRoot.replaceChildren !== "function") return;
+        clearNode(this.toolbarRoot);
+        this.toolbarRoot.setAttribute("role", "toolbar");
+        this.toolbarRoot.setAttribute(
+          "aria-label",
+          this.toolbarRoot.getAttribute("aria-label") || "Classification commands",
+        );
+        for (const command of this.definitions()) {
+          this.toolbarRoot.append(this.commandButton(command, { compact: true }));
+        }
+      }
+
+      surfaceEntries(target = null) {
+        if (typeof this.controller.paletteEntries === "function") {
+          return this.controller.paletteEntries(target);
+        }
+        const baseContext = typeof this.controller.commandContext === "function"
+          ? this.controller.commandContext("command-surface") : {};
+        const context = target
+          ? {
+            ...baseContext,
+            focusedTarget: target,
+            selectionTarget: target,
+            softTarget: null,
+          }
+          : baseContext;
+        return this.registry.list().map((command) => Object.freeze({
+          id: command.id,
+          label: command.label,
+          code: command.code,
+          binding: command.binding,
+          bindingLabel: command.bindingLabel,
+          available: this.registry.canInvoke(command.id, context),
+          invoke: () => this.controller.invoke(command.id, {
+            source: "command-surface",
+            context,
+          }),
+        }));
+      }
+
+      surfaceCommandButton(entry, surface, close) {
+        const button = element(
+          this.documentRef,
+          "button",
+          `classification-surface-command classification-${surface}-command`,
+        );
+        button.type = "button";
+        button.dataset.surfaceCommand = entry.id;
+        if (surface === "context-menu") button.setAttribute("role", "menuitem");
+        const code = element(
+          this.documentRef,
+          "span",
+          "classification-surface-code",
+          entry.code,
+        );
+        code.setAttribute("aria-hidden", "true");
+        const label = element(
+          this.documentRef,
+          "span",
+          "classification-surface-label",
+          entry.label,
+        );
+        const key = element(
+          this.documentRef,
+          "kbd",
+          "classification-surface-key",
+          entry.bindingLabel,
+        );
+        key.setAttribute("aria-hidden", "true");
+        button.append(code, label, key);
+        button.disabled = entry.available !== true;
+        button.setAttribute(
+          "aria-label",
+          `${entry.label}${entry.binding ? ` (${entry.bindingLabel})` : ""}`,
+        );
+        if (entry.binding) {
+          button.setAttribute(
+            "aria-keyshortcuts",
+            commands.ariaKeyBinding(entry.binding),
+          );
+        }
+        button.addEventListener("click", () => {
+          if (button.disabled) return;
+          let invocation;
+          try {
+            invocation = entry.invoke();
+          } catch (error) {
+            this.handleCommandError(error, this.registry.get(entry.id) || entry);
+            return;
+          }
+          close();
+          Promise.resolve(invocation).catch((error) =>
+            this.handleCommandError(error, this.registry.get(entry.id) || entry));
+        });
+        return button;
+      }
+
+      mountContextMenu() {
+        if (!this.contextScope ||
+            typeof this.contextScope.addEventListener !== "function" ||
+            typeof this.contextScope.append !== "function") return;
+        const menu = element(
+          this.documentRef,
+          "div",
+          "classification-context-menu",
+        );
+        menu.dataset.classificationContextMenu = "true";
+        menu.setAttribute("role", "menu");
+        menu.setAttribute("aria-label", "Classification commands");
+        menu.hidden = true;
+        this.contextScope.append(menu);
+        this.contextMenu = menu;
+
+        this.listen(this.contextScope, "contextmenu", (event) => {
+          const contextTarget = this.isContextMenuEvent(event);
+          if (!contextTarget) return;
+          const entries = this.surfaceEntries(
+            typeof contextTarget === "object" ? contextTarget : null,
+          ).filter(
+            (entry) => entry.available === true);
+          if (!entries.length) return;
+          event.preventDefault();
+          this.openContextMenu(event, entries);
+        });
+        this.listen(this.contextScope, "pointerdown", (event) => {
+          if (!this.contextMenu || this.contextMenu.hidden ||
+              nodeInside(this.contextMenu, event.target)) return;
+          this.closeContextMenu(false);
+        });
+        this.listen(menu, "keydown", (event) => this.handleContextMenuKeydown(event));
+      }
+
+      openContextMenu(event, entries) {
+        if (!this.contextMenu) return;
+        this.closePalette(false);
+        this.contextMenuEntries = Object.freeze([...entries]);
+        this.contextMenuReturnFocus = event && event.target || null;
+        clearNode(this.contextMenu);
+        for (const entry of this.contextMenuEntries) {
+          this.contextMenu.append(this.surfaceCommandButton(
+            entry,
+            "context-menu",
+            () => this.closeContextMenu(false),
+          ));
+        }
+        this.contextMenu.hidden = false;
+        const viewportWidth = Number(this.windowRef && this.windowRef.innerWidth) || 1280;
+        const viewportHeight = Number(this.windowRef && this.windowRef.innerHeight) || 800;
+        const menuWidth = Number(this.contextMenu.offsetWidth) || 248;
+        const menuHeight = Number(this.contextMenu.offsetHeight) ||
+          this.contextMenuEntries.length * 38;
+        const rect = event && event.target &&
+          typeof event.target.getBoundingClientRect === "function"
+          ? event.target.getBoundingClientRect() : null;
+        const requestedX = Number(event && event.clientX) ||
+          Number(rect && rect.left) || 8;
+        const requestedY = Number(event && event.clientY) ||
+          Number(rect && rect.bottom) || 8;
+        this.contextMenu.style.left = `${Math.max(
+          8,
+          Math.min(requestedX, Math.max(8, viewportWidth - menuWidth - 8)),
+        )}px`;
+        this.contextMenu.style.top = `${Math.max(
+          8,
+          Math.min(requestedY, Math.max(8, viewportHeight - menuHeight - 8)),
+        )}px`;
+        const first = this.contextMenu.querySelector(
+          "[data-surface-command]",
+        );
+        if (first && typeof first.focus === "function") first.focus();
+      }
+
+      handleContextMenuKeydown(event) {
+        if (!this.contextMenu || this.contextMenu.hidden) return;
+        if (event.key === "Escape") {
+          event.preventDefault();
+          if (typeof event.stopPropagation === "function") event.stopPropagation();
+          this.closeContextMenu(true);
+          return;
+        }
+        const buttons = Array.from(this.contextMenu.querySelectorAll(
+          "[data-surface-command]",
+        )).filter((button) => !button.disabled);
+        if (!buttons.length ||
+            !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+        const active = this.documentRef && this.documentRef.activeElement;
+        const current = Math.max(0, buttons.indexOf(active));
+        const index = event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? buttons.length - 1
+            : event.key === "ArrowUp"
+              ? (current - 1 + buttons.length) % buttons.length
+              : (current + 1) % buttons.length;
+        event.preventDefault();
+        buttons[index].focus();
+      }
+
+      closeContextMenu(restoreFocus = false) {
+        if (!this.contextMenu) return;
+        this.contextMenu.hidden = true;
+        clearNode(this.contextMenu);
+        this.contextMenuEntries = Object.freeze([]);
+        const returnFocus = this.contextMenuReturnFocus;
+        this.contextMenuReturnFocus = null;
+        if (restoreFocus && returnFocus &&
+            typeof returnFocus.focus === "function") returnFocus.focus();
+      }
+
+      mountPalette() {
+        if (!this.contextScope ||
+            typeof this.contextScope.append !== "function" ||
+            !this.paletteTrigger) return;
+        const palette = element(
+          this.documentRef,
+          "dialog",
+          "classification-command-palette",
+        );
+        palette.id = `${this.id}-palette`;
+        palette.dataset.classificationPalette = "true";
+        palette.setAttribute("role", "dialog");
+        palette.setAttribute("aria-modal", "true");
+        palette.setAttribute("aria-labelledby", `${this.id}-palette-title`);
+        palette.hidden = true;
+
+        const surface = element(
+          this.documentRef,
+          "section",
+          "classification-command-palette-surface",
+        );
+        const header = element(
+          this.documentRef,
+          "header",
+          "classification-command-palette-header",
+        );
+        const title = element(
+          this.documentRef,
+          "h2",
+          "",
+          "Classification command palette",
+        );
+        title.id = `${this.id}-palette-title`;
+        const close = element(
+          this.documentRef,
+          "button",
+          "classification-command-palette-close",
+          "Close",
+        );
+        close.type = "button";
+        close.setAttribute("aria-label", "Close command palette");
+        header.append(title, close);
+        const searchLabel = element(
+          this.documentRef,
+          "label",
+          "classification-command-palette-search-label",
+          "Filter commands",
+        );
+        const search = element(
+          this.documentRef,
+          "input",
+          "classification-command-palette-search",
+        );
+        search.type = "search";
+        search.id = `${this.id}-palette-search`;
+        searchLabel.htmlFor = search.id;
+        const list = element(
+          this.documentRef,
+          "div",
+          "classification-command-palette-list",
+        );
+        list.setAttribute("role", "group");
+        list.setAttribute("aria-label", "Classification commands");
+        surface.append(header, searchLabel, search, list);
+        palette.append(surface);
+        this.contextScope.append(palette);
+        this.palette = palette;
+        this.paletteList = list;
+        this.paletteSearch = search;
+
+        this.paletteTrigger.setAttribute("aria-haspopup", "dialog");
+        this.paletteTrigger.setAttribute("aria-controls", palette.id);
+        this.paletteTrigger.setAttribute("aria-expanded", "false");
+        this.listen(this.paletteTrigger, "click", () => this.openPalette());
+        this.listen(close, "click", () => this.closePalette(true));
+        this.listen(search, "input", () => this.filterPalette(search.value));
+        this.listen(palette, "keydown", (event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          if (typeof event.stopPropagation === "function") event.stopPropagation();
+          this.closePalette(true);
+        });
+        this.listen(palette, "pointerdown", (event) => {
+          if (event.target === palette) this.closePalette(true);
+        });
+        this.listen(palette, "cancel", (event) => {
+          event.preventDefault();
+          this.closePalette(true);
+        });
+        this.listen(palette, "close", () => this.finishPaletteClose(false));
+      }
+
+      openPalette() {
+        if (!this.palette) return;
+        this.closeContextMenu(false);
+        this.paletteEntries = Object.freeze([...this.surfaceEntries()]);
+        clearNode(this.paletteList);
+        for (const entry of this.paletteEntries) {
+          const button = this.surfaceCommandButton(
+            entry,
+            "palette",
+            () => this.closePalette(false),
+          );
+          button.dataset.paletteSearch = [
+            entry.code,
+            entry.label,
+            entry.bindingLabel,
+          ].join(" ").toLowerCase();
+          this.paletteList.append(button);
+        }
+        this.paletteSearch.value = "";
+        this.palette.hidden = false;
+        this.paletteTrigger.setAttribute("aria-expanded", "true");
+        if (typeof this.palette.showModal === "function" && this.palette.open !== true) {
+          try {
+            this.palette.showModal();
+          } catch (error) {
+            this.palette.setAttribute("open", "");
+          }
+        } else {
+          this.palette.setAttribute("open", "");
+        }
+        if (typeof this.paletteSearch.focus === "function") {
+          this.paletteSearch.focus();
+        }
+      }
+
+      filterPalette(value) {
+        if (!this.paletteList) return;
+        const query = String(value || "").trim().toLowerCase();
+        for (const button of this.paletteList.querySelectorAll(
+          "[data-surface-command]",
+        )) {
+          button.hidden = Boolean(
+            query && !String(button.dataset.paletteSearch || "").includes(query),
+          );
+        }
+      }
+
+      finishPaletteClose(restoreFocus) {
+        if (!this.palette) return;
+        this.palette.hidden = true;
+        this.palette.removeAttribute("open");
+        this.paletteTrigger.setAttribute("aria-expanded", "false");
+        this.paletteEntries = Object.freeze([]);
+        clearNode(this.paletteList);
+        if (restoreFocus && typeof this.paletteTrigger.focus === "function") {
+          this.paletteTrigger.focus();
+        }
+      }
+
+      closePalette(restoreFocus = false) {
+        if (!this.palette || this.palette.hidden) return;
+        if (this.palette.open === true && typeof this.palette.close === "function") {
+          try {
+            this.palette.close();
+          } catch (error) {
+            this.finishPaletteClose(restoreFocus);
+            return;
+          }
+          this.finishPaletteClose(restoreFocus);
+          return;
+        }
+        this.finishPaletteClose(restoreFocus);
       }
 
       shortcutEditor() {
@@ -392,9 +817,9 @@
       refresh() {
         for (const command of this.definitions()) {
           const binding = bindingValue(this.registry, command.id);
-          const key = this.commandKeys.get(command.id);
+          const keys = this.commandKeys.get(command.id) || [];
           const input = this.shortcutInputs.get(command.id);
-          if (key) key.textContent = binding;
+          for (const key of keys) key.textContent = binding;
           if (input) {
             input.value = binding;
             input.setAttribute("aria-label",
@@ -411,6 +836,20 @@
         if (this.unsubscribeController) this.unsubscribeController();
         for (const binding of this.controlBindings) binding.destroy();
         for (const remove of this.listeners.splice(0)) remove();
+        this.closeContextMenu(false);
+        this.closePalette(false);
+        removeNode(this.contextMenu);
+        removeNode(this.palette);
+        this.contextMenu = null;
+        this.palette = null;
+        this.paletteList = null;
+        this.paletteSearch = null;
+        if (this.toolbarRoot) clearNode(this.toolbarRoot);
+        if (this.paletteTrigger) {
+          this.paletteTrigger.removeAttribute("aria-controls");
+          this.paletteTrigger.removeAttribute("aria-expanded");
+          this.paletteTrigger.removeAttribute("aria-haspopup");
+        }
         this.controlBindings = [];
         this.commandButtons.clear();
         this.commandKeys.clear();

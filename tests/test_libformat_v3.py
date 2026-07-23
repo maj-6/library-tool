@@ -360,6 +360,38 @@ def _planner() -> ExistingItemLibArchivePlanner:
     )
 
 
+def _archive_bytes(
+    manifest: dict,
+    resources: dict[str, bytes] | None = None,
+    *,
+    extra_members: dict[str, bytes] | None = None,
+) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "book.json",
+            json.dumps(manifest, ensure_ascii=False, allow_nan=False),
+        )
+        for member, content in (resources or {}).items():
+            archive.writestr(member, content)
+        for member, content in (extra_members or {}).items():
+            archive.writestr(member, content)
+    return output.getvalue()
+
+
+def _capture_manifest_and_resources() -> tuple[dict, dict[str, bytes]]:
+    document = _capture_document()
+    return (
+        libformat._capture_manifest(
+            document,
+            book_id=BOOK_ID,
+            generator="test/1",
+            instructions_book="",
+        ),
+        document.resources,
+    )
+
+
 def test_capture_only_lib3_validates_and_round_trips_every_graph_class(tmp_path):
     document = _capture_document()
     first_path = tmp_path / "capture.lib"
@@ -480,6 +512,54 @@ def test_current_item_import_refuses_capture_graph_without_discarding_it(tmp_pat
     }
 
 
+def test_current_item_import_refuses_undeclared_graph_member_with_empty_arrays():
+    archive = _archive_bytes(
+        {
+            "format_version": "3.0",
+            "book_id": BOOK_ID,
+            "pages": [],
+            "representations": [],
+            "artifacts": [],
+        },
+        extra_members={"representations/orphan.jpg": b"must not be dropped"},
+    )
+    with pytest.raises(ValidationError) as caught:
+        _planner().plan(
+            archive,
+            ImportDestinationSnapshot(item_id="destination"),
+            source_id="primary",
+            overwrite=False,
+            archive_sha256=hashlib.sha256(archive).hexdigest(),
+        )
+    assert caught.value.code == "lib3_capture_graph_import_unsupported"
+    assert caught.value.details["representations"] == 0
+    assert caught.value.details["artifacts"] == 0
+    assert caught.value.details["data_discarded"] is False
+
+
+def test_current_item_import_rejects_other_undeclared_lib3_members():
+    archive = _archive_bytes(
+        {
+            "format_version": "3.0",
+            "book_id": BOOK_ID,
+            "pages": [1],
+            "representations": [],
+            "artifacts": [],
+        },
+        extra_members={"notes/private.bin": b"must not be dropped"},
+    )
+    with pytest.raises(ValidationError) as caught:
+        _planner().plan(
+            archive,
+            ImportDestinationSnapshot(item_id="destination"),
+            source_id="primary",
+            overwrite=False,
+            archive_sha256=hashlib.sha256(archive).hexdigest(),
+        )
+    assert caught.value.code == "undeclared_lib3_member"
+    assert caught.value.details == {"member": "notes/private.bin"}
+
+
 def test_lib3_rejects_traversal_private_locators_and_checksum_mismatch(tmp_path):
     traversal = io.BytesIO()
     with zipfile.ZipFile(traversal, "w") as archive:
@@ -552,6 +632,519 @@ def test_lib3_rejects_traversal_private_locators_and_checksum_mismatch(tmp_path)
     assert caught.value.code == "lib3_checksum_mismatch"
 
 
+@pytest.mark.parametrize(
+    ("mutate", "location_fragment"),
+    [
+        (
+            lambda manifest: manifest["representations"][1].__setitem__(
+                "revision", "revision with spaces"
+            ),
+            "/revision",
+        ),
+        (
+            lambda manifest: manifest["artifacts"][0]["source"].__setitem__(
+                "representation_revision", "missing-revision"
+            ),
+            "/source/representation_revision",
+        ),
+        (
+            lambda manifest: manifest["artifacts"][3]["selector"].__setitem__(
+                "coordinate_space_revision", "wrong-canvas-revision"
+            ),
+            "/selector/coordinate_space_revision",
+        ),
+        (
+            lambda manifest: manifest["artifacts"][2]["relationships"][
+                0
+            ].__setitem__("artifact_revision", "missing-artifact-revision"),
+            "/relationships[0]/artifact_revision",
+        ),
+    ],
+    ids=[
+        "invalid-revision",
+        "source-revision-mismatch",
+        "selector-revision-mismatch",
+        "relationship-revision-mismatch",
+    ],
+)
+def test_read_lib_semantically_rejects_invalid_graphs(
+    mutate,
+    location_fragment,
+):
+    manifest, resources = _capture_manifest_and_resources()
+    mutate(manifest)
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.read_lib(_archive_bytes(manifest, resources))
+    assert caught.value.code == "invalid_lib3_graph"
+    assert any(
+        location_fragment in issue["loc"]
+        for issue in caught.value.details["issues"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("pages", "page_members"),
+    [
+        ("not-an-array", {}),
+        ([0], {}),
+        ([1, 1], {"pages/1.json": b'{"page":1,"items":[]}'}),
+        ([1], {}),
+        ([2], {"pages/1.json": b'{"page":1,"items":[]}'}),
+    ],
+    ids=[
+        "not-an-array",
+        "out-of-range",
+        "duplicate-declaration",
+        "missing-member",
+        "declared-member-mismatch",
+    ],
+)
+def test_read_lib_rejects_invalid_page_manifest_or_member_parity(
+    pages,
+    page_members,
+):
+    manifest, resources = _capture_manifest_and_resources()
+    manifest["pages"] = pages
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.read_lib(
+            _archive_bytes(
+                manifest,
+                resources,
+                extra_members=page_members,
+            )
+        )
+    assert caught.value.code == "invalid_lib3_graph"
+    assert any(
+        issue["loc"].startswith(("book.json/pages", "pages/"))
+        for issue in caught.value.details["issues"]
+    )
+
+
+def test_lib3_page_schema_and_runtime_validation_agree(tmp_path):
+    document = _capture_document()
+    document.pages = [libformat.LibPage(page=1, items=[])]
+    path = tmp_path / "legacy-page.lib"
+    libformat.write_lib(document, path)
+
+    with zipfile.ZipFile(path) as archive:
+        schema = json.loads(archive.read("schema.json"))
+    pages_schema = schema["$defs"]["bookV3"]["properties"]["pages"]
+    assert pages_schema == {
+        "type": "array",
+        "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 99999,
+        },
+        "maxItems": libformat.MAX_PAGES,
+        "uniqueItems": True,
+    }
+
+    opened = libformat.read_lib(path)
+    assert opened.book["pages"] == [1]
+    assert [page.page for page in opened.pages] == [1]
+    assert not [
+        issue for issue in libformat.validate(opened)
+        if issue.level == "error"
+    ]
+
+    opened.book["pages"] = [2]
+    issues = libformat.validate(opened)
+    assert any(
+        issue.level == "error"
+        and issue.loc == "pages/2.json"
+        and "missing" in issue.msg
+        for issue in issues
+    )
+    assert any(
+        issue.level == "error"
+        and issue.loc == "pages/1.json"
+        and "not declared" in issue.msg
+        for issue in issues
+    )
+
+
+def test_future_major_negotiates_before_lib3_graph_checks():
+    archive = _archive_bytes(
+        {
+            "format_version": "4.0",
+            "book_id": BOOK_ID,
+            "representations": [],
+            "artifacts": [],
+        },
+        extra_members={"representations/future-resource.bin": b"future"},
+    )
+    opened = libformat.read_lib(archive)
+    assert opened.format == (4, 0)
+    issues = libformat.validate(opened)
+    assert len(issues) == 1
+    assert issues[0].level == "error"
+    assert "needs a newer reader" in issues[0].msg
+
+    with pytest.raises(ValidationError) as caught:
+        _planner().plan(
+            archive,
+            ImportDestinationSnapshot(item_id="destination"),
+            source_id="primary",
+            overwrite=False,
+            archive_sha256=hashlib.sha256(archive).hexdigest(),
+        )
+    assert caught.value.code == "newer_lib_format"
+    assert caught.value.details == {"format_version": "4.0"}
+
+
+def test_validate_and_write_use_the_mutated_typed_graph_not_stale_book(
+    tmp_path,
+):
+    path = tmp_path / "capture.lib"
+    libformat.write_lib(_capture_document(), path)
+    opened = libformat.read_lib(path)
+    assert opened.book["artifacts"][0]["revision"] == "metadata-r2"
+
+    opened.artifacts[0].revision = "invalid revision"
+    issues = libformat.validate(opened)
+    assert any(
+        issue.level == "error"
+        and issue.loc == "book.json/artifacts[0]/revision"
+        for issue in issues
+    )
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.write_lib(opened, tmp_path / "invalid.lib")
+    assert caught.value.code == "invalid_lib3_graph"
+
+
+def test_from_dict_preserves_invalid_json_types_until_validation(tmp_path):
+    document = _capture_document()
+    raw_representation = document.representations[0].as_dict()
+    raw_representation["id"] = 123
+    malformed_representation = libformat.LibRepresentation.from_dict(
+        raw_representation
+    )
+    assert malformed_representation.representation_id == 123
+    document.representations = [malformed_representation]
+    document.artifacts = []
+    document.resources = {
+        "representations/capture-original.jpg": b"original capture bytes",
+    }
+    issues = libformat.validate(document)
+    assert any(
+        issue.level == "error"
+        and issue.loc == "book.json/representations[0]/id"
+        for issue in issues
+    )
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.write_lib(document, tmp_path / "numeric-id.lib")
+    assert caught.value.code == "invalid_lib3_graph"
+    malformed_representation.representation_id = "rep-original"
+    assert libformat.validate(document) == []
+    libformat.write_lib(document, tmp_path / "corrected-id.lib")
+
+    malformed_categories = _capture_document()
+    raw_artifact = malformed_categories.artifacts[1].as_dict()
+    valid_categories = raw_artifact["category_assignments"]
+    raw_artifact["category_assignments"] = {"category": "cover"}
+    malformed_artifact = libformat.LibArtifact.from_dict(raw_artifact)
+    assert malformed_artifact.category_assignments == {"category": "cover"}
+    malformed_categories.artifacts[1] = malformed_artifact
+    category_issues = libformat.validate(malformed_categories)
+    assert any(
+        issue.level == "error"
+        and "category_assignments" in issue.loc
+        for issue in category_issues
+    )
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.write_lib(
+            malformed_categories,
+            tmp_path / "object-categories.lib",
+        )
+    assert caught.value.code == "invalid_lib3_graph"
+    malformed_artifact.category_assignments = valid_categories
+    assert libformat.validate(malformed_categories) == []
+    libformat.write_lib(
+        malformed_categories,
+        tmp_path / "corrected-categories.lib",
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "collection",
+        "index",
+        "field_name",
+        "remove",
+        "invalid_value",
+    ),
+    [
+        ("representations", 0, "lineage", True, None),
+        ("representations", 0, "ext", True, None),
+        ("representations", 0, "ext", False, None),
+        ("artifacts", 0, "source", True, None),
+        ("artifacts", 0, "provenance", True, None),
+        ("artifacts", 0, "category_assignments", True, None),
+        ("artifacts", 0, "caption_assertions", True, None),
+        ("artifacts", 0, "role_assignments", True, None),
+        ("artifacts", 0, "relationships", True, None),
+        ("artifacts", 0, "ext", True, None),
+        ("artifacts", 0, "ext", False, None),
+        ("artifacts", 0, "dimensions", False, None),
+        ("artifacts", 0, "dimensions", False, []),
+        ("artifacts", 0, "dimensions", False, {}),
+        ("artifacts", 0, "selector", False, None),
+        ("artifacts", 0, "selector", False, []),
+        ("artifacts", 0, "selector", False, {}),
+    ],
+    ids=[
+        "representation-missing-lineage",
+        "representation-missing-ext",
+        "representation-null-ext",
+        "artifact-missing-source",
+        "artifact-missing-provenance",
+        "artifact-missing-categories",
+        "artifact-missing-captions",
+        "artifact-missing-roles",
+        "artifact-missing-relationships",
+        "artifact-missing-ext",
+        "artifact-null-ext",
+        "non-image-null-dimensions",
+        "non-image-array-dimensions",
+        "non-image-empty-dimensions",
+        "non-spatial-null-selector",
+        "non-spatial-array-selector",
+        "non-spatial-empty-selector",
+    ],
+)
+def test_lib3_structured_fields_never_normalize_invalid_input(
+    collection,
+    index,
+    field_name,
+    remove,
+    invalid_value,
+    tmp_path,
+):
+    manifest, resources = _capture_manifest_and_resources()
+    record = manifest[collection][index]
+    if remove:
+        record.pop(field_name)
+    else:
+        record[field_name] = invalid_value
+
+    with pytest.raises(libformat.LibError) as read_error:
+        libformat.read_lib(_archive_bytes(manifest, resources))
+    assert read_error.value.code == "invalid_lib3_graph"
+    assert any(
+        issue["loc"].endswith(f"/{field_name}")
+        for issue in read_error.value.details["issues"]
+    )
+
+    document = _capture_document()
+    if collection == "representations":
+        document.representations[index] = (
+            libformat.LibRepresentation.from_dict(record)
+        )
+    else:
+        document.artifacts[index] = libformat.LibArtifact.from_dict(record)
+
+    issues = libformat.validate(document)
+    assert any(issue.level == "error" for issue in issues)
+    with pytest.raises(libformat.LibError) as write_error:
+        libformat.write_lib(document, tmp_path / "invalid-structured.lib")
+    assert write_error.value.code in {
+        "invalid_lib3_extension",
+        "invalid_lib3_graph",
+    }
+
+
+@pytest.mark.parametrize(
+    ("artifact_index", "field_path"),
+    [
+        (0, ("provenance", "ext")),
+        (1, ("category_assignments", 0, "provenance")),
+        (1, ("category_assignments", 0, "ext")),
+        (3, ("caption_assertions", 0, "provenance")),
+        (3, ("caption_assertions", 0, "ext")),
+        (3, ("role_assignments", 0, "provenance")),
+        (3, ("role_assignments", 0, "ext")),
+    ],
+    ids=[
+        "provenance-null-ext",
+        "category-null-provenance",
+        "category-null-ext",
+        "caption-null-provenance",
+        "caption-null-ext",
+        "role-null-provenance",
+        "role-null-ext",
+    ],
+)
+def test_lib3_optional_nested_objects_are_validated_when_present(
+    artifact_index,
+    field_path,
+    tmp_path,
+):
+    manifest, resources = _capture_manifest_and_resources()
+    artifact = manifest["artifacts"][artifact_index]
+    target = artifact
+    for segment in field_path[:-1]:
+        target = target[segment]
+    target[field_path[-1]] = None
+
+    with pytest.raises(libformat.LibError) as read_error:
+        libformat.read_lib(_archive_bytes(manifest, resources))
+    assert read_error.value.code == "invalid_lib3_graph"
+
+    document = _capture_document()
+    document.artifacts[artifact_index] = libformat.LibArtifact.from_dict(
+        artifact
+    )
+    assert any(
+        issue.level == "error" for issue in libformat.validate(document)
+    )
+    with pytest.raises(libformat.LibError) as write_error:
+        libformat.write_lib(document, tmp_path / "invalid-nested-object.lib")
+    assert write_error.value.code == "invalid_lib3_graph"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "location_fragment"),
+    [
+        (
+            lambda artifact: artifact.__setattr__(
+                "kind", "generated-metadata"
+            ),
+            "/kind",
+        ),
+        (
+            lambda artifact: artifact.source.__setitem__(
+                "representation_id", "rep-corrected"
+            ),
+            "/source/representation_id",
+        ),
+        (
+            lambda artifact: artifact.source.__setitem__(
+                "representation_revision", "wrong-revision"
+            ),
+            "/source/representation_revision",
+        ),
+        (
+            lambda artifact: artifact.__setattr__(
+                "content_sha256", "0" * 64
+            ),
+            "/content_sha256",
+        ),
+        (
+            lambda artifact: artifact.__setattr__("media_type", "image/png"),
+            "/media_type",
+        ),
+        (
+            lambda artifact: artifact.dimensions.__setitem__("width", 3023),
+            "/dimensions",
+        ),
+    ],
+    ids=[
+        "kind",
+        "source-id",
+        "source-revision",
+        "checksum",
+        "media-type",
+        "dimensions",
+    ],
+)
+def test_shared_capture_member_requires_exact_artifact_agreement(
+    mutate,
+    location_fragment,
+    tmp_path,
+):
+    document = _capture_document()
+    captured = document.artifacts[1]
+    mutate(captured)
+    issues = libformat.validate(document)
+    assert any(
+        issue.level == "error" and location_fragment in issue.loc
+        for issue in issues
+    )
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.write_lib(
+            document,
+            tmp_path / f"mismatch-{location_fragment.rsplit('/', 1)[-1]}.lib",
+        )
+    assert caught.value.code == "invalid_lib3_graph"
+
+    manifest = libformat._capture_manifest(
+        document,
+        book_id=BOOK_ID,
+        generator="test/1",
+        instructions_book="",
+    )
+    with pytest.raises(libformat.LibError) as read_error:
+        libformat.read_lib(_archive_bytes(manifest, document.resources))
+    assert read_error.value.code == "invalid_lib3_resource_sharing"
+    assert any(
+        location_fragment in issue["loc"]
+        for issue in read_error.value.details["issues"]
+    )
+
+
+@pytest.mark.parametrize(
+    "sharing_kind",
+    ["representation", "artifact", "case-alias"],
+)
+def test_writer_rejects_all_other_resource_sharing(
+    sharing_kind,
+    tmp_path,
+):
+    document = _capture_document()
+    if sharing_kind == "representation":
+        duplicate = document.representations[0].as_dict()
+        duplicate["id"] = "rep-duplicate"
+        duplicate["revision"] = "rep-duplicate-r1"
+        document.representations.append(
+            libformat.LibRepresentation.from_dict(duplicate)
+        )
+    elif sharing_kind == "artifact":
+        duplicate = document.artifacts[0].as_dict()
+        duplicate["id"] = "artifact-metadata-duplicate"
+        duplicate["revision"] = "metadata-duplicate-r1"
+        document.artifacts.append(libformat.LibArtifact.from_dict(duplicate))
+    else:
+        duplicate = document.representations[0].as_dict()
+        duplicate["id"] = "rep-case-alias"
+        duplicate["revision"] = "rep-case-alias-r1"
+        duplicate["member"] = "representations/CAPTURE-original.jpg"
+        document.representations.append(
+            libformat.LibRepresentation.from_dict(duplicate)
+        )
+        document.resources[duplicate["member"]] = (
+            document.resources["representations/capture-original.jpg"]
+        )
+
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.write_lib(
+            document,
+            tmp_path / f"invalid-sharing-{sharing_kind}.lib",
+        )
+    assert caught.value.code == "invalid_lib3_graph"
+    assert any(
+        "declared more than once" in issue["msg"]
+        or "aliases" in issue["msg"]
+        for issue in caught.value.details["issues"]
+    )
+
+
+def test_reader_rejects_duplicate_physical_zip_member():
+    manifest, resources = _capture_manifest_and_resources()
+    output = io.BytesIO()
+    duplicate_name = "representations/capture-original.jpg"
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("book.json", json.dumps(manifest))
+            for member, content in resources.items():
+                archive.writestr(member, content)
+            archive.writestr(duplicate_name, resources[duplicate_name])
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.read_lib(output.getvalue())
+    assert caught.value.code == "duplicate_lib_member"
+    assert caught.value.details == {"member": duplicate_name}
+
+
 def test_lib3_total_inflation_limit_fails_closed(monkeypatch, tmp_path):
     document = _capture_document()
     path = tmp_path / "capture.lib"
@@ -566,6 +1159,83 @@ def test_lib3_total_inflation_limit_fails_closed(monkeypatch, tmp_path):
     with pytest.raises(libformat.LibError) as caught:
         libformat.read_lib(path)
     assert caught.value.code == "lib_inflated_limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "expected_code"),
+    [
+        ("MAX_MEMBERS", 2, "lib_member_limit_exceeded"),
+        ("MAX_JSON", 16, "lib_book_too_large"),
+        ("MAX_INFLATED", 64, "lib_inflated_limit_exceeded"),
+        ("MAX_BYTES", 64, "lib_archive_too_large"),
+    ],
+)
+def test_writer_preflights_final_archive_before_atomic_publish(
+    monkeypatch,
+    tmp_path,
+    limit_name,
+    limit_value,
+    expected_code,
+):
+    document = libformat.LibDocument(
+        format=(2, 0),
+        book={
+            "format_version": "2.0",
+            "book_id": BOOK_ID,
+            "source": "primary",
+        },
+    )
+    destination = tmp_path / f"{limit_name}.lib"
+    destination.write_bytes(b"existing archive")
+    monkeypatch.setattr(libformat, limit_name, limit_value)
+    with pytest.raises(libformat.LibError) as caught:
+        libformat.write_lib(document, destination)
+    assert caught.value.code == expected_code
+    assert destination.read_bytes() == b"existing archive"
+
+
+def test_deep_json_is_reported_without_leaking_recursion_errors(tmp_path):
+    nested: dict = {}
+    cursor = nested
+    for _ in range(1200):
+        child: dict = {}
+        cursor["nested"] = child
+        cursor = child
+
+    document = _capture_document()
+    document.book["ext"] = nested
+    issues = libformat.validate(document)
+    assert any(issue.level == "error" and "ext" in issue.loc for issue in issues)
+    with pytest.raises(libformat.LibError):
+        libformat.write_lib(document, tmp_path / "deep.lib")
+
+    manifest_prefix = (
+        '{"format_version":"3.0","book_id":"'
+        + BOOK_ID
+        + '","ext":'
+    )
+    deeply_nested_json = (
+        manifest_prefix
+        + '{"nested":' * 1200
+        + "null"
+        + "}" * 1200
+        + "}"
+    ).encode("utf-8")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("book.json", deeply_nested_json)
+    with pytest.raises(libformat.LibError) as core_error:
+        libformat.read_lib(archive.getvalue())
+    assert core_error.value.code == "invalid_lib_manifest"
+    with pytest.raises(ValidationError) as planner_error:
+        _planner().plan(
+            archive.getvalue(),
+            ImportDestinationSnapshot(item_id="destination"),
+            source_id="primary",
+            overwrite=False,
+            archive_sha256=hashlib.sha256(archive.getvalue()).hexdigest(),
+        )
+    assert planner_error.value.code == "invalid_lib_manifest"
 
 
 def test_lib2_writer_and_lib1_parser_keep_their_existing_semantics(tmp_path):

@@ -326,6 +326,7 @@ test("renderer exposes strict resource pins, safe raster URLs, and accessible nu
   assert.equal(byClass(container, "perspective-validation-status")[0]
     .getAttribute("aria-live"), "polite");
   assert.equal(controller.canvas.tabIndex, 0);
+  assert.equal(controller.canvas.dataset.classificationCanvas, "true");
   assert.match(controller.canvas.getAttribute("aria-label"), /four-corner/i);
   assert.ok(controller.canvas.drawCalls.some(([name]) => name === "fillText"));
   dispose();

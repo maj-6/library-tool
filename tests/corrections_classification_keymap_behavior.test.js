@@ -116,6 +116,54 @@ test("default bare bindings ignore modifiers while explicit modifier remaps work
 });
 
 
+test("Space and Enter remaps preserve native activation on focused controls", async () => {
+  const documentRef = fakeDocument();
+  documentRef.hasFocus = () => true;
+  const scope = new FakeNode("main", documentRef);
+  const button = new FakeNode("button", documentRef);
+  scope.append(button);
+  const calls = [];
+  const controller = createClassificationController({
+    scope,
+    documentRef,
+    port: {
+      async assignImageCategory(payload) {
+        calls.push(payload);
+        return {};
+      },
+    },
+    operationIdFactory: () => "native-control-op",
+  });
+  controller.setSelectionTarget(image());
+  controller.registry.remap(
+    CLASSIFICATION_COMMAND_IDS.titlePage,
+    "space",
+  );
+  controller.mount();
+
+  const space = scope.emit("keydown", {
+    key: " ",
+    code: "Space",
+    target: button,
+  });
+  await settled();
+  assert.equal(space.defaultPrevented, false);
+  assert.equal(calls.length, 0);
+
+  controller.registry.remap(
+    CLASSIFICATION_COMMAND_IDS.titlePage,
+    "enter",
+  );
+  const enter = scope.emit("keydown", {
+    key: "Enter",
+    target: button,
+  });
+  await settled();
+  assert.equal(enter.defaultPrevented, false);
+  assert.equal(calls.length, 0);
+});
+
+
 test("closed dialogs do not block the scope, but an open dialog does", () => {
   const documentRef = fakeDocument();
   documentRef.hasFocus = () => true;
@@ -127,6 +175,21 @@ test("closed dialogs do not block the scope, but an open dialog does", () => {
   assert.equal(eligibleKeyEvent(keyEvent(scope), options), true);
   dialog.setAttribute("open", "");
   assert.equal(eligibleKeyEvent(keyEvent(scope), options), false);
+});
+
+
+test("a hidden modal cannot mask a later visible modal in the same scope", () => {
+  const documentRef = fakeDocument();
+  documentRef.hasFocus = () => true;
+  const scope = new FakeNode("main", documentRef);
+  const hidden = new FakeNode("div", documentRef);
+  hidden.setAttribute("aria-modal", "true");
+  hidden.hidden = true;
+  const visible = new FakeNode("div", documentRef);
+  visible.setAttribute("aria-modal", "true");
+  scope.append(hidden, visible);
+
+  assert.equal(eligibleKeyEvent(keyEvent(scope), { scope, documentRef }), false);
 });
 
 

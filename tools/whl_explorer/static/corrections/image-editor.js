@@ -335,6 +335,7 @@
       image.draggable = false;
       const canvas = element(documentRef, "canvas", "perspective-overlay-canvas");
       canvas.tabIndex = 0;
+      setData(canvas, "classificationCanvas", "true");
       canvas.setAttribute("role", "img");
       canvas.setAttribute(
         "aria-label",

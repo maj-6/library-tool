@@ -567,8 +567,13 @@
 
     let defaultOperationCounter = 0;
     function defaultOperationId(prefix = "classify") {
+      const cryptoRef = typeof globalThis !== "undefined" && globalThis.crypto;
+      if (cryptoRef && typeof cryptoRef.randomUUID === "function") {
+        return `${prefix}-${cryptoRef.randomUUID()}`;
+      }
       defaultOperationCounter += 1;
-      return `${prefix}-${Date.now().toString(36)}-${defaultOperationCounter.toString(36)}`;
+      return `${prefix}-${Date.now().toString(36)}-${Math.random()
+        .toString(36).slice(2)}-${defaultOperationCounter.toString(36)}`;
     }
 
     function conflictError(error) {

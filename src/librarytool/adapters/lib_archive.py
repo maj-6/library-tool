@@ -81,7 +81,7 @@ def _strict_json(payload: bytes) -> Any:
                 ValueError(f"non-finite JSON number {value}")
             ),
         )
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError, RecursionError) as exc:
         raise ValueError("invalid strict JSON") from exc
 
 
@@ -221,6 +221,27 @@ class ExistingItemLibArchivePlanner:
                             "canonical-representation-artifact-import"
                         ),
                     },
+                )
+            known_members = {
+                "book.json",
+                "INSTRUCTIONS.md",
+                "schema.json",
+            }
+            undeclared_members = [
+                name
+                for name in decoded.members
+                if (
+                    name not in known_members
+                    and _PAGE_MEMBER.fullmatch(name) is None
+                    and _ASSET_MEMBER.fullmatch(name) is None
+                    and _TRANSLATION_MEMBER.fullmatch(name) is None
+                )
+            ]
+            if undeclared_members:
+                raise ValidationError(
+                    "the .lib/3 contains an undeclared archive member",
+                    code="undeclared_lib3_member",
+                    details={"member": sorted(undeclared_members)[0]},
                 )
 
         warnings: list[ImportWarning] = []

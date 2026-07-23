@@ -61,6 +61,19 @@
       return false;
     }
 
+    function nativeActivationTarget(node) {
+      let cursor = node;
+      while (cursor) {
+        const tag = String(cursor.tagName || "").toUpperCase();
+        const role = String(attribute(cursor, "role") || "").toLowerCase();
+        if (tag === "BUTTON" || tag === "SUMMARY" ||
+            (tag === "A" && attribute(cursor, "href")) ||
+            ["button", "link", "menuitem"].includes(role)) return true;
+        cursor = cursor.parentNode;
+      }
+      return false;
+    }
+
     function visibleModal(root, documentRef) {
       const selectors = [
         "[aria-modal='true']",
@@ -70,13 +83,17 @@
       for (const owner of [root, documentRef]) {
         if (!owner || typeof owner.querySelector !== "function") continue;
         for (const selector of selectors) {
-          const found = owner.querySelector(selector);
-          if (!found || found.hidden === true ||
-              attribute(found, "aria-hidden") === "true") continue;
-          if (String(found.tagName || "").toUpperCase() === "DIALOG" &&
-              found.open !== true && attribute(found, "open") == null &&
-              attribute(found, "aria-modal") !== "true") continue;
-          return true;
+          const foundValues = typeof owner.querySelectorAll === "function"
+            ? Array.from(owner.querySelectorAll(selector))
+            : [owner.querySelector(selector)].filter(Boolean);
+          for (const found of foundValues) {
+            if (found.hidden === true ||
+                attribute(found, "aria-hidden") === "true") continue;
+            if (String(found.tagName || "").toUpperCase() === "DIALOG" &&
+                found.open !== true && attribute(found, "open") == null &&
+                attribute(found, "aria-modal") !== "true") continue;
+            return true;
+          }
         }
       }
       return false;
@@ -171,6 +188,8 @@
         const binding = commands.eventKeyBinding(event);
         const command = binding && this.registry.commandForBinding(binding);
         if (!command) return false;
+        if (["enter", "space"].includes(binding) &&
+            nativeActivationTarget(event.target)) return false;
         const context = this.getContext("shortcut", event, command);
         if (this.isEventEligible &&
             this.isEventEligible(event, command, context) !== true) return false;
@@ -408,7 +427,12 @@
 
       paletteEntries(target = null) {
         const context = target
-          ? { ...this.commandContext("palette"), focusedTarget: target }
+          ? {
+            ...this.commandContext("palette"),
+            focusedTarget: target,
+            selectionTarget: target,
+            softTarget: null,
+          }
           : this.commandContext("palette");
         return this.registry.list().map((command) => Object.freeze({
           id: command.id,
@@ -452,6 +476,7 @@
       dialogTarget,
       eligibleKeyEvent,
       gestureOwnsKeyboard,
+      nativeActivationTarget,
       nodeInside,
       typingTarget,
     };

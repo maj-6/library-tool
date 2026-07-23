@@ -542,14 +542,114 @@
     }
 
     classificationEventEligible(event, _command, _context = {}) {
+      return this.classificationSurfaceEligible(event, [
+        "booksList",
+        "artifactsTree",
+        "editorHost",
+        "classificationControls",
+        "classificationToolbar",
+      ]);
+    }
+
+    classificationContextMenuEligible(event) {
+      return Boolean(this.classificationContextMenuTarget(event));
+    }
+
+    classificationContextMenuOwner(event) {
+      let capture = null;
+      let artifact = null;
+      let overlay = null;
+      let canvas = null;
       let node = event && event.target || null;
       while (node) {
         const dataset = node.dataset || {};
-        if (Object.prototype.hasOwnProperty.call(dataset, "booksList") ||
-            Object.prototype.hasOwnProperty.call(dataset, "artifactsTree") ||
-            Object.prototype.hasOwnProperty.call(dataset, "editorHost") ||
-            Object.prototype.hasOwnProperty.call(dataset, "classificationControls")) {
-          return true;
+        if (!capture && dataset.itemId && dataset.artifactId) {
+          capture = {
+            kind: "book-capture",
+            node,
+            itemId: dataset.itemId,
+            artifactId: dataset.artifactId,
+          };
+        }
+        if (!artifact && dataset.artifactKey) {
+          artifact = {
+            kind: "artifact",
+            node,
+            key: dataset.artifactKey,
+          };
+        }
+        if (!overlay && dataset.overlayKey) {
+          overlay = {
+            kind: "overlay",
+            node,
+            key: dataset.overlayKey,
+          };
+        }
+        if (!canvas &&
+            Object.prototype.hasOwnProperty.call(dataset, "classificationCanvas")) {
+          canvas = { kind: "editor-canvas", node };
+        }
+        if (Object.prototype.hasOwnProperty.call(dataset, "booksList")) {
+          return capture;
+        }
+        if (Object.prototype.hasOwnProperty.call(dataset, "artifactsTree")) {
+          return artifact;
+        }
+        if (Object.prototype.hasOwnProperty.call(dataset, "editorHost")) {
+          return overlay || canvas;
+        }
+        if (node === this.root) break;
+        node = node.parentElement || node.parentNode || null;
+      }
+      return null;
+    }
+
+    classificationStateTarget(key) {
+      const controller = this.classificationController;
+      const snapshot = controller &&
+        typeof controller.stateSnapshot === "function"
+        ? controller.stateSnapshot() : null;
+      if (!snapshot) return null;
+      return [
+        snapshot.selectionFocused && snapshot.selectionTarget,
+        snapshot.selectionTarget,
+        snapshot.hotTarget,
+      ].find((target) => targetKey(target) === key) || null;
+    }
+
+    classificationContextMenuTarget(event) {
+      const owner = this.classificationContextMenuOwner(event);
+      if (!owner) return null;
+      if (owner.kind === "book-capture") {
+        const books = this.booksFeature &&
+          (this.booksFeature.books || this.booksFeature);
+        if (!books ||
+            typeof books.commandTargetForSelection !== "function") return null;
+        return books.commandTargetForSelection({
+          itemId: owner.itemId,
+          artifactId: owner.artifactId,
+        });
+      }
+      if (owner.kind === "artifact") {
+        return this.artifactsFeature && this.artifactsFeature.items &&
+          this.artifactsFeature.items.get(owner.key) || null;
+      }
+      if (owner.kind === "overlay") {
+        return this.classificationStateTarget(owner.key) ||
+          this.artifactsFeature && this.artifactsFeature.items &&
+            this.artifactsFeature.items.get(owner.key) || null;
+      }
+      const resource = this.state && this.state.resource;
+      return resource && (resource.summary || resource) || null;
+    }
+
+    classificationSurfaceEligible(event, names) {
+      const accepted = new Set(names);
+      let node = event && event.target || null;
+      while (node) {
+        const dataset = node.dataset || {};
+        for (const name of accepted) {
+          if (Object.prototype.hasOwnProperty.call(dataset, name)) return true;
         }
         if (node === this.root) break;
         node = node.parentElement || node.parentNode || null;
@@ -836,6 +936,13 @@
       this.classificationControls = deps.createClassificationControls({
         root: host,
         documentRef: this.documentRef,
+        windowRef: this.windowRef,
+        toolbarRoot: this.root.querySelector("[data-classification-toolbar]"),
+        paletteTrigger: this.root.querySelector(
+          "[data-classification-palette-trigger]"),
+        contextScope: this.root,
+        isContextMenuEvent: (event) =>
+          this.classificationContextMenuTarget(event),
         controller: this.classificationController,
         onError: (error) => this.setStatus(
           error && error.message || "The classification command failed",

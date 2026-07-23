@@ -113,6 +113,31 @@ WORKFLOW_ARTIFACT_KINDS = (
     "transform-recipe",
     "correction-review",
 )
+_REPRESENTATION_REQUIRED_FIELDS = frozenset({
+    "id",
+    "revision",
+    "role",
+    "media_type",
+    "member",
+    "content_sha256",
+    "lineage",
+    "ext",
+})
+_ARTIFACT_REQUIRED_FIELDS = frozenset({
+    "id",
+    "revision",
+    "kind",
+    "media_type",
+    "member",
+    "content_sha256",
+    "source",
+    "provenance",
+    "category_assignments",
+    "caption_assertions",
+    "role_assignments",
+    "relationships",
+    "ext",
+})
 
 _PRIVATE_LOCATOR_KEYS = frozenset({
     "absolute_path",
@@ -313,7 +338,7 @@ def _portable_ext_problem(value, *, loc: str, depth: int = 0,
 
 
 def _portable_ext(value, *, loc: str) -> dict:
-    if value in (None, {}):
+    if value == {}:
         return {}
     if not isinstance(value, dict):
         raise LibError(
@@ -427,7 +452,7 @@ def sanitize_ext(raw, loc: str = "ext", warn=None) -> dict:
         # allow_nan=False so a NaN/Infinity smuggled in can't ride into a
         # member no strict JSON parser will read back
         blob = json.dumps(raw, ensure_ascii=False, allow_nan=False)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         if warn:
             warn(loc, "ext dropped: not JSON-serializable")
         return {}
@@ -435,7 +460,12 @@ def sanitize_ext(raw, loc: str = "ext", warn=None) -> dict:
         if warn:
             warn(loc, f"ext dropped: exceeds {MAX_EXT} bytes")
         return {}
-    return json.loads(blob)
+    try:
+        return json.loads(blob)
+    except (ValueError, RecursionError):
+        if warn:
+            warn(loc, "ext dropped: not JSON-serializable")
+        return {}
 
 
 def sanitize_page_items(raw: list, src_type: str = "human",
@@ -645,23 +675,19 @@ class LibRepresentation:
     @classmethod
     def from_dict(cls, value: Mapping) -> "LibRepresentation":
         return cls(
-            representation_id=str(value.get("id") or ""),
-            revision=str(value.get("revision") or ""),
-            role=str(value.get("role") or ""),
-            media_type=str(value.get("media_type") or ""),
-            member=str(value.get("member") or ""),
-            content_sha256=str(value.get("content_sha256") or ""),
-            dimensions=(
-                value.get("dimensions")
-                if isinstance(value.get("dimensions"), dict)
-                else {}
-            ),
-            lineage=(
-                value.get("lineage")
-                if isinstance(value.get("lineage"), list)
-                else []
-            ),
-            ext=value.get("ext") if isinstance(value.get("ext"), dict) else {},
+            # Preserve the supplied JSON types until the graph validator has
+            # inspected them.  Coercing ``123`` to ``"123"`` (or replacing a
+            # malformed collection with an empty one) would turn hostile or
+            # broken input into a different, apparently valid record.
+            representation_id=value.get("id", ""),
+            revision=value.get("revision", ""),
+            role=value.get("role", ""),
+            media_type=value.get("media_type", ""),
+            member=value.get("member", ""),
+            content_sha256=value.get("content_sha256", ""),
+            dimensions=value.get("dimensions", {}),
+            lineage=value.get("lineage"),
+            ext=value.get("ext"),
             raw=dict(value),
         )
 
@@ -676,7 +702,7 @@ class LibRepresentation:
             "lineage": _json_clone(self.lineage, loc="representation.lineage"),
             "ext": _portable_ext(self.ext, loc="representation.ext"),
         }
-        if self.dimensions:
+        if "dimensions" in self.raw or self.dimensions != {}:
             value["dimensions"] = _json_clone(
                 self.dimensions, loc="representation.dimensions"
             )
@@ -706,30 +732,22 @@ class LibArtifact:
 
     @classmethod
     def from_dict(cls, value: Mapping) -> "LibArtifact":
-        def object_field(name: str) -> dict:
-            supplied = value.get(name)
-            return supplied if isinstance(supplied, dict) else {}
-
-        def array_field(name: str) -> list:
-            supplied = value.get(name)
-            return supplied if isinstance(supplied, list) else []
-
         return cls(
-            artifact_id=str(value.get("id") or ""),
-            revision=str(value.get("revision") or ""),
-            kind=str(value.get("kind") or ""),
-            media_type=str(value.get("media_type") or ""),
-            member=str(value.get("member") or ""),
-            content_sha256=str(value.get("content_sha256") or ""),
-            source=object_field("source"),
-            dimensions=object_field("dimensions"),
-            provenance=object_field("provenance"),
-            category_assignments=array_field("category_assignments"),
-            caption_assertions=array_field("caption_assertions"),
-            role_assignments=array_field("role_assignments"),
-            selector=object_field("selector"),
-            relationships=array_field("relationships"),
-            ext=object_field("ext"),
+            artifact_id=value.get("id", ""),
+            revision=value.get("revision", ""),
+            kind=value.get("kind", ""),
+            media_type=value.get("media_type", ""),
+            member=value.get("member", ""),
+            content_sha256=value.get("content_sha256", ""),
+            source=value.get("source"),
+            dimensions=value.get("dimensions", {}),
+            provenance=value.get("provenance"),
+            category_assignments=value.get("category_assignments"),
+            caption_assertions=value.get("caption_assertions"),
+            role_assignments=value.get("role_assignments"),
+            selector=value.get("selector", {}),
+            relationships=value.get("relationships"),
+            ext=value.get("ext"),
             raw=dict(value),
         )
 
@@ -762,11 +780,11 @@ class LibArtifact:
             ),
             "ext": _portable_ext(self.ext, loc="artifact.ext"),
         }
-        if self.dimensions:
+        if "dimensions" in self.raw or self.dimensions != {}:
             value["dimensions"] = _json_clone(
                 self.dimensions, loc="artifact.dimensions"
             )
-        if self.selector:
+        if "selector" in self.raw or self.selector != {}:
             value["selector"] = _json_clone(
                 self.selector, loc="artifact.selector"
             )
@@ -846,6 +864,12 @@ def _representation_record(value) -> dict:
     }
     if isinstance(value, LibRepresentation):
         source = value.raw
+        if source and any(not isinstance(key, str) for key in source):
+            raise LibError(
+                "representation field names must be strings",
+                code="invalid_lib3_graph",
+                details={"location": "book.json/representations"},
+            )
         if source and set(source) - allowed:
             raise LibError(
                 "representation has unknown fields; move extension data to ext",
@@ -855,35 +879,18 @@ def _representation_record(value) -> dict:
                     "fields": sorted(set(source) - allowed),
                 },
             )
-        if source:
-            problem = _private_locator_problem(
-                source, loc="book.json/representations"
+        record = value.as_dict()
+        problem = _private_locator_problem(
+            record, loc="book.json/representations"
+        )
+        if problem:
+            location, reason = problem
+            raise LibError(
+                f"{location}: {reason}",
+                code="unsafe_lib3_graph",
+                details={"location": location, "reason": reason},
             )
-            if problem:
-                location, reason = problem
-                raise LibError(
-                    f"{location}: {reason}",
-                    code="unsafe_lib3_graph",
-                    details={"location": location, "reason": reason},
-                )
-            for field_name, expected_type in (
-                ("dimensions", dict),
-                ("lineage", list),
-                ("ext", dict),
-            ):
-                if field_name in source and not isinstance(
-                    source[field_name], expected_type
-                ):
-                    raise LibError(
-                        f"representation {field_name} has an invalid type",
-                        code="invalid_lib3_graph",
-                        details={
-                            "location": (
-                                f"book.json/representations/{field_name}"
-                            ),
-                        },
-                    )
-        return value.as_dict()
+        return record
     if isinstance(value, Mapping):
         record = dict(value)
         if any(not isinstance(key, str) for key in record):
@@ -929,6 +936,12 @@ def _artifact_record(value) -> dict:
     }
     if isinstance(value, LibArtifact):
         source = value.raw
+        if source and any(not isinstance(key, str) for key in source):
+            raise LibError(
+                "artifact field names must be strings",
+                code="invalid_lib3_graph",
+                details={"location": "book.json/artifacts"},
+            )
         if source and set(source) - allowed:
             raise LibError(
                 "artifact has unknown fields; move extension data to ext",
@@ -938,39 +951,18 @@ def _artifact_record(value) -> dict:
                     "fields": sorted(set(source) - allowed),
                 },
             )
-        if source:
-            problem = _private_locator_problem(
-                source, loc="book.json/artifacts"
+        record = value.as_dict()
+        problem = _private_locator_problem(
+            record, loc="book.json/artifacts"
+        )
+        if problem:
+            location, reason = problem
+            raise LibError(
+                f"{location}: {reason}",
+                code="unsafe_lib3_graph",
+                details={"location": location, "reason": reason},
             )
-            if problem:
-                location, reason = problem
-                raise LibError(
-                    f"{location}: {reason}",
-                    code="unsafe_lib3_graph",
-                    details={"location": location, "reason": reason},
-                )
-            for field_name, expected_type in (
-                ("source", dict),
-                ("dimensions", dict),
-                ("provenance", dict),
-                ("category_assignments", list),
-                ("caption_assertions", list),
-                ("role_assignments", list),
-                ("selector", dict),
-                ("relationships", list),
-                ("ext", dict),
-            ):
-                if field_name in source and not isinstance(
-                    source[field_name], expected_type
-                ):
-                    raise LibError(
-                        f"artifact {field_name} has an invalid type",
-                        code="invalid_lib3_graph",
-                        details={
-                            "location": f"book.json/artifacts/{field_name}",
-                        },
-                    )
-        return value.as_dict()
+        return record
     if isinstance(value, Mapping):
         record = dict(value)
         if any(not isinstance(key, str) for key in record):
@@ -1245,6 +1237,11 @@ def read_lib(path_or_bytes) -> LibDocument:
                 graph_issues = _lib3_graph_issues(
                     book,
                     {},
+                    page_numbers=[
+                        int(match.group(1))
+                        for name in by_name
+                        if (match := _PAGE_MEMBER.fullmatch(name)) is not None
+                    ],
                     check_resources=False,
                 )
                 if graph_issues:
@@ -1510,7 +1507,9 @@ def _capture_manifest(doc: LibDocument, *, book_id: str, generator: str,
     )
     manifest["format_version"] = CAPTURE_FORMAT_VERSION
     manifest["capabilities"] = list(CAPTURE_CAPABILITIES)
-    manifest["ext"] = _portable_ext(doc.book.get("ext"), loc="book.json/ext")
+    manifest["ext"] = _portable_ext(
+        doc.book.get("ext", {}), loc="book.json/ext"
+    )
     # The typed graph is the mutable in-memory source of truth. Falling back
     # to stale raw manifest arrays would resurrect records a caller removed
     # and would make validate() disagree with the bytes write_lib() seals.
@@ -1723,10 +1722,10 @@ def _valid_revision(value) -> bool:
 
 
 def _check_ext(issues: list[Issue], value, loc: str) -> None:
-    if value in (None, {}):
-        return
     if not isinstance(value, dict):
         _graph_issue(issues, loc, "ext must be an object")
+        return
+    if not value:
         return
     try:
         encoded = json.dumps(
@@ -1744,10 +1743,7 @@ def _check_ext(issues: list[Issue], value, loc: str) -> None:
         _graph_issue(issues, location, message)
 
 
-def _check_dimensions(issues: list[Issue], value, loc: str, *,
-                      required: bool) -> None:
-    if not value and not required:
-        return
+def _check_dimensions(issues: list[Issue], value, loc: str) -> None:
     if not isinstance(value, dict):
         _graph_issue(issues, loc, "dimensions must be an object")
         return
@@ -2184,6 +2180,7 @@ def _lib3_graph_issues(
     book: Mapping,
     resources: Mapping[str, bytes],
     *,
+    page_numbers=None,
     check_resources: bool = True,
 ) -> list[Issue]:
     issues: list[Issue] = []
@@ -2227,6 +2224,68 @@ def _lib3_graph_issues(
     if not isinstance(artifacts, list):
         _graph_issue(issues, "book.json/artifacts", "artifacts must be an array")
         artifacts = []
+    pages = book.get("pages")
+    declared_pages: list[int] = []
+    if not isinstance(pages, list):
+        _graph_issue(issues, "book.json/pages", "pages must be an array")
+        pages = []
+    elif len(pages) > MAX_PAGES:
+        _graph_issue(
+            issues,
+            "book.json/pages",
+            f"more than {MAX_PAGES} pages",
+        )
+    declared_page_set: set[int] = set()
+    for index, page_number in enumerate(pages):
+        loc = f"book.json/pages[{index}]"
+        if isinstance(page_number, bool) or not isinstance(page_number, int):
+            _graph_issue(issues, loc, "page number must be an integer")
+            continue
+        if not 1 <= page_number <= 99999:
+            _graph_issue(issues, loc, "page number must be between 1 and 99999")
+            continue
+        if page_number in declared_page_set:
+            _graph_issue(issues, loc, "page number is duplicated")
+            continue
+        declared_page_set.add(page_number)
+        declared_pages.append(page_number)
+    if page_numbers is not None:
+        physical_page_set: set[int] = set()
+        for page_number in page_numbers:
+            if isinstance(page_number, bool) or not isinstance(page_number, int):
+                _graph_issue(
+                    issues,
+                    "pages",
+                    "archive page member number must be an integer",
+                )
+                continue
+            if not 1 <= page_number <= 99999:
+                _graph_issue(
+                    issues,
+                    f"pages/{page_number}.json",
+                    "archive page member number must be between 1 and 99999",
+                )
+                continue
+            if page_number in physical_page_set:
+                _graph_issue(
+                    issues,
+                    f"pages/{page_number}.json",
+                    "multiple archive members resolve to the same page number",
+                )
+                continue
+            physical_page_set.add(page_number)
+        for page_number in sorted(declared_page_set - physical_page_set):
+            _graph_issue(
+                issues,
+                f"pages/{page_number}.json",
+                "page is declared in book.json but its member is missing",
+            )
+        for page_number in sorted(physical_page_set - declared_page_set):
+            _graph_issue(
+                issues,
+                f"pages/{page_number}.json",
+                "page member is not declared in book.json/pages",
+            )
     if len(representations) > MAX_REPRESENTATIONS:
         _graph_issue(
             issues,
@@ -2239,7 +2298,7 @@ def _lib3_graph_issues(
             "book.json/artifacts",
             f"more than {MAX_ARTIFACTS} artifacts",
         )
-    if not representations and not book.get("pages"):
+    if not representations and not declared_pages:
         _graph_issue(
             issues,
             "book.json",
@@ -2268,6 +2327,14 @@ def _lib3_graph_issues(
         if extra:
             _graph_issue(
                 issues, loc, f"unknown representation fields: {sorted(extra)}"
+            )
+        for field_name in sorted(
+            _REPRESENTATION_REQUIRED_FIELDS - set(record)
+        ):
+            _graph_issue(
+                issues,
+                f"{loc}/{field_name}",
+                f"{field_name} is required",
             )
         identity = record.get("id")
         if not _valid_id(identity):
@@ -2303,15 +2370,16 @@ def _lib3_graph_issues(
                 f"{loc}/content_sha256",
                 "content_sha256 must be a lowercase SHA-256 digest",
             )
-        _check_dimensions(
-            issues,
-            record.get("dimensions"),
-            f"{loc}/dimensions",
-            required=(
-                isinstance(media_type, str)
-                and media_type.casefold().startswith("image/")
-            ),
+        raster_media = (
+            isinstance(media_type, str)
+            and media_type.casefold().startswith("image/")
         )
+        if "dimensions" in record or raster_media:
+            _check_dimensions(
+                issues,
+                record.get("dimensions"),
+                f"{loc}/dimensions",
+            )
         lineage = record.get("lineage", [])
         if not isinstance(lineage, list) or len(lineage) > 64:
             _graph_issue(
@@ -2400,6 +2468,12 @@ def _lib3_graph_issues(
         extra = set(record) - allowed
         if extra:
             _graph_issue(issues, loc, f"unknown artifact fields: {sorted(extra)}")
+        for field_name in sorted(_ARTIFACT_REQUIRED_FIELDS - set(record)):
+            _graph_issue(
+                issues,
+                f"{loc}/{field_name}",
+                f"{field_name} is required",
+            )
         identity = record.get("id")
         if not _valid_id(identity):
             _graph_issue(
@@ -2464,23 +2538,28 @@ def _lib3_graph_issues(
                     f"{loc}/source/representation_revision",
                     "source representation revision does not match",
                 )
-        _check_dimensions(
-            issues,
-            record.get("dimensions"),
-            f"{loc}/dimensions",
-            required=(
-                isinstance(media_type, str)
-                and media_type.casefold().startswith("image/")
-            ),
+        raster_media = (
+            isinstance(media_type, str)
+            and media_type.casefold().startswith("image/")
         )
+        if "dimensions" in record or raster_media:
+            _check_dimensions(
+                issues,
+                record.get("dimensions"),
+                f"{loc}/dimensions",
+            )
         _check_provenance(
             issues, record.get("provenance"), f"{loc}/provenance"
         )
         _check_assertions(issues, record, loc)
-        selector = record.get("selector")
-        if selector:
-            _check_selector(issues, selector, f"{loc}/selector", source)
-        if record.get("kind") == "spatial-annotation" and not selector:
+        if "selector" in record:
+            _check_selector(
+                issues,
+                record.get("selector"),
+                f"{loc}/selector",
+                source,
+            )
+        elif record.get("kind") == "spatial-annotation":
             _graph_issue(
                 issues,
                 f"{loc}/selector",
@@ -2823,7 +2902,11 @@ def _write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
         )
     )
     if capture_aware:
-        graph_issues = _lib3_graph_issues(manifest, doc.resources)
+        graph_issues = _lib3_graph_issues(
+            manifest,
+            doc.resources,
+            page_numbers=[page.page for page in doc.pages],
+        )
         if graph_issues:
             first = graph_issues[0]
             raise LibError(
@@ -2944,6 +3027,8 @@ def validate(doc: LibDocument) -> list:
     sanitize_ext(doc.book.get("ext"), "book.json/ext", warn)
     if doc.format[0] == 3:
         graph_book = dict(doc.book)
+        typed_page_numbers = [page.page for page in doc.pages]
+        graph_book.setdefault("pages", typed_page_numbers)
         try:
             graph_book["representations"] = [
                 _representation_record(value)
@@ -2959,7 +3044,11 @@ def validate(doc: LibDocument) -> list:
                 str(exc),
             )
         else:
-            issues.extend(_lib3_graph_issues(graph_book, doc.resources))
+            issues.extend(_lib3_graph_issues(
+                graph_book,
+                doc.resources,
+                page_numbers=typed_page_numbers,
+            ))
 
     # members read_lib dropped are invisible in doc.pages/translations — name
     # each so validate stays in lockstep with what the import receipt reports
@@ -3683,6 +3772,16 @@ SCHEMA_V3 = {
                 "book_id": {
                     "type": "string",
                     "pattern": BOOK_ID_RE.pattern,
+                },
+                "pages": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 99999,
+                    },
+                    "maxItems": MAX_PAGES,
+                    "uniqueItems": True,
                 },
                 "representations": {
                     "type": "array",

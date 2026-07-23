@@ -325,8 +325,8 @@ as a content-free shell.
   `capture-display`, and `corrected-rendition`. It is extensible through the
   portable identifier syntax.
 - `member` is the only portable resource address. It must be below
-  `representations/`, use portable path segments, exist exactly once, and
-  match `content_sha256`.
+  `representations/`, use portable path segments, exist exactly once in the
+  ZIP, and match `content_sha256`.
 - Raster media require positive pixel dimensions and EXIF orientation 1–8.
 - `lineage[]` contains `{representation_id, representation_revision,
   relation}`. Every local target and target revision must exist in the sealed
@@ -397,6 +397,15 @@ dimensions, bounded `ext`, and revision-pinned `relationships[]` of the form
 history. A relationship may not point to itself or to a missing/mismatched
 local revision.
 
+A captured image is represented by two graph records without duplicating its
+bytes: the representation owns the immutable physical member, and a
+`raster-image` artifact over that same member owns category, caption, and
+other assertions. This is the only shared-member exception. The artifact must
+pin the owning representation's exact ID and revision and must have identical
+media type, checksum, and dimensions. Representation-to-representation
+sharing, artifact-only sharing, mismatched aliases, and case-only member
+aliases are invalid.
+
 A polygon selector uses normalized 0–1 coordinates. Its
 `coordinate_space_revision` must pin the source canvas revision when one is
 present, otherwise the source representation revision. Spatial-annotation
@@ -444,9 +453,14 @@ brightness are never portable archive data.
 - no absolute paths, drive paths, backslashes, `.`/`..` segments, symbolic
   links, duplicate members, case-insensitive aliases, encryption, or
   undeclared members;
-- representation members stay below `representations/`; artifact members stay
-  below `artifacts/`;
-- each declared resource exists once, is bounded, and matches its SHA-256;
+- `book.json.pages` contains unique integer page numbers from 1 through 99999,
+  and it matches the physical `pages/<N>.json` members exactly;
+- representation members stay below `representations/`; artifact-owned
+  members stay below `artifacts/`. A byte-identical `raster-image` assertion
+  artifact may instead reference its source representation's exact
+  `representations/` member under the rules in §8.2;
+- each physical resource exists once, is bounded, and matches every permitted
+  declaration's SHA-256;
 - the archive, member count, individual resources, and total declared
   inflation are capped before decompression;
 - graph fields and nested `ext` data may not contain local paths, URLs,
@@ -454,6 +468,10 @@ brightness are never portable archive data.
   private locators;
 - non-finite JSON, duplicate object keys, invalid revisions/selectors, missing
   relationship targets, and unbounded extension data are errors.
+- Required graph arrays and `ext` objects must be present even when empty.
+  Omission is distinct from an empty array/object, and `null` is never a
+  substitute. Optional structured fields such as `dimensions`, `selector`,
+  assertion provenance, and nested `ext` are validated whenever present.
 
 `LibError.code` and `LibError.details` provide a framework-neutral failure
 receipt. The engine archive planner exposes the equivalent typed
@@ -473,12 +491,14 @@ receipt. The engine archive planner exposes the equivalent typed
 - A `LibDocument(format=(3, 0))` reads/writes the complete graph through
   `LibRepresentation`, `LibArtifact`, and `resources[member]`.
 - The current existing-item importer has no canonical raster/spatial
-  persistence adapter. It therefore rejects every non-empty `lib/3` graph with
+  persistence adapter. It therefore rejects every non-empty `lib/3` graph,
+  including graph resource members that are undeclared by empty arrays, with
   `lib3_capture_graph_import_unsupported` before applying pages or discarding
-  bytes. The Flask-free format core can still validate and round-trip the
-  archive. A future adapter must consume the exposed parsed graph and replace
-  this explicit refusal; it must not route the graph into a browser-owned or
-  legacy sidecar.
+  bytes. Other undeclared `lib/3` members fail with
+  `undeclared_lib3_member`. The Flask-free format core can still validate and
+  round-trip the archive. A future adapter must consume the exposed parsed
+  graph and replace this explicit refusal; it must not route the graph into a
+  browser-owned or legacy sidecar.
 
 `INSTRUCTIONS.md` generated for `lib/3` repeats these invariants for external
 tools: preserve originals, stable identities, provenance, source revisions,

@@ -461,20 +461,104 @@ test("shell profile persistence restores classification remaps without domain st
 });
 
 
-test("classification shortcuts stay inside their image and artifact surfaces", () => {
+test("classification shortcuts stay scoped and context menus use exact event targets", () => {
   const shell = Object.create(CorrectionsShell.prototype);
   shell.root = { dataset: {} };
+  const captureTarget = {
+    key: "artifact:capture-1",
+    objectType: "raster-artifact",
+    family: "image",
+    itemId: "book-1",
+    id: "capture-1",
+    revision: "capture-r1",
+  };
+  const artifactTarget = {
+    key: "artifact:figure-1",
+    objectType: "raster-artifact",
+    family: "image",
+    itemId: "book-1",
+    id: "figure-1",
+    revision: "figure-r1",
+  };
+  const overlayTarget = {
+    key: "annotation:region-1",
+    objectType: "spatial-annotation",
+    itemId: "book-1",
+    id: "region-1",
+    revision: "region-r1",
+  };
+  const canvasTarget = {
+    key: "artifact:canvas-image",
+    objectType: "raster-artifact",
+    family: "image",
+    itemId: "book-1",
+    id: "canvas-image",
+    revision: "canvas-r1",
+  };
+  shell.booksFeature = { books: {
+    commandTargetForSelection(address) {
+      return address.itemId === "book-1" &&
+          address.artifactId === "capture-1"
+        ? captureTarget : null;
+    },
+  } };
+  shell.artifactsFeature = {
+    items: new Map([[artifactTarget.key, artifactTarget]]),
+  };
+  shell.classificationController = {
+    stateSnapshot: () => ({
+      selectionFocused: true,
+      selectionTarget: overlayTarget,
+      hotTarget: null,
+    }),
+  };
+  shell.state = { resource: { summary: canvasTarget } };
+
   const reviewButton = {
     dataset: { reviewAction: "resolve" },
     parentNode: { dataset: { trayPanel: "reviews" }, parentNode: shell.root },
   };
+  const booksList = { dataset: { booksList: "" }, parentNode: shell.root };
   const captureButton = {
-    dataset: { captureId: "capture-1" },
-    parentNode: { dataset: { booksList: "" }, parentNode: shell.root },
+    dataset: { itemId: "book-1", artifactId: "capture-1" },
+    parentNode: booksList,
+  };
+  const bookRow = {
+    dataset: { bookId: "book-1" },
+    parentNode: booksList,
+  };
+  const artifactsTree = {
+    dataset: { artifactsTree: "" },
+    parentNode: shell.root,
+  };
+  const artifactRow = {
+    dataset: { artifactKey: artifactTarget.key },
+    parentNode: artifactsTree,
+  };
+  const artifactGroup = {
+    dataset: { treeKey: "group:source-images" },
+    parentNode: artifactsTree,
+  };
+  const editorHost = { dataset: { editorHost: "" }, parentNode: shell.root };
+  const overlayWrapper = {
+    dataset: { overlayKey: overlayTarget.key },
+    parentNode: editorHost,
+  };
+  const overlayMarker = {
+    dataset: {},
+    parentNode: overlayWrapper,
   };
   const editorCanvas = {
+    dataset: { classificationCanvas: "true" },
+    parentNode: editorHost,
+  };
+  const editorWhitespace = {
     dataset: {},
-    parentNode: { dataset: { editorHost: "" }, parentNode: shell.root },
+    parentNode: editorHost,
+  };
+  const classificationToolbarButton = {
+    dataset: {},
+    parentNode: { dataset: { classificationToolbar: "" }, parentNode: shell.root },
   };
   assert.equal(shell.classificationEventEligible(
     { target: reviewButton }, null, {}), false);
@@ -483,8 +567,31 @@ test("classification shortcuts stay inside their image and artifact surfaces", (
   assert.equal(shell.classificationEventEligible(
     { target: editorCanvas }, null, {}), true);
   assert.equal(shell.classificationEventEligible(
+    { target: classificationToolbarButton }, null, {}), true);
+  assert.equal(shell.classificationEventEligible(
     { target: reviewButton }, null, { softTarget: { id: "hovered-image" } }), false,
     "hover state cannot escape the pane that owns the keyboard event");
+
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: captureButton }), captureTarget);
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: artifactRow }), artifactTarget);
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: overlayMarker }), overlayTarget);
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: editorCanvas }), canvasTarget);
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: bookRow }), null,
+  "book rows without a capture cannot borrow a stale classification target");
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: artifactGroup }), null,
+  "non-classifiable tree rows cannot borrow a stale classification target");
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: editorWhitespace }), null,
+  "editor whitespace cannot borrow a stale classification target");
+  assert.equal(shell.classificationContextMenuEligible(
+    { target: classificationToolbarButton }), false,
+    "classification context menus stay on browsable image/artifact surfaces");
 });
 
 
@@ -781,6 +888,10 @@ test("standalone shell markup exposes accessible panes, tree, editor, tray, and 
   assert.match(templateSource, /data-layout-action="reset"/);
   assert.match(templateSource,
     /data-classification-controls[^>]+aria-label="Classification commands"/);
+  assert.match(templateSource,
+    /data-classification-toolbar[^>]+aria-label="Classification commands"/);
+  assert.match(templateSource,
+    /data-classification-palette-trigger[^>]+aria-label="Open classification command palette"/);
   assert.match(templateSource,
     /data-corrections-command-target[^>]+aria-live="polite"[^>]+aria-atomic="true"/);
   assert.match(templateSource, /corrections\/commands\.js/);

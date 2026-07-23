@@ -42,6 +42,18 @@
       return Math.max(minimum, Math.min(maximum, finite(value)));
     }
 
+    function nodeInside(root, node) {
+      if (!root || !node) return false;
+      if (root === node) return true;
+      if (typeof root.contains === "function") return root.contains(node);
+      let cursor = node;
+      while (cursor) {
+        if (cursor === root) return true;
+        cursor = cursor.parentNode;
+      }
+      return false;
+    }
+
     function exifOrientation(value) {
       const number = Number(value);
       return Number.isSafeInteger(number) && number >= 1 && number <= 8 ? number : 1;
@@ -383,6 +395,7 @@
         this.focusedKey = "";
         this.layer = null;
         this.observer = null;
+        this.rendering = false;
         this.destroyed = false;
       }
 
@@ -533,7 +546,9 @@
         marker.addEventListener("focus", () =>
           this.setFocusedTarget(region.key));
         marker.addEventListener("blur", () => {
-          if (this.focusedKey === region.key) this.setFocusedTarget("");
+          if (!this.rendering && this.focusedKey === region.key) {
+            this.setFocusedTarget("");
+          }
         });
         marker.addEventListener("click", () =>
           this.onActivate(region.target, { key: region.key, element: wrapper }));
@@ -552,20 +567,54 @@
         return wrapper;
       }
 
+      reconcileTargets() {
+        const keys = new Set(this.regions.map((region) => region.key));
+        if (this.hotKey && !keys.has(this.hotKey)) this.setHotTarget("");
+        if (this.focusedKey && !keys.has(this.focusedKey)) {
+          this.setFocusedTarget("");
+        }
+      }
+
       render() {
         if (!this.layer || this.destroyed) return;
+        this.reconcileTargets();
+        const focusKey = this.focusedKey;
+        const active = this.documentRef && this.documentRef.activeElement;
+        const restoreFocus = Boolean(
+          focusKey &&
+          this.regions.some((region) => region.key === focusKey) &&
+          nodeInside(this.marker(focusKey), active),
+        );
         const viewport = this.getViewport() || {};
         const transform = createOverlayTransform({
           ...this.view,
           viewportWidth: positive(viewport.width || viewport.clientWidth),
           viewportHeight: positive(viewport.height || viewport.clientHeight),
         });
-        clearNode(this.layer);
-        for (const region of this.regions) {
-          const marker = this.markerElement(region, transform);
-          if (marker) this.layer.append(marker);
+        this.rendering = true;
+        try {
+          clearNode(this.layer);
+          for (const region of this.regions) {
+            const marker = this.markerElement(region, transform);
+            if (marker) this.layer.append(marker);
+          }
+        } finally {
+          this.rendering = false;
         }
         this.updateTargetStates();
+        if (restoreFocus) {
+          const wrapper = this.marker(focusKey);
+          const marker = wrapper &&
+            typeof wrapper.querySelector === "function" &&
+            wrapper.querySelector(".corrections-artifact-overlay-shape");
+          if (marker && typeof marker.focus === "function") {
+            try {
+              marker.focus({ preventScroll: true });
+            } catch (error) {
+              marker.focus();
+            }
+          }
+        }
       }
 
       destroy() {
