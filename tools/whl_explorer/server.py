@@ -7236,7 +7236,7 @@ def _lib_book_id(build_id: str) -> str:
     builds = lib.load_json(BUILDS_PATH, {}) or {}
     build = builds.get(build_id) if isinstance(builds, dict) else None
     capture_id = (
-        _clean_capture_id(build.get("capture_id"))
+        _capture_archive_id(build.get("capture_id"))
         if isinstance(build, dict)
         else ""
     )
@@ -19407,6 +19407,14 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
 
 
 _CAPTURE_INGEST_LOCKS = tuple(threading.Lock() for _ in range(64))
+_CAPTURE_ARCHIVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+
+
+def _capture_archive_id(value) -> str:
+    """Return the explorer's portable capture id, or empty when unusable."""
+
+    normalized = _clean_capture_id(value)
+    return normalized if _CAPTURE_ARCHIVE_ID_RE.fullmatch(normalized) else ""
 
 
 def _capture_ingest_lock(capture_id: str) -> threading.Lock:
@@ -19458,14 +19466,17 @@ def _capture_archive_association(
         capture_id: str) -> CaptureArchiveAssociation | None:
     """Load and verify the portable association, never a local archive path."""
 
-    return _capture_archive_service().get(capture_id)
+    normalized = _capture_archive_id(capture_id)
+    if not normalized:
+        return None
+    return _capture_archive_service().get(normalized)
 
 
 def _mark_capture_archive_stale(
         capture_id: str) -> CaptureArchiveAssociation | None:
     """Invalidate the sealed snapshot without treating it as the live store."""
 
-    normalized = _clean_capture_id(capture_id)
+    normalized = _capture_archive_id(capture_id)
     if not normalized:
         return None
     return _capture_archive_service().mark_stale(normalized)
@@ -19475,6 +19486,9 @@ def _ensure_capture_archive(
         capture_id: str, entry: Mapping) -> CaptureArchiveAssociation:
     """Seal the durable capture snapshot before an import can report success."""
 
+    capture_id = _capture_archive_id(capture_id)
+    if not capture_id:
+        raise ValueError("capture id is not portable")
     service = _capture_archive_service()
     association = service.get(capture_id)
     if association is not None:
@@ -19492,7 +19506,7 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
                    transport: str = "unknown"):
     """Serialize one capture through duplicate check, assets, and row commit."""
 
-    cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
+    cap_id = _capture_archive_id(cap.get("id"))
     if not cap_id:
         return None, None
     with _capture_ingest_lock(cap_id):
@@ -19509,7 +19523,7 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
     endpoint (photos arrive in the request). Prefers the phone's OCR/fields (via
     _phone_result), else the full desktop pipeline. Returns (entry_id, errors),
     or (None, None) when it's a duplicate (idempotent on capture_id)."""
-    cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
+    cap_id = _capture_archive_id(cap.get("id"))
     if not cap_id:
         return None, None
     phone_review = _capture_phone_review(cap)
@@ -19747,7 +19761,7 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     remote acknowledgement/cleanup. Live status can therefore expose each book
     without waiting for the rest of a batch.
     """
-    cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
+    cap_id = _capture_archive_id(cap.get("id"))
     if not cap_id:
         return {
             "status": "skipped", "capture_id": "", "book_id": "",

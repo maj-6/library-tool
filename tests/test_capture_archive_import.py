@@ -48,6 +48,19 @@ def _prepare_capture(monkeypatch) -> None:
     monkeypatch.setattr(server, "activity", lambda *_args, **_kwargs: None)
 
 
+def test_nonportable_capture_id_is_rejected_before_archive_work(monkeypatch):
+    archive_calls = []
+    monkeypatch.setattr(
+        server,
+        "_capture_archive_service",
+        lambda: archive_calls.append(True),
+    )
+
+    assert server.ingest_capture({"id": "---"}, [b"photo"], "") == (None, None)
+    assert server._capture_archive_association("---") is None
+    assert archive_calls == []
+
+
 def test_ingest_seals_complete_legacy_capture_and_promotion_keeps_identity(
         monkeypatch, data_root):
     _prepare_capture(monkeypatch)
