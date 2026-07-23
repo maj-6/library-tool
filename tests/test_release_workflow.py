@@ -20,7 +20,8 @@ def _job(name: str, next_name: str) -> str:
 
 
 def test_release_tag_version_preflight_gates_every_publish_path():
-    preflight = _job("preflight", "android")
+    preflight = _job("preflight", "validation")
+    validation = _job("validation", "android")
     android = _job("android", "desktop")
     desktop = _job("desktop", "publish")
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
@@ -30,14 +31,19 @@ def test_release_tag_version_preflight_gates_every_publish_path():
     assert "android/BookCapture/app/build.gradle.kts" in preflight
     assert 'expected="android-v$version"' in preflight
     assert 'if [ "$expected" != "$GITHUB_REF_NAME" ]; then' in preflight
-    assert "needs: preflight" in android
-    assert "needs: preflight" in desktop
+    assert "needs: preflight" in validation
+    assert "python -m ruff check ." in validation
+    assert "python -m pytest -q" in validation
+    assert "node --test" in validation
+    assert "needs: [preflight, validation]" in android
+    assert "needs: [preflight, validation]" in desktop
     assert "needs.preflight.result == 'success'" in publish
-    assert "needs: [preflight, android, desktop]" in publish
+    assert "needs.validation.result == 'success'" in publish
+    assert "needs: [preflight, validation, android, desktop]" in publish
 
 
 def test_android_is_released_only_after_its_version_identity_changes():
-    preflight = _job("preflight", "android")
+    preflight = _job("preflight", "validation")
     android = _job("android", "desktop")
 
     assert "fetch-depth: 0" in preflight
@@ -55,7 +61,7 @@ def test_android_is_released_only_after_its_version_identity_changes():
 
 
 def test_public_tags_reject_unknown_prerelease_channels():
-    preflight = _job("preflight", "android")
+    preflight = _job("preflight", "validation")
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
 
     assert "release_channel: ${{ steps.version.outputs.release_channel }}" in preflight
@@ -76,6 +82,7 @@ def test_publish_runs_after_failures_or_skips_but_never_after_cancellation():
     assert "!cancelled()" in condition
     assert "always()" not in condition
     assert "needs.preflight.result == 'success'" in condition
+    assert "needs.validation.result == 'success'" in condition
     assert (
         "needs.desktop.result == 'success' || needs.android.result == 'success'"
         in condition
@@ -142,7 +149,7 @@ def test_release_requires_persistent_android_signing_identity():
 
     # Manual dispatches are dry runs even when dispatched against a tag ref.
     assert release_event in publish
-    preflight = _job("preflight", "android")
+    preflight = _job("preflight", "validation")
     assert release_event in preflight
 
 
@@ -306,10 +313,12 @@ def test_ci_uses_cross_platform_node_test_discovery():
 
 
 def test_all_javascript_workflow_steps_use_electron_43_node_baseline():
-    preflight = _job("preflight", "android")
+    preflight = _job("preflight", "validation")
+    validation = _job("validation", "android")
     desktop = _job("desktop", "publish")
 
     assert 'node-version: "22.12"' in CI_WORKFLOW
     assert 'node-version: "22.12"' in preflight
+    assert 'node-version: "22.12"' in validation
     assert 'node-version: "22.12"' in desktop
     assert 'node-version: "20"' not in WORKFLOW

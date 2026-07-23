@@ -134,8 +134,51 @@ jobs:
             --exclude-tag "$GITHUB_REF_NAME" \
             --github-output "$GITHUB_OUTPUT"
 
-  android:
+  validation:
+    name: Release validation gates
     needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12"
+
+      - name: Install runtime and validation tools
+        run: python -m pip install -e ".[dev]"
+
+      - name: Python lint and tests
+        run: |
+          python -m ruff check .
+          python -m pytest -q
+
+      - name: JavaScript syntax and behavior
+        run: |
+          node --check desktop/main.js
+          node --check desktop/preload.js
+          node --check desktop/startup-preload.js
+          node --check desktop/updater-preload.js
+          node --check tools/whl_explorer/static/app.js
+          node --experimental-default-type=module --check website/assets/data.js
+          node --experimental-default-type=module --check website/assets/browse.js
+          node --experimental-default-type=module --check website/assets/author.js
+          node --experimental-default-type=module --check website/assets/releases.js
+          node --experimental-default-type=module --check website/assets/release-policy.js
+          node --experimental-default-type=module --check website/assets/textsearch.js
+          node --experimental-default-type=module --check website/assets/read.js
+          node --test
+
+  android:
+    needs: [preflight, validation]
     if: needs.preflight.outputs.android_release == 'true'
     runs-on: ubuntu-latest
     outputs:
@@ -308,7 +351,7 @@ jobs:
 
   desktop:
     if: ${{ !startsWith(github.ref_name, 'android-v') }}
-    needs: preflight
+    needs: [preflight, validation]
     runs-on: windows-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -428,8 +471,9 @@ jobs:
     if: |
       !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
       needs.preflight.result == 'success' &&
+      needs.validation.result == 'success' &&
       (needs.desktop.result == 'success' || needs.android.result == 'success')
-    needs: [preflight, android, desktop]
+    needs: [preflight, validation, android, desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload its assets

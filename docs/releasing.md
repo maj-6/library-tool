@@ -72,7 +72,13 @@ Two ways a row gets there:
 pushed. An `android-v*` tag follows the same signed Android path but skips the
 desktop job, which lets the two applications ship on independent schedules:
 
-1. **android** compares its `versionCode` and `versionName` with the newest
+1. **validation** installs the committed runtime/development dependencies and
+   runs Ruff, the complete Python suite, JavaScript syntax checks, and the
+   complete JavaScript behavior suite. Both application builds depend on this
+   job, so no installer or APK is packaged from a tag that fails the repository
+   gates. This includes the executable Corrections recovery, concurrency,
+   accessibility-contract, and performance fixtures.
+2. **android** compares its `versionCode` and `versionName` with the newest
    previous, non-draft GitHub Release that actually contains a non-empty,
    uploaded `BookCapture-*.apk`. Releases where Android failed are not a
    baseline, so a partial desktop release cannot make the next run skip an APK
@@ -93,7 +99,7 @@ desktop job, which lets the two applications ship on independent schedules:
    release-signed `workflow_dispatch` build. A dispatch without the secret still
    builds with the debug key and is suffixed `-debug-DONOTPUBLISH.apk`; that is
    the only signer-mismatch path the workflow permits.
-2. **desktop** freezes the Flask sidecar with PyInstaller and runs
+3. **desktop** freezes the Flask sidecar with PyInstaller and runs
    an isolated transport smoke against that frozen executable before running
    electron-builder on a Windows runner, producing the NSIS installer
    `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
@@ -101,7 +107,7 @@ desktop job, which lets the two applications ship on independent schedules:
    the newest GitHub Release at startup and read them to fetch the update. The
    job requires all three files and verifies that `latest.yml` names the expected
    version and installer before uploading any of them.
-3. **publish** attaches the builds to a GitHub Release named after the tag,
+4. **publish** attaches the builds to a GitHub Release named after the tag,
    using `docs/releases/<tag>.md` as its release notes when that file exists,
    then registers them in the `releases` table via `tools/release_publish.py`
    (URL → the GitHub Release asset). The two apps release independently: the
