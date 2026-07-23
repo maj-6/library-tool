@@ -341,17 +341,187 @@ def _stable_stat_identity(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _AuthoritySnapshot:
+    root: Path
+    named_root: os.stat_result
+
+
+def _windows_normalized_path(value: str) -> str:
+    normalized = value.replace("/", "\\")
+    if normalized.startswith("\\\\?\\UNC\\"):
+        normalized = "\\\\" + normalized[8:]
+    elif normalized.startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return normalized.rstrip("\\")
+
+
+def _windows_path_is_below(candidate: str, authority_root: str) -> bool:
+    value = _windows_normalized_path(candidate)
+    root = _windows_normalized_path(authority_root)
+    if len(value) <= len(root) or value[len(root)] != "\\":
+        return False
+    # These are canonical paths returned by opened handles, not user input.
+    # Exact comparison is required because NTFS directories can opt into
+    # case-sensitive names where ``root`` and ``ROOT`` are distinct siblings.
+    return value[: len(root)] == root
+
+
+def _windows_descriptor_path(descriptor: int) -> str:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    get_final_path.restype = wintypes.DWORD
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+    capacity = 32_768
+    buffer = ctypes.create_unicode_buffer(capacity)
+    length = get_final_path(handle, buffer, capacity, 0)
+    if not length or length >= capacity:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buffer.value
+
+
+def _windows_open_directory_guard(path: Path) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    file_read_attributes = 0x00000080
+    share_read = 0x00000001
+    share_write = 0x00000002
+    open_existing = 3
+    flag_backup_semantics = 0x02000000
+    flag_open_reparse_point = 0x00200000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(
+        str(path),
+        file_read_attributes,
+        # Excluding FILE_SHARE_DELETE keeps the authority root from being
+        # renamed or replaced until the contained file handle is verified.
+        share_read | share_write,
+        None,
+        open_existing,
+        flag_backup_semantics | flag_open_reparse_point,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(
+            handle,
+            os.O_RDONLY
+            | int(getattr(os, "O_BINARY", 0))
+            | int(getattr(os, "O_NOINHERIT", 0)),
+        )
+    except BaseException:
+        close_handle(handle)
+        raise
+
+
+def _open_authorized_descriptor(
+    path: Path,
+    authority: _AuthoritySnapshot,
+) -> int:
+    relative = path.relative_to(authority.root)
+    if not relative.parts:
+        raise OSError("private file must be below its authority root")
+    file_flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    file_flags |= int(getattr(os, "O_CLOEXEC", 0))
+    file_flags |= int(getattr(os, "O_NOINHERIT", 0))
+    file_flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    file_flags |= int(getattr(os, "O_NONBLOCK", 0))
+    if os.name == "nt":
+        guard = _windows_open_directory_guard(authority.root)
+        try:
+            guard_info = os.fstat(guard)
+            if (
+                not stat.S_ISDIR(guard_info.st_mode)
+                or not os.path.samestat(guard_info, authority.named_root)
+            ):
+                raise OSError("authority root identity changed")
+            guard_path = _windows_descriptor_path(guard)
+            descriptor = os.open(path, file_flags)
+            try:
+                if not _windows_path_is_below(
+                    _windows_descriptor_path(descriptor),
+                    guard_path,
+                ):
+                    raise OSError("opened file escaped its authority root")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            return descriptor
+        finally:
+            os.close(guard)
+
+    directory_flags = os.O_RDONLY | int(getattr(os, "O_CLOEXEC", 0))
+    directory_flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    directory_flags |= int(getattr(os, "O_NONBLOCK", 0))
+    directory_flags |= int(getattr(os, "O_DIRECTORY", 0))
+    if (
+        _is_redirecting_path(authority.root)
+        or not stat.S_ISDIR(authority.named_root.st_mode)
+    ):
+        raise OSError("authority root is not a private directory")
+    descriptors: list[int] = []
+    try:
+        current = os.open(authority.root, directory_flags)
+        descriptors.append(current)
+        root_opened = os.fstat(current)
+        if (
+            not stat.S_ISDIR(root_opened.st_mode)
+            or not os.path.samestat(root_opened, authority.named_root)
+        ):
+            raise OSError("authority root identity changed")
+        for part in relative.parts[:-1]:
+            current = os.open(
+                part,
+                directory_flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise OSError("authority path component is not a directory")
+        return os.open(
+            relative.parts[-1],
+            file_flags,
+            dir_fd=current,
+        )
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _open_verified_regular(
     path: Path,
     named_before: os.stat_result,
+    *,
+    authority: _AuthoritySnapshot,
 ) -> tuple[int, os.stat_result]:
-    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
-    flags |= int(getattr(os, "O_CLOEXEC", 0))
-    flags |= int(getattr(os, "O_NOINHERIT", 0))
-    flags |= int(getattr(os, "O_NOFOLLOW", 0))
-    # A swapped FIFO or device must not block a read before fstat rejects it.
-    flags |= int(getattr(os, "O_NONBLOCK", 0))
-    descriptor = os.open(path, flags)
+    descriptor = _open_authorized_descriptor(path, authority)
     try:
         opened = os.fstat(descriptor)
         named_opened = path.lstat()
@@ -708,7 +878,7 @@ class FilesystemCorrectionsArtifactRepository(
         granted = False
         descriptor = -1
         try:
-            self._assert_safe_path(
+            authority = self._assert_safe_path(
                 candidate.path,
                 item_id=item_id,
                 section=candidate.section,
@@ -719,7 +889,11 @@ class FilesystemCorrectionsArtifactRepository(
                 or _stable_stat_identity(named) != candidate.file_identity
             ):
                 return None
-            descriptor, opened = _open_verified_regular(candidate.path, named)
+            descriptor, opened = _open_verified_regular(
+                candidate.path,
+                named,
+                authority=authority,
+            )
             while True:
                 block = os.read(descriptor, 1 << 20)
                 if not block:
@@ -960,11 +1134,9 @@ class FilesystemCorrectionsArtifactRepository(
         item_id: str,
         section: str,
         authority_root: Path | None = None,
-    ) -> None:
+    ) -> _AuthoritySnapshot:
         root = (
-            self._capture_authority_root
-            if authority_root is None and section == "capture"
-            else self._write_set.root
+            self._authority_root_for(section)
             if authority_root is None
             else authority_root
         )
@@ -977,7 +1149,21 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item_id,
                 section=section,
             ) from exc
-        if _is_redirecting_path(root):
+        try:
+            named_root = root.lstat()
+            resolved_root = root.resolve(strict=True)
+        except OSError as exc:
+            raise _repository_error(
+                "a Corrections store root cannot be inspected",
+                code="unsafe_corrections_store_path",
+                item_id=item_id,
+                section=section,
+                cause_type=type(exc).__name__,
+            ) from exc
+        if (
+            _is_redirecting_path(root)
+            or not stat.S_ISDIR(named_root.st_mode)
+        ):
             raise _repository_error(
                 "a Corrections store root redirects outside its authority",
                 code="unsafe_corrections_store_path",
@@ -995,7 +1181,7 @@ class FilesystemCorrectionsArtifactRepository(
                     section=section,
                 )
         try:
-            path.resolve(strict=False).relative_to(root.resolve(strict=False))
+            path.resolve(strict=False).relative_to(resolved_root)
         except (OSError, ValueError) as exc:
             raise _repository_error(
                 "a Corrections store path escapes the workspace",
@@ -1003,6 +1189,14 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item_id,
                 section=section,
             ) from exc
+        return _AuthoritySnapshot(root, named_root)
+
+    def _authority_root_for(self, section: str) -> Path:
+        return (
+            self._capture_authority_root
+            if section == "capture"
+            else self._write_set.root
+        )
 
     def _read_json(
         self,
@@ -1012,7 +1206,11 @@ class FilesystemCorrectionsArtifactRepository(
         section: str,
         maximum_bytes: int,
     ) -> Mapping[str, Any] | None:
-        self._assert_safe_path(path, item_id=item_id, section=section)
+        authority = self._assert_safe_path(
+            path,
+            item_id=item_id,
+            section=section,
+        )
         try:
             info = path.lstat()
         except FileNotFoundError:
@@ -1038,7 +1236,11 @@ class FilesystemCorrectionsArtifactRepository(
             )
         descriptor = -1
         try:
-            descriptor, opened = _open_verified_regular(path, info)
+            descriptor, opened = _open_verified_regular(
+                path,
+                info,
+                authority=authority,
+            )
             chunks: list[bytes] = []
             remaining = maximum_bytes + 1
             while remaining:
@@ -1971,7 +2173,11 @@ class FilesystemCorrectionsArtifactRepository(
             )
         path = directory / reference
         try:
-            self._assert_safe_path(path, item_id=item_id, section=section)
+            authority = self._assert_safe_path(
+                path,
+                item_id=item_id,
+                section=section,
+            )
         except RepositoryError:
             if not declared_sha256 or width is None or height is None:
                 return None
@@ -2022,7 +2228,11 @@ class FilesystemCorrectionsArtifactRepository(
         snapshot: BinaryIO | None = None
         try:
             snapshot = tempfile.TemporaryFile(mode="w+b")
-            descriptor, opened = _open_verified_regular(path, info)
+            descriptor, opened = _open_verified_regular(
+                path,
+                info,
+                authority=authority,
+            )
             digest = hashlib.sha256()
             size = 0
             while True:

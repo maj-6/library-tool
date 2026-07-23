@@ -15,6 +15,7 @@ import libformat
 from librarytool.adapters.filesystem.corrections_artifact_repository import (
     FilesystemCorrectionsArtifactRepository,
     FilesystemRasterResourceResolverPort,
+    _windows_path_is_below,
 )
 from librarytool.adapters.filesystem.recoverable_write_set import RecoverableWriteSet
 from librarytool.engine.errors import NotFoundError, RepositoryError
@@ -262,16 +263,37 @@ def _swap_to_external_hardlink(
     real_open = os.open
     matching_opens = 0
 
-    def swapping_open(path, flags, *args):
+    def swapping_open(path, flags, *args, **kwargs):
         nonlocal matching_opens
-        if Path(path) == target:
+        candidate = Path(path)
+        if candidate == target or (
+            not candidate.is_absolute()
+            and candidate.name == target.name
+            and "dir_fd" in kwargs
+        ):
             matching_opens += 1
             if matching_opens == on_open:
                 target.replace(target.with_name(f"{target.name}.original"))
                 os.link(external, target)
-        return real_open(path, flags, *args)
+        return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", swapping_open)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path semantics")
+def test_windows_authority_comparison_does_not_apply_unicode_casefolding():
+    assert _windows_path_is_below(
+        r"\\?\C:\workspace\root\book\layout.json",
+        r"C:\workspace\root",
+    )
+    assert not _windows_path_is_below(
+        r"\\?\C:\workspace\ROOT\book\layout.json",
+        r"C:\workspace\root",
+    )
+    assert not _windows_path_is_below(
+        r"C:\workspace\fooss\book\layout.json",
+        r"C:\workspace\fooß",
+    )
 
 
 def test_sidecar_name_swap_cannot_disclose_external_json(
@@ -292,6 +314,52 @@ def test_sidecar_name_swap_cannot_disclose_external_json(
 
     with pytest.raises(RepositoryError) as caught:
         _repository(root, capture_ids={}).list_spatial_annotations(ITEM_ID)
+
+    assert caught.value.code == "invalid_mistral_layout"
+    assert "EXTERNAL SECRET" not in str(caught.value)
+
+
+def test_sidecar_ancestor_redirect_cannot_escape_the_authority_root(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "library"
+    layout_path = _write_layout(root, _layout("ab" * 32))
+    external_entries = tmp_path / "external-entries"
+    external_layout = external_entries / ITEM_ID / "ocr" / "layout.json"
+    external_layout.parent.mkdir(parents=True)
+    leaked = _layout("cd" * 32)
+    leaked["regions"]["primary"]["3"]["items"][0]["text"] = "EXTERNAL SECRET"
+    external_layout.write_text(json.dumps(leaked), encoding="utf-8")
+    repository = _repository(root, capture_ids={})
+    real_assert = repository._assert_safe_path
+    swapped = False
+
+    def swapping_assert(path, **kwargs):
+        nonlocal swapped
+        result = real_assert(path, **kwargs)
+        if Path(path) == layout_path and not swapped:
+            swapped = True
+            entries = root / "entries"
+            backup = root / "entries.original"
+            entries.replace(backup)
+            try:
+                os.symlink(
+                    external_entries,
+                    entries,
+                    target_is_directory=True,
+                )
+            except OSError:
+                if entries.is_symlink():
+                    entries.unlink()
+                backup.replace(entries)
+                pytest.skip("directory symlinks are unavailable")
+        return result
+
+    monkeypatch.setattr(repository, "_assert_safe_path", swapping_assert)
+
+    with pytest.raises(RepositoryError) as caught:
+        repository.list_spatial_annotations(ITEM_ID)
 
     assert caught.value.code == "invalid_mistral_layout"
     assert "EXTERNAL SECRET" not in str(caught.value)
@@ -645,6 +713,59 @@ def test_raster_observation_rejects_a_name_swap_to_external_bytes(
     assert figure.resource is None
 
 
+def test_raster_observation_rejects_an_external_ancestor_redirect(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "library"
+    original = _png_bytes((20, 130, 50), (41, 37))
+    external_bytes = _png_bytes((200, 10, 10), (3, 5))
+    image_directory = _entry(root) / "ocr" / "images"
+    image_directory.mkdir(parents=True)
+    figure_path = image_directory / "p3-fig.png"
+    figure_path.write_bytes(original)
+    _write_layout(root, _layout(_digest(original)))
+    external_entries = tmp_path / "external-entries"
+    external_figure = (
+        external_entries / ITEM_ID / "ocr" / "images" / "p3-fig.png"
+    )
+    external_figure.parent.mkdir(parents=True)
+    external_figure.write_bytes(external_bytes)
+    repository = _repository(root, capture_ids={})
+    real_assert = repository._assert_safe_path
+    swapped = False
+
+    def swapping_assert(path, **kwargs):
+        nonlocal swapped
+        result = real_assert(path, **kwargs)
+        if Path(path) == figure_path and not swapped:
+            swapped = True
+            entries = root / "entries"
+            backup = root / "entries.original"
+            entries.replace(backup)
+            try:
+                os.symlink(
+                    external_entries,
+                    entries,
+                    target_is_directory=True,
+                )
+            except OSError:
+                if entries.is_symlink():
+                    entries.unlink()
+                backup.replace(entries)
+                pytest.skip("directory symlinks are unavailable")
+        return result
+
+    monkeypatch.setattr(repository, "_assert_safe_path", swapping_assert)
+
+    figure = repository.list_raster_artifacts(ITEM_ID)[0]
+
+    assert figure.resource_state is ResourceState.UNAVAILABLE
+    assert figure.content_sha256 == _digest(original)
+    assert figure.content_sha256 != _digest(external_bytes)
+    assert figure.resource is None
+
+
 def test_raster_grant_rejects_a_name_swap_after_projection(
     monkeypatch,
     tmp_path,
@@ -668,6 +789,60 @@ def test_raster_grant_rejects_a_name_swap_after_projection(
         external=external,
         on_open=2,
     )
+
+    assert (
+        repository.resolve_raster_resource(ITEM_ID, figure.resource)
+        is None
+    )
+
+
+def test_raster_grant_rejects_an_external_ancestor_redirect(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "library"
+    original = _png_bytes((20, 130, 50), (41, 37))
+    external_bytes = _png_bytes((200, 10, 10), (3, 5))
+    image_directory = _entry(root) / "ocr" / "images"
+    image_directory.mkdir(parents=True)
+    figure_path = image_directory / "p3-fig.png"
+    figure_path.write_bytes(original)
+    _write_layout(root, _layout(_digest(original)))
+    external_entries = tmp_path / "external-entries"
+    external_figure = (
+        external_entries / ITEM_ID / "ocr" / "images" / "p3-fig.png"
+    )
+    external_figure.parent.mkdir(parents=True)
+    external_figure.write_bytes(external_bytes)
+    repository = _repository(root, capture_ids={})
+    figure = repository.list_raster_artifacts(ITEM_ID)[0]
+    assert figure.resource is not None
+    real_assert = repository._assert_safe_path
+    target_checks = 0
+
+    def swapping_assert(path, **kwargs):
+        nonlocal target_checks
+        result = real_assert(path, **kwargs)
+        if Path(path) == figure_path:
+            target_checks += 1
+            if target_checks == 3:
+                entries = root / "entries"
+                backup = root / "entries.original"
+                entries.replace(backup)
+                try:
+                    os.symlink(
+                        external_entries,
+                        entries,
+                        target_is_directory=True,
+                    )
+                except OSError:
+                    if entries.is_symlink():
+                        entries.unlink()
+                    backup.replace(entries)
+                    pytest.skip("directory symlinks are unavailable")
+        return result
+
+    monkeypatch.setattr(repository, "_assert_safe_path", swapping_assert)
 
     assert (
         repository.resolve_raster_resource(ITEM_ID, figure.resource)
@@ -714,6 +889,71 @@ def test_capture_projection_supports_an_explicit_external_authority_root(
         CAPTURE_ORIGINAL_ID,
     }
     assert all(value.resource_state is ResourceState.AVAILABLE for value in artifacts)
+
+
+def test_capture_authority_root_replacement_is_rejected(
+    monkeypatch,
+    tmp_path,
+):
+    workspace = tmp_path / "workspace"
+    capture_root = tmp_path / "phone-captures"
+    original_directory = capture_root / CAPTURE_ID
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original_directory.mkdir(parents=True)
+    (original_directory / "orig_1.jpg").write_bytes(original)
+    (original_directory / "photo_1.jpg").write_bytes(display)
+    (original_directory / "photo_assets.json").write_text(
+        json.dumps(_photo_manifest(original, display)),
+        encoding="utf-8",
+    )
+
+    replacement_root = tmp_path / "replacement-captures"
+    replacement_directory = replacement_root / CAPTURE_ID
+    external_original = _jpeg_bytes((200, 10, 10), (3, 5))
+    external_display = _jpeg_bytes((10, 10, 200), (7, 11))
+    replacement_directory.mkdir(parents=True)
+    (replacement_directory / "orig_1.jpg").write_bytes(external_original)
+    (replacement_directory / "photo_1.jpg").write_bytes(external_display)
+    (replacement_directory / "photo_assets.json").write_text(
+        json.dumps(_photo_manifest(external_original, external_display)),
+        encoding="utf-8",
+    )
+    write_set = RecoverableWriteSet(workspace)
+
+    @contextmanager
+    def lock():
+        yield
+
+    repository = FilesystemCorrectionsArtifactRepository(
+        write_set,
+        item_exists=lambda item_id: item_id == ITEM_ID,
+        capture_id_for=lambda _item_id: CAPTURE_ID,
+        entry_directory_for=lambda item_id: _entry(workspace, item_id),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _representation_id: None,
+        lock_context_for=lock,
+    )
+    real_assert = repository._assert_safe_path
+    swapped = False
+
+    def swapping_assert(path, **kwargs):
+        nonlocal swapped
+        authority = real_assert(path, **kwargs)
+        if Path(path).name == "photo_assets.json" and not swapped:
+            swapped = True
+            capture_root.replace(tmp_path / "phone-captures.original")
+            replacement_root.replace(capture_root)
+        return authority
+
+    monkeypatch.setattr(repository, "_assert_safe_path", swapping_assert)
+
+    with pytest.raises(RepositoryError) as caught:
+        repository.list_raster_artifacts(ITEM_ID)
+
+    assert caught.value.code == "invalid_capture_photo_assets"
+    assert _digest(external_display) not in str(caught.value)
 
 
 def test_capture_resources_report_missing_private_and_stale_states(tmp_path):
