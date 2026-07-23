@@ -199,7 +199,7 @@ class InspectResourceContractTest {
 
         val refreshInspect = home.substringAfter("private fun refreshInspect()")
             .substringBefore("private fun renderInspectBooks")
-        assertTrue(refreshInspect.contains("withContext(Dispatchers.IO)"))
+        assertTrue(refreshInspect.contains("loadHomeSnapshot"))
         assertTrue(refreshInspect.contains("CollectionInventory.items(this@HomeActivity)"))
         assertFalse(refreshInspect.contains("Entries.recent(this)"))
 

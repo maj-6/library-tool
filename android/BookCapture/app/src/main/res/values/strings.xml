@@ -159,6 +159,16 @@
     </plurals>
     <string name="home_group_expand">%1$s, %2$s. Expand group</string>
     <string name="home_group_collapse">%1$s, %2$s. Collapse group</string>
+    <plurals name="home_group_show_newer">
+        <item quantity="one">Show %1$d newer scan</item>
+        <item quantity="other">Show %1$d newer scans</item>
+    </plurals>
+    <plurals name="home_group_show_older">
+        <item quantity="one">Show %1$d older scan</item>
+        <item quantity="other">Show %1$d older scans</item>
+    </plurals>
+    <string name="home_group_page_description">%1$s in %2$s. Opens scans %3$d through %4$d of %5$d.</string>
+    <string name="home_group_page_status">%1$s, showing scans %2$d through %3$d of %4$d.</string>
 
     <!-- Inspect keeps lightweight bibliographic summaries after delivered scan
          media is pruned. It never implies that the tag is the collection UUID. -->
