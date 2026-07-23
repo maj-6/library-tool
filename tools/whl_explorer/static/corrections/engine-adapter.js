@@ -189,6 +189,54 @@
           command, signal,
         } = {}) => corrections.queueTransform({ command, signal });
       }
+      if (typeof corrections.setManualCaption === "function") {
+        commands.setManualCaption = ({
+          operationId, ...payload
+        } = {}) => corrections.setManualCaption({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.clearManualCaption === "function") {
+        commands.clearManualCaption = ({
+          operationId, ...payload
+        } = {}) => corrections.clearManualCaption({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.assertArtifactMetadata === "function") {
+        commands.assertArtifactMetadata = ({
+          operationId, ...payload
+        } = {}) => corrections.assertArtifactMetadata({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.markAttention === "function") {
+        commands.markAttention = ({
+          operationId, ...payload
+        } = {}) => corrections.markAttention({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.resolveCorrections === "function") {
+        commands.resolveCorrections = ({
+          operationId, ...payload
+        } = {}) => corrections.resolveCorrections({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      if (typeof corrections.reopenCorrections === "function") {
+        commands.reopenCorrections = ({
+          operationId, ...payload
+        } = {}) => corrections.reopenCorrections({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
       return Object.keys(commands).length ? Object.freeze(commands) : null;
     }
 

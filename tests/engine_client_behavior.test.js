@@ -320,6 +320,29 @@ function manualRoleAssignment(role = "figure") {
   };
 }
 
+function manualCaptionAssertion(text = "Human caption") {
+  return {
+    text,
+    origin: "manual",
+    revision: "caption-manual-r1",
+    language: "en",
+    source_annotation_id: "",
+    confidence: null,
+    provenance: artifactProvenance({ origin: "human" }),
+    extensions: {},
+  };
+}
+
+function manualMetadataAssertion(name = "plate_number", value = 7) {
+  return {
+    name,
+    value,
+    origin: "manual",
+    revision: "metadata-manual-r1",
+    provenance: artifactProvenance({ origin: "human" }),
+  };
+}
+
 test("EngineClient exposes the complete Replica compatibility surface", () => {
   const { client } = harness();
   assert.equal(typeof client.capabilities, "function");
@@ -351,6 +374,12 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.corrections.assignRegionRole, "function");
   assert.equal(typeof client.corrections.clearRegionRole, "function");
   assert.equal(typeof client.corrections.queueTransform, "function");
+  assert.equal(typeof client.corrections.setManualCaption, "function");
+  assert.equal(typeof client.corrections.clearManualCaption, "function");
+  assert.equal(typeof client.corrections.assertArtifactMetadata, "function");
+  assert.equal(typeof client.corrections.markAttention, "function");
+  assert.equal(typeof client.corrections.resolveCorrections, "function");
+  assert.equal(typeof client.corrections.reopenCorrections, "function");
   assert.equal(typeof client.itemTombstones.list, "function");
   assert.equal(typeof client.itemTombstones.get, "function");
   assert.equal(typeof client.itemTombstones.restore, "function");
@@ -706,6 +735,235 @@ test("correction mutations own exact CAS and idempotency transport", async () =>
   ]);
 });
 
+test("caption metadata and review commands own exact conditional transport",
+  async () => {
+    const captionSetTarget = {
+      kind: "artifact",
+      target_id: "image:one",
+      before_revision: "artifact-r1",
+      after_revision: "artifact-r2",
+    };
+    const captionClearTarget = {
+      ...captionSetTarget,
+      before_revision: "artifact-r2",
+      after_revision: "artifact-r3",
+    };
+    const metadataTarget = {
+      ...captionSetTarget,
+      before_revision: "artifact-r3",
+      after_revision: "artifact-r4",
+    };
+    const markedTarget = {
+      kind: "review",
+      target_id: "book:one",
+      before_revision: "review-r1",
+      after_revision: "review-r2",
+    };
+    const resolvedTarget = {
+      ...markedTarget,
+      before_revision: "review-r2",
+      after_revision: "review-r3",
+    };
+    const reopenedTarget = {
+      ...markedTarget,
+      before_revision: "review-r3",
+      after_revision: "review-r4",
+    };
+    const bodies = [
+      correctionMutationResult({
+        action: "caption.set",
+        operationId: "caption:set:1",
+        targets: [captionSetTarget],
+        inverseAction: "caption.clear",
+        inversePayload: { artifact_id: "image:one" },
+      }),
+      correctionMutationResult({
+        action: "caption.clear",
+        operationId: "caption:clear:1",
+        targets: [captionClearTarget],
+        inverseAction: "caption.set",
+        inversePayload: {
+          artifact_id: "image:one",
+          assertion: manualCaptionAssertion(),
+        },
+      }),
+      correctionMutationResult({
+        action: "metadata.assert",
+        operationId: "metadata:assert:1",
+        targets: [metadataTarget],
+        inverseAction: "metadata.assert",
+        inversePayload: {
+          artifact_id: "image:one",
+          restore_assertions: [manualMetadataAssertion()],
+          clear_names: [],
+        },
+      }),
+      correctionMutationResult({
+        action: "attention.mark",
+        operationId: "attention:mark:1",
+        targets: [markedTarget],
+        inverseAction: "attention.clear",
+        inversePayload: {
+          reason: "Caption needs checking",
+          append_audit: true,
+        },
+      }),
+      correctionMutationResult({
+        action: "attention.resolve",
+        operationId: "attention:resolve:1",
+        targets: [resolvedTarget],
+        inverseAction: "attention.reopen",
+        inversePayload: {
+          reason: "Caption needs checking",
+          append_audit: true,
+        },
+      }),
+      correctionMutationResult({
+        action: "attention.reopen",
+        operationId: "attention:reopen:1",
+        targets: [reopenedTarget],
+        inverseAction: "attention.resolve",
+        inversePayload: {
+          reason: "Caption needs checking",
+          append_audit: true,
+        },
+      }),
+    ];
+    const calls = [];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, bodies.shift());
+      },
+    });
+
+    await client.corrections.setManualCaption({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "artifact-r1",
+      text: "Human caption",
+      language: "en",
+      idempotencyKey: "caption:set:1",
+    });
+    await client.corrections.clearManualCaption({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "artifact-r2",
+      idempotencyKey: "caption:clear:1",
+    });
+    await client.corrections.assertArtifactMetadata({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "artifact-r3",
+      assertions: { plate_number: 8 },
+      clearNames: ["caption_source"],
+      idempotencyKey: "metadata:assert:1",
+    });
+    await client.corrections.markAttention({
+      itemId: "book:one",
+      expectedReviewRevision: "review-r1",
+      reason: "Caption needs checking",
+      actorId: "curator:one",
+      comment: "Found during QA",
+      idempotencyKey: "attention:mark:1",
+    });
+    await client.corrections.resolveCorrections({
+      itemId: "book:one",
+      expectedReviewRevision: "review-r2",
+      actorId: "curator:one",
+      comment: "Caption corrected",
+      idempotencyKey: "attention:resolve:1",
+    });
+    await client.corrections.reopenCorrections({
+      itemId: "book:one",
+      expectedReviewRevision: "review-r3",
+      actorId: "curator:two",
+      comment: "Second look requested",
+      idempotencyKey: "attention:reopen:1",
+    });
+
+    assert.deepEqual(calls.map((call) => [
+      call.init.method,
+      call.url,
+      call.init.headers,
+      JSON.parse(call.init.body),
+    ]), [
+      [
+        "PUT",
+        "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/caption",
+        {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "caption:set:1",
+          "If-Artifact-Match": "\"artifact-r1\"",
+        },
+        { text: "Human caption", language: "en" },
+      ],
+      [
+        "DELETE",
+        "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/caption",
+        {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "caption:clear:1",
+          "If-Artifact-Match": "\"artifact-r2\"",
+        },
+        {},
+      ],
+      [
+        "PATCH",
+        "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/metadata",
+        {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "metadata:assert:1",
+          "If-Artifact-Match": "\"artifact-r3\"",
+        },
+        {
+          assertions: { plate_number: 8 },
+          clear_names: ["caption_source"],
+        },
+      ],
+      [
+        "PUT",
+        "/api/v1/items/book%3Aone/corrections/review/attention",
+        {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "attention:mark:1",
+          "If-Review-Match": "\"review-r1\"",
+        },
+        {
+          actor_id: "curator:one",
+          comment: "Found during QA",
+          reason: "Caption needs checking",
+        },
+      ],
+      [
+        "POST",
+        "/api/v1/items/book%3Aone/corrections/review/resolve",
+        {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "attention:resolve:1",
+          "If-Review-Match": "\"review-r2\"",
+        },
+        { actor_id: "curator:one", comment: "Caption corrected" },
+      ],
+      [
+        "POST",
+        "/api/v1/items/book%3Aone/corrections/review/reopen",
+        {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "attention:reopen:1",
+          "If-Review-Match": "\"review-r3\"",
+        },
+        { actor_id: "curator:two", comment: "Second look requested" },
+      ],
+    ]);
+  });
+
 test("correction mutations reject unsafe commands and malformed receipts", async () => {
   let transports = 0;
   const target = {
@@ -752,6 +1010,36 @@ test("correction mutations reject unsafe commands and malformed receipts", async
     role: "figure",
     linkedArtifactId: "figure:one",
     idempotencyKey: "role:assign:1",
+  }), TypeError);
+  assert.throws(() => client.corrections.setManualCaption({
+    itemId: "book:one",
+    artifactId: "image:one",
+    expectedArtifactRevision: "artifact-r1",
+    text: "   ",
+    language: "en",
+    idempotencyKey: "caption:set:invalid",
+  }), TypeError);
+  assert.throws(() => client.corrections.assertArtifactMetadata({
+    itemId: "book:one",
+    artifactId: "image:one",
+    expectedArtifactRevision: "artifact-r1",
+    assertions: { local_path: "C:/private.png" },
+    idempotencyKey: "metadata:assert:invalid",
+  }), TypeError);
+  assert.throws(() => client.corrections.assertArtifactMetadata({
+    itemId: "book:one",
+    artifactId: "image:one",
+    expectedArtifactRevision: "artifact-r1",
+    assertions: { plate_number: 8 },
+    clearNames: ["plate_number"],
+    idempotencyKey: "metadata:assert:overlap",
+  }), TypeError);
+  assert.throws(() => client.corrections.markAttention({
+    itemId: "book:one",
+    expectedReviewRevision: "review-r1",
+    reason: "",
+    actorId: "curator:one",
+    idempotencyKey: "attention:mark:invalid",
   }), TypeError);
   assert.equal(transports, 0);
 

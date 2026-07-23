@@ -537,3 +537,118 @@ test("transform commands bridge the image editor to EngineClient", async () => {
     (error) => error.code === "capability-unavailable",
   );
 });
+
+test("caption metadata and review commands delegate operation IDs", async () => {
+  const invocations = [];
+  const corrections = {};
+  for (const name of [
+    "setManualCaption",
+    "clearManualCaption",
+    "assertArtifactMetadata",
+    "markAttention",
+    "resolveCorrections",
+    "reopenCorrections",
+  ]) {
+    corrections[name] = async (payload) => {
+      invocations.push([name, payload]);
+      return { receipt: { action: name } };
+    };
+  }
+  const { engineClient } = engineHarness({ corrections });
+  const { commands } = createCorrectionsEnginePorts(engineClient).artifacts;
+  const signal = new AbortController().signal;
+
+  await commands.setManualCaption({
+    itemId: "book-1",
+    artifactId: "image-1",
+    expectedArtifactRevision: "image-r1",
+    text: "Human caption",
+    language: "en",
+    operationId: "caption-set-op",
+    signal,
+  });
+  await commands.clearManualCaption({
+    itemId: "book-1",
+    artifactId: "image-1",
+    expectedArtifactRevision: "image-r2",
+    operationId: "caption-clear-op",
+  });
+  await commands.assertArtifactMetadata({
+    itemId: "book-1",
+    artifactId: "image-1",
+    expectedArtifactRevision: "image-r3",
+    assertions: { plate_number: 8 },
+    clearNames: [],
+    operationId: "metadata-op",
+  });
+  await commands.markAttention({
+    itemId: "book-1",
+    expectedReviewRevision: "review-r1",
+    reason: "Caption needs checking",
+    actorId: "curator-1",
+    comment: "",
+    operationId: "attention-op",
+  });
+  await commands.resolveCorrections({
+    itemId: "book-1",
+    expectedReviewRevision: "review-r2",
+    actorId: "curator-1",
+    comment: "Corrected",
+    operationId: "resolve-op",
+  });
+  await commands.reopenCorrections({
+    itemId: "book-1",
+    expectedReviewRevision: "review-r3",
+    actorId: "curator-2",
+    comment: "Second look",
+    operationId: "reopen-op",
+  });
+
+  assert.deepEqual(invocations, [
+    ["setManualCaption", {
+      itemId: "book-1",
+      artifactId: "image-1",
+      expectedArtifactRevision: "image-r1",
+      text: "Human caption",
+      language: "en",
+      signal,
+      idempotencyKey: "caption-set-op",
+    }],
+    ["clearManualCaption", {
+      itemId: "book-1",
+      artifactId: "image-1",
+      expectedArtifactRevision: "image-r2",
+      idempotencyKey: "caption-clear-op",
+    }],
+    ["assertArtifactMetadata", {
+      itemId: "book-1",
+      artifactId: "image-1",
+      expectedArtifactRevision: "image-r3",
+      assertions: { plate_number: 8 },
+      clearNames: [],
+      idempotencyKey: "metadata-op",
+    }],
+    ["markAttention", {
+      itemId: "book-1",
+      expectedReviewRevision: "review-r1",
+      reason: "Caption needs checking",
+      actorId: "curator-1",
+      comment: "",
+      idempotencyKey: "attention-op",
+    }],
+    ["resolveCorrections", {
+      itemId: "book-1",
+      expectedReviewRevision: "review-r2",
+      actorId: "curator-1",
+      comment: "Corrected",
+      idempotencyKey: "resolve-op",
+    }],
+    ["reopenCorrections", {
+      itemId: "book-1",
+      expectedReviewRevision: "review-r3",
+      actorId: "curator-2",
+      comment: "Second look",
+      idempotencyKey: "reopen-op",
+    }],
+  ]);
+});
