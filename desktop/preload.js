@@ -29,6 +29,21 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld("whlDesktop", {
       ipcRenderer.send("resource:open", url);
     }
   },
+  // Open an independent authenticated workbench. Context is a portable engine
+  // address; the main process validates it and owns reuse/window identity.
+  workbenches: {
+    open: (context, options = {}) => ipcRenderer.invoke("workbench:open", {
+      context,
+      new_window: options && options.newWindow === true,
+    }),
+    currentContext: () => ipcRenderer.invoke("workbench:context:get"),
+    onContext: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const listener = (_event, context) => callback(context);
+      ipcRenderer.on("workbench:context", listener);
+      return () => ipcRenderer.removeListener("workbench:context", listener);
+    },
+  },
   // A .lib opened through the OS (double-click / Open With / second launch).
   // The renderer registers its handler then signals ready; the main process
   // queues any path that arrived earlier and delivers it once signalled.

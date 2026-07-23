@@ -11,13 +11,17 @@
 // (sys.frozen) libcommon reads shipped assets from the bundle and writes state
 // to the per-user dir. So the shell stays tiny.
 
-const { app, BrowserWindow, dialog, shell, Menu, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, shell, Menu, ipcMain, screen } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const http = require("http");
 const net = require("net");
 const fs = require("fs");
 const crypto = require("crypto");
+const {
+  JsonWindowStateStore,
+  WorkbenchWindowRegistry,
+} = require("./window-registry");
 
 let sidecar = null;
 let mainWindow = null;
@@ -27,11 +31,23 @@ let updaterWin = null;        // frameless update splash, shown only while updat
 let sidecarPort = null;
 let sidecarCapability = null;
 let mainReady = false;        // gates window-all-closed: don't quit mid-startup
+let workbenchWindowRegistry = null;
 
 const DESKTOP_CAPABILITY_HEADER = "X-WHL-Desktop-Capability";
 const DESKTOP_CAPABILITY_RE = /^[A-Za-z0-9_-]{43}$/;
 const authenticatedResourceLoads = new Map();
 const resourceWindows = new Set();
+const WORKBENCH_DEFINITIONS = Object.freeze({
+  corrections: Object.freeze({
+    documentPath: "/corrections",
+    title: "Corrections — Library Tool",
+    width: 1280,
+    height: 840,
+    minWidth: 900,
+    minHeight: 600,
+    defaultUiProfileKey: "corrections/default",
+  }),
+});
 
 const isDev = !app.isPackaged;
 
@@ -48,9 +64,9 @@ function parseUrl(value) {
   try { return new URL(value); } catch (e) { return null; }
 }
 
-function isTrustedAppDocumentUrl(value, origin) {
+function isTrustedAppDocumentUrl(value, origin, documentPath = "/") {
   const url = parseUrl(value);
-  return !!url && url.origin === origin && url.pathname === "/" &&
+  return !!url && url.origin === origin && url.pathname === documentPath &&
     !url.search && !url.username && !url.password;
 }
 
@@ -107,7 +123,8 @@ const TRUSTED_APP_PERMISSIONS = new Set([
 function shouldGrantTrustedAppPermission(permission, webContents, details, trust) {
   return !!trust && TRUSTED_APP_PERMISSIONS.has(permission) &&
     webContents === trust.webContents && !!details && details.isMainFrame === true &&
-    isTrustedAppDocumentUrl(details.requestingUrl, trust.origin);
+    isTrustedAppDocumentUrl(
+      details.requestingUrl, trust.origin, trust.documentPath || "/");
 }
 
 function shouldAuthorizeApiRequest(details, trust) {
@@ -132,7 +149,8 @@ function shouldAuthorizeApiRequest(details, trust) {
     return details.resourceType === "image" && details.frame.url === trust.oneShotUrl &&
       !!grantBuild && !!requestedBuild && grantBuild[1] === requestedBuild[1];
   }
-  return isTrustedAppDocumentUrl(details.frame && details.frame.url, trust.origin);
+  return isTrustedAppDocumentUrl(
+    details.frame && details.frame.url, trust.origin, trust.documentPath || "/");
 }
 
 function capabilityHeaders(requestHeaders, capability, authorize) {
@@ -218,11 +236,31 @@ function sidecarOrigin() {
   return `http://127.0.0.1:${sidecarPort}`;
 }
 
+function ensureWorkbenchWindowRegistry() {
+  if (workbenchWindowRegistry) return workbenchWindowRegistry;
+  workbenchWindowRegistry = new WorkbenchWindowRegistry({
+    origin: sidecarOrigin(),
+    definitions: WORKBENCH_DEFINITIONS,
+    stateStore: new JsonWindowStateStore(
+      path.join(app.getPath("userData"), "workbench-window-state.json")),
+    getDisplays: () => {
+      const primary = screen.getPrimaryDisplay();
+      return [primary, ...screen.getAllDisplays().filter(
+        (display) => display.id !== primary.id)];
+    },
+  });
+  return workbenchWindowRegistry;
+}
+
+function trustedApplicationRecord(event) {
+  return workbenchWindowRegistry
+    ? workbenchWindowRegistry.recordForEvent(event, isTrustedAppDocumentUrl)
+    : null;
+}
+
 function isTrustedMainSender(event) {
-  return !!mainWindow && !mainWindow.isDestroyed() && event &&
-    event.sender === mainWindow.webContents &&
-    event.senderFrame === mainWindow.webContents.mainFrame &&
-    isTrustedAppDocumentUrl(event.senderFrame.url, sidecarOrigin());
+  const record = trustedApplicationRecord(event);
+  return !!record && record.role === "manager" && record.window === mainWindow;
 }
 
 // --- .lib open flow ------------------------------------------------------------
@@ -308,16 +346,18 @@ if (!gotSingleInstanceLock) {
 
 // custom title-bar controls (the window is frameless) driven from the renderer
 ipcMain.on("win:minimize", (event) => {
-  if (isTrustedMainSender(event)) mainWindow.minimize();
+  const record = trustedApplicationRecord(event);
+  if (record) record.window.minimize();
 });
 ipcMain.on("win:toggle-maximize", (event) => {
-  if (!isTrustedMainSender(event)) return;
-  if (!mainWindow) return;
-  if (mainWindow.isMaximized()) mainWindow.unmaximize();
-  else mainWindow.maximize();
+  const record = trustedApplicationRecord(event);
+  if (!record) return;
+  if (record.window.isMaximized()) record.window.unmaximize();
+  else record.window.maximize();
 });
 ipcMain.on("win:close", (event) => {
-  if (isTrustedMainSender(event)) mainWindow.close();
+  const record = trustedApplicationRecord(event);
+  if (record) record.window.close();
 });
 
 // Splash renderers signal only after their embedded icon and font have loaded,
@@ -340,7 +380,7 @@ ipcMain.on("updater:ready", (event) => {
 // they don't get trapped in the app). Re-validate the scheme: shell.openExternal
 // will happily launch file:, smb:, mailto: handlers, so only http(s) passes.
 ipcMain.on("win:open-external", (event, url) => {
-  if (!isTrustedMainSender(event)) return;
+  if (!trustedApplicationRecord(event)) return;
   const target = typeof url === "string" ? parseUrl(url) : null;
   if (target && (target.protocol === "http:" || target.protocol === "https:") &&
       !target.username && !target.password && target.origin !== sidecarOrigin()) {
@@ -352,8 +392,29 @@ ipcMain.on("win:open-external", (event, url) => {
 // main-frame-only and this handler independently verifies the sender and a
 // deliberately small GET-only route allowlist before minting a window grant.
 ipcMain.on("resource:open", (event, url) => {
-  if (!isTrustedMainSender(event) || typeof url !== "string") return;
-  createAuthenticatedResourceWindow(url);
+  const record = trustedApplicationRecord(event);
+  if (!record || typeof url !== "string") return;
+  createAuthenticatedResourceWindow(url, record.window);
+});
+
+ipcMain.handle("workbench:open", (event, request) => {
+  if (!trustedApplicationRecord(event)) {
+    return { ok: false, error: "unauthorized_workbench_sender" };
+  }
+  try {
+    return openWorkbenchWindow(request);
+  } catch (error) {
+    return {
+      ok: false,
+      error: "invalid_workbench_open_request",
+      message: String(error && error.message || "invalid request"),
+    };
+  }
+});
+
+ipcMain.handle("workbench:context:get", (event) => {
+  if (!workbenchWindowRegistry) return null;
+  return workbenchWindowRegistry.contextForEvent(event, isTrustedAppDocumentUrl);
 });
 
 // a free loopback port so multiple installs / a running dev server never clash
@@ -681,15 +742,21 @@ const hardenedSessions = new WeakSet();
 function denyUnrequestedPermissions(electronSession) {
   if (hardenedSessions.has(electronSession)) return;
   hardenedSessions.add(electronSession);
-  const trust = () => mainWindow && !mainWindow.isDestroyed() ? {
-    origin: sidecarOrigin(),
-    webContents: mainWindow.webContents,
-  } : null;
+  const trust = (webContents) => {
+    const record = workbenchWindowRegistry &&
+      workbenchWindowRegistry.recordForWebContents(
+        webContents, isTrustedAppDocumentUrl);
+    return record ? {
+      origin: sidecarOrigin(),
+      webContents: record.window.webContents,
+      documentPath: record.documentPath,
+    } : null;
+  };
   electronSession.setPermissionCheckHandler((webContents, permission, _origin, details) =>
-    shouldGrantTrustedAppPermission(permission, webContents, details, trust()));
+    shouldGrantTrustedAppPermission(permission, webContents, details, trust(webContents)));
   electronSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
     callback(shouldGrantTrustedAppPermission(
-      permission, webContents, details, trust()));
+      permission, webContents, details, trust(webContents)));
   });
 }
 
@@ -724,12 +791,10 @@ function installApiCapabilityTransport(win) {
     (details, callback) => {
       const originalApiRequest = requestChains.hasAuthorizedOrigin(details, origin);
       let authorize = false;
-      if (originalApiRequest && mainWindow && !mainWindow.isDestroyed()) {
-        authorize = shouldAuthorizeApiRequest(details, {
-          origin,
-          webContentsId: mainWindow.webContents.id,
-          mainFrame: mainWindow.webContents.mainFrame,
-        });
+      if (originalApiRequest && workbenchWindowRegistry) {
+        const trust = workbenchWindowRegistry.trustForWebRequest(
+          details.webContentsId, isTrustedAppDocumentUrl);
+        if (trust) authorize = shouldAuthorizeApiRequest(details, trust);
       }
       if (!authorize && originalApiRequest) {
         const resource = authenticatedResourceLoads.get(details.webContentsId);
@@ -759,14 +824,14 @@ function openExternalUrl(value) {
   return true;
 }
 
-function createAuthenticatedResourceWindow(value) {
-  if (!mainWindow || mainWindow.isDestroyed()) return false;
+function createAuthenticatedResourceWindow(value, parentWindow = mainWindow) {
+  if (!parentWindow || parentWindow.isDestroyed()) return false;
   const resource = classifyAuthenticatedResource(value, sidecarOrigin());
   if (!resource) return false;
   const networkUrl = resource.url;
   const grantMode = resource.mode;
   const child = new BrowserWindow({
-    parent: mainWindow,
+    parent: parentWindow,
     width: 1000,
     height: 800,
     title: "Library Tool",
@@ -817,6 +882,100 @@ function createAuthenticatedResourceWindow(value) {
   return true;
 }
 
+function configureWorkbenchWindow(record) {
+  const win = record.window;
+  const registry = ensureWorkbenchWindowRegistry();
+  denyUnrequestedPermissions(win.webContents.session);
+  win.on("maximize", () => {
+    if (!win.isDestroyed()) win.webContents.send("win:maximized", true);
+  });
+  win.on("unmaximize", () => {
+    if (!win.isDestroyed()) win.webContents.send("win:maximized", false);
+  });
+  win.webContents.on("did-finish-load", () => {
+    if (win.isDestroyed()) return;
+    win.webContents.send("win:maximized", win.isMaximized());
+    registry.sendContext(record);
+  });
+  win.webContents.on("will-navigate", (event, url) => {
+    if (!isTrustedAppDocumentUrl(url, sidecarOrigin(), record.documentPath)) {
+      event.preventDefault();
+      openExternalUrl(url);
+    }
+  });
+  win.webContents.on("will-redirect", (event, url) => {
+    if (!isTrustedAppDocumentUrl(url, sidecarOrigin(), record.documentPath)) {
+      event.preventDefault();
+      openExternalUrl(url);
+    }
+  });
+  win.webContents.on("will-frame-navigate", (details) => {
+    if (details.isMainFrame) return;
+    const target = parseUrl(details.url);
+    if (details.url === "about:blank" ||
+        (target && target.protocol === "blob:" && target.origin === sidecarOrigin())) return;
+    details.preventDefault();
+  });
+  win.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isSidecarApiUrl(url, sidecarOrigin())) return { action: "deny" };
+    openExternalUrl(url);
+    return { action: "deny" };
+  });
+  win.loadURL(record.documentUrl);
+  win.once("ready-to-show", () => {
+    if (win.isDestroyed()) return;
+    if (record.restoredState && record.restoredState.maximized) win.maximize();
+    win.show();
+  });
+}
+
+function openWorkbenchWindow(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new TypeError("workbench open request must be an object");
+  }
+  const allowed = new Set(["context", "new_window"]);
+  const unknown = Object.keys(request).filter((key) => !allowed.has(key));
+  if (unknown.length) throw new TypeError(`unknown workbench open field: ${unknown[0]}`);
+  if (request.new_window != null && typeof request.new_window !== "boolean") {
+    throw new TypeError("new_window must be a boolean");
+  }
+  const registry = ensureWorkbenchWindowRegistry();
+  const result = registry.open({
+    context: request.context,
+    newWindow: request.new_window === true,
+  }, ({ definition, bounds }) => new BrowserWindow({
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    minWidth: Math.min(definition.minWidth, bounds.width),
+    minHeight: Math.min(definition.minHeight, bounds.height),
+    show: false,
+    title: definition.title,
+    backgroundColor: "#1d1f21",
+    frame: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      devTools: isDev,
+    },
+  }));
+  if (!result.reused) configureWorkbenchWindow(result.record);
+  return {
+    ok: true,
+    schema: "librarytool.workbench-open-result/1",
+    workbench_id: result.record.workbenchId,
+    window_id: result.record.windowId,
+    reused: result.reused,
+  };
+}
+
 function createWindow() {
   sendStartupStatus("Opening library");
   mainWindow = new BrowserWindow({
@@ -840,6 +999,7 @@ function createWindow() {
       devTools: isDev,
     },
   });
+  ensureWorkbenchWindowRegistry().registerManager(mainWindow, { documentPath: "/" });
   denyUnrequestedPermissions(mainWindow.webContents.session);
   installApiCapabilityTransport(mainWindow);
   Menu.setApplicationMenu(null);   // the web UI has its own menu bar
@@ -1147,6 +1307,7 @@ app.on("window-all-closed", () => { if (mainReady) app.quit(); });
 app.on("before-quit", () => {
   app.isQuitting = true;
   if (sidecar) { try { sidecar.kill(); } catch (e) { /* already gone */ } }
+  if (workbenchWindowRegistry) workbenchWindowRegistry.revokeAll();
   authenticatedResourceLoads.clear();
   sidecarCapability = null;
 });

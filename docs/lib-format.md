@@ -12,6 +12,13 @@ needs to understand, edit, and return it without breaking it.** Dropping a
 the illustrations"* should be sufficient; the file itself teaches the assistant
 the structure, the editing rules, and the invariants.
 
+The mutable working-store boundary and ownership of capture images, derived
+artifacts, spatial annotations, human assertions, review records, jobs, and UI
+profiles are fixed by
+[ADR 0001](adr/0001-corrections-workbench-boundary.md). A `.lib` archive is a
+sealed interchange projection of that state; it is never the Corrections
+workbench's mutable database and never carries client UI-profile state.
+
 ---
 
 ## 1. What a `.lib` is today (`lib/1`, on `facsimile`)
