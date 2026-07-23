@@ -27,8 +27,11 @@ const {
   CONTEXT_SCHEMA,
   CorrectionsShell,
   CorrectionsWindowState,
+  artifactSelection,
   nextTrayTab,
+  normalizeSelection,
   normalizeWorkbenchContext,
+  selectionContext,
 } = require("../tools/whl_explorer/static/corrections/shell");
 
 
@@ -163,6 +166,33 @@ test("typed editor registry routes supported resources and safely falls back", (
   registry.setResource({ kind: "image", url: "javascript:alert(1)" });
   assert.equal(registry.render(host), "image-overlay");
   assert.equal(host.children[0].children[0].className, "editor-unsupported");
+});
+
+
+test("editor registry disposes interactive renderers before replacement and destroy", () => {
+  const documentRef = miniDocument();
+  let renders = 0;
+  let cleanups = 0;
+  const registry = createDefaultEditorRegistry({
+    documentRef,
+    imageOverlayRenderer({ container }) {
+      renders += 1;
+      container.replaceChildren(new MiniNode("canvas", documentRef));
+      return () => { cleanups += 1; };
+    },
+  });
+  const host = new MiniNode("div", documentRef);
+  registry.setResource({ id: "page-1", kind: "captured-image", url: "/page-1" });
+  registry.render(host);
+  registry.render(host);
+  assert.equal(renders, 2);
+  assert.equal(cleanups, 1);
+
+  registry.setResource({ id: "ocr-1", kind: "ocr-text", text: "sage" });
+  registry.render(host);
+  assert.equal(cleanups, 2);
+  registry.destroy();
+  assert.equal(cleanups, 2);
 });
 
 
@@ -382,6 +412,87 @@ test("selection, resources, and drafts remain independent per window instance", 
   assert.equal(first.snapshot().resource.metadata.caption, "Sage");
   first.applyContext(context({ artifact_id: "figure-2" }));
   assert.deepEqual(first.getDraft("figure-1:caption"), { value: "Medicinal sage" });
+});
+
+
+test("cross-panel selection addresses retain context without carrying stale object IDs", () => {
+  const prior = normalizeSelection({
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "page-1",
+    artifactId: "capture-1",
+    annotationId: null,
+  });
+  const annotation = artifactSelection({
+    id: "region-2",
+    key: "annotation:region-2",
+    itemId: "book-1",
+    objectType: "spatial-annotation",
+    source: { representationId: "scan-1", canvasId: "page-2" },
+  }, prior);
+  assert.deepEqual(annotation, {
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "page-2",
+    artifactId: null,
+    annotationId: "region-2",
+  });
+
+  const merged = selectionContext(context({ artifact_id: "capture-1" }), annotation);
+  assert.equal(merged.canvas_id, "page-2");
+  assert.equal(merged.annotation_id, "region-2");
+  assert.equal(Object.hasOwn(merged, "artifact_id"), false);
+
+  const transform = artifactSelection({
+    id: "transform-4",
+    key: "transform:transform-4",
+    itemId: "book-1",
+    objectType: "transform",
+  }, prior);
+  assert.equal(transform.artifactId, null);
+  assert.equal(transform.annotationId, null);
+});
+
+
+test("invalidated feature selection clears every object address without losing drafts", async () => {
+  const bookSelections = [];
+  const artifactContexts = [];
+  const state = new CorrectionsWindowState();
+  state.applyContext(context({ artifact_id: "capture-1" }));
+  state.setDraft("caption:capture-1", { text: "keep me" });
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    artifactsFeature: {
+      setContext(value) {
+        artifactContexts.push(value);
+        return Promise.resolve();
+      },
+    },
+    booksFeature: {
+      setSelection(value) { bookSelections.push(value); },
+    },
+    destroyed: false,
+    root: { querySelector() { return null; } },
+    selectionListeners: new Set(),
+    setResource(value) { state.setResource(value); },
+    setStatus() {},
+    state,
+  });
+
+  shell.clearSelection();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(state.selection, {
+    itemId: null,
+    representationId: null,
+    canvasId: null,
+    artifactId: null,
+    annotationId: null,
+  });
+  assert.equal(bookSelections.at(-1), null);
+  assert.equal(artifactContexts.at(-1).item_id, undefined);
+  assert.deepEqual(state.getDraft("caption:capture-1"), { text: "keep me" });
 });
 
 

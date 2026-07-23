@@ -1761,9 +1761,22 @@ def corrections_workbench():
     return render_template(
         "corrections.html",
         corrections_css_v=_asset_v("corrections/corrections.css"),
+        corrections_books_css_v=_asset_v("corrections/books.css"),
+        corrections_artifacts_css_v=_asset_v("corrections/artifacts.css"),
+        corrections_image_editor_css_v=_asset_v(
+            "corrections/image-editor.css"
+        ),
         editor_registry_v=_asset_v("corrections/editor-registry.js"),
         ui_profile_v=_asset_v("corrections/ui-profile.js"),
         layout_controller_v=_asset_v("corrections/layout-controller.js"),
+        artifact_model_v=_asset_v("corrections/artifact-model.js"),
+        artifact_editors_v=_asset_v("corrections/artifact-editors.js"),
+        corrections_properties_v=_asset_v("corrections/properties.js"),
+        corrections_artifacts_v=_asset_v("corrections/artifacts.js"),
+        corrections_books_v=_asset_v("corrections/books.js"),
+        corrections_reviews_v=_asset_v("corrections/reviews.js"),
+        image_editor_state_v=_asset_v("corrections/image-editor-state.js"),
+        corrections_image_editor_v=_asset_v("corrections/image-editor.js"),
         corrections_shell_v=_asset_v("corrections/shell.js"),
     )
 

@@ -154,6 +154,7 @@
       this.family = "missing";
       this.selectedEditorId = null;
       this.fallbackIds = { missing: null, unknown: null };
+      this.renderCleanup = null;
     }
 
     register(definition) {
@@ -249,24 +250,38 @@
       const editor = this.currentEditor();
       const documentRef = this.documentRef || container.ownerDocument;
       if (!editor || !documentRef) throw new TypeError("editor document is required");
-      editor.render({
+      this.releaseRenderedEditor();
+      const cleanup = editor.render({
         container,
         documentRef,
         resource: this.resource,
         family: this.family,
       });
+      if (typeof cleanup === "function") this.renderCleanup = cleanup;
       return editor.id;
+    }
+
+    releaseRenderedEditor() {
+      const cleanup = this.renderCleanup;
+      this.renderCleanup = null;
+      if (typeof cleanup === "function") cleanup();
+    }
+
+    destroy() {
+      this.releaseRenderedEditor();
     }
   }
 
   function createDefaultEditorRegistry(options = {}) {
     const registry = new EditorRegistry(options);
+    const imageOverlayRenderer = typeof options.imageOverlayRenderer === "function"
+      ? options.imageOverlayRenderer : imageRenderer(true);
     registry
       .register({
         id: "image-overlay",
         label: "Image + overlay",
         families: ["image"],
-        render: imageRenderer(true),
+        render: imageOverlayRenderer,
       })
       .register({
         id: "image-plain",
