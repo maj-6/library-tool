@@ -134,6 +134,67 @@ class HomeListPresentationTest {
     }
 
     @Test
+    fun restoredExpansionRetainsAtMostTheFirstVisibleGroup() {
+        val grouped = groups(
+            listOf(
+                Scan("new-a", "a", "A"),
+                Scan("new-b", "b", "B"),
+                Scan("new-c", "c", "C"),
+            ),
+        )
+
+        assertEquals("a", retainedExpandedScanGroup(grouped, setOf("c", "a")))
+        assertNull(retainedExpandedScanGroup(grouped, setOf("missing")))
+    }
+
+    @Test
+    fun scanPagesStayFixedAndCoverBoundaryAndPartialPages() {
+        val items = (1..200).toList()
+
+        assertEquals(24, HOME_SCAN_PAGE_SIZE)
+        val first = scanGroupPage(items, requestedOffset = 0, pageSize = HOME_SCAN_PAGE_SIZE)
+        assertEquals((1..24).toList(), first.items)
+        assertEquals(0, first.startIndex)
+        assertNull(first.previousOffset)
+        assertEquals(24, first.nextOffset)
+        assertEquals(24, first.nextCount)
+
+        val middle = scanGroupPage(items, requestedOffset = 96, pageSize = HOME_SCAN_PAGE_SIZE)
+        assertEquals((97..120).toList(), middle.items)
+        assertEquals(72, middle.previousOffset)
+        assertEquals(120, middle.nextOffset)
+
+        val last = scanGroupPage(items, requestedOffset = 192, pageSize = HOME_SCAN_PAGE_SIZE)
+        assertEquals((193..200).toList(), last.items)
+        assertEquals(168, last.previousOffset)
+        assertEquals(24, last.previousCount)
+        assertNull(last.nextOffset)
+        assertEquals(0, last.nextCount)
+    }
+
+    @Test
+    fun scanPageOffsetsClampAfterRemovalAndNeverAccumulateRows() {
+        for (size in listOf(0, 1, 24, 25, 48, 49, 200)) {
+            val items = (1..size).toList()
+            val page = scanGroupPage(
+                items,
+                requestedOffset = Int.MAX_VALUE,
+                pageSize = HOME_SCAN_PAGE_SIZE,
+            )
+            assertTrue(page.items.size <= HOME_SCAN_PAGE_SIZE)
+            assertTrue(page.startIndex >= 0)
+            assertTrue(page.items.all { it in items })
+        }
+
+        val negative = scanGroupPage(
+            (1..49).toList(),
+            requestedOffset = -50,
+            pageSize = HOME_SCAN_PAGE_SIZE,
+        )
+        assertEquals((1..24).toList(), negative.items)
+    }
+
+    @Test
     fun compactMetricsAreAboutFifteenPercentSmallerAndTwentyPercentTighter() {
         val standard = scanListLayoutMetrics(compact = false)
         val compact = scanListLayoutMetrics(compact = true)

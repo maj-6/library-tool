@@ -10,6 +10,7 @@ import android.text.method.LinkMovementMethod
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -33,12 +34,17 @@ import androidx.work.WorkManager
 import com.google.android.material.button.MaterialButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityHomeBinding
 import org.json.JSONObject
 import java.util.UUID
+import kotlin.coroutines.CoroutineContext
 import kotlin.math.roundToInt
 
 /**
@@ -57,7 +63,6 @@ class HomeActivity : AppCompatActivity() {
         val entry: Entries.Entry,
         val titleLabel: String,
         val statusLabel: String,
-        val thumbnail: EntryPhotoDescriptor?,
     )
 
     private data class ScanListSnapshot(
@@ -70,7 +75,13 @@ class HomeActivity : AppCompatActivity() {
         val item: CollectionInventoryItem,
         val titleLabel: String,
         val statusLabel: String?,
-        val thumbnail: EntryPhotoDescriptor?,
+    )
+
+    private data class ThumbnailRequest(
+        val image: ImageView,
+        val entry: Entries.Entry,
+        val maxWidth: Int,
+        val maxHeight: Int,
     )
 
     private data class InspectSnapshot(
@@ -123,6 +134,8 @@ class HomeActivity : AppCompatActivity() {
     private var reportedTagConflict = ""
     private val expandedScanGroups = linkedSetOf<String>()
     private var scanGroupsInitialized = false
+    private var scanPageGroupKey: String? = null
+    private var scanPageOffset = 0
     private var syncFeedbackRequestId: String? = null
     private var syncFeedbackPhase: CaptureSyncPhase? = null
 
@@ -557,11 +570,29 @@ class HomeActivity : AppCompatActivity() {
 
     // --- collections ---------------------------------------------------------
 
+    /**
+     * Local snapshot reads are blocking filesystem work. Cancellation cannot
+     * interrupt a directory walk already in progress, so serialize all tab
+     * snapshots: canceled waiters leave the mutex queue and only the newest
+     * requested tab can run after the current read reaches a cancellation
+     * checkpoint.
+     */
+    private suspend fun <T> loadHomeSnapshot(
+        block: (CoroutineContext) -> T,
+    ): T = withContext(Dispatchers.IO) {
+        val loadContext = currentCoroutineContext()
+        SNAPSHOT_LOAD_MUTEX.withLock {
+            loadContext.ensureActive()
+            block(loadContext)
+        }
+    }
+
     private fun refreshCollectionBar() {
         cancelCollectionBarLoading()
         collectionBarJob = lifecycleScope.launch {
-            val snapshot = withContext(Dispatchers.IO) {
+            val snapshot = loadHomeSnapshot { loadContext ->
                 val records = Collections.allRecords(this@HomeActivity)
+                loadContext.ensureActive()
                 CollectionBarSnapshot(
                     currentCollection = resolveCurrentCollection(
                         records,
@@ -595,8 +626,9 @@ class HomeActivity : AppCompatActivity() {
         resetThumbnailLoading()
         cancelCollectionListLoading()
         collectionListJob = lifecycleScope.launch {
-            val snapshot = withContext(Dispatchers.IO) {
+            val snapshot = loadHomeSnapshot { loadContext ->
                 val records = Collections.allRecords(this@HomeActivity)
+                loadContext.ensureActive()
                 val live = records.filter { !it.deleted && it.mergedInto == null }
                 val conflictTagId = Prefs.collectionTagConflict(this@HomeActivity)
                 val retiredConflict = records.filter {
@@ -610,7 +642,9 @@ class HomeActivity : AppCompatActivity() {
                     Prefs.currentCollectionId(this@HomeActivity),
                 )
                 val counts = CollectionInventory.items(this@HomeActivity)
+                    .also { loadContext.ensureActive() }
                     .mapNotNull {
+                        loadContext.ensureActive()
                         resolvedLiveCollectionId(it.summary.collectionId, records)
                     }
                     .groupingBy { it }
@@ -881,14 +915,17 @@ class HomeActivity : AppCompatActivity() {
         cancelInspectLoading()
         inspectVisibleBookLimit = INSPECT_BOOK_PAGE_SIZE
         inspectJob = lifecycleScope.launch {
-            val snapshot = withContext(Dispatchers.IO) {
+            val snapshot = loadHomeSnapshot { loadContext ->
                 val records = Collections.allRecords(this@HomeActivity)
+                loadContext.ensureActive()
                 val paths = collectionDisplayPaths(records)
                 val collections = records
                     .filter { !it.deleted && it.mergedInto == null }
                     .sortedBy { (paths[it.id] ?: it.name).lowercase() }
                 val itemsByCollection = CollectionInventory.items(this@HomeActivity)
+                    .also { loadContext.ensureActive() }
                     .mapNotNull { item ->
+                        loadContext.ensureActive()
                         val collectionId = resolvedLiveCollectionId(
                             item.summary.collectionId,
                             records,
@@ -901,7 +938,6 @@ class HomeActivity : AppCompatActivity() {
                             statusLabel = item.current?.let {
                                 Entries.statusLabel(this@HomeActivity, it)
                             },
-                            thumbnail = item.current?.thumbnailDescriptor(),
                         )
                     }
                     .groupBy({ it.first }, { it.second })
@@ -915,7 +951,10 @@ class HomeActivity : AppCompatActivity() {
                 InspectSnapshot(
                     collections = collections,
                     collectionPaths = paths,
-                    currentCollectionId = Collections.current(this@HomeActivity)?.id,
+                    currentCollectionId = resolveCurrentCollection(
+                        records,
+                        Prefs.currentCollectionId(this@HomeActivity),
+                    )?.id,
                     itemsByCollection = itemsByCollection,
                 )
             }
@@ -928,6 +967,9 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun renderInspect(snapshot: InspectSnapshot) {
+        // Show-more can race an authoritative tab refresh just like scan-page
+        // navigation. The new render owns the only thumbnail job.
+        resetThumbnailLoading()
         val collections = snapshot.collections
         val paths = snapshot.collectionPaths
         val counts = snapshot.itemsByCollection.mapValues { it.value.size }
@@ -1065,7 +1107,6 @@ class HomeActivity : AppCompatActivity() {
                 minHeight = dp(48)
                 setOnClickListener {
                     inspectVisibleBookLimit += nextPageSize
-                    resetThumbnailLoading()
                     renderInspect(snapshot)
                 }
             }
@@ -1084,7 +1125,7 @@ class HomeActivity : AppCompatActivity() {
 
     private fun renderInspectBooks(items: List<InspectBookSnapshot>) {
         val inflater = LayoutInflater.from(this)
-        val thumbnails = mutableListOf<Triple<ImageView, java.io.File, Boolean>>()
+        val thumbnails = mutableListOf<ThumbnailRequest>()
         items.chunked(inspectViewMode.columns).forEach { chunk ->
             val row = LinearLayout(this).apply {
                 layoutParams = LinearLayout.LayoutParams(
@@ -1110,37 +1151,13 @@ class HomeActivity : AppCompatActivity() {
             }
             binding.inspectBooks.addView(row)
         }
-        thumbJob = lifecycleScope.launch(Dispatchers.IO) {
-            for ((image, file, cleanupPending) in thumbnails) {
-                var decodedBitmap: Bitmap? = null
-                try {
-                    val decoded = decodeSampledOriented(
-                        file,
-                        maxWidth = 384,
-                        maxHeight = 512,
-                    ) ?: continue
-                    decodedBitmap = decoded
-                    if (cleanupPending) decodedBitmap = softenPendingThumbnail(decoded)
-                    withContext(Dispatchers.Main) {
-                        val bitmap = decodedBitmap ?: return@withContext
-                        if (activeTab != HomeTab.INSPECT ||
-                            !image.isAttachedToWindow ||
-                            !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-                        ) return@withContext
-                        setDynamicThumbnail(image, bitmap)
-                        decodedBitmap = null
-                    }
-                } finally {
-                    decodedBitmap?.takeIf { !it.isRecycled }?.recycle()
-                }
-            }
-        }
+        startThumbnailLoading(thumbnails, HomeTab.INSPECT)
     }
 
     private fun bindInspectBook(
         view: View,
         snapshot: InspectBookSnapshot,
-        thumbnails: MutableList<Triple<ImageView, java.io.File, Boolean>>,
+        thumbnails: MutableList<ThumbnailRequest>,
     ) {
         val item = snapshot.item
         val summary = item.summary
@@ -1163,13 +1180,13 @@ class HomeActivity : AppCompatActivity() {
         }
         view.findViewById<TextView>(R.id.inspectSubtitle).text =
             details.joinToString(" \u00b7 ")
-        snapshot.thumbnail?.let { descriptor ->
+        item.current?.let { entry ->
             val image = view.findViewById<ImageView>(R.id.inspectThumb)
-            image.alpha = if (descriptor.postProcessingPending) .82f else 1f
-            thumbnails += Triple(
-                image,
-                descriptor.displayFile,
-                descriptor.postProcessingPending,
+            thumbnails += ThumbnailRequest(
+                image = image,
+                entry = entry,
+                maxWidth = 384,
+                maxHeight = 512,
             )
         }
         val open = {
@@ -1197,42 +1214,68 @@ class HomeActivity : AppCompatActivity() {
         cancelScanListLoading()
         cancelCollectionBarLoading()
         scanListJob = lifecycleScope.launch {
-            val snapshot = withContext(Dispatchers.IO) {
+            val snapshot = loadHomeSnapshot { loadContext ->
                 val entries = Entries.recent(this@HomeActivity)
+                loadContext.ensureActive()
                 val records = Collections.allRecords(this@HomeActivity)
+                loadContext.ensureActive()
                 ScanListSnapshot(
                     items = entries.map { entry ->
+                        loadContext.ensureActive()
                         ScanListItem(
                             entry = entry,
                             titleLabel = Entries.titleLabel(this@HomeActivity, entry),
                             statusLabel = Entries.statusLabel(this@HomeActivity, entry),
-                            thumbnail = entry.thumbnailDescriptor(),
                         )
                     },
                     collectionPaths = collectionDisplayPaths(records),
-                    currentCollection = Collections.current(this@HomeActivity),
+                    currentCollection = resolveCurrentCollection(
+                        records,
+                        Prefs.currentCollectionId(this@HomeActivity),
+                    ),
                 )
             }
             scanListJob = null
             if (activeTab != HomeTab.SCANS ||
                 !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
             ) return@launch
+            // Every authoritative disk/worker refresh returns to the newest
+            // bounded page. Reset here, immediately before rendering, so an
+            // older in-flight refresh cannot retain a page chosen meanwhile.
+            resetScanPagination()
             renderHome(snapshot)
         }
     }
 
-    private fun renderHome(snapshot: ScanListSnapshot) {
+    private fun resetScanPagination() {
+        scanPageGroupKey = null
+        scanPageOffset = 0
+    }
+
+    private fun renderHome(
+        snapshot: ScanListSnapshot,
+        updateCollectionBar: Boolean = true,
+        focusPageGroupKey: String? = null,
+    ) {
+        // Page navigation can race an authoritative IO refresh. Every render
+        // owns exactly one decoder job and retires the previous page's views
+        // and bitmaps before replacing the hierarchy.
+        resetThumbnailLoading()
         val list = binding.homeList
         list.removeAllViews()
         val entries = snapshot.items.map(ScanListItem::entry)
         val itemById = snapshot.items.associateBy { it.entry.id }
-        renderCollectionBar(snapshot.currentCollection, snapshot.collectionPaths)
+        if (updateCollectionBar) {
+            renderCollectionBar(snapshot.currentCollection, snapshot.collectionPaths)
+        }
         if (entries.isEmpty()) {
             list.addView(emptyNotice(getString(R.string.home_empty)))
             return
         }
         val inflater = LayoutInflater.from(this)
-        val thumbs = ArrayList<Triple<ImageView, java.io.File, Boolean>>()
+        val thumbs = ArrayList<ThumbnailRequest>()
+        var pageFocusTarget: View? = null
+        var pageAnnouncement: String? = null
         val knownCollectionPaths = snapshot.collectionPaths
         val currentCollectionId = snapshot.currentCollection?.id
         val groups = groupScansByCollection(
@@ -1251,9 +1294,12 @@ class HomeActivity : AppCompatActivity() {
             initiallyExpandedScanGroup(groups, currentCollectionId)?.let(expandedScanGroups::add)
             scanGroupsInitialized = true
         }
+        val expandedGroupKey = retainedExpandedScanGroup(groups, expandedScanGroups)
+        expandedScanGroups.clear()
+        expandedGroupKey?.let(expandedScanGroups::add)
         val compact = Prefs.compactScanList(this)
         for (group in groups) {
-            val expanded = group.key in expandedScanGroups
+            val expanded = group.key == expandedGroupKey
             val header = inflater.inflate(R.layout.item_scan_group, list, false)
             val groupName = header.findViewById<TextView>(R.id.groupName)
             groupName.text = group.label
@@ -1275,14 +1321,30 @@ class HomeActivity : AppCompatActivity() {
                 count,
             )
             header.setOnClickListener {
-                if (!expandedScanGroups.add(group.key)) expandedScanGroups.remove(group.key)
+                resetScanPagination()
+                expandedScanGroups.clear()
+                if (!expanded) expandedScanGroups.add(group.key)
                 refreshHome()
             }
             RemoteUiCatalog.apply(header)
             list.addView(header)
             if (!expanded) continue
 
-            for (e in group.items) {
+            val page = scanGroupPage(
+                group.items,
+                if (scanPageGroupKey == group.key) scanPageOffset else 0,
+                HOME_SCAN_PAGE_SIZE,
+            )
+            if (group.key == focusPageGroupKey) {
+                pageAnnouncement = getString(
+                    R.string.home_group_page_status,
+                    group.label,
+                    page.startIndex + 1,
+                    page.startIndex + page.items.size,
+                    group.items.size,
+                )
+            }
+            for (e in page.items) {
                 val item = checkNotNull(itemById[e.id])
                 val row = inflater.inflate(R.layout.item_home, list, false)
                 row.findViewById<TextView>(R.id.title).text = item.titleLabel
@@ -1318,11 +1380,12 @@ class HomeActivity : AppCompatActivity() {
                     .setBackgroundColor(getColor(markerColor(state)))
                 val thumb = row.findViewById<ImageView>(R.id.thumb)
                 applyScanListLayout(row, thumb, compact)
-                item.thumbnail?.let { descriptor ->
-                    val cleanupPending = descriptor.postProcessingPending
-                    thumb.alpha = if (cleanupPending) .82f else 1f
-                    thumbs.add(Triple(thumb, descriptor.displayFile, cleanupPending))
-                }
+                thumbs += ThumbnailRequest(
+                    image = thumb,
+                    entry = e,
+                    maxWidth = 512,
+                    maxHeight = 512,
+                )
                 bindDesktopMetadata(row, e)
                 val openBook = {
                     openEntryDetails(e.id)
@@ -1338,23 +1401,144 @@ class HomeActivity : AppCompatActivity() {
                 configureScanRowAccessibility(row, openBook, markAttention)
                 RemoteUiCatalog.apply(row)
                 list.addView(row)
+                if (group.key == focusPageGroupKey && pageFocusTarget == null) {
+                    pageFocusTarget = row
+                }
+            }
+            if (page.previousOffset != null || page.nextOffset != null) {
+                val controls = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER
+                }
+                fun addPageButton(
+                    textValue: String,
+                    offset: Int,
+                ) {
+                    val targetEnd = minOf(group.items.size, offset + HOME_SCAN_PAGE_SIZE)
+                    val button = MaterialButton(
+                        this,
+                        null,
+                        com.google.android.material.R.attr.materialButtonOutlinedStyle,
+                    ).apply {
+                        text = textValue
+                        contentDescription = getString(
+                            R.string.home_group_page_description,
+                            textValue,
+                            group.label,
+                            offset + 1,
+                            targetEnd,
+                            group.items.size,
+                        )
+                        isAllCaps = false
+                        minHeight = dp(48)
+                        setOnClickListener {
+                            scanPageGroupKey = group.key
+                            scanPageOffset = offset
+                            renderHome(
+                                snapshot,
+                                updateCollectionBar = false,
+                                focusPageGroupKey = group.key,
+                            )
+                        }
+                    }
+                    RemoteUiCatalog.apply(button)
+                    controls.addView(
+                        button,
+                        LinearLayout.LayoutParams(
+                            0,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            1f,
+                        ).apply {
+                            marginStart = dp(4)
+                            marginEnd = dp(4)
+                        },
+                    )
+                }
+                page.previousOffset?.let { offset ->
+                    val label = resources.getQuantityString(
+                        R.plurals.home_group_show_newer,
+                        page.previousCount,
+                        page.previousCount,
+                    )
+                    addPageButton(label, offset)
+                }
+                page.nextOffset?.let { offset ->
+                    val label = resources.getQuantityString(
+                        R.plurals.home_group_show_older,
+                        page.nextCount,
+                        page.nextCount,
+                    )
+                    addPageButton(label, offset)
+                }
+                list.addView(
+                    controls,
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply {
+                        setMargins(dp(8), dp(8), dp(8), dp(12))
+                    },
+                )
             }
         }
-        // decode the page thumbnails off the UI thread, in list order
+        startThumbnailLoading(thumbs, HomeTab.SCANS)
+        val focusTarget = pageFocusTarget
+        val announcement = pageAnnouncement
+        if (focusTarget != null && announcement != null) {
+            binding.homeScroll.post {
+                if (activeTab != HomeTab.SCANS || !focusTarget.isAttachedToWindow) {
+                    return@post
+                }
+                binding.homeScroll.smoothScrollTo(
+                    0,
+                    (binding.homeList.top + focusTarget.top).coerceAtLeast(0),
+                )
+                focusTarget.requestFocus()
+                focusTarget.performAccessibilityAction(
+                    AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS,
+                    null,
+                )
+                binding.homeList.announceForAccessibility(announcement)
+            }
+        }
+    }
+
+    /** Resolve descriptors and decode only rows that survived the visible page. */
+    private fun startThumbnailLoading(
+        requests: List<ThumbnailRequest>,
+        requiredTab: HomeTab,
+    ) {
         thumbJob = lifecycleScope.launch(Dispatchers.IO) {
-            for ((iv, file, cleanupPending) in thumbs) {
+            for (request in requests) {
+                val loadContext = currentCoroutineContext()
                 var decodedBitmap: Bitmap? = null
+                var cleanupPending = false
                 try {
-                    val decoded = decodeSampledOriented(file, maxWidth = 512, maxHeight = 512)
-                        ?: continue
-                    decodedBitmap = decoded
-                    if (cleanupPending) decodedBitmap = softenPendingThumbnail(decoded)
+                    THUMBNAIL_LOAD_MUTEX.withLock {
+                        loadContext.ensureActive()
+                        val descriptor = request.entry.thumbnailDescriptor()
+                            ?: return@withLock
+                        loadContext.ensureActive()
+                        val decoded = decodeSampledOriented(
+                            descriptor.displayFile,
+                            maxWidth = request.maxWidth,
+                            maxHeight = request.maxHeight,
+                        ) ?: return@withLock
+                        decodedBitmap = decoded
+                        cleanupPending = descriptor.postProcessingPending
+                        if (cleanupPending) {
+                            decodedBitmap = softenPendingThumbnail(decoded)
+                        }
+                        loadContext.ensureActive()
+                    }
+                    val readyBitmap = decodedBitmap ?: continue
                     withContext(Dispatchers.Main) {
-                        val bitmap = decodedBitmap ?: return@withContext
-                        if (iv.parent == null ||
+                        if (activeTab != requiredTab ||
+                            !request.image.isAttachedToWindow ||
                             !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
                         ) return@withContext
-                        setDynamicThumbnail(iv, bitmap)
+                        request.image.alpha = if (cleanupPending) .82f else 1f
+                        setDynamicThumbnail(request.image, readyBitmap)
                         decodedBitmap = null
                     }
                 } finally {
@@ -1695,5 +1879,7 @@ class HomeActivity : AppCompatActivity() {
         const val STATE_SYNC_FEEDBACK_PHASE = "sync_feedback_phase"
         const val WORK_REFRESH_COALESCE_MS = 200L
         const val INSPECT_BOOK_PAGE_SIZE = 48
+        val SNAPSHOT_LOAD_MUTEX = Mutex()
+        val THUMBNAIL_LOAD_MUTEX = Mutex()
     }
 }

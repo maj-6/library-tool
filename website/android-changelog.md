@@ -21,6 +21,7 @@ Android version code: `29`.
 
 ### Bugfixes
 
+- Prevented large scan histories from blocking Home by keeping one collection expanded and paging its rows in fixed-size windows.
 - Prevented a collection editor opened before sync from overwriting a newer cloud tag when the tag itself was left unchanged.
 - Rejected duplicate or malformed tags and broken merge-alias chains instead of opening an ambiguous collection.
 - Preserved corrupt or unknown inventory files for recovery instead of replacing them during pruning.

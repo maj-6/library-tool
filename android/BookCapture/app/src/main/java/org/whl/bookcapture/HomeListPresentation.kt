@@ -8,6 +8,7 @@ internal data class ScanCollectionGroup<T>(
 )
 
 internal const val UNFILED_SCAN_GROUP = "__unfiled__"
+internal const val HOME_SCAN_PAGE_SIZE = 24
 
 private const val COLLECTION_PATH_SEPARATOR = " > "
 
@@ -115,6 +116,46 @@ internal fun <T> initiallyExpandedScanGroup(
     val current = currentCollectionId.orEmpty().trim()
     return groups.firstOrNull { current.isNotEmpty() && it.key == current }?.key
         ?: groups.firstOrNull()?.key
+}
+
+/** Keep Home accordion-style so scan-row inflation has one bounded owner. */
+internal fun <T> retainedExpandedScanGroup(
+    groups: List<ScanCollectionGroup<T>>,
+    expandedKeys: Set<String>,
+): String? = groups.firstOrNull { it.key in expandedKeys }?.key
+
+/**
+ * A fixed scan-list window. Unlike an additive "show more" limit, paging can
+ * never rebuild an arbitrarily large view hierarchy after enough taps.
+ */
+internal data class ScanGroupPage<T>(
+    val items: List<T>,
+    val startIndex: Int,
+    val previousOffset: Int?,
+    val previousCount: Int,
+    val nextOffset: Int?,
+    val nextCount: Int,
+)
+
+internal fun <T> scanGroupPage(
+    items: List<T>,
+    requestedOffset: Int,
+    pageSize: Int,
+): ScanGroupPage<T> {
+    require(pageSize > 0)
+    val lastPageStart = if (items.isEmpty()) 0 else (items.lastIndex / pageSize) * pageSize
+    val start = requestedOffset.coerceAtLeast(0).coerceAtMost(lastPageStart)
+    val end = minOf(items.size, start + pageSize)
+    val previousOffset = (start - pageSize).coerceAtLeast(0).takeIf { start > 0 }
+    val nextOffset = end.takeIf { end < items.size }
+    return ScanGroupPage(
+        items = items.subList(start, end),
+        startIndex = start,
+        previousOffset = previousOffset,
+        previousCount = minOf(pageSize, start),
+        nextOffset = nextOffset,
+        nextCount = minOf(pageSize, items.size - end),
+    )
 }
 
 internal data class ScanListLayoutMetrics(

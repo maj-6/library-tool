@@ -27,6 +27,9 @@ in 0.5.1-alpha.9.
 
 ## Compatibility and safeguards
 
+- The Scans tab keeps only one collection expanded and displays its history in
+  fixed 24-scan pages, preventing a large capture backlog from building an
+  unbounded Android view hierarchy.
 - Version-three Android collection stores upgrade deterministically to the
   tag-aware version-four format; duplicate legacy names are numbered by durable
   UUID order rather than local file order.
