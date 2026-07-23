@@ -1389,6 +1389,15 @@ def test_deep_json_is_reported_without_leaking_recursion_errors(tmp_path):
     assert planner_error.value.code == "invalid_lib_manifest"
 
 
+def test_strict_json_depth_guard_ignores_delimiters_inside_strings():
+    braces = "{[}" * (libformat.MAX_JSON_NESTING + 10)
+    payload = json.dumps({"text": braces, "escaped": '\\"{[}'}).encode("utf-8")
+    assert libformat._strict_json(payload) == {
+        "text": braces,
+        "escaped": '\\"{[}',
+    }
+
+
 def test_lib2_writer_and_lib1_parser_keep_their_existing_semantics(tmp_path):
     document = libformat.LibDocument(
         format=(2, 0),

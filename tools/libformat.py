@@ -67,6 +67,7 @@ MAX_BYTES = 250 * 1024 * 1024            # whole archive
 MAX_FIGURE = 15 * 1024 * 1024            # one image member, decompressed
 MAX_PAGES = 2000
 MAX_JSON = 10 * 1024 * 1024              # one JSON member, decompressed
+MAX_JSON_NESTING = 128                    # parser-independent structural cap
 MAX_INFLATED = 300 * 1024 * 1024         # total page-JSON budget
 MAX_EXT = 64 * 1024                       # one `ext` object, serialized
 MAX_ITEMS = 800                           # regions per page
@@ -235,8 +236,35 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict:
     return value
 
 
+def _json_nesting_exceeds(payload: bytes, maximum: int = MAX_JSON_NESTING) -> bool:
+    """Check structural JSON depth without counting delimiters inside strings."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == 0x5C:
+                escaped = True
+            elif value == 0x22:
+                in_string = False
+            continue
+        if value == 0x22:
+            in_string = True
+        elif value in (0x7B, 0x5B):
+            depth += 1
+            if depth > maximum:
+                return True
+        elif value in (0x7D, 0x5D):
+            depth -= 1
+    return False
+
+
 def _strict_json(payload: bytes):
     """Decode strict UTF-8 JSON (no duplicate keys or non-finite numbers)."""
+    if _json_nesting_exceeds(payload):
+        raise ValueError("JSON nesting is too deep")
     try:
         return json.loads(
             payload.decode("utf-8"),
