@@ -258,6 +258,25 @@ test("Corrections index validation is strict and capture order is explicit", () 
   malformedTarget.attention[0].target.artifact_id = "not-a-book-target";
   assert.throws(() => normalizeCorrectionsIndex(malformedTarget),
     /book targets cannot contain subordinate identifiers/);
+
+  const contradictoryBookReview = fixture();
+  contradictoryBookReview.attention[0].review.revision =
+    "review-contradictory-r1";
+  assert.throws(() => normalizeCorrectionsIndex(contradictoryBookReview),
+    /must exactly match its book attention entry/);
+
+  const missingBookAttention = fixture();
+  missingBookAttention.attention.splice(0, 1);
+  assert.throws(() => normalizeCorrectionsIndex(missingBookAttention),
+    /non-clear book reviews require one book attention entry/);
+
+  const attentionForClearBook = fixture();
+  attentionForClearBook.attention[1].target = {
+    kind: "book",
+    item_id: "book-pending",
+  };
+  assert.throws(() => normalizeCorrectionsIndex(attentionForClearBook),
+    /clear book reviews cannot have a book attention entry/);
 });
 
 

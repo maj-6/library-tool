@@ -372,6 +372,46 @@ function correctionReview(overrides = {}) {
   };
 }
 
+function correctionsIndex(overrides = {}) {
+  const latestEvent = {
+    operation_id: "attention:mark:1",
+    action: "attention.mark",
+    actor_id: "local-desktop",
+    occurred_at: "2026-07-23T12:00:00Z",
+    before_state: "clear",
+    after_state: "needs_attention",
+    reason: "Check the title leaf",
+    comment: "",
+  };
+  const review = {
+    revision: "review-r2",
+    state: "needs_attention",
+    reason: latestEvent.reason,
+    history_count: 1,
+    latest_event: latestEvent,
+  };
+  return {
+    ok: true,
+    schema: "librarytool.corrections-index/1",
+    revision: "index-r2",
+    books: [{
+      id: "book:one",
+      revision: "book-r2",
+      title: "A Herbal",
+      import_state: "ready",
+      issues: [],
+      review,
+      captures: [],
+    }],
+    attention: [{
+      key: "attention:book:one",
+      target: { kind: "book", item_id: "book:one" },
+      review: copyJson(review),
+    }],
+    ...overrides,
+  };
+}
+
 test("EngineClient exposes the complete Replica compatibility surface", () => {
   const { client } = harness();
   assert.equal(typeof client.capabilities, "function");
@@ -398,6 +438,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
   assert.equal(typeof client.spatialAnnotations.list, "function");
   assert.equal(typeof client.spatialAnnotations.get, "function");
+  assert.equal(typeof client.corrections.index, "function");
   assert.equal(typeof client.corrections.assignImageCategory, "function");
   assert.equal(typeof client.corrections.clearImageCategory, "function");
   assert.equal(typeof client.corrections.assignRegionRole, "function");
@@ -748,6 +789,80 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
     itemId: "book:one",
     canvasRevision: "bad revision",
   }), TypeError);
+});
+
+test("corrections index is strict, versioned, and workspace scoped", async () => {
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, correctionsIndex());
+    },
+  });
+
+  const index = await client.corrections.index({
+    workspaceId: "workspace:one",
+  });
+
+  assert.equal(index.schema, "librarytool.corrections-index/1");
+  assert.equal(index.ok, undefined);
+  assert.equal(
+    index.attention[0].review.latest_event.actor_id,
+    "local-desktop",
+  );
+  assert.deepEqual(calls, [{
+    url: "/api/v1/corrections/index?workspace_id=workspace%3Aone",
+    init: {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: "no-cache",
+    },
+  }]);
+  assert.throws(() => client.corrections.index({
+    workspaceId: "bad workspace",
+  }), TypeError);
+
+  const malformed = correctionsIndex();
+  malformed.attention[0].target.item_id = "missing:book";
+  const malformedClient = new EngineClient({
+    transport: async () => response(200, malformed),
+  });
+  await assert.rejects(
+    malformedClient.corrections.index({ workspaceId: "workspace:one" }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  for (const mutate of [
+    (body) => {
+      body.attention[0].review.revision = "review-contradictory-r1";
+    },
+    (body) => {
+      body.attention = [];
+    },
+    (body) => {
+      body.books[0].review = {
+        revision: "review-clear-r1",
+        state: "clear",
+        reason: "",
+        history_count: 0,
+        latest_event: null,
+      };
+    },
+  ]) {
+    const contradictory = correctionsIndex();
+    mutate(contradictory);
+    const contradictoryClient = new EngineClient({
+      transport: async () => response(200, contradictory),
+    });
+    await assert.rejects(
+      contradictoryClient.corrections.index({
+        workspaceId: "workspace:one",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  }
 });
 
 test("correction review reads expose revisioned audit state and reject drift",
@@ -1235,21 +1350,18 @@ test("caption metadata and review commands own exact conditional transport",
       itemId: "book:one",
       expectedReviewRevision: "review-r1",
       reason: "Caption needs checking",
-      actorId: "curator:one",
       comment: "Found during QA",
       idempotencyKey: "attention:mark:1",
     });
     await client.corrections.resolveCorrections({
       itemId: "book:one",
       expectedReviewRevision: "review-r2",
-      actorId: "curator:one",
       comment: "Caption corrected",
       idempotencyKey: "attention:resolve:1",
     });
     await client.corrections.reopenCorrections({
       itemId: "book:one",
       expectedReviewRevision: "review-r3",
-      actorId: "curator:two",
       comment: "Second look requested",
       idempotencyKey: "attention:reopen:1",
     });
@@ -1306,7 +1418,6 @@ test("caption metadata and review commands own exact conditional transport",
           "If-Review-Match": "\"review-r1\"",
         },
         {
-          actor_id: "curator:one",
           comment: "Found during QA",
           reason: "Caption needs checking",
         },
@@ -1320,7 +1431,7 @@ test("caption metadata and review commands own exact conditional transport",
           "Idempotency-Key": "attention:resolve:1",
           "If-Review-Match": "\"review-r2\"",
         },
-        { actor_id: "curator:one", comment: "Caption corrected" },
+        { comment: "Caption corrected" },
       ],
       [
         "POST",
@@ -1331,7 +1442,7 @@ test("caption metadata and review commands own exact conditional transport",
           "Idempotency-Key": "attention:reopen:1",
           "If-Review-Match": "\"review-r3\"",
         },
-        { actor_id: "curator:two", comment: "Second look requested" },
+        { comment: "Second look requested" },
       ],
     ]);
   });
@@ -1419,9 +1530,14 @@ test("correction mutations reject unsafe commands and malformed receipts", async
     itemId: "book:one",
     expectedReviewRevision: "review-r1",
     reason: "",
-    actorId: "curator:one",
     idempotencyKey: "attention:mark:invalid",
   }), TypeError);
+  assert.throws(() => client.corrections.resolveCorrections({
+    itemId: "book:one",
+    expectedReviewRevision: "review-r1",
+    actorId: "spoofed-client",
+    idempotencyKey: "attention:resolve:spoof",
+  }), /server-owned/);
   assert.equal(transports, 0);
 
   await assert.rejects(

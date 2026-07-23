@@ -26,6 +26,7 @@ from librarytool.engine.correction_transforms import (
     CorrectionTransformService,
 )
 from librarytool.engine.jobs import JobManager
+from librarytool.engine.items import ItemView, WorkbenchState
 from librarytool.engine.raster_artifacts import (
     ArtifactMetadataAssertion,
     ArtifactFreshness,
@@ -47,6 +48,7 @@ from librarytool.engine.runtime import (
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    ITEM_QUERY_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
 )
@@ -57,6 +59,7 @@ from librarytool.engine.spatial_annotations import (
     SpatialAnnotationView,
     SpatialSourceRef,
 )
+import librarytool_http.corrections as corrections_http
 from librarytool_http.corrections import create_corrections_blueprint
 
 
@@ -163,7 +166,14 @@ class _SpatialProjector:
 
 
 class _Engine:
-    def __init__(self, raster, spatial, corrections=None, transforms=None):
+    def __init__(
+        self,
+        raster,
+        spatial,
+        corrections=None,
+        transforms=None,
+        items=None,
+    ):
         self.services = {
             RASTER_ARTIFACT_QUERY_SERVICE: raster,
             SPATIAL_ANNOTATION_QUERY_SERVICE: spatial,
@@ -178,6 +188,8 @@ class _Engine:
                 self.services[key] = corrections
         if transforms is not None:
             self.services[CORRECTION_TRANSFORM_SERVICE] = transforms
+        if items is not None:
+            self.services[ITEM_QUERY_SERVICE] = items
 
     def get_service(self, key):
         return self.services.get(key)
@@ -209,7 +221,13 @@ class _Resolver:
         )
 
 
-def _app(engine, resolver=None, transform_submitter=None):
+def _app(
+    engine,
+    resolver=None,
+    transform_submitter=None,
+    actor_id_for_request=None,
+    workspace_id_for_request=None,
+):
     app = Flask(__name__)
     app.register_blueprint(
         create_corrections_blueprint(
@@ -217,6 +235,8 @@ def _app(engine, resolver=None, transform_submitter=None):
             raster_resource_resolver_for_request=(
                 None if resolver is None else lambda: resolver
             ),
+            correction_actor_id_for_request=actor_id_for_request,
+            correction_workspace_id_for_request=workspace_id_for_request,
             correction_transform_submitter=transform_submitter,
         )
     )
@@ -261,7 +281,13 @@ def _projected_app(tmp_path, raster_rows, spatial_rows):
     return app
 
 
-def _projected_harness(tmp_path, raster_rows, spatial_rows):
+def _projected_harness(
+    tmp_path,
+    raster_rows,
+    spatial_rows,
+    *,
+    actor_id_for_request=None,
+):
     rasters = _RasterProjector(raster_rows)
     spatial = _SpatialProjector(spatial_rows)
     aggregate = CorrectionAggregateProjector(rasters, spatial)
@@ -278,7 +304,13 @@ def _projected_harness(tmp_path, raster_rows, spatial_rows):
         repository,
     )
     corrections = CorrectionService(repository)
-    return _app(_Engine(projected, projected, corrections)), repository
+    return (
+        _app(
+            _Engine(projected, projected, corrections),
+            actor_id_for_request=actor_id_for_request,
+        ),
+        repository,
+    )
 
 
 class _ReviewService:
@@ -289,6 +321,35 @@ class _ReviewService:
     def get_review(self, item_id):
         self.calls.append(item_id)
         return self.review
+
+
+class _ItemService:
+    def __init__(self, rows):
+        self.rows = tuple(rows)
+
+    def list_items(self):
+        return self.rows
+
+
+def _book_item(
+    item_id: str = "book-1",
+    title: str = "Book One",
+) -> ItemView:
+    return ItemView(
+        item_id=item_id,
+        revision=f"{item_id}-r1",
+        record_revision=f"{item_id}-record-r1",
+        kind="book",
+        title=title,
+        metadata={},
+        representations=(),
+        artifacts=(),
+        workbench_state=WorkbenchState(
+            item_id=item_id,
+            revision=f"{item_id}-workbench-r1",
+            readiness={},
+        ),
+    )
 
 
 def _review_with_history(count, revision):
@@ -962,7 +1023,6 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         f"{endpoint}/attention",
         json={
             "reason": "Caption needs checking",
-            "actor_id": "curator-1",
             "comment": "Found during QA",
         },
         headers=mark_headers,
@@ -971,7 +1031,6 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         f"{endpoint}/attention",
         json={
             "reason": "Caption needs checking",
-            "actor_id": "curator-1",
             "comment": "Found during QA",
         },
         headers=mark_headers,
@@ -986,7 +1045,6 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         f"{endpoint}/attention",
         json={
             "reason": "A stale second opinion",
-            "actor_id": "curator-2",
             "comment": "",
         },
         headers={
@@ -1007,7 +1065,7 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
 
     resolved = second_client.post(
         f"{endpoint}/resolve",
-        json={"actor_id": "curator-1", "comment": "Caption corrected"},
+        json={"comment": "Caption corrected"},
         headers={
             "Idempotency-Key": "review-resolve-op",
             "If-Review-Match": (
@@ -1021,7 +1079,7 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
 
     stale_resolve = first_client.post(
         f"{endpoint}/resolve",
-        json={"actor_id": "curator-1", "comment": ""},
+        json={"comment": ""},
         headers={
             "Idempotency-Key": "review-stale-resolve-op",
             "If-Review-Match": f'"{observed_mark["revision"]}"',
@@ -1034,7 +1092,7 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     assert observed_resolution["state"] == "resolved"
     reopened = first_client.post(
         f"{endpoint}/reopen",
-        json={"actor_id": "curator-2", "comment": "Second review requested"},
+        json={"comment": "Second review requested"},
         headers={
             "Idempotency-Key": "review-reopen-op",
             "If-Review-Match": (
@@ -1056,6 +1114,9 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         "attention.resolve",
         "attention.reopen",
     ]
+    assert {
+        event["actor_id"] for event in converged["history_tail"]
+    } == {"local-desktop"}
     history_endpoint = f"{endpoint}/history"
     first_page = second_client.get(
         history_endpoint,
@@ -1103,7 +1164,7 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
 
     stale = second_client.post(
         f"{endpoint}/resolve",
-        json={"actor_id": "curator-3", "comment": ""},
+        json={"comment": ""},
         headers={
             "Idempotency-Key": "review-stale-op",
             "If-Review-Match": f'"{initial_review["revision"]}"',
@@ -1111,6 +1172,146 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     )
     assert stale.status_code == 409
     assert stale.get_json()["code"] == "review_revision_conflict"
+
+
+def test_review_actor_is_server_owned_and_client_spoofing_is_rejected(
+    tmp_path,
+):
+    app, _repository = _projected_harness(
+        tmp_path,
+        (_raster("image-1"),),
+        (),
+        actor_id_for_request=lambda: "trusted-user-1",
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/corrections/review"
+    initial = client.get(endpoint).get_json()["review"]
+    headers = {
+        "Idempotency-Key": "review-server-actor-op",
+        "If-Review-Match": f'"{initial["revision"]}"',
+    }
+
+    spoofed = client.put(
+        f"{endpoint}/attention",
+        json={
+            "reason": "Check the title leaf",
+            "actor_id": "spoofed-client",
+            "comment": "",
+        },
+        headers=headers,
+    )
+
+    assert spoofed.status_code == 400
+    assert spoofed.get_json()["code"] == "invalid_correction_mutation_envelope"
+    assert client.get(endpoint).get_json()["review"]["state"] == "clear"
+
+    marked = client.put(
+        f"{endpoint}/attention",
+        json={"reason": "Check the title leaf", "comment": ""},
+        headers=headers,
+    )
+    observed = client.get(endpoint).get_json()["review"]
+
+    assert marked.status_code == 200
+    assert observed["history_tail"][-1]["actor_id"] == "trusted-user-1"
+
+
+def test_corrections_index_rejects_ambiguous_or_inactive_workspace_scope():
+    app = _app(
+        _Engine(_RasterProjector(()), _SpatialProjector(())),
+        workspace_id_for_request=lambda: "workspace-authority",
+    )
+    client = app.test_client()
+
+    missing = client.get("/api/v1/corrections/index")
+    repeated = client.get(
+        "/api/v1/corrections/index"
+        "?workspace_id=workspace-authority&workspace_id=workspace-other"
+    )
+    mismatched = client.get(
+        "/api/v1/corrections/index?workspace_id=workspace-other"
+    )
+
+    assert missing.status_code == 400
+    assert missing.get_json()["code"] == "invalid_corrections_workspace"
+    assert repeated.status_code == 400
+    assert repeated.get_json()["code"] == "invalid_corrections_workspace"
+    assert mismatched.status_code == 409
+    assert mismatched.get_json()["code"] == "corrections_workspace_mismatch"
+
+
+def test_corrections_index_enforces_aggregate_capture_budget(monkeypatch):
+    rasters = tuple(
+        replace(
+            _raster(f"image-{index}"),
+            key=RasterArtifactKey(
+                f"book-{index}",
+                f"image-{index}",
+            ),
+            extensions={"capture_order": index},
+        )
+        for index in range(1, 3)
+    )
+    engine = _Engine(
+        _RasterProjector(rasters),
+        _SpatialProjector(()),
+        _ReviewService(CorrectionReviewSnapshot("review-r1")),
+        items=_ItemService(
+            (
+                _book_item("book-1", "Book One"),
+                _book_item("book-2", "Book Two"),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        corrections_http,
+        "CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT",
+        1,
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["code"] == (
+        "invalid_corrections_index_projection"
+    )
+    assert response.get_json()["details"] == {
+        "item_id": "book-2",
+        "maximum_captures": 1,
+    }
+
+
+def test_corrections_index_enforces_serialized_size_budget(monkeypatch):
+    raster = replace(
+        _raster("image-1"),
+        extensions={"capture_order": 0},
+    )
+    engine = _Engine(
+        _RasterProjector((raster,)),
+        _SpatialProjector(()),
+        _ReviewService(CorrectionReviewSnapshot("review-r1")),
+        items=_ItemService((_book_item(),)),
+    )
+    monkeypatch.setattr(
+        corrections_http,
+        "CORRECTIONS_INDEX_MAX_BYTES",
+        128,
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["code"] == (
+        "invalid_corrections_index_projection"
+    )
+    assert response.get_json()["details"] == {
+        "item_id": "book-1",
+        "maximum_bytes": 128,
+    }
 
 
 def test_review_snapshot_bounds_tail_and_history_pages_pin_exact_revision():

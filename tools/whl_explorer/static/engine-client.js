@@ -1043,6 +1043,166 @@
       value.history_tail.at(-1).after_state === value.state;
   }
 
+  const CORRECTIONS_IMPORT_STATES = new Set([
+    "ready", "pending", "legacy", "partial", "missing", "unavailable",
+  ]);
+
+  function hasAllowedKeys(value, allowed, required = allowed) {
+    if (!isObject(value)) return false;
+    const allowedKeys = new Set(allowed);
+    return Object.keys(value).every((key) => allowedKeys.has(key)) &&
+      required.every((key) =>
+        Object.prototype.hasOwnProperty.call(value, key));
+  }
+
+  function isCorrectionsText(value, maximum, allowEmpty = true) {
+    try {
+      correctionText(value, "value", maximum, allowEmpty);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function isCorrectionsIndexReview(value) {
+    return hasExactKeys(value, [
+      "revision", "state", "reason", "history_count", "latest_event",
+    ]) &&
+      isArtifactRevision(value.revision) &&
+      CORRECTION_REVIEW_STATES.has(value.state) &&
+      isCorrectionsText(value.reason, 2048) &&
+      Number.isSafeInteger(value.history_count) &&
+      value.history_count >= 0 &&
+      value.history_count <= MAX_CORRECTION_AUDIT_EVENTS &&
+      (value.state === "clear" ? value.reason === "" :
+        !!value.reason.trim()) &&
+      (value.latest_event === null
+        ? value.history_count === 0
+        : value.history_count > 0 &&
+          isCorrectionAuditEvent(value.latest_event) &&
+          value.latest_event.after_state === value.state);
+  }
+
+  function sameCorrectionsAuditEvent(left, right) {
+    if (left === null || right === null) return left === right;
+    return [
+      "operation_id", "action", "actor_id", "occurred_at", "before_state",
+      "after_state", "reason", "comment",
+    ].every((field) => left[field] === right[field]);
+  }
+
+  function sameCorrectionsIndexReview(left, right) {
+    return left.revision === right.revision &&
+      left.state === right.state &&
+      left.reason === right.reason &&
+      left.history_count === right.history_count &&
+      sameCorrectionsAuditEvent(left.latest_event, right.latest_event);
+  }
+
+  function isCorrectionsThumbnail(value) {
+    if (value === null) return true;
+    if (!hasAllowedKeys(
+      value,
+      ["url", "alt", "width", "height"],
+      ["url", "alt"],
+    ) || !isCorrectionsText(value.url, 4096, false) ||
+        !isCorrectionsText(value.alt, 512)) return false;
+    for (const name of ["width", "height"]) {
+      if (value[name] !== undefined &&
+          (!Number.isSafeInteger(value[name]) || value[name] < 1)) {
+        return false;
+      }
+    }
+    return !/^(?:javascript|file|filesystem):/i.test(value.url) &&
+      (!/^data:/i.test(value.url) || /^data:image\//i.test(value.url));
+  }
+
+  function isCorrectionsCapture(value) {
+    if (!hasAllowedKeys(value, [
+      "artifact_id", "revision", "capture_order", "label",
+      "representation_id", "canvas_id", "effective_category",
+      "resource_state", "import_state", "freshness", "thumbnail",
+    ], [
+      "artifact_id", "revision", "capture_order", "label",
+      "effective_category", "resource_state", "import_state", "freshness",
+      "thumbnail",
+    ]) || !isPortableIdentifier(value.artifact_id) ||
+        !isArtifactRevision(value.revision) ||
+        !Number.isSafeInteger(value.capture_order) ||
+        value.capture_order < 0 ||
+        !isCorrectionsText(value.label, 512) ||
+        !ARTIFACT_CATEGORIES.has(value.effective_category) ||
+        !ARTIFACT_RESOURCE_STATES.has(value.resource_state) ||
+        !CORRECTIONS_IMPORT_STATES.has(value.import_state) ||
+        !ARTIFACT_FRESHNESS.has(value.freshness) ||
+        !isCorrectionsThumbnail(value.thumbnail)) return false;
+    for (const name of ["representation_id", "canvas_id"]) {
+      if (value[name] !== undefined &&
+          !isPortableIdentifier(value[name])) return false;
+    }
+    return value.resource_state === "available" ||
+      value.thumbnail === null;
+  }
+
+  function isCorrectionsBook(value) {
+    if (!hasExactKeys(value, [
+      "id", "revision", "title", "import_state", "issues", "review",
+      "captures",
+    ]) || !isPortableIdentifier(value.id) ||
+        !isArtifactRevision(value.revision) ||
+        !isCorrectionsText(value.title, 2048) ||
+        !CORRECTIONS_IMPORT_STATES.has(value.import_state) ||
+        !Array.isArray(value.issues) || value.issues.length > 1024 ||
+        !value.issues.every((issue) =>
+          isCorrectionsText(issue, 2048, false)) ||
+        !isCorrectionsIndexReview(value.review) ||
+        !Array.isArray(value.captures) || value.captures.length > 100000 ||
+        !value.captures.every(isCorrectionsCapture)) return false;
+    const artifactIds = value.captures.map((capture) =>
+      capture.artifact_id.toLowerCase());
+    const orders = value.captures.map((capture) => capture.capture_order);
+    return new Set(artifactIds).size === artifactIds.length &&
+      new Set(orders).size === orders.length;
+  }
+
+  function isCorrectionsAttentionEntry(value) {
+    return hasExactKeys(value, ["key", "target", "review"]) &&
+      isPortableIdentifier(value.key) &&
+      hasExactKeys(value.target, ["kind", "item_id"]) &&
+      value.target.kind === "book" &&
+      isPortableIdentifier(value.target.item_id) &&
+      isCorrectionsIndexReview(value.review) &&
+      value.review.state !== "clear";
+  }
+
+  function isCorrectionsIndex(value) {
+    if (!hasExactKeys(value, [
+      "schema", "revision", "books", "attention",
+    ]) || value.schema !== "librarytool.corrections-index/1" ||
+        !isArtifactRevision(value.revision) ||
+        !Array.isArray(value.books) || value.books.length > 100000 ||
+        !value.books.every(isCorrectionsBook) ||
+        !Array.isArray(value.attention) ||
+        value.attention.length > 1000000 ||
+        !value.attention.every(isCorrectionsAttentionEntry)) return false;
+    const books = new Map(value.books.map((book) => [book.id, book]));
+    const attentionByBook = new Map(value.attention.map((entry) =>
+      [entry.target.item_id, entry]));
+    const bookIds = value.books.map((book) => book.id.toLowerCase());
+    const keys = value.attention.map((entry) => entry.key.toLowerCase());
+    const targets = value.attention.map((entry) => entry.target.item_id);
+    return new Set(bookIds).size === bookIds.length &&
+      new Set(keys).size === keys.length &&
+      new Set(targets).size === targets.length &&
+      targets.every((itemId) => books.has(itemId)) &&
+      value.books.every((book) => {
+        const entry = attentionByBook.get(book.id);
+        if (book.review.state === "clear") return entry === undefined;
+        return entry !== undefined &&
+          sameCorrectionsIndexReview(book.review, entry.review);
+      });
+  }
+
   function isPolygonSelector(value, canvasRevision) {
     return hasExactKeys(value, [
       "type", "coordinate_space", "coordinate_space_revision", "points",
@@ -1546,6 +1706,8 @@
         get: (args) => this._spatialAnnotationGet(args),
       });
       this.corrections = Object.freeze({
+        index: (args) =>
+          this._correctionsIndex(args),
         assignImageCategory: (args) =>
           this._correctionAssignImageCategory(args),
         clearImageCategory: (args) =>
@@ -2428,6 +2590,33 @@
       });
     }
 
+    _correctionsIndex({ workspaceId, signal } = {}) {
+      const workspace = portableIdentifier(workspaceId, "workspaceId");
+      const path = "/v1/corrections/index";
+      return this._requestJson("GET", path, {
+        query: { workspace_id: workspace },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const index = body && {
+          schema: body.schema,
+          revision: body.revision,
+          books: body.books,
+          attention: body.attention,
+        };
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "revision", "books", "attention",
+        ]) || body.ok !== true || !isCorrectionsIndex(index) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid Corrections index",
+            "GET", path, body, undefined, status);
+        }
+        return index;
+      });
+    }
+
     _correctionReviewGet({ itemId, signal } = {}) {
       const item = portableIdentifier(itemId, "itemId");
       const path = `/v1/items/${encodePart(item)}/corrections/review`;
@@ -2524,8 +2713,15 @@
       });
     }
 
-    _correctionMarkAttention({ itemId, expectedReviewRevision,
-      reason, actorId, comment = "", idempotencyKey, signal } = {}) {
+    _correctionMarkAttention(args = {}) {
+      if (Object.prototype.hasOwnProperty.call(args, "actorId") ||
+          Object.prototype.hasOwnProperty.call(args, "actor_id")) {
+        throw new TypeError("correction review actors are server-owned");
+      }
+      const {
+        itemId, expectedReviewRevision, reason, comment = "",
+        idempotencyKey, signal,
+      } = args;
       return this._correctionReviewMutation({
         action: "attention.mark",
         method: "PUT",
@@ -2533,37 +2729,46 @@
         itemId,
         expectedReviewRevision,
         reason,
-        actorId,
         comment,
         idempotencyKey,
         signal,
       });
     }
 
-    _correctionResolve({ itemId, expectedReviewRevision,
-      actorId, comment = "", idempotencyKey, signal } = {}) {
+    _correctionResolve(args = {}) {
+      if (Object.prototype.hasOwnProperty.call(args, "actorId") ||
+          Object.prototype.hasOwnProperty.call(args, "actor_id")) {
+        throw new TypeError("correction review actors are server-owned");
+      }
+      const {
+        itemId, expectedReviewRevision, comment = "", idempotencyKey, signal,
+      } = args;
       return this._correctionReviewMutation({
         action: "attention.resolve",
         method: "POST",
         mutationSuffix: "resolve",
         itemId,
         expectedReviewRevision,
-        actorId,
         comment,
         idempotencyKey,
         signal,
       });
     }
 
-    _correctionReopen({ itemId, expectedReviewRevision,
-      actorId, comment = "", idempotencyKey, signal } = {}) {
+    _correctionReopen(args = {}) {
+      if (Object.prototype.hasOwnProperty.call(args, "actorId") ||
+          Object.prototype.hasOwnProperty.call(args, "actor_id")) {
+        throw new TypeError("correction review actors are server-owned");
+      }
+      const {
+        itemId, expectedReviewRevision, comment = "", idempotencyKey, signal,
+      } = args;
       return this._correctionReviewMutation({
         action: "attention.reopen",
         method: "POST",
         mutationSuffix: "reopen",
         itemId,
         expectedReviewRevision,
-        actorId,
         comment,
         idempotencyKey,
         signal,
@@ -2571,10 +2776,9 @@
     }
 
     _correctionReviewMutation({ action, method, mutationSuffix, itemId,
-      expectedReviewRevision, reason, actorId, comment,
+      expectedReviewRevision, reason, comment,
       idempotencyKey, signal }) {
       const body = {
-        actor_id: portableIdentifier(actorId, "actorId"),
         comment: correctionText(comment, "comment", 8192),
       };
       if (action === "attention.mark") {
