@@ -438,6 +438,15 @@ CANVAS_PREPARATION_SERVICE: ServiceKey[CanvasPreparationService] = ServiceKey(
 CORRECTION_SERVICE: ServiceKey[CorrectionService] = ServiceKey(
     "library.corrections.commands"
 )
+CORRECTION_CAPTION_SERVICE: ServiceKey[CorrectionService] = ServiceKey(
+    "library.corrections.captions"
+)
+CORRECTION_METADATA_SERVICE: ServiceKey[CorrectionService] = ServiceKey(
+    "library.corrections.metadata"
+)
+CORRECTION_REVIEW_SERVICE: ServiceKey[CorrectionService] = ServiceKey(
+    "library.corrections.reviews"
+)
 CORRECTION_TRANSFORM_SERVICE: ServiceKey[CorrectionTransformService] = ServiceKey(
     "library.corrections.transforms"
 )
@@ -683,6 +692,9 @@ class LibraryEngineBuilder:
 __all__ = [
     "CANVAS_PREPARATION_SERVICE",
     "CANVAS_QUERY_SERVICE",
+    "CORRECTION_CAPTION_SERVICE",
+    "CORRECTION_METADATA_SERVICE",
+    "CORRECTION_REVIEW_SERVICE",
     "CORRECTION_SERVICE",
     "CORRECTION_TRANSFORM_SERVICE",
     "DuplicateServiceError",

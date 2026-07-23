@@ -662,6 +662,21 @@
       !/["\\]/.test(value);
   }
 
+  function sameArtifactJson(left, right) {
+    if (left === right) return true;
+    if (Array.isArray(left) || Array.isArray(right)) {
+      return Array.isArray(left) && Array.isArray(right) &&
+        left.length === right.length &&
+        left.every((value, index) => sameArtifactJson(value, right[index]));
+    }
+    if (!isObject(left) || !isObject(right)) return false;
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return leftKeys.length === rightKeys.length &&
+      leftKeys.every((key, index) =>
+        key === rightKeys[index] && sameArtifactJson(left[key], right[key]));
+  }
+
   function correctionText(value, name, maximum, allowEmpty = true) {
     if (typeof value !== "string" || value.length > maximum ||
         (!allowEmpty && !value.trim()) ||
@@ -772,10 +787,32 @@
     return hasExactKeys(value, [
       "name", "value", "origin", "revision", "provenance",
     ]) && isPortableIdentifier(value.name) &&
+      !isPrivateArtifactKey(value.name) &&
       ["manual", "machine", "imported"].includes(value.origin) &&
       isArtifactRevision(value.revision) &&
       isArtifactProvenance(value.provenance) &&
       isBoundedArtifactJson(value.value);
+  }
+
+  function isEffectiveArtifactMetadata(assertions, value) {
+    if (!isObject(value) || !isBoundedArtifactJson(value)) return false;
+    const identities = assertions.map((assertion) =>
+      `${assertion.name}\u0000${assertion.origin}`);
+    if (new Set(identities).size !== identities.length) return false;
+    const expected = {};
+    const names = [...new Set(assertions.map((assertion) => assertion.name))]
+      .sort();
+    for (const name of names) {
+      for (const origin of ["manual", "imported", "machine"]) {
+        const assertion = assertions.find((candidate) =>
+          candidate.name === name && candidate.origin === origin);
+        if (assertion) {
+          expected[name] = assertion.value;
+          break;
+        }
+      }
+    }
+    return sameArtifactJson(value, expected);
   }
 
   function isCategoryAssignment(value) {
@@ -817,7 +854,8 @@
       "key", "revision", "kind", "label", "media_type", "content_sha256",
       "dimensions", "source", "resource_state", "resource", "freshness",
       "lineage", "category_assignments", "effective_category",
-      "caption_assertions", "effective_caption", "provenance", "extensions",
+      "caption_assertions", "effective_caption", "metadata_assertions",
+      "effective_metadata", "provenance", "extensions",
     ]) || !hasExactKeys(value.key, ["item_id", "artifact_id"]) ||
         value.key.item_id !== itemId ||
         (artifactId !== null && value.key.artifact_id !== artifactId) ||
@@ -853,6 +891,13 @@
         !hasUniqueOrigins(value.caption_assertions) ||
         !(value.effective_caption === null ||
           isArtifactCaption(value.effective_caption)) ||
+        !Array.isArray(value.metadata_assertions) ||
+        value.metadata_assertions.length > 128 ||
+        !value.metadata_assertions.every(isArtifactMetadataAssertion) ||
+        !isEffectiveArtifactMetadata(
+          value.metadata_assertions,
+          value.effective_metadata,
+        ) ||
         !isArtifactProvenance(value.provenance) ||
         !isBoundedArtifactJson(value.extensions)) return false;
     if (value.resource_state === "available") {
@@ -874,6 +919,89 @@
       lineageKeys.add(key);
     }
     return true;
+  }
+
+  const CORRECTION_REVIEW_STATES =
+    new Set(["clear", "needs_attention", "resolved"]);
+  const CORRECTION_REVIEW_HISTORY_PAGE_LIMIT = 100;
+  const CORRECTION_REVIEW_HISTORY_TAIL_LIMIT = 8;
+  const MAX_CORRECTION_AUDIT_EVENTS = 100000;
+  const CORRECTION_REVIEW_TRANSITIONS = Object.freeze({
+    "attention.mark": ["clear", "needs_attention"],
+    "attention.resolve": ["needs_attention", "resolved"],
+    "attention.reopen": ["resolved", "needs_attention"],
+    "attention.clear": ["needs_attention", "clear"],
+  });
+
+  function isCorrectionAuditEvent(value) {
+    if (!hasExactKeys(value, [
+      "operation_id", "action", "actor_id", "occurred_at",
+      "before_state", "after_state", "reason", "comment",
+    ]) || !isPortableIdentifier(value.operation_id) ||
+        !isPortableIdentifier(value.actor_id) ||
+        typeof value.occurred_at !== "string" ||
+        value.occurred_at.length < 1 || value.occurred_at.length > 128 ||
+        typeof value.reason !== "string" || value.reason.length > 2048 ||
+        typeof value.comment !== "string" || value.comment.length > 8192 ||
+        !CORRECTION_REVIEW_STATES.has(value.before_state) ||
+        !CORRECTION_REVIEW_STATES.has(value.after_state) ||
+        !Object.prototype.hasOwnProperty.call(
+          CORRECTION_REVIEW_TRANSITIONS,
+          value.action,
+        ) ||
+        ![
+          value.before_state,
+          value.after_state,
+        ].every((state, index) =>
+          state === CORRECTION_REVIEW_TRANSITIONS[value.action][index])) {
+      return false;
+    }
+    try {
+      correctionText(value.occurred_at, "occurred_at", 128, false);
+      correctionText(value.reason, "reason", 2048);
+      correctionText(value.comment, "comment", 8192);
+    } catch (_error) {
+      return false;
+    }
+    return value.action !== "attention.mark" || !!value.reason.trim();
+  }
+
+  function isContinuousAuditEvents(history) {
+    const operationIds = history.map((event) => event.operation_id);
+    if (new Set(operationIds).size !== operationIds.length) return false;
+    for (let index = 1; index < history.length; index += 1) {
+      if (history[index - 1].after_state !==
+          history[index].before_state) return false;
+    }
+    return true;
+  }
+
+  function isCorrectionReviewSummary(value) {
+    if (!hasExactKeys(value, [
+      "revision", "state", "reason", "history_count", "history_tail",
+    ]) ||
+        !isArtifactRevision(value.revision) ||
+        !CORRECTION_REVIEW_STATES.has(value.state) ||
+        typeof value.reason !== "string" || value.reason.length > 2048 ||
+        !Number.isSafeInteger(value.history_count) ||
+        value.history_count < 0 ||
+        value.history_count > MAX_CORRECTION_AUDIT_EVENTS ||
+        !Array.isArray(value.history_tail) ||
+        value.history_tail.length !== Math.min(
+          value.history_count,
+          CORRECTION_REVIEW_HISTORY_TAIL_LIMIT,
+        ) ||
+        !value.history_tail.every(isCorrectionAuditEvent) ||
+        !isContinuousAuditEvents(value.history_tail)) return false;
+    try {
+      correctionText(value.reason, "reason", 2048);
+    } catch (_error) {
+      return false;
+    }
+    if (value.state === "clear" ? value.reason !== "" :
+        !value.reason.trim()) return false;
+    return value.history_tail.length === 0 ||
+      value.history_tail.at(-1).after_state === value.state;
   }
 
   function isPolygonSelector(value, canvasRevision) {
@@ -1396,6 +1524,10 @@
           this._correctionClearManualCaption(args),
         assertArtifactMetadata: (args) =>
           this._correctionAssertArtifactMetadata(args),
+        getReview: (args) =>
+          this._correctionReviewGet(args),
+        listReviewHistory: (args) =>
+          this._correctionReviewHistoryList(args),
         markAttention: (args) =>
           this._correctionMarkAttention(args),
         resolveCorrections: (args) =>
@@ -2255,6 +2387,102 @@
         expectedLinkedArtifactRevision,
         idempotencyKey,
         signal,
+      });
+    }
+
+    _correctionReviewGet({ itemId, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const path = `/v1/items/${encodePart(item)}/corrections/review`;
+      return this._requestJson("GET", path, {
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "item_id", "review",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.correction-review/1" ||
+            body.item_id !== item ||
+            !isCorrectionReviewSummary(body.review) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid correction review",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _correctionReviewHistoryList({ itemId, reviewRevision, cursor,
+      limit = 100, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (!isArtifactRevision(reviewRevision)) {
+        throw new TypeError("reviewRevision is not a valid review revision");
+      }
+      if (cursor != null && cursor !== "" &&
+          (typeof cursor !== "string" || cursor.length > 2048)) {
+        throw new TypeError("cursor must be a bounded opaque string");
+      }
+      if (!Number.isSafeInteger(limit) || limit < 1 ||
+          limit > CORRECTION_REVIEW_HISTORY_PAGE_LIMIT) {
+        throw new TypeError(
+          `limit must be an integer from 1 to ${
+            CORRECTION_REVIEW_HISTORY_PAGE_LIMIT}`);
+      }
+      const path =
+        `/v1/items/${encodePart(item)}/corrections/review/history`;
+      return this._requestJson("GET", path, {
+        headers: {
+          "If-Review-Match": quoteRevision(
+            reviewRevision,
+            "reviewRevision",
+          ),
+        },
+        query: { cursor, limit },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const events = body && body.events;
+        const eventIds = Array.isArray(events)
+          ? events.map((event) => event.operation_id)
+          : [];
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "item_id", "review_revision", "review_state",
+          "events", "next_cursor", "total",
+        ]) && body.ok === true &&
+          body.schema === "librarytool.correction-review-history/1" &&
+          body.item_id === item &&
+          body.review_revision === reviewRevision &&
+          CORRECTION_REVIEW_STATES.has(body.review_state) &&
+          Array.isArray(events) && events.length <= limit &&
+          events.every(isCorrectionAuditEvent) &&
+          isContinuousAuditEvents(events) &&
+          new Set(eventIds).size === eventIds.length &&
+          (body.next_cursor === null ||
+            typeof body.next_cursor === "string" &&
+            body.next_cursor.length >= 1 &&
+            body.next_cursor.length <= 2048) &&
+          Number.isSafeInteger(body.total) && body.total >= 0 &&
+          body.total <= MAX_CORRECTION_AUDIT_EVENTS &&
+          body.total >= events.length &&
+          (body.total === 0 || events.length > 0) &&
+          (body.next_cursor === null || events.length === limit) &&
+          (cursor || (
+            events.length === Math.min(limit, body.total) &&
+            (body.next_cursor !== null) === (body.total > events.length)
+          )) &&
+          (body.next_cursor !== null || events.length === 0 ||
+            events.at(-1).after_state === body.review_state) &&
+          (body.total !== 0 ||
+            events.length === 0 && body.next_cursor === null) &&
+          !containsCommandFingerprint(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid correction review history page",
+            "GET", path, body, { cursor, limit }, status);
+        }
+        return body;
       });
     }
 

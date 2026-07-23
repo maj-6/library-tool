@@ -88,6 +88,23 @@ test("raster and spatial contracts normalize to bounded summaries and opaque ref
       { text: "Machine caption", origin: "machine", revision: "caption-r1",
         confidence: 0.91 },
     ],
+    metadata_assertions: [
+      {
+        name: "plate_number",
+        value: 3,
+        origin: "machine",
+        revision: "metadata-r1",
+        provenance: { origin: "machine", provider_id: "mistral" },
+      },
+      {
+        name: "plate_number",
+        value: 4,
+        origin: "manual",
+        revision: "metadata-r2",
+        provenance: { origin: "manual" },
+      },
+    ],
+    effective_metadata: { plate_number: 4 },
     lineage: [{
       artifact_id: "source-1",
       artifact_revision: "source-r1",
@@ -122,6 +139,19 @@ test("raster and spatial contracts normalize to bounded summaries and opaque ref
   assert.equal(Object.hasOwn(raster.resourceRef, "url"), false);
   assert.equal(raster.effectiveCaption.text, "Human caption");
   assert.equal(raster.effectiveCategory, "cover");
+  assert.equal(raster.metadataAssertions.length, 2);
+  assert.deepEqual(
+    raster.metadataAssertions.map((assertion) => [
+      assertion.name,
+      assertion.origin,
+      assertion.value,
+    ]),
+    [
+      ["plate_number", "machine", 3],
+      ["plate_number", "manual", 4],
+    ],
+  );
+  assert.deepEqual(raster.metadata, { plate_number: 4 });
   assert.deepEqual(raster.linkedKeys, ["artifact:source-1"]);
   assert.deepEqual(raster.dimensions, { height: 800, orientation: 1, width: 1200 });
   assert.deepEqual(raster.correction, {

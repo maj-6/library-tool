@@ -652,3 +652,86 @@ test("caption metadata and review commands delegate operation IDs", async () => 
     }],
   ]);
 });
+
+test("review reads resolve item context through the dedicated adapter port",
+  async () => {
+    const invocations = [];
+    const signal = new AbortController().signal;
+    const { engineClient } = engineHarness({
+      corrections: {
+        async getReview(payload) {
+          invocations.push(payload);
+          return {
+            item_id: "book-1",
+            review: {
+              revision: "review-r3",
+              state: "resolved",
+              reason: "Caption needed checking",
+              history_count: 2,
+              history_tail: [
+                { action: "attention.mark" },
+                { action: "attention.resolve" },
+              ],
+            },
+          };
+        },
+        async listReviewHistory(payload) {
+          invocations.push(payload);
+          return {
+            item_id: "book-1",
+            review_revision: "review-r3",
+            review_state: "resolved",
+            events: [{ action: "attention.resolve" }],
+            next_cursor: "next-page",
+            total: 2,
+          };
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient);
+
+    const review = await ports.reviews.get({
+      context: { item_id: "book-1" },
+      signal,
+    });
+
+    assert.deepEqual(review, {
+      itemId: "book-1",
+      revision: "review-r3",
+      state: "resolved",
+      reason: "Caption needed checking",
+      history_count: 2,
+      history_tail: [
+        { action: "attention.mark" },
+        { action: "attention.resolve" },
+      ],
+    });
+    assert.equal(Object.isFrozen(review), true);
+    const page = await ports.reviews.listHistory({
+      context: { item_id: "book-1" },
+      reviewRevision: "review-r3",
+      cursor: "history-page",
+      limit: 25,
+      signal,
+    });
+    assert.deepEqual(page, {
+      itemId: "book-1",
+      revision: "review-r3",
+      state: "resolved",
+      events: [{ action: "attention.resolve" }],
+      nextCursor: "next-page",
+      total: 2,
+    });
+    assert.equal(Object.isFrozen(page), true);
+    assert.equal(Object.isFrozen(page.events), true);
+    assert.deepEqual(invocations, [
+      { itemId: "book-1", signal },
+      {
+        itemId: "book-1",
+        reviewRevision: "review-r3",
+        cursor: "history-page",
+        limit: 25,
+        signal,
+      },
+    ]);
+  });

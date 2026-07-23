@@ -168,6 +168,8 @@ function rasterArtifact(overrides = {}) {
     effective_category: "other",
     caption_assertions: [],
     effective_caption: null,
+    metadata_assertions: [],
+    effective_metadata: {},
     provenance: artifactProvenance(),
     extensions: {},
     ...overrides,
@@ -343,6 +345,31 @@ function manualMetadataAssertion(name = "plate_number", value = 7) {
   };
 }
 
+function machineMetadataAssertion(name = "plate_number", value = 3) {
+  return {
+    name,
+    value,
+    origin: "machine",
+    revision: "metadata-machine-r1",
+    provenance: artifactProvenance({
+      origin: "machine",
+      provider_id: "mistral",
+      model: "mistral-ocr-latest",
+    }),
+  };
+}
+
+function correctionReview(overrides = {}) {
+  return {
+    revision: "review-r1",
+    state: "clear",
+    reason: "",
+    history_count: 0,
+    history_tail: [],
+    ...overrides,
+  };
+}
+
 test("EngineClient exposes the complete Replica compatibility surface", () => {
   const { client } = harness();
   assert.equal(typeof client.capabilities, "function");
@@ -377,6 +404,8 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.corrections.setManualCaption, "function");
   assert.equal(typeof client.corrections.clearManualCaption, "function");
   assert.equal(typeof client.corrections.assertArtifactMetadata, "function");
+  assert.equal(typeof client.corrections.getReview, "function");
+  assert.equal(typeof client.corrections.listReviewHistory, "function");
   assert.equal(typeof client.corrections.markAttention, "function");
   assert.equal(typeof client.corrections.resolveCorrections, "function");
   assert.equal(typeof client.corrections.reopenCorrections, "function");
@@ -435,7 +464,13 @@ test("EngineClient exposes versioned capability discovery", async () => {
 });
 
 test("EngineClient validates versioned Corrections artifact reads", async () => {
-  const raster = rasterArtifact();
+  const raster = rasterArtifact({
+    metadata_assertions: [
+      machineMetadataAssertion(),
+      manualMetadataAssertion("plate_number", 7),
+    ],
+    effective_metadata: { plate_number: 7 },
+  });
   const annotation = spatialAnnotation();
   const bodies = [
     {
@@ -485,7 +520,7 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
   assert.equal((await client.rasterArtifacts.get({
     itemId: "book:one",
     artifactId: "image:one",
-  })).artifact.revision, "artifact-r1");
+  })).artifact.effective_metadata.plate_number, 7);
   assert.equal((await client.spatialAnnotations.list({
     itemId: "book:one",
     representationId: "capture:one",
@@ -577,6 +612,48 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
       error.code === "invalid-response",
   );
 
+  const mismatchedMetadata = rasterArtifact({
+    metadata_assertions: [machineMetadataAssertion()],
+    effective_metadata: { plate_number: 9 },
+  });
+  const mismatchedMetadataClient = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifact/1",
+      artifact: mismatchedMetadata,
+    }),
+  });
+  await assert.rejects(
+    mismatchedMetadataClient.rasterArtifacts.get({
+      itemId: "book:one",
+      artifactId: "image:one",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const privateMetadata = rasterArtifact({
+    metadata_assertions: [
+      machineMetadataAssertion("local-path", "C:/private/scan.png"),
+    ],
+    effective_metadata: { "local-path": "C:/private/scan.png" },
+  });
+  const privateMetadataClient = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifact/1",
+      artifact: privateMetadata,
+    }),
+  });
+  await assert.rejects(
+    privateMetadataClient.rasterArtifacts.get({
+      itemId: "book:one",
+      artifactId: "image:one",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
   assert.throws(() => client.rasterArtifacts.resourceUrl({
     itemId: "book:one",
     artifactId: "image:one",
@@ -595,6 +672,201 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
     canvasRevision: "bad revision",
   }), TypeError);
 });
+
+test("correction review reads expose revisioned audit state and reject drift",
+  async () => {
+    const mark = {
+      operation_id: "attention:mark:1",
+      action: "attention.mark",
+      actor_id: "curator:one",
+      occurred_at: "2026-07-23T12:00:00+00:00",
+      before_state: "clear",
+      after_state: "needs_attention",
+      reason: "Caption needs checking",
+      comment: "Found during QA",
+    };
+    const resolve = {
+      operation_id: "attention:resolve:1",
+      action: "attention.resolve",
+      actor_id: "curator:two",
+      occurred_at: "2026-07-23T12:05:00+00:00",
+      before_state: "needs_attention",
+      after_state: "resolved",
+      reason: "Caption needs checking",
+      comment: "Caption corrected",
+    };
+    const envelope = {
+      ok: true,
+      schema: "librarytool.correction-review/1",
+      item_id: "book:one",
+      review: correctionReview({
+        revision: "review-r3",
+        state: "resolved",
+        reason: "Caption needs checking",
+        history_count: 2,
+        history_tail: [mark, resolve],
+      }),
+    };
+    const historyPages = [
+      {
+        ok: true,
+        schema: "librarytool.correction-review-history/1",
+        item_id: "book:one",
+        review_revision: "review-r3",
+        review_state: "resolved",
+        events: [mark],
+        next_cursor: "history-page-two",
+        total: 2,
+      },
+      {
+        ok: true,
+        schema: "librarytool.correction-review-history/1",
+        item_id: "book:one",
+        review_revision: "review-r3",
+        review_state: "resolved",
+        events: [resolve],
+        next_cursor: null,
+        total: 2,
+      },
+    ];
+    const calls = [];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        if (url.includes("/history")) {
+          return response(
+            200,
+            copyJson(url.includes("cursor=") ? historyPages[1] : historyPages[0]),
+          );
+        }
+        return response(200, copyJson(envelope));
+      },
+    });
+
+    const result = await client.corrections.getReview({
+      itemId: "book:one",
+    });
+
+    assert.equal(result.review.revision, "review-r3");
+    assert.equal(result.review.history_count, 2);
+    assert.deepEqual(result.review.history_tail.map((event) => event.action), [
+      "attention.mark",
+      "attention.resolve",
+    ]);
+    const firstPage = await client.corrections.listReviewHistory({
+      itemId: "book:one",
+      reviewRevision: result.review.revision,
+      limit: 1,
+    });
+    const finalPage = await client.corrections.listReviewHistory({
+      itemId: "book:one",
+      reviewRevision: result.review.revision,
+      cursor: firstPage.next_cursor,
+      limit: 1,
+    });
+    assert.deepEqual(
+      [...firstPage.events, ...finalPage.events].map((event) => event.action),
+      ["attention.mark", "attention.resolve"],
+    );
+    assert.deepEqual(calls, [{
+      url: "/api/v1/items/book%3Aone/corrections/review",
+      init: {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-cache",
+      },
+    }, {
+      url: "/api/v1/items/book%3Aone/corrections/review/history?limit=1",
+      init: {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "If-Review-Match": "\"review-r3\"",
+        },
+        cache: "no-cache",
+      },
+    }, {
+      url: "/api/v1/items/book%3Aone/corrections/review/history" +
+        "?cursor=history-page-two&limit=1",
+      init: {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "If-Review-Match": "\"review-r3\"",
+        },
+        cache: "no-cache",
+      },
+    }]);
+
+    for (const mutate of [
+      (body) => {
+        body.review.history_tail[1].before_state = "clear";
+      },
+      (body) => {
+        body.review.history_tail[1].operation_id =
+          body.review.history_tail[0].operation_id;
+      },
+      (body) => {
+        body.review.reason = "";
+      },
+      (body) => {
+        body.review.history_count = 9;
+      },
+      (body) => {
+        body.review.command_sha256 = "a".repeat(64);
+      },
+    ]) {
+      const malformed = copyJson(envelope);
+      mutate(malformed);
+      const malformedClient = new EngineClient({
+        transport: async () => response(200, malformed),
+      });
+      await assert.rejects(
+        malformedClient.corrections.getReview({ itemId: "book:one" }),
+        (error) => error instanceof EngineClientError &&
+          error.code === "invalid-response",
+      );
+    }
+
+    for (const mutate of [
+      (body) => {
+        body.review_revision = "review-r4";
+      },
+      (body) => {
+        body.events[0].before_state = "resolved";
+      },
+      (body) => {
+        body.next_cursor = null;
+      },
+      (body) => {
+        body.command_sha256 = "a".repeat(64);
+      },
+    ]) {
+      const malformed = copyJson(historyPages[0]);
+      mutate(malformed);
+      const malformedClient = new EngineClient({
+        transport: async () => response(200, malformed),
+      });
+      await assert.rejects(
+        malformedClient.corrections.listReviewHistory({
+          itemId: "book:one",
+          reviewRevision: "review-r3",
+          limit: 1,
+        }),
+        (error) => error instanceof EngineClientError &&
+          error.code === "invalid-response",
+      );
+    }
+    assert.throws(() => client.corrections.listReviewHistory({
+      itemId: "book:one",
+      reviewRevision: "bad revision",
+    }), TypeError);
+    assert.throws(() => client.corrections.listReviewHistory({
+      itemId: "book:one",
+      reviewRevision: "review-r3",
+      limit: 101,
+    }), TypeError);
+  });
 
 test("correction mutations own exact CAS and idempotency transport", async () => {
   const artifactTarget = {

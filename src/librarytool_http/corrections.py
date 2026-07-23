@@ -32,6 +32,7 @@ from librarytool.engine.corrections import (
     ClearImageCategoryCommand,
     ClearRegionRoleCommand,
     CorrectionCommandResult,
+    CorrectionReviewSnapshot,
     CorrectionService,
     MarkAttentionCommand,
     ReopenCorrectionsCommand,
@@ -51,6 +52,9 @@ from librarytool.engine.raster_artifacts import (
     ResourceState,
 )
 from librarytool.engine.runtime import (
+    CORRECTION_CAPTION_SERVICE,
+    CORRECTION_METADATA_SERVICE,
+    CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
@@ -65,11 +69,16 @@ from librarytool.engine.spatial_annotations import (
 
 
 ARTIFACT_PAGE_LIMIT = 512
+CORRECTION_REVIEW_HISTORY_PAGE_LIMIT = 100
+CORRECTION_REVIEW_HISTORY_TAIL_LIMIT = 8
 CORRECTION_MUTATION_MAX_BYTES = 64 * 1024
 CORRECTION_TRANSFORM_QUEUE_SCHEMA = (
     "librarytool.correction-transform-queue-receipt/1"
 )
 _CURSOR_SCHEMA = "librarytool.corrections-cursor/1"
+_REVIEW_HISTORY_CURSOR_SCHEMA = (
+    "librarytool.correction-review-history-cursor/1"
+)
 _TRANSFORM_COMMAND_FIELDS = frozenset(
     {
         "schema",
@@ -205,6 +214,36 @@ def _correction_service(
         engine_for_request,
         CORRECTION_SERVICE,
         "correction command",
+    )
+
+
+def _caption_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_CAPTION_SERVICE,
+        "correction caption",
+    )
+
+
+def _metadata_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_METADATA_SERVICE,
+        "correction metadata",
+    )
+
+
+def _review_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_REVIEW_SERVICE,
+        "correction review",
     )
 
 
@@ -580,7 +619,7 @@ def _set_manual_caption(
     expected_revision = _strong_revision("If-Artifact-Match")
     document = _mutation_document(frozenset({"text", "language"}))
     return _mutation_response(
-        _correction_service(engine_for_request).set_manual_caption(
+        _caption_service(engine_for_request).set_manual_caption(
             SetManualCaptionCommand(
                 item_id=item_id,
                 artifact_id=artifact_id,
@@ -602,7 +641,7 @@ def _clear_manual_caption(
     expected_revision = _strong_revision("If-Artifact-Match")
     _mutation_document(frozenset())
     return _mutation_response(
-        _correction_service(engine_for_request).clear_manual_caption(
+        _caption_service(engine_for_request).clear_manual_caption(
             ClearManualCaptionCommand(
                 item_id=item_id,
                 artifact_id=artifact_id,
@@ -636,7 +675,7 @@ def _assert_artifact_metadata(
             code="invalid_correction_mutation_document",
         ) from error
     return _mutation_response(
-        _correction_service(engine_for_request).assert_artifact_metadata(
+        _metadata_service(engine_for_request).assert_artifact_metadata(
             command
         )
     )
@@ -652,7 +691,7 @@ def _mark_attention(
         frozenset({"reason", "actor_id", "comment"})
     )
     return _mutation_response(
-        _correction_service(engine_for_request).mark_attention(
+        _review_service(engine_for_request).mark_attention(
             MarkAttentionCommand(
                 item_id=item_id,
                 expected_review_revision=expected_revision,
@@ -673,7 +712,7 @@ def _resolve_corrections(
     expected_revision = _strong_revision("If-Review-Match")
     document = _mutation_document(frozenset({"actor_id", "comment"}))
     return _mutation_response(
-        _correction_service(engine_for_request).resolve(
+        _review_service(engine_for_request).resolve(
             ResolveCorrectionsCommand(
                 item_id=item_id,
                 expected_review_revision=expected_revision,
@@ -693,7 +732,7 @@ def _reopen_corrections(
     expected_revision = _strong_revision("If-Review-Match")
     document = _mutation_document(frozenset({"actor_id", "comment"}))
     return _mutation_response(
-        _correction_service(engine_for_request).reopen(
+        _review_service(engine_for_request).reopen(
             ReopenCorrectionsCommand(
                 item_id=item_id,
                 expected_review_revision=expected_revision,
@@ -723,7 +762,7 @@ def _conditional_json(body: Mapping[str, Any], revision: str) -> Response:
     return response.make_conditional(request)
 
 
-def _limit() -> int:
+def _limit(*, maximum: int = ARTIFACT_PAGE_LIMIT) -> int:
     raw = request.args.get("limit", "100")
     try:
         value = int(raw, 10)
@@ -733,18 +772,23 @@ def _limit() -> int:
             code="invalid_corrections_page_limit",
             details={"field": "limit"},
         ) from error
-    if value < 1 or value > ARTIFACT_PAGE_LIMIT:
+    if value < 1 or value > maximum:
         raise ValidationError(
-            f"limit must be between 1 and {ARTIFACT_PAGE_LIMIT}",
+            f"limit must be between 1 and {maximum}",
             code="invalid_corrections_page_limit",
-            details={"field": "limit", "maximum": ARTIFACT_PAGE_LIMIT},
+            details={"field": "limit", "maximum": maximum},
         )
     return value
 
 
-def _encode_cursor(revision: str, offset: int) -> str:
+def _encode_cursor(
+    revision: str,
+    offset: int,
+    *,
+    schema: str = _CURSOR_SCHEMA,
+) -> str:
     payload = json.dumps(
-        {"schema": _CURSOR_SCHEMA, "revision": revision, "offset": offset},
+        {"schema": schema, "revision": revision, "offset": offset},
         ensure_ascii=True,
         allow_nan=False,
         sort_keys=True,
@@ -753,7 +797,16 @@ def _encode_cursor(revision: str, offset: int) -> str:
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
-def _cursor_offset(revision: str, total: int) -> int:
+def _cursor_offset(
+    revision: str,
+    total: int,
+    *,
+    schema: str = _CURSOR_SCHEMA,
+    conflict_code: str = "corrections_collection_changed",
+    conflict_message: str = (
+        "the artifact collection changed while it was being paged"
+    ),
+) -> int:
     token = request.args.get("cursor", "")
     if not token:
         return 0
@@ -780,7 +833,7 @@ def _cursor_offset(revision: str, total: int) -> int:
     if (
         not isinstance(value, dict)
         or set(value) != {"schema", "revision", "offset"}
-        or value.get("schema") != _CURSOR_SCHEMA
+        or value.get("schema") != schema
         or isinstance(value.get("offset"), bool)
         or not isinstance(value.get("offset"), int)
         or value["offset"] < 0
@@ -794,8 +847,8 @@ def _cursor_offset(revision: str, total: int) -> int:
         )
     if value["revision"] != revision:
         raise ConflictError(
-            "the artifact collection changed while it was being paged",
-            code="corrections_collection_changed",
+            conflict_message,
+            code=conflict_code,
             details={
                 "expected_revision": value["revision"],
                 "actual_revision": revision,
@@ -808,13 +861,29 @@ def _page(
     rows: Sequence[Mapping[str, Any]],
     *,
     revision: str,
+    maximum: int = ARTIFACT_PAGE_LIMIT,
+    cursor_schema: str = _CURSOR_SCHEMA,
+    conflict_code: str = "corrections_collection_changed",
+    conflict_message: str = (
+        "the artifact collection changed while it was being paged"
+    ),
 ) -> tuple[list[Mapping[str, Any]], str | None]:
-    limit = _limit()
-    offset = _cursor_offset(revision, len(rows))
+    limit = _limit(maximum=maximum)
+    offset = _cursor_offset(
+        revision,
+        len(rows),
+        schema=cursor_schema,
+        conflict_code=conflict_code,
+        conflict_message=conflict_message,
+    )
     values = list(rows[offset : offset + limit])
     next_offset = offset + len(values)
     cursor = (
-        _encode_cursor(revision, next_offset)
+        _encode_cursor(
+            revision,
+            next_offset,
+            schema=cursor_schema,
+        )
         if next_offset < len(rows)
         else None
     )
@@ -958,6 +1027,101 @@ def _raster_detail(
     return _conditional_json(
         body,
         _collection_revision("rad-", (body,)),
+    )
+
+
+def _review_detail(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    review = _review_service(engine_for_request).get_review(item_id)
+    if not isinstance(review, CorrectionReviewSnapshot):
+        raise RepositoryError(
+            "the correction service returned an invalid review",
+            code="invalid_correction_review",
+            details={"item_id": item_id},
+        )
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": "librarytool.correction-review/1",
+            "item_id": item_id,
+            "review": {
+                "revision": review.revision,
+                "state": review.state.value,
+                "reason": review.reason,
+                "history_count": len(review.history),
+                "history_tail": [
+                    event.as_dict()
+                    for event in review.history[
+                        -CORRECTION_REVIEW_HISTORY_TAIL_LIMIT:
+                    ]
+                ],
+            },
+        },
+        review.revision,
+    )
+
+
+def _review_history(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    expected_revision = _strong_revision("If-Review-Match")
+    review = _review_service(engine_for_request).get_review(item_id)
+    if not isinstance(review, CorrectionReviewSnapshot):
+        raise RepositoryError(
+            "the correction service returned an invalid review",
+            code="invalid_correction_review",
+            details={"item_id": item_id},
+        )
+    if review.revision != expected_revision:
+        raise ConflictError(
+            "the correction review changed",
+            code="review_revision_conflict",
+            details={
+                "expected_revision": expected_revision,
+                "actual_revision": review.revision,
+            },
+        )
+    limit = _limit(maximum=CORRECTION_REVIEW_HISTORY_PAGE_LIMIT)
+    offset = _cursor_offset(
+        review.revision,
+        len(review.history),
+        schema=_REVIEW_HISTORY_CURSOR_SCHEMA,
+        conflict_code="review_revision_conflict",
+        conflict_message="the correction review changed while it was being paged",
+    )
+    if request.args.get("cursor", "") and offset == len(review.history):
+        raise ValidationError(
+            "cursor is invalid",
+            code="invalid_corrections_cursor",
+            details={"field": "cursor"},
+        )
+    selected = review.history[offset : offset + limit]
+    next_offset = offset + len(selected)
+    next_cursor = (
+        _encode_cursor(
+            review.revision,
+            next_offset,
+            schema=_REVIEW_HISTORY_CURSOR_SCHEMA,
+        )
+        if next_offset < len(review.history)
+        else None
+    )
+    page = [event.as_dict() for event in selected]
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": "librarytool.correction-review-history/1",
+            "item_id": item_id,
+            "review_revision": review.revision,
+            "review_state": review.state.value,
+            "events": page,
+            "next_cursor": next_cursor,
+            "total": len(review.history),
+        },
+        review.revision,
     )
 
 
@@ -1334,6 +1498,22 @@ def create_corrections_blueprint(
         except EngineError as error:
             return _error_response(error)
 
+    @blueprint.get("/api/v1/items/<item_id>/corrections/review")
+    def get_correction_review(item_id: str):
+        try:
+            return _review_detail(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/corrections/review/history"
+    )
+    def get_correction_review_history(item_id: str):
+        try:
+            return _review_history(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
     @blueprint.put("/api/v1/items/<item_id>/corrections/review/attention")
     def mark_attention(item_id: str):
         try:
@@ -1360,6 +1540,8 @@ def create_corrections_blueprint(
 
 __all__ = [
     "ARTIFACT_PAGE_LIMIT",
+    "CORRECTION_REVIEW_HISTORY_PAGE_LIMIT",
+    "CORRECTION_REVIEW_HISTORY_TAIL_LIMIT",
     "CORRECTION_MUTATION_MAX_BYTES",
     "CORRECTION_TRANSFORM_QUEUE_SCHEMA",
     "create_corrections_blueprint",

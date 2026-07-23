@@ -240,9 +240,52 @@
       return Object.keys(commands).length ? Object.freeze(commands) : null;
     }
 
+    function correctionReviewPort(client) {
+      const corrections = client && client.corrections;
+      if (!corrections ||
+          typeof corrections.getReview !== "function" ||
+          typeof corrections.listReviewHistory !== "function") {
+        return null;
+      }
+      return Object.freeze({
+        async get({ context, itemId, signal } = {}) {
+          const id = itemId || contextValue(context, "itemId", "item_id");
+          const response = await corrections.getReview({
+            itemId: id,
+            signal,
+          });
+          return Object.freeze({
+            itemId: response.item_id,
+            ...response.review,
+          });
+        },
+        async listHistory({
+          context, itemId, reviewRevision, cursor, limit, signal,
+        } = {}) {
+          const id = itemId || contextValue(context, "itemId", "item_id");
+          const response = await corrections.listReviewHistory({
+            itemId: id,
+            reviewRevision,
+            cursor,
+            limit,
+            signal,
+          });
+          return Object.freeze({
+            itemId: response.item_id,
+            revision: response.review_revision,
+            state: response.review_state,
+            events: Object.freeze(response.events.slice()),
+            nextCursor: response.next_cursor,
+            total: response.total,
+          });
+        },
+      });
+    }
+
     function createCorrectionsEnginePorts(engineClient) {
       const client = requireEngineClient(engineClient);
       const commands = correctionCommandPort(client);
+      const reviews = correctionReviewPort(client);
 
       async function listRasterGroup({ context, group, cursor, limit, signal }) {
         if (!RASTER_GROUPS.has(group)) {
@@ -386,6 +429,7 @@
         : null;
       return Object.freeze({
         artifacts,
+        ...(reviews ? { reviews } : {}),
         ...(invokeCommand ? { invokeCommand } : {}),
       });
     }

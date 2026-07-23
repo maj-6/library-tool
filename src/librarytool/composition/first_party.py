@@ -22,6 +22,9 @@ from ..engine.raster_artifacts import (
 from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
+    CORRECTION_CAPTION_SERVICE,
+    CORRECTION_METADATA_SERVICE,
+    CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
@@ -61,6 +64,18 @@ RASTER_ARTIFACTS_CLASSIFY_CAPABILITY = CapabilityRef(
     "library.raster-artifacts.classify"
 )
 SPATIAL_ANNOTATIONS_EDIT_CAPABILITY = CapabilityRef("library.spatial-annotations.edit")
+CORRECTION_CAPTIONS_EDIT_CAPABILITY = CapabilityRef(
+    "library.corrections.captions.edit"
+)
+CORRECTION_METADATA_EDIT_CAPABILITY = CapabilityRef(
+    "library.corrections.metadata.edit"
+)
+CORRECTION_REVIEWS_READ_CAPABILITY = CapabilityRef(
+    "library.corrections.reviews.read"
+)
+CORRECTION_REVIEWS_EDIT_CAPABILITY = CapabilityRef(
+    "library.corrections.reviews.edit"
+)
 CORRECTION_TRANSFORMS_QUEUE_CAPABILITY = CapabilityRef(
     "library.corrections.transforms.queue"
 )
@@ -151,6 +166,27 @@ FIRST_PARTY_MODULE_MANIFESTS = (
             RASTER_ARTIFACTS_READ_CAPABILITY,
             SPATIAL_ANNOTATIONS_READ_CAPABILITY,
         ),
+    ),
+    ModuleManifest(
+        "library.corrections.captions",
+        "1.0.0",
+        provides=(CORRECTION_CAPTIONS_EDIT_CAPABILITY,),
+        requires=(RASTER_ARTIFACTS_READ_CAPABILITY,),
+    ),
+    ModuleManifest(
+        "library.corrections.metadata",
+        "1.0.0",
+        provides=(CORRECTION_METADATA_EDIT_CAPABILITY,),
+        requires=(RASTER_ARTIFACTS_READ_CAPABILITY,),
+    ),
+    ModuleManifest(
+        "library.corrections.reviews",
+        "1.0.0",
+        provides=(
+            CORRECTION_REVIEWS_READ_CAPABILITY,
+            CORRECTION_REVIEWS_EDIT_CAPABILITY,
+        ),
+        requires=(CapabilityRef("library.items.read"),),
     ),
     ModuleManifest(
         "library.corrections.transforms",
@@ -274,6 +310,10 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             CapabilityRef("library.jobs"),
             RASTER_ARTIFACTS_CLASSIFY_CAPABILITY,
             SPATIAL_ANNOTATIONS_EDIT_CAPABILITY,
+            CORRECTION_CAPTIONS_EDIT_CAPABILITY,
+            CORRECTION_METADATA_EDIT_CAPABILITY,
+            CORRECTION_REVIEWS_READ_CAPABILITY,
+            CORRECTION_REVIEWS_EDIT_CAPABILITY,
             CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,
         ),
     ),
@@ -431,6 +471,46 @@ def first_party_module_contributions(
                 ),
             )
         )
+        contributions.extend(
+            (
+                ModuleContribution(
+                    modules["library.corrections.captions"],
+                    bindings=(
+                        ServiceBinding(
+                            CORRECTION_CAPTION_SERVICE,
+                            graph.correction_commands,
+                            modules[
+                                "library.corrections.captions"
+                            ].provides,
+                        ),
+                    ),
+                ),
+                ModuleContribution(
+                    modules["library.corrections.metadata"],
+                    bindings=(
+                        ServiceBinding(
+                            CORRECTION_METADATA_SERVICE,
+                            graph.correction_commands,
+                            modules[
+                                "library.corrections.metadata"
+                            ].provides,
+                        ),
+                    ),
+                ),
+                ModuleContribution(
+                    modules["library.corrections.reviews"],
+                    bindings=(
+                        ServiceBinding(
+                            CORRECTION_REVIEW_SERVICE,
+                            graph.correction_commands,
+                            modules[
+                                "library.corrections.reviews"
+                            ].provides,
+                        ),
+                    ),
+                ),
+            )
+        )
 
     if graph.correction_transforms is not None:
         contributions.append(
@@ -580,6 +660,10 @@ def first_party_module_contributions(
 
 
 __all__ = [
+    "CORRECTION_CAPTIONS_EDIT_CAPABILITY",
+    "CORRECTION_METADATA_EDIT_CAPABILITY",
+    "CORRECTION_REVIEWS_EDIT_CAPABILITY",
+    "CORRECTION_REVIEWS_READ_CAPABILITY",
     "CORRECTION_TRANSFORMS_QUEUE_CAPABILITY",
     "FIRST_PARTY_MODULE_MANIFESTS",
     "FIRST_PARTY_WORKBENCH_MANIFESTS",

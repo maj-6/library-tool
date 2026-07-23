@@ -29,7 +29,6 @@ from .corrections import (
     CorrectionRepositoryPort,
     CorrectionReviewSnapshot,
     EffectiveCategoryOrigin,
-    MetadataAssertionOrigin,
 )
 from .errors import NotFoundError, RepositoryError
 from .raster_artifacts import (
@@ -37,6 +36,7 @@ from .raster_artifacts import (
     AssignmentOrigin,
     CaptionOrigin,
     CategoryAssignment,
+    MetadataAssertionOrigin,
     RasterArtifactKey,
     RasterArtifactProjectorPort,
     RasterArtifactView,
@@ -198,6 +198,7 @@ class CorrectionAggregateProjector:
                 source_artifact_id=sources[value.key.artifact_id],
                 category_assignments=value.category_assignments,
                 caption_assertions=value.caption_assertions,
+                metadata_assertions=value.metadata_assertions,
                 extensions={
                     _MACHINE_EVIDENCE_REVISION: value.revision,
                 },
@@ -580,6 +581,7 @@ class CorrectionProjectionService(
                     revision=correction.revision,
                     category_assignments=categories,
                     caption_assertions=correction.caption_assertions,
+                    metadata_assertions=correction.metadata_assertions,
                 )
             )
         return tuple(result)

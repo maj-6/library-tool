@@ -21,6 +21,10 @@ from librarytool.engine.jobs import JobManager
 from librarytool.engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
+    CORRECTION_CAPTION_SERVICE,
+    CORRECTION_METADATA_SERVICE,
+    CORRECTION_REVIEW_SERVICE,
+    CORRECTION_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -117,6 +121,9 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.canvases": "1.0.0",
         "library.corrections.artifacts": "1.0.0",
         "library.corrections.commands": "1.0.0",
+        "library.corrections.captions": "1.0.0",
+        "library.corrections.metadata": "1.0.0",
+        "library.corrections.reviews": "1.0.0",
         "library.corrections.transforms": "1.0.0",
         "library.text-layers": "1.0.0",
         "library.secrets": "1.0.0",
@@ -180,6 +187,28 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     assert _capabilities(correction_commands.requires) == {
         ("library.raster-artifacts.read", 1),
         ("library.spatial-annotations.read", 1),
+    }
+    correction_captions = modules["library.corrections.captions"]
+    assert _capabilities(correction_captions.provides) == {
+        ("library.corrections.captions.edit", 1),
+    }
+    assert _capabilities(correction_captions.requires) == {
+        ("library.raster-artifacts.read", 1),
+    }
+    correction_metadata = modules["library.corrections.metadata"]
+    assert _capabilities(correction_metadata.provides) == {
+        ("library.corrections.metadata.edit", 1),
+    }
+    assert _capabilities(correction_metadata.requires) == {
+        ("library.raster-artifacts.read", 1),
+    }
+    correction_reviews = modules["library.corrections.reviews"]
+    assert _capabilities(correction_reviews.provides) == {
+        ("library.corrections.reviews.read", 1),
+        ("library.corrections.reviews.edit", 1),
+    }
+    assert _capabilities(correction_reviews.requires) == {
+        ("library.items.read", 1),
     }
     correction_transforms = modules["library.corrections.transforms"]
     assert _capabilities(correction_transforms.provides) == {
@@ -268,6 +297,10 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     assert _capabilities(workbenches["corrections"].enhances) == {
         ("library.jobs", 1),
         ("library.corrections.transforms.queue", 1),
+        ("library.corrections.captions.edit", 1),
+        ("library.corrections.metadata.edit", 1),
+        ("library.corrections.reviews.read", 1),
+        ("library.corrections.reviews.edit", 1),
         ("library.raster-artifacts.classify", 1),
         ("library.spatial-annotations.edit", 1),
     }
@@ -639,13 +672,37 @@ def test_service_graph_allows_independent_correction_command_modules():
     assert command_only.correction_transforms is None
     assert transform_only.correction_commands is None
     assert transform_only.correction_transforms is transforms
+    command_contributions = first_party_module_contributions(command_only)
     assert {
         contribution.manifest.id
-        for contribution in first_party_module_contributions(command_only)
-    } >= {"library.corrections.commands"}
+        for contribution in command_contributions
+    } >= {
+        "library.corrections.commands",
+        "library.corrections.captions",
+        "library.corrections.metadata",
+        "library.corrections.reviews",
+    }
+    expected_keys = {
+        "library.corrections.commands": CORRECTION_SERVICE,
+        "library.corrections.captions": CORRECTION_CAPTION_SERVICE,
+        "library.corrections.metadata": CORRECTION_METADATA_SERVICE,
+        "library.corrections.reviews": CORRECTION_REVIEW_SERVICE,
+    }
+    command_bindings = {
+        contribution.manifest.id: contribution.bindings[0]
+        for contribution in command_contributions
+        if contribution.manifest.id in expected_keys
+    }
+    assert {
+        module_id: binding.key
+        for module_id, binding in command_bindings.items()
+    } == expected_keys
+    assert all(
+        binding.service is commands for binding in command_bindings.values()
+    )
     assert "library.corrections.transforms" not in {
         contribution.manifest.id
-        for contribution in first_party_module_contributions(command_only)
+        for contribution in command_contributions
     }
     assert {
         contribution.manifest.id

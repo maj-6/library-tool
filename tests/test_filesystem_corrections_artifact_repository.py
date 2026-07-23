@@ -1192,6 +1192,16 @@ def test_mistral_regions_and_figure_crops_project_without_rewriting(tmp_path):
     }
     assert figure_view.effective_caption is not None
     assert figure_view.effective_caption.text == "A medicinal plant"
+    assert figure_view.effective_metadata == {
+        "future": {"palette": "green"},
+    }
+    assert len(figure_view.metadata_assertions) == 1
+    metadata = figure_view.metadata_assertions[0]
+    assert metadata.name == "future"
+    assert metadata.value == {"palette": "green"}
+    assert metadata.origin.value == "imported"
+    assert metadata.provenance.origin == "ocr"
+    assert metadata.provenance.provider_id == "mistral"
     assert figure_view.extensions["extension_metadata"]["future"]["palette"] == "green"
     assert (
         figure_view.extensions["corrections_ui"]["annotation_frame"]

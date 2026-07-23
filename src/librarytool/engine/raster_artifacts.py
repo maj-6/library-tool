@@ -41,6 +41,7 @@ MAX_EXTENSION_NODES = 512
 MAX_EXTENSION_ENCODED_BYTES = 32 * 1024
 MAX_LINEAGE_REFS = 64
 MAX_ASSERTIONS = 32
+MAX_METADATA_ASSERTIONS = 128
 MAX_PORTABLE_INTEGER = (1 << 53) - 1
 
 _EMPTY_MAPPING: JsonMapping = MappingProxyType({})
@@ -442,6 +443,12 @@ class CaptionOrigin(str, Enum):
     IMPORTED = "imported"
 
 
+class MetadataAssertionOrigin(str, Enum):
+    MANUAL = "manual"
+    MACHINE = "machine"
+    IMPORTED = "imported"
+
+
 @dataclass(frozen=True, slots=True)
 class RasterArtifactKey:
     item_id: str
@@ -652,6 +659,47 @@ class ArtifactProvenance:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactMetadataAssertion:
+    """One origin-specific, portable metadata assertion for a raster artifact."""
+
+    name: str
+    value: Any
+    origin: MetadataAssertionOrigin | str
+    revision: str
+    provenance: ArtifactProvenance = field(default_factory=ArtifactProvenance)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _identifier(self.name, "metadata.name"))
+        try:
+            origin = MetadataAssertionOrigin(self.origin)
+        except (TypeError, ValueError) as exc:
+            raise _validation(
+                "metadata assertion origin is invalid",
+                code="invalid_metadata_assertion",
+                field_name="metadata.origin",
+            ) from exc
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "revision", _revision(self.revision, "revision"))
+        frozen = _extensions({self.name: self.value}, "metadata.assertion")
+        object.__setattr__(self, "value", frozen[self.name])
+        if not isinstance(self.provenance, ArtifactProvenance):
+            raise _validation(
+                "provenance must be ArtifactProvenance",
+                code="invalid_metadata_assertion",
+                field_name="provenance",
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "value": _thaw(self.value),
+            "origin": self.origin.value,
+            "revision": self.revision,
+            "provenance": self.provenance.as_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CategoryAssignment:
     category: str
     origin: AssignmentOrigin | str
@@ -795,6 +843,7 @@ class RasterArtifactView:
     lineage: tuple[RasterLineageRef, ...] = ()
     category_assignments: tuple[CategoryAssignment, ...] = ()
     caption_assertions: tuple[CaptionAssertion, ...] = ()
+    metadata_assertions: tuple[ArtifactMetadataAssertion, ...] = ()
     provenance: ArtifactProvenance = field(default_factory=ArtifactProvenance)
     extensions: JsonMapping = field(default_factory=lambda: _EMPTY_MAPPING)
 
@@ -902,6 +951,23 @@ class RasterArtifactView:
                 field_name="caption_assertions",
             )
         object.__setattr__(self, "caption_assertions", captions)
+
+        metadata = _typed_values(
+            self.metadata_assertions,
+            ArtifactMetadataAssertion,
+            "metadata_assertions",
+            maximum=MAX_METADATA_ASSERTIONS,
+        )
+        metadata_identities = [
+            (assertion.name, assertion.origin) for assertion in metadata
+        ]
+        if len(metadata_identities) != len(set(metadata_identities)):
+            raise _validation(
+                "metadata assertion names must be unique per origin",
+                code="invalid_metadata_assertion",
+                field_name="metadata_assertions",
+            )
+        object.__setattr__(self, "metadata_assertions", metadata)
         if not isinstance(self.provenance, ArtifactProvenance):
             raise _validation(
                 "provenance must be ArtifactProvenance",
@@ -935,6 +1001,24 @@ class RasterArtifactView:
                 return by_origin[origin]
         return None
 
+    @property
+    def effective_metadata(self) -> dict[str, Any]:
+        by_identity = {
+            (value.name, value.origin): value for value in self.metadata_assertions
+        }
+        result: dict[str, Any] = {}
+        for name in sorted({value.name for value in self.metadata_assertions}):
+            for origin in (
+                MetadataAssertionOrigin.MANUAL,
+                MetadataAssertionOrigin.IMPORTED,
+                MetadataAssertionOrigin.MACHINE,
+            ):
+                assertion = by_identity.get((name, origin))
+                if assertion is not None:
+                    result[name] = _thaw(assertion.value)
+                    break
+        return result
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "key": self.key.as_dict(),
@@ -959,6 +1043,10 @@ class RasterArtifactView:
             "effective_caption": (
                 self.effective_caption.as_dict() if self.effective_caption else None
             ),
+            "metadata_assertions": [
+                value.as_dict() for value in self.metadata_assertions
+            ],
+            "effective_metadata": self.effective_metadata,
             "provenance": self.provenance.as_dict(),
             "extensions": _thaw(self.extensions),
         }
@@ -977,6 +1065,7 @@ class RasterArtifactProjectorPort(Protocol):
 
 
 __all__ = [
+    "ArtifactMetadataAssertion",
     "ArtifactFreshness",
     "ArtifactProvenance",
     "AssignmentOrigin",
@@ -985,6 +1074,8 @@ __all__ = [
     "CaptionOrigin",
     "CategoryAssignment",
     "IMAGE_CATEGORIES",
+    "MAX_METADATA_ASSERTIONS",
+    "MetadataAssertionOrigin",
     "RASTER_ARTIFACTS_READ_CAPABILITY",
     "RasterArtifactKey",
     "RasterArtifactProjectorPort",

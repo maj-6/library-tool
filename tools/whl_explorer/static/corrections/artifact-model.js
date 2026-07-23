@@ -9,6 +9,7 @@
   const MAX_LINKS = 128;
   const MAX_LINEAGE = 128;
   const MAX_ASSERTIONS = 32;
+  const MAX_METADATA_ASSERTIONS = 128;
   const MAX_JSON_DEPTH = 5;
   const MAX_JSON_KEYS = 256;
   const MAX_JSON_ARRAY = 256;
@@ -332,6 +333,27 @@
     }));
   }
 
+  function metadataAssertionArray(value) {
+    if (!Array.isArray(value)) return Object.freeze([]);
+    return Object.freeze(
+      value.slice(0, MAX_METADATA_ASSERTIONS).flatMap((entry) => {
+        if (!isObject(entry)) return [];
+        const origin = text(entry.origin, 24).toLowerCase();
+        const name = portableId(entry.name, "metadata assertion name");
+        if (!name || !["manual", "machine", "imported"].includes(origin)) {
+          return [];
+        }
+        return [Object.freeze({
+          name,
+          value: freezeJson(safeBoundedJson(entry.value, null)),
+          origin,
+          revision: text(entry.revision, 512),
+          provenance: freezeJson(safeBoundedJson(entry.provenance, {})),
+        })];
+      }),
+    );
+  }
+
   function effectiveCaption(assertions, supplied) {
     if (isObject(supplied)) {
       const normalized = assertionArray([supplied],
@@ -422,6 +444,9 @@
       raw.role_assignments || raw.roleAssignments,
       new Set(["manual", "machine", "imported"]),
     );
+    const metadataAssertions = metadataAssertionArray(
+      raw.metadata_assertions || raw.metadataAssertions,
+    );
     const resourceRef = normalizeResourceRef(
       raw.resource_ref || raw.resourceRef || raw.resource,
     );
@@ -465,12 +490,16 @@
       categoryAssignments,
       roleAssignments,
       captionAssertions,
+      metadataAssertions,
       effectiveCaption: effectiveCaption(
         captionAssertions,
         raw.effective_caption || raw.effectiveCaption,
       ),
       provenance: freezeJson(safeBoundedJson(raw.provenance, {})),
-      metadata: freezeJson(safeBoundedJson(raw.metadata, {})),
+      metadata: freezeJson(safeBoundedJson(
+        raw.effective_metadata || raw.effectiveMetadata || raw.metadata,
+        {},
+      )),
       resourceRef,
     };
     result.linkedKeys = normalizeLinkedKeys(raw, objectType, lineage)

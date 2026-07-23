@@ -16,17 +16,23 @@ from librarytool.engine.correction_projection import (
     CorrectionProjectionService,
     reconcile_correction_aggregates,
 )
-from librarytool.engine.corrections import CorrectionService
+from librarytool.engine.corrections import (
+    CorrectionAuditEvent,
+    CorrectionReviewSnapshot,
+    CorrectionService,
+)
 from librarytool.engine.correction_transforms import (
     CorrectionTransformCommand,
     CorrectionTransformService,
 )
 from librarytool.engine.jobs import JobManager
 from librarytool.engine.raster_artifacts import (
+    ArtifactMetadataAssertion,
     ArtifactFreshness,
     ArtifactProvenance,
     CaptionAssertion,
     CaptionOrigin,
+    MetadataAssertionOrigin,
     RasterArtifactKey,
     RasterLineageRef,
     RasterArtifactView,
@@ -36,6 +42,9 @@ from librarytool.engine.raster_artifacts import (
     ResourceState,
 )
 from librarytool.engine.runtime import (
+    CORRECTION_CAPTION_SERVICE,
+    CORRECTION_METADATA_SERVICE,
+    CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
@@ -160,7 +169,13 @@ class _Engine:
             SPATIAL_ANNOTATION_QUERY_SERVICE: spatial,
         }
         if corrections is not None:
-            self.services[CORRECTION_SERVICE] = corrections
+            for key in (
+                CORRECTION_CAPTION_SERVICE,
+                CORRECTION_METADATA_SERVICE,
+                CORRECTION_REVIEW_SERVICE,
+                CORRECTION_SERVICE,
+            ):
+                self.services[key] = corrections
         if transforms is not None:
             self.services[CORRECTION_TRANSFORM_SERVICE] = transforms
 
@@ -264,6 +279,51 @@ def _projected_harness(tmp_path, raster_rows, spatial_rows):
     )
     corrections = CorrectionService(repository)
     return _app(_Engine(projected, projected, corrections)), repository
+
+
+class _ReviewService:
+    def __init__(self, review):
+        self.review = review
+        self.calls = []
+
+    def get_review(self, item_id):
+        self.calls.append(item_id)
+        return self.review
+
+
+def _review_with_history(count, revision):
+    state = "clear"
+    history = []
+    reason = "Caption needs checking"
+    for index in range(count):
+        if state == "clear":
+            action = "attention.mark"
+            after = "needs_attention"
+        elif state == "needs_attention":
+            action = "attention.resolve"
+            after = "resolved"
+        else:
+            action = "attention.reopen"
+            after = "needs_attention"
+        history.append(
+            CorrectionAuditEvent(
+                operation_id=f"review-audit-{index:04d}",
+                action=action,
+                actor_id="curator-1",
+                occurred_at=f"2026-07-23T12:{index:02d}:00+00:00",
+                before_state=state,
+                after_state=after,
+                reason=reason,
+                comment=f"Audit event {index}",
+            )
+        )
+        state = after
+    return CorrectionReviewSnapshot(
+        revision=revision,
+        state=state,
+        reason="" if state == "clear" else reason,
+        history=tuple(history),
+    )
 
 
 def test_raster_list_is_versioned_filterable_and_revision_paged():
@@ -633,27 +693,43 @@ def test_manual_caption_transport_rejects_overlong_valid_language_tag(tmp_path):
 
 
 def test_metadata_transport_is_conditional_replay_safe_and_reversible(tmp_path):
+    machine = ArtifactMetadataAssertion(
+        "plate_number",
+        3,
+        MetadataAssertionOrigin.MACHINE,
+        "metadata-machine-r1",
+        provenance=ArtifactProvenance(
+            origin="ocr",
+            provider_id="mistral",
+        ),
+    )
     rows = (
-        _raster("image-1"),
+        replace(_raster("image-1"), metadata_assertions=(machine,)),
         _raster("figure-1", kind="extracted-figure"),
     )
     spatial = (
         replace(_annotation("region-1"), linked_artifact_ids=("figure-1",)),
     )
-    app, repository = _projected_harness(tmp_path, rows, spatial)
-    client = app.test_client()
+    app, _repository = _projected_harness(tmp_path, rows, spatial)
+    first_client = app.test_client()
+    second_client = app.test_client()
     endpoint = "/api/v1/items/book-1/raster-artifacts/image-1/metadata"
+    artifact_endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    first_view = first_client.get(artifact_endpoint).get_json()["artifact"]
+    second_view = second_client.get(artifact_endpoint).get_json()["artifact"]
+    assert first_view["revision"] == second_view["revision"]
+    assert first_view["effective_metadata"] == {"plate_number": 3}
     headers = {
         "Idempotency-Key": "metadata-assert-op",
-        "If-Artifact-Match": '"artifact-image-1-r1"',
+        "If-Artifact-Match": f'"{first_view["revision"]}"',
     }
     document = {
         "assertions": {"caption_source": "manual", "plate_number": 7},
         "clear_names": [],
     }
 
-    first = client.patch(endpoint, json=document, headers=headers)
-    replay = client.patch(endpoint, json=document, headers=headers)
+    first = first_client.patch(endpoint, json=document, headers=headers)
+    replay = first_client.patch(endpoint, json=document, headers=headers)
 
     assert first.status_code == replay.status_code == 200
     assert replay.get_json()["replayed"] is True
@@ -664,27 +740,33 @@ def test_metadata_transport_is_conditional_replay_safe_and_reversible(tmp_path):
         "restore_assertions": [],
         "clear_names": ["caption_source", "plate_number"],
     }
-    with repository.unit_of_work(operation_id="metadata-inspect-op") as unit:
-        aggregate = unit.get("book-1")
-    artifact = aggregate.artifact("image-1")
-    assert artifact.effective_metadata() == {
+    converged = second_client.get(artifact_endpoint).get_json()["artifact"]
+    assert {
+        (value["name"], value["origin"], value["value"])
+        for value in converged["metadata_assertions"]
+    } == {
+        ("caption_source", "manual", "manual"),
+        ("plate_number", "machine", 3),
+        ("plate_number", "manual", 7),
+    }
+    assert converged["effective_metadata"] == {
         "caption_source": "manual",
         "plate_number": 7,
     }
 
-    stale = client.patch(
+    stale = second_client.patch(
         endpoint,
         json={"assertions": {"plate_number": 8}, "clear_names": []},
         headers={
             "Idempotency-Key": "metadata-stale-op",
-            "If-Artifact-Match": '"artifact-image-1-r1"',
+            "If-Artifact-Match": f'"{second_view["revision"]}"',
         },
     )
     assert stale.status_code == 409
     assert stale.get_json()["code"] == "artifact_revision_conflict"
 
     current_revision = receipt["targets"][0]["after_revision"]
-    cleared = client.patch(
+    cleared = second_client.patch(
         endpoint,
         json={"assertions": {}, "clear_names": ["plate_number"]},
         headers={
@@ -699,6 +781,16 @@ def test_metadata_transport_is_conditional_replay_safe_and_reversible(tmp_path):
     assert [(value["name"], value["value"]) for value in restored] == [
         ("plate_number", 7)
     ]
+    revealed = first_client.get(artifact_endpoint).get_json()["artifact"]
+    assert revealed["effective_metadata"] == {
+        "caption_source": "manual",
+        "plate_number": 3,
+    }
+    assert {
+        (value["origin"], value["value"])
+        for value in revealed["metadata_assertions"]
+        if value["name"] == "plate_number"
+    } == {("machine", 3)}
 
 
 def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
@@ -709,19 +801,37 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     spatial = (
         replace(_annotation("region-1"), linked_artifact_ids=("figure-1",)),
     )
-    base = CorrectionAggregateProjector(
-        _RasterProjector(rows),
-        _SpatialProjector(spatial),
-    ).project("book-1")
-    app, repository = _projected_harness(tmp_path, rows, spatial)
-    client = app.test_client()
+    app, _repository = _projected_harness(tmp_path, rows, spatial)
+    first_client = app.test_client()
+    second_client = app.test_client()
     endpoint = "/api/v1/items/book-1/corrections/review"
+    initial = first_client.get(endpoint)
+    initial_body = initial.get_json()
+    initial_review = initial_body["review"]
+    assert initial.status_code == 200
+    assert initial.headers["ETag"] == f'"{initial_review["revision"]}"'
+    assert initial_body == {
+        "ok": True,
+        "schema": "librarytool.correction-review/1",
+        "item_id": "book-1",
+        "review": {
+            "revision": initial_review["revision"],
+            "state": "clear",
+            "reason": "",
+            "history_count": 0,
+            "history_tail": [],
+        },
+    }
+    assert second_client.get(
+        endpoint,
+        headers={"If-None-Match": initial.headers["ETag"]},
+    ).status_code == 304
 
     mark_headers = {
         "Idempotency-Key": "review-mark-op",
-        "If-Review-Match": f'"{base.review.revision}"',
+        "If-Review-Match": f'"{initial_review["revision"]}"',
     }
-    marked = client.put(
+    marked = first_client.put(
         f"{endpoint}/attention",
         json={
             "reason": "Caption needs checking",
@@ -730,7 +840,7 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         },
         headers=mark_headers,
     )
-    replay = client.put(
+    replay = first_client.put(
         f"{endpoint}/attention",
         json={
             "reason": "Caption needs checking",
@@ -745,13 +855,36 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     assert mark_receipt["inverse"]["action"] == "attention.clear"
     assert mark_receipt["targets"][0]["kind"] == "review"
 
-    resolved = client.post(
+    stale_mark = second_client.put(
+        f"{endpoint}/attention",
+        json={
+            "reason": "A stale second opinion",
+            "actor_id": "curator-2",
+            "comment": "",
+        },
+        headers={
+            "Idempotency-Key": "review-stale-mark-op",
+            "If-Review-Match": f'"{initial_review["revision"]}"',
+        },
+    )
+    assert stale_mark.status_code == 409
+    assert stale_mark.get_json()["code"] == "review_revision_conflict"
+
+    observed_mark = second_client.get(endpoint).get_json()["review"]
+    assert observed_mark["revision"] == mark_receipt["targets"][0]["after_revision"]
+    assert observed_mark["state"] == "needs_attention"
+    assert observed_mark["history_count"] == 1
+    assert [event["action"] for event in observed_mark["history_tail"]] == [
+        "attention.mark"
+    ]
+
+    resolved = second_client.post(
         f"{endpoint}/resolve",
         json={"actor_id": "curator-1", "comment": "Caption corrected"},
         headers={
             "Idempotency-Key": "review-resolve-op",
             "If-Review-Match": (
-                f'"{mark_receipt["targets"][0]["after_revision"]}"'
+                f'"{observed_mark["revision"]}"'
             ),
         },
     )
@@ -759,13 +892,26 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     resolve_receipt = resolved.get_json()["receipt"]
     assert resolve_receipt["inverse"]["action"] == "attention.reopen"
 
-    reopened = client.post(
+    stale_resolve = first_client.post(
+        f"{endpoint}/resolve",
+        json={"actor_id": "curator-1", "comment": ""},
+        headers={
+            "Idempotency-Key": "review-stale-resolve-op",
+            "If-Review-Match": f'"{observed_mark["revision"]}"',
+        },
+    )
+    assert stale_resolve.status_code == 409
+    assert stale_resolve.get_json()["code"] == "review_revision_conflict"
+
+    observed_resolution = first_client.get(endpoint).get_json()["review"]
+    assert observed_resolution["state"] == "resolved"
+    reopened = first_client.post(
         f"{endpoint}/reopen",
         json={"actor_id": "curator-2", "comment": "Second review requested"},
         headers={
             "Idempotency-Key": "review-reopen-op",
             "If-Review-Match": (
-                f'"{resolve_receipt["targets"][0]["after_revision"]}"'
+                f'"{observed_resolution["revision"]}"'
             ),
         },
     )
@@ -774,26 +920,157 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
         "attention.resolve"
     )
 
-    with repository.unit_of_work(operation_id="review-inspect-op") as unit:
-        aggregate = unit.get("book-1")
-    assert aggregate.review.state.value == "needs_attention"
-    assert aggregate.review.reason == "Caption needs checking"
-    assert [event.action for event in aggregate.review.history] == [
+    converged = second_client.get(endpoint).get_json()["review"]
+    assert converged["state"] == "needs_attention"
+    assert converged["reason"] == "Caption needs checking"
+    assert converged["history_count"] == 3
+    assert [event["action"] for event in converged["history_tail"]] == [
         "attention.mark",
         "attention.resolve",
         "attention.reopen",
     ]
+    history_endpoint = f"{endpoint}/history"
+    first_page = second_client.get(
+        history_endpoint,
+        query_string={"limit": 2},
+        headers={"If-Review-Match": f'"{converged["revision"]}"'},
+    )
+    first_history = first_page.get_json()
+    assert first_page.status_code == 200
+    assert first_page.headers["ETag"] == f'"{converged["revision"]}"'
+    assert first_history == {
+        "ok": True,
+        "schema": "librarytool.correction-review-history/1",
+        "item_id": "book-1",
+        "review_revision": converged["revision"],
+        "review_state": "needs_attention",
+        "events": first_history["events"],
+        "next_cursor": first_history["next_cursor"],
+        "total": 3,
+    }
+    assert [event["action"] for event in first_history["events"]] == [
+        "attention.mark",
+        "attention.resolve",
+    ]
+    assert first_history["next_cursor"]
+    final_page = first_client.get(
+        history_endpoint,
+        query_string={
+            "limit": 2,
+            "cursor": first_history["next_cursor"],
+        },
+        headers={"If-Review-Match": f'"{converged["revision"]}"'},
+    )
+    assert final_page.status_code == 200
+    assert [event["action"] for event in final_page.get_json()["events"]] == [
+        "attention.reopen"
+    ]
+    assert final_page.get_json()["next_cursor"] is None
+    assert first_client.get(history_endpoint).status_code == 428
+    stale_history = first_client.get(
+        history_endpoint,
+        headers={"If-Review-Match": f'"{initial_review["revision"]}"'},
+    )
+    assert stale_history.status_code == 409
+    assert stale_history.get_json()["code"] == "review_revision_conflict"
 
-    stale = client.post(
+    stale = second_client.post(
         f"{endpoint}/resolve",
         json={"actor_id": "curator-3", "comment": ""},
         headers={
             "Idempotency-Key": "review-stale-op",
-            "If-Review-Match": f'"{base.review.revision}"',
+            "If-Review-Match": f'"{initial_review["revision"]}"',
         },
     )
     assert stale.status_code == 409
     assert stale.get_json()["code"] == "review_revision_conflict"
+
+
+def test_review_snapshot_bounds_tail_and_history_pages_pin_exact_revision():
+    first_review = _review_with_history(25, "review-long-r1")
+    service = _ReviewService(first_review)
+    client = _app(
+        _Engine(
+            _RasterProjector(()),
+            _SpatialProjector(()),
+            service,
+        )
+    ).test_client()
+    endpoint = "/api/v1/items/book-1/corrections/review"
+
+    summary_response = client.get(endpoint)
+    summary = summary_response.get_json()["review"]
+    assert summary_response.status_code == 200
+    assert summary["revision"] == first_review.revision
+    assert summary["history_count"] == 25
+    assert len(summary["history_tail"]) == 8
+    assert [
+        event["operation_id"] for event in summary["history_tail"]
+    ] == [
+        event.operation_id for event in first_review.history[-8:]
+    ]
+    assert "history" not in summary
+
+    history_endpoint = f"{endpoint}/history"
+    cursor = None
+    first_cursor = None
+    events = []
+    while True:
+        response = client.get(
+            history_endpoint,
+            query_string={
+                "limit": 7,
+                **({"cursor": cursor} if cursor else {}),
+            },
+            headers={
+                "If-Review-Match": f'"{first_review.revision}"',
+            },
+        )
+        assert response.status_code == 200
+        page = response.get_json()
+        assert page["review_revision"] == first_review.revision
+        assert page["review_state"] == first_review.state.value
+        assert page["total"] == 25
+        assert len(page["events"]) <= 7
+        events.extend(page["events"])
+        cursor = page["next_cursor"]
+        if first_cursor is None:
+            first_cursor = cursor
+        if cursor is None:
+            break
+    assert [event["operation_id"] for event in events] == [
+        event.operation_id for event in first_review.history
+    ]
+
+    oversized = client.get(
+        history_endpoint,
+        query_string={"limit": 101},
+        headers={"If-Review-Match": f'"{first_review.revision}"'},
+    )
+    assert oversized.status_code == 400
+    assert oversized.get_json()["code"] == "invalid_corrections_page_limit"
+
+    second_review = _review_with_history(26, "review-long-r2")
+    service.review = second_review
+    changed = client.get(
+        history_endpoint,
+        query_string={"limit": 7, "cursor": first_cursor},
+        headers={"If-Review-Match": f'"{first_review.revision}"'},
+    )
+    assert changed.status_code == 409
+    assert changed.get_json()["code"] == "review_revision_conflict"
+    assert changed.get_json()["details"] == {
+        "actual_revision": second_review.revision,
+        "expected_revision": first_review.revision,
+    }
+
+    mixed_cursor = client.get(
+        history_endpoint,
+        query_string={"limit": 7, "cursor": first_cursor},
+        headers={"If-Review-Match": f'"{second_review.revision}"'},
+    )
+    assert mixed_cursor.status_code == 409
+    assert mixed_cursor.get_json()["code"] == "review_revision_conflict"
 
 
 def test_inherited_category_changes_detail_etag_without_changing_child_cas(
