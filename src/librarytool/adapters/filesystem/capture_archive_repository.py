@@ -18,6 +18,7 @@ from ...engine.capture_archives import (
     CaptureArchivePublication,
     CaptureArchiveReceipt,
     CaptureArchiveResult,
+    CaptureArchiveState,
     capture_book_id,
 )
 from ...engine.errors import ConflictError, EngineError, RepositoryError
@@ -388,6 +389,73 @@ class FilesystemCaptureArchiveRepository:
                 retryable=True,
             ) from exc
 
+    def mark_stale(
+        self,
+        capture_id: str,
+    ) -> CaptureArchiveAssociation | None:
+        capture_book_id(capture_id)
+        try:
+            with self._write_set.workspace_lease():
+                association = self._read_association(capture_id)
+                if association is None:
+                    return None
+                self._validate_archive(association)
+                if association.state is CaptureArchiveState.STALE:
+                    return association
+                stale = CaptureArchiveAssociation(
+                    capture_id=association.capture_id,
+                    book_id=association.book_id,
+                    archive_sha256=association.archive_sha256,
+                    archive_bytes=association.archive_bytes,
+                    format_version=association.format_version,
+                    state=CaptureArchiveState.STALE,
+                    generated_at=association.generated_at,
+                    source_revision=association.source_revision,
+                    source_fingerprint=association.source_fingerprint,
+                )
+                operation_digest = hashlib.sha256(
+                    _canonical_json(
+                        association.as_dict(),
+                        artifact="capture_archive_association",
+                    )
+                ).hexdigest()
+                transaction = self._write_set.begin(
+                    operation_id=f"capture-stale-{operation_digest}",
+                    scope="capture-lib-stale",
+                    metadata={
+                        "capture_id": association.capture_id,
+                        "book_id": association.book_id,
+                        "archive_sha256": association.archive_sha256,
+                    },
+                )
+                transaction.stage_write(
+                    self._relative(self._association_path(capture_id)),
+                    _canonical_json(
+                        stale.as_dict(),
+                        artifact="capture_archive_association",
+                    ),
+                )
+                transaction.commit(receipt=stale.as_dict())
+                return stale
+        except RepositoryError:
+            raise
+        except WriteSetError as exc:
+            raise _repository_failure(
+                "the capture archive stale transition failed",
+                code=exc.code,
+                cause=exc,
+                retryable=exc.retryable,
+            ) from exc
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_failure(
+                "the capture archive stale transition failed",
+                code="capture_archive_stale_transition_failed",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
     def _validate_existing_source(
         self,
         *,
@@ -454,7 +522,17 @@ class FilesystemCaptureArchiveRepository:
         receipt: CaptureArchiveReceipt,
     ) -> None:
         association = self._read_association(receipt.association.capture_id)
-        if association is None or association != receipt.association:
+        same_authority = association == receipt.association
+        if (
+            association is not None
+            and association.state is CaptureArchiveState.STALE
+            and receipt.association.state is CaptureArchiveState.CURRENT
+        ):
+            authoritative = association.as_dict()
+            historical = receipt.association.as_dict()
+            authoritative["state"] = historical["state"]
+            same_authority = authoritative == historical
+        if association is None or not same_authority:
             raise RepositoryError(
                 "the capture archive receipt is not bound to its association",
                 code="invalid_capture_archive_storage",

@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import io
 import json
 from datetime import datetime
 from urllib.parse import parse_qs
 
 import pytest
+from PIL import Image
 
 SURVIVOR = "11111111-2222-3333-4444-555555555555"
 DUPLICATE = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 FINAL = "99999999-8888-7777-6666-555555555555"
+
+
+def _jpeg(seed: str) -> bytes:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    stream = io.BytesIO()
+    Image.new("RGB", (2, 1), tuple(digest[:3])).save(stream, format="JPEG")
+    return stream.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -419,7 +429,7 @@ def test_merge_tombstone_then_failed_save_continues_idempotently(
             "scan_collection": "Blue crate before merge",
             "scan_from": "Christopher Office",
         },
-    }, [b"image"], "")
+        }, [_jpeg("late-collection-arrival")], "")
     late = server.lib.load_json(server.lib.MANUAL_ENTRIES_PATH, {})[entry_id]["extra"]
     assert late == {
         "scan_collection_id": SURVIVOR,

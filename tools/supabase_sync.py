@@ -26,6 +26,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 TIMEOUT = 30.0
+CAPTURE_PHOTO_MAX_BYTES = 32 * 1024 * 1024
 
 
 class SyncError(Exception):
@@ -49,18 +50,39 @@ def _cfg(cfg: dict) -> tuple[str, str, dict]:
 
 
 def _request(method: str, url: str, headers: dict, body: bytes | None = None,
-             timeout: float = TIMEOUT) -> bytes:
+             timeout: float = TIMEOUT, *,
+             maximum_bytes: int | None = None) -> bytes:
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+            if maximum_bytes is None:
+                return resp.read()
+            if maximum_bytes < 0:
+                raise ValueError("maximum_bytes must not be negative")
+            content_length = resp.headers.get("Content-Length")
+            try:
+                advertised_bytes = int(content_length)
+            except (TypeError, ValueError):
+                advertised_bytes = -1
+            if advertised_bytes > maximum_bytes:
+                raise SyncError(
+                    f"response exceeds the {maximum_bytes}-byte download limit"
+                )
+            payload = resp.read(maximum_bytes + 1)
+            if len(payload) > maximum_bytes:
+                raise SyncError(
+                    f"response exceeds the {maximum_bytes}-byte download limit"
+                )
+            return payload
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = exc.read().decode("utf-8", "replace")[:300]
+            detail = exc.read(301).decode("utf-8", "replace")[:300]
         except Exception:
             pass
         raise SyncError(f"HTTP {exc.code} on {method} {url.split('?')[0]}: {detail}")
+    except SyncError:
+        raise
     except Exception as exc:
         raise SyncError(f"{type(exc).__name__}: {exc}")
 
@@ -116,12 +138,14 @@ def list_capture_ids(cfg: dict, capture_ids, chunk: int = 40) -> list[str]:
 
 # --- storage --------------------------------------------------------------------
 
-def download_photo(cfg: dict, object_path: str) -> bytes:
+def download_photo(
+        cfg: dict, object_path: str, *,
+        maximum_bytes: int = CAPTURE_PHOTO_MAX_BYTES) -> bytes:
     url, _, headers = _cfg(cfg)
     bucket = cfg.get("bucket") or "captures"
     path = urllib.parse.quote(str(object_path).lstrip("/"))
     return _request("GET", f"{url}/storage/v1/object/{bucket}/{path}",
-                    headers, timeout=120.0)
+                    headers, timeout=120.0, maximum_bytes=maximum_bytes)
 
 
 def delete_photos(cfg: dict, object_paths: list[str]) -> None:

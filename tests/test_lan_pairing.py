@@ -65,6 +65,28 @@ def test_lan_capture_returns_branded_matching_receipt(monkeypatch, data_root):
         "ingest_capture",
         lambda cap, photos, _key, names, **_kwargs: ("manual-generated-id", []),
     )
+    association = {
+        "capture_id": "entry-1",
+        "book_id": "b-" + "1" * 32,
+        "archive_sha256": "a" * 64,
+        "archive_bytes": 123,
+        "format_version": "3.0",
+        "state": "current",
+        "generated_at": "2026-07-23T00:00:00+00:00",
+        "source_revision": "sha256:" + "b" * 64,
+        "source_fingerprint": "c" * 64,
+    }
+
+    class Association:
+        @staticmethod
+        def as_dict():
+            return dict(association)
+
+    monkeypatch.setattr(
+        server,
+        "_capture_archive_association",
+        lambda _capture_id: Association(),
+    )
     client = server.lan_app.test_client()
     response = client.post(
         "/lan/capture",
@@ -81,6 +103,7 @@ def test_lan_capture_returns_branded_matching_receipt(monkeypatch, data_root):
         "status": "imported",
         "id": "entry-1",
         "entry_id": "manual-generated-id",
+        "lib_association": association,
     }
 
 

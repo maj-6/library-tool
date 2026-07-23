@@ -528,8 +528,16 @@ local path. The archive, association, and replay receipt are one recoverable
 publication; a receipt is not successful unless its exact association and
 archive remain verifiable.
 
+Archive objects are stored locally by content digest beneath the private
+engine namespace. That storage locator never appears in the portable
+association or a LAN/cloud result. Legacy phone captures without a v1
+`photo_assets.json` are sealed with an explicit compatibility asset manifest,
+so their original/display pairing is retained rather than silently omitted.
+
 The initial book identity is UUID5-derived from the canonical capture identity,
 so retries and independent LAN/cloud delivery cannot mint a second book. A
-later promotion copies this identity. Canonical edits mark the association
-`stale` or create an explicit reseal; the archive is a snapshot, never the live
+later promotion copies this identity. Canonical metadata edits use a
+recoverable state transition to mark the association `stale`; historical
+idempotency receipts remain verifiable against the same archive. An explicit
+future reseal may replace that snapshot. The archive is never the live
 Corrections database.
