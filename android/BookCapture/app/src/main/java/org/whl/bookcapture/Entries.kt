@@ -32,6 +32,31 @@ object Entries {
     private const val INSTRUCTIONS = "instructions.txt"
     private const val REPROCESS_ERROR = "reprocess.error"
 
+    internal data class SentRetentionCandidate(
+        val entryId: String,
+        val createdAt: Long,
+        val retainLocally: Boolean,
+    )
+
+    /** Pending entries are protected but do not consume the browsing-copy
+     * allowance for completed entries. Otherwise one indefinitely pending
+     * import would retain every completed capture that follows it. */
+    internal fun sentRetentionOverflow(
+        candidates: Collection<SentRetentionCandidate>,
+        keepCount: Int = KEEP_SENT,
+    ): List<String> {
+        require(keepCount >= 0)
+        return candidates.asSequence()
+            .filterNot(SentRetentionCandidate::retainLocally)
+            .sortedWith(
+                compareByDescending<SentRetentionCandidate> { it.createdAt }
+                    .thenBy { it.entryId },
+            )
+            .drop(keepCount)
+            .map(SentRetentionCandidate::entryId)
+            .toList()
+    }
+
     enum class ProcessingStatus(val wireValue: String) {
         WAITING("waiting"),
         PROCESSING("processing"),
@@ -117,7 +142,10 @@ object Entries {
         /** Details and list thumbnails deliberately resolve independently. */
         fun detailHeroPhoto(): File? = PhotoAssetStore.detailHero(dir)?.displayFile
 
-        fun thumbnailPhoto(): File? = PhotoAssetStore.thumbnail(dir)?.displayFile
+        internal fun thumbnailDescriptor(): EntryPhotoDescriptor? =
+            PhotoAssetStore.thumbnail(dir)
+
+        fun thumbnailPhoto(): File? = thumbnailDescriptor()?.displayFile
 
         fun ocrText(): String = photos().mapIndexedNotNull { i, p ->
             val t = File(dir, p.name + ".txt").takeIf { it.isFile }?.readText()?.trim()
@@ -448,18 +476,36 @@ object Entries {
         return "(no title found)"
     }
 
-    /** Drop the oldest sent entries beyond KEEP_SENT. Dirty phone review state
-     * is still the authoritative offline copy, so retention must keep that
-     * complete entry until an explicit sync acknowledges it. */
-    suspend fun pruneSent(ctx: Context) {
+    /** Drop the oldest eligible sent entries beyond KEEP_SENT. Entries still
+     * needed for import, photo processing, or an offline review remain local,
+     * but do not prevent completed browsing copies from being capped. */
+    suspend fun pruneSent(
+        ctx: Context,
+        retainLocally: (Entry) -> Boolean,
+    ) {
         val dirs = sentRoot(ctx).listFiles { f: File -> f.isDirectory } ?: return
-        dirs.sortedByDescending { load(it)?.createdAt ?: 0L }
-            .drop(KEEP_SENT)
-            .forEach { dir ->
-                EntryOperationLocks.withLock(dir.name) {
-                    CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation(dir)
-                }
+        val entriesById = dirs.mapNotNull { dir ->
+            runCatching { load(dir) }.getOrNull()?.let { entry -> dir.name to entry }
+        }.toMap()
+        val overflowIds = sentRetentionOverflow(
+            entriesById.map { (entryId, entry) ->
+                SentRetentionCandidate(
+                    entryId = entryId,
+                    createdAt = entry.createdAt,
+                    retainLocally = runCatching { retainLocally(entry) }.getOrDefault(true),
+                )
+            },
+        )
+        overflowIds.forEach { entryId ->
+            val dir = File(sentRoot(ctx), entryId)
+            EntryOperationLocks.withLock(entryId) {
+                // Re-read under the same lock used for deletion so a late
+                // import, photo job, or review edit cannot be pruned.
+                val latest = runCatching { load(dir) }.getOrNull() ?: return@withLock
+                if (runCatching { retainLocally(latest) }.getOrDefault(true)) return@withLock
+                CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation(dir)
             }
+        }
     }
 
     fun atomicWrite(target: File, text: String) {

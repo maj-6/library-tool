@@ -21,10 +21,12 @@ import androidx.core.text.HtmlCompat
 import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityHomeBinding
@@ -44,8 +46,27 @@ import kotlin.math.roundToInt
  */
 class HomeActivity : AppCompatActivity() {
 
+    private data class ScanListItem(
+        val entry: Entries.Entry,
+        val titleLabel: String,
+        val statusLabel: String,
+        val thumbnail: EntryPhotoDescriptor?,
+    )
+
+    private data class ScanListSnapshot(
+        val items: List<ScanListItem>,
+        val collectionPaths: Map<String, String>,
+        val currentCollection: BookCollection?,
+    )
+
     private lateinit var binding: ActivityHomeBinding
     private var thumbJob: Job? = null
+    private var scanListJob: Job? = null
+    private var workerRefreshJob: Job? = null
+    private var pendingWorkerContentRefresh = false
+    private var pendingCollectionRefresh = false
+    private val dynamicThumbnailViews = linkedSetOf<ImageView>()
+    private val dynamicThumbnailBitmaps = linkedMapOf<ImageView, Bitmap>()
     private var showingCollections = false
     private val expandedScanGroups = linkedSetOf<String>()
     private var scanGroupsInitialized = false
@@ -92,30 +113,23 @@ class HomeActivity : AppCompatActivity() {
         }
         binding.syncCaptures.setOnClickListener { syncCaptures() }
         // when background OCR / upload lands, the list re-renders itself
-        for (name in listOf(
-            ProcessWorker.UNIQUE_WORK_NAME,
-            ProcessWorker.BACKLOG_WORK_NAME,
-            UploadWorker.EXPLICIT_SYNC_WORK_NAME,
-        ))
-            WorkManager.getInstance(this)
-                .getWorkInfosForUniqueWorkLiveData(name)
-                .observe(this) {
-                    refreshSyncButton()
-                    refreshHome()
-                }
-        WorkManager.getInstance(this)
-            .getWorkInfosForUniqueWorkLiveData(CollectionSyncWorker.WORK_NAME)
+        val workManager = WorkManager.getInstance(this)
+        workManager
+            .getWorkInfosLiveData(activeUniqueWorkQuery(
+                ProcessWorker.UNIQUE_WORK_NAME,
+                ProcessWorker.BACKLOG_WORK_NAME,
+                UploadWorker.EXPLICIT_SYNC_WORK_NAME,
+                CaptureMetadataSyncWorker.WORK_NAME,
+                CaptureMetadataSyncWorker.PULL_WORK_NAME,
+            ))
             .observe(this) {
-                if (showingCollections) refreshCollections() else refreshCollectionBar()
+                scheduleWorkerRefresh(contentChanged = true)
             }
-        for (name in listOf(
-            CaptureMetadataSyncWorker.WORK_NAME,
-            CaptureMetadataSyncWorker.PULL_WORK_NAME,
-        )) {
-            WorkManager.getInstance(this)
-                .getWorkInfosForUniqueWorkLiveData(name)
-                .observe(this) { refreshHome() }
-        }
+        workManager
+            .getWorkInfosLiveData(activeUniqueWorkQuery(CollectionSyncWorker.WORK_NAME))
+            .observe(this) {
+                scheduleWorkerRefresh(contentChanged = false)
+            }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -146,8 +160,14 @@ class HomeActivity : AppCompatActivity() {
                 syncFeedbackPhase = active.phase
             }
         }
+        cancelScheduledWorkerRefresh()
         refreshSyncButton()
         showTab(showingCollections)
+    }
+
+    override fun onStop() {
+        stopHomeLoading()
+        super.onStop()
     }
 
     // --- the app menu, hung off the mark in the toolbar ----------------------
@@ -237,6 +257,7 @@ class HomeActivity : AppCompatActivity() {
 
     private fun showTab(collections: Boolean) {
         showingCollections = collections
+        if (collections) cancelScanListLoading()
         binding.homeList.visibility = if (collections) View.GONE else View.VISIBLE
         binding.collectionsList.visibility = if (collections) View.VISIBLE else View.GONE
         binding.scanActions.visibility = if (collections) View.GONE else View.VISIBLE
@@ -245,6 +266,38 @@ class HomeActivity : AppCompatActivity() {
         emphasizeTab(binding.tabScans, !collections)
         emphasizeTab(binding.tabCollections, collections)
         if (collections) refreshCollections() else refreshHome()
+    }
+
+    /**
+     * A worker transition often reaches several unique-work observers at once.
+     * Treat those callbacks as invalidations and rebuild once after the burst.
+     */
+    private fun scheduleWorkerRefresh(contentChanged: Boolean) {
+        if (contentChanged) pendingWorkerContentRefresh = true
+        else pendingCollectionRefresh = true
+        if (workerRefreshJob?.isActive == true) return
+        workerRefreshJob = lifecycleScope.launch {
+            delay(WORK_REFRESH_COALESCE_MS)
+            val refreshContent = pendingWorkerContentRefresh
+            val collectionChanged = pendingCollectionRefresh
+            pendingWorkerContentRefresh = false
+            pendingCollectionRefresh = false
+            workerRefreshJob = null
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
+            if (refreshContent) {
+                refreshSyncButton()
+                if (showingCollections) refreshCollections() else refreshHome()
+            } else if (collectionChanged) {
+                if (showingCollections) refreshCollections() else refreshCollectionBar()
+            }
+        }
+    }
+
+    private fun cancelScheduledWorkerRefresh() {
+        workerRefreshJob?.cancel()
+        workerRefreshJob = null
+        pendingWorkerContentRefresh = false
+        pendingCollectionRefresh = false
     }
 
     private fun syncCaptures() {
@@ -330,6 +383,13 @@ class HomeActivity : AppCompatActivity() {
     private fun refreshCollectionBar() {
         val current = Collections.current(this)
         val paths = collectionDisplayPaths(Collections.allRecords(this))
+        renderCollectionBar(current, paths)
+    }
+
+    private fun renderCollectionBar(
+        current: BookCollection?,
+        paths: Map<String, String>,
+    ) {
         binding.collectionBar.text = if (current == null) {
             getString(R.string.collections_none_selected)
         } else {
@@ -340,6 +400,7 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun refreshCollections() {
+        resetThumbnailLoading()
         val list = binding.collectionsList
         list.removeAllViews()
         val collections = Collections.all(this)
@@ -499,24 +560,52 @@ class HomeActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        stopHomeLoading()
         super.onDestroy()
-        thumbJob?.cancel()
     }
 
     private fun refreshHome() {
+        resetThumbnailLoading()
+        scanListJob?.cancel()
+        scanListJob = lifecycleScope.launch {
+            val snapshot = withContext(Dispatchers.IO) {
+                val entries = Entries.recent(this@HomeActivity)
+                val records = Collections.allRecords(this@HomeActivity)
+                ScanListSnapshot(
+                    items = entries.map { entry ->
+                        ScanListItem(
+                            entry = entry,
+                            titleLabel = Entries.titleLabel(this@HomeActivity, entry),
+                            statusLabel = Entries.statusLabel(this@HomeActivity, entry),
+                            thumbnail = entry.thumbnailDescriptor(),
+                        )
+                    },
+                    collectionPaths = collectionDisplayPaths(records),
+                    currentCollection = Collections.current(this@HomeActivity),
+                )
+            }
+            scanListJob = null
+            if (showingCollections ||
+                !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            ) return@launch
+            renderHome(snapshot)
+        }
+    }
+
+    private fun renderHome(snapshot: ScanListSnapshot) {
         val list = binding.homeList
         list.removeAllViews()
-        thumbJob?.cancel()
-        val entries = Entries.recent(this)
-        refreshCollectionBar()
+        val entries = snapshot.items.map(ScanListItem::entry)
+        val itemById = snapshot.items.associateBy { it.entry.id }
+        renderCollectionBar(snapshot.currentCollection, snapshot.collectionPaths)
         if (entries.isEmpty()) {
             list.addView(emptyNotice(getString(R.string.home_empty)))
             return
         }
         val inflater = LayoutInflater.from(this)
         val thumbs = ArrayList<Triple<ImageView, java.io.File, Boolean>>()
-        val knownCollectionPaths = collectionDisplayPaths(Collections.allRecords(this))
-        val currentCollectionId = Collections.current(this)?.id
+        val knownCollectionPaths = snapshot.collectionPaths
+        val currentCollectionId = snapshot.currentCollection?.id
         val groups = groupScansByCollection(
             items = entries,
             currentCollectionId = currentCollectionId,
@@ -565,8 +654,9 @@ class HomeActivity : AppCompatActivity() {
             if (!expanded) continue
 
             for (e in group.items) {
+                val item = checkNotNull(itemById[e.id])
                 val row = inflater.inflate(R.layout.item_home, list, false)
-                row.findViewById<TextView>(R.id.title).text = Entries.titleLabel(this, e)
+                row.findViewById<TextView>(R.id.title).text = item.titleLabel
                 row.findViewById<TextView>(R.id.sub).text =
                     listOf(
                         e.author,
@@ -576,7 +666,7 @@ class HomeActivity : AppCompatActivity() {
                         if (e.from.isEmpty()) ""
                         else getString(R.string.collections_row_from, e.from),
                     ).filter { it.isNotEmpty() }.joinToString(" · ")
-                val state = Entries.statusLabel(this, e)
+                val state = item.statusLabel
                 val presentation = homeStatusPresentation(state)
                 row.findViewById<TextView>(R.id.state).apply {
                     text = presentation.text
@@ -599,10 +689,10 @@ class HomeActivity : AppCompatActivity() {
                     .setBackgroundColor(getColor(markerColor(state)))
                 val thumb = row.findViewById<ImageView>(R.id.thumb)
                 applyScanListLayout(row, thumb, compact)
-                e.thumbnailPhoto()?.let { photo ->
-                    val cleanupPending = e.photoDescriptor(photo)?.postProcessingPending == true
+                item.thumbnail?.let { descriptor ->
+                    val cleanupPending = descriptor.postProcessingPending
                     thumb.alpha = if (cleanupPending) .82f else 1f
-                    thumbs.add(Triple(thumb, photo, cleanupPending))
+                    thumbs.add(Triple(thumb, descriptor.displayFile, cleanupPending))
                 }
                 bindDesktopMetadata(row, e)
                 val openBook = {
@@ -622,16 +712,61 @@ class HomeActivity : AppCompatActivity() {
             }
         }
         // decode the page thumbnails off the UI thread, in list order
-        thumbJob = lifecycleScope.launch {
+        thumbJob = lifecycleScope.launch(Dispatchers.IO) {
             for ((iv, file, cleanupPending) in thumbs) {
-                val bmp = withContext(Dispatchers.IO) {
+                var decodedBitmap: Bitmap? = null
+                try {
                     val decoded = decodeSampledOriented(file, maxWidth = 512, maxHeight = 512)
-                        ?: return@withContext null
-                    if (cleanupPending) softenPendingThumbnail(decoded) else decoded
-                } ?: continue
-                iv.setImageBitmap(bmp)
+                        ?: continue
+                    decodedBitmap = decoded
+                    if (cleanupPending) decodedBitmap = softenPendingThumbnail(decoded)
+                    withContext(Dispatchers.Main) {
+                        val bitmap = decodedBitmap ?: return@withContext
+                        if (iv.parent == null ||
+                            !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                        ) return@withContext
+                        setDynamicThumbnail(iv, bitmap)
+                        decodedBitmap = null
+                    }
+                } finally {
+                    decodedBitmap?.takeIf { !it.isRecycled }?.recycle()
+                }
             }
         }
+    }
+
+    private fun setDynamicThumbnail(image: ImageView, bitmap: Bitmap) {
+        dynamicThumbnailViews.add(image)
+        image.setImageBitmap(bitmap)
+        dynamicThumbnailBitmaps.put(image, bitmap)
+            ?.takeIf { previous -> previous !== bitmap && !previous.isRecycled }
+            ?.recycle()
+    }
+
+    private fun resetThumbnailLoading() {
+        thumbJob?.cancel()
+        thumbJob = null
+        releaseDynamicThumbnails()
+    }
+
+    private fun cancelScanListLoading() {
+        scanListJob?.cancel()
+        scanListJob = null
+    }
+
+    private fun releaseDynamicThumbnails() {
+        dynamicThumbnailViews.forEach { it.setImageDrawable(null) }
+        dynamicThumbnailViews.clear()
+        dynamicThumbnailBitmaps.values.forEach { bitmap ->
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        dynamicThumbnailBitmaps.clear()
+    }
+
+    private fun stopHomeLoading() {
+        cancelScheduledWorkerRefresh()
+        cancelScanListLoading()
+        resetThumbnailLoading()
     }
 
     private fun configureScanRowAccessibility(
@@ -908,5 +1043,6 @@ class HomeActivity : AppCompatActivity() {
         const val STATE_EXPANDED_SCAN_GROUPS = "expanded_scan_groups"
         const val STATE_SYNC_FEEDBACK_REQUEST = "sync_feedback_request"
         const val STATE_SYNC_FEEDBACK_PHASE = "sync_feedback_phase"
+        const val WORK_REFRESH_COALESCE_MS = 200L
     }
 }

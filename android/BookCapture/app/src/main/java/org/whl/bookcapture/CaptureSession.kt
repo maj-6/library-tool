@@ -186,7 +186,11 @@ class CaptureSession(private val ctx: Context) {
             )
         }
         ActiveCaptureWrites.unregister(reservation.tempFile)
-        photoCount += 1
+        // commitPhoto can run on the capture-commit executor. A resumed
+        // Activity may reconcile the same renamed file while the photo
+        // contract is being persisted, so publish the idempotent reserved page
+        // number instead of incrementing a shared count a second time.
+        photoCount = reservation.pageNumber
         return true
     }
 

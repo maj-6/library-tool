@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.app.Dialog
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.BitmapFactory
 import android.graphics.drawable.BitmapDrawable
 import android.os.Bundle
@@ -112,6 +113,27 @@ internal fun parseRemoteUiResponse(body: String): RemoteUiSnapshot? {
     return RemoteUiSnapshot(revision, strings, icons)
 }
 
+internal class RemoteUiValueCache<K, V> {
+    private data class Entry<K, V>(val key: K, val value: V)
+
+    @Volatile
+    private var entry: Entry<K, V>? = null
+
+    fun getOrBuild(key: K, build: () -> V): V {
+        entry?.takeIf { it.key == key }?.let { return it.value }
+        synchronized(this) {
+            entry?.takeIf { it.key == key }?.let { return it.value }
+            return build().also { entry = Entry(key, it) }
+        }
+    }
+
+    fun clear() {
+        synchronized(this) {
+            entry = null
+        }
+    }
+}
+
 /**
  * A deliberately small runtime overlay for packaged Android resources.
  *
@@ -122,9 +144,17 @@ internal fun parseRemoteUiResponse(body: String): RemoteUiSnapshot? {
  * hashed, decoded locally, and never executed.
  */
 object RemoteUiCatalog {
+    private data class PackagedStringCacheKey(
+        val revision: Long,
+        val packageName: String,
+        val configuration: Configuration,
+    )
+
     private const val CACHE_NAME = "remote_ui_catalog.json"
     private val lock = Any()
     private val drawableCache = ConcurrentHashMap<String, BitmapDrawable>()
+    private val packagedStringCache =
+        RemoteUiValueCache<PackagedStringCacheKey, Map<String, String>>()
     @Volatile private var loaded = false
     @Volatile private var current = RemoteUiSnapshot.EMPTY
 
@@ -190,6 +220,7 @@ object RemoteUiCatalog {
             }
             current = snapshot
             drawableCache.clear()
+            packagedStringCache.clear()
         }
         RemoteUiLifecycle.applyCurrent()
         return Refresh.CHANGED
@@ -264,14 +295,23 @@ object RemoteUiCatalog {
     private fun packagedStringOverrides(
         ctx: Context,
         snapshot: RemoteUiSnapshot,
-    ): Map<String, String> = buildMap {
-        for ((name, replacement) in snapshot.strings) {
-            val id = ctx.resources.getIdentifier(name, "string", ctx.packageName)
-            if (id == 0) continue
-            val packaged = runCatching { ctx.getString(id) }.getOrNull() ?: continue
-            // Formatted text is routed through text(); guessing its current
-            // arguments from an already-rendered label would be unsafe.
-            if ('%' !in packaged) put(packaged, replacement)
+    ): Map<String, String> {
+        val key = PackagedStringCacheKey(
+            revision = snapshot.revision,
+            packageName = ctx.packageName,
+            configuration = Configuration(ctx.resources.configuration),
+        )
+        return packagedStringCache.getOrBuild(key) {
+            buildMap {
+                for ((name, replacement) in snapshot.strings) {
+                    val id = ctx.resources.getIdentifier(name, "string", ctx.packageName)
+                    if (id == 0) continue
+                    val packaged = runCatching { ctx.getString(id) }.getOrNull() ?: continue
+                    // Formatted text is routed through text(); guessing its current
+                    // arguments from an already-rendered label would be unsafe.
+                    if ('%' !in packaged) put(packaged, replacement)
+                }
+            }
         }
     }
 

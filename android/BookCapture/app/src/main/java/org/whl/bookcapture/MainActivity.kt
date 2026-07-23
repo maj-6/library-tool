@@ -50,10 +50,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityMainBinding
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.Executors
 
 // A 3x3 unsharp/Laplacian kernel: center*3 - 0.5*(4 neighbours). Flat regions
 // keep their value (3 - 0.5*4 = 1), edges get boosted. Coords are in pixels.
@@ -74,6 +77,9 @@ private const val CAMERA_LOG_TAG = "BookCaptureCamera"
 private const val CAMERA_PERMISSION_REQUEST = 1
 private const val VOICE_PERMISSION_REQUEST = 2
 private val TORCH_DIAGNOSTICS = Regex("torch requested=[^;]+")
+private val CAPTURE_COMMIT_EXECUTOR = Executors.newSingleThreadExecutor { task ->
+    Thread(task, "whl-capture-commit")
+}
 
 /**
  * Hands-free book capture:
@@ -104,6 +110,12 @@ class MainActivity : AppCompatActivity() {
     private var extraFieldsDialog: AlertDialog? = null
     private var cameraSettingsDialog: AlertDialog? = null
     private var lastBookPreviewJob: Job? = null
+    private var lastBookPreviewRefreshPending = false
+    private var lastBookPreviewFingerprint: String? = null
+    private var lastBookPreviewBitmap: android.graphics.Bitmap? = null
+    private var backgroundRefreshJob: Job? = null
+    private val thumbnailDecodeGate = Semaphore(permits = 2)
+    private val thumbnailBitmaps = linkedMapOf<ImageView, android.graphics.Bitmap>()
     private val captureQueue = ShallowCaptureQueue()
     private val acceptedShots = mutableMapOf<Long, AcceptedShot>()
     private var pendingCommand: String? = null   // terminal voice command accepted mid-shot
@@ -137,6 +149,13 @@ class MainActivity : AppCompatActivity() {
     private data class BoundCameraUseCases(
         val camera: Camera,
         val capture: ImageCapture,
+    )
+
+    private data class LastBookPreviewLoad(
+        val entry: Entries.Entry?,
+        val bitmap: android.graphics.Bitmap?,
+        val fingerprint: String?,
+        val thumbnailChanged: Boolean,
     )
 
     private sealed interface CaptureUndoOutcome {
@@ -211,14 +230,13 @@ class MainActivity : AppCompatActivity() {
         }
         // Background work landing (OCR done, upload done) refreshes the
         // persistent previous-book preview in place.
-        for (name in listOf(
-            ProcessWorker.UNIQUE_WORK_NAME,
-            ProcessWorker.BACKLOG_WORK_NAME,
-            "capture-upload",
-        ))
-            WorkManager.getInstance(this)
-                .getWorkInfosForUniqueWorkLiveData(name)
-                .observe(this) { updateUi() }
+        WorkManager.getInstance(this)
+            .getWorkInfosLiveData(activeUniqueWorkQuery(
+                ProcessWorker.UNIQUE_WORK_NAME,
+                ProcessWorker.BACKLOG_WORK_NAME,
+                "capture-upload",
+            ))
+            .observe(this) { scheduleBackgroundRefresh() }
     }
 
     override fun onResume() {
@@ -241,6 +259,7 @@ class MainActivity : AppCompatActivity() {
         applyCameraPreferenceChanges()
         submitDeferredCaptureIfReady()
         updateUi()
+        refreshLastCapturedBook()
     }
 
     /** After a config change / process death, CaptureSession re-adopts the open
@@ -254,7 +273,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderCurrentThumbnails() {
         val id = session.entryId
-        binding.thumbs.removeAllViews()
+        clearThumbnailStrip()
         if (id == null) return
         session.refreshPhotoCount()
         session.entryDir(id).listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }
@@ -278,6 +297,8 @@ class MainActivity : AppCompatActivity() {
         // Done is different: it explicitly promises to finish every accepted
         // capture, so keep its one queued reservation for the next resume.
         if (pendingCommand != "done") cancelQueuedCapture()
+        backgroundRefreshJob?.cancel()
+        backgroundRefreshJob = null
         super.onStop()
     }
 
@@ -291,6 +312,13 @@ class MainActivity : AppCompatActivity() {
         extraFieldsDialog = null
         cameraSettingsDialog?.dismiss()
         cameraSettingsDialog = null
+        lastBookPreviewRefreshPending = false
+        lastBookPreviewJob?.cancel()
+        lastBookPreviewJob = null
+        binding.lastBookThumb.setImageDrawable(null)
+        lastBookPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
+        lastBookPreviewBitmap = null
+        clearThumbnailStrip()
         boundCamera = null
         boundCameraConfig = null
         cameraBindingInFlight = null
@@ -1559,6 +1587,7 @@ class MainActivity : AppCompatActivity() {
                             cues.saved(photos)
                             ProcessWorker.enqueuePending(this, id)
                             UploadWorker.enqueue(this)
+                            refreshLastCapturedBook()
                         }
                         // null + still active = the manifest write failed
                         // (disk full); the pages are kept and "done" can retry
@@ -1687,6 +1716,7 @@ class MainActivity : AppCompatActivity() {
                 }
             } finally {
                 captureMutationInFlight = false
+                if (result is CaptureReopenResult.Reopened) refreshLastCapturedBook()
                 updateUi()
             }
         }
@@ -1716,7 +1746,7 @@ class MainActivity : AppCompatActivity() {
         }
         val result = runCatching { session.start(collection) }
         if (result.isSuccess) {
-            binding.thumbs.removeAllViews()
+            clearThumbnailStrip()
             cues.started()
             setStatus(getString(R.string.capture_restart_complete))
         } else {
@@ -1994,15 +2024,39 @@ class MainActivity : AppCompatActivity() {
             session.abortPhoto(reservation)
             return
         }
-        if (!session.commitPhoto(reservation)) {
-            handleCaptureError(
-                ticket,
-                reservation,
-                IllegalStateException("could not finalize capture file"),
-            )
+
+        // registerCapturedPhoto reconciles and persists the complete photo
+        // contract and may copy the original JPEG. Keep that filesystem/JSON
+        // work off CameraX's main-thread callback while the shallow capture
+        // queue preserves page ordering.
+        if (canUpdateCaptureUi()) setStatus("Saving capture\u2026")
+        CAPTURE_COMMIT_EXECUTOR.execute {
+            val commitError = try {
+                if (session.commitPhoto(reservation)) null
+                else IllegalStateException("could not finalize capture file")
+            } catch (error: Exception) {
+                error
+            }
+            ContextCompat.getMainExecutor(this).execute {
+                finishCaptureCommit(ticket, reservation, commitError)
+            }
+        }
+    }
+
+    private fun finishCaptureCommit(
+        ticket: ShallowCaptureQueue.Ticket,
+        reservation: CaptureSession.PhotoReservation,
+        commitError: Exception?,
+    ) {
+        val shot = acceptedShots[ticket.id]
+        if (captureQueue.active?.id != ticket.id || shot?.reservation != reservation) {
+            if (commitError != null) session.abortPhoto(reservation)
             return
         }
-
+        if (commitError != null) {
+            handleCaptureError(ticket, reservation, commitError)
+            return
+        }
         val saved = SystemClock.elapsedRealtimeNanos()
         Log.i(
             CAMERA_LOG_TAG,
@@ -2249,19 +2303,45 @@ class MainActivity : AppCompatActivity() {
         binding.thumbs.addView(iv)
         updateThumbnailStripVisibility()
         lifecycleScope.launch(Dispatchers.IO) {
-            val bmp = decodeSampledOriented(File(path), maxWidth = 640, maxHeight = 640)
-            withContext(Dispatchers.Main) {
-                if (bmp == null) {
-                    binding.thumbs.removeView(iv)
-                    updateThumbnailStripVisibility()
-                    return@withContext
+            var unclaimedBitmap: android.graphics.Bitmap? = null
+            try {
+                unclaimedBitmap = thumbnailDecodeGate.withPermit {
+                    decodeSampledOriented(
+                        File(path),
+                        maxWidth = h * 2,
+                        maxHeight = h,
+                    )
                 }
-                if (iv.parent !== binding.thumbs) return@withContext
-                val w = h * bmp.width / bmp.height.coerceAtLeast(1)
-                iv.layoutParams = LinearLayout.LayoutParams(w, h).apply { marginEnd = gap }
-                iv.setImageBitmap(bmp)
+                withContext(Dispatchers.Main) {
+                    val bitmap = unclaimedBitmap
+                    if (iv.parent !== binding.thumbs) return@withContext
+                    if (bitmap == null) {
+                        binding.thumbs.removeView(iv)
+                        updateThumbnailStripVisibility()
+                        return@withContext
+                    }
+                    val w = h * bitmap.width / bitmap.height.coerceAtLeast(1)
+                    iv.layoutParams = LinearLayout.LayoutParams(w, h).apply { marginEnd = gap }
+                    iv.setImageBitmap(bitmap)
+                    thumbnailBitmaps[iv] = bitmap
+                    unclaimedBitmap = null
+                }
+            } finally {
+                unclaimedBitmap?.takeIf { !it.isRecycled }?.recycle()
             }
         }
+    }
+
+    private fun clearThumbnailStrip() {
+        for (index in 0 until binding.thumbs.childCount) {
+            (binding.thumbs.getChildAt(index) as? ImageView)?.setImageDrawable(null)
+        }
+        binding.thumbs.removeAllViews()
+        thumbnailBitmaps.values.forEach { bitmap ->
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        thumbnailBitmaps.clear()
+        updateThumbnailStripVisibility()
     }
 
     /** Long-press deletion has no confirmation, but cannot race an accepted
@@ -2342,6 +2422,15 @@ class MainActivity : AppCompatActivity() {
         binding.status.text = msg
     }
 
+    private fun scheduleBackgroundRefresh() {
+        backgroundRefreshJob?.cancel()
+        backgroundRefreshJob = lifecycleScope.launch {
+            delay(200)
+            updateUi()
+            refreshLastCapturedBook()
+        }
+    }
+
     private fun updateUi() {
         val active = session.active
         val noteActive = voiceNoteDraft != null
@@ -2362,7 +2451,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnCameraSettings.isEnabled = cameraControlsAvailable
         binding.btnCaptureOrientation.isEnabled = cameraControlsAvailable
         binding.configWarning.isEnabled = !captureQueue.busy && !captureMutationInFlight && !noteActive
-        if (!active) binding.thumbs.removeAllViews()
+        if (!active && binding.thumbs.childCount > 0) clearThumbnailStrip()
         updateThumbnailStripVisibility()
         updateCaptureOrientationUi()
 
@@ -2374,7 +2463,6 @@ class MainActivity : AppCompatActivity() {
         if (err != null && pending > 0)
             setStatus(resources.getQuantityString(
                 R.plurals.uploads_stuck, pending, pending, err))
-        refreshLastCapturedBook()
         finishAfterAcceptedCapturesIfReady()
     }
 
@@ -2382,16 +2470,44 @@ class MainActivity : AppCompatActivity() {
      * remains useful while the operator photographs the next one, and Done
      * replaces it immediately because sealing precedes ProcessWorker enqueue. */
     private fun refreshLastCapturedBook() {
-        lastBookPreviewJob?.cancel()
+        lastBookPreviewRefreshPending = true
+        if (lastBookPreviewJob?.isActive == true) return
         lastBookPreviewJob = lifecycleScope.launch {
-            val (entry, thumbnail) = withContext(Dispatchers.IO) {
-                val latest = selectLastSubmittedEntry(Entries.recent(this@MainActivity))
-                val bitmap = latest?.thumbnailPhoto()?.let { photo ->
-                    decodeSampledOriented(photo, maxWidth = 360, maxHeight = 480)
+            delay(100)
+            while (lastBookPreviewRefreshPending) {
+                lastBookPreviewRefreshPending = false
+                val previousFingerprint = lastBookPreviewFingerprint
+                var unclaimedBitmap: android.graphics.Bitmap? = null
+                try {
+                    val load = withContext(Dispatchers.IO) {
+                        val latest = selectLastSubmittedEntry(Entries.recent(this@MainActivity))
+                        val photo = latest?.thumbnailDescriptor()?.displayFile
+                        val fingerprint = latest?.let { entry ->
+                            listOf(
+                                entry.id,
+                                photo?.absolutePath.orEmpty(),
+                                photo?.length() ?: 0L,
+                                photo?.lastModified() ?: 0L,
+                            ).joinToString("|")
+                        }
+                        val changed = fingerprint != previousFingerprint
+                        val bitmap = if (changed && photo != null) {
+                            decodeSampledOriented(photo, maxWidth = 360, maxHeight = 480)
+                        } else null
+                        unclaimedBitmap = bitmap
+                        LastBookPreviewLoad(
+                            entry = latest,
+                            bitmap = bitmap,
+                            fingerprint = fingerprint,
+                            thumbnailChanged = changed,
+                        )
+                    }
+                    renderLastCapturedBook(load)
+                    unclaimedBitmap = null
+                } finally {
+                    unclaimedBitmap?.takeIf { !it.isRecycled }?.recycle()
                 }
-                latest to bitmap
             }
-            renderLastCapturedBook(entry, thumbnail)
         }
     }
 
@@ -2403,9 +2519,23 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun renderLastCapturedBook(entry: Entries.Entry?, thumbnail: android.graphics.Bitmap?) {
+    private fun renderLastCapturedBook(load: LastBookPreviewLoad) {
+        val entry = load.entry
+        if (load.thumbnailChanged) {
+            binding.lastBookThumb.setImageDrawable(null)
+            lastBookPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
+            lastBookPreviewBitmap = load.bitmap
+            lastBookPreviewFingerprint = load.fingerprint
+            if (load.bitmap == null) {
+                binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
+            } else {
+                binding.lastBookThumb.setImageBitmap(load.bitmap)
+            }
+        }
         if (entry == null) {
-            binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
+            if (!load.thumbnailChanged) {
+                binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
+            }
             binding.lastBookThumb.contentDescription = getString(R.string.capture_last_book_empty)
             binding.lastBookTitle.setText(R.string.capture_last_book_empty)
             binding.lastBookAuthor.setText(R.string.capture_last_book_author_empty)
@@ -2436,11 +2566,6 @@ class MainActivity : AppCompatActivity() {
             entry.title.isNotEmpty() -> entry.title
             entry.meta == null -> Entries.titleLabel(this, entry)
             else -> getString(R.string.capture_last_book_title_missing)
-        }
-        if (thumbnail == null) {
-            binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
-        } else {
-            binding.lastBookThumb.setImageBitmap(thumbnail)
         }
         binding.lastBookThumb.contentDescription = getString(
             R.string.capture_last_book_thumbnail_description,
