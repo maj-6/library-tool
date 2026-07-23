@@ -17,7 +17,12 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from .raster import PageBoundaryProposal, RasterInputError
+from .raster import (
+    PageBoundaryProposal,
+    RasterInputError,
+    apply_capture_pixel_perspective_compat,
+    page_boundary_proposal_from_pixel_quad,
+)
 
 
 CAPTURE_DETECTOR = "librarytool.capture-pipeline.contour"
@@ -145,16 +150,11 @@ def propose_capture_page_boundary(
         if source_revision is not None
         else f"sha256:{hashlib.sha256(image_bytes).hexdigest()}"
     )
-    normalized_quad = tuple(
-        (
-            float(point[0]) / float(detection.width - 1),
-            float(point[1]) / float(detection.height - 1),
-        )
-        for point in detection.quad
-    )
     try:
-        return PageBoundaryProposal(
-            quad=normalized_quad,
+        return page_boundary_proposal_from_pixel_quad(
+            detection.quad,
+            source_width=detection.width,
+            source_height=detection.height,
             confidence=round(max(0.0, min(1.0, detection.area_fraction)), 6),
             detector=CAPTURE_DETECTOR,
             detector_version=CAPTURE_DETECTOR_VERSION,
@@ -175,45 +175,8 @@ def apply_capture_perspective_compat(
     detection = _detect_capture_page(image_bytes)
     if detection is None:
         return image_bytes
-    runtime = _opencv_runtime()
-    if runtime is None:  # Defensive: the detector already proved it available.
-        return image_bytes
-    cv2, np = runtime
-    image = cv2.imdecode(
-        np.frombuffer(image_bytes, dtype=np.uint8),
-        cv2.IMREAD_COLOR,
+    return apply_capture_pixel_perspective_compat(
+        image_bytes,
+        detection.quad,
+        quality=quality,
     )
-    if image is None:
-        return image_bytes
-    top_left, top_right, bottom_right, bottom_left = detection.quad
-    width = int(
-        max(
-            np.linalg.norm(bottom_right - bottom_left),
-            np.linalg.norm(top_right - top_left),
-        )
-    )
-    height = int(
-        max(
-            np.linalg.norm(top_right - bottom_right),
-            np.linalg.norm(top_left - bottom_left),
-        )
-    )
-    if width < 200 or height < 200:
-        return image_bytes
-    destination = np.array(
-        [
-            [0, 0],
-            [width - 1, 0],
-            [width - 1, height - 1],
-            [0, height - 1],
-        ],
-        dtype="float32",
-    )
-    matrix = cv2.getPerspectiveTransform(detection.quad, destination)
-    warped = cv2.warpPerspective(image, matrix, (width, height))
-    encoded, output = cv2.imencode(
-        ".jpg",
-        warped,
-        [cv2.IMWRITE_JPEG_QUALITY, quality],
-    )
-    return output.tobytes() if encoded else image_bytes

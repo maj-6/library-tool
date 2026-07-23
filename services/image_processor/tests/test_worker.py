@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from librarytool.processing import PageBoundaryProposal
 from whl_image_processor.models import JobRecord
 from whl_image_processor.pipeline import ProcessedImage
 from whl_image_processor.settings import Settings
@@ -88,6 +89,13 @@ def _processed() -> ProcessedImage:
             ],
         },
         quality={"focus_variance": 18.5, "page_boundary_detected": True},
+        page_boundary_proposal=PageBoundaryProposal(
+            quad=((0.1, 0.08), (0.9, 0.12), (0.88, 0.92), (0.12, 0.89)),
+            confidence=0.87,
+            detector="whl-image-processor.page-contour",
+            detector_version="1.0.0",
+            source_revision=f"sha256:{hashlib.sha256(SOURCE).hexdigest()}",
+        ),
     )
 
 
@@ -156,6 +164,12 @@ def test_success_result_preserves_lineage_and_is_strict_json(monkeypatch):
     }
     assert result["geometry"]["original_to_output_homography"] == list(
         processed.source_to_display_homography
+    )
+    assert result["geometry"]["page_boundary_proposal"] == (
+        processed.page_boundary_proposal.as_dict()
+    )
+    assert result["geometry"]["page_boundary_proposal"]["source_revision"] == (
+        f"sha256:{hashlib.sha256(SOURCE).hexdigest()}"
     )
     assert result["display"]["merge_base"] == {"sha256": "b" * 64, "revision": 2}
     assert result["display"]["base_to_output_homography"] is None

@@ -85,6 +85,7 @@ class ProcessedImage:
     source_to_display_homography: tuple[float, ...] | None
     transform_manifest: dict[str, Any]
     quality: dict[str, Any]
+    page_boundary_proposal: _raster_processing.PageBoundaryProposal | None = None
 
     @property
     def output_hashes(self) -> dict[str, str]:
@@ -128,6 +129,8 @@ _MAX_COMPRESSED_BYTES = 96 * 1024 * 1024
 _JPEG_MAGIC = b"\xff\xd8\xff"
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _TIFF_MAGICS = (b"II*\x00", b"MM\x00*")
+PAGE_BOUNDARY_DETECTOR = "whl-image-processor.page-contour"
+PAGE_BOUNDARY_DETECTOR_VERSION = "1.0.0"
 
 
 @lru_cache(maxsize=1)
@@ -319,6 +322,75 @@ def _detect_page_boundary(rgb: Any) -> _Boundary:
     area_fraction = abs(float(cv2.contourArea(best_quad))) / float(width * height)
     confidence = max(0.05, min(0.99, 0.25 + 0.85 * area_fraction))
     return _Boundary(best_quad, round(confidence, 4), True, best_method)
+
+
+def _page_boundary_proposal(
+    boundary: _Boundary,
+    *,
+    source_width: int,
+    source_height: int,
+    source_revision: str,
+) -> _raster_processing.PageBoundaryProposal | None:
+    if not boundary.detected or boundary.quad is None:
+        return None
+    try:
+        return _raster_processing.page_boundary_proposal_from_pixel_quad(
+            boundary.quad,
+            source_width=source_width,
+            source_height=source_height,
+            confidence=boundary.confidence,
+            detector=PAGE_BOUNDARY_DETECTOR,
+            detector_version=PAGE_BOUNDARY_DETECTOR_VERSION,
+            source_revision=source_revision,
+        )
+    except _raster_processing.RasterInputError:
+        # Detection remains a best-effort enhancement. A contour that cannot
+        # meet the stricter reusable contract must not change established
+        # processing output or turn an otherwise valid cloud job retryable.
+        return None
+
+
+def propose_page_boundary(
+    data: bytes,
+    *,
+    source_revision: str | None = None,
+    options: ProcessingOptions | None = None,
+) -> _raster_processing.PageBoundaryProposal | None:
+    """Run the cloud detector and return its reusable, revision-pinned proposal."""
+
+    if not isinstance(data, bytes):
+        raise PermanentImageInputError(
+            "Source image must be supplied as immutable bytes"
+        )
+    selected_options = (
+        ProcessingOptions(
+            operations=(),
+            role="title_page",
+            dewarp_strength_percent=0,
+            margin_padding_percent=0,
+            contrast_strength_percent=0,
+            paper_tone_retention_percent=0,
+            curvature_backend="off",
+        )
+        if options is None
+        else options
+    )
+    if not isinstance(selected_options, ProcessingOptions):
+        raise TypeError("options must be ProcessingOptions or None")
+    source_sha256 = hashlib.sha256(data).hexdigest()
+    revision = (
+        source_revision
+        if source_revision is not None
+        else f"sha256:{source_sha256}"
+    )
+    decoded = _decode_source(data, selected_options)
+    source_height, source_width = decoded.rgb.shape[:2]
+    return _page_boundary_proposal(
+        _detect_page_boundary(decoded.rgb),
+        source_width=int(source_width),
+        source_height=int(source_height),
+        source_revision=revision,
+    )
 
 
 def _expand_quad(quad: Any, padding_percent: int, width: int, height: int) -> Any:
@@ -773,6 +845,7 @@ def process_image(data: bytes, options: ProcessingOptions) -> ProcessedImage:
         page_confidence = 0.0
         spine_confidence = 0.0
         nonlinear_manifest: dict[str, Any] | None = None
+        page_boundary_proposal: _raster_processing.PageBoundaryProposal | None = None
 
         if "spine_crop" in options.operations:
             if options.role != "spine":
@@ -793,6 +866,12 @@ def process_image(data: bytes, options: ProcessingOptions) -> ProcessedImage:
             boundary = _detect_page_boundary(rgb)
             page_confidence = boundary.confidence
             page_quad = boundary.quad
+            page_boundary_proposal = _page_boundary_proposal(
+                boundary,
+                source_width=source_width,
+                source_height=source_height,
+                source_revision=f"sha256:{source_sha256}",
+            )
             stages.append(
                 {
                     "name": "page_boundary_detection",
@@ -996,6 +1075,7 @@ def process_image(data: bytes, options: ProcessingOptions) -> ProcessedImage:
             source_to_display_homography=source_to_display,
             transform_manifest=transform_manifest,
             quality=quality,
+            page_boundary_proposal=page_boundary_proposal,
         )
     except (PermanentImageInputError, RetryableImageProcessingError):
         raise

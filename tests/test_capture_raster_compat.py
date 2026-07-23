@@ -13,6 +13,7 @@ from librarytool.processing import (
     CAPTURE_DETECTOR,
     CAPTURE_DETECTOR_VERSION,
     EXIF_ORIENTED_NORMALIZED,
+    apply_capture_pixel_perspective_compat,
     apply_capture_perspective_compat,
     find_capture_page_quad,
     propose_capture_page_boundary,
@@ -61,10 +62,14 @@ def test_capture_pipeline_public_api_is_a_thin_shared_adapter(
 
 def test_capture_pipeline_contains_no_independent_perspective_pixel_path() -> None:
     source = Path(capture_pipeline.__file__).read_text(encoding="utf-8")
+    compatibility_source = Path(capture_compat.__file__).read_text(encoding="utf-8")
 
     assert "getPerspectiveTransform" not in source
     assert "warpPerspective" not in source
     assert "findContours" not in source
+    assert "getPerspectiveTransform" not in compatibility_source
+    assert "warpPerspective" not in compatibility_source
+    assert "apply_capture_pixel_perspective_compat" in compatibility_source
 
 
 def test_missing_optional_runtime_keeps_legacy_fallback(
@@ -250,13 +255,17 @@ def test_perspective_jpeg_bytes_match_the_preconsolidation_contract(
     quality: int,
 ) -> None:
     source = _synthetic_page(520, 480)
+    quad = find_capture_page_quad(source)
+    assert quad is not None
+    expected = _reference_perspective_correct(source, quality)
 
-    assert apply_capture_perspective_compat(source, quality) == (
-        _reference_perspective_correct(source, quality)
-    )
-    assert capture_pipeline.perspective_correct(source, quality) == (
-        _reference_perspective_correct(source, quality)
-    )
+    assert apply_capture_pixel_perspective_compat(
+        source,
+        quad,
+        quality=quality,
+    ) == expected
+    assert apply_capture_perspective_compat(source, quality) == expected
+    assert capture_pipeline.perspective_correct(source, quality) == expected
 
 
 def test_proposal_reuses_the_legacy_detection_in_exif_oriented_coordinates() -> None:

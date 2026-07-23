@@ -25,6 +25,7 @@ pipeline = importlib.import_module("whl_image_processor.pipeline")
 PermanentImageInputError = pipeline.PermanentImageInputError
 ProcessingOptions = pipeline.ProcessingOptions
 process_image = pipeline.process_image
+propose_page_boundary = pipeline.propose_page_boundary
 
 
 def _jpeg(rgb: np.ndarray, *, orientation: int | None = None) -> bytes:
@@ -230,6 +231,55 @@ def test_perspective_page_is_rectified_and_transform_is_normalized() -> None:
     assert max(result.thumbnail_width, result.thumbnail_height) <= 512
 
 
+def test_cloud_detector_publishes_the_shared_revision_pinned_proposal() -> None:
+    source = _synthetic_page()
+    source_hash = hashlib.sha256(source).hexdigest()
+
+    processed = process_image(source, _options())
+    proposal = processed.page_boundary_proposal
+    direct = propose_page_boundary(
+        source,
+        source_revision="capture:cloud-asset-7:revision-3",
+    )
+
+    assert proposal is not None
+    assert direct is not None
+    assert proposal.quad == direct.quad
+    assert proposal.confidence == direct.confidence
+    assert proposal.detector == pipeline.PAGE_BOUNDARY_DETECTOR
+    assert proposal.detector_version == pipeline.PAGE_BOUNDARY_DETECTOR_VERSION
+    assert proposal.source_revision == f"sha256:{source_hash}"
+    assert direct.source_revision == "capture:cloud-asset-7:revision-3"
+    assert proposal.coordinate_space == "exif_oriented_normalized"
+    assert proposal.as_dict()["point_order"] == [
+        "top_left",
+        "top_right",
+        "bottom_right",
+        "bottom_left",
+    ]
+    json.dumps(proposal.as_dict(), allow_nan=False, sort_keys=True)
+
+
+def test_cloud_detector_rejects_an_invalid_source_revision_contract() -> None:
+    with pytest.raises(ValueError, match="source_revision"):
+        propose_page_boundary(_synthetic_page(), source_revision="")
+    with pytest.raises(TypeError, match="options"):
+        propose_page_boundary(_synthetic_page(), options=False)
+
+
+def test_cloud_detector_proposal_is_deterministic_and_does_not_change_pixels() -> None:
+    source = _synthetic_page()
+    options = _options()
+
+    first = process_image(source, options)
+    second = process_image(source, options)
+
+    assert first.page_boundary_proposal == second.page_boundary_proposal
+    assert first.display_jpeg == second.display_jpeg
+    assert first.ocr_jpeg == second.ocr_jpeg
+    assert first.thumbnail_jpeg == second.thumbnail_jpeg
+
+
 def test_older_padding_retains_more_context_than_modern_padding() -> None:
     source = _synthetic_page()
     operations = ("page_dewarp", "detected_margin_crop")
@@ -316,6 +366,10 @@ def test_shared_kernel_preserves_the_preconsolidation_cloud_golden(
     assert consolidated.ocr_jpeg == preconsolidation.ocr_jpeg
     assert consolidated.thumbnail_jpeg == preconsolidation.thumbnail_jpeg
     assert consolidated.transform_manifest == preconsolidation.transform_manifest
+    assert consolidated.page_boundary_proposal == (
+        preconsolidation.page_boundary_proposal
+    )
+    assert consolidated.page_boundary_proposal is not None
 
 
 def test_cloud_pipeline_has_no_independent_projective_pixel_path() -> None:

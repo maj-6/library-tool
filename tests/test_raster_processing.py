@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import math
+import random
 
 import pytest
 from PIL import Image
@@ -17,6 +18,7 @@ from librarytool.processing.raster import (
     RasterLimits,
     apply_manual_binary_adjust,
     apply_perspective_transform,
+    page_boundary_proposal_from_pixel_quad,
     validate_normalized_quad,
 )
 
@@ -117,6 +119,71 @@ def test_page_boundary_proposal_rejects_invalid_confidence(confidence: float) ->
             detector="test",
             detector_version="1",
             source_revision="revision",
+        )
+
+
+def test_pixel_quad_proposal_conversion_round_trips_randomized_valid_geometry() -> None:
+    rng = random.Random(229)
+    for index in range(100):
+        width = rng.randint(32, 6000)
+        height = rng.randint(32, 6000)
+        left = rng.uniform(0.08, 0.18)
+        right = rng.uniform(0.82, 0.92)
+        top = rng.uniform(0.02, 0.18)
+        bottom = rng.uniform(0.82, 0.98)
+        skew_x = rng.uniform(-0.03, 0.03)
+        skew_y = rng.uniform(-0.03, 0.03)
+        normalized = (
+            (left, top),
+            (right, top + skew_y),
+            (right + skew_x, bottom),
+            (left + skew_x, bottom - skew_y),
+        )
+        pixels = tuple(
+            (x * (width - 1), y * (height - 1))
+            for x, y in normalized
+        )
+
+        proposal = page_boundary_proposal_from_pixel_quad(
+            pixels,
+            source_width=width,
+            source_height=height,
+            confidence=index / 100,
+            detector="property-test",
+            detector_version="1",
+            source_revision=f"source:{index}",
+        )
+
+        for actual, expected in zip(proposal.quad, normalized, strict=True):
+            assert actual == pytest.approx(expected, abs=1e-12)
+        assert proposal.confidence == index / 100
+        assert proposal.as_dict() == proposal.as_dict()
+
+
+@pytest.mark.parametrize(
+    ("quad", "width", "height", "message"),
+    [
+        (FULL_FRAME, 1, 100, "source_width"),
+        (FULL_FRAME, 100, 1, "source_height"),
+        (((0, 0), (100, 0), (99, 99), (0, 99)), 100, 100, "pixel bounds"),
+        (((0, 0), (99, False), (99, 99), (0, 99)), 100, 100, "numbers"),
+    ],
+)
+def test_pixel_quad_proposal_conversion_rejects_invalid_pixel_contracts(
+    quad: tuple[tuple[float, float], ...],
+    width: int,
+    height: int,
+    message: str,
+) -> None:
+    with pytest.raises((RasterInputError, ValueError), match=message):
+        page_boundary_proposal_from_pixel_quad(
+            quad,
+            source_width=width,
+            source_height=height,
+            confidence=0.5,
+            detector="test",
+            detector_version="1",
+            source_revision="source",
         )
 
 
