@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Corrections · Library Tool</title>
+  <link rel="icon" href="{{ url_for('static', filename='icon.png') }}" />
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='corrections/corrections.css') }}?v={{ corrections_css_v }}" />
+</head>
+<body>
+  <a class="skip-link" href="#corrections-editor">Skip to editor</a>
+
+  <div class="corrections-app" data-corrections-root data-compact="false">
+    <header class="app-titlebar" aria-label="Corrections window">
+      <div class="titlebar-identity">
+        <span class="app-mark" aria-hidden="true">WHL</span>
+        <span class="titlebar-title">Corrections</span>
+        <span class="titlebar-context" data-context-label>No workspace selected</span>
+      </div>
+      <div class="window-controls" aria-label="Window controls">
+        <button type="button" data-window-action="minimize" aria-label="Minimize window">
+          <span aria-hidden="true">—</span>
+        </button>
+        <button type="button" data-window-action="maximize" aria-label="Maximize window">
+          <span aria-hidden="true">□</span>
+        </button>
+        <button type="button" class="window-close" data-window-action="close"
+                aria-label="Close window">
+          <span aria-hidden="true">×</span>
+        </button>
+      </div>
+    </header>
+
+    <nav class="workspace-toolbar" aria-label="Workspace controls">
+      <div class="toolbar-group compact-tools" aria-label="Compact window drawers">
+        <button type="button" data-drawer-toggle="navigator" aria-expanded="false"
+                aria-controls="corrections-navigator">Books and artifacts</button>
+        <button type="button" data-drawer-toggle="properties" aria-expanded="false"
+                aria-controls="corrections-properties">Properties</button>
+      </div>
+      <div class="toolbar-context" aria-live="polite" data-workspace-status>
+        Waiting for workbench context
+      </div>
+      <div class="toolbar-group">
+        <button type="button" data-layout-action="maximize-primary" aria-pressed="false"
+                aria-controls="corrections-editor">Maximize editor</button>
+        <button type="button" data-layout-action="reset">Reset layout</button>
+      </div>
+    </nav>
+
+    <div class="corrections-workspace" data-workspace-layout>
+      <aside class="corrections-left-dock" id="corrections-navigator"
+             aria-label="Book and artifact navigation">
+        <nav class="workspace-pane books-pane" id="corrections-books"
+             aria-labelledby="books-heading">
+          <header class="pane-header">
+            <div>
+              <h2 id="books-heading">Books</h2>
+              <span class="pane-count" data-books-count>0</span>
+            </div>
+            <button type="button" class="pane-collapse" data-collapse-pane="books"
+                    aria-expanded="true" aria-controls="books-body"
+                    aria-label="Collapse Books panel">⌃</button>
+          </header>
+          <div class="pane-body" id="books-body">
+            <label class="panel-search">
+              <span class="sr-only">Filter books</span>
+              <input type="search" data-books-filter placeholder="Filter books"
+                     autocomplete="off" />
+            </label>
+            <ul class="books-list" data-books-list aria-label="Books">
+              <li class="empty-row">No books loaded</li>
+            </ul>
+          </div>
+        </nav>
+
+        <div class="resize-gutter horizontal-gutter" role="separator" tabindex="0"
+             data-layout-gutter="books" aria-orientation="horizontal"
+             aria-label="Resize Books and Artifacts panels"
+             aria-controls="corrections-books corrections-artifacts"
+             aria-valuemin="120" aria-valuemax="720" aria-valuenow="300"></div>
+
+        <section class="workspace-pane artifacts-pane" id="corrections-artifacts"
+                 aria-labelledby="artifacts-heading">
+          <header class="pane-header">
+            <div>
+              <h2 id="artifacts-heading">Artifacts</h2>
+              <span class="pane-count" data-artifacts-count>0</span>
+            </div>
+            <button type="button" class="pane-collapse" data-collapse-pane="artifacts"
+                    aria-expanded="true" aria-controls="artifacts-body"
+                    aria-label="Collapse Artifacts panel">⌄</button>
+          </header>
+          <div class="pane-body" id="artifacts-body">
+            <div class="artifacts-tree" role="tree" aria-label="Artifacts for selected book"
+                 data-artifacts-tree>
+              <div class="empty-row" role="treeitem" aria-disabled="true">
+                Select a book to browse artifacts
+              </div>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <div class="resize-gutter vertical-gutter" role="separator" tabindex="0"
+           data-layout-gutter="navigator" aria-orientation="vertical"
+           aria-label="Resize navigation panels" aria-controls="corrections-navigator"
+           aria-valuemin="220" aria-valuemax="520" aria-valuenow="292"></div>
+
+      <main class="workspace-pane editor-pane" id="corrections-editor" tabindex="-1"
+            aria-labelledby="editor-heading">
+        <header class="pane-header editor-header">
+          <div class="editor-title">
+            <h1 id="editor-heading">Editor</h1>
+            <span data-editor-resource-label aria-live="polite" aria-atomic="true">
+              No resource selected
+            </span>
+          </div>
+          <label class="editor-selector-label">
+            <span>Editor type</span>
+            <select data-editor-selector aria-describedby="editor-selector-help"></select>
+          </label>
+          <span class="sr-only" id="editor-selector-help">
+            Only editors compatible with the selected resource are available.
+          </span>
+        </header>
+        <div class="editor-host" data-editor-host></div>
+      </main>
+
+      <div class="resize-gutter vertical-gutter properties-gutter" role="separator"
+           tabindex="0" data-layout-gutter="properties" aria-orientation="vertical"
+           aria-label="Resize Properties panel" aria-controls="corrections-properties"
+           aria-valuemin="240" aria-valuemax="560" aria-valuenow="320"></div>
+
+      <aside class="workspace-pane properties-pane" id="corrections-properties"
+             aria-labelledby="properties-heading">
+        <header class="pane-header">
+          <div><h2 id="properties-heading">Properties</h2></div>
+          <button type="button" class="pane-collapse" data-collapse-pane="properties"
+                  aria-expanded="true" aria-controls="properties-body"
+                  aria-label="Collapse Properties panel">›</button>
+        </header>
+        <div class="pane-body properties-body" id="properties-body">
+          <dl class="property-list" data-properties-list>
+            <div><dt>Selection</dt><dd>Nothing selected</dd></div>
+          </dl>
+        </div>
+      </aside>
+
+      <div class="resize-gutter horizontal-gutter tray-gutter" role="separator" tabindex="0"
+           data-layout-gutter="tray" aria-orientation="horizontal"
+           aria-label="Resize review and job tray" aria-controls="corrections-tray"
+           aria-valuemin="120" aria-valuemax="440" aria-valuenow="220"></div>
+
+      <section class="workspace-pane tray-pane" id="corrections-tray"
+               aria-labelledby="tray-heading">
+        <header class="pane-header tray-header">
+          <div class="tray-tabs" role="tablist" aria-label="Review and job tray">
+            <button type="button" role="tab" id="tray-review-tab" aria-selected="true"
+                    aria-controls="tray-review-panel" data-tray-tab="reviews">
+              <span id="tray-heading">Review</span><span class="pane-count">0</span>
+            </button>
+            <button type="button" role="tab" id="tray-jobs-tab" aria-selected="false"
+                    aria-controls="tray-jobs-panel" tabindex="-1" data-tray-tab="jobs">
+              Jobs<span class="pane-count">0</span>
+            </button>
+          </div>
+          <button type="button" class="pane-collapse" data-collapse-pane="tray"
+                  aria-expanded="true" aria-controls="tray-body"
+                  aria-label="Collapse review and job tray">⌄</button>
+        </header>
+        <div class="pane-body tray-body" id="tray-body">
+          <div role="tabpanel" id="tray-review-panel" aria-labelledby="tray-review-tab"
+               data-tray-panel="reviews">
+            <p class="empty-state">No open review item selected.</p>
+          </div>
+          <div role="tabpanel" id="tray-jobs-panel" aria-labelledby="tray-jobs-tab"
+               data-tray-panel="jobs" hidden>
+            <p class="empty-state">No active jobs.</p>
+          </div>
+        </div>
+      </section>
+
+      <button type="button" class="compact-scrim" data-close-drawers tabindex="-1"
+              aria-label="Close side panels"></button>
+    </div>
+
+    <footer class="statusbar" aria-label="Workbench status">
+      <span data-status-message>Ready</span>
+      <span data-profile-label>Profile: corrections/default</span>
+    </footer>
+  </div>
+
+  <script src="{{ url_for('static', filename='corrections/editor-registry.js') }}?v={{ editor_registry_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/ui-profile.js') }}?v={{ ui_profile_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/layout-controller.js') }}?v={{ layout_controller_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/shell.js') }}?v={{ corrections_shell_v }}"></script>
+</body>
+</html>

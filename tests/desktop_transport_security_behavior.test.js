@@ -71,13 +71,28 @@ function apiTransportHarness() {
     let sidecarPort = 45678;
     let sidecarCapability = "${"S".repeat(43)}";
     const mainFrame = { url: "http://127.0.0.1:45678/" };
+    const workbenchFrame = { url: "http://127.0.0.1:45678/corrections" };
     const mainWebContents = { id: 9, mainFrame, session: { webRequest } };
     let mainWindow = { isDestroyed: () => false, webContents: mainWebContents };
+    const workbenchWindowRegistry = {
+      trustForWebRequest: (webContentsId, trustedUrl) => {
+        const candidate = webContentsId === 9
+          ? { frame: mainFrame, documentPath: "/" }
+          : webContentsId === 10
+            ? { frame: workbenchFrame, documentPath: "/corrections" }
+            : null;
+        return candidate && trustedUrl(candidate.frame.url,
+          "http://127.0.0.1:45678", candidate.documentPath) ? {
+            origin: "http://127.0.0.1:45678", webContentsId,
+            mainFrame: candidate.frame, documentPath: candidate.documentPath,
+          } : null;
+      },
+    };
     const authenticatedResourceLoads = new Map();
     function sidecarOrigin() { return "http://127.0.0.1:45678"; }
     ${install}
     installApiCapabilityTransport(mainWindow);
-    this.api = { mainFrame, authenticatedResourceLoads };
+    this.api = { mainFrame, workbenchFrame, authenticatedResourceLoads };
   `, context);
   const before = (details) => {
     let result;
@@ -405,10 +420,20 @@ test("resource-open IPC accepts only the trusted application main frame", () => 
     ${helpers}
     let sidecarPort = 45678;
     const appFrame = { url: "http://127.0.0.1:45678/" };
-    const appContents = { mainFrame: appFrame };
+    const appContents = { id: 9, mainFrame: appFrame };
     let mainWindow = { isDestroyed: () => false, webContents: appContents };
+    const managerRecord = { role: "manager", window: mainWindow, documentPath: "/" };
+    let workbenchWindowRegistry = {
+      recordForEvent: (event, trustedUrl) => event && event.sender === appContents &&
+        event.senderFrame === appFrame &&
+        trustedUrl(appFrame.url, "http://127.0.0.1:45678", "/")
+        ? managerRecord : null,
+    };
     ${senderPolicy}
-    const ipcMain = { on: (name, handler) => { ipcHandlers[name] = handler; } };
+    const ipcMain = {
+      on: (name, handler) => { ipcHandlers[name] = handler; },
+      handle: (name, handler) => { ipcHandlers[name] = handler; },
+    };
     function createAuthenticatedResourceWindow(url) { opened.push(url); }
     ${resourceIpc}
     this.api = { appFrame, appContents };
@@ -500,6 +525,13 @@ test("installed session handlers preserve trusted clipboard and deny everything 
     const mainFrame = { url: "http://127.0.0.1:45678/" };
     const webContents = { id: 9, mainFrame };
     let mainWindow = { isDestroyed: () => false, webContents };
+    const record = { window: mainWindow, documentPath: "/" };
+    const workbenchWindowRegistry = {
+      recordForWebContents: (candidate, trustedUrl) =>
+        candidate === webContents &&
+        trustedUrl(mainFrame.url, "http://127.0.0.1:45678", "/")
+        ? record : null,
+    };
     function sidecarOrigin() { return "http://127.0.0.1:45678"; }
     ${permissions}
     denyUnrequestedPermissions(session);
@@ -610,6 +642,34 @@ test("installed webRequest callbacks enforce provenance and clean terminals", ()
   harness.before(errored);
   harness.handlers.onErrorOccurred({ ...errored, timestamp: 41 });
   assert.equal(harness.send(errored)["X-WHL-Desktop-Capability"], undefined);
+});
+
+test("installed transport authenticates only the registered workbench main frame", () => {
+  const harness = apiTransportHarness();
+  const origin = "http://127.0.0.1:45678";
+  const request = (id, frame = harness.workbenchFrame) => ({
+    id,
+    url: origin + "/api/v1/items",
+    timestamp: id,
+    method: "GET",
+    webContentsId: 10,
+    frame,
+    resourceType: "xhr",
+    requestHeaders: { "x-whl-desktop-capability": "forged" },
+  });
+
+  const exact = request(151);
+  harness.before(exact);
+  assert.equal(harness.send(exact)["X-WHL-Desktop-Capability"], "S".repeat(43));
+
+  const subframe = request(152, { url: harness.workbenchFrame.url });
+  harness.before(subframe);
+  assert.equal(harness.send(subframe)["X-WHL-Desktop-Capability"], undefined);
+
+  harness.workbenchFrame.url = origin + "/";
+  const navigated = request(153);
+  harness.before(navigated);
+  assert.equal(harness.send(navigated)["X-WHL-Desktop-Capability"], undefined);
 });
 
 test("installed transport supports PDF plugin Range but taints redirects", () => {
@@ -1038,7 +1098,8 @@ test("renderer and remote subframes never receive the capability", () => {
   assert.doesNotMatch(mainSource, /localStorage\.setItem|document\.cookie\s*=/);
   assert.match(mainSource, /details\.frame !== trust\.mainFrame/);
   assert.match(preloadSource, /openResource:[\s\S]+ipcRenderer\.send\("resource:open", url\)/);
-  assert.match(mainSource, /ipcMain\.on\("resource:open"[\s\S]+isTrustedMainSender\(event\)/);
+  assert.match(mainSource,
+    /ipcMain\.on\("resource:open"[\s\S]+trustedApplicationRecord\(event\)/);
 });
 
 test("remote HTML is retired before automatic API authorization", () => {

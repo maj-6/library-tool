@@ -272,6 +272,7 @@ _RESOURCE_CSP = "; ".join((
     "img-src 'self' data:",
     "frame-ancestors 'none'",
 ))
+_DESKTOP_DOCUMENT_PATHS = frozenset({"/", "/corrections"})
 
 
 @app.before_request
@@ -347,7 +348,11 @@ def _static_cache_headers(resp):
     if resp.mimetype == "text/html":
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
-        csp = _DESKTOP_CSP if request.path == "/" else _RESOURCE_CSP
+        csp = (
+            _DESKTOP_CSP
+            if request.path in _DESKTOP_DOCUMENT_PATHS
+            else _RESOURCE_CSP
+        )
         resp.headers.setdefault("Content-Security-Policy", csp)
     if resp.status_code in (200, 304) and request.path.startswith("/static/"):
         if request.args.get("v"):
@@ -1820,8 +1825,22 @@ def home():
         "index.html",
         app_v=_asset_v("app.js"),
         engine_v=_asset_v("engine-client.js"),
+        workbench_launch_v=_asset_v("workbench-launch.js"),
         css_v=_asset_v("style.css"),
         app_version=_app_version(),
+    )
+
+
+@app.get("/corrections")
+def corrections_workbench():
+    """Independent desktop document for correction and review workflows."""
+    return render_template(
+        "corrections.html",
+        corrections_css_v=_asset_v("corrections/corrections.css"),
+        editor_registry_v=_asset_v("corrections/editor-registry.js"),
+        ui_profile_v=_asset_v("corrections/ui-profile.js"),
+        layout_controller_v=_asset_v("corrections/layout-controller.js"),
+        corrections_shell_v=_asset_v("corrections/shell.js"),
     )
 
 

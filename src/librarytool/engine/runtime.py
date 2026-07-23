@@ -17,15 +17,19 @@ from .capabilities import (
 )
 from .canvases import CanvasQueryService
 from .canvas_commands import CanvasPreparationService
+from .corrections import CorrectionService
+from .correction_transforms import CorrectionTransformService
 from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
 from .item_lifecycle import ItemLifecycleService
 from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
 from .providers import ProviderDiscoveryService
+from .raster_artifacts import RasterArtifactProjectorPort
 from .replica import ReplicaApplicationService
 from .representation_commands import RepresentationCommandService
 from .secret_store import SecretStoreService
+from .spatial_annotations import SpatialAnnotationProjectorPort
 from .text_layer_aggregate import TextLayerAggregateService
 from .text_layers import TextLayerService
 from .translations import TranslationProvenanceService, TranslationService
@@ -431,6 +435,18 @@ CANVAS_QUERY_SERVICE: ServiceKey[CanvasQueryService] = ServiceKey(
 CANVAS_PREPARATION_SERVICE: ServiceKey[CanvasPreparationService] = ServiceKey(
     "library.canvases.prepare"
 )
+CORRECTION_SERVICE: ServiceKey[CorrectionService] = ServiceKey(
+    "library.corrections.commands"
+)
+CORRECTION_TRANSFORM_SERVICE: ServiceKey[CorrectionTransformService] = ServiceKey(
+    "library.corrections.transforms"
+)
+RASTER_ARTIFACT_QUERY_SERVICE: ServiceKey[RasterArtifactProjectorPort] = ServiceKey(
+    "library.raster-artifacts.query"
+)
+SPATIAL_ANNOTATION_QUERY_SERVICE: ServiceKey[SpatialAnnotationProjectorPort] = (
+    ServiceKey("library.spatial-annotations.query")
+)
 SECRET_STORE_SERVICE: ServiceKey[SecretStoreService] = ServiceKey(
     "library.secrets"
 )
@@ -667,6 +683,8 @@ class LibraryEngineBuilder:
 __all__ = [
     "CANVAS_PREPARATION_SERVICE",
     "CANVAS_QUERY_SERVICE",
+    "CORRECTION_SERVICE",
+    "CORRECTION_TRANSFORM_SERVICE",
     "DuplicateServiceError",
     "INTERCHANGE_SERVICE",
     "LIB_OPEN_SERVICE",
@@ -678,9 +696,11 @@ __all__ = [
     "LibraryEngineBuilder",
     "ModuleContribution",
     "PROVIDER_DISCOVERY_SERVICE",
+    "RASTER_ARTIFACT_QUERY_SERVICE",
     "REPLICA_SERVICE",
     "REPRESENTATION_COMMAND_SERVICE",
     "SECRET_STORE_SERVICE",
+    "SPATIAL_ANNOTATION_QUERY_SERVICE",
     "ServiceBinding",
     "ServiceKey",
     "ServiceNotFoundError",

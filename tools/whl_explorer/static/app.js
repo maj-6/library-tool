@@ -25448,6 +25448,34 @@ async function syncMasterList() {
   }
 }
 
+async function openCorrectionsManager(newWindow = false) {
+  const launcher = window.LibraryToolWorkbenchLaunch;
+  if (!launcher || typeof launcher.open !== "function") {
+    statusCrit("CORRECTIONS LAUNCHER IS NOT AVAILABLE");
+    return;
+  }
+  try {
+    const result = await launcher.open(window.whlDesktop, {
+      workbenchId: "corrections",
+      workspaceId: "local-library",
+      itemId: state.buildSel || null,
+      origin: { surface: "manager" },
+      viewHint: { panel: "books" },
+      uiProfileKey: "corrections/default",
+      newWindow,
+    });
+    status(result && result.reused
+      ? "CORRECTIONS WINDOW FOCUSED"
+      : "CORRECTIONS WINDOW OPENED");
+  } catch (error) {
+    if (error && error.code === "WORKBENCH_UNAVAILABLE") {
+      statusCrit("CORRECTIONS REQUIRES THE DESKTOP APPLICATION");
+      return;
+    }
+    statusCrit("COULD NOT OPEN CORRECTIONS");
+  }
+}
+
 const MENU_CMDS = {
   "export": () => exportJson(),
   "export-builds": () => exportBuilds(),
@@ -25463,6 +25491,8 @@ const MENU_CMDS = {
   "table-whl": () => switchTopTable("whl"),
   "run-scans": () => runScansBatch(),
   "scrape": () => startWhlScrape(),
+  "corrections": () => openCorrectionsManager(false),
+  "corrections-new": () => openCorrectionsManager(true),
   "dl-approved": () => downloadApproved(),
   "setup-guide": () => showWizard(),
   "changelog": () => openChangelog(),
