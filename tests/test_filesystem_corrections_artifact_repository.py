@@ -12,6 +12,7 @@ import pytest
 from PIL import Image
 
 import libformat
+from librarytool.adapters.filesystem import corrections_artifact_repository
 from librarytool.adapters.filesystem.corrections_artifact_repository import (
     FilesystemCorrectionsArtifactRepository,
     FilesystemRasterResourceResolverPort,
@@ -363,6 +364,68 @@ def test_sidecar_ancestor_redirect_cannot_escape_the_authority_root(
 
     assert caught.value.code == "invalid_mistral_layout"
     assert "EXTERNAL SECRET" not in str(caught.value)
+
+
+def test_sidecar_ancestor_redirect_cannot_cross_item_authority(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "library"
+    layout_path = _write_layout(root, _layout("ab" * 32))
+    private_layout = _entry(root, "book-2") / "ocr" / "layout.json"
+    private_layout.parent.mkdir(parents=True)
+    leaked = _layout("cd" * 32)
+    leaked["regions"]["primary"]["3"]["items"][0]["text"] = "PRIVATE ITEM SECRET"
+    private_layout.write_text(json.dumps(leaked), encoding="utf-8")
+    repository = _repository(root, capture_ids={})
+    real_assert = repository._assert_safe_path
+    real_finish = corrections_artifact_repository._finish_verified_regular
+    swapped = False
+    restored = False
+
+    def swapping_assert(path, **kwargs):
+        nonlocal swapped
+        authority = real_assert(path, **kwargs)
+        if Path(path) == layout_path and not swapped:
+            swapped = True
+            item_directory = _entry(root)
+            backup = _entry(root, "book-1.original")
+            item_directory.replace(backup)
+            try:
+                os.symlink(
+                    _entry(root, "book-2"),
+                    item_directory,
+                    target_is_directory=True,
+                )
+            except OSError:
+                if item_directory.is_symlink():
+                    item_directory.unlink()
+                backup.replace(item_directory)
+                pytest.skip("directory symlinks are unavailable")
+        return authority
+
+    def restoring_finish(*args, **kwargs):
+        nonlocal restored
+        result = real_finish(*args, **kwargs)
+        if swapped and not restored:
+            restored = True
+            item_directory = _entry(root)
+            item_directory.unlink()
+            _entry(root, "book-1.original").replace(item_directory)
+        return result
+
+    monkeypatch.setattr(repository, "_assert_safe_path", swapping_assert)
+    monkeypatch.setattr(
+        corrections_artifact_repository,
+        "_finish_verified_regular",
+        restoring_finish,
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        repository.list_spatial_annotations(ITEM_ID)
+
+    assert caught.value.code == "invalid_mistral_layout"
+    assert "PRIVATE ITEM SECRET" not in str(caught.value)
 
 
 def test_android_capture_projection_is_stable_safe_and_read_only(tmp_path):
