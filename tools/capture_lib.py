@@ -16,15 +16,27 @@ import math
 import os
 import re
 import stat
-from collections.abc import Mapping
+import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from librarytool.engine.capture_archives import (
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from librarytool.engine.capture_archives import (  # noqa: E402
     AssociateCaptureArchiveCommand,
+    CaptureArchiveAssociation,
+    CaptureArchiveDisposition,
+    CaptureArchiveMaterializerPort,
+    CaptureArchiveService,
     CaptureArchiveSource,
+    capture_book_id,
 )
+from librarytool.engine.errors import EngineError  # noqa: E402
 
 
 _PHOTO_ASSETS_SCHEMA = "org.whl.bookcapture.photo-assets"
@@ -40,7 +52,10 @@ _MAX_PORTABLE_JSON_DEPTH = 64
 _MAX_PORTABLE_JSON_NODES = 50_000
 _MAX_PORTABLE_JSON_STRING = 1_000_000
 _MAX_PORTABLE_INTEGER = (1 << 53) - 1
+_MAX_BACKFILL_DIAGNOSTICS = 10_000
+_MAX_DIAGNOSTIC_TEXT = 240
 _NUMBERED_IMAGE_RE = re.compile(r"^(orig|photo)_([1-9][0-9]*)\.jpg$")
+_BOOK_ID_RE = re.compile(r"^b-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _ASSET_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _WINDOWS_PATH_RE = re.compile(r"(?:^|[\s\"'(])[A-Za-z]:[\\/]")
@@ -1574,17 +1589,627 @@ def build_capture_archive_command(
     capture_id: str,
     entry: Mapping[str, Any],
     capture_directory: str | Path,
+    *,
+    book_id: str = "",
+    operation_id: str = "",
 ) -> AssociateCaptureArchiveCommand:
     """Build the stable command used by both LAN and cloud import retries."""
 
     source = build_capture_archive_source(capture_id, entry, capture_directory)
     return AssociateCaptureArchiveCommand(
         source=source,
-        operation_id=f"capture-import-{source.fingerprint}",
+        operation_id=operation_id or f"capture-import-{source.fingerprint}",
+        book_id=book_id,
     )
 
 
+def _bounded_diagnostic_text(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:_MAX_DIAGNOSTIC_TEXT]
+
+
+def _diagnostic(
+    *,
+    capture_id: str,
+    entry_id: str = "",
+    status: str,
+    code: str,
+    message: str,
+    changed: bool = False,
+    book_id: str = "",
+    association: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "capture_id": _bounded_diagnostic_text(capture_id),
+        "entry_id": _bounded_diagnostic_text(entry_id),
+        "status": status,
+        "code": code,
+        "message": _bounded_diagnostic_text(message),
+        "changed": bool(changed),
+        "book_id": _bounded_diagnostic_text(book_id),
+        "association": dict(association) if association is not None else None,
+    }
+
+
+def _portable_capture_id(value: Any) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        return ""
+    try:
+        capture_book_id(value)
+    except (EngineError, TypeError, ValueError):
+        return ""
+    return value
+
+
+def _legacy_book_id(
+    entry: Mapping[str, Any],
+    capture_id: str,
+) -> str:
+    candidates: list[tuple[str, Any]] = [
+        ("book_id", entry.get("book_id")),
+        ("lib_book_id", entry.get("lib_book_id")),
+    ]
+    extra = entry.get("extra")
+    if isinstance(extra, Mapping):
+        candidates.append(("extra.book_id", extra.get("book_id")))
+        candidates.append(("extra.lib_book_id", extra.get("lib_book_id")))
+    identities: dict[str, list[str]] = {}
+    for field_name, raw_value in candidates:
+        if raw_value in (None, ""):
+            continue
+        if not isinstance(raw_value, str) or not _BOOK_ID_RE.fullmatch(raw_value):
+            raise ValueError(
+                f"{field_name} is not a valid stable lib book identity"
+            )
+        identities.setdefault(raw_value, []).append(field_name)
+    if len(identities) > 1:
+        raise ValueError("manual entry contains conflicting stable book identities")
+    return next(iter(identities), capture_book_id(capture_id))
+
+
+def _backfill_operation_id(
+    *,
+    capture_id: str,
+    book_id: str,
+    source_fingerprint: str,
+) -> str:
+    digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "schema": "org.whl.capture-lib-backfill-operation",
+                "version": 1,
+                "capture_id": capture_id,
+                "book_id": book_id,
+                "source_fingerprint": source_fingerprint,
+            }
+        )
+    ).hexdigest()
+    return f"capture-backfill-{digest}"
+
+
+def _capture_directories(
+    capture_root: Path,
+) -> tuple[dict[str, Path], list[dict[str, Any]]]:
+    directories: dict[str, Path] = {}
+    diagnostics: list[dict[str, Any]] = []
+    try:
+        root_info = capture_root.lstat()
+    except FileNotFoundError:
+        return directories, diagnostics
+    except OSError as exc:
+        diagnostics.append(
+            _diagnostic(
+                capture_id="",
+                status="failed",
+                code="capture_root_unavailable",
+                message=f"capture root cannot be inspected: {type(exc).__name__}",
+            )
+        )
+        return directories, diagnostics
+    if not stat.S_ISDIR(root_info.st_mode) or capture_root.is_symlink():
+        diagnostics.append(
+            _diagnostic(
+                capture_id="",
+                status="failed",
+                code="capture_root_invalid",
+                message="capture root is redirecting or is not a directory",
+            )
+        )
+        return directories, diagnostics
+    try:
+        children = sorted(capture_root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        diagnostics.append(
+            _diagnostic(
+                capture_id="",
+                status="failed",
+                code="capture_root_unavailable",
+                message=f"capture root cannot be listed: {type(exc).__name__}",
+            )
+        )
+        return directories, diagnostics
+    for child in children:
+        capture_id = _portable_capture_id(child.name)
+        if not capture_id:
+            continue
+        try:
+            info = child.lstat()
+        except OSError as exc:
+            diagnostics.append(
+                _diagnostic(
+                    capture_id=capture_id,
+                    status="failed",
+                    code="capture_asset_directory_unavailable",
+                    message=(
+                        "capture asset directory cannot be inspected: "
+                        f"{type(exc).__name__}"
+                    ),
+                )
+            )
+            continue
+        if not stat.S_ISDIR(info.st_mode) or child.is_symlink():
+            diagnostics.append(
+                _diagnostic(
+                    capture_id=capture_id,
+                    status="failed",
+                    code="capture_asset_directory_invalid",
+                    message="capture asset directory is redirecting or invalid",
+                )
+            )
+            continue
+        directories[capture_id] = child
+    return directories, diagnostics
+
+
+def backfill_capture_archives(
+    manual_entries: Mapping[str, Any],
+    capture_root: str | Path,
+    *,
+    materializer: CaptureArchiveMaterializerPort,
+    service: CaptureArchiveService | None = None,
+    association_lookup: (
+        Callable[[str], CaptureArchiveAssociation | None] | None
+    ) = None,
+    apply: bool = False,
+    diagnostic_limit: int = _MAX_BACKFILL_DIAGNOSTICS,
+) -> dict[str, Any]:
+    """Plan or apply missing capture archive associations.
+
+    The scan is deterministic and independent per capture. Failures are
+    reported and skipped, so a later apply resumes from every association that
+    already committed. The compatibility manual catalogue and capture assets
+    are read-only inputs.
+    """
+
+    if not isinstance(manual_entries, Mapping):
+        raise TypeError("manual_entries must be a mapping")
+    if not isinstance(materializer, CaptureArchiveMaterializerPort):
+        raise TypeError("materializer must implement CaptureArchiveMaterializerPort")
+    if service is not None and not isinstance(service, CaptureArchiveService):
+        raise TypeError("service must be a CaptureArchiveService")
+    if apply and service is None:
+        raise TypeError("apply requires a CaptureArchiveService")
+    if association_lookup is not None and not callable(association_lookup):
+        raise TypeError("association_lookup must be callable")
+    if not isinstance(apply, bool):
+        raise TypeError("apply must be boolean")
+    if (
+        not isinstance(diagnostic_limit, int)
+        or isinstance(diagnostic_limit, bool)
+        or diagnostic_limit < 1
+        or diagnostic_limit > _MAX_BACKFILL_DIAGNOSTICS
+    ):
+        raise ValueError(
+            f"diagnostic_limit must be between 1 and {_MAX_BACKFILL_DIAGNOSTICS}"
+        )
+
+    capture_root = Path(capture_root)
+    lookup = association_lookup or (
+        service.get if service is not None else None
+    )
+    if lookup is None:
+        raise TypeError("an association lookup is required")
+    directories, initial_diagnostics = _capture_directories(capture_root)
+    entries_by_capture: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
+    pending_diagnostics = list(initial_diagnostics)
+    for raw_entry_id in sorted(manual_entries, key=lambda value: str(value)):
+        raw_entry = manual_entries[raw_entry_id]
+        if not isinstance(raw_entry, Mapping):
+            continue
+        raw_capture_id = raw_entry.get("capture_id")
+        if raw_capture_id in (None, ""):
+            continue
+        capture_id = _portable_capture_id(raw_capture_id)
+        if not capture_id:
+            pending_diagnostics.append(
+                _diagnostic(
+                    capture_id=_bounded_diagnostic_text(raw_capture_id),
+                    entry_id=str(raw_entry_id),
+                    status="failed",
+                    code="capture_id_invalid",
+                    message="manual entry has a nonportable capture identity",
+                )
+            )
+            continue
+        entries_by_capture.setdefault(capture_id, []).append(
+            (str(raw_entry_id), raw_entry)
+        )
+
+    candidate_ids = sorted(set(entries_by_capture) | set(directories))
+    diagnostics: list[dict[str, Any]] = []
+    counts = {
+        "created": 0,
+        "would_create": 0,
+        "unchanged": 0,
+        "failed": 0,
+    }
+    omitted = 0
+
+    def record(diagnostic: dict[str, Any]) -> None:
+        nonlocal omitted
+        status = str(diagnostic["status"])
+        counts[status] = counts.get(status, 0) + 1
+        if len(diagnostics) < diagnostic_limit:
+            diagnostics.append(diagnostic)
+        else:
+            omitted += 1
+
+    for diagnostic in pending_diagnostics:
+        record(diagnostic)
+
+    for capture_id in candidate_ids:
+        rows = entries_by_capture.get(capture_id, [])
+        entry_id = rows[0][0] if len(rows) == 1 else ""
+        try:
+            existing = lookup(capture_id)
+        except EngineError as exc:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    entry_id=entry_id,
+                    status="failed",
+                    code=str(exc.code or "capture_association_invalid"),
+                    message=str(exc),
+                )
+            )
+            continue
+        if existing is not None:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    entry_id=entry_id,
+                    status="unchanged",
+                    code="capture_archive_already_associated",
+                    message="stable capture archive association already exists",
+                    book_id=existing.book_id,
+                    association=existing.as_dict(),
+                )
+            )
+            continue
+        if len(rows) > 1:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    status="failed",
+                    code="duplicate_capture_entries",
+                    message=(
+                        f"{len(rows)} manual entries claim this capture identity"
+                    ),
+                )
+            )
+            continue
+        if not rows:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    status="failed",
+                    code="capture_manual_entry_missing",
+                    message="capture directory has no matching manual entry",
+                )
+            )
+            continue
+        directory = directories.get(capture_id)
+        if directory is None:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    entry_id=entry_id,
+                    status="failed",
+                    code="capture_assets_missing",
+                    message="manual entry has no durable capture asset directory",
+                )
+            )
+            continue
+        entry = rows[0][1]
+        try:
+            book_id = _legacy_book_id(entry, capture_id)
+        except ValueError as exc:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    entry_id=entry_id,
+                    status="failed",
+                    code="capture_book_identity_invalid",
+                    message=str(exc),
+                )
+            )
+            continue
+        try:
+            source = build_capture_archive_source(
+                capture_id,
+                entry,
+                directory,
+            )
+            command = AssociateCaptureArchiveCommand(
+                source=source,
+                operation_id=_backfill_operation_id(
+                    capture_id=capture_id,
+                    book_id=book_id,
+                    source_fingerprint=source.fingerprint,
+                ),
+                book_id=book_id,
+            )
+            if not apply:
+                materializer.materialize(source, book_id=book_id)
+                record(
+                    _diagnostic(
+                        capture_id=capture_id,
+                        entry_id=entry_id,
+                        status="would_create",
+                        code="capture_archive_missing",
+                        message="capture archive association would be created",
+                        book_id=book_id,
+                    )
+                )
+                continue
+            if service is None:
+                raise RuntimeError("apply service is unavailable")
+            result = service.associate(command)
+        except EngineError as exc:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    entry_id=entry_id,
+                    status="failed",
+                    code=str(exc.code or "capture_backfill_failed"),
+                    message=str(exc),
+                    book_id=book_id,
+                )
+            )
+            continue
+        except (OSError, TypeError, ValueError) as exc:
+            message = str(exc).replace(str(capture_root), "<capture-root>")
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    entry_id=entry_id,
+                    status="failed",
+                    code="capture_source_invalid",
+                    message=message or type(exc).__name__,
+                    book_id=book_id,
+                )
+            )
+            continue
+        except Exception as exc:
+            record(
+                _diagnostic(
+                    capture_id=capture_id,
+                    entry_id=entry_id,
+                    status="failed",
+                    code="capture_backfill_failed",
+                    message=type(exc).__name__,
+                    book_id=book_id,
+                )
+            )
+            continue
+
+        association = result.receipt.association
+        changed = (
+            not result.replayed
+            and result.receipt.disposition is CaptureArchiveDisposition.CREATED
+        )
+        record(
+            _diagnostic(
+                capture_id=capture_id,
+                entry_id=entry_id,
+                status="created" if changed else "unchanged",
+                code=(
+                    "capture_archive_created"
+                    if changed
+                    else "capture_archive_already_associated"
+                ),
+                message=(
+                    "capture archive association created"
+                    if changed
+                    else "stable capture archive association already exists"
+                ),
+                changed=changed,
+                book_id=association.book_id,
+                association=association.as_dict(),
+            )
+        )
+
+    failed = counts.get("failed", 0)
+    return {
+        "schema": "org.whl.capture-lib-backfill-report",
+        "version": 1,
+        "mode": "apply" if apply else "dry-run",
+        "ok": failed == 0,
+        "summary": {
+            "total": sum(counts.values()),
+            "created": counts.get("created", 0),
+            "would_create": counts.get("would_create", 0),
+            "unchanged": counts.get("unchanged", 0),
+            "failed": failed,
+            "omitted_diagnostics": omitted,
+        },
+        "diagnostics": diagnostics,
+    }
+
+
+def _load_manual_entries(path: Path) -> dict[str, Any]:
+    try:
+        payload = _read_regular(
+            path,
+            maximum=_MAX_CAPTURE_JSON_BYTES,
+            artifact="manual entries catalogue",
+        )
+    except FileNotFoundError:
+        return {}
+    return _json_object(payload, artifact="manual entries catalogue")
+
+
+def run_capture_archive_backfill(
+    *,
+    manual_entries_path: str | Path,
+    capture_root: str | Path,
+    workspace_root: str | Path,
+    format_module: Any,
+    apply: bool = False,
+    diagnostic_limit: int = _MAX_BACKFILL_DIAGNOSTICS,
+) -> dict[str, Any]:
+    """Compose and run the standalone backfill against one local workspace."""
+
+    from librarytool.adapters.capture_lib import Lib3CaptureArchiveMaterializer
+    from librarytool.adapters.filesystem.capture_archive_repository import (
+        FilesystemCaptureArchiveRepository,
+    )
+    from librarytool.adapters.filesystem.recoverable_write_set import (
+        RecoverableWriteSet,
+    )
+
+    manual_entries = _load_manual_entries(Path(manual_entries_path))
+    materializer = Lib3CaptureArchiveMaterializer(
+        format_module,
+        generator="library-tool/capture-backfill-v1",
+    )
+    service = None
+    association_lookup = None
+    if apply:
+        write_set = RecoverableWriteSet(Path(workspace_root))
+        repository = FilesystemCaptureArchiveRepository(write_set)
+        service = CaptureArchiveService(repository, materializer)
+    else:
+        def inspect_existing(
+            capture_id: str,
+        ) -> CaptureArchiveAssociation | None:
+            return FilesystemCaptureArchiveRepository.inspect_association(
+                workspace_root,
+                capture_id,
+            )
+
+        association_lookup = inspect_existing
+    return backfill_capture_archives(
+        manual_entries,
+        capture_root,
+        materializer=materializer,
+        service=service,
+        association_lookup=association_lookup,
+        apply=apply,
+        diagnostic_limit=diagnostic_limit,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the machine-readable dry-run/apply capture backfill command."""
+
+    import argparse
+
+    import libcommon as lib
+    import libformat
+
+    parser = argparse.ArgumentParser(
+        description="Backfill stable .lib/3 associations for legacy captures."
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and report changes without writing (the default)",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="atomically create missing archive associations",
+    )
+    parser.add_argument(
+        "--manual-entries",
+        type=Path,
+        default=lib.MANUAL_ENTRIES_PATH,
+    )
+    parser.add_argument(
+        "--captures",
+        type=Path,
+        default=lib.DATA_ROOT / "captures",
+    )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=lib.OUTPUT_DIR,
+    )
+    parser.add_argument(
+        "--diagnostic-limit",
+        type=int,
+        default=_MAX_BACKFILL_DIAGNOSTICS,
+    )
+    args = parser.parse_args(argv)
+    apply = bool(args.apply)
+    try:
+        report = run_capture_archive_backfill(
+            manual_entries_path=args.manual_entries,
+            capture_root=args.captures,
+            workspace_root=args.workspace,
+            format_module=libformat,
+            apply=apply,
+            diagnostic_limit=args.diagnostic_limit,
+        )
+    except (EngineError, OSError, TypeError, ValueError) as exc:
+        report = {
+            "schema": "org.whl.capture-lib-backfill-report",
+            "version": 1,
+            "mode": "apply" if apply else "dry-run",
+            "ok": False,
+            "summary": {
+                "total": 1,
+                "created": 0,
+                "would_create": 0,
+                "unchanged": 0,
+                "failed": 1,
+                "omitted_diagnostics": 0,
+            },
+            "diagnostics": [
+                _diagnostic(
+                    capture_id="",
+                    status="failed",
+                    code=(
+                        str(exc.code)
+                        if isinstance(exc, EngineError)
+                        else "capture_backfill_setup_failed"
+                    ),
+                    message=str(exc) or type(exc).__name__,
+                )
+            ],
+        }
+    print(
+        json.dumps(
+            report,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    return 0 if report["ok"] else 1
+
+
 __all__ = [
+    "backfill_capture_archives",
     "build_capture_archive_command",
     "build_capture_archive_source",
+    "main",
+    "run_capture_archive_backfill",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

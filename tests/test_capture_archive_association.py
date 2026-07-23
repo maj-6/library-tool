@@ -710,6 +710,39 @@ def test_operation_and_source_revision_conflicts_fail_closed(tmp_path):
     assert reseal_error.value.code == "capture_archive_reseal_required"
 
 
+def test_legacy_book_identity_override_is_fingerprint_bound_and_preserved(
+    tmp_path,
+):
+    service, _repository, _materializer = _service(tmp_path)
+    source = _source()
+    canonical = AssociateCaptureArchiveCommand(
+        source,
+        "operation-canonical",
+    )
+    explicit_canonical = AssociateCaptureArchiveCommand(
+        source,
+        "operation-explicit-canonical",
+        book_id=capture_book_id(source.capture_id),
+    )
+    legacy_book_id = "b-fedcba0987654321fedcba0987654321"
+    legacy = AssociateCaptureArchiveCommand(
+        source,
+        "operation-legacy",
+        book_id=legacy_book_id,
+    )
+
+    assert explicit_canonical.fingerprint == canonical.fingerprint
+    assert legacy.fingerprint != canonical.fingerprint
+
+    created = service.associate(legacy)
+    assert created.receipt.association.book_id == legacy_book_id
+    assert service.get(source.capture_id).book_id == legacy_book_id
+
+    with pytest.raises(ConflictError) as conflict:
+        service.associate(canonical)
+    assert conflict.value.code == "capture_book_identity_conflict"
+
+
 def test_stale_transition_is_idempotent_and_preserves_historical_replay(
     tmp_path,
 ):

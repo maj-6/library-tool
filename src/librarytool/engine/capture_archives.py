@@ -608,6 +608,7 @@ class CaptureArchiveSource:
 class AssociateCaptureArchiveCommand:
     source: CaptureArchiveSource
     operation_id: str
+    book_id: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, CaptureArchiveSource):
@@ -617,6 +618,19 @@ class AssociateCaptureArchiveCommand:
             "operation_id",
             _identifier(self.operation_id, "operation_id"),
         )
+        requested_book_id = self.book_id
+        if requested_book_id == "":
+            requested_book_id = capture_book_id(self.source.capture_id)
+        if (
+            not isinstance(requested_book_id, str)
+            or not _BOOK_ID_RE.fullmatch(requested_book_id)
+        ):
+            raise _validation(
+                "book_id must be a stable lib identity",
+                code="invalid_capture_archive_command",
+                field_name="book_id",
+            )
+        object.__setattr__(self, "book_id", requested_book_id)
 
     @property
     def fingerprint(self) -> str:
@@ -625,6 +639,11 @@ class AssociateCaptureArchiveCommand:
             "version": _CAPTURE_ARCHIVE_COMMAND_VERSION,
             "source": self.source.descriptor(),
         }
+        # Preserve the original command fingerprint for ordinary canonical
+        # imports. A legacy identity override is exceptional and must be bound
+        # into its own idempotency command.
+        if self.book_id != capture_book_id(self.source.capture_id):
+            command["book_id"] = self.book_id
         return hashlib.sha256(
             _canonical_json(command, field_name="command")
         ).hexdigest()
@@ -998,7 +1017,7 @@ class CaptureArchiveService:
                 self._validate_result(command, existing)
                 return existing
 
-            book_id = capture_book_id(command.source.capture_id)
+            book_id = command.book_id
             archive = self._materializer.materialize(
                 command.source,
                 book_id=book_id,
@@ -1050,10 +1069,7 @@ class CaptureArchiveService:
                 details={"cause": type(exc).__name__},
                 retryable=True,
             ) from exc
-        if association is not None and (
-            association.capture_id != normalized
-            or association.book_id != capture_book_id(normalized)
-        ):
+        if association is not None and association.capture_id != normalized:
             raise RepositoryError(
                 "the capture archive repository returned another identity",
                 code="invalid_capture_archive_storage",
@@ -1080,7 +1096,6 @@ class CaptureArchiveService:
             ) from exc
         if association is not None and (
             association.capture_id != normalized
-            or association.book_id != capture_book_id(normalized)
             or association.state is not CaptureArchiveState.STALE
         ):
             raise RepositoryError(
@@ -1107,7 +1122,7 @@ class CaptureArchiveService:
             receipt.operation_id != command.operation_id
             or receipt.command_sha256 != command.fingerprint
             or association.capture_id != command.source.capture_id
-            or association.book_id != capture_book_id(command.source.capture_id)
+            or association.book_id != command.book_id
             or association.source_revision != command.source.source_revision
             or association.source_fingerprint != command.source.fingerprint
         ):

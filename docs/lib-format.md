@@ -541,3 +541,28 @@ recoverable state transition to mark the association `stale`; historical
 idempotency receipts remain verifiable against the same archive. An explicit
 future reseal may replace that snapshot. The archive is never the live
 Corrections database.
+
+Legacy desktop stores can be inspected and repaired with the standalone
+backfill command:
+
+```text
+python tools/capture_lib.py --dry-run
+python tools/capture_lib.py --apply
+```
+
+Dry-run is the default. It reads the manual catalogue and capture directories,
+materializes each candidate in temporary storage for validation, and emits one
+`org.whl.capture-lib-backfill-report` version 1 JSON document without
+recovering or changing the target workspace. Apply uses the same recoverable
+archive/association transaction as live intake. Each capture is independent:
+missing or corrupt assets produce a bounded diagnostic and processing
+continues, so a later apply resumes failed rows while already-associated rows
+remain unchanged.
+
+Normal intake still derives `book_id` from the capture identity. Backfill also
+accepts a valid legacy `book_id` already stored on the manual entry (including
+its legacy `extra` projection), binds that exception into the idempotency
+fingerprint, and preserves it in the archive and association. With no existing
+identity it uses the same deterministic capture-derived ID. The command never
+edits the manual catalogue, deletes or replaces capture originals, exposes a
+local path in diagnostics, or advances a cloud status/association.
