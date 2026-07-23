@@ -70,6 +70,10 @@ class HomeListResourceTest {
         assertTrue(source.contains("parentId = parentId"))
         assertTrue(source.contains("R.id.cancelCollectionEdit"))
         assertTrue(source.contains("R.id.saveCollectionEdit"))
+        assertTrue(source.contains("val isRetiredConflict = existing?.deleted == true"))
+        assertTrue(source.contains("Collections.retagRetired(this, checkNotNull(existing).id"))
+        assertTrue(source.contains("R.string.collections_retag_retired_title"))
+        assertTrue(source.contains("delete.visibility = View.GONE"))
     }
 
     @Test
@@ -123,6 +127,7 @@ class HomeListResourceTest {
         for ((id, icon) in listOf(
             "tabScans" to "@drawable/ic_scans",
             "tabCollections" to "@drawable/ic_collections",
+            "tabInspect" to "@drawable/ic_inspect",
         )) {
             val tab = elementById(home, id)
             assertEquals(icon, tab.getAttributeNS(appNs, "icon"))

@@ -17,6 +17,9 @@ class HomeLifecyclePerformanceTest {
         val stopLoading = section("private fun stopHomeLoading()", "private fun configureScanRowAccessibility")
         assertTrue(stopLoading.contains("cancelScheduledWorkerRefresh()"))
         assertTrue(stopLoading.contains("cancelScanListLoading()"))
+        assertTrue(stopLoading.contains("cancelCollectionBarLoading()"))
+        assertTrue(stopLoading.contains("cancelCollectionListLoading()"))
+        assertTrue(stopLoading.contains("cancelInspectLoading()"))
         assertTrue(stopLoading.contains("resetThumbnailLoading()"))
 
         val resetThumbnails =
@@ -54,6 +57,51 @@ class HomeLifecyclePerformanceTest {
     }
 
     @Test
+    fun inspectInventoryAndPhotoContractReadsRunOffTheUiThread() {
+        val refresh = section("private fun refreshInspect()", "private fun renderInspect(")
+        assertTrue(refresh.contains("withContext(Dispatchers.IO)"))
+        assertTrue(refresh.contains("CollectionInventory.items(this@HomeActivity)"))
+        assertTrue(refresh.contains("Entries.statusLabel(this@HomeActivity, it)"))
+        assertTrue(refresh.contains("item.current?.thumbnailDescriptor()"))
+
+        val render = section("private fun renderInspect(", "override fun onDestroy()")
+        assertFalse(render.contains("CollectionInventory.items("))
+        assertFalse(render.contains("Entries.statusLabel("))
+        assertFalse(render.contains("thumbnailDescriptor()"))
+        assertTrue(render.contains("snapshot.statusLabel"))
+        assertTrue(render.contains("snapshot.thumbnail"))
+        assertTrue(render.contains("setDynamicThumbnail(image, bitmap)"))
+        assertTrue(render.contains("selectedItems.take(inspectVisibleBookLimit)"))
+        assertTrue(render.contains("INSPECT_BOOK_PAGE_SIZE"))
+        assertTrue(render.contains("R.string.inspect_show_more"))
+        assertTrue(render.contains("!image.isAttachedToWindow"))
+        assertTrue(render.contains("decodedBitmap?.takeIf { !it.isRecycled }?.recycle()"))
+    }
+
+    @Test
+    fun collectionBookCountsRunOffTheUiThread() {
+        val refresh = section("private fun refreshCollections()", "private fun renderCollections(")
+        assertTrue(refresh.contains("withContext(Dispatchers.IO)"))
+        assertTrue(refresh.contains("CollectionInventory.items(this@HomeActivity)"))
+
+        val render = section("private fun renderCollections(", "private fun emptyNotice")
+        assertFalse(render.contains("CollectionInventory.items("))
+        assertTrue(render.contains("snapshot.bookCounts"))
+    }
+
+    @Test
+    fun collectionBarRefreshRunsOffTheUiThreadWithoutRebuildingTheScanList() {
+        val refresh = section("private fun refreshCollectionBar()", "private fun renderCollectionBar(")
+        assertTrue(refresh.contains("withContext(Dispatchers.IO)"))
+        assertTrue(refresh.contains("Collections.allRecords(this@HomeActivity)"))
+        assertTrue(refresh.contains("activeTab != HomeTab.SCANS"))
+
+        val scheduler =
+            section("private fun scheduleWorkerRefresh", "private fun cancelScheduledWorkerRefresh")
+        assertTrue(scheduler.contains("HomeTab.SCANS -> refreshCollectionBar()"))
+    }
+
+    @Test
     fun workerInvalidationsAreCoalescedAndResumePerformsTheAuthoritativeRefresh() {
         val observers = section(
             "// when background OCR / upload lands",
@@ -82,7 +130,7 @@ class HomeLifecyclePerformanceTest {
 
         val onResume = section("override fun onResume()", "override fun onStop()")
         assertTrue(onResume.contains("cancelScheduledWorkerRefresh()"))
-        assertTrue(onResume.contains("showTab(showingCollections)"))
+        assertTrue(onResume.contains("showTab(activeTab)"))
     }
 
     private fun section(start: String, end: String): String =

@@ -45,6 +45,13 @@ internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
     val id = row.optString("id").trim()
     val name = normalizeCollectionField(row.optString("name"))
     if (id.isEmpty() || name.isEmpty()) return null
+    val rawTagId = when (val rawTag = row.opt("tag_id")) {
+        null, JSONObject.NULL -> null
+        is String -> rawTag
+        else -> return null
+    }
+    val tagId = normalizeCollectionTagId(rawTagId.orEmpty())
+        .ifEmpty { defaultCollectionTagId(name) }
     val mergedInto = if (row.isNull("merged_into")) null
     else row.optString("merged_into").trim().ifEmpty { null }
     val parentId = if (row.isNull("parent_id")) null
@@ -57,6 +64,7 @@ internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
         deleted = row.optBoolean("deleted", false),
         mergedInto = mergedInto,
         parentId = parentId,
+        tagId = tagId,
     )
 }
 
@@ -73,7 +81,17 @@ internal fun collectCollectionPages(
         val rows = fetchPage(afterId)
         if (rows.length() == 0) return out
         for (index in 0 until rows.length()) {
-            rows.optJSONObject(index)?.let(::cloudCollectionFromJson)?.let(out::add)
+            rows.optJSONObject(index)?.let(::cloudCollectionFromJson)?.let { parsed ->
+                // A legacy cloud snapshot can contain null tags. Resolve its
+                // in-memory fallback deterministically across pagination too.
+                val uniqueTagId = resolveCollectionTagId(
+                    parsed.name,
+                    out,
+                    preferredTagId = parsed.tagId,
+                )
+                out += if (uniqueTagId == parsed.tagId) parsed
+                else parsed.copy(tagId = uniqueTagId)
+            }
         }
         val next = rows.optJSONObject(rows.length() - 1)
             ?.optString("id")
@@ -96,6 +114,7 @@ internal fun collectionCloudBody(
     .put("id", row.id)
     .put("name", row.name)
     .put("from_place", row.from)
+    .put("tag_id", canonicalCollectionTagId(row))
     // JSON null deliberately clears a parent during PATCH.
     .put("parent_id", row.parentId ?: JSONObject.NULL)
     .put("deleted", row.deleted)
@@ -115,7 +134,11 @@ class SupabaseClient(
     expectedUserId: String? = null,
 ) {
 
-    class HttpException(val code: Int, message: String) : IOException(message)
+    class HttpException(
+        val code: Int,
+        message: String,
+        val responseBody: String = "",
+    ) : IOException(message)
     class SignedOut : IOException("signed out")
     class AccountChanged : IOException("account changed during delivery")
     class ObjectTooLarge : IOException("private object exceeds the download limit")
@@ -158,7 +181,9 @@ class SupabaseClient(
         } catch (e: Exception) {
             if (code in 200..299) throw e else ""
         }
-        if (code !in 200..299) throw HttpException(code, "HTTP $code: ${body.take(300)}")
+        if (code !in 200..299) {
+            throw HttpException(code, "HTTP $code: ${body.take(300)}", body)
+        }
         return body
     }
 
@@ -449,7 +474,7 @@ class SupabaseClient(
         val conn = open(
             "GET",
             "$baseUrl/rest/v1/collections" +
-                "?select=id,name,from_place,updated_at,deleted,merged_into,parent_id" +
+                "?select=id,name,from_place,tag_id,updated_at,deleted,merged_into,parent_id" +
                 "&order=id.asc&limit=$COLLECTION_PAGE_SIZE$cursor",
             null,
         )
