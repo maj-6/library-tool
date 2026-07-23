@@ -404,6 +404,7 @@ def _windows_open_directory_guard(path: Path) -> int:
 
     file_read_attributes = 0x00000080
     share_read = 0x00000001
+    share_write = 0x00000002
     open_existing = 3
     flag_backup_semantics = 0x02000000
     flag_open_reparse_point = 0x00200000
@@ -425,10 +426,10 @@ def _windows_open_directory_guard(path: Path) -> int:
     handle = create_file(
         str(path),
         file_read_attributes,
-        # Read sharing is sufficient for the contained read. Excluding write
-        # and delete sharing also prevents a guarded directory from being
-        # retargeted as a junction or replaced while the file is verified.
-        share_read,
+        # Excluding delete sharing is defense in depth. The authority proof
+        # below does not rely on sharing semantics: it revalidates the exact
+        # canonical root-to-parent handle chain after opening the file.
+        share_read | share_write,
         None,
         open_existing,
         flag_backup_semantics | flag_open_reparse_point,
@@ -484,22 +485,39 @@ def _open_authorized_descriptor(
                     or _is_redirecting_path(directory.path)
                 ):
                     raise OSError("authority path component identity changed")
-            root_guard_path = _windows_descriptor_path(guards[0])
+            guard_paths = tuple(
+                _windows_descriptor_path(guard) for guard in guards
+            )
             if any(
-                not _windows_path_is_below(
-                    _windows_descriptor_path(guard),
-                    root_guard_path,
+                not _windows_path_is_below(child, parent)
+                for parent, child in zip(
+                    guard_paths[:-1],
+                    guard_paths[1:],
+                    strict=True,
                 )
-                for guard in guards[1:]
             ):
                 raise OSError("authority path component escaped its root")
             descriptor = os.open(path, file_flags)
             try:
+                guard_paths = tuple(
+                    _windows_descriptor_path(guard) for guard in guards
+                )
+                if any(
+                    not _windows_path_is_below(child, parent)
+                    for parent, child in zip(
+                        guard_paths[:-1],
+                        guard_paths[1:],
+                        strict=True,
+                    )
+                ):
+                    raise OSError(
+                        "authority path component changed while opening"
+                    )
                 if not _windows_path_is_below(
                     _windows_descriptor_path(descriptor),
-                    root_guard_path,
+                    guard_paths[-1],
                 ):
-                    raise OSError("opened file escaped its authority root")
+                    raise OSError("opened file escaped its authority parent")
             except BaseException:
                 os.close(descriptor)
                 raise
