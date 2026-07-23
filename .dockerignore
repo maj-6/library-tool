@@ -1,0 +1,17 @@
+**
+!pyproject.toml
+!src/
+!src/librarytool/
+!src/librarytool/**
+!services/
+!services/image_processor/
+!services/image_processor/pyproject.toml
+!services/image_processor/README.md
+!services/image_processor/requirements.lock
+!services/image_processor/Dockerfile
+!services/image_processor/whl_image_processor/
+!services/image_processor/whl_image_processor/**
+services/image_processor/.env
+services/image_processor/.venv/
+**/__pycache__/
+**/.pytest_cache/

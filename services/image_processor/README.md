@@ -99,6 +99,7 @@ inside this directory and fill only your local copy.
 python -m venv services/image_processor/.venv
 services/image_processor/.venv/Scripts/python -m pip install -r services/image_processor/requirements-dev.txt
 services/image_processor/.venv/Scripts/python -m pip install --no-deps page-dewarp==0.3.4
+services/image_processor/.venv/Scripts/python -m pip install --no-deps -e .
 services/image_processor/.venv/Scripts/python -m pip install --no-deps -e services/image_processor
 services/image_processor/.venv/Scripts/python -m pytest services/image_processor/tests
 ```
@@ -106,10 +107,12 @@ services/image_processor/.venv/Scripts/python -m pytest services/image_processor
 Build the same container that will run in production:
 
 ```powershell
-docker build -t whl-image-processor:local services/image_processor
+docker build -f services/image_processor/Dockerfile -t whl-image-processor:local .
 docker run --rm --env-file services/image_processor/.env whl-image-processor:local python -m whl_image_processor.worker --limit 10
 ```
 
+The repository root is the image build context because the worker installs the
+same `librarytool.processing` package used by the desktop correction engine.
 The container installs `requirements.lock`; update that lock deliberately when
 upgrading the image stack. `page-dewarp` is installed without dependencies
 because its GUI OpenCV requirement is intentionally supplied by the compatible
@@ -136,7 +139,7 @@ gcloud config set project $ProjectId
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com
 gcloud artifacts repositories create $Repository --repository-format=docker --location=$Region
 gcloud iam service-accounts create whl-image-processor --display-name="WHL image processor"
-gcloud builds submit services/image_processor --tag $Image
+gcloud builds submit . --config services/image_processor/cloudbuild.yaml --substitutions "_IMAGE=$Image"
 ```
 
 Create a Secret Manager secret named `whl-supabase-secret` in the Cloud

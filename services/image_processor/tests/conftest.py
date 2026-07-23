@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import copy
+import sys
+from pathlib import Path
 
 import pytest
+
+
+REPOSITORY_SRC = Path(__file__).resolve().parents[3] / "src"
+if str(REPOSITORY_SRC) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_SRC))
 
 
 def request_document(*, role: str = "title_page") -> dict:

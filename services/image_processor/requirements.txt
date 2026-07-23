@@ -1,4 +1,7 @@
 # Runtime dependencies are exact-pinned so the same container can be rebuilt.
+# The repository-local world-herb-library package is installed separately by
+# the Dockerfile so this worker uses the shared raster kernel from the same
+# source revision.
 fastapi==0.139.2
 httpx==0.28.1
 numpy==2.4.6

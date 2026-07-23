@@ -20,6 +20,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
+from librarytool.processing import raster as _raster_processing
+
 
 class PermanentImageInputError(ValueError):
     """The source or recipe is invalid and retrying cannot repair it."""
@@ -222,18 +224,7 @@ def _decode_source(data: bytes, options: ProcessingOptions) -> _DecodedImage:
 
 
 def _order_quad(points: Any) -> Any:
-    _, np, _, _ = _runtime()
-    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    ordered = np.empty((4, 2), dtype=np.float32)
-    sums = points.sum(axis=1)
-    differences = np.diff(points, axis=1).reshape(-1)
-    ordered[0] = points[int(np.argmin(sums))]  # top left
-    ordered[2] = points[int(np.argmax(sums))]  # bottom right
-    ordered[1] = points[int(np.argmin(differences))]  # top right
-    ordered[3] = points[int(np.argmax(differences))]  # bottom left
-    if len({(float(x), float(y)) for x, y in ordered}) != 4:
-        raise ValueError("Degenerate four-point boundary")
-    return ordered
+    return _raster_processing.order_pixel_quad(points)
 
 
 def _quad_score(quad: Any, contour_area: float, width: int, height: int) -> float:
@@ -342,45 +333,17 @@ def _expand_quad(quad: Any, padding_percent: int, width: int, height: int) -> An
     return expanded.astype(np.float32)
 
 
-def _destination_size(quad: Any, options: ProcessingOptions) -> tuple[int, int]:
-    _, np, _, _ = _runtime()
-    tl, tr, br, bl = _order_quad(quad)
-    widths = (float(np.linalg.norm(tr - tl)), float(np.linalg.norm(br - bl)))
-    heights = (float(np.linalg.norm(bl - tl)), float(np.linalg.norm(br - tr)))
-    # Averaging opposite edges avoids preserving a near/far perspective size
-    # difference in the supposedly rectified image.  Using the longer edge
-    # alone noticeably widens strongly trapezoidal phone captures.
-    width = max(32, int(round(sum(widths) / 2.0)))
-    height = max(32, int(round(sum(heights) / 2.0)))
-    scale = min(
-        1.0,
-        options.max_edge_px / max(width, height),
-        math.sqrt(options.max_megapixels * 1_000_000 / max(width * height, 1)),
-    )
-    return max(32, int(round(width * scale))), max(32, int(round(height * scale)))
-
-
 def _projective_warp(rgb: Any, quad: Any, options: ProcessingOptions) -> tuple[Any, Any]:
-    cv2, np, _, _ = _runtime()
-    output_width, output_height = _destination_size(quad, options)
-    destination = np.array(
-        [
-            [0, 0],
-            [output_width - 1, 0],
-            [output_width - 1, output_height - 1],
-            [0, output_height - 1],
-        ],
-        dtype=np.float32,
-    )
-    matrix = cv2.getPerspectiveTransform(_order_quad(quad), destination)
-    warped = cv2.warpPerspective(
+    # Resolve the service runtime first so its established retryable error is
+    # retained when OpenCV/NumPy are absent.
+    _runtime()
+    result = _raster_processing.apply_pixel_perspective_transform(
         rgb,
-        matrix,
-        (output_width, output_height),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REPLICATE,
+        quad,
+        max_edge_px=options.max_edge_px,
+        max_megapixels=options.max_megapixels,
     )
-    return warped, matrix.astype(np.float64)
+    return result.pixels, result.source_to_output_pixel_homography
 
 
 def _limit_output(rgb: Any, options: ProcessingOptions) -> tuple[Any, Any | None]:
@@ -480,15 +443,14 @@ def _normalised_homography(
     output_width: int,
     output_height: int,
 ) -> tuple[float, ...]:
-    _, np, _, _ = _runtime()
-    source_scale = np.diag([max(source_width - 1, 1), max(source_height - 1, 1), 1.0])
-    output_scale_inverse = np.diag(
-        [1.0 / max(output_width - 1, 1), 1.0 / max(output_height - 1, 1), 1.0]
+    _runtime()
+    return _raster_processing.normalize_pixel_homography(
+        pixel_matrix,
+        source_width=source_width,
+        source_height=source_height,
+        output_width=output_width,
+        output_height=output_height,
     )
-    matrix = output_scale_inverse @ np.asarray(pixel_matrix, dtype=np.float64) @ source_scale
-    if abs(float(matrix[2, 2])) > 1e-12:
-        matrix /= matrix[2, 2]
-    return tuple(round(float(value), 12) for value in matrix.reshape(-1))
 
 
 def _normalise_colour(rgb: Any, strength_percent: int, retention_percent: int) -> Any:
