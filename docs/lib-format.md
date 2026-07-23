@@ -509,3 +509,27 @@ receipt. The engine archive planner exposes the equivalent typed
 `INSTRUCTIONS.md` generated for `lib/3` repeats these invariants for external
 tools: preserve originals, stable identities, provenance, source revisions,
 lineage, checksums, extension data, and human overrides.
+
+### 8.7 Deterministic sealing and capture associations
+
+`libformat.seal_lib(...)` returns the exact bytes written by `write_lib(...)`.
+The writer uses fixed ZIP member timestamps, modes, member order, and
+compression settings, so the same canonical document, explicit `book_id`, and
+generator produce the same archive bytes. Semantic timestamps remain manifest
+data supplied by the caller; filesystem wall-clock metadata never changes the
+archive digest.
+
+Desktop capture intake associates a sealed archive through the engine's
+`org.whl.capture-lib-association` version 1 sidecar. The portable association
+contains `capture_id`, stable `book_id`, archive SHA-256 and byte count,
+`format_version`, `state` (`current` or `stale`), `generated_at`,
+`source_revision`, and a canonical source fingerprint. It never contains a
+local path. The archive, association, and replay receipt are one recoverable
+publication; a receipt is not successful unless its exact association and
+archive remain verifiable.
+
+The initial book identity is UUID5-derived from the canonical capture identity,
+so retries and independent LAN/cloud delivery cannot mint a second book. A
+later promotion copies this identity. Canonical edits mark the association
+`stale` or create an explicit reseal; the archive is a snapshot, never the live
+Corrections database.
