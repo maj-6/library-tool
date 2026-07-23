@@ -87,8 +87,12 @@ any failure.
   protected secret store. Both that key and a signed-in user session are
   required, and they must name the same Supabase project: the user session
   first limits the operation to capture IDs that account may ingest, then the
-  service credential reads/writes only that exact set. A service key by itself
-  never enables phone round-trip publication. Without the protected owner
+  service credential invokes migration 021's exact-ID RPC. That transaction
+  locks the capture, rechecks the signed-in user's current ownership or ingest
+  grant, and compare-and-sets the association plus imported status. Direct
+  service-role table updates cannot write the trusted association columns, and
+  a service key by itself never enables phone round-trip publication. Without
+  the protected owner
   credential, a locally sealed capture must remain remotely `pending` until a
   later retry can atomically publish `status=imported` plus the association.
   A Mistral API key (Settings → Credentials) is
@@ -169,17 +173,23 @@ association writes are service-only and also guarded by a trigger. These
 explicit grants are required on Supabase projects that no longer add Data API
 privileges for new schema objects automatically.
 
-The cloud adapter and Android client in this release understand the
-association and confirmation envelopes. The final desktop seams intentionally
-remain with the capture-import owner: once #239 is present,
-`tools/whl_explorer/server.py` must pass its exact association to
+The desktop passes its exact verified association to
 `publish_capture_lib_association` with separate owner-service and signed-in-user
-configs. The helper rechecks that exact capture ID through user-JWT RLS before
-its service-role CAS write; the caller must not delete remote photos until that
-atomic write succeeds. Its LAN `/lan/capture` receipt
-and `/lan/metadata` projection must add `org.whl.capture-lib-confirmation`
-envelopes from the durable LAN revision ledger. Until those seams land, older
-cloud/LAN responses remain valid but produce no archive marker.
+configs. The helper proves that exact capture through user-JWT RLS and extracts
+the verified subject. A service-role-only RPC then locks the capture, rechecks
+that subject against the current owner or locked ingest grant, and applies the
+association/status CAS in the same transaction. A grant or ownership change
+between proof and write therefore conflicts. Direct service-role association
+column updates are not granted. Remote photos are deleted only after the RPC
+returns the exact accepted association.
+
+LAN `/lan/capture` receipts and `/lan/metadata` projections expose
+`org.whl.capture-lib-confirmation` envelopes. Their independent durable stream
+ledger keeps exact replays stable across restarts, advances revision and
+timestamp when the current/stale association changes, and rotates the stream
+before any safe revision reset after ledger loss or corruption. The raw
+`lib_association` receipt field remains for older paired clients; older
+cloud/LAN responses without a confirmation also remain valid but unconfirmed.
 
 When migration 015 finds a valid processing request in an uploaded capture,
 it atomically changes that row from `pending` to `processing`. The desktop

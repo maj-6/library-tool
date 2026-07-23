@@ -33,6 +33,11 @@ def _isolate_capture_files(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(server, "ENTRIES_DIR", workspace / "entries")
     monkeypatch.setattr(server, "CAPTURES_DIR", workspace / "captures")
+    monkeypatch.setattr(
+        server,
+        "CAPTURE_PHONE_SYNC_STATE_PATH",
+        tmp_path / "capture_phone_sync_state.json",
+    )
     session = server._open_engine_session(workspace)
     aliases = {
         "_engine_session": session,
@@ -476,7 +481,9 @@ def test_cloud_acknowledgement_waits_for_archive_commit(monkeypatch):
     _prepare_capture(monkeypatch)
     capture_id = "a3333333-3333-4333-8333-333333333333"
     write_set = server._ensure_engine_session().write_set
-    marks = []
+    publications = []
+    owner_cfg = {"url": "owner-cloud", "key": "service"}
+    capture_cfg = {"url": "capture-cloud", "key": "user"}
     monkeypatch.setattr(
         server.sbase,
         "download_photo",
@@ -484,8 +491,10 @@ def test_cloud_acknowledgement_waits_for_archive_commit(monkeypatch):
     )
     monkeypatch.setattr(
         server.sbase,
-        "mark_capture",
-        lambda _cfg, remote_id, status: marks.append((remote_id, status)),
+        "publish_capture_lib_association",
+        lambda *args, **kwargs: publications.append((args, kwargs)) or {
+            "lib_association_revision": 8,
+        },
     )
 
     def fail_receipt(index, _path):
@@ -496,33 +505,154 @@ def test_cloud_acknowledgement_waits_for_archive_commit(monkeypatch):
     capture = {
         **_capture(capture_id),
         "photos": ["phone/photo_1.jpg"],
+        "lib_association_revision": 7,
     }
     with pytest.raises(server.EngineRepositoryError):
         server._import_capture(
-            {"url": "capture-cloud"},
+            owner_cfg,
+            capture_cfg,
             capture,
             "",
             False,
         )
-    assert marks == []
+    assert publications == []
     assert server._capture_archive_association(capture_id) is None
 
     monkeypatch.setattr(write_set, "_publish_hook", None)
     result = server._import_capture(
-        {"url": "capture-cloud"},
+        owner_cfg,
+        capture_cfg,
         capture,
         "",
         False,
     )
 
     assert result["status"] == "skipped"
-    assert marks == [(capture_id, "imported")]
+    association = server._capture_archive_association(capture_id)
+    assert result["lib_association"] == association.as_dict()
+    assert publications == [(
+        (
+            owner_cfg,
+            capture_cfg,
+            capture_id,
+            association.as_dict(),
+        ),
+        {"expected_revision": 7, "mark_imported": True},
+    )]
+
+
+def test_cloud_import_without_owner_keeps_remote_pending_and_photos(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a6666666-6666-4666-8666-666666666666"
+    capture_cfg = {"url": "capture-cloud", "key": "user"}
+    publications = []
+    deletions = []
+    monkeypatch.setattr(
+        server.sbase,
+        "download_photo",
+        lambda _cfg, _path: _jpeg(capture_id),
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        lambda *args, **kwargs: publications.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "delete_photos",
+        lambda *args: deletions.append(args),
+    )
+
+    result = server._import_capture(
+        None,
+        capture_cfg,
+        {
+            **_capture(capture_id),
+            "photos": ["phone/photo_1.jpg"],
+        },
+        "",
+        True,
+    )
+
+    assert result["status"] == "imported"
+    assert "owner service credential is required" in result["sync_error"]
     assert result["lib_association"] == (
         server._capture_archive_association(capture_id).as_dict()
     )
+    assert publications == []
+    assert deletions == []
 
 
-def test_lan_import_and_duplicate_return_same_portable_association(
+def test_cloud_acknowledgement_exact_retry_precedes_photo_cleanup(monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a7777777-7777-4777-8777-777777777777"
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+    events = []
+    monkeypatch.setattr(
+        server.sbase,
+        "download_photo",
+        lambda _cfg, _path: _jpeg(capture_id),
+    )
+
+    def publish(*args, **kwargs):
+        events.append(("publish", args, kwargs))
+        if sum(event[0] == "publish" for event in events) == 1:
+            raise server.sbase.SyncError("response lost after commit")
+        return {"lib_association_revision": 1}
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        publish,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "delete_photos",
+        lambda cfg, paths: events.append(("delete", cfg, paths)),
+    )
+    capture = {
+        **_capture(capture_id),
+        "photos": ["phone/photo_1.jpg"],
+    }
+
+    result = server._import_capture(
+        owner_cfg,
+        capture_cfg,
+        capture,
+        "",
+        True,
+    )
+
+    association = server._capture_archive_association(capture_id)
+    assert result["status"] == "imported"
+    assert [event[0] for event in events] == [
+        "publish",
+        "publish",
+        "delete",
+    ]
+    first = events[0]
+    second = events[1]
+    assert first[1:] == second[1:]
+    assert first[1] == (
+        owner_cfg,
+        capture_cfg,
+        capture_id,
+        association.as_dict(),
+    )
+    assert first[2] == {
+        "expected_revision": 0,
+        "mark_imported": True,
+    }
+    assert events[2] == (
+        "delete",
+        capture_cfg,
+        ["phone/photo_1.jpg"],
+    )
+
+
+def test_lan_import_duplicate_and_stale_return_monotonic_confirmation(
         monkeypatch, data_root):
     _prepare_capture(monkeypatch)
     capture_id = "a4444444-4444-4444-8444-444444444444"
@@ -552,17 +682,54 @@ def test_lan_import_and_duplicate_return_same_portable_association(
 
     first = send()
     second = send()
+    server._mark_capture_archive_stale(capture_id)
+    stale_response = send()
 
-    assert first.status_code == second.status_code == 200
+    assert first.status_code == second.status_code == \
+        stale_response.status_code == 200
     first_body = first.get_json()
     second_body = second.get_json()
+    stale_body = stale_response.get_json()
     assert first_body["status"] == "imported"
     assert second_body["status"] == "duplicate"
     assert second_body["lib_association"] == first_body["lib_association"]
+    assert second_body["lib_confirmation"] == first_body["lib_confirmation"]
     assert first_body["lib_association"]["capture_id"] == capture_id
     assert first_body["lib_association"]["book_id"] == (
         server.capture_book_id(capture_id)
     )
+    first_confirmation = first_body["lib_confirmation"]
+    stale_confirmation = stale_body["lib_confirmation"]
+    assert set(first_confirmation) == {
+        "schema",
+        "version",
+        "capture_id",
+        "stream_id",
+        "revision",
+        "updated_at",
+        "association",
+    }
+    assert first_confirmation["revision"] == 1
+    assert stale_confirmation["stream_id"] == first_confirmation["stream_id"]
+    assert stale_confirmation["revision"] == 2
+    assert stale_confirmation["updated_at"] > first_confirmation["updated_at"]
+    assert stale_confirmation["association"]["state"] == "stale"
+    assert stale_body["lib_association"] == stale_confirmation["association"]
+    metadata = server._lan_metadata_exchange({
+        "capture_ids": [capture_id],
+        "reviews": [],
+    })
+    assert metadata["associations"] == [stale_confirmation]
+    snapshot = server._capture_phone_sync_state()[
+        "lan_confirmations"
+    ][capture_id]
+    assert set(snapshot) == {
+        "fingerprint",
+        "revision",
+        "updated_at",
+        "last_seen_at",
+    }
+    assert "association" not in snapshot
     portable = json.dumps(first_body, sort_keys=True)
     assert str(data_root) not in portable
     assert ".engine" not in portable
@@ -1388,3 +1555,104 @@ def test_lan_rejects_nonportable_id_instead_of_returning_aliased_receipt(
     }
     assert server._capture_archive_association("abcdef") is None
     assert lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) == {}
+
+
+def test_lan_confirmation_commit_failure_returns_500_and_retry_repairs(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a9999999-9999-4999-8999-999999999999"
+    monkeypatch.setattr(server, "_lan_token", lambda: "paired-secret")
+    monkeypatch.setattr(server, "_client_settings", lambda: {})
+    monkeypatch.setattr(
+        server,
+        "_lease_secret",
+        lambda _key: contextlib.nullcontext(""),
+    )
+    original_save_json = lib.save_json
+
+    def fail_confirmation_state(path, value):
+        if path == server.CAPTURE_PHONE_SYNC_STATE_PATH:
+            raise OSError("injected confirmation ledger failure")
+        return original_save_json(path, value)
+
+    monkeypatch.setattr(lib, "save_json", fail_confirmation_state)
+    client = server.lan_app.test_client()
+
+    def send():
+        return client.post(
+            "/lan/capture",
+            headers={"X-WHL-Token": "paired-secret"},
+            data={
+                "meta": json.dumps(_capture(capture_id)),
+                "photo": (
+                    io.BytesIO(_jpeg(capture_id)),
+                    "photo_1.jpg",
+                ),
+            },
+            content_type="multipart/form-data",
+        )
+
+    failed = send()
+    assert failed.status_code == 500
+    assert server._capture_archive_association(capture_id) is not None
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    assert sum(
+        isinstance(entry, dict) and entry.get("capture_id") == capture_id
+        for entry in entries.values()
+    ) == 1
+
+    monkeypatch.setattr(lib, "save_json", original_save_json)
+    repaired = send()
+    assert repaired.status_code == 200
+    body = repaired.get_json()
+    assert body["status"] == "duplicate"
+    assert body["lib_confirmation"]["revision"] == 1
+
+
+def test_malformed_or_lost_lan_confirmation_ledger_rotates_stream(monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "abbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    monkeypatch.setattr(server, "_lan_token", lambda: "paired-secret")
+    monkeypatch.setattr(server, "_client_settings", lambda: {})
+    monkeypatch.setattr(
+        server,
+        "_lease_secret",
+        lambda _key: contextlib.nullcontext(""),
+    )
+    client = server.lan_app.test_client()
+
+    def send():
+        return client.post(
+            "/lan/capture",
+            headers={"X-WHL-Token": "paired-secret"},
+            data={
+                "meta": json.dumps(_capture(capture_id)),
+                "photo": (
+                    io.BytesIO(_jpeg(capture_id)),
+                    "photo_1.jpg",
+                ),
+            },
+            content_type="multipart/form-data",
+        )
+
+    first = send()
+    assert first.status_code == 200
+    first_confirmation = first.get_json()["lib_confirmation"]
+    state = lib.load_json(server.CAPTURE_PHONE_SYNC_STATE_PATH, {})
+    state["lan_confirmations"][capture_id]["revision"] = True
+    lib.save_json(server.CAPTURE_PHONE_SYNC_STATE_PATH, state)
+
+    replay = send()
+
+    assert replay.status_code == 200
+    confirmation = replay.get_json()["lib_confirmation"]
+    assert confirmation["stream_id"] != first_confirmation["stream_id"]
+    assert confirmation["revision"] == 1
+    assert confirmation["association"] == first_confirmation["association"]
+
+    server.CAPTURE_PHONE_SYNC_STATE_PATH.unlink()
+    after_loss = send()
+    assert after_loss.status_code == 200
+    recovered = after_loss.get_json()["lib_confirmation"]
+    assert recovered["stream_id"] != confirmation["stream_id"]
+    assert recovered["revision"] == 1

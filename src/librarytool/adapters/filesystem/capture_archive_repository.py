@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ...engine.capture_archives import (
+    CAPTURE_LIB_MAX_ARCHIVE_BYTES,
     AssociateCaptureArchiveCommand,
     CaptureArchiveAssociation,
     CaptureArchiveDisposition,
@@ -39,7 +40,7 @@ _ASSOCIATION_ROOT = PurePosixPath(".engine/capture-lib/associations")
 _RECEIPT_ROOT = PurePosixPath(".engine/receipts/capture-lib")
 _ARCHIVE_ROOT = PurePosixPath(".engine/capture-lib/objects")
 _MAX_DOCUMENT_BYTES = 128 * 1024
-_MAX_ARCHIVE_BYTES = 250 * 1024 * 1024
+_MAX_ARCHIVE_BYTES = CAPTURE_LIB_MAX_ARCHIVE_BYTES
 
 
 class _ReadOnlyWorkspaceRoot:

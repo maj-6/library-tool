@@ -221,14 +221,27 @@ def _capture_lib_association_write(raw: dict,
     return value
 
 
-def _jwt_role(value: str) -> str:
+def _jwt_claims(value: str) -> dict:
     try:
         body = value.split(".")[1]
         body += "=" * (-len(body) % 4)
         payload = json.loads(base64.urlsafe_b64decode(body))
-        return str(payload.get("role") or "").strip()
+        return payload if isinstance(payload, dict) else {}
     except Exception:
+        return {}
+
+
+def _jwt_role(value: str) -> str:
+    return str(_jwt_claims(value).get("role") or "").strip()
+
+
+def _jwt_subject(value: str) -> str:
+    subject = str(_jwt_claims(value).get("sub") or "").strip()
+    try:
+        normalized = str(uuid.UUID(subject))
+    except (AttributeError, ValueError):
         return ""
+    return normalized if subject == normalized else ""
 
 
 def _service_write_config(cfg: dict) -> None:
@@ -260,12 +273,16 @@ def _capture_lib_publish_configs(service_cfg: dict,
         not service_url
         or service_url != scope_url
         or service_table != scope_table
-        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", service_table)
+        or service_table != "captures"
     ):
-        raise SyncError("capture archive credentials target different projects")
+        raise SyncError(
+            "capture archive credentials target different projects "
+            "or unsupported tables"
+        )
     if (
         not access_token
         or _jwt_role(access_token) != "authenticated"
+        or not _jwt_subject(access_token)
         or access_token == str(service_cfg.get("key") or "").strip()
         or scope_key.startswith("sb_secret_")
         or _jwt_role(scope_key) == "service_role"
@@ -286,9 +303,10 @@ def publish_capture_lib_association(
     """CAS-publish one trusted association, optionally with imported status.
 
     ``service_cfg`` is the protected owner credential and ``scope_cfg`` carries
-    a distinct signed-in user's JWT. The exact capture id is re-read through
-    RLS immediately before the service-role PATCH; service-role RLS bypass is
-    never permission to discover or enumerate captures.
+    a distinct signed-in user's JWT. The exact capture id is first proven
+    through user RLS. A narrowly granted service RPC then locks that row and
+    transactionally rechecks the proven subject against its current owner or
+    ingest grant before applying the association/status compare-and-set.
     """
     service_cfg, scope_cfg = _capture_lib_publish_configs(service_cfg, scope_cfg)
     ids = _capture_sync_ids((capture_id,))
@@ -303,46 +321,29 @@ def publish_capture_lib_association(
         or not isinstance(expected_revision, int)
         or expected_revision < 0
         or expected_revision >= 9223372036854775807
+        or not isinstance(mark_imported, bool)
     ):
         raise SyncError("capture archive expected revision is invalid")
     capture_id = ids[0]
     desired = _capture_lib_association_write(association, capture_id)
     if list_capture_ids(scope_cfg, (capture_id,), chunk=1) != [capture_id]:
         raise SyncError("capture archive publication is outside the signed-in user scope")
-    table = service_cfg.get("table") or "captures"
-    encoded = urllib.parse.quote(capture_id, safe="")
-    selected = (
-        "id,status,lib_association,lib_association_revision,"
-        "lib_association_updated_at"
-    )
-    filters = (
-        f"id=eq.{encoded}&lib_association_revision=eq.{expected_revision}"
-    )
-    if mark_imported:
-        filters += "&status=eq.pending"
-    payload = {"lib_association": desired}
-    if mark_imported:
-        payload["status"] = "imported"
+    actor_id = _jwt_subject(str(scope_cfg.get("access_token") or ""))
     response = _rest(
         service_cfg,
-        "PATCH",
-        f"{table}?{filters}&select={selected}",
-        payload,
-        prefer="return=representation",
+        "POST",
+        "rpc/publish_capture_lib_association",
+        {
+            "p_capture_id": capture_id,
+            "p_actor_id": actor_id,
+            "p_association": desired,
+            "p_expected_revision": expected_revision,
+            "p_mark_imported": mark_imported,
+        },
     )
 
-    zero_row_cas = isinstance(response, list) and len(response) == 0
     if isinstance(response, list) and len(response) == 1:
         accepted = response[0]
-    elif zero_row_cas:
-        existing = _rest(
-            service_cfg,
-            "GET",
-            f"{table}?id=eq.{encoded}&select={selected}&limit=2",
-        )
-        if not isinstance(existing, list) or len(existing) != 1:
-            raise SyncError("capture archive association compare-and-set conflict")
-        accepted = existing[0]
     else:
         raise SyncError("capture archive publication returned an invalid row")
     accepted_fields = {
@@ -364,11 +365,10 @@ def publish_capture_lib_association(
     )
     accepted_revision = accepted.get("lib_association_revision")
     accepted_updated_at = accepted.get("lib_association_updated_at")
-    expected_accepted_revisions = (
-        {expected_revision + 1}
-        if zero_row_cas
-        else {expected_revision, expected_revision + 1}
-    )
+    expected_accepted_revisions = {
+        expected_revision,
+        expected_revision + 1,
+    }
     if (
         accepted_association != desired
         or isinstance(accepted_revision, bool)

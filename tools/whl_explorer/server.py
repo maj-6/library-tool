@@ -141,6 +141,7 @@ from librarytool.engine.contracts import (  # noqa: E402
 from librarytool.engine.capture_archives import (  # noqa: E402
     CaptureArchiveAssociation,
     CaptureArchiveService,
+    CaptureArchiveState,
     capture_book_id as capture_book_id,
 )
 from librarytool.engine.errors import (  # noqa: E402
@@ -1634,6 +1635,13 @@ def _capture_phone_sync_state() -> dict:
     shadows = raw.get("review_shadows")
     pending = raw.get("pending_reviews")
     lan_snapshots = raw.get("lan_snapshots")
+    lan_confirmations = copy.deepcopy(raw.get("lan_confirmations"))
+    lan_confirmation_stream_id = copy.deepcopy(
+        raw.get("lan_confirmation_stream_id")
+    )
+    lan_confirmation_fingerprint = copy.deepcopy(
+        raw.get("lan_confirmation_fingerprint")
+    )
     lan_owner_id = str(raw.get("lan_owner_id") or "")
     try:
         lan_owner_id = str(uuid.UUID(lan_owner_id)) if lan_owner_id else ""
@@ -1647,6 +1655,12 @@ def _capture_phone_sync_state() -> dict:
         "pending_reviews": dict(pending) if isinstance(pending, dict) else {},
         "lan_snapshots": dict(lan_snapshots)
         if isinstance(lan_snapshots, dict) else {},
+        # Preserve these raw so corruption cannot be silently normalized by an
+        # unrelated metadata/review sync before confirmation publication sees
+        # it and rotates to a fresh stream.
+        "lan_confirmation_stream_id": lan_confirmation_stream_id,
+        "lan_confirmation_fingerprint": lan_confirmation_fingerprint,
+        "lan_confirmations": lan_confirmations,
         "lan_owner_id": lan_owner_id,
     }
 
@@ -1667,6 +1681,13 @@ def _update_capture_phone_sync_state(mutator) -> dict:
             if isinstance(raw.get("pending_reviews"), dict) else {},
             "lan_snapshots": dict(raw.get("lan_snapshots"))
             if isinstance(raw.get("lan_snapshots"), dict) else {},
+            "lan_confirmation_stream_id": copy.deepcopy(
+                raw.get("lan_confirmation_stream_id")
+            ),
+            "lan_confirmation_fingerprint": copy.deepcopy(
+                raw.get("lan_confirmation_fingerprint")
+            ),
+            "lan_confirmations": copy.deepcopy(raw.get("lan_confirmations")),
             "lan_owner_id": str(raw.get("lan_owner_id") or ""),
         }
         mutator(state)
@@ -20614,7 +20635,67 @@ def _manual_capture_identity(capture_id: str) -> tuple[str, str]:
     return entry_id, title
 
 
-def _import_capture(cfg: dict, cap: dict, mistral_key: str,
+def _cloud_capture_association_revision(cap: dict) -> int:
+    """Return the server-owned CAS revision observed in one pending row."""
+
+    value = cap.get("lib_association_revision", 0)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value >= 9223372036854775807
+    ):
+        raise sbase.SyncError("capture archive revision is invalid")
+    return value
+
+
+def _publish_cloud_capture_acknowledgement(
+        owner_cfg: dict | None,
+        capture_cfg: dict,
+        cap: dict,
+        association: CaptureArchiveAssociation | None) -> dict:
+    """Publish one exact current association through scoped service CAS.
+
+    A second immediate attempt closes the common lost-response window. The
+    locked RPC accepts only the immediately preceding exact attempt as replay;
+    another document or revision remains a conflict.
+    """
+
+    if owner_cfg is None:
+        raise sbase.SyncError(
+            "owner service credential is required for capture acknowledgement"
+        )
+    capture_id = _capture_archive_id(cap.get("id"))
+    if (
+        not capture_id
+        or not isinstance(association, CaptureArchiveAssociation)
+        or association.capture_id != capture_id
+        or association.state is not CaptureArchiveState.CURRENT
+    ):
+        raise sbase.SyncError(
+            "a verified current library archive is required for acknowledgement"
+        )
+    expected_revision = _cloud_capture_association_revision(cap)
+    last_error = None
+    for attempt in range(2):
+        try:
+            return sbase.publish_capture_lib_association(
+                owner_cfg,
+                capture_cfg,
+                capture_id,
+                association.as_dict(),
+                expected_revision=expected_revision,
+                mark_imported=True,
+            )
+        except sbase.SyncError as exc:
+            last_error = exc
+            if attempt:
+                raise
+    raise last_error  # pragma: no cover - the bounded loop always raises/returns
+
+
+def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
+                    cap: dict, mistral_key: str,
                     delete_remote: bool, on_persisted=None) -> dict:
     """Import one pending cloud capture and return its detailed outcome.
 
@@ -20641,7 +20722,8 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
         }
         try:
             # Idempotently repair a lost acknowledgement from an earlier run.
-            sbase.mark_capture(cfg, cap["id"], "imported")
+            _publish_cloud_capture_acknowledgement(
+                owner_cfg, capture_cfg, cap, association)
         except Exception as exc:
             result["sync_error"] = (
                 f"cloud acknowledgement failed: {type(exc).__name__}: {exc}"
@@ -20649,16 +20731,19 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
             return result
         if delete_remote:                                # a lost mark left these behind
             try:
-                sbase.delete_photos(cfg, photo_paths)
+                sbase.delete_photos(capture_cfg, photo_paths)
             except sbase.SyncError:
                 pass
         return result
     try:
-        raw_photos = _download_cloud_capture_photos(cfg, photo_paths)
+        raw_photos = _download_cloud_capture_photos(
+            capture_cfg,
+            photo_paths,
+        )
     except sbase.SyncError as exc:
         if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
             # the photos are gone — this row can never import; stop retrying it
-            sbase.mark_capture(cfg, cap["id"], "error")
+            sbase.mark_capture(capture_cfg, cap["id"], "error")
         raise
     new_id, errors = ingest_capture(
         cap, raw_photos, mistral_key, photo_paths, transport="cloud")
@@ -20686,7 +20771,8 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     if new_id and on_persisted is not None:
         on_persisted(dict(result))
     try:
-        sbase.mark_capture(cfg, cap["id"], "imported")
+        _publish_cloud_capture_acknowledgement(
+            owner_cfg, capture_cfg, cap, association)
     except Exception as exc:
         # The local book is already durable and must remain visible. Leave the
         # remote row pending for a later idempotent acknowledgement repair.
@@ -20698,7 +20784,7 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     # are local too, but leaving the remote set makes recovery foolproof
     if delete_remote and not errors:
         try:
-            sbase.delete_photos(cfg, photo_paths)
+            sbase.delete_photos(capture_cfg, photo_paths)
         except sbase.SyncError as exc:
             result["warnings"].append(
                 f"remote photo cleanup deferred: {type(exc).__name__}: {exc}"
@@ -21857,7 +21943,8 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                              else contextlib.nullcontext(""))
                     with lease as mistral_key:
                         outcome = _import_capture(
-                            capture_cfg, cap, mistral_key, delete_remote,
+                            owner_cfg, capture_cfg, cap, mistral_key,
+                            delete_remote,
                             on_persisted=_cloudsync_book_ready,
                         )
                     status = str(outcome.get("status") or "skipped")
@@ -22207,6 +22294,25 @@ LAN_CAPTURE_MAX_REQUEST_BYTES = CAPTURE_MAX_TOTAL_PHOTO_BYTES
 LAN_CAPTURE_MAX_PHOTOS = CAPTURE_MAX_PHOTOS
 LAN_CAPTURE_MAX_PHOTO_BYTES = CAPTURE_MAX_PHOTO_BYTES
 LAN_SNAPSHOT_MAX_ENTRIES = 2_000
+LAN_CAPTURE_LIB_CONFIRMATION_SCHEMA = "org.whl.capture-lib-confirmation"
+LAN_CAPTURE_LIB_CONFIRMATION_VERSION = 1
+LAN_CAPTURE_LIB_CONFIRMATION_MAX_BYTES = 16 * 1024
+LAN_CAPTURE_LIB_CONFIRMATION_MAX_ENTRIES = 2_000
+_LAN_CAPTURE_LIB_CONFIRMATION_FIELDS = frozenset({
+    "schema",
+    "version",
+    "capture_id",
+    "stream_id",
+    "revision",
+    "updated_at",
+    "association",
+})
+_LAN_CAPTURE_LIB_SNAPSHOT_FIELDS = frozenset({
+    "fingerprint",
+    "revision",
+    "updated_at",
+    "last_seen_at",
+})
 
 
 def _lan_token() -> str:
@@ -22311,6 +22417,248 @@ def _lan_snapshot_owner_id() -> str:
 
         _update_capture_phone_sync_state(reset)
         return owner_id
+
+
+def _lan_capture_lib_timestamp(value) -> datetime:
+    if (
+        not isinstance(value, str)
+        or not 0 < len(value) <= 80
+        or value != value.strip()
+        or not sbase._CAPTURE_LIB_OFFSET_TIMESTAMP.fullmatch(value)
+    ):
+        raise ValueError("LAN archive confirmation timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            "LAN archive confirmation timestamp is invalid"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("LAN archive confirmation timestamp needs an offset")
+    return parsed
+
+
+def _lan_capture_lib_confirmation_write(
+        raw: dict,
+        expected_capture_id: str,
+        expected_stream_id: str) -> dict:
+    """Validate and detach one exact Android-compatible LAN confirmation."""
+
+    if not isinstance(raw, dict) or set(raw) != \
+            _LAN_CAPTURE_LIB_CONFIRMATION_FIELDS:
+        raise ValueError("LAN archive confirmation fields are invalid")
+    try:
+        payload = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        value = json.loads(payload.decode("utf-8"))
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise ValueError("LAN archive confirmation is not strict JSON") from exc
+    if len(payload) > LAN_CAPTURE_LIB_CONFIRMATION_MAX_BYTES:
+        raise ValueError("LAN archive confirmation is too large")
+    capture_id = _canonical_capture_id(value.get("capture_id"))
+    stream_id = _canonical_capture_id(value.get("stream_id"))
+    revision = value.get("revision")
+    if (
+        value.get("schema") != LAN_CAPTURE_LIB_CONFIRMATION_SCHEMA
+        or type(value.get("version")) is not int
+        or value.get("version") != LAN_CAPTURE_LIB_CONFIRMATION_VERSION
+        or not capture_id
+        or capture_id != expected_capture_id
+        or value.get("capture_id") != capture_id
+        or not stream_id
+        or stream_id != expected_stream_id
+        or value.get("stream_id") != stream_id
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision > 9223372036854775807
+    ):
+        raise ValueError("LAN archive confirmation is invalid")
+    _lan_capture_lib_timestamp(value.get("updated_at"))
+    try:
+        value["association"] = sbase._capture_lib_association_write(
+            value.get("association"),
+            capture_id,
+        )
+    except sbase.SyncError as exc:
+        raise ValueError("LAN archive confirmation association is invalid") from exc
+    return value
+
+
+def _lan_capture_lib_snapshot(raw) -> dict:
+    if not isinstance(raw, dict) or set(raw) != \
+            _LAN_CAPTURE_LIB_SNAPSHOT_FIELDS:
+        raise ValueError("LAN archive confirmation snapshot is invalid")
+    fingerprint = raw.get("fingerprint")
+    revision = raw.get("revision")
+    if (
+        not isinstance(fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision > 9223372036854775807
+    ):
+        raise ValueError("LAN archive confirmation snapshot is invalid")
+    _lan_capture_lib_timestamp(raw.get("updated_at"))
+    _lan_capture_lib_timestamp(raw.get("last_seen_at"))
+    return dict(raw)
+
+
+def _lan_capture_lib_map_fingerprint(confirmations: dict) -> str:
+    try:
+        payload = json.dumps(
+            confirmations,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise ValueError("LAN archive confirmation ledger is invalid") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _lan_capture_lib_confirmation(capture_id: str) -> dict | None:
+    """Return one durable monotonic confirmation for a verified association."""
+
+    capture_id = _canonical_capture_id(capture_id)
+    if not capture_id:
+        return None
+    accepted: dict = {}
+    write_set = _ensure_engine_session().write_set
+    # Keep the archive read ordered with its confirmation commit. A concurrent
+    # current -> stale transition cannot publish an older state at a newer
+    # confirmation revision.
+    with write_set.workspace_lease():
+        association = _capture_archive_association(capture_id)
+        if association is None:
+            return None
+        desired = sbase._capture_lib_association_write(
+            association.as_dict(),
+            capture_id,
+        )
+        desired_payload = json.dumps(
+            desired,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        desired_fingerprint = hashlib.sha256(desired_payload).hexdigest()
+
+        def update(state):
+            raw_stream = state.get("lan_confirmation_stream_id")
+            raw_fingerprint = state.get("lan_confirmation_fingerprint")
+            raw_confirmations = state.get("lan_confirmations")
+            stream_id = _canonical_capture_id(raw_stream)
+            confirmations = raw_confirmations
+            reset = (
+                not stream_id
+                or raw_stream != stream_id
+                or not isinstance(raw_fingerprint, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", raw_fingerprint)
+                or not isinstance(confirmations, dict)
+            )
+            if not reset:
+                try:
+                    if _lan_capture_lib_map_fingerprint(confirmations) != \
+                            raw_fingerprint:
+                        raise ValueError(
+                            "LAN archive confirmation ledger changed"
+                        )
+                    for key, snapshot in confirmations.items():
+                        if _canonical_capture_id(key) != key:
+                            raise ValueError(
+                                "LAN archive confirmation id is invalid"
+                            )
+                        _lan_capture_lib_snapshot(snapshot)
+                except ValueError:
+                    reset = True
+            if (
+                not reset
+                and capture_id not in confirmations
+                and len(confirmations) >=
+                LAN_CAPTURE_LIB_CONFIRMATION_MAX_ENTRIES
+            ):
+                reset = True
+            if reset:
+                stream_id = str(uuid.uuid4())
+                confirmations = {}
+
+            previous = None
+            if capture_id in confirmations:
+                previous = _lan_capture_lib_snapshot(
+                    confirmations[capture_id]
+                )
+            previous_revision = (
+                previous["revision"] if previous is not None else 0
+            )
+            if (
+                previous is not None
+                and previous["fingerprint"] != desired_fingerprint
+                and previous_revision == 9223372036854775807
+            ):
+                # A new stream is the only non-wrapping continuation.
+                stream_id = str(uuid.uuid4())
+                confirmations = {}
+                previous = None
+                previous_revision = 0
+
+            now = datetime.now(timezone.utc)
+            now_text = now.isoformat(timespec="microseconds")
+            if (
+                previous is not None
+                and previous["fingerprint"] == desired_fingerprint
+            ):
+                revision = previous_revision
+                updated_at = previous["updated_at"]
+                last_seen_at = max(
+                    now,
+                    _lan_capture_lib_timestamp(previous["last_seen_at"]),
+                ).isoformat(timespec="microseconds")
+            else:
+                revision = previous_revision + 1
+                if previous is not None:
+                    prior_time = _lan_capture_lib_timestamp(
+                        previous["updated_at"]
+                    )
+                    now = max(now, prior_time + timedelta(microseconds=1))
+                    now_text = now.isoformat(timespec="microseconds")
+                updated_at = now_text
+                last_seen_at = now_text
+            candidate = {
+                "schema": LAN_CAPTURE_LIB_CONFIRMATION_SCHEMA,
+                "version": LAN_CAPTURE_LIB_CONFIRMATION_VERSION,
+                "capture_id": capture_id,
+                "stream_id": stream_id,
+                "revision": revision,
+                "updated_at": updated_at,
+                "association": desired,
+            }
+            accepted.update(_lan_capture_lib_confirmation_write(
+                candidate,
+                capture_id,
+                stream_id,
+            ))
+            confirmations[capture_id] = {
+                "fingerprint": desired_fingerprint,
+                "revision": revision,
+                "updated_at": updated_at,
+                "last_seen_at": last_seen_at,
+            }
+            state["lan_confirmation_stream_id"] = stream_id
+            state["lan_confirmation_fingerprint"] = \
+                _lan_capture_lib_map_fingerprint(confirmations)
+            state["lan_confirmations"] = confirmations
+
+        _update_capture_phone_sync_state(update)
+    return accepted
 
 
 def _lan_versioned_capture_rows(capture_ids: list[str]) -> tuple[list[dict],
@@ -22481,10 +22829,22 @@ def _lan_metadata_exchange(payload: dict) -> dict:
             errors.append({"capture_id": capture_id, "error": str(exc)[:200]})
     books, reviews, projection_errors = _lan_versioned_capture_rows(capture_ids)
     errors.extend(projection_errors)
+    associations = []
+    for capture_id in capture_ids:
+        try:
+            confirmation = _lan_capture_lib_confirmation(capture_id)
+            if confirmation is not None:
+                associations.append(confirmation)
+        except Exception as exc:
+            errors.append({
+                "capture_id": capture_id,
+                "error": str(exc)[:200],
+            })
     return {
         "app": "whl-capture",
         "books": books,
         "reviews": reviews,
+        "associations": associations,
         "errors": errors,
     }
 
@@ -22595,14 +22955,31 @@ def _lan_capture():
     except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500
-    association = _capture_archive_association(capture_id)
-    if association is None:
-        log.error(
-            "LAN capture returned without a durable archive: capture=%s",
-            capture_id,
-        )
-        return jsonify(error="capture archive association is unavailable"), 500
-    portable = {"lib_association": association.as_dict()}
+    canonical_capture_id = _canonical_capture_id(capture_id)
+    try:
+        if canonical_capture_id:
+            confirmation = _lan_capture_lib_confirmation(
+                canonical_capture_id
+            )
+            if confirmation is None:
+                raise RuntimeError(
+                    "verified capture archive confirmation is unavailable"
+                )
+            portable = {
+                # Retain the prerelease field for older paired clients.
+                "lib_association": confirmation["association"],
+                "lib_confirmation": confirmation,
+            }
+        else:
+            association = _capture_archive_association(capture_id)
+            portable = (
+                {"lib_association": association.as_dict()}
+                if association is not None
+                else {}
+            )
+    except Exception as exc:
+        log.exception("LAN capture confirmation failed")
+        return jsonify(error=str(exc)[:200]), 500
     if entry_id is None:
         # Idempotent retry. Echo the submitted capture id so Android can prove
         # that this receipt belongs to the entry it is about to move to sent/.

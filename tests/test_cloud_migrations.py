@@ -54,6 +54,10 @@ COLLECTION_TAG_RESERVATION_HARDENING_FLAT = " ".join(
 )
 CAPTURE_LIB_ASSOCIATION = SQL["020_capture_lib_association"]
 CAPTURE_LIB_ASSOCIATION_FLAT = " ".join(CAPTURE_LIB_ASSOCIATION.split())
+CAPTURE_LIB_ASSOCIATION_RPC = SQL["021_capture_lib_association_rpc"]
+CAPTURE_LIB_ASSOCIATION_RPC_FLAT = " ".join(
+    CAPTURE_LIB_ASSOCIATION_RPC.split()
+)
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -506,6 +510,39 @@ def test_capture_lib_association_revision_is_server_owned_and_replay_safe():
     assert "before insert or update of id, lib_association," in trigger
 
 
+def test_capture_lib_rpc_rechecks_current_authority_under_transaction_locks():
+    function = CAPTURE_LIB_ASSOCIATION_RPC_FLAT.split(
+        "create or replace function public.publish_capture_lib_association(",
+        1,
+    )[1].split(
+        "revoke all on function public.publish_capture_lib_association(",
+        1,
+    )[0]
+    assert "security definer" in function
+    assert "set search_path = ''" in function
+    assert "auth.role()" not in function
+    assert "p_expected_revision is null" in function
+    assert "where capture_row.id = p_capture_id for update;" in function
+    assert "locked_owner is distinct from p_actor_id" in function
+    assert "grant_row.ingester_id = p_actor_id" in function
+    assert "grant_row.contributor_id = locked_owner for key share;" in function
+    assert "locked_revision <> p_expected_revision" in function
+    assert "locked_status <> 'pending'" in function
+    assert "locked_association is not distinct from p_association" in function
+    assert "p_expected_revision + 1" in function
+    assert "set lib_association = p_association" in function
+    assert "when p_mark_imported then 'imported'" in function
+    assert (
+        "revoke all on function public.publish_capture_lib_association( "
+        "uuid, uuid, jsonb, bigint, boolean ) from public, anon, "
+        "authenticated, service_role;"
+    ) in CAPTURE_LIB_ASSOCIATION_RPC_FLAT
+    assert (
+        "grant execute on function public.publish_capture_lib_association( "
+        "uuid, uuid, jsonb, bigint, boolean ) to service_role;"
+    ) in CAPTURE_LIB_ASSOCIATION_RPC_FLAT
+
+
 def test_capture_lib_association_retrofits_partial_transport_metadata_before_check():
     drop_check = CAPTURE_LIB_ASSOCIATION_FLAT.index(
         "drop constraint if exists captures_lib_association_state_check",
@@ -540,8 +577,13 @@ def test_capture_lib_association_grants_block_phone_forgery_and_keep_rls_reads()
             CAPTURE_LIB_ASSOCIATION_FLAT)
     assert ("grant select on public.captures to authenticated;" in
             CAPTURE_LIB_ASSOCIATION_FLAT)
-    assert ("grant select, insert, update, delete on public.captures to "
-            "service_role;" in CAPTURE_LIB_ASSOCIATION_FLAT)
+    assert "revoke update on public.captures from service_role;" in \
+        CAPTURE_LIB_ASSOCIATION_RPC_FLAT
+    assert ("grant select, insert, delete on public.captures to service_role;"
+            in CAPTURE_LIB_ASSOCIATION_RPC_FLAT)
+    assert ("grant update ( device, status, photos, note, contributor, ocr, "
+            "meta ) on public.captures to service_role;" in
+            CAPTURE_LIB_ASSOCIATION_RPC_FLAT)
     # The inherited SELECT policy is owner-or-assigned-ingester. Merely being
     # authenticated never exposes another contributor's association.
     select_policy = BASELINE_FLAT.split(

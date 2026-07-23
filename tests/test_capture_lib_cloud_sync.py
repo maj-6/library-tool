@@ -36,10 +36,13 @@ def service_key() -> str:
     return f"{header}.{payload}.signature"
 
 
-def user_token(role: str = "authenticated") -> str:
+def user_token(
+    role: str = "authenticated",
+    subject: str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(
-        json.dumps({"role": role, "sub": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}).encode(),
+        json.dumps({"role": role, "sub": subject}).encode(),
     ).decode().rstrip("=")
     return f"{header}.{payload}.signature"
 
@@ -135,28 +138,27 @@ def test_atomic_publish_uses_service_cas_and_returns_verified_row(monkeypatch):
     assert "id=in.(11111111-2222-4333-8444-555555555555)" in calls[0][2]
     cfg, method, path, payload, prefer = calls[1]
     assert cfg is service_cfg
-    assert method == "PATCH"
-    assert path.startswith(
-        "captures?id=eq.11111111-2222-4333-8444-555555555555"
-        "&lib_association_revision=eq.0&status=eq.pending&select=",
-    )
+    assert method == "POST"
+    assert path == "rpc/publish_capture_lib_association"
     assert payload == {
-        "status": "imported",
-        "lib_association": association(),
+        "p_capture_id": CAPTURE_ID,
+        "p_actor_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "p_association": association(),
+        "p_expected_revision": 0,
+        "p_mark_imported": True,
     }
-    assert prefer == "return=representation"
+    assert prefer == ""
 
 
 def test_atomic_publish_accepts_exact_replay_after_cas_race(monkeypatch):
     service_cfg, scope_cfg = publish_configs()
-    service_responses = iter([[], [accepted_row()]])
     calls = []
 
     def rest(cfg, method, path, payload=None, prefer=""):
         calls.append((cfg, method, path, payload, prefer))
         if cfg is scope_cfg:
             return [{"id": CAPTURE_ID}]
-        return next(service_responses)
+        return [accepted_row(lib_association_revision=4)]
 
     monkeypatch.setattr(supabase_sync, "_rest", rest)
     result = supabase_sync.publish_capture_lib_association(
@@ -164,11 +166,12 @@ def test_atomic_publish_accepts_exact_replay_after_cas_race(monkeypatch):
         scope_cfg,
         CAPTURE_ID,
         association(),
+        expected_revision=3,
     )
-    assert result["lib_association_revision"] == 1
-    assert [call[1] for call in calls] == ["GET", "PATCH", "GET"]
-    assert "id=eq.11111111-2222-4333-8444-555555555555" in calls[2][2]
-    assert "limit=2" in calls[2][2]
+    assert result["lib_association_revision"] == 4
+    assert [call[1] for call in calls] == ["GET", "POST"]
+    assert calls[1][2] == "rpc/publish_capture_lib_association"
+    assert calls[1][3]["p_expected_revision"] == 3
 
 
 def test_association_only_update_keeps_status_out_of_payload(monkeypatch):
@@ -195,8 +198,14 @@ def test_association_only_update_keeps_status_out_of_payload(monkeypatch):
         mark_imported=False,
     )
     assert result["lib_association"]["state"] == "stale"
-    assert calls[1][2] == {"lib_association": association(state="stale")}
-    assert "status=eq.pending" not in calls[1][1]
+    assert calls[1][1] == "rpc/publish_capture_lib_association"
+    assert calls[1][2] == {
+        "p_capture_id": CAPTURE_ID,
+        "p_actor_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "p_association": association(state="stale"),
+        "p_expected_revision": 1,
+        "p_mark_imported": False,
+    }
 
 
 @pytest.mark.parametrize("mark_imported", [False, True])
@@ -223,26 +232,21 @@ def test_atomic_publish_accepts_direct_same_document_noop(monkeypatch, mark_impo
     assert result["lib_association_revision"] == 3
 
 
-def test_zero_row_cas_only_accepts_exact_previous_attempt_replay(monkeypatch):
+def test_rpc_must_return_one_verified_confirmation_row(monkeypatch):
     service_cfg, scope_cfg = publish_configs()
-    service_responses = iter([
-        [],
-        [accepted_row(lib_association_revision=3)],
-    ])
 
     def rest(cfg, *_args, **_kwargs):
         if cfg is scope_cfg:
             return [{"id": CAPTURE_ID}]
-        return next(service_responses)
+        return []
 
     monkeypatch.setattr(supabase_sync, "_rest", rest)
-    with pytest.raises(supabase_sync.SyncError, match="compare-and-set"):
+    with pytest.raises(supabase_sync.SyncError, match="invalid row"):
         supabase_sync.publish_capture_lib_association(
             service_cfg,
             scope_cfg,
             CAPTURE_ID,
             association(),
-            expected_revision=3,
         )
 
 
@@ -307,6 +311,53 @@ def test_publish_honors_rls_visibility_before_service_write(
                 association(),
             )
     assert any(call[0] is service_cfg for call in calls) is service_patch_expected
+
+
+def test_publish_rejects_unverified_or_noncanonical_user_subject(monkeypatch):
+    service_cfg, scope_cfg = publish_configs()
+    monkeypatch.setattr(
+        supabase_sync,
+        "_rest",
+        lambda *_args, **_kwargs: pytest.fail("invalid subject reached REST"),
+    )
+    scope_cfg["access_token"] = user_token(subject="not-a-uuid")
+    with pytest.raises(supabase_sync.SyncError, match="signed-in user scope"):
+        supabase_sync.publish_capture_lib_association(
+            service_cfg,
+            scope_cfg,
+            CAPTURE_ID,
+            association(),
+        )
+
+
+def test_rpc_authorization_change_conflict_has_no_service_fallback(monkeypatch):
+    service_cfg, scope_cfg = publish_configs()
+    calls = []
+
+    def rest(cfg, method, path, *_args, **_kwargs):
+        calls.append((cfg, method, path))
+        if cfg is scope_cfg:
+            return [{"id": CAPTURE_ID}]
+        raise supabase_sync.SyncError(
+            "capture archive publication authorization changed"
+        )
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+    with pytest.raises(supabase_sync.SyncError, match="authorization changed"):
+        supabase_sync.publish_capture_lib_association(
+            service_cfg,
+            scope_cfg,
+            CAPTURE_ID,
+            association(),
+        )
+    assert [(call[1], call[2]) for call in calls] == [
+        (
+            "GET",
+            "captures?id=in.(11111111-2222-4333-8444-555555555555)"
+            "&select=id&order=id.asc",
+        ),
+        ("POST", "rpc/publish_capture_lib_association"),
+    ]
 
 
 def test_atomic_publish_rejects_conflict_or_untrusted_credentials(monkeypatch):

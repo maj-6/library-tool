@@ -27,12 +27,19 @@ CAPTURE_LIB_ASSOCIATION_SCHEMA = "org.whl.capture-lib-association"
 CAPTURE_LIB_ASSOCIATION_VERSION = 1
 CAPTURE_LIB_RECEIPT_SCHEMA = "org.whl.capture-lib-receipt"
 CAPTURE_LIB_RECEIPT_VERSION = 1
+CAPTURE_LIB_MAX_ARCHIVE_BYTES = 250 * 1024 * 1024
 
 _CAPTURE_ARCHIVE_COMMAND_SCHEMA = "org.whl.capture-lib-command"
 _CAPTURE_ARCHIVE_COMMAND_VERSION = 1
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BOOK_ID_RE = re.compile(r"^b-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_OFFSET_TIMESTAMP_RE = re.compile(
+    r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T"
+    r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+    r"(?:\.[0-9]{1,9})?"
+    r"(?:Z|[+-](?:(?:0[0-9]|1[0-3]):[0-5][0-9]|14:00))"
+)
 _ALLOWED_MANIFEST_FIELDS = frozenset(
     {
         "created_at",
@@ -130,6 +137,19 @@ def _revision(value: Any, field_name: str) -> str:
     return value
 
 
+def _source_revision(value: Any, field_name: str) -> str:
+    """Validate the portable association revision shared with cloud/mobile."""
+
+    revision = _revision(value, field_name)
+    if "/" in revision:
+        raise _validation(
+            f"{field_name} must be a revision token",
+            code="invalid_capture_archive_command",
+            field_name=field_name,
+        )
+    return revision
+
+
 def _sha256(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
         raise _validation(
@@ -146,9 +166,10 @@ def _timestamp(value: Any, field_name: str) -> str:
         or not value
         or len(value) > 80
         or value != value.strip()
+        or not _OFFSET_TIMESTAMP_RE.fullmatch(value)
     ):
         raise _validation(
-            f"{field_name} must be a bounded timestamp",
+            f"{field_name} must be an offset ISO-8601 timestamp",
             code="invalid_capture_archive_document",
             field_name=field_name,
         )
@@ -283,7 +304,7 @@ class CaptureArchiveSource:
         object.__setattr__(
             self,
             "source_revision",
-            _revision(self.source_revision, "source_revision"),
+            _source_revision(self.source_revision, "source_revision"),
         )
         if not isinstance(self.manifest, Mapping):
             raise _validation(
@@ -692,11 +713,13 @@ class CaptureArchiveAssociation:
             not isinstance(self.archive_bytes, int)
             or isinstance(self.archive_bytes, bool)
             or self.archive_bytes <= 0
+            or self.archive_bytes > CAPTURE_LIB_MAX_ARCHIVE_BYTES
         ):
             raise _validation(
-                "archive_bytes must be a positive integer",
+                "archive_bytes must be within the portable archive limit",
                 code="invalid_capture_archive_document",
                 field_name="archive_bytes",
+                details={"maximum_bytes": CAPTURE_LIB_MAX_ARCHIVE_BYTES},
             )
         if self.format_version != CAPTURE_LIB_FORMAT_VERSION:
             raise _validation(
@@ -721,7 +744,7 @@ class CaptureArchiveAssociation:
         object.__setattr__(
             self,
             "source_revision",
-            _revision(self.source_revision, "source_revision"),
+            _source_revision(self.source_revision, "source_revision"),
         )
         object.__setattr__(
             self,
@@ -907,7 +930,7 @@ class CaptureArchivePublication:
         object.__setattr__(
             self,
             "source_revision",
-            _revision(self.source_revision, "source_revision"),
+            _source_revision(self.source_revision, "source_revision"),
         )
         object.__setattr__(
             self,
@@ -919,11 +942,16 @@ class CaptureArchivePublication:
             "generated_at",
             _timestamp(self.generated_at, "generated_at"),
         )
-        if not isinstance(self.archive, bytes) or not self.archive:
+        if (
+            not isinstance(self.archive, bytes)
+            or not self.archive
+            or len(self.archive) > CAPTURE_LIB_MAX_ARCHIVE_BYTES
+        ):
             raise _validation(
-                "archive must be non-empty immutable bytes",
+                "archive must be immutable bytes within the portable limit",
                 code="invalid_capture_archive_document",
                 field_name="archive",
+                details={"maximum_bytes": CAPTURE_LIB_MAX_ARCHIVE_BYTES},
             )
 
     @property
@@ -1150,6 +1178,7 @@ __all__ = [
     "CAPTURE_LIB_ASSOCIATION_SCHEMA",
     "CAPTURE_LIB_ASSOCIATION_VERSION",
     "CAPTURE_LIB_FORMAT_VERSION",
+    "CAPTURE_LIB_MAX_ARCHIVE_BYTES",
     "CAPTURE_LIB_RECEIPT_SCHEMA",
     "CAPTURE_LIB_RECEIPT_VERSION",
     "AssociateCaptureArchiveCommand",

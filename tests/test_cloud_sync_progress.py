@@ -33,6 +33,7 @@ def _restore_cloudsync_state():
 def test_import_publishes_durable_book_before_cloud_acknowledgement(
         monkeypatch, tmp_path):
     manual_path = tmp_path / "manual_entries.json"
+    capture_id = "a8888888-8888-4888-8888-888888888888"
     monkeypatch.setattr(lib, "MANUAL_ENTRIES_PATH", manual_path)
     monkeypatch.setattr(
         server.sbase, "download_photo", lambda _cfg, _path: b"photo")
@@ -47,15 +48,40 @@ def test_import_publishes_durable_book_before_cloud_acknowledgement(
         return "book-1", []
 
     monkeypatch.setattr(server, "ingest_capture", ingest)
+    association = server.CaptureArchiveAssociation(
+        capture_id=capture_id,
+        book_id=server.capture_book_id(capture_id),
+        archive_sha256="a" * 64,
+        archive_bytes=1,
+        format_version="3.0",
+        state="current",
+        generated_at="2026-07-23T12:00:00Z",
+        source_revision="capture-r1",
+        source_fingerprint="b" * 64,
+    )
     monkeypatch.setattr(
-        server.sbase, "mark_capture",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("offline")),
+        server,
+        "_capture_archive_association",
+        lambda _capture_id: association,
+    )
+
+    def acknowledge(_owner, _scope, _capture_id, _association, **_kwargs):
+        assert lib.load_json(manual_path, {})["book-1"]["title"] == (
+            "Incremental Herbal"
+        )
+        raise server.sbase.SyncError("offline")
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        acknowledge,
     )
     seen = []
 
     result = server._import_capture(
-        {"url": "cloud"},
-        {"id": "capture-1", "photos": ["one.jpg"]},
+        {"url": "cloud", "key": "service"},
+        {"url": "cloud", "key": "user"},
+        {"id": capture_id, "photos": ["one.jpg"]},
         "",
         False,
         on_persisted=lambda item: seen.append((
@@ -92,6 +118,7 @@ def test_zero_photo_cloud_capture_fails_before_ingest_or_acknowledgement(
 
     with pytest.raises(ValueError, match="at least one photo"):
         server._import_capture(
+            None,
             {"url": "cloud"},
             {"id": "capture-empty", "photos": []},
             "",
@@ -302,7 +329,8 @@ def test_cloud_run_reports_each_capture_and_compatibility_views(monkeypatch):
                         lambda _cfg: captures)
     monkeypatch.setattr(server, "_secret_is_configured", lambda _key: False)
 
-    def import_one(_cfg, cap, _key, _delete, on_persisted=None):
+    def import_one(_owner_cfg, _capture_cfg, cap, _key, _delete,
+                   on_persisted=None):
         if cap["id"] == "cap-three":
             raise RuntimeError("bad image")
         result = {
@@ -363,7 +391,8 @@ def test_owner_phases_become_indeterminate_after_capture_meter(monkeypatch):
     )
     monkeypatch.setattr(server, "_secret_is_configured", lambda _key: False)
 
-    def import_one(_cfg, cap, _key, _delete, on_persisted=None):
+    def import_one(_owner_cfg, _capture_cfg, cap, _key, _delete,
+                   on_persisted=None):
         result = {
             "status": "imported", "capture_id": cap["id"],
             "book_id": "book-one", "title": "One",

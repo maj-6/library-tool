@@ -160,6 +160,7 @@ def test_lan_metadata_roundtrip_applies_and_acknowledges_phone_review(
     assert body["books"][0]["data"]["registered"] is False
     assert body["reviews"][0]["needs_review"] is True
     assert body["reviews"][0]["attention_reason"] == "Check edition"
+    assert body["associations"] == []
     assert second.get_json()["books"][0]["revision"] == \
         body["books"][0]["revision"]
     assert second.get_json()["reviews"][0]["revision"] == \
