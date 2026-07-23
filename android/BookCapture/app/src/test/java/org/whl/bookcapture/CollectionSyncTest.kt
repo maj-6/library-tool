@@ -369,7 +369,7 @@ class CollectionSyncTest {
     }
 
     @Test
-    fun parentlessRowsKeepTheirVersionTwoContentHash() {
+    fun tagIdsParticipateInContentHashAlongsideParents() {
         val unchanged = row("Blue crate", "2026-07-19T10:00:00Z")
         val canonical = listOf(
             unchanged.id,
@@ -377,6 +377,7 @@ class CollectionSyncTest {
             unchanged.from,
             unchanged.deleted.toString(),
             unchanged.mergedInto.orEmpty(),
+            "tag:${unchanged.tagId}",
         ).joinToString("\u0000")
         val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray())
         val legacyHash = digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
@@ -386,6 +387,9 @@ class CollectionSyncTest {
             legacyHash == collectionContentHash(
                 unchanged.copy(parentId = "00000000-0000-0000-0000-000000000002"),
             ),
+        )
+        assertFalse(
+            legacyHash == collectionContentHash(unchanged.copy(tagId = "BLUE_CRATE_2")),
         )
     }
 
@@ -408,6 +412,7 @@ class CollectionSyncTest {
                 .put("id", "a")
                 .put("name", "Blue crate")
                 .put("from_place", "Storage")
+                .put("tag_id", " blue crate 7 ")
                 .put("updated_at", "2026-07-19T12:00:00Z")
                 .put("deleted", true)
                 .put("merged_into", "b")
@@ -422,6 +427,7 @@ class CollectionSyncTest {
                 true,
                 "b",
                 "parent",
+                "BLUE_CRATE_7",
             ),
             parsed,
         )
@@ -485,6 +491,83 @@ class CollectionSyncTest {
             ExistingWorkPolicy.APPEND_OR_REPLACE,
             collectionSyncWorkPolicy(guaranteed = true),
         )
+    }
+
+    @Test
+    fun uniqueConflictRequiresHumanRetaggingInsteadOfAutomaticRelabeling() {
+        val tagConflict = SupabaseClient.HttpException(
+            409,
+            "conflict",
+            """{"code":"23505","message":"duplicate key value violates unique constraint \"collections_tag_id_key\""}""",
+        )
+        val otherUnique = SupabaseClient.HttpException(
+            409,
+            "conflict",
+            """{"code":"23505","message":"duplicate key value violates unique constraint \"collections_pkey\""}""",
+        )
+        val permanentlyReserved = SupabaseClient.HttpException(
+            409,
+            "conflict",
+            """{"code":"23505","message":"duplicate key value violates unique constraint \"collection_tag_reservations_pkey\""}""",
+        )
+
+        assertTrue(isCollectionTagConflict(tagConflict))
+        assertTrue(isCollectionTagConflict(permanentlyReserved))
+        assertFalse(isCollectionTagConflict(otherUnique))
+        assertFalse(isCollectionTagConflict(SupabaseClient.HttpException(400, "bad request")))
+    }
+
+    @Test
+    fun duplicateLocalAndCloudTagsDoNotSilentlyRelabelTheCloudCollection() {
+        val timestamp = "2026-07-19T12:00:00Z"
+        val local = collectionStoreFromJson(
+            """{"version":4,"collections":[
+                {"id":"a","name":"Local fungi","from":"Storage","tag_id":"FUNGI_1","updated_at":"$timestamp"},
+                {"id":"b","name":"Cloud fungi","from":"Storage","tag_id":"FUNGI_1","updated_at":"$timestamp"}
+            ]}""",
+        )
+        val cloud = row(
+            name = "Cloud fungi",
+            updatedAt = timestamp,
+            id = "b",
+        ).copy(tagId = "FUNGI_1")
+
+        val merge = mergeCollections(
+            local.collections,
+            listOf(cloud),
+            shadowOf(cloud),
+            dirty = setOf("a"),
+        )
+
+        assertEquals(listOf("a"), merge.writes.map { it.row.id })
+        assertEquals("FUNGI_1", merge.collections.single { it.id == "b" }.tagId)
+    }
+
+    @Test
+    fun neverSyncedDeletedTagCollisionIsRetiredWithoutACloudWrite() {
+        val timestamp = "2026-07-19T12:00:00Z"
+        val deletedOffline = row(
+            name = "Local fungi",
+            updatedAt = timestamp,
+            deleted = true,
+            id = "a",
+        ).copy(tagId = "FUNGI_1")
+        val cloudOwner = row(
+            name = "Cloud fungi",
+            updatedAt = timestamp,
+            id = "b",
+        ).copy(tagId = "FUNGI_1")
+
+        val merge = mergeCollections(
+            local = listOf(deletedOffline),
+            cloud = listOf(cloudOwner),
+            shadow = emptyMap(),
+            dirty = setOf(deletedOffline.id),
+        )
+
+        assertEquals(listOf(cloudOwner), merge.collections)
+        assertTrue(merge.writes.isEmpty())
+        assertFalse(deletedOffline.id in merge.dirty)
     }
 
     @Test

@@ -17,6 +17,7 @@ class HomeLifecyclePerformanceTest {
         val stopLoading = section("private fun stopHomeLoading()", "private fun configureScanRowAccessibility")
         assertTrue(stopLoading.contains("cancelScheduledWorkerRefresh()"))
         assertTrue(stopLoading.contains("cancelScanListLoading()"))
+        assertTrue(stopLoading.contains("cancelInspectListLoading()"))
         assertTrue(stopLoading.contains("resetThumbnailLoading()"))
 
         val resetThumbnails =
@@ -82,7 +83,7 @@ class HomeLifecyclePerformanceTest {
 
         val onResume = section("override fun onResume()", "override fun onStop()")
         assertTrue(onResume.contains("cancelScheduledWorkerRefresh()"))
-        assertTrue(onResume.contains("showTab(showingCollections)"))
+        assertTrue(onResume.contains("showTab(activeTab)"))
     }
 
     private fun section(start: String, end: String): String =

@@ -80,15 +80,29 @@ class CollectionSyncWorker(ctx: Context, params: WorkerParameters) :
                 }
                 val cloud = client.collections()
                 val writes = Collections.planSync(ctx, cloud)
-                if (writes.isEmpty()) return@withContext Result.success()
+                if (writes.isEmpty()) {
+                    Prefs.setCollectionTagConflict(ctx, null)
+                    return@withContext Result.success()
+                }
                 for (write in writes) {
                     if (!Auth.signedIn(ctx) || Prefs.userId(ctx) != owner) {
                         return@withContext Result.success()
                     }
                     // A null response means insert/CAS lost a race. The next
                     // pass re-fetches instead of overwriting that winner.
-                    client.writeCollection(write)?.let { accepted ->
-                        Collections.acknowledgeWrite(ctx, write.row, accepted)
+                    try {
+                        client.writeCollection(write)?.let { accepted ->
+                            Collections.acknowledgeWrite(ctx, write.row, accepted)
+                        }
+                    } catch (e: SupabaseClient.HttpException) {
+                        if (isCollectionTagConflict(e)) {
+                            // Never silently rename a value that may already be
+                            // printed. The row stays dirty; editing its tag
+                            // queues a fresh guaranteed sync attempt.
+                            Prefs.setCollectionTagConflict(ctx, write.row.tagId)
+                            return@withContext Result.failure()
+                        }
+                        throw e
                     }
                 }
                 // Always fetch and plan again. That hydrates returned server
@@ -118,4 +132,15 @@ class CollectionSyncWorker(ctx: Context, params: WorkerParameters) :
             Result.retry()
         }
     }
+}
+
+internal fun isCollectionTagConflict(error: SupabaseClient.HttpException): Boolean {
+    if (error.code != 409) return false
+    val body = runCatching { org.json.JSONObject(error.responseBody) }.getOrNull() ?: return false
+    if (body.optString("code") != "23505") return false
+    return sequenceOf(body.optString("message"), body.optString("details"))
+        .any {
+            it.contains("collections_tag_id_key") ||
+                it.contains("collection_tag_reservations_pkey")
+        }
 }

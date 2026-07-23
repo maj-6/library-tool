@@ -1,6 +1,8 @@
 package org.whl.bookcapture
 
+import android.app.Activity
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.os.Bundle
@@ -9,21 +11,26 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.ArrayAdapter
 import android.widget.Spinner
+import android.widget.Space
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.text.HtmlCompat
 import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.core.widget.doAfterTextChanged
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
+import com.google.android.material.button.MaterialButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -46,6 +53,19 @@ import kotlin.math.roundToInt
  */
 class HomeActivity : AppCompatActivity() {
 
+    private enum class HomeTab { SCANS, COLLECTIONS, INSPECT }
+
+    private enum class InspectViewMode(val wireValue: String, val columns: Int, val layout: Int) {
+        TILES("tiles", 2, R.layout.item_inspect_tile),
+        CONTENT("content", 1, R.layout.item_inspect_content),
+        ICONS("icons", 3, R.layout.item_inspect_icon);
+
+        companion object {
+            fun fromWire(value: String?): InspectViewMode =
+                entries.firstOrNull { it.wireValue == value } ?: TILES
+        }
+    }
+
     private data class ScanListItem(
         val entry: Entries.Entry,
         val titleLabel: String,
@@ -59,25 +79,81 @@ class HomeActivity : AppCompatActivity() {
         val currentCollection: BookCollection?,
     )
 
+    private data class InspectListItem(
+        val collectionId: String,
+        val summary: CollectionInventorySummary,
+        val current: Entries.Entry?,
+        val statusLabel: String?,
+        val thumbnail: EntryPhotoDescriptor?,
+    )
+
+    private data class InspectSnapshot(
+        val collections: List<BookCollection>,
+        val collectionPaths: Map<String, String>,
+        val items: List<InspectListItem>,
+        val currentCollection: BookCollection?,
+    )
+
     private lateinit var binding: ActivityHomeBinding
     private var thumbJob: Job? = null
     private var scanListJob: Job? = null
+    private var inspectListJob: Job? = null
     private var workerRefreshJob: Job? = null
     private var pendingWorkerContentRefresh = false
     private var pendingCollectionRefresh = false
     private val dynamicThumbnailViews = linkedSetOf<ImageView>()
     private val dynamicThumbnailBitmaps = linkedMapOf<ImageView, Bitmap>()
-    private var showingCollections = false
+    private var activeTab = HomeTab.SCANS
+    private var inspectedCollectionId: String? = null
+    private var inspectViewMode = InspectViewMode.TILES
+    private var reportedTagConflict = ""
     private val expandedScanGroups = linkedSetOf<String>()
     private var scanGroupsInitialized = false
     private var syncFeedbackRequestId: String? = null
     private var syncFeedbackPhase: CaptureSyncPhase? = null
 
+    private val qrScanner = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        val raw = result.data?.getStringExtra(QrScannerActivity.EXTRA_TAG_ID)
+        val collection = findCollectionByTagId(Collections.allRecords(this), raw.orEmpty())
+        if (collection == null) {
+            val normalized = normalizeCollectionTagId(raw.orEmpty())
+            Toast.makeText(
+                this,
+                if (normalized.isEmpty()) getString(R.string.inspect_scan_invalid)
+                else getString(R.string.inspect_scan_unknown, normalized),
+                Toast.LENGTH_LONG,
+            ).show()
+            return@registerForActivityResult
+        }
+        inspectedCollectionId = collection.id
+        activeTab = HomeTab.INSPECT
+        Toast.makeText(
+            this,
+            getString(R.string.inspect_scan_matched, collection.name, collection.tagId),
+            Toast.LENGTH_SHORT,
+        ).show()
+        showTab(HomeTab.INSPECT)
+        binding.homeScroll.post { binding.homeScroll.fullScroll(View.FOCUS_UP) }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityHomeBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        showingCollections = savedInstanceState?.getBoolean(STATE_TAB_COLLECTIONS) ?: false
+        activeTab = savedInstanceState?.getString(STATE_ACTIVE_TAB)
+            ?.let { runCatching { HomeTab.valueOf(it) }.getOrNull() }
+            ?: if (savedInstanceState?.getBoolean(STATE_TAB_COLLECTIONS) == true) {
+                HomeTab.COLLECTIONS
+            } else {
+                HomeTab.SCANS
+            }
+        inspectedCollectionId = savedInstanceState?.getString(STATE_INSPECTED_COLLECTION)
+        inspectViewMode = InspectViewMode.fromWire(
+            savedInstanceState?.getString(STATE_INSPECT_VIEW_MODE) ?: Prefs.inspectViewMode(this),
+        )
         scanGroupsInitialized =
             savedInstanceState?.getBoolean(STATE_SCAN_GROUPS_INITIALIZED) ?: false
         syncFeedbackRequestId = savedInstanceState?.getString(STATE_SYNC_FEEDBACK_REQUEST)
@@ -86,10 +162,31 @@ class HomeActivity : AppCompatActivity() {
         savedInstanceState?.getStringArrayList(STATE_EXPANDED_SCAN_GROUPS)
             ?.let(expandedScanGroups::addAll)
 
-        binding.tabScans.setOnClickListener { showTab(collections = false) }
-        binding.tabCollections.setOnClickListener { showTab(collections = true) }
-        binding.collectionBar.setOnClickListener { showTab(collections = true) }
+        binding.tabScans.setOnClickListener { showTab(HomeTab.SCANS) }
+        binding.tabCollections.setOnClickListener { showTab(HomeTab.COLLECTIONS) }
+        binding.tabInspect.setOnClickListener { showTab(HomeTab.INSPECT) }
+        binding.collectionBar.setOnClickListener { showTab(HomeTab.COLLECTIONS) }
         binding.newCollection.setOnClickListener { editCollection(null) }
+        binding.scanBox.setOnClickListener {
+            qrScanner.launch(Intent(this, QrScannerActivity::class.java))
+        }
+        binding.inspectViewModes.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            inspectViewMode = when (checkedId) {
+                R.id.inspectModeContent -> InspectViewMode.CONTENT
+                R.id.inspectModeIcons -> InspectViewMode.ICONS
+                else -> InspectViewMode.TILES
+            }
+            Prefs.setInspectViewMode(this, inspectViewMode.wireValue)
+            if (activeTab == HomeTab.INSPECT) refreshInspect()
+        }
+        binding.inspectViewModes.check(
+            when (inspectViewMode) {
+                InspectViewMode.TILES -> R.id.inspectModeTiles
+                InspectViewMode.CONTENT -> R.id.inspectModeContent
+                InspectViewMode.ICONS -> R.id.inspectModeIcons
+            },
+        )
         binding.newScan.setOnClickListener {
             // A book has to belong to a batch, so the origin is never guessed
             // later. With nothing chosen, send the user to pick rather than
@@ -102,7 +199,7 @@ class HomeActivity : AppCompatActivity() {
             val resuming = Prefs.currentEntryId(this) != null
             if (!resuming && Collections.current(this) == null) {
                 Toast.makeText(this, R.string.collections_choose_first, Toast.LENGTH_LONG).show()
-                showTab(collections = true)
+                showTab(HomeTab.COLLECTIONS)
                 return@setOnClickListener
             }
             startActivity(Intent(this, MainActivity::class.java))
@@ -134,7 +231,10 @@ class HomeActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putBoolean(STATE_TAB_COLLECTIONS, showingCollections)
+        outState.putString(STATE_ACTIVE_TAB, activeTab.name)
+        outState.putBoolean(STATE_TAB_COLLECTIONS, activeTab == HomeTab.COLLECTIONS)
+        outState.putString(STATE_INSPECTED_COLLECTION, inspectedCollectionId)
+        outState.putString(STATE_INSPECT_VIEW_MODE, inspectViewMode.wireValue)
         outState.putBoolean(STATE_SCAN_GROUPS_INITIALIZED, scanGroupsInitialized)
         outState.putString(STATE_SYNC_FEEDBACK_REQUEST, syncFeedbackRequestId)
         outState.putString(STATE_SYNC_FEEDBACK_PHASE, syncFeedbackPhase?.storedValue)
@@ -162,7 +262,23 @@ class HomeActivity : AppCompatActivity() {
         }
         cancelScheduledWorkerRefresh()
         refreshSyncButton()
-        showTab(showingCollections)
+        showCollectionTagConflictIfNeeded()
+        showTab(activeTab)
+    }
+
+    private fun showCollectionTagConflictIfNeeded() {
+        val tagId = Prefs.collectionTagConflict(this)
+        if (tagId.isEmpty()) {
+            reportedTagConflict = ""
+            return
+        }
+        if (tagId == reportedTagConflict) return
+        reportedTagConflict = tagId
+        Toast.makeText(
+            this,
+            getString(R.string.collections_sync_tag_conflict, tagId),
+            Toast.LENGTH_LONG,
+        ).show()
     }
 
     override fun onStop() {
@@ -255,17 +371,35 @@ class HomeActivity : AppCompatActivity() {
 
     // --- tabs ----------------------------------------------------------------
 
-    private fun showTab(collections: Boolean) {
-        showingCollections = collections
-        if (collections) cancelScanListLoading()
-        binding.homeList.visibility = if (collections) View.GONE else View.VISIBLE
-        binding.collectionsList.visibility = if (collections) View.VISIBLE else View.GONE
-        binding.scanActions.visibility = if (collections) View.GONE else View.VISIBLE
-        binding.newCollection.visibility = if (collections) View.VISIBLE else View.GONE
-        binding.collectionBar.visibility = if (collections) View.GONE else View.VISIBLE
-        emphasizeTab(binding.tabScans, !collections)
-        emphasizeTab(binding.tabCollections, collections)
-        if (collections) refreshCollections() else refreshHome()
+    private fun showTab(tab: HomeTab) {
+        activeTab = tab
+        if (tab != HomeTab.SCANS) cancelScanListLoading()
+        if (tab != HomeTab.INSPECT) cancelInspectListLoading()
+        binding.homeList.visibility = if (tab == HomeTab.SCANS) View.VISIBLE else View.GONE
+        binding.collectionsList.visibility =
+            if (tab == HomeTab.COLLECTIONS) View.VISIBLE else View.GONE
+        binding.inspectPane.visibility = if (tab == HomeTab.INSPECT) View.VISIBLE else View.GONE
+        binding.scanActions.visibility = if (tab == HomeTab.SCANS) View.VISIBLE else View.GONE
+        binding.newCollection.visibility =
+            if (tab == HomeTab.COLLECTIONS) View.VISIBLE else View.GONE
+        binding.scanBox.visibility = if (tab == HomeTab.INSPECT) View.VISIBLE else View.GONE
+        binding.collectionBar.visibility = if (tab == HomeTab.SCANS) View.VISIBLE else View.GONE
+        emphasizeTab(binding.tabScans, tab == HomeTab.SCANS)
+        emphasizeTab(binding.tabCollections, tab == HomeTab.COLLECTIONS)
+        emphasizeTab(binding.tabInspect, tab == HomeTab.INSPECT)
+        when (tab) {
+            HomeTab.SCANS -> refreshHome()
+            HomeTab.COLLECTIONS -> refreshCollections()
+            HomeTab.INSPECT -> refreshInspect()
+        }
+    }
+
+    private fun refreshContentTab() {
+        when (activeTab) {
+            HomeTab.SCANS -> refreshHome()
+            HomeTab.COLLECTIONS -> refreshCollections()
+            HomeTab.INSPECT -> refreshInspect()
+        }
     }
 
     /**
@@ -284,11 +418,16 @@ class HomeActivity : AppCompatActivity() {
             pendingCollectionRefresh = false
             workerRefreshJob = null
             if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
+            if (collectionChanged) showCollectionTagConflictIfNeeded()
             if (refreshContent) {
                 refreshSyncButton()
-                if (showingCollections) refreshCollections() else refreshHome()
+                refreshContentTab()
             } else if (collectionChanged) {
-                if (showingCollections) refreshCollections() else refreshCollectionBar()
+                when (activeTab) {
+                    HomeTab.SCANS -> refreshCollectionBar()
+                    HomeTab.COLLECTIONS -> refreshCollections()
+                    HomeTab.INSPECT -> refreshInspect()
+                }
             }
         }
     }
@@ -373,9 +512,14 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
-    private fun emphasizeTab(button: com.google.android.material.button.MaterialButton, on: Boolean) {
+    private fun emphasizeTab(button: MaterialButton, on: Boolean) {
+        button.isSelected = on
         button.alpha = if (on) 1f else .5f
         button.setTypeface(null, if (on) Typeface.BOLD else Typeface.NORMAL)
+        ViewCompat.setStateDescription(
+            button,
+            getString(R.string.selection_selected_state).takeIf { on },
+        )
     }
 
     // --- collections ---------------------------------------------------------
@@ -405,14 +549,15 @@ class HomeActivity : AppCompatActivity() {
         list.removeAllViews()
         val collections = Collections.all(this)
         val current = Collections.current(this)
-        val collectionPaths = collectionDisplayPaths(Collections.allRecords(this))
+        val collectionRecords = Collections.allRecords(this)
+        val collectionPaths = collectionDisplayPaths(collectionRecords)
         refreshCollectionBar()
         if (collections.isEmpty()) {
             list.addView(emptyNotice(getString(R.string.collections_empty)))
             return
         }
-        val counts = Entries.recent(this)
-            .mapNotNull { it.provenance?.collectionId }
+        val counts = CollectionInventory.items(this)
+            .mapNotNull { resolvedLiveCollectionId(it.summary.collectionId, collectionRecords) }
             .groupingBy { it }.eachCount()
         val inflater = LayoutInflater.from(this)
         for (c in collections) {
@@ -430,6 +575,7 @@ class HomeActivity : AppCompatActivity() {
             row.setBackgroundResource(
                 if (isCurrent) R.drawable.whl_collection_current else R.drawable.whl_row)
             row.findViewById<TextView>(R.id.sub).text = listOf(
+                c.tagId,
                 if (c.from.isEmpty()) getString(R.string.collections_row_no_from)
                 else getString(R.string.collections_row_from, c.from),
                 resources.getQuantityString(
@@ -472,10 +618,12 @@ class HomeActivity : AppCompatActivity() {
         // soon as mutate() returns, so selecting the list's last row would race
         // that pull and could choose a different collection.
         val collectionId = existing?.id ?: UUID.randomUUID().toString()
-        val collections = Collections.all(this)
-        val collectionPaths = collectionDisplayPaths(Collections.allRecords(this))
+        val collectionRecords = Collections.allRecords(this)
+        val collections = collectionRecords.filter { !it.deleted && it.mergedInto == null }
+        val collectionPaths = collectionDisplayPaths(collectionRecords)
         val view = layoutInflater.inflate(R.layout.dialog_collection, null)
         val nameField = view.findViewById<android.widget.EditText>(R.id.collectionName)
+        val tagIdField = view.findViewById<android.widget.EditText>(R.id.collectionTagId)
         val parentField = view.findViewById<Spinner>(R.id.collectionParent)
         val fromField = view.findViewById<android.widget.EditText>(R.id.collectionFrom)
         val parentIds = mutableListOf<String?>(null)
@@ -499,6 +647,16 @@ class HomeActivity : AppCompatActivity() {
         }
         parentField.setSelection(parentIds.indexOf(existing?.parentId).coerceAtLeast(0))
         nameField.setText(existing?.name.orEmpty())
+        tagIdField.setText(existing?.tagId.orEmpty())
+        var tagIdEdited = false
+        tagIdField.doAfterTextChanged { tagIdEdited = true }
+        if (existing == null) {
+            nameField.doAfterTextChanged { value ->
+                if (tagIdField.text.isNullOrBlank() && !value.isNullOrBlank()) {
+                    tagIdField.hint = suggestCollectionTagId(value.toString(), collectionRecords)
+                }
+            }
+        }
         fromField.setText(existing?.from.orEmpty())
         val dialog = AlertDialog.Builder(this)
             .setTitle(
@@ -511,6 +669,18 @@ class HomeActivity : AppCompatActivity() {
         }
         view.findViewById<View>(R.id.saveCollectionEdit).setOnClickListener {
             val name = nameField.text.toString()
+            val enteredTagId = tagIdField.text.toString()
+            // A cleared/new tag means "suggest one". Include tombstones so a
+            // printed label from a retired box is never offered again.
+            val tagId = if (existing != null && !tagIdEdited) null else {
+                enteredTagId.ifBlank {
+                    suggestCollectionTagId(
+                        name,
+                        Collections.allRecords(this),
+                        exceptId = existing?.id,
+                    )
+                }
+            }
             val from = fromField.text.toString()
             val parentId = parentIds.getOrNull(parentField.selectedItemPosition)
             val error = Collections.mutate(this) { current ->
@@ -521,9 +691,17 @@ class HomeActivity : AppCompatActivity() {
                         from,
                         id = collectionId,
                         parentId = parentId,
+                        tagId = tagId,
                     )
                 } else {
-                    updateCollection(current, existing.id, name, from, parentId)
+                    updateCollection(
+                        current,
+                        existing.id,
+                        name,
+                        from,
+                        parentId,
+                        tagId = tagId,
+                    )
                 }
             }
             if (error != null) {
@@ -559,6 +737,301 @@ class HomeActivity : AppCompatActivity() {
         RemoteUiCatalog.apply(dialog)
     }
 
+    // --- inspect -------------------------------------------------------------
+
+    /** Follow only explicit merge aliases. A normal deleted collection remains
+     * historical and does not silently become a different physical box. */
+    private fun resolvedLiveCollectionId(
+        collectionId: String,
+        records: List<BookCollection>,
+    ): String? {
+        if (collectionId.isEmpty()) return null
+        val byId = records.associateBy { it.id }
+        val visited = mutableSetOf<String>()
+        var cursor = collectionId
+        while (visited.add(cursor)) {
+            val row = byId[cursor] ?: return null
+            val merged = row.mergedInto
+            if (merged != null) {
+                cursor = merged
+                continue
+            }
+            return row.id.takeIf { !row.deleted }
+        }
+        return null
+    }
+
+    private fun refreshInspect() {
+        resetThumbnailLoading()
+        inspectListJob?.cancel()
+        inspectListJob = lifecycleScope.launch {
+            val snapshot = withContext(Dispatchers.IO) {
+                loadInspectSnapshot()
+            }
+            inspectListJob = null
+            if (activeTab != HomeTab.INSPECT ||
+                !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            ) return@launch
+            renderInspect(snapshot)
+        }
+    }
+
+    private fun loadInspectSnapshot(): InspectSnapshot {
+        val records = Collections.allRecords(this)
+        val live = records.filter { !it.deleted && it.mergedInto == null }
+        val paths = collectionDisplayPaths(records)
+        val collections = live.sortedBy { (paths[it.id] ?: it.name).lowercase() }
+        val items = CollectionInventory.items(this).mapNotNull { item ->
+            val collectionId =
+                resolvedLiveCollectionId(item.summary.collectionId, records) ?: return@mapNotNull null
+            InspectListItem(
+                collectionId = collectionId,
+                summary = item.summary,
+                current = item.current,
+                statusLabel = item.current?.let { Entries.statusLabel(this, it) },
+                thumbnail = item.current?.thumbnailDescriptor(),
+            )
+        }
+        return InspectSnapshot(
+            collections = collections,
+            collectionPaths = paths,
+            items = items,
+            currentCollection = Collections.current(this),
+        )
+    }
+
+    private fun renderInspect(snapshot: InspectSnapshot) {
+        val collections = snapshot.collections
+        val paths = snapshot.collectionPaths
+        val counts = snapshot.items.groupingBy(InspectListItem::collectionId).eachCount()
+        val totalBooks = counts.values.sum()
+
+        val collectionCount = resources.getQuantityString(
+            R.plurals.inspect_collection_count,
+            collections.size,
+            collections.size,
+        )
+        val totalBookCount = resources.getQuantityString(
+            R.plurals.inspect_book_count,
+            totalBooks,
+            totalBooks,
+        )
+        binding.inspectSummary.text = getString(
+            R.string.inspect_summary,
+            collectionCount,
+            totalBookCount,
+        )
+        binding.inspectCollectionChips.removeAllViews()
+        binding.inspectBooks.removeAllViews()
+
+        if (collections.isEmpty()) {
+            inspectedCollectionId = null
+            binding.inspectSelectionHeader.visibility = View.GONE
+            binding.inspectEmpty.visibility = View.VISIBLE
+            binding.inspectEmpty.text = getString(R.string.inspect_empty_collections)
+            return
+        }
+
+        val selected = collections.firstOrNull { it.id == inspectedCollectionId }
+            ?: snapshot.currentCollection?.let { current ->
+                collections.firstOrNull { it.id == current.id }
+            }
+            ?: collections.first()
+        inspectedCollectionId = selected.id
+
+        var selectedChip: View? = null
+        val inflater = LayoutInflater.from(this)
+        collections.forEach { collection ->
+            val chip = inflater.inflate(
+                R.layout.item_inspect_collection,
+                binding.inspectCollectionChips,
+                false,
+            ) as MaterialButton
+            val count = counts[collection.id] ?: 0
+            val bookCount = resources.getQuantityString(
+                R.plurals.inspect_book_count,
+                count,
+                count,
+            )
+            val displayName = paths[collection.id] ?: collection.name
+            chip.text = getString(
+                R.string.inspect_collection_chip,
+                displayName,
+                collection.tagId,
+                bookCount,
+            )
+            chip.contentDescription = getString(
+                R.string.inspect_collection_description,
+                displayName,
+                collection.tagId,
+                bookCount,
+            )
+            val isSelected = collection.id == selected.id
+            chip.isSelected = isSelected
+            ViewCompat.setStateDescription(
+                chip,
+                getString(R.string.selection_selected_state).takeIf { isSelected },
+            )
+            chip.strokeWidth = dp(if (isSelected) 2 else 1)
+            chip.strokeColor = ColorStateList.valueOf(
+                getColor(if (isSelected) R.color.whl_cyan else R.color.whl_face_sh2),
+            )
+            chip.backgroundTintList = ColorStateList.valueOf(
+                getColor(if (isSelected) R.color.whl_row_checked else R.color.whl_face_hi),
+            )
+            chip.setOnClickListener {
+                inspectedCollectionId = collection.id
+                refreshInspect()
+            }
+            RemoteUiCatalog.apply(chip)
+            binding.inspectCollectionChips.addView(chip)
+            if (isSelected) selectedChip = chip
+        }
+        selectedChip?.let { chip ->
+            binding.inspectCollectionScroll.post {
+                binding.inspectCollectionScroll.smoothScrollTo(
+                    (chip.left - dp(10)).coerceAtLeast(0),
+                    0,
+                )
+            }
+        }
+
+        val selectedName = paths[selected.id] ?: selected.name
+        val selectedItems = snapshot.items.asSequence()
+            .filter { it.collectionId == selected.id }
+            .sortedWith(
+                compareBy<InspectListItem> { item ->
+                    item.summary.title.ifEmpty {
+                        getString(R.string.inspect_book_untitled)
+                    }.lowercase()
+                }.thenByDescending { it.summary.createdAt },
+            )
+            .toList()
+        binding.inspectSelectionHeader.visibility = View.VISIBLE
+        binding.inspectCollectionName.text = selectedName
+        val selectedBookCount = resources.getQuantityString(
+            R.plurals.inspect_book_count,
+            selectedItems.size,
+            selectedItems.size,
+        )
+        val origin = if (selected.from.isEmpty()) {
+            ""
+        } else {
+            " \u00b7 ${getString(R.string.collections_row_from, selected.from)}"
+        }
+        binding.inspectCollectionMeta.text = getString(
+            R.string.inspect_collection_meta,
+            selected.tagId,
+            selectedBookCount,
+            origin,
+        )
+
+        if (selectedItems.isEmpty()) {
+            binding.inspectEmpty.visibility = View.VISIBLE
+            binding.inspectEmpty.text = getString(R.string.inspect_empty_books)
+            return
+        }
+        binding.inspectEmpty.visibility = View.GONE
+        renderInspectBooks(selectedItems)
+    }
+
+    private fun renderInspectBooks(items: List<InspectListItem>) {
+        val inflater = LayoutInflater.from(this)
+        val thumbnails = mutableListOf<Triple<ImageView, java.io.File, Boolean>>()
+        items.chunked(inspectViewMode.columns).forEach { chunk ->
+            val row = LinearLayout(this).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.TOP
+            }
+            chunk.forEach { item ->
+                val view = inflater.inflate(inspectViewMode.layout, row, false)
+                view.layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f,
+                )
+                bindInspectBook(view, item, thumbnails)
+                RemoteUiCatalog.apply(view)
+                row.addView(view)
+            }
+            repeat(inspectViewMode.columns - chunk.size) {
+                row.addView(Space(this), LinearLayout.LayoutParams(0, 1, 1f))
+            }
+            binding.inspectBooks.addView(row)
+        }
+        thumbJob = lifecycleScope.launch(Dispatchers.IO) {
+            for ((image, file, cleanupPending) in thumbnails) {
+                var decodedBitmap: Bitmap? = null
+                try {
+                    val decoded = decodeSampledOriented(file, maxWidth = 384, maxHeight = 512)
+                        ?: continue
+                    decodedBitmap = decoded
+                    if (cleanupPending) decodedBitmap = softenPendingThumbnail(decoded)
+                    withContext(Dispatchers.Main) {
+                        val bitmap = decodedBitmap ?: return@withContext
+                        if (activeTab != HomeTab.INSPECT ||
+                            image.parent == null ||
+                            !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                        ) return@withContext
+                        setDynamicThumbnail(image, bitmap)
+                        decodedBitmap = null
+                    }
+                } finally {
+                    decodedBitmap?.takeIf { !it.isRecycled }?.recycle()
+                }
+            }
+        }
+    }
+
+    private fun bindInspectBook(
+        view: View,
+        item: InspectListItem,
+        thumbnails: MutableList<Triple<ImageView, java.io.File, Boolean>>,
+    ) {
+        val summary = item.summary
+        view.findViewById<TextView>(R.id.inspectTitle).text =
+            summary.title.ifEmpty { getString(R.string.inspect_book_untitled) }
+        val details = mutableListOf<String>()
+        summary.author.takeIf { it.isNotEmpty() }?.let(details::add)
+        summary.year.takeIf { it.isNotEmpty() }?.let(details::add)
+        if (inspectViewMode != InspectViewMode.ICONS) {
+            details += resources.getQuantityString(
+                R.plurals.inspect_book_pages,
+                summary.photoCount,
+                summary.photoCount,
+            )
+            details += item.statusLabel ?: getString(R.string.inspect_book_archived)
+        }
+        view.findViewById<TextView>(R.id.inspectSubtitle).text =
+            details.joinToString(" \u00b7 ")
+        item.thumbnail?.let { descriptor ->
+            val image = view.findViewById<ImageView>(R.id.inspectThumb)
+            image.alpha = if (descriptor.postProcessingPending) .82f else 1f
+            thumbnails += Triple(
+                image,
+                descriptor.displayFile,
+                descriptor.postProcessingPending,
+            )
+        }
+        val open = {
+            if (item.current != null) openEntryDetails(summary.entryId)
+            else Toast.makeText(
+                this,
+                R.string.inspect_book_unavailable,
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+        view.setOnClickListener { open() }
+        view.findViewById<View>(R.id.inspectOpen)?.apply {
+            visibility = if (item.current == null) View.INVISIBLE else View.VISIBLE
+            setOnClickListener { open() }
+        }
+    }
+
     override fun onDestroy() {
         stopHomeLoading()
         super.onDestroy()
@@ -585,7 +1058,7 @@ class HomeActivity : AppCompatActivity() {
                 )
             }
             scanListJob = null
-            if (showingCollections ||
+            if (activeTab != HomeTab.SCANS ||
                 !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
             ) return@launch
             renderHome(snapshot)
@@ -722,7 +1195,8 @@ class HomeActivity : AppCompatActivity() {
                     if (cleanupPending) decodedBitmap = softenPendingThumbnail(decoded)
                     withContext(Dispatchers.Main) {
                         val bitmap = decodedBitmap ?: return@withContext
-                        if (iv.parent == null ||
+                        if (activeTab != HomeTab.SCANS ||
+                            iv.parent == null ||
                             !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
                         ) return@withContext
                         setDynamicThumbnail(iv, bitmap)
@@ -754,6 +1228,11 @@ class HomeActivity : AppCompatActivity() {
         scanListJob = null
     }
 
+    private fun cancelInspectListLoading() {
+        inspectListJob?.cancel()
+        inspectListJob = null
+    }
+
     private fun releaseDynamicThumbnails() {
         dynamicThumbnailViews.forEach { it.setImageDrawable(null) }
         dynamicThumbnailViews.clear()
@@ -766,6 +1245,7 @@ class HomeActivity : AppCompatActivity() {
     private fun stopHomeLoading() {
         cancelScheduledWorkerRefresh()
         cancelScanListLoading()
+        cancelInspectListLoading()
         resetThumbnailLoading()
     }
 
@@ -1038,7 +1518,10 @@ class HomeActivity : AppCompatActivity() {
         const val COPYRIGHT_POPUP_CONTENT_BUDGET = 22_000
         const val COPYRIGHT_RECORD_FIELD_LIMIT = 20
         const val COPYRIGHT_RECORD_VALUE_LIMIT = 500
+        const val STATE_ACTIVE_TAB = "active_tab"
         const val STATE_TAB_COLLECTIONS = "tab_collections"
+        const val STATE_INSPECTED_COLLECTION = "inspected_collection"
+        const val STATE_INSPECT_VIEW_MODE = "inspect_view_mode"
         const val STATE_SCAN_GROUPS_INITIALIZED = "scan_groups_initialized"
         const val STATE_EXPANDED_SCAN_GROUPS = "expanded_scan_groups"
         const val STATE_SYNC_FEEDBACK_REQUEST = "sync_feedback_request"

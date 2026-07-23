@@ -1,12 +1,15 @@
 # Collections on the desktop: two-way sync
 
-Status: **implemented and deployed on 2026-07-19.** Migrations 009–011 are
-applied to the `library-tool-store` Supabase project and verified against the
-live catalogue, grants, policies, function ACL, and both migration ledgers.
+Status: **the Android/cloud prerelease path is implemented and deployed as of
+2026-07-19.** Migrations 009–011 are applied to the `library-tool-store`
+Supabase project and verified against the live catalogue, grants, policies,
+function ACL, and both migration ledgers. The full desktop collection manager
+from the original feature branch is intentionally deferred until it can be
+reconciled with the ongoing lifecycle refactor.
 
 ## Implementation outcome
 
-All four suggested stages below are implemented together:
+The integrated Android prerelease scope includes:
 
 - the phone sends `scan_collection_id` while preserving the frozen name and
   origin snapshots;
@@ -14,23 +17,25 @@ All four suggested stages below are implemented together:
   a transactional merge RPC;
 - the Android store performs crash-safe, paginated two-way synchronization and
   remains fully usable signed out;
-- the desktop displays read-only `Collection` and `From` snapshot columns,
-  filters by collection identity, and includes a collection manager with CRUD,
-  duplicate warnings, counts, and human-confirmed merges.
+- the desktop LAN importer preserves the UUID, name, and origin snapshots and
+  keeps them out of the fallback-OCR metadata test.
 
 The implementation keeps catalogue provenance derived from `entry.extra`; it
-does not widen the manual-entry schema. Desktop-created rows are pulled by an
-authenticated background worker, so no blocking spinner is added to the
-offline-first Collections screen. An archive state remains outside this
-change's scope.
+does not widen the manual-entry schema. Rows created by another authenticated
+client are pulled by the Android background worker, so no blocking spinner is
+added to the offline-first Collections screen. The current desktop workbench
+still shows the three provenance values as generic metadata; columns, filters,
+CRUD/merge UI, and alias healing remain a separate integration. An archive
+state also remains outside this change's scope.
 
 One refinement was required during adversarial review: an ordinary soft delete
 is still last-write-wins and can be superseded by a later edit, but a
 human-confirmed duplicate merge must be permanent. Migration 009 therefore
 adds `merged_into` and performs merges through `merge_collections(...)`, which
 locks both rows, validates their revisions, and atomically writes an
-authoritative loser-to-survivor marker. Both clients consume that marker and
-never treat an arbitrary deleted row as a merge.
+authoritative loser-to-survivor marker. Android consumes that marker and never
+treats an arbitrary deleted row as a merge; the deferred desktop manager must
+preserve the same rule.
 
 ## Deployment verification
 
@@ -61,7 +66,7 @@ revision checks, deterministic row locks, and restricted ACL bound its
 authority. Newly created collection indexes are also reported as unused while
 the table is empty. Other advisor notices predate this feature.
 
-Book Capture 0.5.1-alpha.6 shipped phone-local collections (see
+Book Capture 0.5.1-alpha.6 introduced phone-local collections (see
 `android/BookCapture/README.md` → "Collections and provenance"). This document
 specifies promoting them to shared cloud rows, editable from either the desktop
 or the phone, and surfacing them in the desktop catalogue.
@@ -94,17 +99,32 @@ to disagree and the UI must not pretend otherwise.
 
 | File | Role |
 |---|---|
-| `Collections.kt` | `BookCollection(id, name, from)`, pure edit/validate functions, `filesDir/collections.json` via `Entries.atomicWrite` |
+| `Collections.kt` | `BookCollection(id, name, tagId, from)`, pure edit/validate functions, `filesDir/collections.json` via `Entries.atomicWrite` |
 | `Prefs.kt` | `current_collection` — a pointer only |
 | `CaptureSession.kt` | freezes `CaptureProvenance` per entry into `collection.json`; `applyProvenance` (manifest, nested, keeps the id) and `applyProvenanceToPayload` (wire, flat strings) |
 | `UploadWorker.kt` | folds provenance into the outgoing `meta` for both transports |
 
-**Wire.** Provenance rides inside the capture's `meta` as `scan_collection` and
-`scan_from`.
+`BookCollection.tagId` is the short, QR-facing physical-box label. It is
+separate from the durable UUID `id`: QR inspection resolves `tagId` to the
+current collection row, while hierarchy, synchronization, and book provenance
+continue to use the UUID. Android also keeps a photo-free
+`collection_inventory.json` summary before old sent media is pruned so the
+Inspect tab does not collapse back to the 15-entry recent list.
+
+Migration 018 contains the database-side `tag_id` backfill, uniqueness,
+canonical-format constraint, legacy-client allocator, narrow grants, and a
+private permanent-reservation ledger so an edited tag cannot later move to a
+different collection UUID. Migration 019 adds the ledger owner index and an
+explicit deny policy for API roles. Both were deployed database-first on
+2026-07-22 and verified before building Book Capture 0.5.1-alpha.10 (version
+code 29).
+
+**Wire.** Provenance rides inside the capture's `meta` as
+`scan_collection_id`, `scan_collection`, and `scan_from`.
 
 **Desktop.** `tools/whl_explorer/server.py`
 
-- `PHONE_PROVENANCE_KEYS = {"scan_collection", "scan_from"}`
+- `PHONE_PROVENANCE_KEYS = {"scan_collection_id", "scan_collection", "scan_from"}`
 - `_capture_provenance(cap)` merges them into `entry["extra"]` on **both**
   import paths
 - `_phone_result` excludes them from its `has_metadata` test
@@ -117,22 +137,15 @@ to disagree and the UI must not pretend otherwise.
 > `tests/test_phone_capture.py` and `CollectionsTest`. Renaming these keys means
 > changing both sides in the same commit.
 
-So today a collection reaches the desktop only as two untyped strings inside a
-generic `extra` blob, rendered as "scan collection" / "scan from".
+The desktop preserves all three values in the generic `extra` blob, making the
+UUID available to the later manager integration. The current workbench does not
+yet promote them to dedicated columns, filters, or counts.
 
-## Gap: the wire carries no collection id
+## Wire compatibility
 
-`applyProvenanceToPayload` sends the collection **name** only. The manifest keeps
-the id (`applyProvenance`), but it never leaves the phone.
-
-Without an id the desktop cannot tell a renamed collection from a different one,
-so it cannot link an entry to a synced collection row, count books per
-collection reliably, or filter by collection across a rename.
-
-**Required change:** add `scan_collection_id` to the wire payload and to
-`PHONE_PROVENANCE_KEYS`, keeping `scan_collection` (the name snapshot) as well.
-Both are needed: the id links, the name records what the book was actually filed
-under at the time.
+`applyProvenanceToPayload` now sends both the durable collection UUID and the
+frozen name snapshot. `PHONE_PROVENANCE_KEYS` recognizes both so provenance
+never suppresses desktop OCR on a capture that has no extracted metadata.
 
 Entries imported before this change have a name but no id. Treat a missing id as
 "unlinked" — match by name only as a display convenience, never as identity.
@@ -232,7 +245,7 @@ and syncs nothing. On first sign-in, push local collections that have no cloud
 counterpart. This is the same shape as the anonymous-capture claim flow in
 `CaptureOwnership.kt` — read it for precedent.
 
-## Desktop work
+## Deferred desktop integration
 
 1. **Read the table.** New sync path; service key on the desktop is already
    available for working-store tables, but prefer the signed-in user's session
@@ -264,10 +277,10 @@ counterpart. This is the same shape as the anonymous-capture claim flow in
   an id-keyed dict written under `_manual_lock` and needs a forward-compatible
   read (absent key ⇒ empty string), not a rewrite.
 
-## Test plan
+## Verification coverage
 
-Mirror the existing two-sided pattern — a test on each side that names the
-other, as `test_phone_capture.py` and `CollectionsTest` already do.
+The implementation mirrors the existing two-sided pattern — a test on each
+side names the other, as `test_phone_capture.py` and `CollectionsTest` do.
 
 - **Migration**: `tests/test_cloud_migrations.py` covers the migrations
   directory; the new file must satisfy it (idempotent, registers itself).
@@ -285,9 +298,10 @@ other, as `test_phone_capture.py` and `CollectionsTest` already do.
   from `has_metadata`. This is the highest-severity regression in this area and
   it has already happened once.
 
-## Suggested staging
+## Staging status
 
-Each stage is shippable alone.
+Each stage is independently shippable. Stages 1 and 3 are in this Android
+prerelease integration; stages 2 and 4 remain deferred with the desktop UI/API.
 
 1. **Wire the id.** Add `scan_collection_id` on the phone and to
    `PHONE_PROVENANCE_KEYS`. No schema, no UI. Unblocks everything else and is
@@ -303,8 +317,8 @@ Each stage is shippable alone.
 
 - **Field representation:** catalogue columns remain derived from `extra`,
   preserving the existing manual-entry schema and immutable capture snapshot.
-- **Desktop-to-phone visibility:** authenticated background synchronization
-  pulls desktop-created collections without making local collection editing
-  wait on the network.
+- **Cloud-to-phone visibility:** authenticated background synchronization pulls
+  shared collection rows without making local collection editing wait on the
+  network. Desktop creation is deferred with the collection manager.
 - **Archive state:** not added. Soft delete and authoritative merge tombstones
   cover this design; a separate archive lifecycle can be designed later.

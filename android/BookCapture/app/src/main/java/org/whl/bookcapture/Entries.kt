@@ -373,6 +373,11 @@ object Entries {
         if (Prefs.currentEntryId(ctx) == entryId) return@withLock DeleteResult.ACTIVE_CAPTURE
         val entry = find(ctx, entryId) ?: return@withLock DeleteResult.MISSING
         if (entry.uploaded && !allowUploaded) return@withLock DeleteResult.ALREADY_UPLOADED
+        // A local-delete action clears media, not the physical book's place in
+        // its box. Preserve the same photo-free summary used by automatic prune.
+        if (entry.uploaded && !CollectionInventory.recordFinalized(ctx, listOf(entry))) {
+            return@withLock DeleteResult.DELETE_FAILED
+        }
         deleteDirectoryResult(entry.dir)
     }
 
@@ -478,7 +483,8 @@ object Entries {
 
     /** Drop the oldest eligible sent entries beyond KEEP_SENT. Entries still
      * needed for import, photo processing, or an offline review remain local,
-     * but do not prevent completed browsing copies from being capped. */
+     * but do not prevent completed browsing copies from being capped. A
+     * photo-free Inspect summary must be durable before browsing media is lost. */
     suspend fun pruneSent(
         ctx: Context,
         retainLocally: (Entry) -> Boolean,
@@ -487,6 +493,9 @@ object Entries {
         val entriesById = dirs.mapNotNull { dir ->
             runCatching { load(dir) }.getOrNull()?.let { entry -> dir.name to entry }
         }.toMap()
+        // A corrupt or unwritable index pauses pruning instead of erasing the
+        // only collection-content record still available on this device.
+        if (!CollectionInventory.recordFinalized(ctx, entriesById.values)) return
         val overflowIds = sentRetentionOverflow(
             entriesById.map { (entryId, entry) ->
                 SentRetentionCandidate(
@@ -503,6 +512,9 @@ object Entries {
                 // import, photo job, or review edit cannot be pruned.
                 val latest = runCatching { load(dir) }.getOrNull() ?: return@withLock
                 if (runCatching { retainLocally(latest) }.getOrDefault(true)) return@withLock
+                // Persist the locked, freshly loaded state so a metadata update
+                // cannot leave Inspect with the older pre-lock snapshot.
+                if (!CollectionInventory.recordFinalized(ctx, listOf(latest))) return@withLock
                 CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation(dir)
             }
         }

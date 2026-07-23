@@ -29,8 +29,8 @@ android {
         applicationId = "org.whl.bookcapture"
         minSdk = 26
         targetSdk = 34
-        versionCode = 28
-        versionName = "0.5.1-alpha.9"
+        versionCode = 29
+        versionName = "0.5.1-alpha.10"
         buildConfigField("String", "SUPABASE_URL", "\"${env("WHL_SUPABASE_URL")}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${env("WHL_SUPABASE_ANON_KEY")}\"")
     }
@@ -85,6 +85,10 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+
+    // Bundled decoder keeps box-label QR inspection available offline and on
+    // sideloaded/non-GMS devices; CameraX supplies the preview and frames.
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
     implementation("androidx.work:work-runtime-ktx:2.9.1")
 

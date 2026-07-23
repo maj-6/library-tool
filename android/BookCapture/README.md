@@ -1,9 +1,9 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.1-alpha.8` is the Android companion for Library
-Tool. It photographs books, runs OCR and catalog extraction in the background,
-and sends captures either through the cloud or directly to a paired desktop on
-the local network.
+Library Tool Capture `0.5.1-alpha.10` (version code 29) is the Android
+companion for Library Tool. It photographs books, runs OCR and catalog
+extraction in the background, and sends captures either through the cloud or
+directly to a paired desktop on the local network.
 
 The app is still a prerelease. **Check for updates** currently refreshes the
 validated remote catalog of Android strings and in-app icons; it does not offer
@@ -11,7 +11,8 @@ or install an uncertified APK.
 
 ## Home and book details
 
-The app opens on **Home**, which has **Scans** and **Collections** tabs.
+The app opens on **Home**, which has **Scans**, **Collections**, and **Inspect**
+tabs.
 
 The Scans tab groups books into collapsible collection sections. The current
 collection is listed first and expanded initially. Waiting work uses an
@@ -92,6 +93,20 @@ Collections remain available offline in `filesDir/collections.json`. When
 signed in, a background worker reconciles their edits, hierarchy, tombstones,
 and merges with the shared cloud rows. Each capture sends
 `scan_collection_id`, `scan_collection`, and `scan_from`.
+
+Every collection also has a short, unique **tag ID** separate from its durable
+UUID. New collections derive an editable label from their name (for example,
+`Fungi` becomes `FUNGI_1`). This is the human-facing value printed on a box and
+encoded as its QR label; renaming a collection does not silently change a tag
+that may already be printed.
+
+The **Inspect** tab gives a compact collection overview and opens a box directly
+from its QR label. A selected box can be browsed as Windows-like **Tiles**,
+**Content**, or **Icons**. The display choice is kept on the device and scanning
+a box does not change the collection used by the next capture. Inspect retains
+only a small bibliographic summary when old delivered scan media is cleared, so
+the list remains useful without defeating the app's storage limit; cleared
+photos and their local detail view are not retained.
 
 ## Voice commands and notes
 

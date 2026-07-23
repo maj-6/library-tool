@@ -6,6 +6,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
+import java.text.Normalizer
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
@@ -15,7 +16,9 @@ import java.util.UUID
  * A collection is the batch a book was scanned into — a shelf, a crate, a room.
  *
  * [from] is where that batch physically came from ("Storage", "Christopher
- * Office"). [parentId] is a durable collection-to-collection hierarchy edge;
+ * Office"). [tagId] is the editable, human-facing identifier printed as a QR
+ * code on its physical box; it is deliberately separate from the durable UUID
+ * [id]. [parentId] is a durable collection-to-collection hierarchy edge;
  * physical provenance is never used as identity. [updatedAt] and [deleted] are
  * synchronization state. Tombstones are retained on disk but hidden from
  * [Collections.all], so a signed-out delete cannot be resurrected by the next
@@ -30,6 +33,7 @@ data class BookCollection(
     /** Non-null only for an irreversible, human-confirmed identity merge. */
     val mergedInto: String? = null,
     val parentId: String? = null,
+    val tagId: String = defaultCollectionTagId(name),
 )
 
 private fun BookCollection.isLive(): Boolean = !deleted && mergedInto == null
@@ -68,6 +72,151 @@ internal data class CollectionMerge(
  * shelf", short enough that a row stays one line on a phone. */
 internal const val COLLECTION_FIELD_MAX = 80
 
+/** Compact enough for a box label while leaving room for a numeric suffix. */
+internal const val COLLECTION_TAG_ID_MAX = 32
+
+// Keep this explicitly bounded list in sync with migration 018. Using Unicode
+// categories or locale-sensitive uppercase independently in two runtimes would
+// let the same legacy name receive two different printed labels.
+private val COLLECTION_TAG_MARKS = Regex(
+    "[\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F]+",
+)
+private val COLLECTION_TAG_SEPARATORS = Regex("[^A-Z0-9]+")
+private val COLLECTION_TAG_SEQUENCE = Regex("^(.*)_([1-9][0-9]*)$")
+
+private fun uppercaseAscii(value: String): String = buildString(value.length) {
+    value.forEach { char ->
+        append(
+            if (char in 'a'..'z') {
+                (char.code - 'a'.code + 'A'.code).toChar()
+            } else {
+                char
+            },
+        )
+    }
+}
+
+/**
+ * Canonical form shared by editing, persistence, sync, and QR lookup. Accents
+ * are folded where Unicode provides a decomposition; punctuation and runs of
+ * whitespace become one underscore. An empty result remains empty so callers
+ * can choose whether to suggest a value or reject it.
+ */
+private fun canonicalCollectionTagIdCharacters(value: String): String =
+    uppercaseAscii(
+        Normalizer.normalize(value.trim(), Normalizer.Form.NFKD)
+            .replace(COLLECTION_TAG_MARKS, ""),
+    )
+        .replace(COLLECTION_TAG_SEPARATORS, "_")
+        .trim('_')
+
+internal fun normalizeCollectionTagId(value: String): String =
+    canonicalCollectionTagIdCharacters(value)
+        .take(COLLECTION_TAG_ID_MAX)
+        .trimEnd('_')
+
+private fun sequencedCollectionTagId(stem: String, sequence: Int): String {
+    val suffix = "_${sequence.coerceAtLeast(1)}"
+    val fallback = "COLLECTION"
+    val available = (COLLECTION_TAG_ID_MAX - suffix.length).coerceAtLeast(1)
+    val clipped = stem.take(available).trimEnd('_')
+        .ifEmpty { fallback.take(available) }
+    return clipped + suffix
+}
+
+/** The first label suggested for a name; notably, Fungi becomes FUNGI_1. */
+internal fun defaultCollectionTagId(name: String): String {
+    val stem = normalizeCollectionTagId(name).ifEmpty { "COLLECTION" }
+    return sequencedCollectionTagId(stem, 1)
+}
+
+/** Effective canonical tag for legacy/directly constructed model instances. */
+internal fun canonicalCollectionTagId(collection: BookCollection): String =
+    normalizeCollectionTagId(collection.tagId).ifEmpty {
+        defaultCollectionTagId(collection.name)
+    }
+
+/**
+ * Tags stay reserved even on tombstones. Reusing one would make an old QR label
+ * silently open a different physical box after a delete and later recreation.
+ */
+internal fun collectionTagIdTaken(
+    collections: List<BookCollection>,
+    tagId: String,
+    exceptId: String? = null,
+): Boolean {
+    val canonical = normalizeCollectionTagId(tagId)
+    return canonical.isNotEmpty() && collections.any {
+        it.id != exceptId && canonicalCollectionTagId(it) == canonical
+    }
+}
+
+internal fun collectionTagIdsAreUnique(collections: List<BookCollection>): Boolean {
+    val seen = mutableSetOf<String>()
+    return collections.all { seen.add(canonicalCollectionTagId(it)) }
+}
+
+/**
+ * Resolve a suggestion or migrated value without changing UUID identity. An
+ * existing numeric suffix is incremented (FUNGI_1 -> FUNGI_2); otherwise the
+ * first collision candidate is suffixed with _1.
+ */
+internal fun resolveCollectionTagId(
+    name: String,
+    collections: List<BookCollection>,
+    preferredTagId: String? = null,
+    exceptId: String? = null,
+): String {
+    val preferred = preferredTagId?.let(::normalizeCollectionTagId)
+        ?.takeIf { it.isNotEmpty() }
+        ?: defaultCollectionTagId(name)
+    if (!collectionTagIdTaken(collections, preferred, exceptId)) return preferred
+
+    val match = COLLECTION_TAG_SEQUENCE.matchEntire(preferred)
+    val stem = match?.groupValues?.get(1)?.ifEmpty { "COLLECTION" } ?: preferred
+    var sequence = match?.groupValues?.get(2)?.toIntOrNull()
+        ?.takeIf { it < Int.MAX_VALUE }
+        ?.plus(1)
+        ?: 1
+    while (true) {
+        val candidate = sequencedCollectionTagId(stem, sequence)
+        if (!collectionTagIdTaken(collections, candidate, exceptId)) return candidate
+        sequence = if (sequence == Int.MAX_VALUE) 1 else sequence + 1
+    }
+}
+
+internal fun suggestCollectionTagId(
+    name: String,
+    collections: List<BookCollection>,
+    exceptId: String? = null,
+): String = resolveCollectionTagId(name, collections, exceptId = exceptId)
+
+/**
+ * Pure QR result. A unique tag on a live row returns that row. A tag retained
+ * by a human-confirmed merge loser follows the authoritative merge chain to its
+ * live survivor, keeping old printed labels useful. Ordinary deletes, missing
+ * targets, cycles, malformed tags, and duplicate tags resolve to no box.
+ */
+internal fun findCollectionByTagId(
+    collections: List<BookCollection>,
+    scannedTagId: String,
+): BookCollection? {
+    // Editing may truncate a suggestion, but scanning must never turn an
+    // overlong payload into a valid tag by matching only its first 32 chars.
+    val canonical = canonicalCollectionTagIdCharacters(scannedTagId)
+    if (canonical.isEmpty() || canonical.length > COLLECTION_TAG_ID_MAX) return null
+    var cursor = collections.singleOrNull { canonicalCollectionTagId(it) == canonical }
+        ?: return null
+    val byId = collections.associateBy { it.id }
+    val visited = mutableSetOf<String>()
+    while (visited.add(cursor.id)) {
+        if (cursor.isLive()) return cursor
+        val survivorId = cursor.mergedInto ?: return null
+        cursor = byId[survivorId] ?: return null
+    }
+    return null
+}
+
 /** Collapse whitespace and clip. Names are compared case-insensitively for
  * duplicates but stored as typed, so "Storage" doesn't become "storage". */
 internal fun normalizeCollectionField(value: String): String =
@@ -78,6 +227,7 @@ private fun collectionToJson(collection: BookCollection): JSONObject =
         .put("id", collection.id)
         .put("name", collection.name)
         .put("from", collection.from)
+        .put("tag_id", canonicalCollectionTagId(collection))
         .apply {
             if (collection.updatedAt.isNotEmpty()) put("updated_at", collection.updatedAt)
             if (collection.deleted) put("deleted", true)
@@ -100,7 +250,7 @@ internal fun collectionStoreToJson(store: CollectionStore): String {
     val dirty = JSONArray()
     store.dirty.toSortedSet().forEach { dirty.put(it) }
     return JSONObject()
-        .put("version", 3)
+        .put("version", 4)
         .put("collections", array)
         .put("sync_shadow", shadow)
         .put("sync_dirty", dirty)
@@ -122,7 +272,7 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
         it.isFinite() && it % 1.0 == 0.0
     }) { "version must be an integer" }
     val version = rawVersion.toInt()
-    require(version in 1..3) { "unsupported collections version" }
+    require(version in 1..4) { "unsupported collections version" }
     val array = root.optJSONArray("collections")
         ?: throw IllegalArgumentException("collections must be an array")
     if (version >= 2 && root.has("sync_shadow") && root.optJSONObject("sync_shadow") == null) {
@@ -138,6 +288,21 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
         val id = item.optString("id").trim()
         val name = normalizeCollectionField(item.optString("name"))
         if (id.isEmpty() || name.isEmpty() || !seen.add(id)) continue
+        val rawTagId = when (val rawTag = item.opt("tag_id")) {
+            null, JSONObject.NULL -> null
+            is String -> rawTag
+            else -> continue
+        }
+        // Never silently repair a v4 duplicate. It can represent a real sync
+        // conflict between an unsynced local box and a newly fetched cloud
+        // row. Keeping both labels makes QR lookup fail closed and lets the
+        // explicit conflict/editor flow decide which physical box is retagged.
+        val tagId = if (version >= 4) {
+            normalizeCollectionTagId(rawTagId.orEmpty())
+                .ifEmpty { defaultCollectionTagId(name) }
+        } else {
+            defaultCollectionTagId(name)
+        }
         val mergedInto = if (item.isNull("merged_into")) null
         else item.optString("merged_into").trim().ifEmpty { null }
         val parentId = when (val rawParent = item.opt("parent_id")) {
@@ -153,7 +318,20 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
             deleted = item.optBoolean("deleted", false),
             mergedInto = mergedInto,
             parentId = parentId,
+            tagId = tagId,
         )
+    }
+    val collections = if (version >= 4) out else {
+        val allocated = mutableListOf<BookCollection>()
+        val tagsById = mutableMapOf<String, String>()
+        out.sortedBy { it.id.lowercase() }.forEach { row ->
+            val migrated = row.copy(
+                tagId = resolveCollectionTagId(row.name, allocated),
+            )
+            allocated += migrated
+            tagsById[row.id] = migrated.tagId
+        }
+        out.map { it.copy(tagId = tagsById.getValue(it.id)) }
     }
     val shadowObject = root.optJSONObject("sync_shadow") ?: JSONObject()
     val shadow = mutableMapOf<String, CollectionSyncShadow>()
@@ -182,7 +360,20 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
             add(id)
         }
     }
-    CollectionStore(out, shadow, dirty)
+    val migratedShadow = if (version >= 4) shadow else shadow.mapValues { (id, baseline) ->
+        val row = collections.firstOrNull { it.id == id }
+        // Adding a synthesized tag is a format migration, not local intent. If
+        // every pre-tag semantic field still matches the saved baseline, rebase
+        // that baseline so a differing server backfill wins as a one-sided
+        // cloud change. A genuinely edited legacy row keeps its old hash (and
+        // usually its dirty marker), preserving the normal three-way merge.
+        if (row != null && baseline.hash == collectionContentHashBeforeTags(row)) {
+            baseline.copy(hash = collectionContentHash(row))
+        } else {
+            baseline
+        }
+    }
+    CollectionStore(collections, migratedShadow, dirty)
 } catch (_: Exception) {
     CollectionStore(emptyList(), valid = false)
 }
@@ -249,11 +440,21 @@ internal fun addCollection(
     from: String,
     id: String = UUID.randomUUID().toString(),
     parentId: String? = null,
+    tagId: String? = null,
 ): CollectionEdit {
     val clean = normalizeCollectionField(name)
     if (clean.isEmpty()) return CollectionEdit(null, R.string.collections_error_name_required)
     if (collectionNameTaken(collections, clean)) {
         return CollectionEdit(null, R.string.collections_error_name_taken)
+    }
+    val requestedTagId = tagId?.let(::normalizeCollectionTagId)
+    val cleanTagId = if (requestedTagId.isNullOrEmpty()) {
+        suggestCollectionTagId(clean, collections)
+    } else {
+        if (collectionTagIdTaken(collections, requestedTagId)) {
+            return CollectionEdit(null, R.string.collections_error_tag_id_taken)
+        }
+        requestedTagId
     }
     val cleanParentId = normalizeCollectionParentId(parentId)
     if (collectionParentIsInvalid(collections, id, cleanParentId)) {
@@ -265,6 +466,7 @@ internal fun addCollection(
             name = clean,
             from = normalizeCollectionField(from),
             parentId = cleanParentId,
+            tagId = cleanTagId,
         ),
         null,
     )
@@ -276,6 +478,7 @@ internal fun updateCollection(
     name: String,
     from: String,
     parentId: String? = null,
+    tagId: String? = null,
 ): CollectionEdit {
     val clean = normalizeCollectionField(name)
     if (clean.isEmpty()) return CollectionEdit(null, R.string.collections_error_name_required)
@@ -285,6 +488,15 @@ internal fun updateCollection(
     val existing = collections.firstOrNull { it.id == id && it.isLive() }
     if (existing == null) {
         return CollectionEdit(null, R.string.collections_error_missing)
+    }
+    val requestedTagId = tagId?.let(::normalizeCollectionTagId)
+    val cleanTagId = when {
+        tagId == null -> existing.tagId
+        requestedTagId.isNullOrEmpty() -> suggestCollectionTagId(clean, collections, id)
+        collectionTagIdTaken(collections, requestedTagId, id) -> {
+            return CollectionEdit(null, R.string.collections_error_tag_id_taken)
+        }
+        else -> requestedTagId
     }
     val cleanParentId = normalizeCollectionParentId(parentId)
     val allowedMissing = existing.parentId?.takeIf { it == cleanParentId }
@@ -297,6 +509,7 @@ internal fun updateCollection(
                 name = clean,
                 from = normalizeCollectionField(from),
                 parentId = cleanParentId,
+                tagId = cleanTagId,
             ) else it
         },
         null,
@@ -350,8 +563,20 @@ internal fun collectionPatchTimestamp(expected: String): String {
 private fun compareCollectionTimestamps(left: String, right: String): Int =
     parseCollectionTimestamp(left).compareTo(parseCollectionTimestamp(right))
 
-/** Stable semantic identity; timestamps are revision metadata, not content. */
-internal fun collectionContentHash(collection: BookCollection): String {
+private fun hashCollectionFields(fields: List<String>): String {
+    val canonical = fields.joinToString("\u0000")
+    val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray())
+    return buildString(digest.size * 2) {
+        digest.forEach { byte ->
+            val value = byte.toInt() and 0xff
+            if (value < 16) append('0')
+            append(value.toString(16))
+        }
+    }
+}
+
+/** Hash emitted by the parent-aware v3 store immediately before tags existed. */
+private fun collectionContentHashBeforeTags(collection: BookCollection): String {
     val fields = mutableListOf(
         collection.id,
         collection.name,
@@ -362,15 +587,21 @@ internal fun collectionContentHash(collection: BookCollection): String {
     // Preserve every v2 hash when no parent exists, so upgrading does not make
     // all clean rows look locally edited against their stored sync shadow.
     collection.parentId?.let { fields += "parent:$it" }
-    val canonical = fields.joinToString("\u0000")
-    val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray())
-    return buildString(digest.size * 2) {
-        digest.forEach { byte ->
-            val value = byte.toInt() and 0xff
-            if (value < 16) append('0')
-            append(value.toString(16))
-        }
-    }
+    return hashCollectionFields(fields)
+}
+
+/** Stable semantic identity; timestamps are revision metadata, not content. */
+internal fun collectionContentHash(collection: BookCollection): String {
+    val fields = mutableListOf(
+        collection.id,
+        collection.name,
+        collection.from,
+        collection.deleted.toString(),
+        collection.mergedInto.orEmpty(),
+        "tag:${canonicalCollectionTagId(collection)}",
+    )
+    collection.parentId?.let { fields += "parent:$it" }
+    return hashCollectionFields(fields)
 }
 
 private fun shadowOf(row: BookCollection) =
@@ -417,15 +648,30 @@ internal fun mergeCollections(
                 nextDirty.remove(id)
             }
             cloudRow == null -> {
-                merged += localRow
-                if (localRow.mergedInto == null) {
+                if (localRow.deleted && baseline == null) {
+                    // This collection was created and retired entirely offline.
+                    // With no cloud row or acknowledged baseline there is
+                    // nothing to tombstone remotely. Dropping it also prevents
+                    // a hidden, uneditable row from permanently blocking sync
+                    // when its proposed tag was reserved by another device.
+                    nextShadow.remove(id)
+                    nextDirty.remove(id)
+                } else {
+                    merged += localRow
+                }
+                if (!localRow.deleted && localRow.mergedInto == null) {
                     nextDirty += id
                     writes += CollectionCloudWrite(localRow, expectedCloudUpdatedAt = null)
-                } else {
+                } else if (localRow.mergedInto != null) {
                     // A merge marker can only be created by the transactional
                     // server RPC. Never recreate or clear it through ordinary
                     // authenticated row writes.
                     nextDirty.remove(id)
+                } else if (baseline != null) {
+                    // A previously synchronized tombstone remains durable even
+                    // if an inconsistent response temporarily omits its row.
+                    nextDirty += id
+                    writes += CollectionCloudWrite(localRow, expectedCloudUpdatedAt = null)
                 }
             }
             else -> {
@@ -577,6 +823,13 @@ object Collections {
             val currentLive = store.collections.filter { it.isLive() }
             val edited = edit(currentLive)
             val nextLive = edited.collections ?: return@synchronized edited.error
+            val retired = store.collections.filterNot { it.isLive() }
+            // The editor intentionally receives live rows only, but an old QR
+            // label must never be rebound to a different box. Recheck against
+            // tombstones under the store lock before anything is persisted.
+            if (!collectionTagIdsAreUnique(nextLive + retired)) {
+                return@synchronized R.string.collections_error_tag_id_taken
+            }
             val remaining = nextLive.associateBy { it.id }.toMutableMap()
             val now = Instant.now()
             val nextRecords = mutableListOf<BookCollection>()
@@ -596,7 +849,8 @@ object Collections {
                 } else {
                     val changed = replacement.name != old.name ||
                         replacement.from != old.from ||
-                        replacement.parentId != old.parentId
+                        replacement.parentId != old.parentId ||
+                        replacement.tagId != old.tagId
                     nextRecords += replacement.copy(
                         updatedAt = if (changed) nextCollectionTimestamp(old.updatedAt, now)
                         else old.updatedAt,
@@ -694,6 +948,9 @@ object Collections {
 
     fun byId(ctx: Context, id: String): BookCollection? =
         all(ctx).firstOrNull { it.id == id }
+
+    fun byTagId(ctx: Context, tagId: String): BookCollection? =
+        findCollectionByTagId(allRecords(ctx), tagId)
 }
 
 /** Read separately from Android context so preservation of corrupt local-first
