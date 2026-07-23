@@ -342,9 +342,16 @@ def _stable_stat_identity(info: os.stat_result) -> tuple[int, ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class _AuthorityDirectorySnapshot:
+    path: Path
+    named: os.stat_result | None
+
+
+@dataclass(frozen=True, slots=True)
 class _AuthoritySnapshot:
     root: Path
     named_root: os.stat_result
+    directories: tuple[_AuthorityDirectorySnapshot, ...]
 
 
 def _windows_normalized_path(value: str) -> str:
@@ -397,7 +404,6 @@ def _windows_open_directory_guard(path: Path) -> int:
 
     file_read_attributes = 0x00000080
     share_read = 0x00000001
-    share_write = 0x00000002
     open_existing = 3
     flag_backup_semantics = 0x02000000
     flag_open_reparse_point = 0x00200000
@@ -419,9 +425,10 @@ def _windows_open_directory_guard(path: Path) -> int:
     handle = create_file(
         str(path),
         file_read_attributes,
-        # Excluding FILE_SHARE_DELETE keeps the authority root from being
-        # renamed or replaced until the contained file handle is verified.
-        share_read | share_write,
+        # Keep guarded components read-only while the authority proof
+        # revalidates the canonical root-to-parent handle chain. Denying
+        # write/delete sharing also prevents concurrent junction retargeting.
+        share_read,
         None,
         open_existing,
         flag_backup_semantics | flag_open_reparse_point,
@@ -454,28 +461,69 @@ def _open_authorized_descriptor(
     file_flags |= int(getattr(os, "O_NOFOLLOW", 0))
     file_flags |= int(getattr(os, "O_NONBLOCK", 0))
     if os.name == "nt":
-        guard = _windows_open_directory_guard(authority.root)
+        guards: list[int] = []
         try:
-            guard_info = os.fstat(guard)
-            if (
-                not stat.S_ISDIR(guard_info.st_mode)
-                or not os.path.samestat(guard_info, authority.named_root)
+            for directory in (
+                _AuthorityDirectorySnapshot(
+                    authority.root,
+                    authority.named_root,
+                ),
+                *authority.directories,
             ):
-                raise OSError("authority root identity changed")
-            guard_path = _windows_descriptor_path(guard)
+                if directory.named is None:
+                    raise OSError("authority path component appeared during read")
+                guard = _windows_open_directory_guard(directory.path)
+                guards.append(guard)
+                guard_info = os.fstat(guard)
+                if (
+                    not stat.S_ISDIR(guard_info.st_mode)
+                    or not os.path.samestat(guard_info, directory.named)
+                    # The no-delete-share guard makes this pathname identity
+                    # stable while we reject a junction/reparse point that
+                    # raced the earlier lexical inspection.
+                    or _is_redirecting_path(directory.path)
+                ):
+                    raise OSError("authority path component identity changed")
+            guard_paths = tuple(
+                _windows_descriptor_path(guard) for guard in guards
+            )
+            if any(
+                not _windows_path_is_below(child, parent)
+                for parent, child in zip(
+                    guard_paths[:-1],
+                    guard_paths[1:],
+                    strict=True,
+                )
+            ):
+                raise OSError("authority path component escaped its root")
             descriptor = os.open(path, file_flags)
             try:
+                guard_paths = tuple(
+                    _windows_descriptor_path(guard) for guard in guards
+                )
+                if any(
+                    not _windows_path_is_below(child, parent)
+                    for parent, child in zip(
+                        guard_paths[:-1],
+                        guard_paths[1:],
+                        strict=True,
+                    )
+                ):
+                    raise OSError(
+                        "authority path component changed while opening"
+                    )
                 if not _windows_path_is_below(
                     _windows_descriptor_path(descriptor),
-                    guard_path,
+                    guard_paths[-1],
                 ):
-                    raise OSError("opened file escaped its authority root")
+                    raise OSError("opened file escaped its authority parent")
             except BaseException:
                 os.close(descriptor)
                 raise
             return descriptor
         finally:
-            os.close(guard)
+            for guard in reversed(guards):
+                os.close(guard)
 
     directory_flags = os.O_RDONLY | int(getattr(os, "O_CLOEXEC", 0))
     directory_flags |= int(getattr(os, "O_NOFOLLOW", 0))
@@ -496,15 +544,28 @@ def _open_authorized_descriptor(
             or not os.path.samestat(root_opened, authority.named_root)
         ):
             raise OSError("authority root identity changed")
-        for part in relative.parts[:-1]:
+        directory_parts = relative.parts[:-1]
+        if len(directory_parts) != len(authority.directories):
+            raise OSError("authority path snapshot is incomplete")
+        for part, directory in zip(
+            directory_parts,
+            authority.directories,
+            strict=True,
+        ):
+            if directory.named is None:
+                raise OSError("authority path component appeared during read")
             current = os.open(
                 part,
                 directory_flags,
                 dir_fd=current,
             )
             descriptors.append(current)
-            if not stat.S_ISDIR(os.fstat(current).st_mode):
-                raise OSError("authority path component is not a directory")
+            opened_directory = os.fstat(current)
+            if (
+                not stat.S_ISDIR(opened_directory.st_mode)
+                or not os.path.samestat(opened_directory, directory.named)
+            ):
+                raise OSError("authority path component identity changed")
         return os.open(
             relative.parts[-1],
             file_flags,
@@ -1170,8 +1231,9 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item_id,
                 section=section,
             )
+        directory_snapshots: list[_AuthorityDirectorySnapshot] = []
         current = root
-        for part in relative.parts:
+        for index, part in enumerate(relative.parts):
             current /= part
             if _is_redirecting_path(current):
                 raise _repository_error(
@@ -1180,6 +1242,33 @@ class FilesystemCorrectionsArtifactRepository(
                     item_id=item_id,
                     section=section,
                 )
+            if index >= len(relative.parts) - 1:
+                continue
+            try:
+                named_directory = current.lstat()
+            except FileNotFoundError:
+                named_directory = None
+            except OSError as exc:
+                raise _repository_error(
+                    "a Corrections store path cannot be inspected",
+                    code="unsafe_corrections_store_path",
+                    item_id=item_id,
+                    section=section,
+                    cause_type=type(exc).__name__,
+                ) from exc
+            if (
+                named_directory is not None
+                and not stat.S_ISDIR(named_directory.st_mode)
+            ):
+                raise _repository_error(
+                    "a Corrections store path component is not a directory",
+                    code="unsafe_corrections_store_path",
+                    item_id=item_id,
+                    section=section,
+                )
+            directory_snapshots.append(
+                _AuthorityDirectorySnapshot(current, named_directory)
+            )
         try:
             path.resolve(strict=False).relative_to(resolved_root)
         except (OSError, ValueError) as exc:
@@ -1189,7 +1278,11 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item_id,
                 section=section,
             ) from exc
-        return _AuthoritySnapshot(root, named_root)
+        return _AuthoritySnapshot(
+            root,
+            named_root,
+            tuple(directory_snapshots),
+        )
 
     def _authority_root_for(self, section: str) -> Path:
         return (

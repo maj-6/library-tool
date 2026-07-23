@@ -15,6 +15,7 @@ import libformat
 from librarytool.adapters.filesystem.corrections_artifact_repository import (
     FilesystemCorrectionsArtifactRepository,
     FilesystemRasterResourceResolverPort,
+    _open_authorized_descriptor,
     _windows_path_is_below,
 )
 from librarytool.adapters.filesystem.recoverable_write_set import RecoverableWriteSet
@@ -363,6 +364,93 @@ def test_sidecar_ancestor_redirect_cannot_escape_the_authority_root(
 
     assert caught.value.code == "invalid_mistral_layout"
     assert "EXTERNAL SECRET" not in str(caught.value)
+
+
+def test_sidecar_ancestor_redirect_cannot_cross_item_authority(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "library"
+    layout_path = _write_layout(root, _layout("ab" * 32))
+    private_layout = _entry(root, "book-2") / "ocr" / "layout.json"
+    private_layout.parent.mkdir(parents=True)
+    leaked = _layout("cd" * 32)
+    leaked["regions"]["primary"]["3"]["items"][0]["text"] = "PRIVATE ITEM SECRET"
+    private_layout.write_text(json.dumps(leaked), encoding="utf-8")
+    repository = _repository(root, capture_ids={})
+    real_assert = repository._assert_safe_path
+    swapped = False
+    item_directory = _entry(root)
+    private_item_directory = _entry(root, "book-2")
+    backup = _entry(root, "book-1.original")
+
+    def swapping_assert(path, **kwargs):
+        nonlocal swapped
+        authority = real_assert(path, **kwargs)
+        if Path(path) == layout_path and not swapped:
+            swapped = True
+            item_directory.replace(backup)
+            private_item_directory.replace(item_directory)
+        return authority
+
+    monkeypatch.setattr(repository, "_assert_safe_path", swapping_assert)
+
+    try:
+        with pytest.raises(RepositoryError) as caught:
+            repository.list_spatial_annotations(ITEM_ID)
+    finally:
+        if swapped:
+            item_directory.replace(private_item_directory)
+            backup.replace(item_directory)
+
+    assert caught.value.code == "invalid_mistral_layout"
+    assert "PRIVATE ITEM SECRET" not in str(caught.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle semantics")
+def test_opened_file_must_remain_under_its_guarded_parent(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "library"
+    layout_path = _write_layout(root, _layout("ab" * 32))
+    private_layout = _entry(root, "book-2") / "ocr" / "layout.json"
+    private_layout.parent.mkdir(parents=True)
+    private_layout.write_text(
+        json.dumps(_layout("cd" * 32)),
+        encoding="utf-8",
+    )
+    repository = _repository(root, capture_ids={})
+    authority = repository._assert_safe_path(
+        layout_path,
+        item_id=ITEM_ID,
+        section="layout",
+    )
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == layout_path and not swapped:
+            swapped = True
+            item_directory = _entry(root) / "ocr"
+            item_directory.replace(_entry(root) / "ocr.original")
+            os.symlink(
+                _entry(root, "book-2") / "ocr",
+                item_directory,
+                target_is_directory=True,
+            )
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(OSError, match="escaped its authority parent"):
+        _open_authorized_descriptor(
+            layout_path,
+            authority,
+        )
+
+    assert swapped is True
 
 
 def test_android_capture_projection_is_stable_safe_and_read_only(tmp_path):
