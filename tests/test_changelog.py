@@ -8,6 +8,17 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 DESKTOP_CHANGELOG = (ROOT / "website" / "changelog.md").read_text(encoding="utf-8")
 ANDROID_CHANGELOG = (ROOT / "website" / "android-changelog.md").read_text(encoding="utf-8")
+PACKAGED_ANDROID_CHANGELOG = (
+    ROOT
+    / "android"
+    / "BookCapture"
+    / "app"
+    / "src"
+    / "release"
+    / "res"
+    / "raw"
+    / "android_changelog.md"
+).read_text(encoding="utf-8")
 CATEGORY_ORDER = ("Additions", "Other Changes", "Bugfixes")
 
 
@@ -83,3 +94,7 @@ def test_changelog_avoids_internal_release_note_terms():
     ):
         assert term not in DESKTOP_CHANGELOG
         assert term not in ANDROID_CHANGELOG
+
+
+def test_android_release_packages_the_public_android_changelog_verbatim():
+    assert PACKAGED_ANDROID_CHANGELOG == ANDROID_CHANGELOG
