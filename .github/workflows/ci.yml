@@ -106,7 +106,7 @@ jobs:
       - name: Install processor and test tools
         run: |
           python -m pip install -r requirements.lock
-          python -m pip install --no-deps pytest==9.0.2 ruff==0.15.7
+          python -m pip install pytest==9.0.2 ruff==0.15.7
           python -m pip install --no-deps page-dewarp==0.3.4
           python -m pip install --no-deps -e ../..
           python -m pip install --no-deps -e .
