@@ -461,6 +461,8 @@ brightness are never portable archive data.
   `representations/` member under the rules in §8.2;
 - each physical resource exists once, is bounded, and matches every permitted
   declaration's SHA-256;
+- `book.json.pages` is a unique, bounded list of valid page numbers and must
+  exactly match the physical `pages/<N>.json` members;
 - the archive, member count, individual resources, and total declared
   inflation are capped before decompression;
 - graph fields and nested `ext` data may not contain local paths, URLs,
@@ -472,6 +474,10 @@ brightness are never portable archive data.
   Omission is distinct from an empty array/object, and `null` is never a
   substitute. Optional structured fields such as `dimensions`, `selector`,
   assertion provenance, and nested `ext` are validated whenever present.
+- Optional string fields are likewise validated whenever present. Empty
+  strings are accepted only where the schema explicitly uses
+  `optionalPortableId` or `optionalRevision` (and for unconstrained strings);
+  `null`, booleans, numbers, arrays, and objects are not omission.
 
 `LibError.code` and `LibError.details` provide a framework-neutral failure
 receipt. The engine archive planner exposes the equivalent typed
