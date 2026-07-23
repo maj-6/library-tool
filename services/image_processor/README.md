@@ -139,8 +139,14 @@ gcloud config set project $ProjectId
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com
 gcloud artifacts repositories create $Repository --repository-format=docker --location=$Region
 gcloud iam service-accounts create whl-image-processor --display-name="WHL image processor"
-gcloud builds submit . --config services/image_processor/cloudbuild.yaml --substitutions "_IMAGE=$Image"
+gcloud builds submit . --ignore-file=.gcloudignore --config services/image_processor/cloudbuild.yaml --substitutions "_IMAGE=$Image"
 ```
+
+The checked-in root `.gcloudignore` allowlists only the package and processor
+files required by this build. Keep local `.env` files outside that upload
+context; verify the effective list with
+`gcloud meta list-files-for-upload . --ignore-file=.gcloudignore` before
+changing the build inputs.
 
 Create a Secret Manager secret named `whl-supabase-secret` in the Cloud
 Console and add the dedicated Supabase key as version 1. Using the Console here
