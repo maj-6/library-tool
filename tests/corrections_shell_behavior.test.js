@@ -146,6 +146,17 @@ test("typed editor registry routes supported resources and safely falls back", (
 
   const image = { id: "page-1", kind: "captured-image", url: "/resource/page-1" };
   assert.equal(resourceFamily(image), "image");
+  assert.equal(resourceFamily({
+    ...image,
+    family: "image",
+    media_type: "image/jpeg",
+    regions: [],
+  }), "image", "decoded image details retain image editor precedence");
+  assert.equal(resourceFamily({
+    ...image,
+    media_type: "image/jpeg",
+    regions: [],
+  }), "image", "an optional regions collection cannot mask image media");
   assert.deepEqual(registry.compatibleEditors(image).map((editor) => editor.id), [
     "image-overlay", "image-plain",
   ]);
