@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import threading
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -373,6 +374,83 @@ def test_queue_is_idempotent_and_operation_reuse_conflicts() -> None:
     with pytest.raises(ConflictError) as conflict:
         service.queue(_command(source, adjustment=None))
     assert conflict.value.code == "correction_operation_conflict"
+
+
+def test_queue_replays_terminal_outcome_after_live_history_is_pruned() -> None:
+    source = _source()
+    command = _command(source)
+    jobs = JobManager(keep=0, checkpoint_interval=0)
+    store = MemoryStore(source)
+    worker = CorrectionTransformWorker(jobs, store)
+    service = CorrectionTransformService(jobs, executor=worker.run)
+
+    first = service.queue(command)
+    result = service.execute_queued(command)
+
+    assert result.job_id == first.job_id
+    assert jobs.view(first.job_id) is None
+    replay = service.queue(
+        CorrectionTransformCommand.from_dict(command.as_dict())
+    )
+    assert replay.created is False
+    assert replay.job_id == first.job_id
+    assert replay.job.state.value == "done"
+    assert replay.job.outputs
+    with pytest.raises(ConflictError) as conflict:
+        service.queue(_command(source, adjustment=None))
+    assert conflict.value.code == "correction_operation_conflict"
+
+
+def test_queue_registration_runs_inside_injected_item_start_guard() -> None:
+    events = []
+
+    class ObservedJobs(JobManager):
+        def track(self, job, kind, *, label=""):
+            events.append(("track", job["subject"]["item_id"]))
+            assert events[-2] == ("enter", "book-1")
+            return super().track(job, kind, label=label)
+
+    @contextmanager
+    def start_guard(item_id):
+        events.append(("enter", item_id))
+        try:
+            yield
+        finally:
+            events.append(("exit", item_id))
+
+    service = CorrectionTransformService(
+        ObservedJobs(),
+        start_guard_for=start_guard,
+    )
+
+    queued = service.queue(_command())
+
+    assert queued.created is True
+    assert events == [
+        ("enter", "book-1"),
+        ("track", "book-1"),
+        ("exit", "book-1"),
+    ]
+
+
+def test_item_start_guard_can_reject_registration_without_leaving_a_job() -> None:
+    jobs = JobManager()
+
+    @contextmanager
+    def reject_start(_item_id):
+        raise ConflictError("item deletion won", code="item_deletion_won")
+        yield  # pragma: no cover - contextmanager shape
+
+    service = CorrectionTransformService(
+        jobs,
+        start_guard_for=reject_start,
+    )
+
+    with pytest.raises(ConflictError) as conflict:
+        service.queue(_command())
+
+    assert conflict.value.code == "item_deletion_won"
+    assert jobs.list() == []
 
 
 def test_service_executes_a_queued_command_through_its_injected_runner() -> None:

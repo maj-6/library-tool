@@ -421,6 +421,7 @@ class CorrectionsBindings:
     capture_authority_root: Path
     representation_revision_for: CorrectionsRepresentationRevision
     lock_context_for: CatalogueLockFactory
+    job_start_context_for: ItemLockFactory | None = None
 
     def __post_init__(self) -> None:
         capture_authority_root = Path(self.capture_authority_root)
@@ -443,6 +444,11 @@ class CorrectionsBindings:
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+        if (
+            self.job_start_context_for is not None
+            and not callable(self.job_start_context_for)
+        ):
+            raise TypeError("job_start_context_for must be callable or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -727,13 +733,6 @@ class FilesystemServiceGraph:
                 "correction_transforms must be a "
                 "CorrectionTransformService or None"
             )
-        if (self.correction_commands is None) != (
-            self.correction_transforms is None
-        ):
-            raise ValueError(
-                "correction commands and transforms must be installed together"
-            )
-
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
@@ -906,6 +905,7 @@ def compose_filesystem_engine(
         correction_transforms = CorrectionTransformService(
             resources.jobs,
             executor=correction_transform_worker.run,
+            start_guard_for=corrections.job_start_context_for,
         )
 
     canvas_query = None

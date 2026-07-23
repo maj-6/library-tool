@@ -5406,6 +5406,7 @@ def _engine_host_bindings() -> FilesystemHostBindings:
                 _corrections_representation_revision
             ),
             lock_context_for=lambda: _engine_workspace_locks(""),
+            job_start_context_for=_correction_transform_job_start_guard,
         ),
         workspace_lock_context_for=_engine_workspace_locks,
         recovery_lock_context=_engine_recovery_locks,
@@ -8987,6 +8988,38 @@ class _ItemJobStartRejected(Exception):
     """The catalogue item disappeared before its worker was registered."""
 
 
+@contextlib.contextmanager
+def _item_job_start_guard(
+        item_id: str, *, rejection: Exception | None = None):
+    """Hold the lifecycle/catalogue gate until an item job is observable."""
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        raise rejection or _ItemJobStartRejected(
+            "an item-scoped job needs an item id"
+        )
+    with _page_structure_lock:
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            item = builds.get(item_id) if isinstance(builds, dict) else None
+            if not isinstance(item, dict):
+                raise rejection or _ItemJobStartRejected(
+                    "the item disappeared before the job could start"
+                )
+            yield item
+
+
+@contextlib.contextmanager
+def _correction_transform_job_start_guard(item_id: str):
+    """Expose the shared host lifecycle gate through the engine binding."""
+    rejection = EngineNotFoundError(
+        "the correction item no longer exists",
+        code="correction_item_not_found",
+        details={"item_id": str(item_id or "")},
+    )
+    with _item_job_start_guard(item_id, rejection=rejection):
+        yield
+
+
 def _job_track(job: dict, kind: str, label: str = "") -> threading.Event:
     """Enter a per-kind job dict into the unified registry (shared dict) and
     return its cancellation event. This is the low-level compatibility seam;
@@ -9012,30 +9045,21 @@ def _job_track_item_guarded(
     must not hold the non-reentrant ``_builds_lock``.
     """
     item_id = str(item_id or "").strip()
-    if not item_id:
-        raise _ItemJobStartRejected("an item-scoped job needs an item id")
-    with _page_structure_lock:
-        with _builds_lock:
-            builds = lib.load_json(BUILDS_PATH, {})
-            item = builds.get(item_id) if isinstance(builds, dict) else None
-            if not isinstance(item, dict):
-                raise _ItemJobStartRejected(
-                    "the item disappeared before the job could start"
-                )
-            job["build_id"] = item_id
-            raw_subject = job.get("subject")
-            subject = dict(raw_subject) if isinstance(raw_subject, Mapping) else {}
-            subject["item_id"] = item_id
-            job["subject"] = subject
-            resolved_label = (
-                str(label or "").strip()
-                or str(item.get("title") or "").strip()
-                or item_id
-            )
-            # Keep both locks until JobManager.track has made the active job
-            # observable. Releasing either one first recreates a delete/start
-            # time-of-check/time-of-use window.
-            return _job_track(job, kind, label=resolved_label)
+    with _item_job_start_guard(item_id) as item:
+        job["build_id"] = item_id
+        raw_subject = job.get("subject")
+        subject = dict(raw_subject) if isinstance(raw_subject, Mapping) else {}
+        subject["item_id"] = item_id
+        job["subject"] = subject
+        resolved_label = (
+            str(label or "").strip()
+            or str(item.get("title") or "").strip()
+            or item_id
+        )
+        # Keep both locks until JobManager.track has made the active job
+        # observable. Releasing either one first recreates a delete/start
+        # time-of-check/time-of-use window.
+        return _job_track(job, kind, label=resolved_label)
 
 
 def _job_transition_locked(job: dict, status: str, **fields) -> None:

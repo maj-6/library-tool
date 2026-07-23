@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
 import server
 
+from librarytool.engine.errors import NotFoundError
 from librarytool.engine.correction_transforms import (
     CorrectionTransformCommand,
     CorrectionTransformRunResult,
@@ -12,10 +14,8 @@ from librarytool.engine.correction_transforms import (
 from librarytool.engine.jobs import JobManager
 
 
-def test_process_host_deduplicates_window_independent_transform_threads(
-    monkeypatch,
-):
-    command = CorrectionTransformCommand(
+def _command() -> CorrectionTransformCommand:
+    return CorrectionTransformCommand(
         item_id="book-1",
         artifact_id="capture-1",
         artifact_revision="artifact-r1",
@@ -24,6 +24,29 @@ def test_process_host_deduplicates_window_independent_transform_threads(
         quad=((0, 0), (1, 0), (1, 1), (0, 1)),
         operation_id="transform-host-op",
     )
+
+
+def test_process_host_rejects_transform_start_after_item_disappears(
+    monkeypatch,
+):
+    monkeypatch.setattr(server.lib, "load_json", lambda _path, _default: {})
+    jobs = JobManager()
+    service = CorrectionTransformService(
+        jobs,
+        start_guard_for=server._correction_transform_job_start_guard,
+    )
+
+    with pytest.raises(NotFoundError) as missing:
+        service.queue(_command())
+
+    assert missing.value.code == "correction_item_not_found"
+    assert jobs.list() == []
+
+
+def test_process_host_deduplicates_window_independent_transform_threads(
+    monkeypatch,
+):
+    command = _command()
     jobs = JobManager()
     job_id = CorrectionTransformService.job_id_for(command.operation_id)
     executed = []
