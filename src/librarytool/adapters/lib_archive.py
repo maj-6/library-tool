@@ -40,6 +40,7 @@ _TRANSLATION_MEMBER = re.compile(
     r"translations/([a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\.json"
 )
 _BOOK_ID = re.compile(r"b-[0-9a-f]{32}")
+_MAX_JSON_NESTING = 128
 
 
 def _safe_archive_member(name: object, *, directory: bool = False) -> bool:
@@ -71,7 +72,37 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _json_nesting_exceeds(
+    payload: bytes,
+    maximum: int = _MAX_JSON_NESTING,
+) -> bool:
+    """Check structural JSON depth without counting delimiters inside strings."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == 0x5C:
+                escaped = True
+            elif value == 0x22:
+                in_string = False
+            continue
+        if value == 0x22:
+            in_string = True
+        elif value in (0x7B, 0x5B):
+            depth += 1
+            if depth > maximum:
+                return True
+        elif value in (0x7D, 0x5D):
+            depth -= 1
+    return False
+
+
 def _strict_json(payload: bytes) -> Any:
+    if _json_nesting_exceeds(payload):
+        raise ValueError("JSON nesting is too deep")
     try:
         text = payload.decode("utf-8")
         return json.loads(

@@ -15,6 +15,7 @@ import libformat
 import pytest
 import replica_service
 
+from librarytool.adapters import lib_archive as lib_archive_adapter
 from librarytool.adapters.lib_archive import ExistingItemLibArchivePlanner
 from librarytool.engine.errors import ValidationError
 from librarytool.engine.interchange import ImportDestinationSnapshot
@@ -1392,10 +1393,25 @@ def test_deep_json_is_reported_without_leaking_recursion_errors(tmp_path):
 def test_strict_json_depth_guard_ignores_delimiters_inside_strings():
     braces = "{[}" * (libformat.MAX_JSON_NESTING + 10)
     payload = json.dumps({"text": braces, "escaped": '\\"{[}'}).encode("utf-8")
-    assert libformat._strict_json(payload) == {
+    expected = {
         "text": braces,
         "escaped": '\\"{[}',
     }
+    assert libformat._strict_json(payload) == expected
+    assert lib_archive_adapter._strict_json(payload) == expected
+
+
+def test_strict_json_depth_guards_share_the_same_boundary():
+    at_limit = (
+        b"[" * libformat.MAX_JSON_NESTING
+        + b"0"
+        + b"]" * libformat.MAX_JSON_NESTING
+    )
+    above_limit = b"[" + at_limit + b"]"
+    for parser in (libformat._strict_json, lib_archive_adapter._strict_json):
+        assert parser(at_limit)
+        with pytest.raises(ValueError):
+            parser(above_limit)
 
 
 def test_lib2_writer_and_lib1_parser_keep_their_existing_semantics(tmp_path):
