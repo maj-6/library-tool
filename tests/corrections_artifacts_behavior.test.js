@@ -187,6 +187,25 @@ test("tree groups load lazily, page on demand, and remain keyboard navigable", a
 });
 
 
+test("read-only artifact composition preserves missing caption capabilities", () => {
+  const documentRef = fakeDocument();
+  const treeRoot = new FakeNode("div", documentRef);
+  const propertiesRoot = new FakeNode("dl", documentRef);
+  const feature = createArtifactsFeature({
+    treeRoot,
+    propertiesRoot,
+    documentRef,
+  }).mount();
+
+  assert.deepEqual(feature.properties.captionCapabilities, {
+    set: false,
+    clear: false,
+    undo: false,
+  });
+  feature.destroy();
+});
+
+
 test("context and selection generations discard stale results and abort prior work", async () => {
   const first = deferred();
   const second = deferred();

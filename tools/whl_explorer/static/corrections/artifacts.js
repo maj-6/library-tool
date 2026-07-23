@@ -204,7 +204,7 @@
         this.documentRef = options.documentRef || this.treeRoot.ownerDocument;
         this.catalog = options.catalog || UNAVAILABLE.catalog;
         this.resources = options.resources || UNAVAILABLE.resources;
-        this.commands = options.commands || UNAVAILABLE.commands;
+        this.commands = options.commands || null;
         this.editorRegistry = options.editorRegistry || null;
         this.onResource = typeof options.onResource === "function"
           ? options.onResource : (resource) => {
