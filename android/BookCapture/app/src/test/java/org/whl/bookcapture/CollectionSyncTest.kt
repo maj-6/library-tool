@@ -572,6 +572,37 @@ class CollectionSyncTest {
     }
 
     @Test
+    fun collectionPaginationPreservesExplicitTagConflictsAndAllocatesOnlyLegacyTags() {
+        val rows = JSONArray()
+            .put(
+                JSONObject()
+                    .put("id", "a")
+                    .put("name", "Fungi")
+                    .put("tag_id", " fungi-1 "),
+            )
+            .put(
+                JSONObject()
+                    .put("id", "b")
+                    .put("name", "Mushrooms")
+                    .put("tag_id", "FUNGI_1"),
+            )
+            .put(
+                JSONObject()
+                    .put("id", "c")
+                    .put("name", "Fungi")
+                    .put("tag_id", JSONObject.NULL),
+            )
+
+        val loaded = collectCollectionPages { afterId ->
+            if (afterId == null) rows else JSONArray()
+        }
+
+        assertEquals(listOf("a", "b", "c"), loaded.map { it.id })
+        assertEquals(listOf("FUNGI_1", "FUNGI_1", "FUNGI_2"), loaded.map { it.tagId })
+        assertFalse(collectionTagIdsAreUnique(loaded))
+    }
+
+    @Test
     fun opportunisticWorkCoalescesButMutationsAppend() {
         assertEquals(ExistingWorkPolicy.KEEP, collectionSyncWorkPolicy(guaranteed = false))
         assertEquals(

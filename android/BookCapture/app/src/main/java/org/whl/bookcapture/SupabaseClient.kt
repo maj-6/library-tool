@@ -50,8 +50,11 @@ internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
         is String -> rawTag
         else -> return null
     }
-    val tagId = normalizeCollectionTagId(rawTagId.orEmpty())
-        .ifEmpty { defaultCollectionTagId(name) }
+    val tagId = if (rawTagId == null) {
+        defaultCollectionTagId(name)
+    } else {
+        normalizeCollectionTagId(rawTagId).ifEmpty { return null }
+    }
     val mergedInto = if (row.isNull("merged_into")) null
     else row.optString("merged_into").trim().ifEmpty { null }
     val parentId = if (row.isNull("parent_id")) null
@@ -81,9 +84,16 @@ internal fun collectCollectionPages(
         val rows = fetchPage(afterId)
         if (rows.length() == 0) return out
         for (index in 0 until rows.length()) {
-            rows.optJSONObject(index)?.let(::cloudCollectionFromJson)?.let { parsed ->
-                // A legacy cloud snapshot can contain null tags. Resolve its
-                // in-memory fallback deterministically across pagination too.
+            val row = rows.optJSONObject(index) ?: continue
+            val parsed = cloudCollectionFromJson(row) ?: continue
+            if (row.has("tag_id") && !row.isNull("tag_id")) {
+                // Preserve an explicit duplicate so the conflict detector and
+                // QR lookup fail closed. Printed box tags must never be
+                // silently reassigned while reading a drifted cloud snapshot.
+                out += parsed
+            } else {
+                // A legacy cloud snapshot can contain null tags. Resolve only
+                // that synthesized fallback deterministically across pages.
                 val uniqueTagId = resolveCollectionTagId(
                     parsed.name,
                     out,

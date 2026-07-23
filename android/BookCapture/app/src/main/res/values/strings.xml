@@ -146,11 +146,11 @@
     <string name="collections_choose_first">Choose a collection before scanning a book.</string>
     <string name="collections_row_from">from %1$s</string>
     <string name="collections_row_no_from">no origin recorded</string>
-    <!-- Deliberately "on this phone", not a total: the recent list prunes
-         uploaded scans, so a plain count would shrink as books are delivered. -->
+    <!-- The durable inventory retains summaries after delivered scan media is
+         pruned, so this count does not shrink as books are delivered. -->
     <plurals name="collections_row_books">
-        <item quantity="one">%1$d on this phone</item>
-        <item quantity="other">%1$d on this phone</item>
+        <item quantity="one">%1$d recorded on this device</item>
+        <item quantity="other">%1$d recorded on this device</item>
     </plurals>
     <string name="home_group_unfiled">No collection</string>
     <plurals name="home_group_scan_count">
