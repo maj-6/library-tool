@@ -36,8 +36,10 @@ from librarytool.engine.runtime import (
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
+    RASTER_ARTIFACT_QUERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    SPATIAL_ANNOTATION_QUERY_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -266,13 +268,15 @@ def test_http_discovery_exposes_resolved_installed_workbenches(client):
     assert document["ok"] is True
     assert document["schema"] == "librarytool.capabilities/1"
     assert {row["id"] for row in document["workbenches"] if row["visible"]} == {
-        "catalog", "replica"}
+        "catalog", "corrections", "replica"}
     capabilities = {
         (row["id"], row["version"]) for row in document["capabilities"]}
     assert ("replica.regions", 1) in capabilities
     assert ("replica.interchange", 2) in capabilities
     assert ("replica.interchange.open", 1) in capabilities
     assert ("library.jobs", 1) in capabilities
+    assert ("library.raster-artifacts.read", 1) in capabilities
+    assert ("library.spatial-annotations.read", 1) in capabilities
 
 
 def test_import_does_not_claim_or_open_the_engine_workspace(tmp_path):
@@ -363,6 +367,13 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
     assert server._jobs_lock is server._engine_session.jobs.lock
     assert server._library_engine_instance is engine
     assert engine.capabilities.sealed is True
+    raster_artifacts = engine.require_service(
+        RASTER_ARTIFACT_QUERY_SERVICE
+    )
+    assert raster_artifacts is engine.require_service(
+        SPATIAL_ANNOTATION_QUERY_SERVICE
+    )
+    assert server._engine_session.raster_resource_resolver is raster_artifacts
     assert engine.items is not None
     assert engine.item_commands._allow_legacy_delete is False
     assert {

@@ -10,6 +10,8 @@ def test_corrections_workbench_is_an_independent_document(client):
     assert "corrections/editor-registry.js" in document
     assert "corrections/layout-controller.js" in document
     assert "corrections/artifact-model.js" in document
+    assert "engine-client.js" in document
+    assert "corrections/engine-adapter.js" in document
     assert "corrections/artifact-editors.js" in document
     assert "corrections/properties.js" in document
     assert "corrections/artifacts.js" in document
@@ -28,7 +30,13 @@ def test_corrections_workbench_is_an_independent_document(client):
     assert "corrections/image-editor.css" in document
     assert "corrections/classification.css" in document
     assert "corrections/image-adjust-tool.css" in document
-    assert document.count("?v=") >= 23
+    assert document.count("?v=") >= 25
+    assert document.index("engine-client.js") < document.index(
+        "corrections/engine-adapter.js"
+    )
+    assert document.index("corrections/engine-adapter.js") < document.index(
+        "corrections/shell.js"
+    )
     assert document.index("corrections/books.js") < document.index(
         "corrections/reviews.js"
     )

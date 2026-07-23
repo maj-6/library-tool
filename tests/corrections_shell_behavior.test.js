@@ -35,6 +35,7 @@ const {
   CorrectionsShell,
   CorrectionsWindowState,
   artifactSelection,
+  correctionsRuntimePorts,
   nextTrayTab,
   normalizeSelection,
   normalizeWorkbenchContext,
@@ -760,6 +761,32 @@ test("Corrections context validation is canonical and matches the desktop contra
 });
 
 
+test("standalone runtime uses engine artifact ports while desktop remains preferred", () => {
+  const engineClient = {
+    rasterArtifacts: {
+      list() {},
+      get() {},
+      resourceUrl() {},
+    },
+    spatialAnnotations: {
+      list() {},
+      get() {},
+    },
+  };
+  const standalone = correctionsRuntimePorts({ engineClient }, null);
+  assert.equal(typeof standalone.artifacts.catalog.list, "function");
+  assert.equal(typeof standalone.artifacts.resources.resolveRaster, "function");
+
+  const desktopCorrections = { artifacts: { catalog: { list() {} } } };
+  assert.equal(
+    correctionsRuntimePorts({ engineClient }, desktopCorrections),
+    null,
+    "the authenticated desktop bridge remains authoritative when present",
+  );
+  assert.equal(correctionsRuntimePorts({}, null), null);
+});
+
+
 test("late currentContext results cannot overwrite a newer pushed context", async () => {
   let pushContext;
   let resolveCurrent;
@@ -908,6 +935,21 @@ test("standalone shell markup exposes accessible panes, tree, editor, tray, and 
   assert.match(templateSource, /corrections\/commands\.js/);
   assert.match(templateSource, /corrections\/classification-controls\.js/);
   assert.match(templateSource, /corrections\/image-adjust-tool\.js/);
+  assert.match(templateSource, /engine-client\.js/);
+  assert.match(templateSource, /corrections\/engine-adapter\.js/);
+  assert.match(templateSource, /engine-client\.js'\) \}\}\?v=\{\{ corrections_engine_client_v \}\}/);
+  assert.match(
+    templateSource,
+    /corrections\/engine-adapter\.js'\) \}\}\?v=\{\{ corrections_engine_adapter_v \}\}/,
+  );
+  assert.ok(
+    templateSource.indexOf("engine-client.js") <
+      templateSource.indexOf("corrections/engine-adapter.js"),
+  );
+  assert.ok(
+    templateSource.indexOf("corrections/engine-adapter.js") <
+      templateSource.indexOf("corrections/shell.js"),
+  );
 
   const separators = [...templateSource.matchAll(/<div[^>]+role="separator"[^>]*>/g)];
   assert.equal(separators.length, 4);

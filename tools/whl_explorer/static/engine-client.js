@@ -606,6 +606,273 @@
           value.units[0].after_content_revision);
   }
 
+  const ARTIFACT_FRESHNESS = new Set(["current", "stale", "untracked"]);
+  const ARTIFACT_RESOURCE_STATES =
+    new Set(["available", "missing", "unavailable"]);
+  const ARTIFACT_CATEGORIES =
+    new Set(["title_page", "cover", "spine", "content_specimen", "other"]);
+  const ARTIFACT_PRIVATE_KEYS = new Set([
+    "absolute_path", "asset_ref", "file", "file_name", "filename", "filepath",
+    "local_path", "locator", "path", "resource_ref", "storage_key",
+    "storage_locator", "storage_path", "uri", "url",
+  ]);
+
+  function normalizedArtifactKey(value) {
+    return String(value || "").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase();
+  }
+
+  function isPrivateArtifactKey(value) {
+    const key = normalizedArtifactKey(value);
+    return ARTIFACT_PRIVATE_KEYS.has(key) ||
+      ["file", "filename", "filepath", "locator", "path", "uri", "url"]
+        .includes(key.split("_").at(-1));
+  }
+
+  function isBoundedArtifactJson(value, state = { nodes: 0 }, depth = 0) {
+    state.nodes += 1;
+    if (state.nodes > 512 || depth > 12) return false;
+    if (value === null || typeof value === "boolean") return true;
+    if (typeof value === "string") {
+      return value.length <= 8192 &&
+        !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\ud800-\udfff]/u
+          .test(value);
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) &&
+        (!Number.isInteger(value) || Number.isSafeInteger(value));
+    }
+    if (Array.isArray(value)) {
+      return value.length <= 512 &&
+        value.every((entry) => isBoundedArtifactJson(entry, state, depth + 1));
+    }
+    if (!isObject(value)) return false;
+    const keys = Object.keys(value);
+    return keys.length <= 512 && keys.every((key) =>
+      key.length >= 1 && key.length <= 128 && key === key.trim() &&
+      !isPrivateArtifactKey(key) &&
+      isBoundedArtifactJson(value[key], state, depth + 1));
+  }
+
+  function isArtifactRevision(value, optional = false) {
+    if (typeof value !== "string") return false;
+    if (!value) return optional;
+    return value.length <= 512 && /^[\x21-\x7e]+$/.test(value) &&
+      !/["\\]/.test(value);
+  }
+
+  function isArtifactProvenance(value) {
+    return hasExactKeys(value, [
+      "origin", "provider_id", "model", "recipe_revision", "operation_id",
+      "generated_at", "extensions",
+    ]) && isPortableIdentifier(value.origin) &&
+      (value.provider_id === "" || isPortableIdentifier(value.provider_id)) &&
+      typeof value.model === "string" && value.model.length <= 256 &&
+      isArtifactRevision(value.recipe_revision, true) &&
+      (value.operation_id === "" || isPortableIdentifier(value.operation_id)) &&
+      typeof value.generated_at === "string" &&
+      value.generated_at.length <= 128 &&
+      isBoundedArtifactJson(value.extensions);
+  }
+
+  function isRasterSource(value) {
+    if (!isObject(value)) return false;
+    const keys = Object.keys(value);
+    const hasCanvas = keys.length === 4 &&
+      hasExactKeys(value, [
+        "representation_id", "representation_revision",
+        "canvas_id", "canvas_revision",
+      ]);
+    const noCanvas = keys.length === 2 &&
+      hasExactKeys(value, ["representation_id", "representation_revision"]);
+    return (hasCanvas || noCanvas) &&
+      isPortableIdentifier(value.representation_id) &&
+      isArtifactRevision(value.representation_revision) &&
+      (!hasCanvas || isPortableIdentifier(value.canvas_id) &&
+        isArtifactRevision(value.canvas_revision));
+  }
+
+  function isSpatialSource(value) {
+    return hasExactKeys(value, [
+      "representation_id", "representation_revision",
+      "canvas_id", "canvas_revision",
+    ]) && isPortableIdentifier(value.representation_id) &&
+      isArtifactRevision(value.representation_revision) &&
+      isPortableIdentifier(value.canvas_id) &&
+      isArtifactRevision(value.canvas_revision);
+  }
+
+  function isArtifactCaption(value) {
+    return hasExactKeys(value, [
+      "text", "origin", "revision", "language", "source_annotation_id",
+      "confidence", "provenance", "extensions",
+    ]) && typeof value.text === "string" && value.text.length >= 1 &&
+      value.text.length <= 16384 &&
+      ["manual", "machine", "inherited", "imported"].includes(value.origin) &&
+      isArtifactRevision(value.revision) &&
+      typeof value.language === "string" && value.language.length <= 64 &&
+      (value.source_annotation_id === "" ||
+        isPortableIdentifier(value.source_annotation_id)) &&
+      (value.confidence === null || typeof value.confidence === "number" &&
+        Number.isFinite(value.confidence) &&
+        value.confidence >= 0 && value.confidence <= 1) &&
+      isArtifactProvenance(value.provenance) &&
+      isBoundedArtifactJson(value.extensions);
+  }
+
+  function isCategoryAssignment(value) {
+    return hasExactKeys(value, [
+      "category", "origin", "revision", "inherited_from_artifact_id",
+      "confidence", "provenance", "extensions",
+    ]) && ARTIFACT_CATEGORIES.has(value.category) &&
+      ["manual", "inherited", "suggested"].includes(value.origin) &&
+      isArtifactRevision(value.revision) &&
+      (value.origin === "inherited"
+        ? isPortableIdentifier(value.inherited_from_artifact_id)
+        : value.inherited_from_artifact_id === "") &&
+      (value.confidence === null || typeof value.confidence === "number" &&
+        Number.isFinite(value.confidence) &&
+        value.confidence >= 0 && value.confidence <= 1) &&
+      isArtifactProvenance(value.provenance) &&
+      isBoundedArtifactJson(value.extensions);
+  }
+
+  function isRoleAssignment(value) {
+    return hasExactKeys(value, [
+      "role", "origin", "revision", "confidence", "provenance", "extensions",
+    ]) && isPortableIdentifier(value.role) &&
+      ["manual", "machine", "imported"].includes(value.origin) &&
+      isArtifactRevision(value.revision) &&
+      (value.confidence === null || typeof value.confidence === "number" &&
+        Number.isFinite(value.confidence) &&
+        value.confidence >= 0 && value.confidence <= 1) &&
+      isArtifactProvenance(value.provenance) &&
+      isBoundedArtifactJson(value.extensions);
+  }
+
+  function hasUniqueOrigins(values) {
+    return new Set(values.map((value) => value.origin)).size === values.length;
+  }
+
+  function isRasterArtifactView(value, itemId, artifactId = null) {
+    if (!hasExactKeys(value, [
+      "key", "revision", "kind", "label", "media_type", "content_sha256",
+      "dimensions", "source", "resource_state", "resource", "freshness",
+      "lineage", "category_assignments", "effective_category",
+      "caption_assertions", "effective_caption", "provenance", "extensions",
+    ]) || !hasExactKeys(value.key, ["item_id", "artifact_id"]) ||
+        value.key.item_id !== itemId ||
+        (artifactId !== null && value.key.artifact_id !== artifactId) ||
+        !isPortableIdentifier(value.key.item_id) ||
+        !isPortableIdentifier(value.key.artifact_id) ||
+        !isArtifactRevision(value.revision) ||
+        !isPortableIdentifier(value.kind) ||
+        typeof value.label !== "string" || value.label.length > 512 ||
+        typeof value.media_type !== "string" ||
+        !/^image\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i.test(
+          value.media_type) ||
+        value.media_type.toLowerCase() === "image/svg+xml" ||
+        !/^[0-9a-f]{64}$/.test(value.content_sha256) ||
+        !hasExactKeys(value.dimensions, ["width", "height", "orientation"]) ||
+        !Number.isSafeInteger(value.dimensions.width) ||
+        value.dimensions.width < 1 ||
+        !Number.isSafeInteger(value.dimensions.height) ||
+        value.dimensions.height < 1 ||
+        !Number.isSafeInteger(value.dimensions.orientation) ||
+        value.dimensions.orientation < 1 || value.dimensions.orientation > 8 ||
+        !isRasterSource(value.source) ||
+        !ARTIFACT_RESOURCE_STATES.has(value.resource_state) ||
+        !ARTIFACT_FRESHNESS.has(value.freshness) ||
+        !Array.isArray(value.lineage) || value.lineage.length > 64 ||
+        !Array.isArray(value.category_assignments) ||
+        value.category_assignments.length > 3 ||
+        !value.category_assignments.every(isCategoryAssignment) ||
+        !hasUniqueOrigins(value.category_assignments) ||
+        !ARTIFACT_CATEGORIES.has(value.effective_category) ||
+        !Array.isArray(value.caption_assertions) ||
+        value.caption_assertions.length > 32 ||
+        !value.caption_assertions.every(isArtifactCaption) ||
+        !hasUniqueOrigins(value.caption_assertions) ||
+        !(value.effective_caption === null ||
+          isArtifactCaption(value.effective_caption)) ||
+        !isArtifactProvenance(value.provenance) ||
+        !isBoundedArtifactJson(value.extensions)) return false;
+    if (value.resource_state === "available") {
+      if (!hasExactKeys(value.resource, ["id", "revision", "variant"]) ||
+          !isPortableIdentifier(value.resource.id) ||
+          !isArtifactRevision(value.resource.revision) ||
+          !isPortableIdentifier(value.resource.variant)) return false;
+    } else if (value.resource !== null) return false;
+    const lineageKeys = new Set();
+    for (const entry of value.lineage) {
+      if (!hasExactKeys(entry, [
+        "artifact_id", "artifact_revision", "relation",
+      ]) || !isPortableIdentifier(entry.artifact_id) ||
+          entry.artifact_id === value.key.artifact_id ||
+          !isArtifactRevision(entry.artifact_revision) ||
+          !isPortableIdentifier(entry.relation)) return false;
+      const key = `${entry.relation}\u0000${entry.artifact_id}`;
+      if (lineageKeys.has(key)) return false;
+      lineageKeys.add(key);
+    }
+    return true;
+  }
+
+  function isPolygonSelector(value, canvasRevision) {
+    return hasExactKeys(value, [
+      "type", "coordinate_space", "coordinate_space_revision", "points",
+    ]) && value.type === "polygon" &&
+      isPortableIdentifier(value.coordinate_space) &&
+      value.coordinate_space_revision === canvasRevision &&
+      isArtifactRevision(value.coordinate_space_revision) &&
+      Array.isArray(value.points) && value.points.length >= 3 &&
+      value.points.length <= 256 &&
+      value.points.every((point) =>
+        hasExactKeys(point, ["x", "y"]) &&
+        typeof point.x === "number" && Number.isFinite(point.x) &&
+        point.x >= 0 && point.x <= 1 &&
+        typeof point.y === "number" && Number.isFinite(point.y) &&
+        point.y >= 0 && point.y <= 1) &&
+      new Set(value.points.map((point) => `${point.x}\u0000${point.y}`)).size ===
+        value.points.length;
+  }
+
+  function isSpatialAnnotationView(value, itemId, annotationId = null) {
+    return hasExactKeys(value, [
+      "key", "revision", "source", "selector", "order", "label", "freshness",
+      "role_assignments", "effective_role", "caption_assertions",
+      "linked_artifact_ids", "provenance", "extensions",
+    ]) && hasExactKeys(value.key, ["item_id", "annotation_id"]) &&
+      value.key.item_id === itemId &&
+      (annotationId === null || value.key.annotation_id === annotationId) &&
+      isPortableIdentifier(value.key.item_id) &&
+      isPortableIdentifier(value.key.annotation_id) &&
+      isArtifactRevision(value.revision) &&
+      isSpatialSource(value.source) &&
+      isPolygonSelector(value.selector, value.source.canvas_revision) &&
+      Number.isSafeInteger(value.order) && value.order >= 0 &&
+      typeof value.label === "string" && value.label.length <= 512 &&
+      ARTIFACT_FRESHNESS.has(value.freshness) &&
+      Array.isArray(value.role_assignments) &&
+      value.role_assignments.length <= 3 &&
+      value.role_assignments.every(isRoleAssignment) &&
+      hasUniqueOrigins(value.role_assignments) &&
+      (value.effective_role === "" ||
+        isPortableIdentifier(value.effective_role)) &&
+      Array.isArray(value.caption_assertions) &&
+      value.caption_assertions.length <= 32 &&
+      value.caption_assertions.every(isArtifactCaption) &&
+      hasUniqueOrigins(value.caption_assertions) &&
+      Array.isArray(value.linked_artifact_ids) &&
+      value.linked_artifact_ids.length <= 64 &&
+      value.linked_artifact_ids.every(isPortableIdentifier) &&
+      new Set(value.linked_artifact_ids).size ===
+        value.linked_artifact_ids.length &&
+      isArtifactProvenance(value.provenance) &&
+      isBoundedArtifactJson(value.extensions);
+  }
+
   function isItemTombstone(value) {
     if (!isObject(value) ||
         !isPortableIdentifier(value.tombstone_id) ||
@@ -749,6 +1016,15 @@
         detachRepresentation: (args) => this._representationDetach(args),
         artifacts: (args) => this._itemArtifacts(args),
         readiness: (args) => this._itemReadiness(args),
+      });
+      this.rasterArtifacts = Object.freeze({
+        list: (args) => this._rasterArtifactList(args),
+        get: (args) => this._rasterArtifactGet(args),
+        resourceUrl: (args) => this._rasterArtifactResourceUrl(args),
+      });
+      this.spatialAnnotations = Object.freeze({
+        list: (args) => this._spatialAnnotationList(args),
+        get: (args) => this._spatialAnnotationGet(args),
       });
       this.itemTombstones = Object.freeze({
         list: (args) => this._itemTombstonesList(args),
@@ -1285,6 +1561,187 @@
     _itemArtifacts({ itemId, signal } = {}) {
       return this._requestJson(
         "GET", `/v1/items/${encodePart(itemId)}/artifacts`, { signal });
+    }
+
+    _rasterArtifactList({ itemId, representationId, canvasId, group, cursor,
+      limit = 100, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 512) {
+        throw new TypeError("limit must be an integer from 1 to 512");
+      }
+      if (representationId != null && representationId !== "") {
+        portableIdentifier(representationId, "representationId");
+      }
+      if (canvasId != null && canvasId !== "") {
+        portableIdentifier(canvasId, "canvasId");
+      }
+      if (group != null && group !== "" &&
+          !["source-images", "extracted-figures", "processed-images",
+            "generated-images"].includes(group)) {
+        throw new TypeError("group is not a supported raster artifact group");
+      }
+      if (cursor != null && cursor !== "" &&
+          (typeof cursor !== "string" || cursor.length > 2048)) {
+        throw new TypeError("cursor must be a bounded opaque string");
+      }
+      const path = `/v1/items/${encodePart(item)}/raster-artifacts`;
+      return this._requestJson("GET", path, {
+        query: {
+          representation_id: representationId,
+          canvas_id: canvasId,
+          group,
+          cursor,
+          limit,
+        },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "item_id", "revision", "artifacts",
+          "next_cursor", "total",
+        ]) && body.ok === true &&
+          body.schema === "librarytool.raster-artifacts/1" &&
+          body.item_id === item && isArtifactRevision(body.revision) &&
+          Array.isArray(body.artifacts) &&
+          body.artifacts.length <= limit &&
+          body.artifacts.every((value) =>
+            isRasterArtifactView(value, item)) &&
+          new Set(body.artifacts.map((value) =>
+            value.key.artifact_id.toLowerCase())).size ===
+              body.artifacts.length &&
+          (body.next_cursor === null ||
+            typeof body.next_cursor === "string" &&
+            body.next_cursor.length >= 1 && body.next_cursor.length <= 2048) &&
+          Number.isSafeInteger(body.total) && body.total >= 0 &&
+          body.total >= body.artifacts.length &&
+          !containsCommandFingerprint(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid raster artifact collection",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _rasterArtifactGet({ itemId, artifactId, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      const path = `/v1/items/${encodePart(item)}/raster-artifacts/` +
+        encodePart(artifact);
+      return this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "artifact",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.raster-artifact/1" ||
+            !isRasterArtifactView(body.artifact, item, artifact) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid raster artifact detail",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _rasterArtifactResourceUrl({ itemId, artifactId, revision } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      if (!isArtifactRevision(revision)) {
+        throw new TypeError("revision is not a valid raster resource revision");
+      }
+      return this._url(
+        `/v1/items/${encodePart(item)}/raster-artifacts/` +
+          `${encodePart(artifact)}/resource`,
+        { revision },
+      );
+    }
+
+    _spatialAnnotationList({ itemId, representationId, canvasId,
+      canvasRevision, cursor, limit = 100, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 512) {
+        throw new TypeError("limit must be an integer from 1 to 512");
+      }
+      if (representationId != null && representationId !== "") {
+        portableIdentifier(representationId, "representationId");
+      }
+      if (canvasId != null && canvasId !== "") {
+        portableIdentifier(canvasId, "canvasId");
+      }
+      if (canvasRevision != null && canvasRevision !== "" &&
+          !isArtifactRevision(canvasRevision)) {
+        throw new TypeError(
+          "canvasRevision is not a valid canvas revision");
+      }
+      if (cursor != null && cursor !== "" &&
+          (typeof cursor !== "string" || cursor.length > 2048)) {
+        throw new TypeError("cursor must be a bounded opaque string");
+      }
+      const path = `/v1/items/${encodePart(item)}/spatial-annotations`;
+      return this._requestJson("GET", path, {
+        query: {
+          representation_id: representationId,
+          canvas_id: canvasId,
+          canvas_revision: canvasRevision,
+          cursor,
+          limit,
+        },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "item_id", "revision", "annotations",
+          "next_cursor", "total",
+        ]) && body.ok === true &&
+          body.schema === "librarytool.spatial-annotations/1" &&
+          body.item_id === item && isArtifactRevision(body.revision) &&
+          Array.isArray(body.annotations) &&
+          body.annotations.length <= limit &&
+          body.annotations.every((value) =>
+            isSpatialAnnotationView(value, item)) &&
+          new Set(body.annotations.map((value) =>
+            value.key.annotation_id.toLowerCase())).size ===
+              body.annotations.length &&
+          (body.next_cursor === null ||
+            typeof body.next_cursor === "string" &&
+            body.next_cursor.length >= 1 && body.next_cursor.length <= 2048) &&
+          Number.isSafeInteger(body.total) && body.total >= 0 &&
+          body.total >= body.annotations.length &&
+          !containsCommandFingerprint(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid spatial annotation collection",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _spatialAnnotationGet({ itemId, annotationId, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const annotation = portableIdentifier(annotationId, "annotationId");
+      const path = `/v1/items/${encodePart(item)}/spatial-annotations/` +
+        encodePart(annotation);
+      return this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "annotation",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.spatial-annotation/1" ||
+            !isSpatialAnnotationView(body.annotation, item, annotation) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid spatial annotation detail",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
     }
 
     _itemReadiness({ itemId, signal } = {}) {

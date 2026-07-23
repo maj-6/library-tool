@@ -5,6 +5,7 @@
     ...require("./layout-controller"),
     ...require("./reviews"),
     ...require("./artifacts"),
+    ...require("./engine-adapter"),
     ...require("./commands"),
     ...require("./keymap"),
     ...require("./artifact-overlay"),
@@ -339,6 +340,14 @@
     return null;
   }
 
+  function correctionsRuntimePorts(windowRef, desktopCorrections) {
+    if (desktopCorrections || !windowRef || !windowRef.engineClient ||
+        typeof deps.createCorrectionsEnginePorts !== "function") {
+      return null;
+    }
+    return deps.createCorrectionsEnginePorts(windowRef.engineClient);
+  }
+
   class CorrectionsShell {
     constructor(options = {}) {
       if (!options.root || typeof options.root.querySelector !== "function") {
@@ -362,9 +371,13 @@
       this.destroyed = false;
       this.activeTrayTab = "reviews";
       const desktopCorrections = this.desktop && this.desktop.corrections || null;
-      this.booksApi = options.booksApi || desktopCorrections || null;
+      this.engineCorrections = correctionsRuntimePorts(
+        this.windowRef, desktopCorrections);
+      this.booksApi = options.booksApi || desktopCorrections ||
+        this.engineCorrections && this.engineCorrections.books || null;
       this.artifactPorts = options.artifactPorts ||
-        desktopCorrections && desktopCorrections.artifacts || {};
+        desktopCorrections && desktopCorrections.artifacts ||
+        this.engineCorrections && this.engineCorrections.artifacts || {};
       const invokeCommand = typeof options.invokeCommand === "function"
         ? options.invokeCommand
         : desktopCorrections && typeof desktopCorrections.invokeCommand === "function"
@@ -1462,6 +1475,7 @@
     CorrectionsShell,
     CorrectionsWindowState,
     artifactSelection,
+    correctionsRuntimePorts,
     installAutoBoot,
     nextTrayTab,
     normalizeSelection,

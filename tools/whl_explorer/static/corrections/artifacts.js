@@ -65,6 +65,7 @@
       for (const name of [
         "workspace_id", "workspaceId", "item_id", "itemId",
         "representation_id", "representationId", "canvas_id", "canvasId",
+        "canvas_revision", "canvasRevision",
         "artifact_id", "artifactId", "annotation_id", "annotationId",
         "resource_revision", "resourceRevision", "view_hint", "viewHint",
       ]) {
@@ -74,6 +75,8 @@
       result.representationId = String(
         value.representationId || value.representation_id || "");
       result.canvasId = String(value.canvasId || value.canvas_id || "");
+      result.canvasRevision = String(
+        value.canvasRevision || value.canvas_revision || "");
       return Object.freeze(result);
     }
 
@@ -140,6 +143,27 @@
       });
     }
 
+    function annotationIdentity(value) {
+      if (!value || typeof value !== "object") return "";
+      const key = value.key && typeof value.key === "object" ? value.key : {};
+      return String(
+        value.annotation_id || value.annotationId ||
+        key.annotation_id || key.annotationId || value.id || "",
+      );
+    }
+
+    function uniqueRegions(values, limit = REGION_PAGE_LIMIT, seen = new Set()) {
+      const rows = [];
+      for (const value of values) {
+        const identity = annotationIdentity(value);
+        if (identity && seen.has(identity)) continue;
+        if (identity) seen.add(identity);
+        rows.push(value);
+        if (rows.length >= limit) break;
+      }
+      return rows;
+    }
+
     function defaultObjectUrls() {
       const api = typeof URL === "function" || typeof URL === "object" ? URL : null;
       return {
@@ -180,7 +204,7 @@
         this.documentRef = options.documentRef || this.treeRoot.ownerDocument;
         this.catalog = options.catalog || UNAVAILABLE.catalog;
         this.resources = options.resources || UNAVAILABLE.resources;
-        this.commands = options.commands || UNAVAILABLE.commands;
+        this.commands = options.commands || null;
         this.editorRegistry = options.editorRegistry || null;
         this.onResource = typeof options.onResource === "function"
           ? options.onResource : (resource) => {
@@ -921,6 +945,8 @@
       async resolveRaster(detail, variant, selectionGeneration) {
         if (!detail.resourceRef) throw capabilityError("raster resource reference");
         const value = await this.resources.resolveRaster({
+          itemId: detail.itemId || this.context && this.context.itemId,
+          artifactId: detail.id,
           resourceRef: detail.resourceRef,
           variant,
           signal: this.selectionAbort && this.selectionAbort.signal,
@@ -942,6 +968,7 @@
         }
         if (detail.family === "image") {
           const display = await this.resolveRaster(detail, "display", selectionGeneration);
+          const regions = await this.imageRegions(detail, selectionGeneration);
           const resource = {
             id: detail.id,
             label: resourceLabel(detail),
@@ -953,7 +980,7 @@
             freshness: detail.freshness,
             correction: detail.correction,
             dimensions: detail.dimensions,
-            regions: detail.regions,
+            regions,
             coordinateSpace: detail.extensions &&
               (detail.extensions.coordinate_space ||
                 detail.extensions.coordinateSpace) || "",
@@ -992,6 +1019,45 @@
           detail,
           summary: detail,
         });
+      }
+
+      async imageRegions(detail, selectionGeneration) {
+        const correctionsUi = detail.extensions &&
+          detail.extensions.corrections_ui || {};
+        const source = detail.source || {};
+        if (correctionsUi.paged_regions !== true || !source.canvasId ||
+            !this.resources || typeof this.resources.listRegions !== "function") {
+          return detail.regions;
+        }
+        const rows = [];
+        let cursor = null;
+        try {
+          for (let pageIndex = 0; pageIndex < MAX_REGION_PAGES; pageIndex += 1) {
+            const page = regionPage(await this.resources.listRegions({
+              context: this.context,
+              representationId: source.representationId,
+              canvasId: source.canvasId,
+              canvasRevision: source.canvasRevision,
+              cursor,
+              limit: REGION_PAGE_LIMIT,
+              signal: this.selectionAbort && this.selectionAbort.signal,
+            }));
+            if (selectionGeneration !== this.selectionGeneration || this.destroyed) {
+              const error = new Error("Spatial annotation response is stale");
+              error.name = "AbortError";
+              throw error;
+            }
+            rows.push(...page.items);
+            const nextCursor = page.nextCursor === cursor ? null : page.nextCursor;
+            cursor = nextCursor;
+            if (!cursor || rows.length >= 512) break;
+          }
+          return Object.freeze(rows.slice(0, 512));
+        } catch (error) {
+          if (isAbort(error)) throw error;
+          this.onStatus("Image loaded without spatial annotations", true, error);
+          return detail.regions;
+        }
       }
 
       async openText(detail, selectionGeneration) {
@@ -1051,12 +1117,19 @@
           effectiveRole: detail.effectiveRole,
         }] : [];
         let page = { items: [], nextCursor: null };
+        const source = detail.source || {};
+        const regionQuery = {
+          representationId: source.representationId ||
+            this.context.representationId,
+          canvasId: source.canvasId || this.context.canvasId,
+          canvasRevision: source.canvasRevision ||
+            this.context.canvasRevision,
+        };
         if (this.resources && typeof this.resources.listRegions === "function") {
           try {
             page = regionPage(await this.resources.listRegions({
               context: this.context,
-              canvasId: detail.source && detail.source.canvasId ||
-                this.context.canvasId,
+              ...regionQuery,
               cursor: null,
               limit: REGION_PAGE_LIMIT,
               signal: this.selectionAbort && this.selectionAbort.signal,
@@ -1066,8 +1139,10 @@
           }
         }
         if (selectionGeneration !== this.selectionGeneration || this.destroyed) return;
-        const rows = [...first, ...(Array.isArray(page.items) ? page.items : [])]
-          .slice(0, REGION_PAGE_LIMIT);
+        const rows = uniqueRegions(
+          [...first, ...(Array.isArray(page.items) ? page.items : [])],
+          REGION_PAGE_LIMIT + first.length,
+        );
         const resource = {
           id: detail.id,
           label: resourceLabel(detail),
@@ -1077,6 +1152,7 @@
           pages: [rows],
           regions: rows,
           nextCursor: page.nextCursor,
+          regionQuery: Object.freeze(regionQuery),
           summary: detail,
         };
         resource.loadNext = () => this.loadMoreRegions(
@@ -1088,14 +1164,19 @@
         if (!resource.nextCursor || selectionGeneration !== this.selectionGeneration) return;
         const page = regionPage(await this.resources.listRegions({
           context: this.context,
-          canvasId: detail.source && detail.source.canvasId || this.context.canvasId,
+          ...resource.regionQuery,
           cursor: resource.nextCursor,
           limit: REGION_PAGE_LIMIT,
           signal: this.selectionAbort && this.selectionAbort.signal,
         }));
         if (selectionGeneration !== this.selectionGeneration || this.destroyed ||
             this.currentResource !== resource) return;
-        const rows = Array.isArray(page.items) ? page.items.slice(0, REGION_PAGE_LIMIT) : [];
+        const seen = new Set(resource.regions.map(annotationIdentity).filter(Boolean));
+        const rows = uniqueRegions(
+          Array.isArray(page.items) ? page.items : [],
+          REGION_PAGE_LIMIT,
+          seen,
+        );
         resource.pages.push(rows);
         if (resource.pages.length > MAX_REGION_PAGES) resource.pages.shift();
         resource.regions = resource.pages.flat();
