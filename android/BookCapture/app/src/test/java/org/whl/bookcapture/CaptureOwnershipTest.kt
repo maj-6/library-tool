@@ -82,7 +82,7 @@ class CaptureOwnershipTest {
         val ownership = source("CaptureOwnership")
         val client = source("SupabaseClient")
 
-        assertTrue(upload.contains("cloudUploadOwnership(prepared.creator, Prefs.userId(ctx))"))
+        assertTrue(upload.contains("cloudUploadOwnership(prepared.creator, uploadOwner)"))
         assertTrue(upload.contains("CloudUploadOwnership.NEEDS_CLAIM"))
         assertTrue(ownership.contains("EntryOperationLocks.withLock(entryId)"))
         assertTrue(ownership.contains("manifest.put(\"creator\", creator)"))

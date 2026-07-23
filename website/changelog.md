@@ -4,6 +4,21 @@ Stable releases are listed newest first. Prerelease changes are included in the
 next stable release. These notes are also available in the desktop app under
 Help → View changelog.
 
+## Next prerelease — 2026-07-22
+
+### Additions
+
+- Desktop capture sync now publishes registered-book copyright records and status, WHL and Internet Archive availability, scan status, remarks, and review state back to the originating Android capture.
+- Phone Needs attention reasons and Needs review requests now join the desktop attention and review workflow through either account cloud sync or a paired LAN connection.
+
+### Other Changes
+
+- Phone round-trip state uses owner-scoped, revisioned projections and preserves unregister/delete tombstones so stale catalog badges are removed safely.
+
+### Bugfixes
+
+- Kept cloud and paired-LAN capture identities separate during metadata sync and preserved concurrent phone and desktop review edits.
+
 ## 0.7.0 — 2026-07-15
 
 ### Additions

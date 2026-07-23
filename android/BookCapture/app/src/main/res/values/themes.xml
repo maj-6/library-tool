@@ -27,6 +27,11 @@
     <color name="whl_thumbnail_border">#616661</color>
     <color name="whl_button_text">#FBF9F2</color>
     <color name="ic_launcher_bg">#4A743A</color>
+    <color name="whl_copyright_registration">#47789B</color>
+    <color name="whl_copyright_public_domain">#3F7C68</color>
+    <color name="whl_copyright_in_copyright">#B45132</color>
+    <color name="whl_copyright_inconclusive">#9B6A24</color>
+    <color name="whl_copyright_unknown">#7D817C</color>
 
     <!-- Sage is a light paper palette: default widget text goes
          dark, and the status/nav bars carry dark icons over the light canvas. -->
@@ -80,6 +85,26 @@
         <item name="android:minWidth">48dp</item>
         <item name="android:padding">12dp</item>
         <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <style name="WhlMetadataIconButton" parent="Widget.AppCompat.ImageButton">
+        <item name="android:layout_width">48dp</item>
+        <item name="android:layout_height">48dp</item>
+        <item name="android:background">@android:color/transparent</item>
+        <item name="android:foreground">?attr/selectableItemBackgroundBorderless</item>
+        <!-- Preserve the compact 20dp copyright glyph inside a full accessible
+             touch target. -->
+        <item name="android:padding">14dp</item>
+        <item name="android:minWidth">48dp</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <style name="WhlMetadataIcon">
+        <item name="android:layout_width">26dp</item>
+        <item name="android:layout_height">26dp</item>
+        <item name="android:layout_marginStart">2dp</item>
+        <item name="android:padding">2dp</item>
     </style>
 
     <!-- Text actions in app chrome still need a real button role and a 48dp

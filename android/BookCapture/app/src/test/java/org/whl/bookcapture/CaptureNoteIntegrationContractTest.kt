@@ -66,14 +66,27 @@ class CaptureNoteIntegrationContractTest {
     @Test
     fun controllerGrammarAndPolicyExposeEveryNewVoiceCommand() {
         val controller = source("VoiceController")
-        for (spoken in listOf("restart", "undo", "notes", "end notes")) {
+        for (spoken in listOf("restart", "undo", "edit", "notes", "end notes")) {
             assertTrue("voice grammar is missing $spoken", controller.contains("\"$spoken\""))
         }
         assertTrue(controller.contains("StateAwareVoiceCommandPolicy.evaluate("))
         val main = source("MainActivity")
         assertTrue(main.contains("\"notes\" ->"))
+        assertTrue(main.contains("\"edit\" -> reopenLastScannedBook()"))
         assertTrue(main.contains("VoiceCommandState.NOTE_ACTIVE"))
         assertTrue(main.contains("transcriptBeforeCommand"))
+        val editSource = main.substringAfter("private fun reopenLastScannedBook()")
+            .substringBefore("private fun restartCapture()")
+        for (resource in listOf(
+            "capture_edit_already_open_error", "capture_edit_finish_current",
+            "capture_edit_busy_error", "capture_edit_busy_status", "capture_edit_reopening",
+            "capture_edit_failed_error", "capture_edit_failed_status", "capture_edit_reopened",
+            "capture_edit_none_error", "capture_edit_none_status",
+        )) {
+            assertTrue(editSource.contains("R.string.$resource"))
+        }
+        assertFalse(editSource.contains("setStatus(\""))
+        assertFalse(editSource.contains("cues.error(\""))
 
         assertEquals(
             PolicyVoiceCommand.RESTART,

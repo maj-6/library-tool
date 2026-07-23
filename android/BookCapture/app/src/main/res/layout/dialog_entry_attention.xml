@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingStart="20dp"
+    android:paddingTop="8dp"
+    android:paddingEnd="20dp"
+    android:paddingBottom="4dp">
+
+    <EditText
+        android:id="@+id/attentionReason"
+        style="@style/WhlInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="@string/attention_reason_hint"
+        android:inputType="textCapSentences|textMultiLine"
+        android:maxLines="4"
+        android:minLines="2" />
+
+    <CheckBox
+        android:id="@+id/attentionNeedsReview"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_marginTop="8dp"
+        android:buttonTint="@color/whl_cyan"
+        android:fontFamily="@font/roboto_slab"
+        android:text="@string/attention_mark_review"
+        android:textAllCaps="false"
+        android:textColor="@color/whl_ink"
+        android:textSize="14sp" />
+</LinearLayout>

@@ -87,9 +87,12 @@ object Entries {
         val photoCount: Int,
         val meta: JSONObject?,          // null until extraction lands
         val cloudStatus: String,        // "", "pending", "imported", "void"
+        val deliveryTransport: String = "", // "cloud" / "lan" for sent captures
         val processing: ProcessingState,
         val processingRecorded: Boolean,
         val provenance: CaptureProvenance? = null,  // null for pre-collections captures
+        val desktopBook: DesktopBookMetadata? = null,
+        val captureReview: CaptureReviewMetadata? = null,
     ) {
         val collectionName: String get() = provenance?.collectionName ?: ""
         val from: String get() = provenance?.from ?: ""
@@ -308,6 +311,29 @@ object Entries {
         return load(if (q.isDirectory) q else s)
     }
 
+    /** Persist a phone review immediately and offline. Cloud work is
+     * deliberately not enqueued here: only the explicit Sync action may push
+     * dirty review state. The entry lock prevents queue -> sent delivery (or
+     * local deletion) from moving the directory during the atomic mutation. */
+    suspend fun setCaptureReview(
+        ctx: Context,
+        entryId: String,
+        needsAttention: Boolean,
+        needsReview: Boolean,
+        reason: String,
+    ): Boolean = EntryOperationLocks.withLock(entryId) {
+        val entry = find(ctx, entryId) ?: return@withLock false
+        CaptureMetadataStore.mutateReview(entry.dir) { current ->
+            editCaptureReview(
+                current,
+                entry.id,
+                needsAttention,
+                needsReview,
+                reason,
+            )
+        }
+    }
+
     /** Remove only this device's browsing/queue copy while excluding delivery
      *  and processing for the same entry. The active in-memory capture must be
      *  discarded from Camera, never out from under its CaptureSession. */
@@ -351,11 +377,14 @@ object Entries {
             photoCount = photos.size,
             meta = meta,
             cloudStatus = manifest?.optString("cloud_status") ?: "",
+            deliveryTransport = manifest?.optString("delivery_transport") ?: "",
             processing = processing,
             processingRecorded = recorded,
             // The sidecar, not the manifest: it exists from the first photo, so
             // an entry still being captured into already reports its collection.
             provenance = readProvenance(dir),
+            desktopBook = CaptureMetadataStore.readDesktopBook(dir),
+            captureReview = CaptureMetadataStore.readReview(dir)?.current,
         )
     }
 
@@ -419,14 +448,17 @@ object Entries {
         return "(no title found)"
     }
 
-    /** Drop the oldest sent entries beyond KEEP_SENT; photos are already in
-     *  the cloud, this is only the local browsing copy. */
+    /** Drop the oldest sent entries beyond KEEP_SENT. Dirty phone review state
+     * is still the authoritative offline copy, so retention must keep that
+     * complete entry until an explicit sync acknowledges it. */
     suspend fun pruneSent(ctx: Context) {
         val dirs = sentRoot(ctx).listFiles { f: File -> f.isDirectory } ?: return
         dirs.sortedByDescending { load(it)?.createdAt ?: 0L }
             .drop(KEEP_SENT)
             .forEach { dir ->
-                EntryOperationLocks.withLock(dir.name) { dir.deleteRecursively() }
+                EntryOperationLocks.withLock(dir.name) {
+                    CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation(dir)
+                }
             }
     }
 

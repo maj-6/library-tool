@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- One scan row. Tapping selects it; the trailing disclosure action opens
-     the full detail (all photos, OCR text, every field). -->
+<!-- One scan row. A tap opens the book; a long press marks it for attention. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
@@ -12,15 +11,6 @@
     android:paddingTop="9dp"
     android:paddingBottom="9dp"
     android:background="@drawable/whl_row">
-
-    <CheckBox
-        android:id="@+id/selected"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginEnd="7dp"
-        android:buttonTint="@color/whl_cyan"
-        android:visibility="gone"
-        android:contentDescription="@string/home_select_scan" />
 
     <ImageView
         android:id="@+id/thumb"
@@ -57,48 +47,101 @@
             android:textSize="11sp"
             android:maxLines="1"
             android:ellipsize="end" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="2dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <View
+                android:id="@+id/marker"
+                android:layout_width="7dp"
+                android:layout_height="7dp"
+                android:layout_marginEnd="6dp"
+                android:background="@color/whl_face_sh2" />
+
+            <TextView
+                android:id="@+id/state"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:fontFamily="@font/roboto_slab"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textSize="10sp"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_ink_dim" />
+
+            <ProgressBar
+                android:id="@+id/waitingIndicator"
+                style="?android:attr/progressBarStyleSmall"
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:layout_marginStart="4dp"
+                android:indeterminate="true"
+                android:indeterminateTint="@color/whl_amber"
+                android:visibility="gone"
+                android:contentDescription="@string/home_status_waiting" />
+
+            <ImageView
+                android:id="@+id/stateIcon"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_marginStart="3dp"
+                android:src="@drawable/ic_cloud_done"
+                android:visibility="gone"
+                android:contentDescription="@string/home_status_uploaded" />
+
+            <LinearLayout
+                android:id="@+id/desktopMetadataIcons"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical|end">
+
+                <androidx.appcompat.widget.AppCompatImageButton
+                    android:id="@+id/copyrightStatus"
+                    style="@style/WhlMetadataIconButton"
+                    android:contentDescription="@string/home_copyright_status"
+                    android:visibility="gone" />
+
+                <ImageView
+                    android:id="@+id/whlAvailability"
+                    style="@style/WhlMetadataIcon"
+                    android:contentDescription="@string/home_whl_available"
+                    android:src="@drawable/ic_whl_available"
+                    android:visibility="gone" />
+
+                <ImageView
+                    android:id="@+id/internetArchiveAvailability"
+                    style="@style/WhlMetadataIcon"
+                    android:contentDescription="@string/home_ia_available"
+                    android:src="@drawable/ic_archive_available"
+                    android:visibility="gone" />
+
+                <ImageView
+                    android:id="@+id/scanStatus"
+                    style="@style/WhlMetadataIcon"
+                    android:contentDescription="@string/home_scan_status"
+                    android:src="@drawable/ic_scan_status"
+                    android:visibility="gone" />
+
+                <ImageView
+                    android:id="@+id/remarksStatus"
+                    style="@style/WhlMetadataIcon"
+                    android:contentDescription="@string/home_remarks"
+                    android:src="@drawable/ic_remarks"
+                    android:visibility="gone" />
+
+                <ImageView
+                    android:id="@+id/attentionStatus"
+                    style="@style/WhlMetadataIcon"
+                    android:contentDescription="@string/home_needs_attention"
+                    android:src="@drawable/ic_needs_attention"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
-
-    <View
-        android:id="@+id/marker"
-        android:layout_width="7dp"
-        android:layout_height="7dp"
-        android:layout_marginStart="8dp"
-        android:layout_marginEnd="6dp"
-        android:background="@color/whl_face_sh2" />
-
-    <TextView
-        android:id="@+id/state"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:fontFamily="@font/roboto_slab"
-        android:textSize="10sp"
-        android:textAllCaps="false"
-        android:textColor="@color/whl_ink_dim" />
-
-    <ProgressBar
-        android:id="@+id/waitingIndicator"
-        style="?android:attr/progressBarStyleSmall"
-        android:layout_width="20dp"
-        android:layout_height="20dp"
-        android:indeterminate="true"
-        android:indeterminateTint="@color/whl_amber"
-        android:visibility="gone"
-        android:contentDescription="@string/home_status_waiting" />
-
-    <ImageView
-        android:id="@+id/stateIcon"
-        android:layout_width="22dp"
-        android:layout_height="22dp"
-        android:src="@drawable/ic_cloud_done"
-        android:visibility="gone"
-        android:contentDescription="@string/home_status_uploaded" />
-
-    <androidx.appcompat.widget.AppCompatImageButton
-        android:id="@+id/openDetails"
-        style="@style/WhlInlineIconButton"
-        android:layout_width="48dp"
-        android:layout_height="48dp"
-        android:contentDescription="@string/home_open_details"
-        app:srcCompat="@drawable/ic_chevron_right" />
 </LinearLayout>

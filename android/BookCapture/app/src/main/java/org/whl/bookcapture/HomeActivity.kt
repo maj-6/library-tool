@@ -8,9 +8,9 @@ import android.text.method.LinkMovementMethod
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.ArrayAdapter
 import android.widget.Spinner
 import android.widget.TextView
@@ -20,6 +20,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.text.HtmlCompat
 import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
@@ -27,6 +28,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityHomeBinding
+import org.json.JSONObject
 import java.util.UUID
 import kotlin.math.roundToInt
 
@@ -44,21 +46,22 @@ class HomeActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityHomeBinding
     private var thumbJob: Job? = null
-    private var selectionMode = false
-    private val selectedIds = linkedSetOf<String>()
     private var showingCollections = false
     private val expandedScanGroups = linkedSetOf<String>()
     private var scanGroupsInitialized = false
+    private var syncFeedbackRequestId: String? = null
+    private var syncFeedbackPhase: CaptureSyncPhase? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityHomeBinding.inflate(layoutInflater)
         setContentView(binding.root)
         showingCollections = savedInstanceState?.getBoolean(STATE_TAB_COLLECTIONS) ?: false
-        selectionMode = savedInstanceState?.getBoolean(STATE_SELECTION_MODE) ?: false
-        savedInstanceState?.getStringArrayList(STATE_SELECTED_IDS)?.let(selectedIds::addAll)
         scanGroupsInitialized =
             savedInstanceState?.getBoolean(STATE_SCAN_GROUPS_INITIALIZED) ?: false
+        syncFeedbackRequestId = savedInstanceState?.getString(STATE_SYNC_FEEDBACK_REQUEST)
+        syncFeedbackPhase = savedInstanceState?.getString(STATE_SYNC_FEEDBACK_PHASE)
+            ?.let(CaptureSyncPhase::fromStoredValue)
         savedInstanceState?.getStringArrayList(STATE_EXPANDED_SCAN_GROUPS)
             ?.let(expandedScanGroups::addAll)
 
@@ -87,30 +90,40 @@ class HomeActivity : AppCompatActivity() {
         binding.configWarning.setOnClickListener {
             startActivity(Intent(this, LoginActivity::class.java))
         }
-        binding.cancelSelection.setOnClickListener { leaveSelectionMode() }
-        binding.deleteSelected.setOnClickListener { confirmDeleteSelected() }
+        binding.syncCaptures.setOnClickListener { syncCaptures() }
         // when background OCR / upload lands, the list re-renders itself
         for (name in listOf(
             ProcessWorker.UNIQUE_WORK_NAME,
             ProcessWorker.BACKLOG_WORK_NAME,
-            "capture-upload",
+            UploadWorker.EXPLICIT_SYNC_WORK_NAME,
         ))
             WorkManager.getInstance(this)
                 .getWorkInfosForUniqueWorkLiveData(name)
-                .observe(this) { refreshHome() }
+                .observe(this) {
+                    refreshSyncButton()
+                    refreshHome()
+                }
         WorkManager.getInstance(this)
             .getWorkInfosForUniqueWorkLiveData(CollectionSyncWorker.WORK_NAME)
             .observe(this) {
                 if (showingCollections) refreshCollections() else refreshCollectionBar()
             }
+        for (name in listOf(
+            CaptureMetadataSyncWorker.WORK_NAME,
+            CaptureMetadataSyncWorker.PULL_WORK_NAME,
+        )) {
+            WorkManager.getInstance(this)
+                .getWorkInfosForUniqueWorkLiveData(name)
+                .observe(this) { refreshHome() }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_TAB_COLLECTIONS, showingCollections)
-        outState.putBoolean(STATE_SELECTION_MODE, selectionMode)
-        outState.putStringArrayList(STATE_SELECTED_IDS, ArrayList(selectedIds))
         outState.putBoolean(STATE_SCAN_GROUPS_INITIALIZED, scanGroupsInitialized)
+        outState.putString(STATE_SYNC_FEEDBACK_REQUEST, syncFeedbackRequestId)
+        outState.putString(STATE_SYNC_FEEDBACK_PHASE, syncFeedbackPhase?.storedValue)
         outState.putStringArrayList(
             STATE_EXPANDED_SCAN_GROUPS,
             ArrayList(expandedScanGroups),
@@ -121,14 +134,19 @@ class HomeActivity : AppCompatActivity() {
         super.onResume()
         val signedIn = Auth.signedIn(this)
         binding.configWarning.visibility = if (signedIn) View.GONE else View.VISIBLE
-        // returning to Home is a good moment to drain the queue and process
-        // anything a previous run left un-OCR'd
-        if (CaptureSession(this).pendingUploads().isNotEmpty() &&
-            (signedIn || Prefs.transport(this) != "cloud")) {
-            UploadWorker.kick(this)
-        }
+        // A previously authorized batch may resume after process death, but a
+        // new upload batch is created only by the Sync captures button.
+        UploadWorker.kick(this)
         ProcessWorker.enqueue(this)
         CollectionSyncWorker.enqueueCoalesced(this)
+        CaptureMetadataSyncWorker.enqueuePull(this)
+        Prefs.activeCaptureSyncRecord(this)?.let { active ->
+            if (syncFeedbackRequestId == null) {
+                syncFeedbackRequestId = active.requestId
+                syncFeedbackPhase = active.phase
+            }
+        }
+        refreshSyncButton()
         showTab(showingCollections)
     }
 
@@ -219,18 +237,87 @@ class HomeActivity : AppCompatActivity() {
 
     private fun showTab(collections: Boolean) {
         showingCollections = collections
-        // Selecting scans to delete is a Scans-tab activity; leaving it behind
-        // on the Collections tab would strand the selection bar over a list it
-        // cannot act on.
-        if (collections && selectionMode) leaveSelectionMode()
         binding.homeList.visibility = if (collections) View.GONE else View.VISIBLE
         binding.collectionsList.visibility = if (collections) View.VISIBLE else View.GONE
-        binding.newScan.visibility = if (collections) View.GONE else View.VISIBLE
+        binding.scanActions.visibility = if (collections) View.GONE else View.VISIBLE
         binding.newCollection.visibility = if (collections) View.VISIBLE else View.GONE
         binding.collectionBar.visibility = if (collections) View.GONE else View.VISIBLE
         emphasizeTab(binding.tabScans, !collections)
         emphasizeTab(binding.tabCollections, collections)
         if (collections) refreshCollections() else refreshHome()
+    }
+
+    private fun syncCaptures() {
+        val canSync = Prefs.transport(this) != "cloud" || Auth.signedIn(this)
+        if (!canSync) {
+            Toast.makeText(
+                this,
+                RemoteUiCatalog.text(this, R.string.home_sync_sign_in),
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        val pendingReviewChanges = Entries.recent(this).any {
+            CaptureMetadataStore.hasPendingReviewSync(it.dir)
+        }
+        val state = UploadWorker.enqueueExplicitSync(this)
+        CaptureMetadataSyncWorker.enqueueExplicitSync(this)
+        Prefs.captureSyncRecord(this)?.takeIf { state.active }?.let { record ->
+            syncFeedbackRequestId = record.requestId
+            syncFeedbackPhase = state.phase
+        }
+        refreshSyncButton(state)
+        if (state.requestedCount == 0)
+            Toast.makeText(
+                this,
+                RemoteUiCatalog.text(
+                    this,
+                    if (pendingReviewChanges) R.string.home_sync_review_queued
+                    else R.string.home_sync_none,
+                ),
+                Toast.LENGTH_SHORT,
+            ).show()
+    }
+
+    private fun refreshSyncButton(
+        state: CaptureSyncState = UploadWorker.captureSyncState(this),
+    ) {
+        val record = Prefs.captureSyncRecord(this)
+        if (record?.requestId == syncFeedbackRequestId) {
+            val previous = syncFeedbackPhase
+            syncFeedbackPhase = state.phase
+            if (previous?.active == true && !state.active) {
+                val message = when (state.phase) {
+                    CaptureSyncPhase.COMPLETE -> RemoteUiCatalog.text(
+                        this, R.string.home_sync_complete, state.syncedCount,
+                    )
+                    CaptureSyncPhase.COMPLETE_WITH_ERRORS -> RemoteUiCatalog.text(
+                        this,
+                        R.string.home_sync_partial,
+                        state.syncedCount,
+                        state.blockedCount,
+                    )
+                    else -> RemoteUiCatalog.text(this, R.string.home_sync_failed)
+                }
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                binding.syncCaptures.announceForAccessibility(message)
+                syncFeedbackRequestId = null
+                syncFeedbackPhase = null
+            }
+        }
+        binding.syncCaptures.isEnabled = !state.active
+        binding.syncCaptures.alpha = if (state.active) .72f else 1f
+        binding.syncCaptures.text = when {
+            state.phase == CaptureSyncPhase.QUEUED ->
+                RemoteUiCatalog.text(this, R.string.home_sync_queued)
+            state.active && state.requestedCount > 0 -> RemoteUiCatalog.text(
+                this,
+                R.string.home_sync_running,
+                state.syncedCount,
+                state.requestedCount,
+            )
+            else -> RemoteUiCatalog.text(this, R.string.home_sync_captures)
+        }
     }
 
     private fun emphasizeTab(button: com.google.android.material.button.MaterialButton, on: Boolean) {
@@ -421,8 +508,6 @@ class HomeActivity : AppCompatActivity() {
         list.removeAllViews()
         thumbJob?.cancel()
         val entries = Entries.recent(this)
-        selectedIds.retainAll(entries.map { it.id }.toSet())
-        updateSelectionUi()
         refreshCollectionBar()
         if (entries.isEmpty()) {
             list.addView(emptyNotice(getString(R.string.home_empty)))
@@ -514,29 +599,24 @@ class HomeActivity : AppCompatActivity() {
                     .setBackgroundColor(getColor(markerColor(state)))
                 val thumb = row.findViewById<ImageView>(R.id.thumb)
                 applyScanListLayout(row, thumb, compact)
-                val selected = row.findViewById<CheckBox>(R.id.selected)
-                selected.visibility = if (selectionMode) View.VISIBLE else View.GONE
-                selected.isChecked = e.id in selectedIds
-                selected.setOnClickListener { selectSingle(e.id) }
-                selected.setOnLongClickListener {
-                    toggleAdditiveSelection(e.id)
-                    true
-                }
-                row.findViewById<View>(R.id.openDetails).setOnClickListener {
-                    openEntryDetails(e.id)
-                }
                 e.thumbnailPhoto()?.let { photo ->
                     val cleanupPending = e.photoDescriptor(photo)?.postProcessingPending == true
                     thumb.alpha = if (cleanupPending) .82f else 1f
                     thumbs.add(Triple(thumb, photo, cleanupPending))
                 }
-                // A tap replaces the selection. Only a long press changes one
-                // member without clearing the others; the disclosure icon opens details.
-                row.setOnClickListener { selectSingle(e.id) }
+                bindDesktopMetadata(row, e)
+                val openBook = {
+                    openEntryDetails(e.id)
+                }
+                val markAttention = {
+                    showEntryAttentionDialog(this, e.id) { refreshHome() }
+                }
+                row.setOnClickListener { openBook() }
                 row.setOnLongClickListener {
-                    toggleAdditiveSelection(e.id)
+                    markAttention()
                     true
                 }
+                configureScanRowAccessibility(row, openBook, markAttention)
                 RemoteUiCatalog.apply(row)
                 list.addView(row)
             }
@@ -552,6 +632,217 @@ class HomeActivity : AppCompatActivity() {
                 iv.setImageBitmap(bmp)
             }
         }
+    }
+
+    private fun configureScanRowAccessibility(
+        row: View,
+        openBook: () -> Unit,
+        markAttention: () -> Unit,
+    ) {
+        val summaryIds = listOf(
+            R.id.title,
+            R.id.sub,
+            R.id.state,
+            R.id.waitingIndicator,
+            R.id.stateIcon,
+            R.id.whlAvailability,
+            R.id.internetArchiveAvailability,
+            R.id.scanStatus,
+            R.id.remarksStatus,
+            R.id.attentionStatus,
+        )
+        row.contentDescription = summaryIds.mapNotNull { id ->
+            row.findViewById<View>(id).takeIf { it.visibility == View.VISIBLE }?.let { child ->
+                when (child) {
+                    is TextView -> child.text?.toString()
+                    else -> child.contentDescription?.toString()
+                }?.trim()?.takeIf(String::isNotEmpty)
+            }
+        }.distinct().joinToString(". ")
+        summaryIds.forEach { id ->
+            row.findViewById<View>(id).importantForAccessibility =
+                View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        row.findViewById<View>(R.id.thumb).importantForAccessibility =
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        ViewCompat.setScreenReaderFocusable(row, true)
+        ViewCompat.replaceAccessibilityAction(
+            row,
+            AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_CLICK,
+            getString(R.string.home_open_details),
+        ) { _, _ ->
+            openBook()
+            true
+        }
+        ViewCompat.replaceAccessibilityAction(
+            row,
+            AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK,
+            getString(R.string.home_mark_needs_attention),
+        ) { _, _ ->
+            markAttention()
+            true
+        }
+    }
+
+    private fun bindDesktopMetadata(row: View, entry: Entries.Entry) {
+        val desktop = entry.desktopBook
+        val copyrightView = row.findViewById<androidx.appcompat.widget.AppCompatImageButton>(
+            R.id.copyrightStatus,
+        )
+        val copyright = desktop?.copyright
+        val hasCopyright = copyright != null && (
+            desktop.registered || copyright.status.isNotBlank() ||
+                copyright.registrationRecords.isNotEmpty() || copyright.renewalRecords.isNotEmpty()
+            )
+        copyrightView.visibility = if (hasCopyright) View.VISIBLE else View.GONE
+        if (copyright != null && hasCopyright) {
+            copyrightView.setImageDrawable(copyrightStatusDrawable(this, copyright))
+            copyrightView.contentDescription = listOf(
+                getString(R.string.home_copyright_status),
+                copyright.status,
+                resources.getQuantityString(
+                    R.plurals.detail_registration_count,
+                    copyright.registrationRecords.size,
+                    copyright.registrationRecords.size,
+                ),
+                resources.getQuantityString(
+                    R.plurals.detail_renewal_count,
+                    copyright.renewalRecords.size,
+                    copyright.renewalRecords.size,
+                ),
+            ).filter(String::isNotBlank).joinToString(": ")
+            copyrightView.setOnClickListener { showCopyrightRecords(copyright) }
+            copyrightView.setOnLongClickListener {
+                showEntryAttentionDialog(this, entry.id) { refreshHome() }
+                true
+            }
+        } else {
+            copyrightView.setOnClickListener(null)
+            copyrightView.setOnLongClickListener(null)
+        }
+
+        row.findViewById<ImageView>(R.id.whlAvailability).apply {
+            val availability = desktop?.whl
+            visibility = if (availability?.available == true) View.VISIBLE else View.GONE
+            contentDescription = availability?.detail?.takeIf(String::isNotBlank)?.let {
+                getString(R.string.home_availability_detail, getString(R.string.home_whl_available), it)
+            } ?: getString(R.string.home_whl_available)
+        }
+        row.findViewById<ImageView>(R.id.internetArchiveAvailability).apply {
+            val availability = desktop?.internetArchive
+            visibility = if (availability?.available == true) View.VISIBLE else View.GONE
+            contentDescription = availability?.detail?.takeIf(String::isNotBlank)?.let {
+                getString(R.string.home_availability_detail, getString(R.string.home_ia_available), it)
+            } ?: getString(R.string.home_ia_available)
+        }
+        row.findViewById<ImageView>(R.id.scanStatus).apply {
+            val status = desktop?.scanStatus.orEmpty().trim()
+            val actionable = status.isNotEmpty() &&
+                status.lowercase() !in setOf("none", "unknown")
+            visibility = if (actionable) View.VISIBLE else View.GONE
+            contentDescription = getString(R.string.home_scan_status_value, status)
+        }
+        row.findViewById<ImageView>(R.id.remarksStatus).apply {
+            val remarks = desktop?.remarks.orEmpty()
+            visibility = if (remarks.isNotEmpty()) View.VISIBLE else View.GONE
+            contentDescription = resources.getQuantityString(
+                R.plurals.home_remarks_count,
+                remarks.size,
+                remarks.size,
+            )
+        }
+
+        val localReview = entry.captureReview
+        val needsAttention = localReview?.needsAttention == true
+        val needsReview = localReview?.needsReview == true
+        val reason = localReview?.attentionReason.orEmpty()
+        row.findViewById<ImageView>(R.id.attentionStatus).apply {
+            visibility = if (needsAttention || needsReview) View.VISIBLE else View.GONE
+            setColorFilter(getColor(if (needsReview) R.color.whl_red else R.color.whl_amber))
+            contentDescription = buildString {
+                append(getString(
+                    if (needsReview) R.string.home_needs_review else R.string.home_needs_attention,
+                ))
+                if (reason.isNotBlank()) append(": ").append(reason)
+            }
+        }
+    }
+
+    private fun showCopyrightRecords(copyright: DesktopCopyrightMetadata) {
+        val sections = mutableListOf<String>()
+        if (copyright.status.isNotBlank()) {
+            sections += getString(R.string.copyright_status_value, copyright.status)
+        }
+        fun appendRecords(heading: Int, records: List<JSONObject>) {
+            if (records.isEmpty()) return
+            val rendered = mutableListOf<String>()
+            var omitted = 0
+            for ((index, record) in records.withIndex()) {
+                val next = copyrightRecordText(record)
+                val currentSize = sections.sumOf(String::length) +
+                    rendered.sumOf(String::length) + next.length
+                if (currentSize > COPYRIGHT_POPUP_CONTENT_BUDGET) {
+                    omitted = records.size - index
+                    break
+                }
+                rendered += next
+            }
+            if (omitted > 0) {
+                rendered += resources.getQuantityString(
+                    R.plurals.copyright_records_omitted,
+                    omitted,
+                    omitted,
+                )
+            }
+            sections += getString(heading) + "\n" + rendered.joinToString("\n\n")
+        }
+        appendRecords(R.string.copyright_registration_heading, copyright.registrationRecords)
+        appendRecords(R.string.copyright_renewal_heading, copyright.renewalRecords)
+        if (sections.isEmpty()) sections += getString(R.string.copyright_no_records)
+
+        val message = TextView(this).apply {
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            setTextColor(getColor(R.color.whl_ink))
+            textSize = 12f
+            typeface = android.graphics.Typeface.MONOSPACE
+            text = sections.joinToString("\n\n")
+            setTextIsSelectable(true)
+        }
+        val scroll = ScrollView(this).apply { addView(message) }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.copyright_records_title)
+            .setView(scroll)
+            .setPositiveButton(R.string.close, null)
+            .show()
+        RemoteUiCatalog.apply(dialog)
+    }
+
+    private fun copyrightRecordText(record: JSONObject): String {
+        val preferred = listOf(
+            "registration_number", "reg_number", "number", "registration_date", "date",
+            "renewal_id", "renewal_number", "renewal_date", "renewal_year", "title", "author",
+            "source", "via",
+        )
+        val ordered = preferred.filter(record::has) +
+            record.keys().asSequence().filterNot(preferred::contains).sorted().toList()
+        val distinct = ordered.distinct()
+        val shown = distinct.take(COPYRIGHT_RECORD_FIELD_LIMIT)
+        val lines = shown.mapNotNull { key ->
+            val value = record.opt(key)?.takeUnless { it == JSONObject.NULL }?.toString()?.trim()
+                .orEmpty()
+            value.takeIf(String::isNotEmpty)?.let {
+                val bounded = if (it.length <= COPYRIGHT_RECORD_VALUE_LIMIT) it
+                else it.take(COPYRIGHT_RECORD_VALUE_LIMIT - 1) + "…"
+                "${key.replace('_', ' ')}: $bounded"
+            }
+        }.toMutableList()
+        val omitted = distinct.size - shown.size
+        if (omitted > 0) lines += resources.getQuantityString(
+            R.plurals.copyright_fields_omitted,
+            omitted,
+            omitted,
+        )
+        return lines.joinToString("\n").ifBlank { record.toString().take(COPYRIGHT_RECORD_VALUE_LIMIT) }
     }
 
     /** A deliberately cheap blur for small list thumbnails while the remote
@@ -589,88 +880,11 @@ class HomeActivity : AppCompatActivity() {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).roundToInt()
 
-    private fun selectSingle(id: String) {
-        selectionMode = true
-        val updated = replaceScanSelection(selectedIds, id)
-        selectedIds.clear()
-        selectedIds.addAll(updated)
-        updateSelectionUi()
-        refreshHome()
-    }
-
-    private fun toggleAdditiveSelection(id: String) {
-        selectionMode = true
-        val updated = toggleScanSelectionAdditively(selectedIds, id)
-        selectedIds.clear()
-        selectedIds.addAll(updated)
-        updateSelectionUi()
-        refreshHome()
-    }
-
     private fun openEntryDetails(id: String) {
         startActivity(
             Intent(this, EntryDetailActivity::class.java)
                 .putExtra(EntryDetailActivity.EXTRA_ID, id),
         )
-    }
-
-    private fun updateSelectionUi() {
-        binding.selectionBar.visibility = if (selectionMode) View.VISIBLE else View.GONE
-        binding.newScan.isEnabled = !selectionMode
-        binding.selectionCount.text = resources.getQuantityString(
-            R.plurals.home_selected_count, selectedIds.size, selectedIds.size)
-        binding.deleteSelected.isEnabled = selectedIds.isNotEmpty()
-        binding.deleteSelected.alpha = if (selectedIds.isNotEmpty()) 1f else .45f
-    }
-
-    private fun leaveSelectionMode() {
-        selectionMode = false
-        selectedIds.clear()
-        updateSelectionUi()
-        refreshHome()
-    }
-
-    private fun confirmDeleteSelected() {
-        if (selectedIds.isEmpty()) return
-        val count = selectedIds.size
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.home_delete_title)
-            .setMessage(resources.getQuantityString(
-                R.plurals.home_delete_message, count, count))
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.home_delete_selected) { _, _ ->
-                val ids = selectedIds.toList()
-                lifecycleScope.launch {
-                    val results = withContext(Dispatchers.IO) {
-                        ids.map {
-                            Entries.deleteLocalSafely(
-                                this@HomeActivity,
-                                it,
-                                allowUploaded = true,
-                            )
-                        }
-                    }
-                    if (Entries.DeleteResult.ACTIVE_CAPTURE in results) {
-                        Toast.makeText(
-                            this@HomeActivity,
-                            R.string.home_delete_active_skipped,
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                    if (Entries.DeleteResult.DELETE_FAILED in results) {
-                        Toast.makeText(
-                            this@HomeActivity,
-                            R.string.home_delete_failed,
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                    selectionMode = false
-                    selectedIds.clear()
-                    refreshHome()
-                }
-            }
-            .show()
-        RemoteUiCatalog.apply(dialog)
     }
 
     private fun markerColor(state: String): Int = when {
@@ -686,10 +900,13 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private companion object {
+        const val COPYRIGHT_POPUP_CONTENT_BUDGET = 22_000
+        const val COPYRIGHT_RECORD_FIELD_LIMIT = 20
+        const val COPYRIGHT_RECORD_VALUE_LIMIT = 500
         const val STATE_TAB_COLLECTIONS = "tab_collections"
-        const val STATE_SELECTION_MODE = "selection_mode"
-        const val STATE_SELECTED_IDS = "selected_ids"
         const val STATE_SCAN_GROUPS_INITIALIZED = "scan_groups_initialized"
         const val STATE_EXPANDED_SCAN_GROUPS = "expanded_scan_groups"
+        const val STATE_SYNC_FEEDBACK_REQUEST = "sync_feedback_request"
+        const val STATE_SYNC_FEEDBACK_PHASE = "sync_feedback_phase"
     }
 }

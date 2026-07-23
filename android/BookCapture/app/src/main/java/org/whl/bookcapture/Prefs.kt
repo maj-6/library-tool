@@ -31,6 +31,17 @@ internal fun captureCreatorFor(accountId: String, anonymousId: String): CaptureC
 object Prefs {
     private val profileLock = Any()
     private val deviceIdentityLock = Any()
+    private val captureSyncLock = Any()
+
+    private const val CAPTURE_SYNC_REQUEST_ID = "capture_sync_request_id"
+    private const val CAPTURE_SYNC_PHASE = "capture_sync_phase"
+    private const val CAPTURE_SYNC_TARGET_IDS = "capture_sync_target_ids"
+    private const val CAPTURE_SYNC_SYNCED_IDS = "capture_sync_synced_ids"
+    private const val CAPTURE_SYNC_BLOCKED_IDS = "capture_sync_blocked_ids"
+    private const val CAPTURE_SYNC_TRANSPORT_MODE = "capture_sync_transport_mode"
+    private const val CAPTURE_SYNC_LAN_HOST = "capture_sync_lan_host"
+    private const val CAPTURE_SYNC_CLOUD_OWNER = "capture_sync_cloud_owner"
+    private const val CAPTURE_SYNC_RESOLVED_TRANSPORT = "capture_sync_resolved_transport"
 
     private fun sp(ctx: Context): SharedPreferences =
         ctx.getSharedPreferences("bookcapture", Context.MODE_PRIVATE)
@@ -370,6 +381,172 @@ object Prefs {
     fun setLastUploadError(ctx: Context, m: String?) = put(ctx, "last_upload_error" to m)
     fun lastProcError(ctx: Context): String? = str(ctx, "last_proc_error").ifEmpty { null }
     fun setLastProcError(ctx: Context, m: String?) = put(ctx, "last_proc_error" to m)
+
+    // --- explicit capture synchronization ----------------------------------
+
+    /**
+     * A capture upload is authorized only by this durable record. Keeping the
+     * request id in both preferences and WorkManager input prevents lifecycle
+     * nudges, old APK work, or a superseded batch from uploading anything.
+     */
+    internal fun captureSyncRecord(ctx: Context): CaptureSyncRecord? =
+        synchronized(captureSyncLock) { captureSyncRecordLocked(ctx) }
+
+    internal fun activeCaptureSyncRecord(ctx: Context): CaptureSyncRecord? =
+        synchronized(captureSyncLock) {
+            captureSyncRecordLocked(ctx)?.takeIf { it.phase.active }
+        }
+
+    /** Freeze the eligible ids at button-press time. A repeated press while
+     * the batch is active reuses the same identity and target set. */
+    internal fun beginCaptureSync(
+        ctx: Context,
+        targetIds: Collection<String>,
+    ): CaptureSyncStart = synchronized(captureSyncLock) {
+        val start = beginCaptureSyncRecord(
+            existing = captureSyncRecordLocked(ctx),
+            targetIds = targetIds,
+            newRequestId = UUID.randomUUID().toString(),
+            transportMode = transport(ctx),
+            lanHost = lanHost(ctx),
+            cloudOwner = userId(ctx),
+        )
+        if (!start.created) return@synchronized start
+        check(writeCaptureSyncRecordLocked(ctx, start.record)) {
+            "Could not persist capture sync request"
+        }
+        start
+    }
+
+    /** Settings may repair an undelivered batch. Once one capture has landed,
+     * its transport/destination stays frozen so a single request cannot split
+     * across desktops or cloud accounts. */
+    internal fun refreshUndeliveredCaptureSyncDestination(ctx: Context): CaptureSyncRecord? =
+        synchronized(captureSyncLock) {
+            val current = captureSyncRecordLocked(ctx)?.takeIf { it.phase.active }
+                ?: return@synchronized null
+            if (current.syncedIds.isNotEmpty()) return@synchronized current
+            val mode = transport(ctx).takeIf { it in setOf("cloud", "lan", "auto") }
+                ?: "cloud"
+            val updated = current.copy(
+                transportMode = mode,
+                lanHost = lanHost(ctx),
+                cloudOwner = userId(ctx),
+                resolvedTransport = if (mode == "auto") "" else mode,
+            )
+            if (!writeCaptureSyncRecordLocked(ctx, updated)) return@synchronized current
+            updated
+        }
+
+    internal fun resolveCaptureSyncTransport(
+        ctx: Context,
+        requestId: String,
+        transport: String,
+    ): String? = synchronized(captureSyncLock) {
+        if (transport !in setOf("cloud", "lan")) return@synchronized null
+        val current = captureSyncRecordLocked(ctx)
+            ?.takeIf { it.requestId == requestId && it.phase.active }
+            ?: return@synchronized null
+        if (current.resolvedTransport.isNotEmpty()) {
+            return@synchronized current.resolvedTransport
+        }
+        if (current.transportMode != "auto") return@synchronized null
+        val updated = current.copy(resolvedTransport = transport)
+        if (!writeCaptureSyncRecordLocked(ctx, updated)) return@synchronized null
+        transport
+    }
+
+    internal fun setCaptureSyncPhase(
+        ctx: Context,
+        requestId: String,
+        phase: CaptureSyncPhase,
+    ): Boolean = synchronized(captureSyncLock) {
+        val current = captureSyncRecordLocked(ctx)
+            ?.takeIf { it.requestId == requestId } ?: return@synchronized false
+        writeCaptureSyncRecordLocked(ctx, current.copy(phase = phase))
+    }
+
+    internal fun markCaptureSynced(
+        ctx: Context,
+        requestId: String,
+        entryId: String,
+    ): Boolean = synchronized(captureSyncLock) {
+        val current = captureSyncRecordLocked(ctx)
+            ?.takeIf { it.requestId == requestId && entryId in it.targetIds }
+            ?: return@synchronized false
+        writeCaptureSyncRecordLocked(
+            ctx,
+            current.copy(
+                syncedIds = current.syncedIds + entryId,
+                blockedIds = current.blockedIds - entryId,
+            ),
+        )
+    }
+
+    internal fun markCaptureSyncBlocked(
+        ctx: Context,
+        requestId: String,
+        entryId: String,
+    ): Boolean = synchronized(captureSyncLock) {
+        val current = captureSyncRecordLocked(ctx)
+            ?.takeIf {
+                it.requestId == requestId && entryId in it.targetIds &&
+                    entryId !in it.syncedIds
+            } ?: return@synchronized false
+        writeCaptureSyncRecordLocked(
+            ctx,
+            current.copy(blockedIds = current.blockedIds + entryId),
+        )
+    }
+
+    private fun captureSyncRecordLocked(ctx: Context): CaptureSyncRecord? {
+        val prefs = sp(ctx)
+        val requestId = prefs.getString(CAPTURE_SYNC_REQUEST_ID, "").orEmpty().trim()
+        if (requestId.isEmpty()) return null
+        val targets = normalizedCaptureSyncIds(
+            prefs.getStringSet(CAPTURE_SYNC_TARGET_IDS, emptySet()).orEmpty(),
+        )
+        val synced = normalizedCaptureSyncIds(
+            prefs.getStringSet(CAPTURE_SYNC_SYNCED_IDS, emptySet()).orEmpty(),
+        ).intersect(targets)
+        val blocked = normalizedCaptureSyncIds(
+            prefs.getStringSet(CAPTURE_SYNC_BLOCKED_IDS, emptySet()).orEmpty(),
+        ).intersect(targets - synced)
+        val mode = prefs.getString(CAPTURE_SYNC_TRANSPORT_MODE, null)
+            ?.takeIf { it in setOf("cloud", "lan", "auto") }
+            ?: transport(ctx)
+        val resolved = prefs.getString(CAPTURE_SYNC_RESOLVED_TRANSPORT, null)
+            ?.takeIf { it in setOf("cloud", "lan") }
+            ?: if (mode == "auto") "" else mode
+        return CaptureSyncRecord(
+            requestId = requestId,
+            phase = CaptureSyncPhase.fromStoredValue(
+                prefs.getString(CAPTURE_SYNC_PHASE, null),
+            ),
+            targetIds = targets,
+            syncedIds = synced,
+            blockedIds = blocked,
+            transportMode = mode,
+            lanHost = prefs.getString(CAPTURE_SYNC_LAN_HOST, null) ?: lanHost(ctx),
+            cloudOwner = prefs.getString(CAPTURE_SYNC_CLOUD_OWNER, null) ?: userId(ctx),
+            resolvedTransport = resolved,
+        )
+    }
+
+    private fun writeCaptureSyncRecordLocked(
+        ctx: Context,
+        record: CaptureSyncRecord,
+    ): Boolean = sp(ctx).edit()
+        .putString(CAPTURE_SYNC_REQUEST_ID, record.requestId)
+        .putString(CAPTURE_SYNC_PHASE, record.phase.storedValue)
+        .putStringSet(CAPTURE_SYNC_TARGET_IDS, record.targetIds.toSet())
+        .putStringSet(CAPTURE_SYNC_SYNCED_IDS, record.syncedIds.toSet())
+        .putStringSet(CAPTURE_SYNC_BLOCKED_IDS, record.blockedIds.toSet())
+        .putString(CAPTURE_SYNC_TRANSPORT_MODE, record.transportMode)
+        .putString(CAPTURE_SYNC_LAN_HOST, record.lanHost)
+        .putString(CAPTURE_SYNC_CLOUD_OWNER, record.cloudOwner)
+        .putString(CAPTURE_SYNC_RESOLVED_TRANSPORT, record.resolvedTransport)
+        .commit()
 
     // --- session ---------------------------------------------------------------
 

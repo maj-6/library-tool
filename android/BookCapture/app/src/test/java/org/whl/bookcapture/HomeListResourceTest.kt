@@ -111,9 +111,10 @@ class HomeListResourceTest {
     }
 
     @Test
-    fun homeToolbarContainsOnlyIconTabsAndScanRowsUseLiteralSelectionGestures() {
+    fun homeToolbarContainsOnlyIconTabsAndScanRowsOpenOrMarkAttention() {
         val home = xml("src/main/res/layout/activity_home.xml")
         assertFalse(hasElementWithId(home, "btnSelect"))
+        assertFalse(hasElementWithId(home, "selectionBar"))
         val appMenu = elementById(home, "appMenu")
         assertEquals("56dp", appMenu.getAttributeNS(androidNs, "layout_width"))
         assertEquals("56dp", appMenu.getAttributeNS(androidNs, "layout_height"))
@@ -128,18 +129,29 @@ class HomeListResourceTest {
             assertEquals("@font/roboto_slab", tab.getAttributeNS(androidNs, "fontFamily"))
         }
         val source = source("HomeActivity")
-        assertTrue(source.contains("row.setOnClickListener { selectSingle(e.id) }"))
-        assertTrue(source.contains("row.setOnLongClickListener"))
-        assertTrue(source.contains("toggleAdditiveSelection(e.id)"))
+        assertTrue(source.contains("val openBook = {"))
         assertTrue(source.contains("openEntryDetails(e.id)"))
-        assertTrue(source.contains("outState.putBoolean(STATE_SELECTION_MODE, selectionMode)"))
-        assertTrue(source.contains("outState.putStringArrayList(STATE_SELECTED_IDS"))
+        assertTrue(source.contains("row.setOnClickListener { openBook() }"))
+        assertTrue(source.contains("row.setOnLongClickListener"))
+        assertTrue(source.contains("showEntryAttentionDialog(this, e.id)"))
+        assertTrue(source.contains("configureScanRowAccessibility(row, openBook, markAttention)"))
+        assertTrue(source.contains("AccessibilityActionCompat.ACTION_LONG_CLICK"))
+        assertTrue(source.contains("R.string.home_mark_needs_attention"))
+        assertTrue(source.contains("copyrightView.setOnLongClickListener"))
+        assertTrue(source.contains("showEntryAttentionDialog(this, entry.id)"))
+        assertFalse(source.contains("sections.joinToString(\"\\n\\n\").take(24_000)"))
+        assertTrue(source.contains("R.plurals.copyright_records_omitted"))
+        assertFalse(source.contains("selectSingle(e.id)"))
+        assertFalse(source.contains("toggleAdditiveSelection(e.id)"))
+        assertFalse(source.contains("STATE_SELECTION_MODE"))
 
         val scanRow = xml("src/main/res/layout/item_home.xml")
-        val details = elementById(scanRow, "openDetails")
-        assertEquals("androidx.appcompat.widget.AppCompatImageButton", details.tagName)
-        assertEquals("@drawable/ic_chevron_right", details.getAttributeNS(appNs, "srcCompat"))
-        assertEquals("@string/home_open_details", details.getAttributeNS(androidNs, "contentDescription"))
+        assertFalse(hasElementWithId(scanRow, "selected"))
+        assertFalse(hasElementWithId(scanRow, "openDetails"))
+        for (id in listOf(
+            "copyrightStatus", "whlAvailability", "internetArchiveAvailability",
+            "scanStatus", "remarksStatus", "attentionStatus",
+        )) assertNotNull(elementById(scanRow, id))
 
         val plate = xml("src/main/res/drawable/whl_icon_plate.xml")
         assertEquals(0, plate.getElementsByTagName("stroke").length)
@@ -155,6 +167,47 @@ class HomeListResourceTest {
         assertEquals("com.google.android.material.button.MaterialButton", newScan.tagName)
         assertEquals("@drawable/ic_camera_new", newScan.getAttributeNS(appNs, "icon"))
         assertEquals("textStart", newScan.getAttributeNS(appNs, "iconGravity"))
+        val sync = elementById(home, "syncCaptures")
+        assertEquals("com.google.android.material.button.MaterialButton", sync.tagName)
+        assertEquals("@drawable/ic_sync_upload", sync.getAttributeNS(appNs, "icon"))
+        assertTrue(source.contains("UploadWorker.enqueueExplicitSync(this)"))
+        assertTrue(source.contains("CaptureMetadataSyncWorker.enqueueExplicitSync(this)"))
+        val syncSource = source.substringAfter("private fun syncCaptures()")
+            .substringBefore("private fun emphasizeTab")
+        val normalizedSyncSource = syncSource.filterNot(Char::isWhitespace)
+        for (resource in listOf(
+            "home_sync_sign_in", "home_sync_none", "home_sync_queued", "home_sync_running",
+            "home_sync_captures", "home_sync_complete", "home_sync_partial", "home_sync_failed",
+        )) {
+            // Some messages share one RemoteUiCatalog call and select the
+            // resource dynamically (for example, no captures vs review-only
+            // changes). Assert catalog use and the complete resource contract
+            // without coupling this test to that harmless expression shape.
+            assertTrue(normalizedSyncSource.contains("R.string.$resource"))
+        }
+        assertTrue(normalizedSyncSource.contains("RemoteUiCatalog.text("))
+        assertTrue(source.contains("R.string.home_sync_review_queued"))
+        assertEquals("polite", sync.getAttributeNS(androidNs, "accessibilityLiveRegion"))
+        assertTrue(source.contains("binding.syncCaptures.announceForAccessibility(message)"))
+
+        val copyrightButton = elementById(scanRow, "copyrightStatus")
+        assertEquals("@style/WhlMetadataIconButton", copyrightButton.getAttribute("style"))
+        assertEquals(
+            "48dp",
+            elementById(scanRow, "desktopMetadataIcons")
+                .getAttributeNS(androidNs, "layout_height"),
+        )
+        val status = elementById(scanRow, "state")
+        assertEquals("0dp", status.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("1", status.getAttributeNS(androidNs, "layout_weight"))
+        assertEquals("end", status.getAttributeNS(androidNs, "ellipsize"))
+        assertEquals("1", status.getAttributeNS(androidNs, "maxLines"))
+        val metadataStyle = File("src/main/res/values/themes.xml").readText()
+            .substringAfter("<style name=\"WhlMetadataIconButton\"")
+            .substringBefore("</style>")
+        assertTrue(metadataStyle.contains("android:layout_width\">48dp"))
+        assertTrue(metadataStyle.contains("android:layout_height\">48dp"))
+        assertTrue(metadataStyle.contains("android:padding\">14dp"))
     }
 
     @Test

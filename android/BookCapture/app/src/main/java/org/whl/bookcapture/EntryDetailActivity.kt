@@ -80,6 +80,8 @@ class EntryDetailActivity : AppCompatActivity() {
             ProcessWorker.UNIQUE_WORK_NAME,
             ProcessWorker.BACKLOG_WORK_NAME,
             ProcessWorker.workNameForEntry(entryId),
+            CaptureMetadataSyncWorker.WORK_NAME,
+            CaptureMetadataSyncWorker.PULL_WORK_NAME,
         )) {
             WorkManager.getInstance(this)
                 .getWorkInfosForUniqueWorkLiveData(workName)
@@ -133,8 +135,9 @@ class EntryDetailActivity : AppCompatActivity() {
 
         binding.overviewText.text = details.overview
         binding.overviewSection.visibility = details.overview.visibleOrGone()
-        renderFields(binding.otherFields, details.other, compact = true)
-        binding.otherSection.visibility = if (details.other.isEmpty()) View.GONE else View.VISIBLE
+        val otherFields = details.other + desktopDetailFields(entry)
+        renderFields(binding.otherFields, otherFields, compact = true)
+        binding.otherSection.visibility = if (otherFields.isEmpty()) View.GONE else View.VISIBLE
         renderOwnership(entry)
 
         binding.ocrText.text = entry.ocrText().ifEmpty { getString(R.string.detail_no_ocr) }
@@ -162,6 +165,69 @@ class EntryDetailActivity : AppCompatActivity() {
             !entry.uploaded && ownership == CloudUploadOwnership.NEEDS_CLAIM && Auth.signedIn(this)
         ) View.VISIBLE else View.GONE
         binding.claimCloud.setOnClickListener { showClaimConfirmation(entry.id) }
+    }
+
+    private fun desktopDetailFields(entry: Entries.Entry): List<BookDetailField> {
+        val desktop = entry.desktopBook ?: return emptyList()
+        val fields = mutableListOf<BookDetailField>()
+        val copyright = desktop.copyright
+        if (desktop.registered || copyright.status.isNotBlank()) {
+            val evidence = buildList {
+                if (copyright.registrationRecords.isNotEmpty()) add(resources.getQuantityString(
+                    R.plurals.detail_registration_count,
+                    copyright.registrationRecords.size,
+                    copyright.registrationRecords.size,
+                ))
+                if (copyright.renewalRecords.isNotEmpty()) add(resources.getQuantityString(
+                    R.plurals.detail_renewal_count,
+                    copyright.renewalRecords.size,
+                    copyright.renewalRecords.size,
+                ))
+            }
+            fields += BookDetailField(
+                getString(R.string.detail_copyright),
+                (listOf(copyright.status.ifBlank { getString(R.string.detail_unknown) }) + evidence)
+                    .joinToString(" \u00b7 "),
+            )
+        }
+        fields += BookDetailField(
+            getString(R.string.detail_whl_availability),
+            desktopAvailabilityText(desktop.whl),
+        )
+        fields += BookDetailField(
+            getString(R.string.detail_ia_availability),
+            desktopAvailabilityText(desktop.internetArchive),
+        )
+        desktop.scanStatus.takeIf(String::isNotBlank)?.let {
+            fields += BookDetailField(getString(R.string.detail_scan_status), it)
+        }
+        if (desktop.remarks.isNotEmpty()) {
+            fields += BookDetailField(
+                getString(R.string.detail_remarks),
+                desktop.remarks.joinToString("\n"),
+            )
+        }
+        val localReview = entry.captureReview
+        val needsReview = localReview?.needsReview == true
+        val needsAttention = localReview?.needsAttention == true || needsReview
+        if (needsAttention) {
+            val reason = localReview?.attentionReason.orEmpty()
+            fields += BookDetailField(
+                getString(if (needsReview) R.string.home_needs_review else R.string.home_needs_attention),
+                reason.ifBlank { getString(R.string.detail_marked) },
+            )
+        }
+        return fields
+    }
+
+    private fun desktopAvailabilityText(availability: DesktopAvailability): String {
+        val state = getString(when (availability.state) {
+            DesktopAvailabilityState.AVAILABLE -> R.string.detail_available
+            DesktopAvailabilityState.UNAVAILABLE -> R.string.detail_unavailable
+            DesktopAvailabilityState.UNKNOWN -> R.string.detail_unknown
+        })
+        val detail = availability.detail.ifBlank { availability.identifier }
+        return if (detail.isBlank()) state else "$state \u00b7 $detail"
     }
 
     private fun renderFields(

@@ -61,7 +61,8 @@ ANON_CAN = [
 ]
 ANON_CANNOT = [
     "profiles", "events", "captures", "photo_processing_jobs", "passages",
-    "collections", "android_ui_publishers",
+    "collections", "android_ui_publishers", "capture_book_metadata",
+    "capture_reviews",
 ]
 
 

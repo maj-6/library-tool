@@ -83,6 +83,10 @@ internal fun nextUploadQueueKey(
 
 internal const val UPLOAD_PROGRESS_ENTRY_ID = "upload-entry-id"
 internal const val UPLOAD_PROGRESS_STAGE = "upload-stage"
+internal const val UPLOAD_PROGRESS_TOTAL = "upload-total"
+internal const val UPLOAD_PROGRESS_SYNCED = "upload-synced"
+internal const val UPLOAD_PROGRESS_BLOCKED = "upload-blocked"
+internal const val UPLOAD_PROGRESS_REMAINING = "upload-remaining"
 
 internal fun deferredUploadRecheckDelayMs(round: Int): Long {
     val exponent = round.coerceIn(0, 2)
@@ -312,8 +316,9 @@ internal fun deliverValidatedCapture(
 }
 
 /**
- * Uploads one sealed capture per WorkManager invocation and persists a serial
- * cursor continuation for the next capture. Photos go to the `captures`
+ * After a user-created batch authorizes its frozen ids, uploads one sealed
+ * capture per WorkManager invocation and persists a serial cursor continuation
+ * for the next capture. Photos go to the `captures`
  * bucket ("<device>/<entryId>/photo_N.jpg"), then
  * one `captures` table row carrying the contributor and whatever OCR/meta the
  * background pipeline has produced. Uploads run as the signed-in user; the
@@ -331,9 +336,10 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
     companion object {
         private const val PROCESS_GRACE_MS = 10 * 60 * 1000L
-        private const val UPLOAD_WORK = "capture-upload"
+        const val EXPLICIT_SYNC_WORK_NAME = "capture-upload"
         private const val IMPORT_POLL_WORK = "capture-import-poll"
         private const val POLL_ONLY = "poll-only"
+        private const val SYNC_REQUEST_ID = "explicit-sync-request-id"
         private const val HAS_CURSOR = "upload-has-cursor"
         private const val CURSOR_CREATED_AT = "upload-cursor-created-at"
         private const val CURSOR_ENTRY_ID = "upload-cursor-entry-id"
@@ -341,23 +347,71 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         private const val CHAIN_HAD_ERROR = "upload-chain-had-error"
         private const val DEFERRED_ROUND = "upload-deferred-round"
 
-        /** Fresh run now, fresh backoff clock. REPLACE cancels a chain that
-         *  may be hours into exponential backoff — right after "done" or a
-         *  settings fix, waiting that out is wrong. Safe because every run
-         *  resumes from local folders and uploads are upsert-idempotent. */
-        fun enqueue(ctx: Context) {
-            WorkManager.getInstance(ctx)
-                .enqueueUniqueWork(UPLOAD_WORK, ExistingWorkPolicy.REPLACE, request())
+        /**
+         * The sole capture-delivery entry point. The eligible folder ids are
+         * frozen before WorkManager is touched, so captures sealed after this
+         * button press remain local for the next explicit sync.
+         */
+        internal fun enqueueExplicitSync(ctx: Context): CaptureSyncState {
+            val session = CaptureSession(ctx)
+            val targets = session.manualSyncCandidates().map { it.name }
+            val start = Prefs.beginCaptureSync(ctx, targets)
+            if (start.record.targetIds.isNotEmpty()) {
+                WorkManager.getInstance(ctx).enqueueUniqueWork(
+                    EXPLICIT_SYNC_WORK_NAME,
+                    if (start.created) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
+                    request(start.record.requestId),
+                )
+            }
+            return captureSyncState(ctx)
         }
 
-        /** Opportunistic nudge (onResume, post-processing): starts a run only
-         *  if none is queued, never resets a live chain's backoff. */
+        /** A filesystem-backed aggregate; no WorkManager query is required. */
+        internal fun captureSyncState(ctx: Context): CaptureSyncState {
+            val session = CaptureSession(ctx)
+            val candidates = session.manualSyncCandidates().map { it.name }
+            return aggregateCaptureSyncState(
+                record = Prefs.captureSyncRecord(ctx),
+                eligibleIds = candidates,
+                pendingIds = candidates,
+            )
+        }
+
+        /** Existing lifecycle calls may resume, but never authorize, a batch. */
+        @Deprecated("Capture uploads require enqueueExplicitSync")
+        fun enqueue(ctx: Context) {
+            resumeExplicitSync(ctx)
+        }
+
+        @Deprecated("Capture uploads require enqueueExplicitSync")
         fun kick(ctx: Context) {
+            resumeExplicitSync(ctx)
+        }
+
+        private fun resumeExplicitSync(ctx: Context) {
+            val active = Prefs.activeCaptureSyncRecord(ctx) ?: return
             WorkManager.getInstance(ctx)
-                .enqueueUniqueWork(UPLOAD_WORK, ExistingWorkPolicy.KEEP, request())
+                .enqueueUniqueWork(
+                    EXPLICIT_SYNC_WORK_NAME,
+                    ExistingWorkPolicy.KEEP,
+                    request(active.requestId),
+                )
+        }
+
+        /** A settings repair may replace backoff work, but it cannot authorize
+         * a new batch. Before the first successful delivery only, refresh the
+         * frozen destination from the newly saved settings. */
+        internal fun restartExplicitSyncAfterSettingsChange(ctx: Context) {
+            val active = Prefs.refreshUndeliveredCaptureSyncDestination(ctx) ?: return
+            WorkManager.getInstance(ctx).enqueueUniqueWork(
+                EXPLICIT_SYNC_WORK_NAME,
+                ExistingWorkPolicy.REPLACE,
+                request(active.requestId),
+            )
         }
 
         private fun request(
+            syncRequestId: String,
             cursor: UploadQueueKey? = null,
             sawDeferred: Boolean = false,
             hadError: Boolean = false,
@@ -366,6 +420,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         ): OneTimeWorkRequest {
             val builder = OneTimeWorkRequestBuilder<UploadWorker>()
                 .setInputData(workDataOf(
+                    SYNC_REQUEST_ID to syncRequestId,
                     HAS_CURSOR to (cursor != null),
                     CURSOR_CREATED_AT to (cursor?.createdAt ?: 0L),
                     CURSOR_ENTRY_ID to cursor?.entryId.orEmpty(),
@@ -374,7 +429,12 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                     DEFERRED_ROUND to deferredRound,
                 ))
                 .setConstraints(
-                    Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                    // LAN Wi-Fi may have no validated Internet capability.
+                    // Transport probes below provide retry semantics for both
+                    // local and cloud destinations.
+                    Constraints.Builder().setRequiredNetworkType(
+                        NetworkType.NOT_REQUIRED,
+                    ).build())
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             if (delayMs > 0) builder.setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
             return builder.build()
@@ -382,6 +442,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
         private fun continueUploadChain(
             ctx: Context,
+            syncRequestId: String,
             cursor: UploadQueueKey?,
             sawDeferred: Boolean,
             hadError: Boolean,
@@ -389,9 +450,16 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             delayMs: Long = 0,
         ): Boolean = try {
             WorkManager.getInstance(ctx).enqueueUniqueWork(
-                UPLOAD_WORK,
+                EXPLICIT_SYNC_WORK_NAME,
                 ExistingWorkPolicy.APPEND_OR_REPLACE,
-                request(cursor, sawDeferred, hadError, deferredRound, delayMs),
+                request(
+                    syncRequestId,
+                    cursor,
+                    sawDeferred,
+                    hadError,
+                    deferredRound,
+                    delayMs,
+                ),
             ).result.get()
             true
         } catch (e: InterruptedException) {
@@ -439,6 +507,15 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             inputData.getString(CURSOR_ENTRY_ID).orEmpty(),
         )
 
+    private fun inputSyncRequestId(): String =
+        inputData.getString(SYNC_REQUEST_ID).orEmpty().trim()
+
+    private fun authorizedSyncRecord(ctx: Context): CaptureSyncRecord? {
+        val inputId = inputSyncRequestId()
+        if (inputId.isEmpty()) return null
+        return Prefs.activeCaptureSyncRecord(ctx)?.takeIf { it.requestId == inputId }
+    }
+
     private fun queueKey(dir: File): UploadQueueKey {
         val manifest = File(dir, "manifest.json")
         val createdAt = try {
@@ -453,40 +530,111 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         session: CaptureSession,
         cursor: UploadQueueKey?,
     ): PendingCapture? {
-        val byKey = session.pendingUploads().associateBy(::queueKey)
+        val targets = authorizedSyncRecord(applicationContext)?.targetIds.orEmpty()
+        val byKey = session.pendingUploads()
+            .filter { it.name in targets }
+            .associateBy(::queueKey)
         val next = nextUploadQueueKey(byKey.keys, cursor) ?: return null
         return PendingCapture(next, checkNotNull(byKey[next]))
     }
 
     private suspend fun setUploadProgress(entryId: String, stage: String) {
+        val state = captureSyncState(applicationContext)
         setProgress(workDataOf(
             UPLOAD_PROGRESS_ENTRY_ID to entryId,
             UPLOAD_PROGRESS_STAGE to stage,
+            UPLOAD_PROGRESS_TOTAL to state.requestedCount,
+            UPLOAD_PROGRESS_SYNCED to state.syncedCount,
+            UPLOAD_PROGRESS_BLOCKED to state.blockedCount,
+            UPLOAD_PROGRESS_REMAINING to state.remainingCount,
         ))
     }
 
-    private suspend fun finishUploadChain(ctx: Context): Result {
+    private fun syncResultData(ctx: Context, stage: String, entryId: String = "") =
+        captureSyncState(ctx).let { state ->
+            workDataOf(
+                UPLOAD_PROGRESS_ENTRY_ID to entryId,
+                UPLOAD_PROGRESS_STAGE to stage,
+                UPLOAD_PROGRESS_TOTAL to state.requestedCount,
+                UPLOAD_PROGRESS_SYNCED to state.syncedCount,
+                UPLOAD_PROGRESS_BLOCKED to state.blockedCount,
+                UPLOAD_PROGRESS_REMAINING to state.remainingCount,
+            )
+        }
+
+    private suspend fun recoverDeliveredAccounting(
+        ctx: Context,
+        record: CaptureSyncRecord,
+    ): Boolean {
+        var schedulingSucceeded = true
+        for (snapshot in Entries.recent(ctx)) {
+            if (!snapshot.uploaded || snapshot.id !in record.targetIds ||
+                snapshot.id in record.syncedIds) continue
+            EntryOperationLocks.withLock(snapshot.id) {
+                val entry = Entries.find(ctx, snapshot.id)
+                    ?.takeIf { it.uploaded } ?: return@withLock
+                val receipt = try {
+                    JSONObject(File(entry.dir, "manifest.json").readText())
+                } catch (_: Exception) {
+                    return@withLock
+                }
+                if (receipt.optString("sync_request_id") != record.requestId) return@withLock
+                // A crash can occur after queue -> sent but before the normal
+                // post-delivery enqueue. Persist metadata work first; only then
+                // close the upload accounting window. Repeating either action
+                // is safe and the delivery marker routes cloud and LAN rows.
+                if (CaptureMetadataStore.hasPendingReviewSync(entry.dir)) {
+                    val persisted = try {
+                        CaptureMetadataSyncWorker.enqueueExplicitSyncDurably(ctx)
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (!persisted) {
+                        schedulingSucceeded = false
+                        return@withLock
+                    }
+                }
+                Prefs.markCaptureSynced(ctx, record.requestId, entry.id)
+            }
+        }
+        return schedulingSucceeded
+    }
+
+    private suspend fun finishUploadChain(ctx: Context, syncRequestId: String): Result {
         val hadError = inputData.getBoolean(CHAIN_HAD_ERROR, false)
         val sawDeferred = inputData.getBoolean(CHAIN_SAW_DEFERRED, false)
         if (sawDeferred) {
+            Prefs.setCaptureSyncPhase(
+                ctx,
+                syncRequestId,
+                CaptureSyncPhase.WAITING_FOR_PROCESSING,
+            )
             val round = inputData.getInt(DEFERRED_ROUND, 0)
             val persisted = continueUploadChain(
                 ctx = ctx,
+                syncRequestId = syncRequestId,
                 cursor = null,
                 sawDeferred = false,
                 hadError = hadError,
                 deferredRound = round + 1,
                 delayMs = deferredUploadRecheckDelayMs(round),
             )
-            if (!persisted) return Result.retry()
+            if (!persisted) {
+                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+                return Result.retry()
+            }
         } else {
             if (!hadError) Prefs.setLastUploadError(ctx, null)
             if (hasPendingImports(ctx)) scheduleImportPolling(ctx) else Entries.pruneSent(ctx)
+            Prefs.setCaptureSyncPhase(
+                ctx,
+                syncRequestId,
+                if (hadError) CaptureSyncPhase.COMPLETE_WITH_ERRORS
+                else CaptureSyncPhase.COMPLETE,
+            )
         }
-        return Result.success(workDataOf(
-            UPLOAD_PROGRESS_STAGE to
-                if (sawDeferred) "waiting-for-processing" else "complete",
-        ))
+        val stage = if (sawDeferred) "waiting-for-processing" else "complete"
+        return Result.success(syncResultData(ctx, stage))
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
@@ -495,24 +643,57 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             return@withContext pollImportsOnly(ctx)
         }
 
+        val syncRecord = authorizedSyncRecord(ctx)
+            ?: return@withContext Result.success(
+                workDataOf(UPLOAD_PROGRESS_STAGE to "manual-sync-required"),
+            )
+        val syncRequestId = syncRecord.requestId
+        Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RUNNING)
+
         val session = CaptureSession(ctx)
         val cursor = inputCursor()
         if (cursor == null) {
-            session.recoverOrphans()  // once per chain: crash leftovers become uploads
+            // Only folders frozen into this user-requested batch are rescued.
+            session.recoverOrphans(syncRecord.targetIds)
+        }
+        // A continuation can deliver and move an entry to sent/ before its
+        // metadata work is durably scheduled or its batch accounting closes.
+        // Retried continuations retain their cursor, so reconcile sent/
+        // before every pending-queue lookup rather than only at chain start.
+        if (!recoverDeliveredAccounting(ctx, syncRecord)) {
+            Prefs.setCaptureSyncPhase(
+                ctx,
+                syncRequestId,
+                CaptureSyncPhase.RETRYING,
+            )
+            return@withContext Result.retry()
         }
         val candidate = nextPendingCapture(session, cursor)
-            ?: return@withContext finishUploadChain(ctx)
+            ?: return@withContext finishUploadChain(ctx, syncRequestId)
         setUploadProgress(candidate.key.entryId, "preparing")
 
-        // transport: a paired desktop over the LAN (offline) when selected, or
-        // in "auto" when it answers; otherwise the cloud path below.
-        val mode = Prefs.transport(ctx)
-        val lan = if (mode != "cloud" && Prefs.lanHost(ctx).isNotEmpty())
-            try { LanClient(ctx) } catch (_: Exception) { null } else null
-        if (lan != null) {
-            if (lan.ping()) return@withContext uploadOneViaLan(ctx, candidate, lan)
-            if (mode == "lan") {
+        // The batch freezes its transport/destination. Auto resolves once on
+        // the first attempt, then later captures cannot silently fall through
+        // to a different destination when connectivity changes.
+        var resolved = syncRecord.resolvedTransport
+        val lan = if (syncRecord.transportMode != "cloud" &&
+            syncRecord.lanHost.isNotEmpty()) {
+            try { LanClient(ctx, syncRecord.lanHost) } catch (_: Exception) { null }
+        } else null
+        val lanReady = lan?.ping() == true
+        if (resolved.isEmpty() && syncRecord.transportMode == "auto") {
+            resolved = if (lanReady) "lan" else "cloud"
+            resolved = Prefs.resolveCaptureSyncTransport(
+                ctx, syncRequestId, resolved,
+            ) ?: return@withContext Result.retry()
+        }
+        if (resolved == "lan") {
+            if (lanReady && lan != null) {
+                return@withContext uploadOneViaLan(ctx, candidate, lan)
+            }
+            run {
                 Prefs.setLastUploadError(ctx, "paired desktop could not be authenticated")
+                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
                 setUploadProgress(candidate.key.entryId, "retrying")
                 return@withContext Result.retry()
             }
@@ -520,9 +701,15 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
         if (!Prefs.configured(ctx) || !Auth.signedIn(ctx)) {
             Prefs.setLastUploadError(ctx, if (Auth.signedIn(ctx)) null else "signed out")
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.FAILED)
             return@withContext Result.failure()
         }
-        val uploadOwner = Prefs.userId(ctx)
+        val uploadOwner = syncRecord.cloudOwner.ifEmpty { Prefs.userId(ctx) }
+        if (uploadOwner != Prefs.userId(ctx)) {
+            Prefs.setLastUploadError(ctx, "capture sync belongs to a different account")
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.FAILED)
+            return@withContext Result.failure()
+        }
         val client = SupabaseClient(ctx, uploadOwner)
         var transient = false
         var deferredForProcessing = false
@@ -544,7 +731,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 // sealed entry needs an actionable error now, not ten minutes
                 // later. OCR/meta sidecars may still arrive during the grace.
                 val prepared = prepareCapture(ctx, dir)
-                when (cloudUploadOwnership(prepared.creator, Prefs.userId(ctx))) {
+                when (cloudUploadOwnership(prepared.creator, uploadOwner)) {
                     CloudUploadOwnership.ALLOWED -> Unit
                     CloudUploadOwnership.NEEDS_CLAIM -> throw UploadEntryProblem(
                         "This local book scan is not claimed by an account. " +
@@ -563,8 +750,25 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                     deferredForProcessing = true
                     return@withLock
                 }
+                val pendingReviewSync = CaptureMetadataStore.hasPendingReviewSync(dir)
                 val delivery = uploadEntry(client, dir, prepared)
-                markUploaded(ctx, dir, delivery)
+                markUploaded(ctx, dir, delivery, syncRequestId)
+                // The capture row now exists, so an attention/review edit made
+                // before this explicit sync can be pushed instead of racing
+                // the pre-upload metadata pass started by the same button.
+                if (pendingReviewSync) {
+                    val persisted = try {
+                        CaptureMetadataSyncWorker.enqueueExplicitSyncDurably(ctx)
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (!persisted) throw UploadEntryProblem(
+                        "Capture was delivered, but its review sync could not be scheduled.",
+                        retryable = true,
+                    )
+                } else {
+                    CaptureMetadataSyncWorker.enqueueExplicitSync(ctx)
+                }
                 delivered = true
                 }
             } catch (e: UploadEntryProblem) {
@@ -589,6 +793,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
         if (transient) {
             retryableError?.let { Prefs.setLastUploadError(ctx, it) }
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
             setUploadProgress(candidate.key.entryId, "retrying")
             return@withContext Result.retry()
         }
@@ -603,20 +808,31 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             delivered -> "delivered"
             else -> "skipped"
         }
+        when {
+            delivered -> Prefs.markCaptureSynced(ctx, syncRequestId, candidate.key.entryId)
+            permanentError != null ->
+                Prefs.markCaptureSyncBlocked(ctx, syncRequestId, candidate.key.entryId)
+            deferredForProcessing -> Prefs.setCaptureSyncPhase(
+                ctx,
+                syncRequestId,
+                CaptureSyncPhase.WAITING_FOR_PROCESSING,
+            )
+        }
         setUploadProgress(candidate.key.entryId, stage)
         val persisted = continueUploadChain(
             ctx = ctx,
+            syncRequestId = syncRequestId,
             cursor = candidate.key,
             sawDeferred = inputData.getBoolean(CHAIN_SAW_DEFERRED, false) ||
                 deferredForProcessing,
             hadError = hadError,
             deferredRound = inputData.getInt(DEFERRED_ROUND, 0),
         )
-        if (!persisted) return@withContext Result.retry()
-        Result.success(workDataOf(
-            UPLOAD_PROGRESS_ENTRY_ID to candidate.key.entryId,
-            UPLOAD_PROGRESS_STAGE to stage,
-        ))
+        if (!persisted) {
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+            return@withContext Result.retry()
+        }
+        Result.success(syncResultData(ctx, stage, candidate.key.entryId))
     }
 
     private data class PreparedCapture(
@@ -728,8 +944,13 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
     }
 
     /** queue/<id> -> sent/<id>, stamped; the recent list's "uploaded". */
-    private fun markUploaded(ctx: Context, dir: File, delivery: ConfirmedDelivery) {
-        markDelivered(ctx, dir, delivery, "pending")
+    private fun markUploaded(
+        ctx: Context,
+        dir: File,
+        delivery: ConfirmedDelivery,
+        syncRequestId: String,
+    ) {
+        markDelivered(ctx, dir, delivery, "pending", syncRequestId, "cloud")
     }
 
     private fun markDelivered(
@@ -737,6 +958,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         dir: File,
         delivery: ConfirmedDelivery,
         cloudStatus: String,
+        syncRequestId: String,
+        deliveryTransport: String,
     ) {
         check(delivery.entryId == dir.name && delivery.photoCount > 0) {
             "delivery receipt does not match local entry"
@@ -746,6 +969,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             val manifest = JSONObject(manifestFile.readText())
                 .put("uploaded_at", System.currentTimeMillis())
                 .put("cloud_status", cloudStatus)
+                .put("sync_request_id", syncRequestId)
+                .put("delivery_transport", deliveryTransport)
             Entries.atomicWrite(manifestFile, manifest.toString())
             val target = File(Entries.sentRoot(ctx), dir.name)
             if (!dir.renameTo(target)) {
@@ -771,6 +996,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         candidate: PendingCapture,
         client: LanClient,
     ): Result {
+        val syncRequestId = inputSyncRequestId()
         var transient = false
         var deferredForProcessing = false
         var permanentError: String? = null
@@ -785,8 +1011,26 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                         return@withLock
                     }
                     setUploadProgress(candidate.key.entryId, "uploading")
+                    val pendingReviewSync = CaptureMetadataStore.hasPendingReviewSync(dir)
                     val delivery = uploadEntryLan(client, dir, prepareCapture(ctx, dir))
-                    markSentImported(ctx, dir, delivery)
+                    markSentImported(ctx, dir, delivery, syncRequestId)
+                    // The initial multipart carried the review snapshot, but
+                    // the paired desktop's canonical revision is returned by
+                    // /lan/metadata. Queue this only after queue -> sent so the
+                    // worker can find and acknowledge the durable sidecar.
+                    if (pendingReviewSync) {
+                        val persisted = try {
+                            CaptureMetadataSyncWorker.enqueueExplicitSyncDurably(ctx)
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!persisted) throw UploadEntryProblem(
+                            "Capture was delivered, but its review sync could not be scheduled.",
+                            retryable = true,
+                        )
+                    } else {
+                        CaptureMetadataSyncWorker.enqueueExplicitSync(ctx)
+                    }
                     delivered = true
                 }
             } catch (e: UploadEntryProblem) {
@@ -809,6 +1053,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
         if (transient) {
             retryableError?.let { Prefs.setLastUploadError(ctx, it) }
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
             setUploadProgress(candidate.key.entryId, "retrying")
             return Result.retry()
         }
@@ -822,20 +1067,31 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             delivered -> "delivered"
             else -> "skipped"
         }
+        when {
+            delivered -> Prefs.markCaptureSynced(ctx, syncRequestId, candidate.key.entryId)
+            permanentError != null ->
+                Prefs.markCaptureSyncBlocked(ctx, syncRequestId, candidate.key.entryId)
+            deferredForProcessing -> Prefs.setCaptureSyncPhase(
+                ctx,
+                syncRequestId,
+                CaptureSyncPhase.WAITING_FOR_PROCESSING,
+            )
+        }
         setUploadProgress(candidate.key.entryId, stage)
         val persisted = continueUploadChain(
             ctx = ctx,
+            syncRequestId = syncRequestId,
             cursor = candidate.key,
             sawDeferred = inputData.getBoolean(CHAIN_SAW_DEFERRED, false) ||
                 deferredForProcessing,
             hadError = hadError,
             deferredRound = inputData.getInt(DEFERRED_ROUND, 0),
         )
-        if (!persisted) return Result.retry()
-        return Result.success(workDataOf(
-            UPLOAD_PROGRESS_ENTRY_ID to candidate.key.entryId,
-            UPLOAD_PROGRESS_STAGE to stage,
-        ))
+        if (!persisted) {
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+            return Result.retry()
+        }
+        return Result.success(syncResultData(ctx, stage, candidate.key.entryId))
     }
 
     private fun uploadEntryLan(
@@ -857,9 +1113,11 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         val meta = attachCaptureNotes(withProvenance(File(dir, "meta.json").takeIf { it.isFile }
             ?.let { try { JSONObject(it.readText()) } catch (_: Exception) { null } }
             ?: JSONObject(), dir), prepared.captureNotes)
+        val captureReview = CaptureMetadataStore.readReview(dir)?.current
+            ?.let(::captureReviewLanBody)
         client.uploadCapture(id, device, manifest.optString("note", ""),
                              createdAt, ocr, meta,
-                             prepared.photoAssets, photos)
+                             prepared.photoAssets, captureReview, photos)
         return ConfirmedDelivery(id, photos.size, photos.map { it.first })
     }
 
@@ -874,8 +1132,9 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         ctx: Context,
         dir: File,
         delivery: ConfirmedDelivery,
+        syncRequestId: String,
     ) {
-        markDelivered(ctx, dir, delivery, "imported")
+        markDelivered(ctx, dir, delivery, "imported", syncRequestId, "lan")
     }
 
     private fun hasPendingImports(ctx: Context): Boolean = Entries.recent(ctx).any { entry ->
