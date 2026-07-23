@@ -5,7 +5,7 @@ import io
 import json
 import os
 from dataclasses import replace
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -15,6 +15,7 @@ from PIL import Image
 from librarytool.adapters.filesystem import (
     FilesystemCorrectionTransformStore,
     RecoverableWriteSet,
+    WriteSetError,
 )
 from librarytool.engine.correction_transforms import (
     CORRECTION_OUTPUT_KINDS,
@@ -318,6 +319,54 @@ def test_exact_replay_survives_restart_without_querying_stale_authority(
     authority.fail = True
     restarted = _store(tmp_path, authority)
     replay = restarted.commit_transform(draft)
+
+    assert replay == first
+    assert _managed_files(tmp_path) == before
+
+
+def test_replay_returns_original_result_after_rendered_output_drift(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    first = store.commit_transform(draft)
+    before = _managed_files(tmp_path)
+    drifted_thumbnail = replace(
+        draft.output("thumbnail"),
+        content=b"processor-upgrade-output",
+    )
+    drifted = replace(
+        draft,
+        outputs=tuple(
+            drifted_thumbnail if output.kind == "thumbnail" else output
+            for output in draft.outputs
+        ),
+    )
+    authority.fail = True
+
+    replay = store.commit_transform(drifted)
+
+    assert replay == first
+    assert _managed_files(tmp_path) == before
+
+
+def test_replay_returns_original_result_after_dependent_assertion_drift(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    command = _command(source)
+    draft = _draft(source, command)
+    store = _store(tmp_path, authority)
+    first = store.commit_transform(draft)
+    before = _managed_files(tmp_path)
+    changed_source = _source(annotation_revision="region-r2")
+    changed = _draft(changed_source, command)
+    authority.fail = True
+
+    replay = store.commit_transform(changed)
 
     assert replay == first
     assert _managed_files(tmp_path) == before
@@ -633,3 +682,34 @@ def test_replay_non_regular_name_swap_is_nonblocking(
         if swapped:
             receipt_path.unlink(missing_ok=True)
             backup.replace(receipt_path)
+
+
+@pytest.mark.parametrize("operation", ("load", "commit"))
+def test_write_set_errors_are_translated_by_the_store(
+    monkeypatch,
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+
+    @contextmanager
+    def failing_lease():
+        raise WriteSetError(
+            "sentinel raw write-set failure",
+            code="sentinel_write_set_failure",
+            retryable=False,
+        )
+        yield
+
+    monkeypatch.setattr(store._write_set, "workspace_lease", failing_lease)
+
+    with pytest.raises(RepositoryError) as raised:
+        if operation == "load":
+            store.load_source(source.artifact.key)
+        else:
+            store.commit_transform(_draft(source))
+
+    assert type(raised.value) is RepositoryError
+    assert raised.value.code == "sentinel_write_set_failure"
+    assert raised.value.details["cause_type"] == "WriteSetError"

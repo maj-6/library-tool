@@ -27,6 +27,7 @@ from ...engine.correction_transforms import (
     CommittedCorrectionOutput,
     CorrectionHumanAssertions,
     CorrectionSourceSnapshot,
+    CorrectionTransformCommand,
     CorrectionTransformCommitDraft,
     CorrectionTransformCommitResult,
 )
@@ -36,7 +37,11 @@ from ...engine.errors import (
     NotFoundError,
     RepositoryError,
 )
-from ...engine.raster_artifacts import RasterArtifactKey
+from ...engine.raster_artifacts import (
+    ArtifactProvenance,
+    RasterArtifactKey,
+    RasterDimensions,
+)
 from .corrections_artifact_repository import (
     _AuthorityDirectorySnapshot,
     _AuthoritySnapshot,
@@ -80,6 +85,60 @@ _RECEIPT_FIELDS = frozenset(
 _RESULT_FIELDS = frozenset({"operation_id", "outputs"})
 _COMMITTED_OUTPUT_FIELDS = frozenset(
     {"kind", "artifact_id", "artifact_revision", "content_sha256"}
+)
+_PUBLICATION_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "operation_id",
+        "command_sha256",
+        "command",
+        "source",
+        "result",
+        "outputs",
+        "mapped_annotations",
+        "dropped_annotation_ids",
+        "human_assertions",
+        "human_assertion_policy",
+    }
+)
+_PUBLICATION_SOURCE_FIELDS = frozenset(
+    {
+        "item_id",
+        "artifact_id",
+        "artifact_revision",
+        "source_revision",
+        "source_sha256",
+        "dependent_revision_pins",
+    }
+)
+_PUBLICATION_OUTPUT_FIELDS = frozenset(
+    {
+        "kind",
+        "media_type",
+        "content_sha256",
+        "bytes",
+        "dimensions",
+        "provenance",
+        "artifact_id",
+        "artifact_revision",
+        "storage",
+    }
+)
+_HUMAN_ASSERTION_FIELDS = frozenset(
+    {"artifact_categories", "artifact_captions", "spatial", "text"}
+)
+_DIMENSION_FIELDS = frozenset({"width", "height", "orientation"})
+_PROVENANCE_FIELDS = frozenset(
+    {
+        "origin",
+        "provider_id",
+        "model",
+        "recipe_revision",
+        "operation_id",
+        "generated_at",
+        "extensions",
+    }
 )
 
 
@@ -172,14 +231,12 @@ def _command_pins(draft: CorrectionTransformCommitDraft) -> dict[str, str]:
 
 
 def _output_identity(
-    draft: CorrectionTransformCommitDraft,
+    command_sha256: str,
     kind: str,
     reserved: set[str],
 ) -> str:
     for nonce in range(32):
-        payload = (f"{draft.command.fingerprint}\0{kind}\0{nonce}\0artifact").encode(
-            "ascii"
-        )
+        payload = f"{command_sha256}\0{kind}\0{nonce}\0artifact".encode("ascii")
         candidate = "ctr-" + hashlib.sha256(payload).hexdigest()[:40]
         if candidate.casefold() not in reserved:
             reserved.add(candidate.casefold())
@@ -190,6 +247,13 @@ def _output_identity(
     )
 
 
+def _output_revision(command_sha256: str, kind: str, content_sha256: str) -> str:
+    payload = f"{command_sha256}\0{kind}\0{content_sha256}\0revision".encode(
+        "ascii"
+    )
+    return "ctr:" + hashlib.sha256(payload).hexdigest()
+
+
 def _commit_result_for(
     draft: CorrectionTransformCommitDraft,
 ) -> CorrectionTransformCommitResult:
@@ -197,16 +261,19 @@ def _commit_result_for(
     outputs: list[CommittedCorrectionOutput] = []
     for kind in CORRECTION_OUTPUT_KINDS:
         output = draft.output(kind)
-        artifact_id = _output_identity(draft, kind, reserved)
-        revision_payload = (
-            f"{draft.command.fingerprint}\0{kind}\0{output.content_sha256}\0revision"
-        ).encode("ascii")
+        artifact_id = _output_identity(
+            draft.command.fingerprint,
+            kind,
+            reserved,
+        )
         outputs.append(
             CommittedCorrectionOutput(
                 kind=kind,
                 artifact_id=artifact_id,
-                artifact_revision=(
-                    "ctr:" + hashlib.sha256(revision_payload).hexdigest()
+                artifact_revision=_output_revision(
+                    draft.command.fingerprint,
+                    kind,
+                    output.content_sha256,
                 ),
                 content_sha256=output.content_sha256,
             )
@@ -264,8 +331,6 @@ class FilesystemCorrectionTransformStore:
             with self._write_set.workspace_lease():
                 with self._lock_context_for():
                     return self._load_source_locked(key)
-        except EngineError:
-            raise
         except WriteSetError as exc:
             raise _repository_error(
                 "the correction transform workspace is unavailable",
@@ -273,6 +338,8 @@ class FilesystemCorrectionTransformStore:
                 cause=exc,
                 retryable=True,
             ) from exc
+        except EngineError:
+            raise
         except Exception as exc:
             raise _repository_error(
                 "the correction source authority is unavailable",
@@ -287,7 +354,6 @@ class FilesystemCorrectionTransformStore:
     ) -> CorrectionTransformCommitResult:
         if not isinstance(draft, CorrectionTransformCommitDraft):
             raise TypeError("draft must be a CorrectionTransformCommitDraft")
-        self._validate_draft(draft)
         try:
             with self._write_set.workspace_lease():
                 with self._lock_context_for():
@@ -301,19 +367,18 @@ class FilesystemCorrectionTransformStore:
                                 details={"operation_id": draft.command.operation_id},
                             )
                         self._validate_replay_publication(
-                            draft,
+                            draft.command,
                             result,
                             publication_sha256=publication_sha256,
                         )
                         return result
 
+                    self._validate_draft(draft)
                     live = self._load_source_locked(draft.command.key)
                     self._compare_source(draft, live)
                     result = _commit_result_for(draft)
                     self._publish(draft, result)
                     return result
-        except (ConflictError, NotFoundError, RepositoryError):
-            raise
         except WriteSetError as exc:
             raise _repository_error(
                 "the correction transform transaction failed",
@@ -321,6 +386,8 @@ class FilesystemCorrectionTransformStore:
                 cause=exc,
                 retryable=exc.retryable,
             ) from exc
+        except (ConflictError, NotFoundError, RepositoryError):
+            raise
         except EngineError:
             raise
         except Exception as exc:
@@ -598,28 +665,11 @@ class FilesystemCorrectionTransformStore:
                 or not _SHA256_RE.fullmatch(receipt["publication_sha256"])
             ):
                 raise ValueError("receipt envelope is invalid")
-            result_raw = _strict_object(
+            result = self._result_from_document(
                 receipt["result"],
-                fields=_RESULT_FIELDS,
+                operation_id=operation_id,
                 artifact="correction_transform_result",
             )
-            if (
-                result_raw["operation_id"] != operation_id
-                or isinstance(result_raw["outputs"], (str, bytes))
-                or not isinstance(result_raw["outputs"], Sequence)
-            ):
-                raise ValueError("receipt result is invalid")
-            outputs = tuple(
-                CommittedCorrectionOutput(
-                    **_strict_object(
-                        value,
-                        fields=_COMMITTED_OUTPUT_FIELDS,
-                        artifact="correction_transform_output",
-                    )
-                )
-                for value in result_raw["outputs"]
-            )
-            result = CorrectionTransformCommitResult(operation_id, outputs)
             return (
                 receipt["command_sha256"],
                 receipt["publication_sha256"],
@@ -633,22 +683,47 @@ class FilesystemCorrectionTransformStore:
                 cause=exc,
             ) from exc
 
+    def _result_from_document(
+        self,
+        raw: Any,
+        *,
+        operation_id: str,
+        artifact: str,
+    ) -> CorrectionTransformCommitResult:
+        result_raw = _strict_object(
+            raw,
+            fields=_RESULT_FIELDS,
+            artifact=artifact,
+        )
+        if (
+            result_raw["operation_id"] != operation_id
+            or isinstance(result_raw["outputs"], (str, bytes))
+            or not isinstance(result_raw["outputs"], Sequence)
+        ):
+            raise ValueError(f"{artifact} is invalid")
+        outputs = tuple(
+            CommittedCorrectionOutput(
+                **_strict_object(
+                    value,
+                    fields=_COMMITTED_OUTPUT_FIELDS,
+                    artifact="correction_transform_output",
+                )
+            )
+            for value in result_raw["outputs"]
+        )
+        if tuple(output.kind for output in outputs) != CORRECTION_OUTPUT_KINDS:
+            raise ValueError(f"{artifact} output order is invalid")
+        return CorrectionTransformCommitResult(operation_id, outputs)
+
     def _validate_replay_publication(
         self,
-        draft: CorrectionTransformCommitDraft,
+        command: CorrectionTransformCommand,
         result: CorrectionTransformCommitResult,
         *,
         publication_sha256: str,
     ) -> None:
-        expected_result = _commit_result_for(draft)
-        if result != expected_result:
-            raise _repository_error(
-                "the correction transform receipt result is invalid",
-                code="invalid_correction_transform_storage",
-                artifact="correction_transform_receipt",
-            )
         artifact_ids = tuple(output.artifact_id for output in result.outputs)
-        if draft.command.artifact_id.casefold() in {
+        if command.artifact_id.casefold() in {
             artifact_id.casefold() for artifact_id in artifact_ids
         } or len({artifact_id.casefold() for artifact_id in artifact_ids}) != len(
             artifact_ids
@@ -658,8 +733,26 @@ class FilesystemCorrectionTransformStore:
                 code="invalid_correction_transform_storage",
                 artifact="correction_transform_receipt",
             )
-        publication_payload, _ = self._read_regular(
-            self._publication_path(draft.command.operation_id),
+        reserved = {command.artifact_id.casefold()}
+        for output in result.outputs:
+            if (
+                output.artifact_id
+                != _output_identity(command.fingerprint, output.kind, reserved)
+                or output.artifact_revision
+                != _output_revision(
+                    command.fingerprint,
+                    output.kind,
+                    output.content_sha256,
+                )
+            ):
+                raise _repository_error(
+                    "the correction transform receipt identity is invalid",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_receipt",
+                )
+
+        publication_payload, _, _ = self._read_regular(
+            self._publication_path(command.operation_id),
             maximum=_MAX_PUBLICATION_BYTES,
             artifact="correction_transform_publication",
             collect=True,
@@ -670,29 +763,221 @@ class FilesystemCorrectionTransformStore:
                 code="invalid_correction_transform_storage",
                 artifact="correction_transform_publication",
             )
-        expected_publication = _canonical_json(
-            self._publication_document(draft, expected_result),
+        publication = self._decode_json(
+            publication_payload,
             artifact="correction_transform_publication",
         )
-        if publication_payload != expected_publication:
+        try:
+            self._validate_publication_document(
+                publication,
+                command=command,
+                result=result,
+            )
+            canonical = _canonical_json(
+                publication,
+                artifact="correction_transform_publication",
+            )
+        except (EngineError, KeyError, TypeError, ValueError) as exc:
             raise _repository_error(
-                "the correction transform publication does not match its receipt",
+                "the correction transform publication is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_publication",
+                cause=exc,
+            ) from exc
+        if publication_payload != canonical:
+            raise _repository_error(
+                "the correction transform publication is not canonical",
                 code="invalid_correction_transform_storage",
                 artifact="correction_transform_publication",
             )
-        for output in result.outputs:
-            _payload, digest = self._read_regular(
-                self._object_path(output.artifact_id),
+
+        publication_outputs = publication["outputs"]
+        for committed, descriptor in zip(
+            result.outputs,
+            publication_outputs,
+            strict=True,
+        ):
+            _payload, digest, byte_count = self._read_regular(
+                self._object_path(committed.artifact_id),
                 maximum=_MAX_OUTPUT_BYTES,
-                artifact=output.kind,
+                artifact=committed.kind,
                 collect=False,
             )
-            if digest != output.content_sha256:
+            if (
+                digest != committed.content_sha256
+                or byte_count != descriptor["bytes"]
+            ):
                 raise _repository_error(
                     "a correction transform object checksum is invalid",
                     code="invalid_correction_transform_storage",
-                    artifact=output.kind,
+                    artifact=committed.kind,
                 )
+
+    def _validate_publication_document(
+        self,
+        raw: Any,
+        *,
+        command: CorrectionTransformCommand,
+        result: CorrectionTransformCommitResult,
+    ) -> None:
+        publication = _strict_object(
+            raw,
+            fields=_PUBLICATION_FIELDS,
+            artifact="correction_transform_publication",
+        )
+        if (
+            publication["schema"] != CORRECTION_TRANSFORM_PUBLICATION_SCHEMA
+            or type(publication["version"]) is not int
+            or publication["version"] != CORRECTION_TRANSFORM_PUBLICATION_VERSION
+            or publication["operation_id"] != command.operation_id
+            or publication["command_sha256"] != command.fingerprint
+            or publication["human_assertion_policy"]
+            != "carry-separately-never-overwrite"
+        ):
+            raise ValueError("publication envelope is invalid")
+        stored_command = CorrectionTransformCommand.from_dict(publication["command"])
+        if stored_command != command or stored_command.fingerprint != command.fingerprint:
+            raise ValueError("publication command is not bound to its receipt")
+
+        source = _strict_object(
+            publication["source"],
+            fields=_PUBLICATION_SOURCE_FIELDS,
+            artifact="correction_transform_source",
+        )
+        source_pins = {
+            key: source[key]
+            for key in (
+                "item_id",
+                "artifact_id",
+                "artifact_revision",
+                "source_revision",
+                "source_sha256",
+            )
+        }
+        if source_pins != {
+            "item_id": command.item_id,
+            "artifact_id": command.artifact_id,
+            "artifact_revision": command.artifact_revision,
+            "source_revision": command.source_revision,
+            "source_sha256": command.source_sha256,
+        }:
+            raise ValueError("publication source is not bound to its command")
+        self._validate_dependent_revision_pins(source["dependent_revision_pins"])
+
+        publication_result = self._result_from_document(
+            publication["result"],
+            operation_id=command.operation_id,
+            artifact="correction_transform_publication_result",
+        )
+        if publication_result != result:
+            raise ValueError("publication result does not match its receipt")
+
+        outputs_raw = publication["outputs"]
+        if isinstance(outputs_raw, (str, bytes)) or not isinstance(
+            outputs_raw,
+            Sequence,
+        ):
+            raise ValueError("publication outputs must be a sequence")
+        if len(outputs_raw) != len(result.outputs):
+            raise ValueError("publication outputs are incomplete")
+        for committed, raw_output in zip(result.outputs, outputs_raw, strict=True):
+            output = _strict_object(
+                raw_output,
+                fields=_PUBLICATION_OUTPUT_FIELDS,
+                artifact="correction_transform_publication_output",
+            )
+            media_type = output["media_type"]
+            dimensions = output["dimensions"]
+            if isinstance(media_type, str) and media_type.startswith("image/"):
+                RasterDimensions(
+                    **_strict_object(
+                        dimensions,
+                        fields=_DIMENSION_FIELDS,
+                        artifact="correction_transform_output_dimensions",
+                    )
+                )
+            elif dimensions is not None:
+                raise ValueError("non-raster correction output has dimensions")
+            provenance = ArtifactProvenance(
+                **_strict_object(
+                    output["provenance"],
+                    fields=_PROVENANCE_FIELDS,
+                    artifact="correction_transform_output_provenance",
+                )
+            )
+            expected_provenance = ArtifactProvenance(
+                origin="transform",
+                recipe_revision="correction-transform-v1",
+                operation_id=command.operation_id,
+            )
+            expected_media_type = (
+                "application/json"
+                if committed.kind == "transform-manifest"
+                else "image/png"
+            )
+            if (
+                output["kind"] != committed.kind
+                or output["artifact_id"] != committed.artifact_id
+                or output["artifact_revision"] != committed.artifact_revision
+                or output["content_sha256"] != committed.content_sha256
+                or output["storage"] != "immutable-object-v1"
+                or type(output["bytes"]) is not int
+                or output["bytes"] <= 0
+                or media_type != expected_media_type
+                or provenance != expected_provenance
+            ):
+                raise ValueError("publication output is not bound to its result")
+
+        human_assertions = _strict_object(
+            publication["human_assertions"],
+            fields=_HUMAN_ASSERTION_FIELDS,
+            artifact="correction_transform_human_assertions",
+        )
+        for field in _HUMAN_ASSERTION_FIELDS:
+            self._require_sequence(human_assertions[field], field=field)
+        self._require_sequence(
+            publication["mapped_annotations"],
+            field="mapped_annotations",
+        )
+        dropped = self._require_sequence(
+            publication["dropped_annotation_ids"],
+            field="dropped_annotation_ids",
+        )
+        if any(not isinstance(value, str) for value in dropped):
+            raise ValueError("dropped annotation identities must be strings")
+
+    def _validate_dependent_revision_pins(self, raw: Any) -> None:
+        pins = _strict_object(
+            raw,
+            fields=frozenset({"spatial_annotations", "human_text_assertions"}),
+            artifact="correction_transform_dependent_revision_pins",
+        )
+        for field, identity_field in (
+            ("spatial_annotations", "annotation_id"),
+            ("human_text_assertions", "assertion_id"),
+        ):
+            values = self._require_sequence(pins[field], field=field)
+            identities: list[str] = []
+            for value in values:
+                pin = _strict_object(
+                    value,
+                    fields=frozenset({identity_field, "revision"}),
+                    artifact="correction_transform_dependent_revision_pin",
+                )
+                if not isinstance(pin[identity_field], str) or not isinstance(
+                    pin["revision"],
+                    str,
+                ):
+                    raise ValueError("dependent revision pin values must be strings")
+                identities.append(pin[identity_field])
+            if len(set(identities)) != len(identities):
+                raise ValueError("dependent revision pin identities must be unique")
+
+    @staticmethod
+    def _require_sequence(raw: Any, *, field: str) -> Sequence[Any]:
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+            raise ValueError(f"publication {field} must be a sequence")
+        return raw
 
     def _read_json(
         self,
@@ -701,12 +986,15 @@ class FilesystemCorrectionTransformStore:
         maximum: int,
         artifact: str,
     ) -> Any:
-        payload, _digest = self._read_regular(
+        payload, _digest, _byte_count = self._read_regular(
             path,
             maximum=maximum,
             artifact=artifact,
             collect=True,
         )
+        return self._decode_json(payload, artifact=artifact)
+
+    def _decode_json(self, payload: bytes, *, artifact: str) -> Any:
         try:
             return json.loads(
                 payload.decode("ascii"),
@@ -730,7 +1018,7 @@ class FilesystemCorrectionTransformStore:
         maximum: int,
         artifact: str,
         collect: bool,
-    ) -> tuple[bytes, str]:
+    ) -> tuple[bytes, str, int]:
         descriptor = -1
         try:
             authority = self._authority_snapshot(path, artifact=artifact)
@@ -766,7 +1054,7 @@ class FilesystemCorrectionTransformStore:
                 opened_before=opened_before,
             )
             self._authority_snapshot(path, artifact=artifact)
-            return (b"".join(chunks), digest.hexdigest())
+            return (b"".join(chunks), digest.hexdigest(), total)
         except (OSError, TypeError, ValueError) as exc:
             raise _repository_error(
                 "a correction transform storage object cannot be read",
