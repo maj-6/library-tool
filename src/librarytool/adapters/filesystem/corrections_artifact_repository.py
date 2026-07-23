@@ -45,6 +45,7 @@ from ...engine.raster_artifacts import (
     CaptionAssertion,
     CaptionOrigin,
     CategoryAssignment,
+    MAX_METADATA_ASSERTIONS,
     MetadataAssertionOrigin,
     RasterArtifactKey,
     RasterArtifactProjectorPort,
@@ -713,6 +714,8 @@ def _public_metadata_assertions(
         return ()
     assertions: list[ArtifactMetadataAssertion] = []
     for name in sorted(public):
+        if len(assertions) >= MAX_METADATA_ASSERTIONS // 2:
+            break
         if name == "caption" or not _IDENTIFIER_RE.fullmatch(name):
             continue
         try:

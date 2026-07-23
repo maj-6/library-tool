@@ -197,6 +197,7 @@ class CorrectionAggregateProjector:
                 revision=value.revision,
                 source_artifact_id=sources[value.key.artifact_id],
                 category_assignments=value.category_assignments,
+                role_assignments=value.role_assignments,
                 caption_assertions=value.caption_assertions,
                 metadata_assertions=value.metadata_assertions,
                 extensions={
@@ -580,6 +581,7 @@ class CorrectionProjectionService(
                     value,
                     revision=correction.revision,
                     category_assignments=categories,
+                    role_assignments=correction.role_assignments,
                     caption_assertions=correction.caption_assertions,
                     metadata_assertions=correction.metadata_assertions,
                 )

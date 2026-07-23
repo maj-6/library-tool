@@ -282,6 +282,7 @@ class ArtifactCorrectionSnapshot:
                 code="invalid_metadata_assertion",
             )
         object.__setattr__(self, "metadata_assertions", metadata)
+        _extensions(self.effective_metadata(), "effective_metadata")
         object.__setattr__(self, "extensions", _extensions(self.extensions))
 
     def category(self, origin: AssignmentOrigin) -> CategoryAssignment | None:
@@ -1765,6 +1766,66 @@ class CorrectionService:
                     code="manual_metadata_not_found",
                     details={"artifact_id": artifact.key.artifact_id},
                 )
+            changed_names = set(command.assertions) | set(command.clear_names)
+            retained = sum(
+                1
+                for value in artifact.metadata_assertions
+                if (
+                    value.origin is not MetadataAssertionOrigin.MANUAL
+                    or value.name not in changed_names
+                )
+            )
+            required = retained + len(command.assertions)
+            if required > MAX_METADATA_ASSERTIONS:
+                raise ConflictError(
+                    "the artifact has insufficient metadata assertion capacity",
+                    code="metadata_assertion_capacity_conflict",
+                    details={
+                        "artifact_id": artifact.key.artifact_id,
+                        "capacity": MAX_METADATA_ASSERTIONS,
+                        "required": required,
+                    },
+                )
+            current_by_identity = {
+                (value.name, value.origin): value.value
+                for value in artifact.metadata_assertions
+                if not (
+                    value.origin is MetadataAssertionOrigin.MANUAL
+                    and value.name in changed_names
+                )
+            }
+            current_by_identity.update(
+                {
+                    (name, MetadataAssertionOrigin.MANUAL): value
+                    for name, value in command.assertions.items()
+                }
+            )
+            effective_metadata = {}
+            for name in sorted(
+                {identity[0] for identity in current_by_identity}
+            ):
+                for origin in (
+                    MetadataAssertionOrigin.MANUAL,
+                    MetadataAssertionOrigin.IMPORTED,
+                    MetadataAssertionOrigin.MACHINE,
+                ):
+                    identity = (name, origin)
+                    if identity in current_by_identity:
+                        effective_metadata[name] = current_by_identity[identity]
+                        break
+            try:
+                _extensions(effective_metadata, "effective_metadata")
+            except ValidationError as exc:
+                raise ConflictError(
+                    "the artifact effective metadata budget would be exceeded",
+                    code="metadata_assertion_capacity_conflict",
+                    details={
+                        "artifact_id": artifact.key.artifact_id,
+                        "capacity": MAX_METADATA_ASSERTIONS,
+                        "required": required,
+                        "cause_code": exc.code,
+                    },
+                ) from exc
             return
         if isinstance(command, (AssignRegionRoleCommand, ClearRegionRoleCommand)):
             annotation = self._annotation(current, command.annotation_id)

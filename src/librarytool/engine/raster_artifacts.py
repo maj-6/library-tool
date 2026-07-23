@@ -19,10 +19,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, runtime_checkable
 
 from .capabilities import CapabilityRef
 from .errors import ValidationError
+
+if TYPE_CHECKING:
+    from .spatial_annotations import SpatialRoleAssignment
 
 
 JsonMapping: TypeAlias = Mapping[str, Any]
@@ -842,6 +845,7 @@ class RasterArtifactView:
     freshness: ArtifactFreshness | str = ArtifactFreshness.UNTRACKED
     lineage: tuple[RasterLineageRef, ...] = ()
     category_assignments: tuple[CategoryAssignment, ...] = ()
+    role_assignments: tuple["SpatialRoleAssignment", ...] = ()
     caption_assertions: tuple[CaptionAssertion, ...] = ()
     metadata_assertions: tuple[ArtifactMetadataAssertion, ...] = ()
     provenance: ArtifactProvenance = field(default_factory=ArtifactProvenance)
@@ -937,6 +941,26 @@ class RasterArtifactView:
             )
         object.__setattr__(self, "category_assignments", categories)
 
+        # Imported lazily because spatial annotations build on the raster
+        # contracts. Linked extracted-image roles share the same assertion
+        # value without creating a module import cycle.
+        from .spatial_annotations import RoleAssignmentOrigin, SpatialRoleAssignment
+
+        roles = _typed_values(
+            self.role_assignments,
+            SpatialRoleAssignment,
+            "role_assignments",
+            maximum=len(RoleAssignmentOrigin),
+        )
+        role_origins = [assignment.origin for assignment in roles]
+        if len(role_origins) != len(set(role_origins)):
+            raise _validation(
+                "role assignments must have unique origins",
+                code="invalid_spatial_role",
+                field_name="role_assignments",
+            )
+        object.__setattr__(self, "role_assignments", roles)
+
         captions = _typed_values(
             self.caption_assertions,
             CaptionAssertion,
@@ -968,6 +992,7 @@ class RasterArtifactView:
                 field_name="metadata_assertions",
             )
         object.__setattr__(self, "metadata_assertions", metadata)
+        _extensions(self.effective_metadata, "effective_metadata")
         if not isinstance(self.provenance, ArtifactProvenance):
             raise _validation(
                 "provenance must be ArtifactProvenance",
@@ -1000,6 +1025,16 @@ class RasterArtifactView:
             if origin in by_origin:
                 return by_origin[origin]
         return None
+
+    @property
+    def effective_role(self) -> str:
+        by_origin = {
+            value.origin.value: value for value in self.role_assignments
+        }
+        for origin in ("manual", "imported", "machine"):
+            if origin in by_origin:
+                return by_origin[origin].role
+        return ""
 
     @property
     def effective_metadata(self) -> dict[str, Any]:
@@ -1037,6 +1072,10 @@ class RasterArtifactView:
                 value.as_dict() for value in self.category_assignments
             ],
             "effective_category": self.effective_category,
+            "role_assignments": [
+                value.as_dict() for value in self.role_assignments
+            ],
+            "effective_role": self.effective_role,
             "caption_assertions": [
                 value.as_dict() for value in self.caption_assertions
             ],

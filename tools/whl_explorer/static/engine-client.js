@@ -655,6 +655,30 @@
       isBoundedArtifactJson(value[key], state, depth + 1));
   }
 
+  function artifactJsonUtf8Bytes(value) {
+    let encoded;
+    try {
+      encoded = JSON.stringify(value);
+    } catch (_error) {
+      return Number.POSITIVE_INFINITY;
+    }
+    if (typeof encoded !== "string") return Number.POSITIVE_INFINITY;
+    let bytes = 0;
+    for (const character of encoded) {
+      const codePoint = character.codePointAt(0);
+      if (codePoint <= 0x7f) bytes += 1;
+      else if (codePoint <= 0x7ff) bytes += 2;
+      else if (codePoint <= 0xffff) bytes += 3;
+      else bytes += 4;
+    }
+    return bytes;
+  }
+
+  function isArtifactExtensionJson(value) {
+    return isBoundedArtifactJson(value) &&
+      artifactJsonUtf8Bytes(value) <= 32 * 1024;
+  }
+
   function isArtifactRevision(value, optional = false) {
     if (typeof value !== "string") return false;
     if (!value) return optional;
@@ -704,7 +728,7 @@
   }
 
   function correctionMetadata(assertions, clearNames) {
-    if (!isObject(assertions) || !isBoundedArtifactJson(assertions)) {
+    if (!isObject(assertions) || !isArtifactExtensionJson(assertions)) {
       throw new TypeError("assertions must be bounded portable metadata");
     }
     const assertedNames = Object.keys(assertions);
@@ -735,7 +759,7 @@
       (value.operation_id === "" || isPortableIdentifier(value.operation_id)) &&
       typeof value.generated_at === "string" &&
       value.generated_at.length <= 128 &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isRasterSource(value) {
@@ -780,7 +804,7 @@
         Number.isFinite(value.confidence) &&
         value.confidence >= 0 && value.confidence <= 1) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isArtifactMetadataAssertion(value) {
@@ -791,11 +815,11 @@
       ["manual", "machine", "imported"].includes(value.origin) &&
       isArtifactRevision(value.revision) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.value);
+      isArtifactExtensionJson({ [value.name]: value.value });
   }
 
   function isEffectiveArtifactMetadata(assertions, value) {
-    if (!isObject(value) || !isBoundedArtifactJson(value)) return false;
+    if (!isObject(value) || !isArtifactExtensionJson(value)) return false;
     const identities = assertions.map((assertion) =>
       `${assertion.name}\u0000${assertion.origin}`);
     if (new Set(identities).size !== identities.length) return false;
@@ -829,7 +853,7 @@
         Number.isFinite(value.confidence) &&
         value.confidence >= 0 && value.confidence <= 1) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isRoleAssignment(value) {
@@ -842,11 +866,20 @@
         Number.isFinite(value.confidence) &&
         value.confidence >= 0 && value.confidence <= 1) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function hasUniqueOrigins(values) {
     return new Set(values.map((value) => value.origin)).size === values.length;
+  }
+
+  function isEffectiveRole(assignments, value) {
+    if (typeof value !== "string") return false;
+    for (const origin of ["manual", "imported", "machine"]) {
+      const assignment = assignments.find((entry) => entry.origin === origin);
+      if (assignment) return value === assignment.role;
+    }
+    return value === "";
   }
 
   function isRasterArtifactView(value, itemId, artifactId = null) {
@@ -854,6 +887,7 @@
       "key", "revision", "kind", "label", "media_type", "content_sha256",
       "dimensions", "source", "resource_state", "resource", "freshness",
       "lineage", "category_assignments", "effective_category",
+      "role_assignments", "effective_role",
       "caption_assertions", "effective_caption", "metadata_assertions",
       "effective_metadata", "provenance", "extensions",
     ]) || !hasExactKeys(value.key, ["item_id", "artifact_id"]) ||
@@ -885,6 +919,11 @@
         !value.category_assignments.every(isCategoryAssignment) ||
         !hasUniqueOrigins(value.category_assignments) ||
         !ARTIFACT_CATEGORIES.has(value.effective_category) ||
+        !Array.isArray(value.role_assignments) ||
+        value.role_assignments.length > 3 ||
+        !value.role_assignments.every(isRoleAssignment) ||
+        !hasUniqueOrigins(value.role_assignments) ||
+        !isEffectiveRole(value.role_assignments, value.effective_role) ||
         !Array.isArray(value.caption_assertions) ||
         value.caption_assertions.length > 32 ||
         !value.caption_assertions.every(isArtifactCaption) ||
@@ -899,7 +938,7 @@
           value.effective_metadata,
         ) ||
         !isArtifactProvenance(value.provenance) ||
-        !isBoundedArtifactJson(value.extensions)) return false;
+        !isArtifactExtensionJson(value.extensions)) return false;
     if (value.resource_state === "available") {
       if (!hasExactKeys(value.resource, ["id", "revision", "variant"]) ||
           !isPortableIdentifier(value.resource.id) ||
@@ -1043,8 +1082,7 @@
       value.role_assignments.length <= 3 &&
       value.role_assignments.every(isRoleAssignment) &&
       hasUniqueOrigins(value.role_assignments) &&
-      (value.effective_role === "" ||
-        isPortableIdentifier(value.effective_role)) &&
+      isEffectiveRole(value.role_assignments, value.effective_role) &&
       Array.isArray(value.caption_assertions) &&
       value.caption_assertions.length <= 32 &&
       value.caption_assertions.every(isArtifactCaption) &&
@@ -1055,7 +1093,7 @@
       new Set(value.linked_artifact_ids).size ===
         value.linked_artifact_ids.length &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isItemTombstone(value) {

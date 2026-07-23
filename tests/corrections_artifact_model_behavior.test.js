@@ -202,6 +202,150 @@ test("raster and spatial contracts normalize to bounded summaries and opaque ref
 });
 
 
+test("artifact decoder preserves deeply nested effective metadata at transport limits", () => {
+  let nested = "herbarium leaf";
+  for (let depth = 0; depth < 8; depth += 1) {
+    nested = { next: nested };
+  }
+  const longText = "x".repeat(8192);
+  const samples = Array.from({ length: 510 }, () => null);
+  const decoded = decodeArtifactSummary(artifact({
+    metadata_assertions: [
+      {
+        name: "description",
+        value: nested,
+        origin: "machine",
+        revision: "metadata-r1",
+      },
+      {
+        name: "transcript",
+        value: longText,
+        origin: "manual",
+        revision: "metadata-r2",
+      },
+    ],
+    effective_metadata: {
+      description: nested,
+      transcript: longText,
+    },
+  }));
+
+  assert.deepEqual(decoded.metadata.description, nested);
+  assert.equal(decoded.metadata.transcript, longText);
+  assert.deepEqual(decoded.metadataAssertions[0].value, nested);
+  assert.equal(decoded.metadataAssertions[1].value, longText);
+  assert.equal(Object.isFrozen(decoded.metadata.description.next), true);
+
+  const nodeBoundary = decodeArtifactSummary(artifact({
+    metadata_assertions: [{
+      name: "samples",
+      value: samples,
+      origin: "manual",
+      revision: "metadata-r3",
+    }],
+    effective_metadata: { samples },
+  }));
+  assert.equal(nodeBoundary.metadata.samples.length, 510,
+    "the 512-node public metadata limit remains usable");
+
+  const aggregateMetadata = Object.fromEntries(
+    Array.from({ length: 5 }, (_value, index) =>
+      [`segment_${index}`, "y".repeat(7000)]),
+  );
+  assert.throws(
+    () => decodeArtifactSummary(artifact({
+      metadata_assertions: Object.entries(aggregateMetadata).map(([name, value]) => ({
+        name,
+        value,
+        origin: "manual",
+        revision: `metadata-aggregate-r${name.at(-1)}`,
+      })),
+      effective_metadata: aggregateMetadata,
+    })),
+    /effective metadata exceeds its encoded size budget/,
+    "effective metadata enforces the engine's aggregate extension budget",
+  );
+});
+
+
+test("artifact decoder rejects invalid metadata instead of substituting fallbacks", () => {
+  const tooDeep = {};
+  let cursor = tooDeep;
+  for (let depth = 0; depth < 13; depth += 1) {
+    cursor.next = {};
+    cursor = cursor.next;
+  }
+
+  const invalidEffectiveMetadata = [
+    tooDeep,
+    { value: "x".repeat(8193) },
+    { values: Array.from({ length: 511 }, () => null) },
+    null,
+  ];
+  for (const effectiveMetadata of invalidEffectiveMetadata) {
+    assert.throws(
+      () => decodeArtifactSummary(artifact({
+        effective_metadata: effectiveMetadata,
+      })),
+      TypeError,
+    );
+  }
+
+  assert.throws(
+    () => decodeArtifactSummary(artifact({
+      metadata_assertions: [{
+        name: "confidence",
+        value: Number.POSITIVE_INFINITY,
+        origin: "machine",
+        revision: "metadata-r1",
+      }],
+      effective_metadata: {},
+    })),
+    /non-portable number/,
+    "invalid assertion values must not silently become null",
+  );
+  assert.throws(
+    () => decodeArtifactSummary(artifact({
+      metadata_assertions: [{
+        name: "segments",
+        value: { chunks: Array.from({ length: 5 }, () => "z".repeat(7000)) },
+        origin: "machine",
+        revision: "metadata-r2",
+      }],
+      effective_metadata: {},
+    })),
+    /encoded size budget/,
+    "each assertion retains the engine's individual 32 KiB encoded budget",
+  );
+  assert.throws(
+    () => decodeArtifactSummary(artifact({
+      metadata_assertions: [{
+        name: "samples",
+        value: Array.from({ length: 511 }, () => null),
+        origin: "machine",
+        revision: "metadata-r3",
+      }],
+      effective_metadata: {},
+    })),
+    /too many values/,
+    "the assertion-name wrapper counts toward the engine's node budget",
+  );
+  assert.throws(
+    () => decodeArtifactSummary(artifact({
+      metadata_assertions: [{
+        name: "local-path",
+        value: "C:/private/scan.png",
+        origin: "machine",
+        revision: "metadata-r4",
+      }],
+      effective_metadata: {},
+    })),
+    /invalid field/,
+    "assertion names cannot smuggle private resource metadata",
+  );
+});
+
+
 test("page decoder is bounded and generic unknown artifacts stay inspectable", () => {
   const unknown = decodeArtifactPage({
     revision: "inventory-r1",
@@ -227,7 +371,7 @@ test("page decoder is bounded and generic unknown artifacts stay inspectable", (
 
   const excessive = {};
   let cursor = excessive;
-  for (let depth = 0; depth < 8; depth += 1) {
+  for (let depth = 0; depth < 14; depth += 1) {
     cursor.next = {};
     cursor = cursor.next;
   }

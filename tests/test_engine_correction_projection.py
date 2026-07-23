@@ -46,6 +46,7 @@ def _raster(
     revision: str | None = None,
     lineage: tuple[RasterLineageRef, ...] = (),
     categories: tuple[CategoryAssignment, ...] = (),
+    roles: tuple[SpatialRoleAssignment, ...] = (),
     captions: tuple[CaptionAssertion, ...] = (),
     metadata: tuple[ArtifactMetadataAssertion, ...] = (),
 ) -> RasterArtifactView:
@@ -70,6 +71,7 @@ def _raster(
         freshness=ArtifactFreshness.CURRENT,
         lineage=lineage,
         category_assignments=categories,
+        role_assignments=roles,
         caption_assertions=captions,
         metadata_assertions=metadata,
         provenance=ArtifactProvenance(origin="capture"),
@@ -492,6 +494,42 @@ def test_projection_service_exposes_manual_metadata_without_erasing_machine_evid
     assert public["metadata_assertions"][0]["provenance"]["provider_id"] == (
         "mistral"
     )
+
+
+def test_projection_service_exposes_linked_artifact_role_assignments():
+    raster = _raster("image-a")
+    live = _project((raster,))
+    live_artifact = live.artifact("image-a")
+    assert live_artifact is not None
+    manual_role = SpatialRoleAssignment(
+        "figure",
+        RoleAssignmentOrigin.MANUAL,
+        "manual-role-r1",
+        provenance=ArtifactProvenance(origin="manual"),
+    )
+    durable = replace(
+        live,
+        revision="aggregate-correction-r1",
+        artifacts=(
+            replace(
+                live_artifact,
+                revision="artifact-correction-r1",
+                role_assignments=(manual_role,),
+            ),
+        ),
+    )
+    service = CorrectionProjectionService(
+        _RasterProjector((raster,)),
+        _SpatialProjector(()),
+        _ReadRepository(durable),
+    )
+
+    projected = service.get_raster_artifact(raster.key)
+
+    assert projected is not None
+    assert projected.role_assignments == (manual_role,)
+    assert projected.effective_role == "figure"
+    assert projected.as_dict()["effective_role"] == "figure"
 
 
 def test_reconciliation_marks_disappeared_targets_unavailable_until_they_return():

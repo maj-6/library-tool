@@ -166,6 +166,8 @@ function rasterArtifact(overrides = {}) {
     lineage: [],
     category_assignments: [],
     effective_category: "other",
+    role_assignments: [],
+    effective_role: "",
     caption_assertions: [],
     effective_caption: null,
     metadata_assertions: [],
@@ -465,6 +467,8 @@ test("EngineClient exposes versioned capability discovery", async () => {
 
 test("EngineClient validates versioned Corrections artifact reads", async () => {
   const raster = rasterArtifact({
+    role_assignments: [manualRoleAssignment()],
+    effective_role: "figure",
     metadata_assertions: [
       machineMetadataAssertion(),
       manualMetadataAssertion("plate_number", 7),
@@ -517,10 +521,12 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
     group: "source-images",
     limit: 1,
   })).artifacts[0].key.artifact_id, "image:one");
-  assert.equal((await client.rasterArtifacts.get({
+  const rasterDetail = (await client.rasterArtifacts.get({
     itemId: "book:one",
     artifactId: "image:one",
-  })).artifact.effective_metadata.plate_number, 7);
+  })).artifact;
+  assert.equal(rasterDetail.effective_metadata.plate_number, 7);
+  assert.equal(rasterDetail.effective_role, "figure");
   assert.equal((await client.spatialAnnotations.list({
     itemId: "book:one",
     representationId: "capture:one",
@@ -625,6 +631,77 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
   });
   await assert.rejects(
     mismatchedMetadataClient.rasterArtifacts.get({
+      itemId: "book:one",
+      artifactId: "image:one",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const oversizedAssertionValue =
+    Array.from({ length: 4 }, () => "x".repeat(8192));
+  const oversizedAssertion = rasterArtifact({
+    metadata_assertions: [
+      machineMetadataAssertion("segments", oversizedAssertionValue),
+    ],
+    effective_metadata: { segments: oversizedAssertionValue },
+  });
+  const oversizedAssertionClient = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifact/1",
+      artifact: oversizedAssertion,
+    }),
+  });
+  await assert.rejects(
+    oversizedAssertionClient.rasterArtifacts.get({
+      itemId: "book:one",
+      artifactId: "image:one",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const boundedLargeValue = ["x".repeat(8192), "y".repeat(8192)];
+  const oversizedEffectiveMetadata = rasterArtifact({
+    metadata_assertions: [
+      machineMetadataAssertion("first", boundedLargeValue),
+      manualMetadataAssertion("second", boundedLargeValue),
+    ],
+    effective_metadata: {
+      first: boundedLargeValue,
+      second: boundedLargeValue,
+    },
+  });
+  const oversizedEffectiveMetadataClient = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifact/1",
+      artifact: oversizedEffectiveMetadata,
+    }),
+  });
+  await assert.rejects(
+    oversizedEffectiveMetadataClient.rasterArtifacts.get({
+      itemId: "book:one",
+      artifactId: "image:one",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const mismatchedRole = rasterArtifact({
+    role_assignments: [manualRoleAssignment("figure")],
+    effective_role: "marginalia",
+  });
+  const mismatchedRoleClient = new EngineClient({
+    transport: async () => response(200, {
+      ok: true,
+      schema: "librarytool.raster-artifact/1",
+      artifact: mismatchedRole,
+    }),
+  });
+  await assert.rejects(
+    mismatchedRoleClient.rasterArtifacts.get({
       itemId: "book:one",
       artifactId: "image:one",
     }),
@@ -1328,6 +1405,15 @@ test("correction mutations reject unsafe commands and malformed receipts", async
     assertions: { plate_number: 8 },
     clearNames: ["plate_number"],
     idempotencyKey: "metadata:assert:overlap",
+  }), TypeError);
+  assert.throws(() => client.corrections.assertArtifactMetadata({
+    itemId: "book:one",
+    artifactId: "image:one",
+    expectedArtifactRevision: "artifact-r1",
+    assertions: {
+      segments: Array.from({ length: 4 }, () => "x".repeat(8192)),
+    },
+    idempotencyKey: "metadata:assert:oversized",
   }), TypeError);
   assert.throws(() => client.corrections.markAttention({
     itemId: "book:one",

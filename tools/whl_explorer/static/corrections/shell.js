@@ -541,10 +541,11 @@
           this.classificationEventEligible(event, command, context),
         resolveLinkedArtifact: (_target, detail = {}) =>
           this.resolveLinkedArtifact(detail.linkedKey),
-        refreshTarget: (target) => this.refreshClassificationTarget(target),
+        refreshTarget: (target, detail) =>
+          this.refreshClassificationTarget(target, detail),
         promoteSoftTarget: (target) => this.promoteClassificationTarget(target),
-        onChanged: (_result, detail) =>
-          this.refreshClassificationTarget(detail && detail.target),
+        onChanged: (_result, detail) => detail && detail.refreshAttempted
+          ? null : this.refreshClassificationTarget(detail && detail.target, detail),
         onConflict: (error) => this.setStatus(
           error && error.message ||
             "The classification target changed; its latest revision was loaded",
@@ -780,10 +781,40 @@
       }
     }
 
-    async refreshClassificationTarget(target) {
+    categoryInventoryRefresh(_target, detail = {}) {
+      const command = detail && detail.command || {};
+      const undo = detail && detail.undo || {};
+      const action = String(command.action || "").toLowerCase();
+      const commandIds = [
+        command.id,
+        undo.commandId,
+        undo.command_id,
+      ].filter(Boolean).map((value) => String(value).toLowerCase());
+      return action.startsWith("category.") ||
+        commandIds.some((value) => value.startsWith("corrections.category."));
+    }
+
+    async refreshClassificationTarget(target, detail = {}) {
       const key = targetKey(target);
       let refreshed = null;
-      if (key && this.artifactsFeature &&
+      const refreshInherited = this.categoryInventoryRefresh(target, detail);
+      if (refreshInherited && this.artifactsFeature &&
+          typeof this.artifactsFeature.refresh === "function") {
+        try {
+          await this.artifactsFeature.refresh({
+            preserveSelection: true,
+            reason: "category-inheritance",
+          });
+          refreshed = key && this.artifactsFeature.items &&
+            this.artifactsFeature.items.get(key) || null;
+        } catch (error) {
+          this.setStatus(
+            error && error.message ||
+              "Inherited artifact categories could not be refreshed",
+            true,
+          );
+        }
+      } else if (key && this.artifactsFeature &&
           typeof this.artifactsFeature.reloadDetail === "function") {
         try {
           refreshed = await this.artifactsFeature.reloadDetail(key);
@@ -794,7 +825,8 @@
           );
         }
       }
-      if (this.booksFeature && typeof this.booksFeature.refresh === "function") {
+      if (refreshInherited && this.booksFeature &&
+          typeof this.booksFeature.refresh === "function") {
         try {
           await this.booksFeature.refresh("classification");
         } catch (error) {

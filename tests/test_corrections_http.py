@@ -793,6 +793,133 @@ def test_metadata_transport_is_conditional_replay_safe_and_reversible(tmp_path):
     } == {("machine", 3)}
 
 
+def test_metadata_capacity_is_explicit_and_reserves_imported_evidence(tmp_path):
+    imported = tuple(
+        ArtifactMetadataAssertion(
+            f"imported_{index:03d}",
+            index,
+            MetadataAssertionOrigin.IMPORTED,
+            f"metadata-imported-{index}",
+            provenance=ArtifactProvenance(
+                origin="ocr",
+                provider_id="mistral",
+            ),
+        )
+        for index in range(64)
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (replace(_raster("image-1"), metadata_assertions=imported),),
+        (),
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    revision = client.get(endpoint).get_json()["artifact"]["revision"]
+    assertions = {
+        f"manual_{index:03d}": index for index in range(64)
+    }
+
+    accepted = client.patch(
+        f"{endpoint}/metadata",
+        json={"assertions": assertions, "clear_names": []},
+        headers={
+            "Idempotency-Key": "metadata-capacity-accepted",
+            "If-Artifact-Match": f'"{revision}"',
+        },
+    )
+
+    assert accepted.status_code == 200
+    projected = client.get(endpoint).get_json()["artifact"]
+    assert len(projected["metadata_assertions"]) == 128
+    assert projected["effective_metadata"]["manual_063"] == 63
+
+
+def test_metadata_capacity_conflict_is_typed_before_repository_stage(tmp_path):
+    imported = tuple(
+        ArtifactMetadataAssertion(
+            f"imported_{index:03d}",
+            index,
+            MetadataAssertionOrigin.IMPORTED,
+            f"metadata-imported-{index}",
+        )
+        for index in range(128)
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (replace(_raster("image-1"), metadata_assertions=imported),),
+        (),
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    revision = client.get(endpoint).get_json()["artifact"]["revision"]
+
+    rejected = client.patch(
+        f"{endpoint}/metadata",
+        json={"assertions": {"manual_override": True}, "clear_names": []},
+        headers={
+            "Idempotency-Key": "metadata-capacity-rejected",
+            "If-Artifact-Match": f'"{revision}"',
+        },
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.get_json()["code"] == (
+        "metadata_assertion_capacity_conflict"
+    )
+    assert rejected.get_json()["details"] == {
+        "artifact_id": "image-1",
+        "capacity": 128,
+        "required": 129,
+    }
+
+
+def test_metadata_effective_value_budget_conflict_is_typed_and_non_mutating(
+    tmp_path,
+):
+    large_value = ["x" * 8192, "y" * 8192]
+    imported = ArtifactMetadataAssertion(
+        "imported_large",
+        large_value,
+        MetadataAssertionOrigin.IMPORTED,
+        "metadata-imported-large",
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (
+            replace(
+                _raster("image-1"),
+                metadata_assertions=(imported,),
+            ),
+        ),
+        (),
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    before = client.get(endpoint).get_json()["artifact"]
+
+    rejected = client.patch(
+        f"{endpoint}/metadata",
+        json={"assertions": {"manual_large": large_value}, "clear_names": []},
+        headers={
+            "Idempotency-Key": "metadata-effective-budget-rejected",
+            "If-Artifact-Match": f'"{before["revision"]}"',
+        },
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.get_json()["code"] == (
+        "metadata_assertion_capacity_conflict"
+    )
+    assert rejected.get_json()["details"] == {
+        "artifact_id": "image-1",
+        "capacity": 128,
+        "required": 2,
+        "cause_code": "invalid_artifact_extensions",
+    }
+    after = client.get(endpoint).get_json()["artifact"]
+    assert after == before
+
+
 def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     rows = (
         _raster("image-1"),
@@ -1140,8 +1267,14 @@ def test_linked_region_role_mutates_annotation_and_artifact_atomically(
     annotation = client.get(
         "/api/v1/items/book-1/spatial-annotations/region-1"
     ).get_json()["annotation"]
+    artifact = client.get(
+        "/api/v1/items/book-1/raster-artifacts/figure-1"
+    ).get_json()["artifact"]
     assert annotation["effective_role"] == "figure"
     assert annotation["revision"] == receipt["targets"][0]["after_revision"]
+    assert artifact["effective_role"] == "figure"
+    assert artifact["role_assignments"][0]["origin"] == "manual"
+    assert artifact["revision"] == receipt["targets"][1]["after_revision"]
 
 
 def test_introduced_figure_link_survives_refresh_and_clears_atomically(
@@ -1169,6 +1302,7 @@ def test_introduced_figure_link_survives_refresh_and_clears_atomically(
         "artifact"
     ]
     assert annotation["linked_artifact_ids"] == ["figure-1"]
+    assert figure["effective_role"] == "figure"
     clear = client.delete(
         "/api/v1/items/book-1/spatial-annotations/region-1/role",
         json={"linked_artifact_id": "figure-1"},
@@ -1192,6 +1326,11 @@ def test_introduced_figure_link_survives_refresh_and_clears_atomically(
     ).get_json()["annotation"]
     assert refreshed["effective_role"] == ""
     assert refreshed["linked_artifact_ids"] == ["figure-1"]
+    refreshed_figure = client.get(
+        "/api/v1/items/book-1/raster-artifacts/figure-1"
+    ).get_json()["artifact"]
+    assert refreshed_figure["effective_role"] == ""
+    assert refreshed_figure["role_assignments"] == []
 
 
 def test_ambiguous_region_links_are_readable_but_not_mutable(tmp_path):

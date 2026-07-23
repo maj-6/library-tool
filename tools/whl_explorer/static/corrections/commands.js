@@ -589,6 +589,110 @@
         ? result.receipt : null;
     }
 
+    function refreshTarget(kind, itemId, id, revision = "", hint = null) {
+      const key = `${kind}:${id}`;
+      const group = text(read(hint, "group"), 64).toLowerCase();
+      const artifactKind = text(read(hint, "kind"), 64).toLowerCase();
+      if (kind === "artifact") {
+        return Object.freeze({
+          key,
+          objectType: "raster-artifact",
+          family: "image",
+          ...(group ? { group } : {}),
+          ...(artifactKind ? { kind: artifactKind } : {}),
+          itemId,
+          id,
+          artifactId: id,
+          revision,
+        });
+      }
+      return Object.freeze({
+        key,
+        objectType: "spatial-annotation",
+        kind: "spatial-annotation",
+        itemId,
+        id,
+        annotationId: id,
+        revision,
+      });
+    }
+
+    function refreshTargetsFromRevisions(values, itemId, hints = []) {
+      if (!Array.isArray(values)) return Object.freeze([]);
+      const targets = [];
+      const seen = new Set();
+      const hintsByKey = new Map((hints || []).map((value) =>
+        [targetKey(value), value]));
+      for (const value of values) {
+        if (!value || typeof value !== "object") return Object.freeze([]);
+        const kind = text(read(value, "kind"), 32).toLowerCase();
+        const id = text(read(value, "target_id", "targetId"), 256);
+        if (!["artifact", "annotation"].includes(kind) ||
+            !PORTABLE_ID.test(id)) return Object.freeze([]);
+        const key = `${kind}:${id}`;
+        if (seen.has(key)) return Object.freeze([]);
+        seen.add(key);
+        targets.push(refreshTarget(
+          kind,
+          itemId,
+          id,
+          text(read(
+            value,
+            "after_revision", "afterRevision",
+            "before_revision", "beforeRevision",
+          ), 512),
+          hintsByKey.get(key),
+        ));
+      }
+      return Object.freeze(targets);
+    }
+
+    function uniqueRefreshTargets(values) {
+      const result = [];
+      const seen = new Set();
+      for (const value of values || []) {
+        const key = targetKey(value);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        result.push(value);
+      }
+      return Object.freeze(result);
+    }
+
+    async function refreshClassificationTargets(context, targets, detail) {
+      if (typeof context.refreshTarget !== "function") {
+        return Object.freeze({
+          attempted: false,
+          errors: Object.freeze([]),
+        });
+      }
+      const errors = [];
+      for (const target of uniqueRefreshTargets(targets)) {
+        try {
+          await context.refreshTarget(target, Object.freeze({
+            ...detail,
+            refreshTarget: target,
+          }));
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      return Object.freeze({
+        attempted: true,
+        errors: Object.freeze(errors),
+      });
+    }
+
+    function attachRefreshErrors(error, refresh) {
+      if (!error || !refresh || !refresh.errors.length) return;
+      try {
+        error.refreshError = refresh.errors[0];
+        error.refreshErrors = refresh.errors;
+      } catch (ignored) {
+        // A frozen transport error must still be rethrown as the conflict.
+      }
+    }
+
     async function invokePort(port, names, command, payload) {
       for (const name of names) {
         if (port && typeof port[name] === "function") return port[name](payload);
@@ -720,6 +824,17 @@
         }
         this.busy.add(busyKey);
         const signal = context.signal;
+        const primaryKind = command.targetKind === TARGET_KINDS.ANNOTATION
+          ? "annotation" : "artifact";
+        let mutationTargets = Object.freeze([
+          refreshTarget(
+            primaryKind,
+            identifiers.itemId,
+            identifiers.id,
+            identifiers.revision,
+            resolved.target,
+          ),
+        ]);
         let result;
         try {
           if (command.targetKind === TARGET_KINDS.IMAGE) {
@@ -739,6 +854,17 @@
               payload,
             );
           } else {
+            const linkedKeys = linkedArtifactKeys(resolved.target);
+            if (linkedKeys.length === 1) {
+              mutationTargets = Object.freeze([
+                ...mutationTargets,
+                refreshTarget(
+                  "artifact",
+                  identifiers.itemId,
+                  linkedKeys[0].slice("artifact:".length),
+                ),
+              ]);
+            }
             const linked = await this.resolveLinkedArtifact(
               resolved.target, context, identifiers, command);
             const payload = {
@@ -753,6 +879,17 @@
             if (linked) {
               payload.linkedArtifactId = linked.id;
               payload.expectedLinkedArtifactRevision = linked.revision;
+              mutationTargets = Object.freeze([
+                ...mutationTargets.filter((target) =>
+                  target.key !== `artifact:${linked.id}`),
+                refreshTarget(
+                  "artifact",
+                  identifiers.itemId,
+                  linked.id,
+                  linked.revision,
+                  linked,
+                ),
+              ]);
             }
             result = await invokePort(
               this.port,
@@ -763,17 +900,19 @@
           }
         } catch (error) {
           if (conflictError(error)) {
-            if (typeof context.refreshTarget === "function") {
-              try {
-                await context.refreshTarget(resolved.target, { command, error });
-              } catch (refreshError) {
-                error.refreshError = refreshError;
-              }
-            }
+            const refresh = await refreshClassificationTargets(
+              context,
+              mutationTargets,
+              { command, error, reason: "conflict" },
+            );
+            attachRefreshErrors(error, refresh);
             await this.onConflict(error, Object.freeze({
               command,
               target: resolved.target,
+              targets: mutationTargets,
               name: resolved.name,
+              refreshAttempted: refresh.attempted,
+              refreshErrors: refresh.errors,
             }));
           }
           throw error;
@@ -782,6 +921,18 @@
         }
 
         const receipt = receiptFromResult(result);
+        const receiptTargets = refreshTargetsFromRevisions(
+          receipt && receipt.targets,
+          identifiers.itemId,
+          mutationTargets,
+        );
+        const changedTargets = receiptTargets.length
+          ? receiptTargets : mutationTargets;
+        const refresh = await refreshClassificationTargets(
+          context,
+          changedTargets,
+          { command, receipt, reason: "committed" },
+        );
         if (receipt && receipt.inverse) {
           const undo = Object.freeze({
             commandId: command.id,
@@ -789,6 +940,7 @@
             targetName: resolved.name,
             itemId: identifiers.itemId,
             inverse: receipt.inverse,
+            refreshTargets: changedTargets,
           });
           this.undoStack.push(undo);
           if (this.history && typeof this.history.push === "function") {
@@ -798,7 +950,10 @@
         await this.onChanged(result, Object.freeze({
           command,
           target: resolved.target,
+          targets: changedTargets,
           name: resolved.name,
+          refreshAttempted: refresh.attempted,
+          refreshErrors: refresh.errors,
         }));
         this.onStatus(`${command.shortLabel} assigned to ${resolved.name}`, false);
         return result;
@@ -812,6 +967,13 @@
             "undo_unavailable",
           );
         }
+        const expectedTargets = refreshTargetsFromRevisions(
+          entry.inverse && entry.inverse.expected_targets,
+          entry.itemId,
+          entry.refreshTargets,
+        );
+        const fallbackTargets = expectedTargets.length
+          ? expectedTargets : entry.refreshTargets || Object.freeze([]);
         const payload = Object.freeze({
           itemId: entry.itemId,
           inverse: entry.inverse,
@@ -830,18 +992,56 @@
             { id: `${entry.commandId}.undo`, action: "inverse.execute" },
             payload,
           );
+          const receipt = receiptFromResult(result);
+          const receiptTargets = refreshTargetsFromRevisions(
+            receipt && receipt.targets,
+            entry.itemId,
+            fallbackTargets,
+          );
+          const changedTargets = receiptTargets.length
+            ? receiptTargets : fallbackTargets;
+          const refresh = await refreshClassificationTargets(
+            context,
+            changedTargets,
+            {
+              command: Object.freeze({
+                id: `${entry.commandId}.undo`,
+                action: "inverse.execute",
+              }),
+              receipt,
+              undo: entry,
+              reason: "undo-committed",
+            },
+          );
           this.undoStack.pop();
           await this.onChanged(result, Object.freeze({
             command: Object.freeze({
               id: `${entry.commandId}.undo`,
               action: "inverse.execute",
             }),
+            target: changedTargets[0] || null,
+            targets: changedTargets,
             undo: entry,
+            refreshAttempted: refresh.attempted,
+            refreshErrors: refresh.errors,
           }));
           this.onStatus(`Undid ${entry.label.toLowerCase()}`, false);
           return result;
         } catch (error) {
-          if (conflictError(error)) await this.onConflict(error, { undo: entry });
+          if (conflictError(error)) {
+            const refresh = await refreshClassificationTargets(
+              context,
+              fallbackTargets,
+              { error, undo: entry, reason: "undo-conflict" },
+            );
+            attachRefreshErrors(error, refresh);
+            await this.onConflict(error, Object.freeze({
+              undo: entry,
+              targets: fallbackTargets,
+              refreshAttempted: refresh.attempted,
+              refreshErrors: refresh.errors,
+            }));
+          }
           throw error;
         }
       }

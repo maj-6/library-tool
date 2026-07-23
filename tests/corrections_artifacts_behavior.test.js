@@ -239,6 +239,69 @@ test("context and selection generations discard stale results and abort prior wo
 });
 
 
+test("refresh evicts same-revision details before restoring inherited-category selection", async () => {
+  let effectiveCategory = "cover";
+  let detailReads = 0;
+  const source = () => raster("capture-1", "captured-image", {
+    category_assignments: [{
+      category: effectiveCategory,
+      origin: "manual",
+      revision: "capture-category-r1",
+    }],
+    effective_category: effectiveCategory,
+  });
+  const child = () => raster("processed-1", "corrected-image", {
+    revision: "processed-1-r1",
+    source_artifact_id: "capture-1",
+    category_assignments: [{
+      category: effectiveCategory,
+      origin: "inherited",
+      revision: "capture-category-r1",
+      inherited_from_artifact_id: "capture-1",
+    }],
+    effective_category: effectiveCategory,
+  });
+  const { feature } = harness({
+    initialExpandedGroups: ["source-images", "processed-images"],
+    catalog: {
+      async list({ group }) {
+        return {
+          revision: `${group}-${effectiveCategory}`,
+          items: group === "source-images" ? [source()] : [child()],
+        };
+      },
+      async get({ key }) {
+        detailReads += 1;
+        return key === "artifact:capture-1" ? source() : child();
+      },
+    },
+    resources: {
+      async resolveRaster() { return { url: "/safe/display.jpg" }; },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select("artifact:processed-1");
+  assert.equal(feature.items.get("artifact:processed-1").effectiveCategory, "cover");
+  assert.equal(detailReads, 1);
+
+  effectiveCategory = "title_page";
+  await feature.refresh({ preserveSelection: true });
+
+  assert.equal(feature.selectedKey, "artifact:processed-1");
+  assert.equal(detailReads, 2,
+    "the old same-revision detail must not overwrite the refreshed group summary");
+  assert.equal(
+    feature.items.get("artifact:processed-1").effectiveCategory,
+    "title_page",
+  );
+  assert.equal(
+    feature.currentResource.summary.effectiveCategory,
+    "title_page",
+  );
+});
+
+
 test("image selection resolves only display data until full resolution is explicit", async () => {
   const variants = [];
   const revoked = [];
