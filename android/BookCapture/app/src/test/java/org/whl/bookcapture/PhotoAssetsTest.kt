@@ -18,6 +18,17 @@ class PhotoAssetsTest {
     private val sourceHash = "a".repeat(64)
     private val displayHash = "b".repeat(64)
 
+    @Test
+    fun unrelatedEntriesDoNotShareOneProcessWidePhotoContractLock() {
+        val source = File("src/main/java/org/whl/bookcapture/PhotoAssets.kt").readText()
+
+        assertTrue(source.contains("private val entryMonitors = Array(32) { Any() }"))
+        assertTrue(source.contains("private fun monitorFor(dir: File): Any"))
+        assertTrue(source.contains("synchronized(monitorFor(dir))"))
+        assertFalse(source.contains("private val monitor = Any()"))
+        assertFalse(source.contains("synchronized(monitor)"))
+    }
+
     private fun asset(
         id: String,
         order: Int,

@@ -11,15 +11,19 @@ Authenticated-user calls also carry ``access_token``; the project key stays in
 ``apikey`` while the user's JWT goes in ``Authorization``, so RLS sees that
 user. Owner-only calls omit ``access_token`` and continue to use the service
 credential as their bearer. Optional keys "table" (default "captures"),
-"bucket" (default "captures"), "books_table" (default "books"). Errors raise
+"bucket" (default "captures"), "books_table" (default "books"),
+"capture_book_metadata_table", and "capture_reviews_table" (the latter two
+use same-named defaults). Errors raise
 SyncError with a readable message — callers report, they don't crash.
 """
 from __future__ import annotations
 
 import json
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 TIMEOUT = 30.0
 
@@ -93,6 +97,21 @@ def mark_capture(cfg: dict, capture_id: str, status: str) -> None:
     cid = urllib.parse.quote(str(capture_id))
     _rest(cfg, "PATCH", f"{table}?id=eq.{cid}",
           {"status": status}, prefer="return=minimal")
+
+
+def list_capture_ids(cfg: dict, capture_ids, chunk: int = 40) -> list[str]:
+    """Return only named capture ids that actually exist in this project."""
+    out: list[str] = []
+    ids = _capture_sync_ids(capture_ids)
+    table = cfg.get("table") or "captures"
+    for i in range(0, len(ids), chunk):
+        batch = ids[i:i + chunk]
+        encoded = ",".join(urllib.parse.quote(value, safe="") for value in batch)
+        rows = _rest(cfg, "GET", f"{table}?id=in.({encoded})&select=id&order=id.asc")
+        if isinstance(rows, list):
+            out.extend(str(row.get("id")) for row in rows
+                       if isinstance(row, dict) and row.get("id") in batch)
+    return _capture_sync_ids(out)
 
 
 # --- storage --------------------------------------------------------------------
@@ -202,6 +221,323 @@ def push_books(cfg: dict, rows: list[dict], chunk: int = 200) -> int:
               prefer="resolution=merge-duplicates,return=minimal")
         pushed += len(batch)
     return pushed
+
+
+# --- registered phone-capture metadata ------------------------------------------
+
+def _capture_sync_ids(values) -> list[str]:
+    """Unique canonical capture UUIDs, preserving caller order.
+
+    ``captures.id`` is a PostgreSQL uuid. Filtering it with a merely URL-safe
+    legacy folder name makes PostgREST reject the complete batch before RLS is
+    evaluated, so invalid local history is excluded here.
+    """
+    out = []
+    for value in values:
+        capture_id = str(value or "").strip()
+        try:
+            capture_id = str(uuid.UUID(capture_id))
+        except (ValueError, AttributeError):
+            continue
+        if capture_id in out:
+            continue
+        out.append(capture_id)
+    return out
+
+
+def list_capture_book_metadata(cfg: dict, capture_ids,
+                               chunk: int = 40) -> list[dict]:
+    """Read desktop snapshots for only the named phone captures.
+
+    The service role can see every account, so the explicit id filter is a
+    required scope boundary, not merely an optimization.
+    """
+    out: list[dict] = []
+    ids = _capture_sync_ids(capture_ids)
+    table = cfg.get("capture_book_metadata_table") or "capture_book_metadata"
+    for i in range(0, len(ids), chunk):
+        batch = ids[i:i + chunk]
+        encoded = ",".join(urllib.parse.quote(value, safe="") for value in batch)
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?capture_id=in.({encoded})"
+            "&select=capture_id,book_id,data,revision,updated_at"
+            "&order=capture_id.asc",
+        )
+        if isinstance(rows, list):
+            out.extend(row for row in rows if isinstance(row, dict)
+                       and row.get("capture_id") in batch)
+    return out
+
+
+def _capture_book_metadata_write_row(raw: dict) -> dict:
+    """Validate one complete, bounded desktop projection."""
+    if not isinstance(raw, dict):
+        raise SyncError("capture metadata row must be an object")
+    capture_id = str(raw.get("capture_id") or "").strip()
+    book_id = str(raw.get("book_id") or "").strip()
+    data = raw.get("data")
+    normalized = _capture_sync_ids((capture_id,))
+    try:
+        data_size = len(json.dumps(
+            data, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise SyncError("capture metadata data is not JSON") from exc
+    if (not normalized or len(book_id) > 200 or
+            not isinstance(data, dict) or data_size > 256 * 1024):
+        raise SyncError("capture metadata row is invalid or exceeds 256 KiB")
+    return {"capture_id": normalized[0], "book_id": book_id, "data": data}
+
+
+def _projection_stamp(value: str) -> datetime | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _projection_vector(data: dict) -> dict[str, datetime | None] | None:
+    source = data.get("projection_source") if isinstance(data, dict) else None
+    if not isinstance(source, dict):
+        return None
+    # These are independent monotonic facts.  In particular, copyright-cache
+    # enrichment is not a build/manual edit, while unregister/re-register can
+    # legitimately reuse the same replicated build revision on either side of
+    # a tombstone.  Keeping their clocks separate prevents an equal build
+    # vector from stranding either update.
+    keys = (
+        "build_updated_at",
+        "manual_updated_at",
+        "evidence_updated_at",
+        "registration_updated_at",
+        "tombstone_updated_at",
+    )
+    if any(not isinstance(source.get(key, ""), str) for key in keys):
+        return None
+    return {key: _projection_stamp(source.get(key, "")) for key in keys}
+
+
+def _projection_freshness(desired: dict, existing: dict) -> str:
+    """Return newer/equal/stale for the projection's small vector clock."""
+    desired_vector = _projection_vector(desired)
+    existing_vector = _projection_vector(existing)
+    if desired_vector is not None and existing_vector is None:
+        return "newer"
+    if desired_vector is None and existing_vector is not None:
+        return "stale"
+    if desired_vector is not None and existing_vector is not None:
+        advanced = False
+        floor = datetime.min.replace(tzinfo=timezone.utc)
+        for key in desired_vector:
+            left = desired_vector[key] or floor
+            right = existing_vector[key] or floor
+            if left < right:
+                return "stale"
+            advanced = advanced or left > right
+        return "newer" if advanced else "equal"
+    desired_stamp = _projection_stamp(desired.get("source_updated_at", ""))
+    existing_stamp = _projection_stamp(existing.get("source_updated_at", ""))
+    if desired_stamp is None and existing_stamp is None:
+        return "newer"  # legacy rows retain CAS protection, without freshness
+    if desired_stamp is None:
+        return "stale"
+    if existing_stamp is None or desired_stamp > existing_stamp:
+        return "newer"
+    return "equal" if desired_stamp == existing_stamp else "stale"
+
+
+def push_capture_book_metadata(cfg: dict, rows: list[dict],
+                               chunk: int = 100) -> int:
+    """CAS-publish fresh desktop snapshots without revision churn.
+
+    Invalid rows and freshness/revision conflicts are reported after unrelated
+    valid rows have had an opportunity to publish. A stale desktop therefore
+    cannot overwrite a newer projection on its next periodic run.
+    """
+    del chunk  # retained for call compatibility; writes are intentionally CAS-per-row
+    desired: dict[str, dict] = {}
+    failures: list[str] = []
+    for raw in rows:
+        capture_id = str(raw.get("capture_id") or "").strip() \
+            if isinstance(raw, dict) else "<unknown>"
+        try:
+            normalized = _capture_book_metadata_write_row(raw)
+        except SyncError as exc:
+            failures.append(f"{capture_id or '<unknown>'}: {exc}")
+            continue
+        desired[normalized["capture_id"]] = normalized
+    existing = {
+        str(row.get("capture_id")): row
+        for row in list_capture_book_metadata(cfg, desired)
+    }
+    table = cfg.get("capture_book_metadata_table") or "capture_book_metadata"
+    pushed = 0
+    selected = "capture_id,book_id,data,revision,updated_at"
+    for capture_id, row in desired.items():
+        previous = existing.get(capture_id)
+        if (previous is not None and
+                str(previous.get("book_id") or "") == row["book_id"] and
+                previous.get("data") == row["data"]):
+            continue
+        try:
+            if previous is None:
+                response = _rest(
+                    cfg, "POST",
+                    f"{table}?on_conflict=capture_id&select={selected}", [row],
+                    prefer="resolution=ignore-duplicates,return=representation",
+                )
+                expected_revision = 1
+            else:
+                relation = _projection_freshness(
+                    row["data"], previous.get("data") or {})
+                if relation != "newer":
+                    raise SyncError(f"{relation} projection source conflicts with cloud")
+                revision = previous.get("revision")
+                if (isinstance(revision, bool) or not isinstance(revision, int) or
+                        revision < 1):
+                    raise SyncError("cloud projection has an invalid revision")
+                encoded = urllib.parse.quote(capture_id, safe="")
+                response = _rest(
+                    cfg, "PATCH",
+                    f"{table}?capture_id=eq.{encoded}&revision=eq.{revision}"
+                    f"&select={selected}",
+                    {"book_id": row["book_id"], "data": row["data"]},
+                    prefer="return=representation",
+                )
+                expected_revision = revision + 1
+            if not isinstance(response, list) or len(response) != 1:
+                raise SyncError("capture metadata compare-and-set conflict")
+            accepted = response[0]
+            if (not isinstance(accepted, dict) or
+                    accepted.get("capture_id") != capture_id or
+                    str(accepted.get("book_id") or "") != row["book_id"] or
+                    accepted.get("data") != row["data"] or
+                    accepted.get("revision") != expected_revision or
+                    not isinstance(accepted.get("updated_at"), str) or
+                    not accepted.get("updated_at")):
+                raise SyncError("capture metadata write returned an invalid row")
+            pushed += 1
+        except SyncError as exc:
+            failures.append(f"{capture_id}: {exc}")
+    if failures:
+        detail = "; ".join(failures[:10])
+        if len(failures) > 10:
+            detail += f"; +{len(failures) - 10} more"
+        raise SyncError(
+            f"{len(failures)} capture metadata row(s) failed "
+            f"({pushed} succeeded): {detail}")
+    return pushed
+
+
+def list_capture_reviews(cfg: dict, capture_ids,
+                         chunk: int = 40) -> list[dict]:
+    """Read shared review rows for only the explicitly named captures.
+
+    Desktop owner sync normally uses a service credential.  The id filter is
+    therefore a security boundary: never replace it with an unscoped table
+    read, even though RLS also protects authenticated-user callers.
+    """
+    out: list[dict] = []
+    ids = _capture_sync_ids(capture_ids)
+    table = cfg.get("capture_reviews_table") or "capture_reviews"
+    for i in range(0, len(ids), chunk):
+        batch = ids[i:i + chunk]
+        encoded = ",".join(urllib.parse.quote(value, safe="") for value in batch)
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?capture_id=in.({encoded})"
+            "&select=capture_id,needs_attention,attention_reason,needs_review,"
+            "review_id,status,revision,updated_at"
+            "&order=capture_id.asc",
+        )
+        if isinstance(rows, list):
+            out.extend(row for row in rows if isinstance(row, dict)
+                       and row.get("capture_id") in batch)
+    return out
+
+
+def _capture_review_write_row(raw: dict) -> dict:
+    """Validate the complete service-authored capture-review projection."""
+    if not isinstance(raw, dict):
+        raise SyncError("capture review row must be an object")
+    normalized = _capture_sync_ids((raw.get("capture_id"),))
+    reason = raw.get("attention_reason")
+    review_id = raw.get("review_id")
+    status = raw.get("status")
+    if (not normalized or type(raw.get("needs_attention")) is not bool or
+            type(raw.get("needs_review")) is not bool or
+            not isinstance(reason, str) or len(reason) > 1000 or
+            not isinstance(review_id, str) or len(review_id) > 160 or
+            not isinstance(status, str) or len(status) > 40):
+        raise SyncError("capture review row is invalid")
+    needs_review = raw["needs_review"]
+    return {
+        "capture_id": normalized[0],
+        "needs_attention": raw["needs_attention"] or needs_review,
+        "attention_reason": reason,
+        "needs_review": needs_review,
+        "review_id": review_id,
+        "status": status,
+    }
+
+
+def write_capture_review(cfg: dict, row: dict,
+                         expected_revision: int | None) -> dict | None:
+    """Insert or compare-and-set one canonical desktop review row.
+
+    ``None`` is a benign race: another writer inserted the row or advanced its
+    revision after the caller read it.  The next sync re-reads and merges that
+    state instead of overwriting it.
+    """
+    desired = _capture_review_write_row(row)
+    capture_id = desired["capture_id"]
+    table = cfg.get("capture_reviews_table") or "capture_reviews"
+    selected = (
+        "capture_id,needs_attention,attention_reason,needs_review,review_id,"
+        "status,revision,updated_at"
+    )
+    if expected_revision is None:
+        path = f"{table}?on_conflict=capture_id&select={selected}"
+        prefer = "resolution=ignore-duplicates,return=representation"
+        response = _rest(cfg, "POST", path, [desired], prefer=prefer)
+    else:
+        if (isinstance(expected_revision, bool) or
+                not isinstance(expected_revision, int) or expected_revision < 1):
+            raise SyncError("capture review expected revision is invalid")
+        encoded = urllib.parse.quote(capture_id, safe="")
+        path = (f"{table}?capture_id=eq.{encoded}"
+                f"&revision=eq.{expected_revision}&select={selected}")
+        response = _rest(
+            cfg, "PATCH", path, desired,
+            prefer="return=representation",
+        )
+    if not isinstance(response, list) or not response:
+        return None
+    if len(response) != 1:
+        raise SyncError("capture review write returned multiple rows")
+    accepted = response[0]
+    if not isinstance(accepted, dict) or accepted.get("capture_id") != capture_id:
+        raise SyncError("capture review write returned an invalid row")
+    accepted_writable = _capture_review_write_row(accepted)
+    if accepted_writable != desired:
+        raise SyncError("capture review write returned different writable fields")
+    revision = accepted.get("revision")
+    updated_at = accepted.get("updated_at")
+    if (isinstance(revision, bool) or not isinstance(revision, int) or
+            revision != (1 if expected_revision is None else expected_revision + 1) or
+            not isinstance(updated_at, str) or not updated_at or
+            len(updated_at) > 80):
+        raise SyncError("capture review write did not advance a valid revision")
+    return accepted
 
 
 # --- desktop working stores (builds / ia_catalog / corrections) -------------------

@@ -152,6 +152,12 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             currentCoroutineContext().ensureActive()
             val outcome = EntryOperationLocks.withLock(dir.name) {
                 if (!dir.isDirectory) DirectoryOutcome()
+                else if (!cleanupCommittedThumbnailDeletes(dir)) {
+                    DirectoryOutcome(
+                        retry = true,
+                        lastError = "Waiting for interrupted photo deletion recovery",
+                    )
+                }
                 else processDirectory(
                     ctx,
                     dir,
@@ -169,8 +175,8 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         // Kept for the existing top-level warning; the authoritative details
         // now live beside each entry in processing.json.
         Prefs.setLastProcError(ctx, permanent ?: lastFailure)
-        // freshly processed entries may be ready to ship
-        UploadWorker.kick(ctx)
+        // Processing is local-only. Delivery starts only from the explicit
+        // capture-sync action; its bounded chain rechecks deferred entries.
         when {
             shouldRetryProcessingWork(
                 transient,

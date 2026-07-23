@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import copy
 import contextlib
 import functools
 import hashlib
@@ -1542,6 +1543,100 @@ def api_profile():
 REVIEWS_PATH = lib.OUTPUT_DIR / "reviews.json"
 _reviews_lock = threading.Lock()
 _REVIEW_KINDS = ("key", "row", "build")
+CAPTURE_PHONE_SYNC_STATE_PATH = lib.OUTPUT_DIR / "capture_phone_sync_state.json"
+_capture_phone_sync_state_lock = threading.Lock()
+
+
+def _capture_phone_sync_state() -> dict:
+    """Small local cursor store for safe capture metadata/review replication."""
+    with _capture_phone_sync_state_lock:
+        raw = lib.load_json(CAPTURE_PHONE_SYNC_STATE_PATH, {}) or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    published = raw.get("published_capture_ids")
+    shadows = raw.get("review_shadows")
+    pending = raw.get("pending_reviews")
+    lan_snapshots = raw.get("lan_snapshots")
+    lan_owner_id = str(raw.get("lan_owner_id") or "")
+    try:
+        lan_owner_id = str(uuid.UUID(lan_owner_id)) if lan_owner_id else ""
+    except (ValueError, AttributeError):
+        lan_owner_id = ""
+    return {
+        "version": 1,
+        "published_capture_ids": list(published)
+        if isinstance(published, list) else [],
+        "review_shadows": dict(shadows) if isinstance(shadows, dict) else {},
+        "pending_reviews": dict(pending) if isinstance(pending, dict) else {},
+        "lan_snapshots": dict(lan_snapshots)
+        if isinstance(lan_snapshots, dict) else {},
+        "lan_owner_id": lan_owner_id,
+    }
+
+
+def _update_capture_phone_sync_state(mutator) -> dict:
+    """Atomically merge one cursor mutation with concurrent LAN ingest."""
+    with _capture_phone_sync_state_lock:
+        raw = lib.load_json(CAPTURE_PHONE_SYNC_STATE_PATH, {}) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        state = {
+            "version": 1,
+            "published_capture_ids": list(raw.get("published_capture_ids"))
+            if isinstance(raw.get("published_capture_ids"), list) else [],
+            "review_shadows": dict(raw.get("review_shadows"))
+            if isinstance(raw.get("review_shadows"), dict) else {},
+            "pending_reviews": dict(raw.get("pending_reviews"))
+            if isinstance(raw.get("pending_reviews"), dict) else {},
+            "lan_snapshots": dict(raw.get("lan_snapshots"))
+            if isinstance(raw.get("lan_snapshots"), dict) else {},
+            "lan_owner_id": str(raw.get("lan_owner_id") or ""),
+        }
+        mutator(state)
+        state["version"] = 1
+        lib.save_json(CAPTURE_PHONE_SYNC_STATE_PATH, state)
+        return state
+
+
+def _ensure_open_review(kind: str, ref: str, label: str, reason: str,
+                        *, refresh_existing: bool) -> tuple[dict, bool]:
+    """Return the one open review, optionally refreshing UI-authored fields.
+
+    Phone/cloud merges use ``refresh_existing=False``: an existing desktop
+    reason, comments, label, and status are newer curated state and must remain
+    byte-for-byte intact.
+    """
+    if kind not in _REVIEW_KINDS or not ref:
+        raise ValueError("invalid review target")
+    key = f"{kind}:{ref}"
+    label = str(label or "").strip()[:120]
+    reason = str(reason or "").strip()[:500]
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {}) or {}
+        if not isinstance(reviews, dict):
+            reviews = {}
+        review = next((value for value in reviews.values()
+                       if isinstance(value, dict)
+                       and value.get("key") == key
+                       and value.get("status") == "open"), None)
+        created = review is None
+        if review is not None:
+            if refresh_existing:
+                review["label"] = label or review.get("label", "")
+                if reason:
+                    review["reason"] = reason
+                lib.save_json(REVIEWS_PATH, reviews)
+            return dict(review), False
+        rid = lib.gen_id(set(reviews))
+        review = reviews[rid] = {
+            "id": rid, "key": key, "kind": kind, "ref": ref,
+            "label": label, "reason": reason, "status": "open",
+            "created_by": _actor(), "created_at": now,
+            "resolved_by": "", "resolved_at": "", "comments": [],
+        }
+        lib.save_json(REVIEWS_PATH, reviews)
+        return dict(review), created
 
 
 @app.route("/api/reviews")
@@ -1558,34 +1653,15 @@ def api_reviews_create():
     ref = str(payload.get("ref") or "").strip()
     if kind not in _REVIEW_KINDS or not ref:
         abort(400)
-    key = f"{kind}:{ref}"
     label = str(payload.get("label") or "").strip()[:120]
     reason = str(payload.get("reason") or "").strip()[:500]
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def write_review():
-        created = False
-        with _reviews_lock:
-            reviews = lib.load_json(REVIEWS_PATH, {})
-            # one OPEN review per item -- flagging again refreshes label/reason
-            review = next((x for x in reviews.values()
-                           if x.get("key") == key and x.get("status") == "open"),
-                          None)
-            if review:
-                review["label"] = label or review.get("label", "")
-                if reason:
-                    review["reason"] = reason
-            else:
-                rid = lib.gen_id(set(reviews))
-                review = reviews[rid] = {
-                    "id": rid, "key": key, "kind": kind, "ref": ref,
-                    "label": label, "reason": reason, "status": "open",
-                    "created_by": _actor(), "created_at": now,
-                    "resolved_by": "", "resolved_at": "", "comments": [],
-                }
-                created = True
-            lib.save_json(REVIEWS_PATH, reviews)
-        return review, created
+        # Interactive desktop behavior intentionally refreshes an existing
+        # open review; replicated phone state uses the same helper with that
+        # refresh disabled.
+        return _ensure_open_review(
+            kind, ref, label, reason, refresh_existing=True)
 
     page_ref = _page_remark_ref_parts(ref) if kind == "key" else None
     if page_ref:
@@ -2067,6 +2143,14 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
         }
         builds[build["id"]] = build
         lib.save_json(BUILDS_PATH, builds)
+    try:
+        _apply_pending_capture_review(build)
+    except Exception as exc:
+        # The build itself is already durable.  Keep the pending cursor so the
+        # next sync/create retry can add the mark without damaging catalogue
+        # creation.
+        log.warning("could not carry phone review into build %s: %s",
+                    build["id"], exc)
     activity("created", "draft entry", detail=build.get("title", ""))
     return build, ""
 
@@ -8921,10 +9005,27 @@ def api_jobs():
                              "state": "running",
                              "done": int(d.get("bytes") or 0),
                              "total": int(d.get("total") or 0)})
-    with _cloudsync_lock:
-        if _cloudsync.get("running"):
-            rows.append({"kind": "cloudsync", "label": "Cloud sync",
-                         "state": "running"})
+    cloud = _cloudsync_snapshot()
+    if cloud.get("running"):
+        progress = cloud.get("progress") or {}
+        rows.append({
+            "id": cloud.get("run_id") or "",
+            "kind": "cloudsync",
+            "label": "Cloud sync",
+            "state": "running",
+            "created_at": cloud.get("started_at") or "",
+            "done": int(progress.get("completed") or 0),
+            "total": int(progress.get("total") or 0),
+            "note": cloud.get("stage_label") or "Cloud sync",
+            "stage": cloud.get("stage") or "",
+            "progress": progress,
+            "counts": {
+                "imported": int(progress.get("imported") or 0),
+                "skipped": int(progress.get("skipped") or 0),
+                "failed": int(progress.get("failed") or 0),
+            },
+            "events": cloud.get("events") or [],
+        })
     active = sum(1 for r in rows if r.get("state") in _JOB_ACTIVE)
     return jsonify({"ok": True, "jobs": rows, "active": active})
 
@@ -12193,7 +12294,11 @@ def _checked_diff(old, new, cap: int = 3):
 
 @app.route("/api/manual")
 def api_manual_list():
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    # Cloud capture ingest publishes one whole entry at a time. Pair the read
+    # with that writer's lock so a progress-event consumer can fetch the book
+    # named by the event immediately and always see a coherent durable row.
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
     out = sorted(entries.values(), key=lambda e: e.get("created_at", ""), reverse=True)
     return jsonify(out)
 
@@ -12296,6 +12401,19 @@ def api_manual_add():
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     activity("added", "manual entry", detail=entry.get("title", ""))
     return jsonify({"ok": True, "entry": entry})
+
+
+@app.route("/api/manual/<entry_id>")
+def api_manual_get(entry_id: str):
+    """Fetch one manual row for incremental capture-event consumption."""
+
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        entry = entries.get(entry_id)
+        if not isinstance(entry, dict):
+            abort(404)
+        out = copy.deepcopy(entry)
+    return jsonify({"ok": True, "entry": out})
 
 
 @app.route("/api/manual/<entry_id>", methods=["PATCH"])
@@ -14581,8 +14699,269 @@ def api_scans():
 
 CAPTURES_DIR = lib.DATA_ROOT / "captures"
 _cloudsync_lock = threading.Lock()
-_cloudsync = {"running": False, "last_run": "", "last_error": "", "last_result": None}
+_CLOUDSYNC_EVENT_KEEP = 128
+_cloudsync = {
+    "running": False,
+    "run_id": "",
+    "revision": 0,
+    "event_seq": 0,
+    "stage": "idle",
+    "stage_label": "Idle",
+    "started_at": "",
+    "updated_at": "",
+    "last_run": "",
+    "last_error": "",
+    "last_result": None,
+    "progress": {
+        "phase": "idle",
+        "completed": 0,
+        "total": 0,
+        "unit": "captures",
+        "indeterminate": False,
+        "capture_completed": 0,
+        "capture_total": 0,
+        "imported": 0,
+        "skipped": 0,
+        "failed": 0,
+        "current_capture": "",
+        "current_book": "",
+        "current_index": 0,
+        "photo_count": 0,
+    },
+    "events": [],
+}
 _autosync_last = 0.0
+
+
+def _cloudsync_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _cloudsync_changed_locked() -> None:
+    """Stamp one atomic live-state mutation.
+
+    ``revision`` is process-lifetime monotonic, so a polling client can detect
+    every state change even when multiple stages have the same counts.
+    """
+
+    _cloudsync["revision"] = int(_cloudsync.get("revision") or 0) + 1
+    _cloudsync["updated_at"] = _cloudsync_now()
+
+
+def _cloudsync_begin() -> str | None:
+    """Claim the single cloud-sync slot and initialize its public job state."""
+
+    with _cloudsync_lock:
+        if _cloudsync.get("running"):
+            return None
+        run_id = uuid.uuid4().hex
+        event_seq = int(_cloudsync.get("event_seq") or 0)
+        revision = int(_cloudsync.get("revision") or 0)
+        last_run = str(_cloudsync.get("last_run") or "")
+        _cloudsync.clear()
+        _cloudsync.update({
+            "running": True,
+            "run_id": run_id,
+            "revision": revision,
+            "event_seq": event_seq,
+            "stage": "starting",
+            "stage_label": "Starting cloud sync",
+            "started_at": _cloudsync_now(),
+            "updated_at": "",
+            "last_run": last_run,
+            "last_error": "",
+            "last_result": None,
+            "progress": {
+                "phase": "starting",
+                "completed": 0,
+                "total": 0,
+                "unit": "captures",
+                "indeterminate": True,
+                "capture_completed": 0,
+                "capture_total": 0,
+                "imported": 0,
+                "skipped": 0,
+                "failed": 0,
+                "current_capture": "",
+                "current_book": "",
+                "current_index": 0,
+                "photo_count": 0,
+            },
+            "events": [],
+        })
+        _cloudsync_changed_locked()
+        return run_id
+
+
+def _cloudsync_set_stage(stage: str, label: str, *,
+                         total: int | None = None,
+                         completed: int | None = None,
+                         unit: str | None = None,
+                         indeterminate: bool | None = None,
+                         current_capture: str | None = None,
+                         current_book: str | None = None,
+                         current_index: int | None = None,
+                         photo_count: int | None = None) -> None:
+    """Publish a stage/current-item transition as one coherent snapshot."""
+
+    with _cloudsync_lock:
+        if not _cloudsync.get("running"):
+            return
+        _cloudsync["stage"] = str(stage)
+        _cloudsync["stage_label"] = str(label)[:240]
+        progress = _cloudsync.setdefault("progress", {})
+        progress["phase"] = str(stage)
+        if total is not None:
+            progress["total"] = max(0, int(total))
+        if completed is not None:
+            progress["completed"] = max(0, int(completed))
+        if unit is not None:
+            progress["unit"] = str(unit)[:40]
+        if indeterminate is not None:
+            progress["indeterminate"] = bool(indeterminate)
+        if total is not None and progress.get("unit") == "captures":
+            progress["capture_total"] = max(0, int(total))
+        if current_capture is not None:
+            progress["current_capture"] = str(current_capture)[:64]
+        if current_book is not None:
+            progress["current_book"] = str(current_book)[:240]
+        if current_index is not None:
+            progress["current_index"] = max(0, int(current_index))
+        if photo_count is not None:
+            progress["photo_count"] = max(0, int(photo_count))
+        _cloudsync_changed_locked()
+
+
+def _cloudsync_append_event_locked(*, kind: str, status: str,
+                                   capture_id: str = "", book_id: str = "",
+                                   title: str = "", message: str = "",
+                                   details: list[str] | None = None) -> dict:
+    seq = int(_cloudsync.get("event_seq") or 0) + 1
+    _cloudsync["event_seq"] = seq
+    event = {
+        "seq": seq,
+        "kind": str(kind)[:40],
+        "status": str(status)[:40],
+        "capture_id": str(capture_id)[:64],
+        "book_id": str(book_id)[:64],
+        "title": str(title)[:240],
+        "message": str(message)[:500],
+        "at": _cloudsync_now(),
+    }
+    if details:
+        event["details"] = [str(value)[:500] for value in details[:20]]
+    events = _cloudsync.setdefault("events", [])
+    events.append(event)
+    del events[:-_CLOUDSYNC_EVENT_KEEP]
+    return event
+
+
+def _cloudsync_book_ready(import_result: dict) -> None:
+    """Publish an imported book only after its manual-entry save returned."""
+
+    with _cloudsync_lock:
+        if not _cloudsync.get("running"):
+            return
+        _cloudsync_append_event_locked(
+            kind="capture",
+            status="imported",
+            capture_id=import_result.get("capture_id", ""),
+            book_id=import_result.get("book_id", ""),
+            title=import_result.get("title", ""),
+            message=import_result.get("message") or "Book imported",
+            details=import_result.get("warnings") or None,
+        )
+        _cloudsync_changed_locked()
+
+
+def _cloudsync_item_completed(*, completed: int, imported: int, skipped: int,
+                              failed: int, event: dict | None = None) -> None:
+    """Commit one capture outcome and clear the in-flight identity."""
+
+    with _cloudsync_lock:
+        if not _cloudsync.get("running"):
+            return
+        progress = _cloudsync.setdefault("progress", {})
+        progress.update({
+            "completed": max(0, int(completed)),
+            "capture_completed": max(0, int(completed)),
+            "imported": max(0, int(imported)),
+            "skipped": max(0, int(skipped)),
+            "failed": max(0, int(failed)),
+            "current_capture": "",
+            "current_book": "",
+            "current_index": 0,
+            "photo_count": 0,
+            "unit": "captures",
+            "indeterminate": False,
+        })
+        if event:
+            _cloudsync_append_event_locked(**event)
+        _cloudsync_changed_locked()
+
+
+def _cloudsync_snapshot() -> dict:
+    """Return a detached, internally consistent public state snapshot."""
+
+    with _cloudsync_lock:
+        out = copy.deepcopy(_cloudsync)
+    progress = out.get("progress") or {}
+    if (progress.get("current_capture") or progress.get("current_book") or
+            progress.get("current_index")):
+        out["current"] = {
+            "index": int(progress.get("current_index") or 0),
+            "total": int(progress.get("total") or 0),
+            "capture_id": str(progress.get("current_capture") or ""),
+            "title": str(progress.get("current_book") or ""),
+            "photo_count": int(progress.get("photo_count") or 0),
+        }
+    else:
+        out["current"] = None
+    # Compatibility view for the first incremental desktop client. ``events``
+    # is canonical; both views share the same monotonic sequence.
+    out["recent_items"] = [{
+        "sequence": event.get("seq", 0),
+        "outcome": event.get("status", ""),
+        "capture_id": event.get("capture_id", ""),
+        "entry_id": event.get("book_id", ""),
+        "title": event.get("title", ""),
+        "detail": event.get("message", ""),
+        "errors": list(event.get("details") or []),
+        "completed_at": event.get("at", ""),
+    } for event in out.get("events") or []]
+    return out
+
+
+def _cloudsync_finish(run_id: str, result: dict) -> None:
+    """Publish a terminal snapshot without letting a stale worker overwrite it."""
+
+    with _cloudsync_lock:
+        if str(_cloudsync.get("run_id") or "") != str(run_id):
+            return
+        ok = bool(result.get("ok"))
+        errors = result.get("errors") or []
+        terminal = "complete" if ok else "failed"
+        label = "Cloud sync complete" if ok else "Cloud sync completed with errors"
+        _cloudsync["running"] = False
+        _cloudsync["stage"] = terminal
+        _cloudsync["stage_label"] = label
+        progress = _cloudsync.setdefault("progress", {})
+        progress["phase"] = terminal
+        progress["unit"] = "captures"
+        progress["indeterminate"] = False
+        progress["completed"] = int(progress.get("capture_completed") or 0)
+        progress["total"] = int(progress.get("capture_total") or 0)
+        progress["current_capture"] = ""
+        progress["current_book"] = ""
+        progress["current_index"] = 0
+        progress["photo_count"] = 0
+        _cloudsync["last_run"] = _cloudsync_now()
+        _cloudsync["last_result"] = copy.deepcopy(result)
+        _cloudsync["last_error"] = (
+            str(result.get("error") or "") or
+            "; ".join(str(value) for value in errors)
+        )[:4000]
+        _cloudsync_changed_locked()
 
 
 def _cloud_public_cfg() -> dict:
@@ -18405,6 +18784,7 @@ PHONE_INTERNAL_META_KEYS = frozenset({
 })
 PHONE_PHOTO_ASSETS_SCHEMA = "org.whl.bookcapture.photo-assets"
 PHONE_CAPTURE_NOTES_SCHEMA = "org.whl.bookcapture.capture-notes"
+PHONE_CAPTURE_REVIEW_SCHEMA = "org.whl.bookcapture.capture-review"
 PHONE_CAPTURE_NOTE_FIELDS = frozenset({
     "price", "pages", "condition", "illustrations", "remark",
 })
@@ -18606,6 +18986,49 @@ def _capture_notes(cap: dict) -> dict:
     return preserved
 
 
+def _capture_phone_review(cap: dict) -> dict:
+    """Validate the user-authored part of an Android LAN review snapshot.
+
+    Review ids/status are desktop-controlled and deliberately ignored.  An
+    advertised but malformed object is rejected so a paired phone never gets a
+    successful delivery receipt for state the desktop silently discarded.
+    """
+    supplied = "capture_review" in cap
+    payload = cap.get("capture_review")
+    if not supplied:
+        return {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError("capture review is not valid JSON") from exc
+    capture_id = str(cap.get("id") or "")
+    canonical_id = _canonical_capture_id(capture_id)
+    if (not isinstance(payload, dict) or
+            payload.get("schema") != PHONE_CAPTURE_REVIEW_SCHEMA or
+            type(payload.get("version")) is not int or payload.get("version") != 1 or
+            str(payload.get("capture_id") or "") != capture_id or
+            not canonical_id or
+            type(payload.get("needs_attention")) is not bool or
+            type(payload.get("needs_review")) is not bool or
+            not isinstance(payload.get("attention_reason"), str) or
+            len(payload["attention_reason"]) > 1000):
+        raise ValueError("invalid capture review snapshot")
+    revision = payload.get("revision", 0)
+    if (isinstance(revision, bool) or not isinstance(revision, int)
+            or revision < 0):
+        raise ValueError("invalid capture review revision")
+    needs_review = payload["needs_review"]
+    return {
+        "capture_id": canonical_id,
+        "revision": revision,
+        "updated_at": str(payload.get("updated_at") or "")[:80],
+        "needs_attention": payload["needs_attention"] or needs_review,
+        "attention_reason": payload["attention_reason"].strip()[:1000],
+        "needs_review": needs_review,
+    }
+
+
 def _capture_note_extra(notes: dict) -> dict:
     """Latest non-blank spoken value for each recognized catalogue fact."""
     extra = {}
@@ -18729,8 +19152,34 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
             "fields": fields, "extra": extra, "errors": errors}
 
 
+_CAPTURE_INGEST_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+def _capture_ingest_lock(capture_id: str) -> threading.Lock:
+    """Stable bounded lock stripe for one capture's local asset publication."""
+
+    digest = hashlib.sha256(capture_id.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:2], "big") % len(_CAPTURE_INGEST_LOCKS)
+    return _CAPTURE_INGEST_LOCKS[index]
+
+
 def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
-                   photo_paths: list | None = None):
+                   photo_paths: list | None = None, *,
+                   transport: str = "unknown"):
+    """Serialize one capture through duplicate check, assets, and row commit."""
+
+    cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
+    if not cap_id:
+        return None, None
+    with _capture_ingest_lock(cap_id):
+        return _ingest_capture_locked(
+            cap, raw_photos, mistral_key, photo_paths, transport=transport)
+
+
+def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
+                           mistral_key: str,
+                           photo_paths: list | None = None, *,
+                           transport: str = "unknown"):
     """Raw photo bytes + a capture dict -> a manual entry, with NO cloud
     involved. Shared by the cloud sync (photos downloaded first) and the LAN
     endpoint (photos arrive in the request). Prefers the phone's OCR/fields (via
@@ -18739,10 +19188,26 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
     cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
     if not cap_id:
         return None, None
+    phone_review = _capture_phone_review(cap)
+    duplicate = None
     with _manual_lock:
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        if any(e.get("capture_id") == cap_id for e in entries.values()):
-            return None, None                     # already here: idempotent
+        duplicate = next((
+            (str(entry_id), entry) for entry_id, entry in entries.items()
+            if isinstance(entry, dict) and entry.get("capture_id") == cap_id
+        ), None)
+    if duplicate is not None:
+        if phone_review:
+            entry_id, entry = duplicate
+            target = {
+                "kind": "row", "id": entry_id, "record": entry,
+                "title": str(entry.get("title") or "phone capture"),
+                "updated_at": str(entry.get("updated_at") or
+                                  entry.get("created_at") or ""),
+            }
+            _merge_phone_review_into_target(target, phone_review)
+            _remember_pending_capture_review(phone_review)
+        return None, None                         # already here: idempotent
     photo_contract = _capture_photo_assets(cap)
     transported_assets = (_transported_original_assets(
         photo_contract, raw_photos, photo_paths or []) if photo_contract else [])
@@ -18824,9 +19289,27 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
     entry["extra"] = _clean_extra({**capture_extra, **provenance})
     entry["images"] = images
     entry["capture_id"] = cap_id
+    entry["capture_transport"] = transport \
+        if transport in ("cloud", "lan") else "unknown"
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     entry["checks"] = _entry_checks(entry)
     with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        # Cloud and paired-LAN delivery can race after both initial duplicate
+        # checks complete but while either side is doing expensive photo work.
+        # Recheck at the commit boundary so one capture can never publish two
+        # manual books.
+        duplicate = next((
+            (str(entry_id), existing)
+            for entry_id, existing in entries.items()
+            if (isinstance(existing, dict) and
+                existing.get("capture_id") == cap_id)
+        ), None)
+        if duplicate is not None:
+            duplicate_id, duplicate_entry = duplicate
+        else:
+            duplicate_id = ""
+            duplicate_entry = None
         # Close the ingest/merge interleaving: a merge alias can be committed
         # while photo processing is in flight, after the first resolution
         # above but before this entry exists for the merge repoint walk.
@@ -18835,41 +19318,121 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
             entry["extra"] = dict(extra, scan_collection_id=
                                   _resolve_collection_alias(
                                       str(extra["scan_collection_id"])))
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        entry["id"] = lib.gen_id(set(entries))
-        entries[entry["id"]] = entry
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        if duplicate_entry is None:
+            entry["id"] = lib.gen_id(set(entries))
+            entries[entry["id"]] = entry
+            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+
+    if duplicate_entry is not None:
+        if phone_review:
+            target = {
+                "kind": "row", "id": duplicate_id, "record": duplicate_entry,
+                "title": str(duplicate_entry.get("title") or "phone capture"),
+                "updated_at": str(duplicate_entry.get("updated_at") or
+                                  duplicate_entry.get("created_at") or ""),
+            }
+            _merge_phone_review_into_target(target, phone_review)
+            _remember_pending_capture_review(phone_review)
+        return None, None
 
     # a phone capture is attributed to whoever photographed it (the signed-in
     # contributor), not to whoever ran the sync; device name is the fallback
     actor = str(cap.get("contributor") or cap.get("device") or "phone")[:60]
     activity("captured", "book", actor=actor, detail=entry.get("title", ""))
+    if phone_review:
+        target = {
+            "kind": "row", "id": str(entry["id"]), "record": entry,
+            "title": str(entry.get("title") or "phone capture"),
+            "updated_at": str(entry.get("created_at") or ""),
+        }
+        _merge_phone_review_into_target(target, phone_review)
+        _remember_pending_capture_review(phone_review)
     return entry["id"], result["errors"]
 
 
+def _cloud_capture_photo_paths(cap: dict) -> list:
+    value = cap.get("photos") or []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = []
+    return list(value) if isinstance(value, list) else []
+
+
+def _cloud_capture_title(cap: dict) -> str:
+    """Best available pre-import book label, bounded for live job display."""
+
+    meta = cap.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            meta = {}
+    candidates = [cap]
+    if isinstance(meta, dict):
+        candidates.append(meta)
+        if isinstance(meta.get("fields"), dict):
+            candidates.append(meta["fields"])
+    for source in candidates:
+        title = str(source.get("title") or "").strip()
+        if title:
+            return title[:240]
+    capture_id = _clean_capture_id(cap.get("id"))
+    return f"Capture {capture_id[:8]}" if capture_id else "Phone capture"
+
+
+def _manual_capture_identity(capture_id: str) -> tuple[str, str]:
+    """Return the durable local entry id/title for one capture, if present."""
+
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        for entry_id, entry in entries.items():
+            if (isinstance(entry, dict) and
+                    str(entry.get("capture_id") or "") == capture_id):
+                return str(entry_id), str(
+                    entry.get("title") or f"Capture {capture_id[:8]}"
+                )[:240]
+    return "", ""
+
+
 def _import_capture(cfg: dict, cap: dict, mistral_key: str,
-                    delete_remote: bool) -> str:
-    """One pending CLOUD capture -> a manual entry. Returns 'imported'|'skipped'."""
+                    delete_remote: bool, on_persisted=None) -> dict:
+    """Import one pending cloud capture and return its detailed outcome.
+
+    ``on_persisted`` runs after the manual entry is durably saved but before
+    remote acknowledgement/cleanup. Live status can therefore expose each book
+    without waiting for the rest of a batch.
+    """
     cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
     if not cap_id:
-        return "skipped"
-    photo_paths = cap.get("photos") or []
-    if isinstance(photo_paths, str):
+        return {
+            "status": "skipped", "capture_id": "", "book_id": "",
+            "title": "Phone capture", "message": "Invalid capture id",
+            "warnings": [],
+        }
+    photo_paths = _cloud_capture_photo_paths(cap)
+    book_id, title = _manual_capture_identity(cap_id)
+    if book_id:
+        result = {
+            "status": "skipped", "capture_id": cap_id, "book_id": book_id,
+            "title": title, "message": "Already present on this desktop",
+            "warnings": [],
+        }
         try:
-            photo_paths = json.loads(photo_paths)
-        except json.JSONDecodeError:
-            photo_paths = []
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        dup = any(e.get("capture_id") == cap_id for e in entries.values())
-    if dup:
-        sbase.mark_capture(cfg, cap["id"], "imported")   # already here: idempotent
+            # Idempotently repair a lost acknowledgement from an earlier run.
+            sbase.mark_capture(cfg, cap["id"], "imported")
+        except Exception as exc:
+            result["sync_error"] = (
+                f"cloud acknowledgement failed: {type(exc).__name__}: {exc}"
+            )[:500]
+            return result
         if delete_remote:                                # a lost mark left these behind
             try:
                 sbase.delete_photos(cfg, photo_paths)
             except sbase.SyncError:
                 pass
-        return "skipped"
+        return result
     try:
         raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
     except sbase.SyncError as exc:
@@ -18877,17 +19440,47 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
             # the photos are gone — this row can never import; stop retrying it
             sbase.mark_capture(cfg, cap["id"], "error")
         raise
-    new_id, errors = ingest_capture(cap, raw_photos, mistral_key, photo_paths)
+    new_id, errors = ingest_capture(
+        cap, raw_photos, mistral_key, photo_paths, transport="cloud")
 
-    sbase.mark_capture(cfg, cap["id"], "imported")
+    # A concurrent/idempotent ingest may have won between the first duplicate
+    # check and the save. Resolve the durable identity either way.
+    book_id, title = _manual_capture_identity(cap_id)
+    warnings = [str(error)[:500] for error in (errors or [])[:20]]
+    result = {
+        "status": "imported" if new_id else "skipped",
+        "capture_id": cap_id,
+        "book_id": str(new_id or book_id),
+        "title": title or _cloud_capture_title(cap),
+        "message": (
+            f"Imported with {len(warnings)} processing warning(s)"
+            if new_id and warnings else
+            "Book imported" if new_id else
+            "Already present on this desktop"
+        ),
+        "warnings": warnings,
+    }
+    if new_id and on_persisted is not None:
+        on_persisted(dict(result))
+    try:
+        sbase.mark_capture(cfg, cap["id"], "imported")
+    except Exception as exc:
+        # The local book is already durable and must remain visible. Leave the
+        # remote row pending for a later idempotent acknowledgement repair.
+        result["sync_error"] = (
+            f"cloud acknowledgement failed: {type(exc).__name__}: {exc}"
+        )[:500]
+        return result
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
     if delete_remote and not errors:
         try:
             sbase.delete_photos(cfg, photo_paths)
-        except sbase.SyncError:
-            pass                                   # cleanup is best-effort
-    return "imported" if new_id else "skipped"
+        except sbase.SyncError as exc:
+            result["warnings"].append(
+                f"remote photo cleanup deferred: {type(exc).__name__}: {exc}"
+            )
+    return result
 
 
 def _books_mirror_rows() -> list[dict]:
@@ -18912,6 +19505,1043 @@ def _books_mirror_rows() -> list[dict]:
     return rows
 
 
+def _canonical_capture_id(value) -> str:
+    try:
+        return str(uuid.UUID(str(value or "").strip()))
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _capture_targets(builds: dict, manual_entries: dict) -> dict[str, dict]:
+    """Choose the desktop item currently representing each phone capture.
+
+    A registered build wins over its source manual row.  Duplicate builds use
+    the same newest-updated deterministic rule as the phone metadata snapshot.
+    """
+    targets: dict[str, dict] = {}
+    for entry_id, entry in sorted((manual_entries or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        capture_id = _canonical_capture_id(entry.get("capture_id"))
+        if not capture_id:
+            continue
+        current = targets.get(capture_id)
+        candidate = {
+            "kind": "row", "id": str(entry_id), "record": entry,
+            "title": str(entry.get("title") or "phone capture"),
+            "updated_at": str(entry.get("updated_at") or
+                              entry.get("created_at") or ""),
+        }
+        if current is None or (candidate["updated_at"], candidate["id"]) > \
+                (current["updated_at"], current["id"]):
+            targets[capture_id] = candidate
+    for build_id, build in sorted((builds or {}).items()):
+        if not isinstance(build, dict):
+            continue
+        capture_id = _canonical_capture_id(build.get("capture_id"))
+        if not capture_id:
+            continue
+        current = targets.get(capture_id)
+        candidate = {
+            "kind": "build", "id": str(build_id), "record": build,
+            "title": str(build.get("title") or "phone capture"),
+            "updated_at": str(build.get("updated_at") or ""),
+        }
+        if (current is None or current["kind"] != "build" or
+                (candidate["updated_at"], candidate["id"]) >
+                (current["updated_at"], current["id"])):
+            targets[capture_id] = candidate
+    return targets
+
+
+def _current_capture_targets() -> dict[str, dict]:
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {}) or {}
+    with _manual_lock:
+        manual_entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    return _capture_targets(builds, manual_entries)
+
+
+def _target_open_review(target: dict) -> dict | None:
+    key = f"{target['kind']}:{target['id']}"
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {}) or {}
+    if not isinstance(reviews, dict):
+        return None
+    value = next((review for review in reviews.values()
+                  if isinstance(review, dict)
+                  and review.get("key") == key
+                  and review.get("status") == "open"), None)
+    return dict(value) if value is not None else None
+
+
+def _combine_review_reasons(desktop_reason: str, phone_reason: str) -> str:
+    """Preserve simultaneous desktop/phone reasons without duplicate growth.
+
+    The shared database column is capped at 1000 characters.  Refuse an
+    unrepresentable merge instead of silently truncating either person's note.
+    """
+    desktop_reason = str(desktop_reason or "").strip()
+    phone_reason = str(phone_reason or "").strip()
+    if not desktop_reason:
+        return phone_reason
+    if not phone_reason or phone_reason == desktop_reason:
+        return desktop_reason
+    phone_line = f"Phone: {phone_reason}"
+    if phone_line in desktop_reason.splitlines():
+        return desktop_reason
+    prefix = desktop_reason if desktop_reason.startswith("Desktop: ") \
+        else f"Desktop: {desktop_reason}"
+    combined = f"{prefix}\n{phone_line}"
+    if len(combined) > 1000:
+        raise ValueError("combined desktop and phone review reasons exceed 1000 characters")
+    return combined
+
+
+def _attention_merge(current: str, incoming: dict,
+                     desktop_reason: str = "") -> str:
+    """Add phone attention without ever clearing curated desktop text."""
+    current = str(current or "").strip()
+    if not (incoming.get("needs_attention") or incoming.get("needs_review")):
+        return current
+    phone_reason = str(incoming.get("attention_reason") or "").strip()[:1000]
+    curated_reason = str(desktop_reason or "").strip()[:1000]
+    base = curated_reason or ("" if current == "1" else current)
+    return _combine_review_reasons(base, phone_reason) or "1"
+
+
+def _set_target_attention(target: dict, incoming: dict,
+                          desktop_reason: str) -> None:
+    if target["kind"] == "row":
+        with _manual_lock:
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+            entry = entries.get(target["id"])
+            if not isinstance(entry, dict):
+                raise KeyError(f"manual entry {target['id']} is no longer available")
+            current = str(entry.get("attention") or "").strip()
+            desired = _attention_merge(current, incoming, desktop_reason)
+            if desired != current:
+                entry["attention"] = desired
+                lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        return
+
+    operation_digest = hashlib.sha256(json.dumps({
+        "target": f"{target['kind']}:{target['id']}",
+        "capture_id": incoming.get("capture_id"),
+        "revision": incoming.get("revision", 0),
+        "needs_attention": incoming.get("needs_attention"),
+        "attention_reason": incoming.get("attention_reason"),
+        "needs_review": incoming.get("needs_review"),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+    for attempt in range(2):
+        item = _item_engine().get_item(target["id"])
+        current = str(item.metadata.get("attention") or "").strip()
+        desired = _attention_merge(current, incoming, desktop_reason)
+        if desired == current:
+            return
+        operation_id = (
+            f"capture-review-{incoming['capture_id'].replace('-', '')}-"
+            f"{operation_digest}-r{attempt}"
+        )
+        try:
+            _item_command_engine().update(UpdateItemCommand(
+                item_id=target["id"],
+                expected_revision=item.record_revision,
+                patch=ItemPatch(metadata_set={"attention": desired}),
+                operation_id=operation_id,
+            ))
+            return
+        except EngineConflictError:
+            if attempt:
+                raise
+
+
+def _target_review_state(target: dict) -> dict:
+    if target["kind"] == "build":
+        item = _item_engine().get_item(target["id"])
+        attention = str(item.metadata.get("attention") or "").strip()
+        title = item.title or target.get("title") or "phone capture"
+    else:
+        with _manual_lock:
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+            entry = entries.get(target["id"])
+            if not isinstance(entry, dict):
+                raise KeyError(f"manual entry {target['id']} is no longer available")
+            attention = str(entry.get("attention") or "").strip()
+            title = str(entry.get("title") or target.get("title") or "phone capture")
+    open_review = _target_open_review(target)
+    review_reason = str((open_review or {}).get("reason") or "").strip()
+    reason = ("" if attention == "1" else attention) or review_reason
+    needs_review = open_review is not None
+    return {
+        "needs_attention": bool(attention) or needs_review,
+        "attention_reason": reason[:1000],
+        "needs_review": needs_review,
+        "review_id": str((open_review or {}).get("id") or "")[:160],
+        "status": str((open_review or {}).get("status") or "")[:40],
+        "title": title,
+    }
+
+
+def _merge_phone_review_into_target(target: dict, incoming: dict) -> dict:
+    """Persist an additive phone edit, then return authoritative local state."""
+    before = _target_review_state(target)
+    _set_target_attention(target, incoming, before["attention_reason"])
+    if incoming.get("needs_review") and not before["needs_review"]:
+        reason = before["attention_reason"] or incoming.get("attention_reason") or ""
+        _ensure_open_review(
+            target["kind"], target["id"], before["title"], str(reason),
+            refresh_existing=False,
+        )
+    return _target_review_state(target)
+
+
+def _capture_review_row(raw: dict) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    capture_id = _canonical_capture_id(raw.get("capture_id"))
+    revision = raw.get("revision")
+    reason = raw.get("attention_reason")
+    review_id = raw.get("review_id")
+    status = raw.get("status")
+    updated_at = raw.get("updated_at")
+    if (not capture_id or isinstance(revision, bool) or
+            not isinstance(revision, int) or revision < 1 or
+            type(raw.get("needs_attention")) is not bool or
+            type(raw.get("needs_review")) is not bool or
+            not isinstance(reason, str) or len(reason) > 1000 or
+            not isinstance(review_id, str) or len(review_id) > 160 or
+            not isinstance(status, str) or len(status) > 40 or
+            not isinstance(updated_at, str) or not updated_at or
+            len(updated_at) > 80):
+        return None
+    needs_review = raw["needs_review"]
+    return {
+        "capture_id": capture_id,
+        "revision": revision,
+        "updated_at": updated_at,
+        "needs_attention": raw["needs_attention"] or needs_review,
+        "attention_reason": reason,
+        "needs_review": needs_review,
+        "review_id": review_id,
+        "status": status,
+    }
+
+
+def _review_writable(value: dict) -> tuple:
+    return (
+        bool(value.get("needs_attention") or value.get("needs_review")),
+        str(value.get("attention_reason") or ""),
+        bool(value.get("needs_review")),
+        str(value.get("review_id") or ""),
+        str(value.get("status") or ""),
+    )
+
+
+def _review_shadow(capture_id: str, row: dict, target_key: str) -> None:
+    shadow = dict(row)
+    shadow["target_key"] = target_key
+
+    def update(state):
+        state["review_shadows"][capture_id] = shadow
+
+    _update_capture_phone_sync_state(update)
+
+
+def _canonical_review_write(capture_id: str, state: dict) -> dict:
+    return {
+        "capture_id": capture_id,
+        "needs_attention": bool(state.get("needs_attention") or
+                                state.get("needs_review")),
+        "attention_reason": str(state.get("attention_reason") or "")[:1000],
+        "needs_review": bool(state.get("needs_review")),
+        "review_id": str(state.get("review_id") or "")[:160],
+        "status": str(state.get("status") or "")[:40],
+    }
+
+
+def _remember_pending_capture_review(incoming: dict) -> None:
+    if not (incoming.get("needs_attention") or incoming.get("needs_review")):
+        return
+    capture_id = _canonical_capture_id(incoming.get("capture_id"))
+    if not capture_id:
+        return
+    pending = {
+        "capture_id": capture_id,
+        "revision": int(incoming.get("revision") or 0),
+        "updated_at": str(incoming.get("updated_at") or "")[:80],
+        "needs_attention": bool(incoming.get("needs_attention") or
+                                incoming.get("needs_review")),
+        "attention_reason": str(incoming.get("attention_reason") or "")[:1000],
+        "needs_review": bool(incoming.get("needs_review")),
+    }
+
+    def update(state):
+        state["pending_reviews"][capture_id] = pending
+
+    _update_capture_phone_sync_state(update)
+
+
+def _apply_pending_capture_review(build: dict) -> None:
+    """Carry an unregistered manual-row phone mark into its new build."""
+    capture_id = _canonical_capture_id(build.get("capture_id"))
+    if not capture_id:
+        return
+    pending = _capture_phone_sync_state()["pending_reviews"].get(capture_id)
+    if not isinstance(pending, dict):
+        return
+    target = {
+        "kind": "build",
+        "id": str(build.get("id") or ""),
+        "record": build,
+        "title": str(build.get("title") or "phone capture"),
+        "updated_at": str(build.get("updated_at") or ""),
+    }
+    if not target["id"]:
+        return
+    _merge_phone_review_into_target(target, pending)
+
+    def update(state):
+        if state["pending_reviews"].get(capture_id) == pending:
+            state["pending_reviews"].pop(capture_id, None)
+
+    _update_capture_phone_sync_state(update)
+
+
+def _capture_roundtrip_configs(owner_cfg: dict, capture_cfg: dict) -> tuple[dict, dict]:
+    """Require separate service-write and user/RLS scope credentials."""
+    if not isinstance(owner_cfg, dict) or not isinstance(capture_cfg, dict):
+        raise ValueError("capture roundtrip requires owner and signed-in user credentials")
+    owner_url = str(owner_cfg.get("url") or "").strip().rstrip("/").lower()
+    capture_url = str(capture_cfg.get("url") or "").strip().rstrip("/").lower()
+    if not owner_url or owner_url != capture_url:
+        raise ValueError("capture roundtrip credentials target different projects")
+    if not str(capture_cfg.get("access_token") or "").strip():
+        raise ValueError("capture roundtrip scope requires a signed-in user token")
+    return owner_cfg, capture_cfg
+
+
+def _sync_capture_reviews(owner_cfg: dict, capture_cfg: dict) -> dict:
+    """Merge phone review rows into desktop targets, acknowledging last."""
+    owner_cfg, capture_cfg = _capture_roundtrip_configs(owner_cfg, capture_cfg)
+    targets = _current_capture_targets()
+    result = {"read": 0, "merged": 0, "pushed": 0,
+              "conflicts": 0, "errors": []}
+    if not targets:
+        return result
+    try:
+        cloud_ids = set(sbase.list_capture_ids(capture_cfg, targets))
+        targets = {capture_id: target for capture_id, target in targets.items()
+                   if capture_id in cloud_ids}
+        if not targets:
+            return result
+        # The user JWT established this exact capture-id scope through the
+        # grant-aware captures policy. Review/metadata rows themselves are
+        # owner-only, so a curator ingesting a contributor-granted capture
+        # needs the service credential for the scoped read.
+        raw_rows = sbase.list_capture_reviews(owner_cfg, targets)
+    except Exception as exc:
+        result["errors"].append(f"capture reviews read: {exc}")
+        return result
+    rows = {}
+    for raw in raw_rows:
+        row = _capture_review_row(raw)
+        if row is None or row["capture_id"] not in targets:
+            result["errors"].append("capture reviews read: invalid row ignored")
+            continue
+        rows[row["capture_id"]] = row
+    result["read"] = len(rows)
+    shadows = _capture_phone_sync_state()["review_shadows"]
+    for capture_id, target in targets.items():
+        target_key = f"{target['kind']}:{target['id']}"
+        cloud = rows.get(capture_id)
+        shadow = shadows.get(capture_id)
+        try:
+            if cloud is not None and isinstance(shadow, dict):
+                shadow_revision = shadow.get("revision")
+                if isinstance(shadow_revision, int) and cloud["revision"] < shadow_revision:
+                    # A deleted/recreated row has a fresh revision stream. Use
+                    # the actual row as the new baseline so desktop state is
+                    # either merged/CAS-written or explicitly conflicts; never
+                    # strand a pending difference behind a successful no-op.
+                    shadow = None
+                elif (cloud["revision"] == shadow_revision and
+                        _review_writable(cloud) != _review_writable(shadow)):
+                    raise ValueError("same capture review revision has conflicting data")
+            phone_changed = cloud is not None and (
+                not isinstance(shadow, dict) or
+                cloud["revision"] > int(shadow.get("revision") or 0) or
+                shadow.get("target_key") != target_key
+            )
+            if phone_changed:
+                _merge_phone_review_into_target(target, cloud)
+                if target["kind"] == "row":
+                    _remember_pending_capture_review(cloud)
+                result["merged"] += 1
+            local = _target_review_state(target)
+            desired = _canonical_review_write(capture_id, local)
+            if cloud is None:
+                if not (desired["needs_attention"] or desired["needs_review"]):
+                    continue
+                accepted_raw = sbase.write_capture_review(owner_cfg, desired, None)
+            elif _review_writable(desired) == _review_writable(cloud):
+                _review_shadow(capture_id, cloud, target_key)
+                continue
+            else:
+                accepted_raw = sbase.write_capture_review(
+                    owner_cfg, desired, cloud["revision"])
+            accepted = _capture_review_row(accepted_raw) \
+                if accepted_raw is not None else None
+            if accepted is None:
+                result["conflicts"] += 1
+                continue
+            _review_shadow(capture_id, accepted, target_key)
+            result["pushed"] += 1
+        except Exception as exc:
+            result["errors"].append(f"capture {capture_id[:8]} review: {exc}")
+    return result
+
+
+def _capture_availability(state: str = "unknown", *, url: str = "",
+                          identifier: str = "", detail: str = "") -> dict:
+    state = state if state in ("available", "unavailable", "unknown") else "unknown"
+    return {"state": state, "url": str(url or "")[:2048],
+            "identifier": str(identifier or "")[:300],
+            "detail": str(detail or "")[:1000]}
+
+
+def _capture_source_availability(source: dict | None, name: str) -> dict:
+    source = source if isinstance(source, dict) else {}
+    verify = source.get("verify") if isinstance(source.get("verify"), dict) else {}
+    manual_urls = source.get("manual_urls") \
+        if isinstance(source.get("manual_urls"), dict) else {}
+    if name == "whl":
+        checks_row = source.get("checks") if isinstance(source.get("checks"), dict) else {}
+        value = str(checks_row.get("in_whl") or "unknown")
+        match = checks_row.get("whl_match") \
+            if isinstance(checks_row.get("whl_match"), dict) else {}
+        rejected = (value in ("yes", "draft") and
+                    verify.get("whl") == "rejected")
+        manual = str(manual_urls.get("whl") or "")
+        return _capture_availability(
+            "available" if (value == "yes" and not rejected) or manual
+            else "unavailable" if rejected or value == "no" else "unknown",
+            url=manual or match.get("permalink") or "",
+            detail="manual" if rejected and manual else
+            "rejected" if rejected else "draft" if value == "draft" else value,
+        )
+    scans = source.get("scans") if isinstance(source.get("scans"), dict) else {}
+    scan = scans.get("internet_archive") \
+        if isinstance(scans.get("internet_archive"), dict) else {}
+    best = scan.get("best_match") if isinstance(scan.get("best_match"), dict) else {}
+    available = scan.get("available")
+    manual = str(manual_urls.get("internet_archive") or "")
+    rejected = available is True and verify.get("internet_archive") == "rejected"
+    if rejected:
+        available = True if manual else False
+    state = "available" if available is True \
+        else "unavailable" if available is False else "unknown"
+    return _capture_availability(
+        state,
+        url=(manual or best.get("url") or best.get("record_url") or
+             scan.get("search_url") or ""),
+        identifier=(best.get("identifier") or best.get("id") or ""),
+        detail=("manual" if rejected and manual else
+                "rejected" if rejected else
+                "full view" if scan.get("full_view") else
+                "borrow only" if scan.get("no_download") else
+                str(scan.get("note") or "")),
+    )
+
+
+def _capture_scan_status(source: dict | None) -> str:
+    """The Catalogs table's SCAN/UPLOAD/approved decision, compactly."""
+    source = source if isinstance(source, dict) else {}
+    if source.get("local_pdf"):
+        return "approved"
+    checks_row = source.get("checks") if isinstance(source.get("checks"), dict) else {}
+    whl = str(checks_row.get("in_whl") or "unknown")
+    verify = source.get("verify") if isinstance(source.get("verify"), dict) else {}
+    manual_urls = source.get("manual_urls") \
+        if isinstance(source.get("manual_urls"), dict) else {}
+    whl_rejected = (whl in ("yes", "draft") and
+                    verify.get("whl") == "rejected" and
+                    not manual_urls.get("whl"))
+    if whl in ("yes", "draft") and not whl_rejected:
+        return "none"
+    whl_absent = whl == "no" or whl_rejected
+    scans = source.get("scans") if isinstance(source.get("scans"), dict) else None
+    if scans is None:
+        return "unknown"
+
+    def effective(name: str):
+        value = scans.get(name)
+        if not isinstance(value, dict):
+            return None
+        available = value.get("available")
+        if available is True and verify.get(name) == "rejected":
+            return True if manual_urls.get(name) else False
+        return available
+
+    found = [name for name in ("internet_archive", "hathitrust")
+             if effective(name) is True]
+    if found:
+        approved = any(verify.get(name) == "approved"
+                       or (verify.get(name) == "rejected" and manual_urls.get(name))
+                       for name in found)
+        return "approved" if approved else "upload"
+    copyright_status = str(checks_row.get("copyright_status") or "")
+    if (whl_absent and copyright_status.startswith("Public domain")
+            and effective("internet_archive") is False
+            and effective("hathitrust") is not True):
+        return "scan"
+    return "unknown"
+
+
+def _capture_registration_prefixes(book: dict,
+                                   source: dict | None) -> set[str]:
+    def norm(value):
+        return " ".join(str(value or "").lower().split())
+
+    candidates = [(book.get("title"), book.get("authors") or book.get("author"),
+                   book.get("year"))]
+    if isinstance(source, dict):
+        candidates.append((source.get("title"), source.get("author"), source.get("year")))
+    return {
+        f"registration-v{_REG_CACHE_VERSION}|{norm(title)}|{norm(author)}|{norm(year)}|"
+        for title, author, year in candidates if str(title or "").strip()
+    }
+
+
+def _capture_registration_evidence_stamp(
+        book: dict, source: dict | None, registration_cache: dict) -> str:
+    """Newest matching cache observation, independent of book edit times."""
+    if not isinstance(registration_cache, dict):
+        return ""
+    prefixes = _capture_registration_prefixes(book, source)
+    return _capture_latest_projection_stamp(*(
+        _capture_cache_projection_stamp(wrapper.get("cached_at"))
+        for key, wrapper in registration_cache.items()
+        if any(str(key).startswith(prefix) for prefix in prefixes)
+        and isinstance(wrapper, dict)
+        and isinstance(wrapper.get("result"), dict)
+    ))
+
+
+def _capture_registration_records(book: dict, source: dict | None,
+                                  registration_cache: dict) -> list[dict]:
+    prefixes = _capture_registration_prefixes(book, source)
+    out = []
+    seen = set()
+    if not isinstance(registration_cache, dict):
+        return []
+    for key, wrapper in registration_cache.items():
+        if not any(str(key).startswith(prefix) for prefix in prefixes):
+            continue
+        result = wrapper.get("result") if isinstance(wrapper, dict) else None
+        if not isinstance(result, dict) or result.get("found") is not True:
+            continue
+        match = result.get("match")
+        if not isinstance(match, dict):
+            continue
+        sources = result.get("sources")
+        if isinstance(sources, str):
+            source_names = sources
+        elif isinstance(sources, (list, tuple)):
+            source_names = ",".join(
+                str(value) for value in sources
+                if isinstance(value, (str, int, float)) and not isinstance(value, bool)
+            )
+        else:
+            source_names = ""
+        record = {
+            "number": str(match.get("reg_number") or "")[:160],
+            "date": str(match.get("date") or match.get("year") or "")[:80],
+            "source": str(match.get("source") or
+                          source_names)[:80],
+            "title": str(match.get("title") or "")[:300],
+            "author": str(match.get("author") or "")[:300],
+            "record_id": str(match.get("record_id") or "")[:200],
+        }
+        marker = json.dumps(record, sort_keys=True, ensure_ascii=False)
+        if marker not in seen:
+            seen.add(marker)
+            out.append(record)
+    return out[:25]
+
+
+def _capture_renewal_record(renewal_id: str, value: dict) -> dict:
+    """Bound the tooltip projection instead of forwarding cache internals."""
+    limits = {
+        "id": 160,
+        "renewal_year": 80,
+        "renewal_date": 80,
+        "registration_date": 80,
+        "registration_number": 160,
+    }
+    out = {key: str(value.get(key) or "")[:limit]
+           for key, limit in limits.items()}
+    out["renewal_id"] = renewal_id[:160]
+    return out
+
+
+def _capture_remarks(build: dict, source: dict | None) -> list[str]:
+    values = [build.get("notes")]
+    if isinstance(source, dict):
+        values.append(source.get("notes"))
+        extra = source.get("extra") if isinstance(source.get("extra"), dict) else {}
+        values.extend((extra.get("remark"), extra.get("remarks")))
+    out = []
+    for value in values:
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            text = str(item or "").strip()[:500]
+            if text and text not in out:
+                out.append(text)
+    return out[:25]
+
+
+def _capture_projection_stamp(value) -> str:
+    """Canonical UTC source time for projection freshness comparisons."""
+    raw = str(value or "").strip()[:80]
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _capture_latest_projection_stamp(*values) -> str:
+    stamps = [_capture_projection_stamp(value) for value in values]
+    return max((value for value in stamps if value), default="")
+
+
+def _capture_next_projection_stamp(*values) -> str:
+    """Return a wall-clock stamp strictly after every supplied component."""
+    latest = _capture_latest_projection_stamp(*values)
+    floor = (datetime.fromisoformat(latest) + timedelta(microseconds=1)
+             if latest else datetime.min.replace(tzinfo=timezone.utc))
+    return max(datetime.now(timezone.utc), floor).isoformat(
+        timespec="microseconds")
+
+
+def _capture_cache_projection_stamp(value) -> str:
+    """Normalize cache ``cached_at`` values (Unix seconds or ISO text)."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, timezone.utc).isoformat(
+                timespec="microseconds")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    return _capture_projection_stamp(value)
+
+
+def _merge_capture_evidence_records(previous, current) -> list[dict]:
+    """Stable existing-first union, bounded like the public projection."""
+    out = []
+    seen = set()
+    for value in list(previous or []) + list(current or []):
+        if not isinstance(value, dict):
+            continue
+        marker = json.dumps(value, sort_keys=True, ensure_ascii=False)
+        if marker not in seen:
+            seen.add(marker)
+            out.append(value)
+    return out[:25]
+
+
+def _capture_retained_projection_evidence(data: dict) -> dict:
+    """Bounded facts carried internally through an unregister tombstone.
+
+    Android treats ``registered: false`` as authoritative and ignores this
+    underscored desktop merge envelope.  The envelope exists because this
+    single JSON column is also the only cross-desktop handoff available to a
+    build-only replica; it is removed again when the capture is registered.
+    It is transport-visible, not a secrecy boundary; that would require a
+    separate owner-only column/table.
+    """
+    out = {}
+    for key in ("copyright", "availability", "scan_status", "remarks"):
+        value = data.get(key)
+        if value not in (None, "", [], {}):
+            out[key] = json.loads(json.dumps(value, ensure_ascii=False))
+    return out
+
+
+def _merge_capture_projection_with_existing(row: dict,
+                                            existing: dict | None) -> dict:
+    """Keep source-only evidence when another desktop lacks manual entries.
+
+    Builds replicate between owner desktops; their originating manual capture
+    rows do not. A build-only replica may update build-derived fields, but it
+    must carry forward the cloud's richer source-derived facts and vector-clock
+    component instead of replacing them with unknown/empty values.
+    """
+    if not isinstance(existing, dict):
+        return row
+    desired_data = row.get("data")
+    existing_data = existing.get("data")
+    if not isinstance(desired_data, dict) or not isinstance(existing_data, dict):
+        return row
+    desired = json.loads(json.dumps(desired_data, ensure_ascii=False))
+    previous = existing_data
+    desired_source = desired.get("projection_source")
+    desired_source = dict(desired_source) if isinstance(desired_source, dict) else {}
+    previous_source = previous.get("projection_source")
+    previous_source = dict(previous_source) if isinstance(previous_source, dict) else {}
+    retained = previous_source.get("_retained_desktop_evidence")
+    previous_facts = retained if isinstance(retained, dict) else previous
+
+    local_manual = desired_source.get("manual_present") is True
+    local_registered = bool(row.get("book_id"))
+    previous_registered = bool(existing.get("book_id"))
+    preserve_source = local_registered and not local_manual
+    if preserve_source:
+        old_copyright = previous_facts.get("copyright")
+        new_copyright = desired.get("copyright")
+        if isinstance(old_copyright, dict):
+            if not isinstance(new_copyright, dict):
+                new_copyright = {}
+                desired["copyright"] = new_copyright
+            for key in ("automated_status",):
+                if not new_copyright.get(key) and old_copyright.get(key):
+                    new_copyright[key] = old_copyright[key]
+            if not (new_copyright.get("curated_status") or
+                    new_copyright.get("rights")):
+                for key in ("curated_status", "rights", "rights_label"):
+                    if old_copyright.get(key):
+                        new_copyright[key] = old_copyright[key]
+            new_copyright["status"] = str(
+                new_copyright.get("curated_status") or
+                new_copyright.get("automated_status") or
+                old_copyright.get("status") or ""
+            )[:500]
+        if isinstance(previous_facts.get("availability"), dict):
+            desired["availability"] = previous_facts["availability"]
+        if (str(desired.get("scan_status") or "") in ("", "unknown") and
+                previous_facts.get("scan_status")):
+            desired["scan_status"] = previous_facts["scan_status"]
+        old_remarks = previous_facts.get("remarks")
+        new_remarks = desired.get("remarks")
+        if isinstance(old_remarks, list) and isinstance(new_remarks, list):
+            desired["remarks"] = list(dict.fromkeys(
+                [str(value)[:1000] for value in old_remarks + new_remarks
+                 if str(value).strip()]
+            ))[:25]
+
+    desired_evidence = _capture_projection_stamp(
+        desired_source.get("evidence_updated_at"))
+    previous_evidence = _capture_projection_stamp(
+        previous_source.get("evidence_updated_at"))
+    # A fresher cache result may replace stale evidence (including with a
+    # negative result).  An absent, older, or equal cache can only enrich the
+    # existing record, never erase facts another desktop already established.
+    if local_registered and (
+            not desired_evidence or
+            (previous_evidence and desired_evidence <= previous_evidence)):
+        old_copyright = previous_facts.get("copyright")
+        new_copyright = desired.get("copyright")
+        evidence_enriched = False
+        if isinstance(old_copyright, dict):
+            if not isinstance(new_copyright, dict):
+                new_copyright = {}
+                desired["copyright"] = new_copyright
+            for key in ("registration_records", "renewal_records"):
+                previous_records = _merge_capture_evidence_records(
+                    old_copyright.get(key), ())
+                merged_records = _merge_capture_evidence_records(
+                    old_copyright.get(key), new_copyright.get(key))
+                new_copyright[key] = merged_records
+                evidence_enriched = evidence_enriched or \
+                    merged_records != previous_records
+        desired_source["evidence_updated_at"] = (
+            _capture_next_projection_stamp(
+                previous_evidence, desired_evidence)
+            if evidence_enriched else previous_evidence or desired_evidence
+        )
+
+    copyright_data = desired.get("copyright")
+    if isinstance(copyright_data, dict):
+        copyright_data["status"] = str(
+            copyright_data.get("curated_status") or
+            copyright_data.get("automated_status") or
+            copyright_data.get("status") or ""
+        )[:500]
+
+    if not local_registered:
+        retained_evidence = _capture_retained_projection_evidence(previous_facts)
+        if retained_evidence:
+            desired_source["_retained_desktop_evidence"] = retained_evidence
+    else:
+        desired_source.pop("_retained_desktop_evidence", None)
+
+    # Every new row carries the prior tombstone component. A build-only
+    # desktop also carries the prior manual component; a desktop with the
+    # actual source row supplies its own stamp and lets vector CAS arbitrate.
+    if not desired_source.get("build_updated_at"):
+        desired_source["build_updated_at"] = str(
+            previous_source.get("build_updated_at") or "")
+    if not local_manual:
+        desired_source["manual_updated_at"] = str(
+            previous_source.get("manual_updated_at") or "")
+        desired_source["manual_present"] = bool(
+            previous_source.get("manual_present"))
+    if not desired_source.get("evidence_updated_at"):
+        desired_source["evidence_updated_at"] = str(
+            previous_source.get("evidence_updated_at") or "")
+    registration_stamp = _capture_latest_projection_stamp(
+        desired_source.get("registration_updated_at"),
+        previous_source.get("registration_updated_at"),
+    )
+    if local_registered != previous_registered:
+        registration_stamp = _capture_next_projection_stamp(
+            desired_source.get("build_updated_at"),
+            desired_source.get("manual_updated_at"),
+            desired_source.get("evidence_updated_at"),
+            desired_source.get("registration_updated_at"),
+            desired_source.get("tombstone_updated_at"),
+            previous_source.get("build_updated_at"),
+            previous_source.get("manual_updated_at"),
+            previous_source.get("evidence_updated_at"),
+            previous_source.get("registration_updated_at"),
+            previous_source.get("tombstone_updated_at"),
+        )
+    desired_source["registration_updated_at"] = registration_stamp
+    desired_source["tombstone_updated_at"] = str(
+        desired_source.get("tombstone_updated_at") or
+        previous_source.get("tombstone_updated_at") or "")
+    desired["projection_source"] = desired_source
+    desired["source_updated_at"] = _capture_latest_projection_stamp(
+        desired_source.get("build_updated_at"),
+        desired_source.get("manual_updated_at"),
+        desired_source.get("evidence_updated_at"),
+        desired_source.get("registration_updated_at"),
+        desired_source.get("tombstone_updated_at"),
+    )
+    return {**row, "data": desired}
+
+
+def _capture_book_metadata_rows(builds: dict | None = None,
+                                manual_entries: dict | None = None,
+                                reviews: dict | None = None,
+                                registration_cache: dict | None = None,
+                                tombstone_capture_ids=(),
+                                tombstone_updated_at: dict | None = None,
+                                validation_errors: list[dict] | None = None
+                                ) -> list[dict]:
+    """Desktop-enriched snapshots keyed by the registered build's capture id."""
+    if builds is None:
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {}) or {}
+    if manual_entries is None:
+        with _manual_lock:
+            manual_entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    if reviews is None:
+        with _reviews_lock:
+            reviews = lib.load_json(REVIEWS_PATH, {}) or {}
+    if registration_cache is None:
+        with _reg_cache_lock:
+            registration_cache = dict(_reg_cache_load())
+
+    sources = {}
+    for value in manual_entries.values():
+        if not isinstance(value, dict):
+            continue
+        capture_id = _canonical_capture_id(value.get("capture_id"))
+        if capture_id:
+            sources[capture_id] = value
+    selected = {
+        capture_id: (target["id"], target["record"])
+        for capture_id, target in _capture_targets(builds, manual_entries).items()
+        if target["kind"] == "build"
+    }
+
+    prepared = []
+    renewal_ids = set()
+    for capture_id, (build_id, build) in selected.items():
+        source = sources.get(capture_id)
+        checks_row = source.get("checks") \
+            if isinstance(source, dict) and isinstance(source.get("checks"), dict) else {}
+        automated_status = str(checks_row.get("copyright_status") or "")[:500]
+        rights = str(build.get("rights") or "")[:200]
+        curated_status = (_RIGHTS_PUBLIC.get(rights, rights) if rights else "")[:500]
+        display_status = curated_status or automated_status
+        match = re.match(r"^In copyright \(renewal (.+)\)$", automated_status)
+        renewal_id = match.group(1).strip() if match else ""
+        if renewal_id:
+            renewal_ids.add(renewal_id)
+        prepared.append((capture_id, build_id, build, source, display_status,
+                         automated_status, curated_status, renewal_id))
+
+    renewal_records = {}
+    cached = registration_cache
+    missing = []
+    for renewal_id in renewal_ids:
+        value = cached.get("__renewal__|" + renewal_id)
+        if isinstance(value, dict):
+            renewal_records[renewal_id] = value
+        else:
+            missing.append(renewal_id)
+    if missing:
+        try:
+            renewal_records.update(checks.renewal_details(missing))
+        except Exception:
+            pass
+
+    rows = []
+    for (capture_id, build_id, build, source, copyright_status,
+         automated_status, curated_status, renewal_id) in prepared:
+        rights = str(build.get("rights") or "")[:200]
+        build_stamp = _capture_projection_stamp(
+            build.get("updated_at") or build.get("created_at"))
+        manual_stamp = _capture_projection_stamp(
+            (source or {}).get("updated_at") or (source or {}).get("created_at"))
+        evidence_stamp = _capture_registration_evidence_stamp(
+            build, source, registration_cache)
+        registration_stamp = _capture_latest_projection_stamp(
+            build_stamp, manual_stamp)
+        copyright_data = {
+            "status": copyright_status,
+            "automated_status": automated_status,
+            "curated_status": curated_status,
+            "rights": rights,
+            "rights_label": _RIGHTS_PUBLIC.get(rights, rights),
+            "registration_records": _capture_registration_records(
+                build, source, registration_cache),
+            "renewal_records": ([_capture_renewal_record(
+                renewal_id, renewal_records[renewal_id])]
+                                if renewal_id and renewal_id in renewal_records else []),
+        }
+        data = {
+            "schema": "org.whl.capture.desktop-book-metadata",
+            "version": 1,
+            "source_updated_at": _capture_latest_projection_stamp(
+                build_stamp, manual_stamp, evidence_stamp,
+                registration_stamp),
+            "projection_source": {
+                "build_updated_at": build_stamp,
+                "manual_updated_at": manual_stamp,
+                "evidence_updated_at": evidence_stamp,
+                "registration_updated_at": registration_stamp,
+                "tombstone_updated_at": "",
+                "manual_present": isinstance(source, dict),
+            },
+            "copyright": copyright_data,
+            "availability": {
+                "whl": _capture_source_availability(source, "whl"),
+                "internet_archive": _capture_source_availability(
+                    source, "internet_archive"),
+            },
+            "scan_status": _capture_scan_status(source),
+            "catalog_status": str(build.get("status") or "")[:80],
+            "remarks": _capture_remarks(build, source),
+        }
+        rows.append({"capture_id": capture_id, "book_id": build_id, "data": data})
+    tombstone_updated_at = tombstone_updated_at \
+        if isinstance(tombstone_updated_at, dict) else {}
+    for capture_id in sorted({
+            _canonical_capture_id(value) for value in tombstone_capture_ids
+    } - {""} - set(selected)):
+        rows.append({
+            "capture_id": capture_id,
+            "book_id": "",
+            "data": {
+                "schema": "org.whl.capture.desktop-book-metadata",
+                "version": 1,
+                "registered": False,
+                "source_updated_at": _capture_projection_stamp(
+                    tombstone_updated_at.get(capture_id)),
+                "projection_source": {
+                    "build_updated_at": "",
+                    "manual_updated_at": "",
+                    "evidence_updated_at": "",
+                    "registration_updated_at": "",
+                    "tombstone_updated_at": _capture_projection_stamp(
+                        tombstone_updated_at.get(capture_id)),
+                    "manual_present": False,
+                },
+            },
+        })
+    valid_rows = []
+    for row in rows:
+        try:
+            sbase._capture_book_metadata_write_row(row)
+        except (sbase.SyncError, TypeError, ValueError) as exc:
+            message = str(exc)[:200]
+            if validation_errors is None:
+                raise ValueError(
+                    f"capture {row['capture_id'][:8]} metadata is invalid: "
+                    f"{message}") from exc
+            validation_errors.append({
+                "capture_id": row["capture_id"], "error": message,
+            })
+            continue
+        valid_rows.append(row)
+    return sorted(valid_rows, key=lambda row: row["capture_id"])
+
+
+def _publish_capture_book_metadata(owner_cfg: dict, capture_cfg: dict) -> int:
+    """Publish current snapshots plus durable unregister/delete tombstones."""
+    owner_cfg, capture_cfg = _capture_roundtrip_configs(owner_cfg, capture_cfg)
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {}) or {}
+    with _manual_lock:
+        manual_entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    state = _capture_phone_sync_state()
+    published = {
+        capture_id for value in state["published_capture_ids"]
+        if (capture_id := _canonical_capture_id(value))
+    }
+    targets = _capture_targets(builds, manual_entries)
+    local_current = {
+        capture_id for capture_id, target in targets.items()
+        if target["kind"] == "build"
+    }
+    # Discover rows written by prerelease builds before the local cursor file
+    # existed.  The service credential is still scoped to capture ids already
+    # present in this desktop's own manual/build stores.
+    scope = published | set(targets)
+    cloud_ids = set(sbase.list_capture_ids(capture_cfg, scope))
+    current = local_current & cloud_ids
+    existing = sbase.list_capture_book_metadata(owner_cfg, cloud_ids)
+    existing_by_id = {
+        str(row.get("capture_id")): row
+        for row in existing if isinstance(row, dict)
+    }
+    stale = published | {
+        _canonical_capture_id(row.get("capture_id"))
+        for row in existing if isinstance(row, dict) and row.get("book_id")
+    }
+    tombstone_ids = stale - current
+    tombstone_time = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    rows = _capture_book_metadata_rows(
+        builds=builds,
+        manual_entries=manual_entries,
+        tombstone_capture_ids=stale,
+        tombstone_updated_at={capture_id: tombstone_time
+                              for capture_id in tombstone_ids},
+    )
+    rows = [row for row in rows if row["capture_id"] in cloud_ids]
+    rows = [
+        _merge_capture_projection_with_existing(
+            row, existing_by_id.get(row["capture_id"]))
+        for row in rows
+    ]
+    pushed = sbase.push_capture_book_metadata(owner_cfg, rows)
+
+    def update(sync_state):
+        sync_state["published_capture_ids"] = sorted(current)
+
+    _update_capture_phone_sync_state(update)
+    return pushed
+
+
 @contextlib.contextmanager
 def _cloud_sync_item_policy_guard():
     """Yield the tombstone policy while lifecycle isolation remains held."""
@@ -18922,62 +20552,159 @@ def _cloud_sync_item_policy_guard():
 
 
 def _cloud_sync_run_with_configs(owner_cfg: dict | None,
-                                 capture_cfg: dict | None) -> dict:
-    """Import this user's pending phone captures, with optional owner work.
+                                 capture_cfg: dict | None,
+                                 claimed_run_id: str = "") -> dict:
+    """Run independent phone-account and owner-maintenance pipelines.
 
     Capture ingest runs with the signed-in user's JWT and RLS. If an owner has
-    separately configured a service credential, the same pass also pushes the
-    catalog mirror, merges the owner working stores, and mirrors entry folders.
+    separately configured a service credential, the same pass pushes the
+    catalog mirror, merges the owner working stores, and mirrors entry folders
+    even while the interactive account is signed out. Only capture ingest and
+    its id-scoped phone metadata/review roundtrip require the user JWT.
 
     Everything after the flag is claimed runs inside try/finally, and ANY
     exception lands in `result` — the flag can never stay stuck on, and a
     failed pass can't masquerade as the previous run's outcome."""
-    if not capture_cfg:
-        return {"ok": False,
-                "error": "Sign in to your Library Tool account to sync phone captures"}
-    with _cloudsync_lock:
-        if _cloudsync["running"]:
+    if not capture_cfg and not owner_cfg:
+        result = {"ok": False, "error": "Cloud sync is not configured",
+                  "errors": []}
+        if claimed_run_id:
+            _cloudsync_finish(claimed_run_id, result)
+        return result
+    if claimed_run_id:
+        with _cloudsync_lock:
+            claimed = (
+                _cloudsync.get("running") and
+                str(_cloudsync.get("run_id") or "") == claimed_run_id
+            )
+        if not claimed:
+            return {"ok": False, "error": "sync claim is no longer active"}
+        run_id = claimed_run_id
+    else:
+        run_id = _cloudsync_begin()
+        if not run_id:
             return {"ok": False, "error": "sync already running"}
-        _cloudsync["running"] = True
-    imported = skipped = 0
+    imported = skipped = failed = completed = 0
     errors: list[str] = []
     result: dict = {"ok": False, "error": "sync crashed", "errors": errors}
     log.info("cloud sync started")
     try:
         s = _client_settings()
         delete_remote = s.get("cloudDeleteRemote") is not False
-        # A different desktop may have merged an identity since this process
-        # last opened the Collections window. Refresh durable merge markers
-        # before importing queued captures so their ids converge immediately.
-        # If this authoritative read fails, stop before filing captures with a
-        # potentially stale identity; the next sync can retry without loss.
-        collection_token = (str(capture_cfg.get("access_token") or "").strip()
-                            or str(capture_cfg.get("key") or "").strip())
-        _refresh_collection_aliases(capture_cfg, collection_token)
-        for cap in sbase.list_pending_captures(capture_cfg):
-            try:
-                lease = (_lease_secret("mistralKey")
-                         if _secret_is_configured("mistralKey")
-                         else contextlib.nullcontext(""))
-                with lease as mistral_key:
-                    outcome = _import_capture(
-                        capture_cfg, cap, mistral_key, delete_remote)
-                if outcome == "imported":
-                    imported += 1
-                else:
-                    skipped += 1
-            except Exception as exc:      # one bad capture must not stop the rest
-                errors.append(f"capture {str(cap.get('id'))[:8]}: {exc}")
-        pushed = 0
+        if capture_cfg:
+            _cloudsync_set_stage(
+                "collections", "Refreshing collection identities",
+                total=0, completed=0, unit="operations", indeterminate=True)
+            # A different desktop may have merged an identity since this
+            # process last opened Collections. Refresh durable merge markers
+            # before filing account-scoped captures.
+            collection_token = (
+                str(capture_cfg.get("access_token") or "").strip() or
+                str(capture_cfg.get("key") or "").strip()
+            )
+            _refresh_collection_aliases(capture_cfg, collection_token)
+            _cloudsync_set_stage(
+                "capture_discovery", "Checking for phone captures",
+                total=0, completed=0, unit="captures", indeterminate=True)
+            pending_captures = list(sbase.list_pending_captures(capture_cfg))
+            _cloudsync_set_stage(
+                "capture_import",
+                ("No phone captures to import" if not pending_captures else
+                 f"Importing {len(pending_captures)} phone capture(s)"),
+                total=len(pending_captures),
+                completed=0,
+                unit="captures",
+                indeterminate=False,
+            )
+            for index, cap in enumerate(pending_captures, 1):
+                capture_id = _clean_capture_id(cap.get("id"))
+                title_hint = _cloud_capture_title(cap)
+                _cloudsync_set_stage(
+                    "capture_import",
+                    f"Importing {index} of {len(pending_captures)}: {title_hint}",
+                    current_capture=capture_id,
+                    current_book=title_hint,
+                    current_index=index,
+                    photo_count=len(_cloud_capture_photo_paths(cap)),
+                )
+                item_event = None
+                try:
+                    lease = (_lease_secret("mistralKey")
+                             if _secret_is_configured("mistralKey")
+                             else contextlib.nullcontext(""))
+                    with lease as mistral_key:
+                        outcome = _import_capture(
+                            capture_cfg, cap, mistral_key, delete_remote,
+                            on_persisted=_cloudsync_book_ready,
+                        )
+                    status = str(outcome.get("status") or "skipped")
+                    if status == "imported":
+                        imported += 1
+                    else:
+                        skipped += 1
+                        item_event = {
+                            "kind": "capture",
+                            "status": "skipped",
+                            "capture_id": outcome.get("capture_id", capture_id),
+                            "book_id": outcome.get("book_id", ""),
+                            "title": outcome.get("title", title_hint),
+                            "message": outcome.get("message") or
+                            "Capture was already present",
+                            "details": outcome.get("warnings") or None,
+                        }
+                    if outcome.get("sync_error"):
+                        sync_error = str(outcome["sync_error"])
+                        errors.append(
+                            f"capture {capture_id[:8]}: {sync_error}")
+                        if status == "imported":
+                            item_event = {
+                                "kind": "capture",
+                                "status": "warning",
+                                "capture_id": outcome.get(
+                                    "capture_id", capture_id),
+                                "book_id": outcome.get("book_id", ""),
+                                "title": outcome.get("title", title_hint),
+                                "message": sync_error,
+                                "details": outcome.get("warnings") or None,
+                            }
+                        elif item_event:
+                            details = list(item_event.get("details") or [])
+                            details.append(sync_error)
+                            item_event["details"] = details
+                except Exception as exc:  # one bad capture must not stop the rest
+                    failed += 1
+                    detail = f"{type(exc).__name__}: {exc}"
+                    errors.append(f"capture {capture_id[:8]}: {detail}")
+                    item_event = {
+                        "kind": "capture",
+                        "status": "failed",
+                        "capture_id": capture_id,
+                        "book_id": "",
+                        "title": title_hint,
+                        "message": detail,
+                    }
+                finally:
+                    completed += 1
+                    _cloudsync_item_completed(
+                        completed=completed,
+                        imported=imported,
+                        skipped=skipped,
+                        failed=failed,
+                        event=item_event,
+                    )
+        pushed = metadata_pushed = 0
+        review_sync: dict = {}
         stores: dict = {}
         entries_res: dict = {}
         if owner_cfg:
-            try:
-                pushed = sbase.push_books(owner_cfg, _books_mirror_rows())
-            except sbase.SyncError as exc:
-                errors.append(f"books mirror: {exc}")
+            _cloudsync_set_stage(
+                "owner_stores", "Reconciling desktop catalog data",
+                total=0, completed=0, unit="operations", indeterminate=True)
             # the working stores that left git in 87a9bf2 (two-way, per record;
-            # store_sync guards against an emptier side clobbering a fuller one)
+            # store_sync guards against an emptier side clobbering a fuller
+            # one). Reconcile builds before deriving phone projections: a
+            # second desktop must not tombstone or downgrade a newer build it
+            # simply had not pulled yet.
             stores = store_sync.sync_stores(
                 owner_cfg,
                 locks={
@@ -18992,6 +20719,49 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                     errors.append(f"{name}: {res['error']}")
                 if res.get("guard"):      # a wipe was caught: worth surfacing
                     errors.append(f"{name}: {res['guard']}")
+            builds_result = stores.get("builds") or {}
+            catalogue_safe = not (
+                builds_result.get("error") or builds_result.get("guard")
+            )
+            if catalogue_safe:
+                _cloudsync_set_stage(
+                    "book_mirror", "Publishing the desktop book catalog",
+                    total=0, completed=0, unit="operations",
+                    indeterminate=True)
+                try:
+                    pushed = sbase.push_books(owner_cfg, _books_mirror_rows())
+                except Exception as exc:
+                    errors.append(f"books mirror: {exc}")
+                if capture_cfg:
+                    _cloudsync_set_stage(
+                        "capture_reviews", "Synchronizing capture review status",
+                        total=0, completed=0, unit="operations",
+                        indeterminate=True)
+                    try:
+                        review_sync = _sync_capture_reviews(
+                            owner_cfg, capture_cfg)
+                        errors.extend(review_sync.get("errors") or [])
+                    except Exception as exc:
+                        errors.append(f"capture reviews: {exc}")
+                    _cloudsync_set_stage(
+                        "capture_metadata", "Publishing phone book metadata",
+                        total=0, completed=0, unit="operations",
+                        indeterminate=True)
+                    try:
+                        # Review merge runs first so this snapshot reflects
+                        # local state durably accepted from the phone.
+                        metadata_pushed = _publish_capture_book_metadata(
+                            owner_cfg, capture_cfg)
+                    except Exception as exc:
+                        errors.append(f"capture metadata: {exc}")
+                else:
+                    review_sync = {"skipped": "signed out"}
+            else:
+                errors.append(
+                    "capture metadata: skipped because builds sync was unsafe")
+            _cloudsync_set_stage(
+                "entry_files", "Synchronizing entry files",
+                total=0, completed=0, unit="operations", indeterminate=True)
             with _lease_r2_cfg() as r2cfg:
                 if r2.configured(r2cfg):
                     try:
@@ -19005,28 +20775,32 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                     entries_res = {"skipped": "R2 not configured"}
         else:
             entries_res = {"skipped": "owner sync not configured"}
+        _cloudsync_set_stage(
+            "finishing", "Finalizing cloud sync",
+            total=0, completed=0, unit="operations", indeterminate=True)
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
-                  "books_pushed": pushed, "stores": stores,
+                  "failed": failed, "captures_total": completed,
+                  "books_pushed": pushed,
+                  "capture_metadata_pushed": metadata_pushed,
+                  "capture_reviews": review_sync,
+                  "stores": stores,
                   "entries": entries_res, "errors": errors,
                   "owner_sync": bool(owner_cfg)}
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
-                  "imported": imported, "errors": errors}
+                  "imported": imported, "skipped": skipped, "failed": failed,
+                  "captures_total": completed, "errors": errors}
         log.error("cloud sync crashed", exc_info=exc)
     finally:
-        with _cloudsync_lock:
-            _cloudsync["running"] = False
-            _cloudsync["last_run"] = datetime.now(timezone.utc).isoformat(
-                timespec="seconds")
-            _cloudsync["last_result"] = result
-            _cloudsync["last_error"] = (result.get("error", "")
-                                        or "; ".join(result.get("errors") or []))
+        _cloudsync_finish(run_id, result)
         if result.get("ok"):
             stores = result.get("stores") or {}
             log.info("cloud sync done: %d imported, %d skipped, %d books pushed, "
+                     "%d capture snapshots pushed, "
                      "stores %d up / %d down, entry files %d up / %d down",
                      result.get("imported", 0), result.get("skipped", 0),
                      result.get("books_pushed", 0),
+                     result.get("capture_metadata_pushed", 0),
                      sum(r.get("pushed", 0) + r.get("tombstoned", 0)
                          for r in stores.values()),
                      sum(r.get("pulled", 0) + r.get("deleted", 0)
@@ -19039,13 +20813,24 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
     return result
 
 
-def _cloud_sync_run() -> dict:
+def _cloud_sync_run(claimed_run_id: str = "") -> dict:
     """Acquire owner credentials inside the sync execution, never a job."""
-    with contextlib.ExitStack() as stack:
-        capture_cfg = stack.enter_context(_lease_capture_cfg())
-        owner_cfg = stack.enter_context(_lease_cloud_cfg())
-        return _cloud_sync_run_with_configs(
-            owner_cfg, capture_cfg or owner_cfg)
+    try:
+        with contextlib.ExitStack() as stack:
+            capture_cfg = stack.enter_context(_lease_capture_cfg())
+            owner_cfg = stack.enter_context(_lease_cloud_cfg())
+            return _cloud_sync_run_with_configs(
+                owner_cfg, capture_cfg, claimed_run_id=claimed_run_id)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "errors": [],
+        }
+        if claimed_run_id:
+            _cloudsync_finish(claimed_run_id, result)
+        log.error("cloud sync credential setup failed", exc_info=exc)
+        return result
 
 
 def _cloud_autosync_loop() -> None:
@@ -19074,17 +20859,30 @@ def api_cloudsync_run():
     if not (_capture_configured() or _cloud_configured()):
         return jsonify({"ok": False,
                         "error": "Sign in to your Library Tool account to sync phone captures"})
-    with _cloudsync_lock:
-        already = _cloudsync["running"]
-    if not already:
-        threading.Thread(target=_cloud_sync_run, daemon=True).start()
-    return jsonify({"ok": True, "started": not already})
+    # Claim under the state lock before spawning. Two clicks, or a manual click
+    # racing the interval loop, can no longer both report that they started.
+    run_id = _cloudsync_begin()
+    if not run_id:
+        snapshot = _cloudsync_snapshot()
+        return jsonify({
+            "ok": True, "started": False,
+            "run_id": snapshot.get("run_id") or "",
+        })
+    try:
+        threading.Thread(
+            target=_cloud_sync_run, args=(run_id,), daemon=True).start()
+    except Exception as exc:
+        result = {"ok": False,
+                  "error": f"could not start cloud sync: {exc}",
+                  "errors": []}
+        _cloudsync_finish(run_id, result)
+        return jsonify(result), 500
+    return jsonify({"ok": True, "started": True, "run_id": run_id})
 
 
 @app.route("/api/cloudsync/status")
 def api_cloudsync_status():
-    with _cloudsync_lock:
-        out = dict(_cloudsync)
+    out = _cloudsync_snapshot()
     out["configured"] = bool(_capture_configured() or _cloud_configured())
     return jsonify(out)
 
@@ -19178,6 +20976,14 @@ def _migrate_stored_paths() -> None:
 # sync uses, so a LAN capture lands as an identical manual entry — no internet.
 
 _LAN_TOKEN_PATH = lib.DATA_ROOT / "lan_token.txt"
+_LAN_ID_PATH = lib.DATA_ROOT / "lan_desktop_id.txt"
+_lan_identity_lock = threading.Lock()
+LAN_METADATA_MAX_REQUEST_BYTES = 512 * 1024
+LAN_CONTROL_MAX_REQUEST_BYTES = 8 * 1024
+LAN_CAPTURE_MAX_REQUEST_BYTES = 256 * 1024 * 1024
+LAN_CAPTURE_MAX_PHOTOS = 64
+LAN_CAPTURE_MAX_PHOTO_BYTES = 32 * 1024 * 1024
+LAN_SNAPSHOT_MAX_ENTRIES = 2_000
 
 
 def _lan_token() -> str:
@@ -19224,7 +21030,259 @@ def _lan_ips() -> list[str]:
     return sorted(ips)
 
 
+def _lan_owner_id_locked() -> str:
+    """Read/create the durable LAN stream identity with its lock held."""
+    try:
+        raw = _LAN_ID_PATH.read_text("utf-8").strip()
+    except FileNotFoundError:
+        value = str(uuid.uuid4())
+        try:
+            lib._strict_atomic_replace(_LAN_ID_PATH, value.encode("utf-8"))
+        except OSError as exc:
+            raise RuntimeError("LAN desktop identity could not be stored") from exc
+        try:
+            persisted = _LAN_ID_PATH.read_text("utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError("LAN desktop identity could not be verified") from exc
+        if persisted != value:
+            raise RuntimeError("LAN desktop identity was not durably stored")
+        return value
+    except OSError as exc:
+        raise RuntimeError("LAN desktop identity could not be read") from exc
+    try:
+        return str(uuid.UUID(raw))
+    except (ValueError, AttributeError) as exc:
+        # Replacing a corrupt identity would reuse low snapshot revisions under
+        # an identity the phone has never seen. Fail closed and let the desktop
+        # user repair/remove the corrupt file deliberately.
+        raise RuntimeError("LAN desktop identity is invalid") from exc
+
+
+def _lan_owner_id() -> str:
+    """Stable opaque desktop identity, deliberately independent of its token."""
+    with _lan_identity_lock:
+        return _lan_owner_id_locked()
+
+
+def _lan_snapshot_owner_id() -> str:
+    """Bind the revision ledger to a durable stream identity.
+
+    If the ledger marker is missing or disagrees with the identity file, rotate
+    the stream before returning any rows. Android can then accept revision 1 as
+    a new stream instead of silently ignoring it after state loss.
+    """
+    with _lan_identity_lock:
+        owner_id = _lan_owner_id_locked()
+        state = _capture_phone_sync_state()
+        if state.get("lan_owner_id") == owner_id:
+            return owner_id
+        owner_id = str(uuid.uuid4())
+        try:
+            lib._strict_atomic_replace(_LAN_ID_PATH, owner_id.encode("utf-8"))
+        except OSError as exc:
+            raise RuntimeError("LAN desktop identity could not be rotated") from exc
+
+        def reset(value):
+            value["lan_owner_id"] = owner_id
+            value["lan_snapshots"] = {}
+
+        _update_capture_phone_sync_state(reset)
+        return owner_id
+
+
+def _lan_versioned_capture_rows(capture_ids: list[str]) -> tuple[list[dict],
+                                                                  list[dict],
+                                                                  list[dict]]:
+    """Build monotonic LAN projections for captures known to this desktop."""
+    targets = _current_capture_targets()
+    known = set(capture_ids)
+    if not known:
+        return [], [], []
+    validation_errors: list[dict] = []
+    book_rows = {
+        row["capture_id"]: row
+        for row in _capture_book_metadata_rows(
+            tombstone_capture_ids=known,
+            validation_errors=validation_errors,
+        )
+        if row["capture_id"] in known
+    }
+    invalid_book_ids = {
+        row.get("capture_id") for row in validation_errors
+        if isinstance(row, dict)
+    }
+    desired_reviews = {
+        capture_id: _canonical_review_write(
+            capture_id, _target_review_state(targets[capture_id]))
+        for capture_id in known if capture_id in targets
+    }
+    out_books: list[dict] = []
+    out_reviews: list[dict] = []
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    owner_id = _lan_snapshot_owner_id()
+
+    def versioned(previous: dict | None, desired: dict,
+                  fields: tuple[str, ...]) -> tuple[dict, dict]:
+        previous = previous if isinstance(previous, dict) else {}
+        fingerprint = hashlib.sha256(json.dumps(
+            {field: desired.get(field) for field in fields},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        previous_fingerprint = str(previous.get("fingerprint") or "")
+        if not previous_fingerprint and any(field in previous for field in fields):
+            # One-way upgrade from prerelease snapshots that retained complete
+            # book projections in the cursor file.
+            previous_fingerprint = hashlib.sha256(json.dumps(
+                {field: previous.get(field) for field in fields},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+        unchanged = previous_fingerprint == fingerprint
+        revision = previous.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            revision = 0
+        updated_at = str(previous.get("updated_at") or "")
+        if not unchanged or revision == 0 or not updated_at:
+            revision += 1
+            updated_at = now
+        response = {**desired, "revision": revision, "updated_at": updated_at}
+        snapshot = {
+            "fingerprint": fingerprint,
+            "revision": revision,
+            "updated_at": updated_at,
+            "last_seen_at": now,
+        }
+        return response, snapshot
+
+    def update(state):
+        snapshots = state["lan_snapshots"]
+        for capture_id in capture_ids:
+            if capture_id not in known or capture_id in invalid_book_ids:
+                continue
+            capture_snapshot = snapshots.get(capture_id)
+            if not isinstance(capture_snapshot, dict):
+                capture_snapshot = {}
+            desired_book = book_rows.get(capture_id) or {
+                "capture_id": capture_id,
+                "book_id": "",
+                "data": {
+                    "schema": "org.whl.capture.desktop-book-metadata",
+                    "version": 1,
+                    "registered": False,
+                },
+            }
+            book, book_snapshot = versioned(
+                capture_snapshot.get("book"), desired_book, ("book_id", "data"))
+            try:
+                # Apply the same bounded validator as cloud publication so one
+                # malformed projection is reported without poisoning every
+                # other row in this LAN exchange.
+                sbase._capture_book_metadata_write_row(book)
+            except sbase.SyncError as exc:
+                validation_errors.append({
+                    "capture_id": capture_id, "error": str(exc)[:200],
+                })
+                continue
+            capture_snapshot["book"] = book_snapshot
+            snapshots[capture_id] = capture_snapshot
+            out_books.append({**book, "owner_id": owner_id})
+            desired_review = desired_reviews.get(capture_id)
+            if desired_review is not None:
+                review, review_snapshot = versioned(
+                    capture_snapshot.get("review"), desired_review,
+                    ("needs_attention", "attention_reason", "needs_review",
+                     "review_id", "status"),
+                )
+                capture_snapshot["review"] = review_snapshot
+                out_reviews.append(review)
+        if len(snapshots) > LAN_SNAPSHOT_MAX_ENTRIES:
+            def last_seen(item):
+                snapshot = item[1] if isinstance(item[1], dict) else {}
+                book = snapshot.get("book")
+                review = snapshot.get("review")
+                book = book if isinstance(book, dict) else {}
+                review = review if isinstance(review, dict) else {}
+                return max(
+                    str(book.get("last_seen_at") or ""),
+                    str(review.get("last_seen_at") or ""),
+                )
+
+            newest = sorted(
+                snapshots.items(),
+                key=last_seen,
+                reverse=True,
+            )[:LAN_SNAPSHOT_MAX_ENTRIES]
+            snapshots.clear()
+            snapshots.update(newest)
+
+    _update_capture_phone_sync_state(update)
+    return out_books, out_reviews, validation_errors
+
+
+def _lan_metadata_exchange(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("metadata request must be an object")
+    raw_ids = payload.get("capture_ids")
+    raw_reviews = payload.get("reviews", [])
+    if (not isinstance(raw_ids, list) or len(raw_ids) > 100 or
+            not isinstance(raw_reviews, list) or len(raw_reviews) > 100):
+        raise ValueError("metadata request is too large or malformed")
+    capture_ids = []
+    for value in raw_ids:
+        capture_id = _canonical_capture_id(value)
+        if not capture_id:
+            raise ValueError("metadata request contains an invalid capture id")
+        if capture_id not in capture_ids:
+            capture_ids.append(capture_id)
+    allowed = set(capture_ids)
+    targets = _current_capture_targets()
+    errors = []
+    for raw in raw_reviews:
+        capture_id = ""
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError("review is not an object")
+            capture_id = _canonical_capture_id(raw.get("capture_id"))
+            if not capture_id or capture_id not in allowed:
+                raise ValueError("review is outside the requested capture scope")
+            incoming = _capture_phone_review({
+                "id": capture_id,
+                "capture_review": raw,
+            })
+            target = targets.get(capture_id)
+            if target is None:
+                raise ValueError("capture is not known to this desktop")
+            _merge_phone_review_into_target(target, incoming)
+            if target["kind"] == "row":
+                _remember_pending_capture_review(incoming)
+        except Exception as exc:
+            errors.append({"capture_id": capture_id, "error": str(exc)[:200]})
+    books, reviews, projection_errors = _lan_versioned_capture_rows(capture_ids)
+    errors.extend(projection_errors)
+    return {
+        "app": "whl-capture",
+        "books": books,
+        "reviews": reviews,
+        "errors": errors,
+    }
+
+
 lan_app = Flask("whl_lan")
+lan_app.config["MAX_CONTENT_LENGTH"] = LAN_CAPTURE_MAX_REQUEST_BYTES
+
+
+def _read_lan_photo(stream, maximum: int = LAN_CAPTURE_MAX_PHOTO_BYTES) -> bytes:
+    """Read one multipart photo without trusting Content-Length metadata."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = stream.read(min(1024 * 1024, maximum - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum:
+            raise ValueError("LAN capture photo exceeds the size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @lan_app.get("/lan/ping")
@@ -19242,11 +21300,44 @@ def _lan_pair():
     import hmac
     if not hmac.compare_digest(request.headers.get("X-WHL-Token", ""), _lan_token()):
         abort(401)
-    payload = request.get_json(silent=True) or {}
+    if (request.content_length is not None and
+            request.content_length > LAN_CONTROL_MAX_REQUEST_BYTES):
+        abort(413)
+    raw = request.stream.read(LAN_CONTROL_MAX_REQUEST_BYTES + 1)
+    if len(raw) > LAN_CONTROL_MAX_REQUEST_BYTES:
+        abort(413)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        abort(400)
+    if not isinstance(payload, dict):
+        abort(400)
     nonce = str(payload.get("nonce") or "")
     if not (16 <= len(nonce) <= 128):
         abort(400)
     return jsonify(app="whl-capture", authorized=True, nonce=nonce)
+
+
+@lan_app.post("/lan/metadata")
+def _lan_metadata():
+    """Authenticated pull plus optional explicit phone-review push."""
+    import hmac
+    if not hmac.compare_digest(request.headers.get("X-WHL-Token", ""), _lan_token()):
+        abort(401)
+    if (request.content_length is not None and
+            request.content_length > LAN_METADATA_MAX_REQUEST_BYTES):
+        abort(413)
+    raw = request.stream.read(LAN_METADATA_MAX_REQUEST_BYTES + 1)
+    if len(raw) > LAN_METADATA_MAX_REQUEST_BYTES:
+        abort(413)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        return jsonify(_lan_metadata_exchange(payload))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return jsonify(error=str(exc)[:200]), 400
+    except Exception as exc:
+        log.exception("LAN metadata exchange failed")
+        return jsonify(error=str(exc)[:200]), 500
 
 
 @lan_app.post("/lan/capture")
@@ -19261,14 +21352,20 @@ def _lan_capture():
     if not isinstance(cap, dict):
         abort(400)
     files = request.files.getlist("photo")
+    if not files or len(files) > LAN_CAPTURE_MAX_PHOTOS:
+        abort(413 if files else 400)
     names = [f.filename or "" for f in files]
-    photos = [p for p in (f.read() for f in files) if p]
-    if not photos:
+    try:
+        photos = [_read_lan_photo(f.stream) for f in files]
+    except ValueError:
+        abort(413)
+    if any(not photo for photo in photos):
         abort(400)
     try:
         # pass the filenames so _phone_result can key the phone's OCR by name
         with _lease_secret("mistralKey") as mistral_key:
-            entry_id, _errors = ingest_capture(cap, photos, mistral_key, names)
+            entry_id, _errors = ingest_capture(
+                cap, photos, mistral_key, names, transport="lan")
     except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500

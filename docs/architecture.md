@@ -230,9 +230,11 @@ Per-component detail lives in each part's own README (map at the end).
   `tools/cloud_setup.py check` diffs the `schema_migrations` table against
   that directory to name what is still pending. The cloud is authoritative only for what is
   born there or published to it: accounts, the `captures` queue, the
+  per-capture `capture_reviews` revision stream,
   shared `events` feed, and the published `volumes` catalogue + its
   artifacts; the working-store tables (`builds`, `ia_catalog`,
-  `corrections`, `taxonomy`, `books`) mirror desktop state.
+  `corrections`, `taxonomy`, `books`) and the bounded
+  `capture_book_metadata` phone projection mirror desktop state.
 
 ## Network dependencies
 
@@ -255,7 +257,16 @@ In between sits the **paired LAN** path: the sidecar runs a separate
 capture listener (default port 8899, `server.py`; off unless Settings >
 LAN enables it) and the phone's Settings > Transport pairs host + token.
 A LAN capture POSTs photos straight to the desktop and feeds the same
-ingest as cloud sync — no internet on that leg.
+ingest as cloud sync — no internet on that leg. The same authenticated
+listener exposes a bounded `POST /lan/metadata` exchange for desktop book
+projections and additive review state, so LAN-only capture IDs never need a
+Supabase `captures` row. The phone records each delivered entry's transport;
+later metadata sync follows that entry marker instead of the current global
+setting. LAN capture requests have total, photo-count, and per-photo limits.
+The desktop stream identity is written atomically; its compact, capped
+fingerprint ledger rotates the identity after ledger loss, and timestamp-aware
+phone merges recover from an older restored revision without accepting delayed
+stale responses.
 
 ## Trust boundaries
 
@@ -290,6 +301,19 @@ RLS is what protects the project.
   maintainer-provisioned `capture_ingest_grants` row pairs you as their
   ingester. The `captures` bucket mirrors the same policy; grants rows
   themselves are readable (own only) but writable only by `service_role`.
+- `capture_book_metadata`: owner-only read of desktop-authored status for a
+  retained capture; authenticated clients cannot write it. `capture_reviews`
+  is owner-readable and permits authenticated writes only to the attention,
+  reason, and needs-review columns. A trigger derives ownership from the
+  capture and advances the server revision/timestamp on every write. Both
+  tables revoke PUBLIC access explicitly, bound JSON/reason sizes by their
+  uncompressed representation, and use in-place revisions/tombstones rather
+  than exposing DELETE to clients or the desktop service path. Desktop
+  round-trip code requires both a signed-in capture credential and a service
+  credential for the same project: it scopes IDs with the former before any
+  exact-ID service read/write. Metadata rows use revision compare-and-set and a
+  build/manual/tombstone source vector to prevent stale desktops from erasing
+  richer projections.
 - `events` (the shared activity feed): read for any signed-in user;
   append-only insert, and `actor_id` must be the writer's own uid.
 - `profiles`: readable by signed-in users only (contributor names are not

@@ -95,53 +95,6 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <LinearLayout
-        android:id="@+id/selectionBar"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:paddingStart="14dp"
-        android:paddingEnd="8dp"
-        android:paddingTop="7dp"
-        android:paddingBottom="7dp"
-        android:background="@drawable/whl_panel"
-        android:visibility="gone"
-        app:layout_constraintTop_toBottomOf="@id/configWarning"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
-
-        <TextView
-            android:id="@+id/selectionCount"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:fontFamily="@font/roboto_slab"
-            android:textSize="12sp"
-            android:textColor="@color/whl_ink" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/deleteSelected"
-            style="@style/WhlToolbarAction"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:fontFamily="@font/roboto_slab"
-            android:textAllCaps="false"
-            android:textSize="11sp"
-            android:textColor="@color/whl_red"
-            android:text="@string/home_delete_selected" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/cancelSelection"
-            style="@style/WhlToolbarAction"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:fontFamily="@font/roboto_slab"
-            android:textAllCaps="false"
-            android:textSize="11sp"
-            android:text="@string/home_cancel_select" />
-    </LinearLayout>
-
     <!-- which collection the next book lands in; tap to go and change it -->
     <TextView
         android:id="@+id/collectionBar"
@@ -155,7 +108,7 @@
         android:fontFamily="monospace"
         android:textSize="12sp"
         android:textColor="@color/whl_ink_dim"
-        app:layout_constraintTop_toBottomOf="@id/selectionBar"
+        app:layout_constraintTop_toBottomOf="@id/configWarning"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
@@ -207,21 +160,48 @@
         app:layout_constraintEnd_toEndOf="parent">
 
         <!-- the way into capture; the app no longer opens straight onto the camera -->
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/newScan"
-            style="@style/WhlButton"
+        <LinearLayout
+            android:id="@+id/scanActions"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:fontFamily="@font/roboto_slab"
-            android:gravity="center"
-            android:textAllCaps="false"
-            android:textSize="15sp"
-            android:text="@string/home_new_scan"
-            app:icon="@drawable/ic_camera_new"
-            app:iconGravity="textStart"
-            app:iconPadding="8dp"
-            app:iconSize="26dp"
-            app:iconTint="@color/whl_button_text" />
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/newScan"
+                style="@style/WhlButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginEnd="6dp"
+                android:fontFamily="@font/roboto_slab"
+                android:gravity="center"
+                android:textAllCaps="false"
+                android:textSize="15sp"
+                android:text="@string/home_new_scan"
+                app:icon="@drawable/ic_camera_new"
+                app:iconGravity="textStart"
+                app:iconPadding="8dp"
+                app:iconSize="26dp"
+                app:iconTint="@color/whl_button_text" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/syncCaptures"
+                style="@style/WhlButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:fontFamily="@font/roboto_slab"
+                android:gravity="center"
+                android:accessibilityLiveRegion="polite"
+                android:textAllCaps="false"
+                android:textSize="15sp"
+                android:text="@string/home_sync_captures"
+                app:icon="@drawable/ic_sync_upload"
+                app:iconGravity="textStart"
+                app:iconPadding="7dp"
+                app:iconSize="24dp"
+                app:iconTint="@color/whl_button_text" />
+        </LinearLayout>
 
         <Button
             android:id="@+id/newCollection"

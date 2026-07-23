@@ -133,23 +133,6 @@ private val COMPACT_SCAN_LIST_METRICS = ScanListLayoutMetrics(39, 51, 7, 9)
 internal fun scanListLayoutMetrics(compact: Boolean): ScanListLayoutMetrics =
     if (compact) COMPACT_SCAN_LIST_METRICS else STANDARD_SCAN_LIST_METRICS
 
-/** A regular row tap always replaces the selection with that one scan. */
-internal fun replaceScanSelection(
-    current: Collection<String>,
-    id: String,
-): LinkedHashSet<String> = LinkedHashSet(current).apply {
-    clear()
-    add(id)
-}
-
-/** A long press changes one member without clearing the rest of the selection. */
-internal fun toggleScanSelectionAdditively(
-    current: Collection<String>,
-    id: String,
-): LinkedHashSet<String> = LinkedHashSet(current).apply {
-    if (!add(id)) remove(id)
-}
-
 internal enum class HomeStatusAdornment { NONE, WAITING, UPLOADED }
 
 /**

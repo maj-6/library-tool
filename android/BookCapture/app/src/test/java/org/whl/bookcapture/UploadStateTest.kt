@@ -280,6 +280,59 @@ class UploadStateTest {
     }
 
     @Test
+    fun pendingSentEntriesDoNotConsumeCompletedRetentionSlots() {
+        val completed = (1..20).map { index ->
+            Entries.SentRetentionCandidate(
+                entryId = "completed-$index",
+                createdAt = index.toLong(),
+                retainLocally = sentEntryNeedsLocalRetention("imported", false),
+            )
+        }
+        val pending = listOf(
+            Entries.SentRetentionCandidate(
+                entryId = "unknown-import",
+                createdAt = 100,
+                retainLocally = sentEntryNeedsLocalRetention("future-in-progress-state", false),
+            ),
+            Entries.SentRetentionCandidate(
+                entryId = "pending-photo-work",
+                createdAt = 99,
+                retainLocally = sentEntryNeedsLocalRetention("imported", true),
+            ),
+        )
+
+        val overflow = Entries.sentRetentionOverflow(completed + pending)
+
+        assertEquals(
+            (1..5).map { "completed-$it" }.toSet(),
+            overflow.toSet(),
+        )
+        assertFalse("unknown import must remain recoverable", "unknown-import" in overflow)
+        assertFalse("pending photo work must remain recoverable", "pending-photo-work" in overflow)
+    }
+
+    @Test
+    fun onlyTerminalEntriesWithoutPhotoWorkArePruneEligible() {
+        assertTrue(sentEntryNeedsLocalRetention("", false))
+        assertTrue(sentEntryNeedsLocalRetention("pending", false))
+        assertTrue(sentEntryNeedsLocalRetention("future-in-progress-state", false))
+        assertTrue(sentEntryNeedsLocalRetention("imported", true))
+        assertFalse(sentEntryNeedsLocalRetention("imported", false))
+        assertFalse(sentEntryNeedsLocalRetention("failed", false))
+    }
+
+    @Test
+    fun pruningRunsEvenWhenOtherSentEntriesStillNeedPolling() {
+        val source = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        val finish = source.substringAfter("private suspend fun finishUploadChain")
+            .substringBefore("override suspend fun doWork")
+
+        assertTrue(finish.contains("if (hasPendingImports(ctx)) scheduleImportPolling(ctx)"))
+        assertTrue(finish.contains("Entries.pruneSent(ctx, ::retainSentEntryLocally)"))
+        assertFalse(finish.contains("else Entries.pruneSent"))
+    }
+
+    @Test
     fun finalRemoteImportStatesHaveTruthfulLabels() {
         assertEquals("imported", remoteImportTerminalLabel("imported"))
         assertEquals("import failed", remoteImportTerminalLabel("failed"))

@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
@@ -15,6 +16,26 @@ internal data class PrivateObjectDownload(
 )
 
 private val SAFE_CLOUD_FILTER_TOKEN = Regex("[A-Za-z0-9._-]+")
+private const val DEFAULT_SUPABASE_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
+private const val SUPABASE_ERROR_RESPONSE_MAX_BYTES = 16 * 1024
+private const val CAPTURE_REVIEW_RESPONSE_MAX_BYTES = 128 * 1024
+
+private class SupabaseResponseTooLarge : IOException("Supabase response is too large")
+
+internal fun readBoundedSupabaseResponse(input: InputStream, maximum: Int): ByteArray {
+    require(maximum > 0) { "maximum must be positive" }
+    val output = java.io.ByteArrayOutputStream(minOf(maximum, 64 * 1024))
+    val buffer = ByteArray(16 * 1024)
+    var total = 0
+    while (true) {
+        val count = input.read(buffer)
+        if (count < 0) break
+        total += count
+        if (total > maximum) throw SupabaseResponseTooLarge()
+        output.write(buffer, 0, count)
+    }
+    return output.toByteArray()
+}
 
 private fun encodedStoragePath(value: String): String = value.split('/').joinToString("/") {
     URLEncoder.encode(it, Charsets.UTF_8.name()).replace("+", "%20")
@@ -98,6 +119,7 @@ class SupabaseClient(
     class SignedOut : IOException("signed out")
     class AccountChanged : IOException("account changed during delivery")
     class ObjectTooLarge : IOException("private object exceeds the download limit")
+    class InvalidResponse(message: String) : IOException(message)
 
     private val baseUrl = Prefs.supabaseUrl(ctx)
     private val ownerId = expectedUserId?.trim().orEmpty().ifEmpty { Prefs.userId(ctx) }
@@ -117,12 +139,25 @@ class SupabaseClient(
         return conn
     }
 
-    private fun finish(conn: HttpURLConnection): String {
+    private fun finish(
+        conn: HttpURLConnection,
+        maxResponseBytes: Int = DEFAULT_SUPABASE_RESPONSE_MAX_BYTES,
+    ): String {
         val code = conn.responseCode
         val body = try {
             (if (code in 200..299) conn.inputStream else conn.errorStream)
-                ?.use { it.readBytes().decodeToString() } ?: ""
-        } catch (_: Exception) { "" }
+                ?.use {
+                    readBoundedSupabaseResponse(
+                        it,
+                        if (code in 200..299) maxResponseBytes
+                        else SUPABASE_ERROR_RESPONSE_MAX_BYTES,
+                    ).decodeToString()
+                } ?: ""
+        } catch (e: SupabaseResponseTooLarge) {
+            if (code in 200..299) throw InvalidResponse(e.message.orEmpty()) else ""
+        } catch (e: Exception) {
+            if (code in 200..299) throw e else ""
+        }
         if (code !in 200..299) throw HttpException(code, "HTTP $code: ${body.take(300)}")
         return body
     }
@@ -171,6 +206,165 @@ class SupabaseClient(
         return (0 until rows.length()).associate {
             rows.getJSONObject(it).let { r -> r.getString("id") to r.optString("status") }
         }
+    }
+
+    /** Desktop-authored projections for this account's retained captures.
+     * The table's RLS is owner-only; checking owner_id again fails closed if a
+     * project was misconfigured or the account changed around token refresh. */
+    internal fun desktopBookMetadata(ids: List<String>): Map<String, DesktopBookMetadata> {
+        val out = linkedMapOf<String, DesktopBookMetadata>()
+        for (batch in safeCaptureSyncIds(ids).chunked(CAPTURE_METADATA_BATCH_SIZE)) {
+            fetchDesktopBookMetadataIsolated(batch, out)
+        }
+        return out
+    }
+
+    /** Split only malformed/oversized responses. Network and HTTP errors still
+     * retry normally. A bad single row is dropped without preventing unrelated
+     * captures in the explicit batch from receiving valid metadata. */
+    private fun fetchDesktopBookMetadataIsolated(
+        batch: List<String>,
+        out: MutableMap<String, DesktopBookMetadata>,
+    ) {
+        if (batch.isEmpty()) return
+        try {
+            val filter = batch.joinToString(",") {
+                URLEncoder.encode(it, Charsets.UTF_8.name())
+            }
+            val conn = open(
+                "GET",
+                "$baseUrl/rest/v1/capture_book_metadata" +
+                    "?capture_id=in.($filter)&select=" +
+                    "capture_id,owner_id,book_id,data,revision,updated_at" +
+                    "&order=capture_id.asc",
+                null,
+            )
+            val maximum = batch.size * (CAPTURE_METADATA_MAX_BYTES + 2 * 1024) + 8 * 1024
+            val rows = try {
+                JSONArray(finish(conn, maximum).ifEmpty { "[]" })
+            } catch (e: org.json.JSONException) {
+                throw InvalidResponse("invalid desktop book metadata response")
+            }
+            for (index in 0 until rows.length()) {
+                val parsed = rows.optJSONObject(index)?.let(::desktopBookMetadataFromJson)
+                    ?: continue
+                if (parsed.ownerId != ownerId || parsed.captureId !in batch ||
+                    parsed.captureId in out) continue
+                out[parsed.captureId] = parsed
+            }
+        } catch (e: InvalidResponse) {
+            if (batch.size == 1) return
+            val midpoint = batch.size / 2
+            fetchDesktopBookMetadataIsolated(batch.subList(0, midpoint), out)
+            fetchDesktopBookMetadataIsolated(batch.subList(midpoint, batch.size), out)
+        }
+    }
+
+    /** Shared attention/review state. Missing rows are meaningful: a capture
+     * can be edited offline before its first explicit sync. */
+    internal fun captureReviews(ids: List<String>): Map<String, CaptureReviewMetadata> {
+        val out = linkedMapOf<String, CaptureReviewMetadata>()
+        for (batch in safeCaptureSyncIds(ids).chunked(CAPTURE_METADATA_BATCH_SIZE)) {
+            fetchCaptureReviewsIsolated(batch, out)
+        }
+        return out
+    }
+
+    private fun fetchCaptureReviewsIsolated(
+        batch: List<String>,
+        out: MutableMap<String, CaptureReviewMetadata>,
+    ) {
+        if (batch.isEmpty()) return
+        try {
+            val filter = batch.joinToString(",") {
+                URLEncoder.encode(it, Charsets.UTF_8.name())
+            }
+            val conn = open(
+                "GET",
+                "$baseUrl/rest/v1/capture_reviews" +
+                    "?capture_id=in.($filter)&select=" +
+                    "capture_id,owner_id,needs_attention,attention_reason," +
+                    "needs_review,review_id,status,revision,updated_at" +
+                    "&order=capture_id.asc",
+                null,
+            )
+            val rows = try {
+                JSONArray(finish(conn, CAPTURE_REVIEW_RESPONSE_MAX_BYTES).ifEmpty { "[]" })
+            } catch (e: org.json.JSONException) {
+                throw InvalidResponse("invalid capture review response")
+            }
+            for (index in 0 until rows.length()) {
+                val row = rows.optJSONObject(index) ?: continue
+                if (row.opt("owner_id") !is String ||
+                    row.optString("owner_id").trim() != ownerId) {
+                    continue
+                }
+                val parsed = captureReviewFromJson(row) ?: continue
+                if (parsed.captureId !in batch || parsed.captureId in out) continue
+                out[parsed.captureId] = parsed
+            }
+        } catch (e: InvalidResponse) {
+            if (batch.size == 1) return
+            val midpoint = batch.size / 2
+            fetchCaptureReviewsIsolated(batch.subList(0, midpoint), out)
+            fetchCaptureReviewsIsolated(batch.subList(midpoint, batch.size), out)
+        }
+    }
+
+    /** Insert or compare-and-set only the phone-writable review fields. The
+     * database trigger owns revisions/timestamps and desktop review identity. */
+    internal fun writeCaptureReview(
+        write: CaptureReviewCloudWrite,
+    ): CaptureReviewMetadata? {
+        val state = write.state
+        require(SAFE_CAPTURE_SYNC_ID.matches(state.captureId)) { "invalid capture id" }
+        val expected = write.expectedCloudRevision
+        val (method, url, body) = if (expected == null) {
+            Triple(
+                "POST",
+                "$baseUrl/rest/v1/capture_reviews?on_conflict=capture_id",
+                captureReviewCloudBody(state),
+            )
+        } else {
+            val captureFilter = URLEncoder.encode(state.captureId, Charsets.UTF_8.name())
+            val patch = captureReviewCloudBody(state).apply {
+                remove("capture_id")
+            }
+            Triple(
+                "PATCH",
+                "$baseUrl/rest/v1/capture_reviews" +
+                    "?capture_id=eq.$captureFilter&revision=eq.$expected",
+                patch,
+            )
+        }
+        val conn = open(method, url, "application/json")
+        conn.setRequestProperty(
+            "Prefer",
+            if (expected == null) "resolution=ignore-duplicates,return=representation"
+            else "return=representation",
+        )
+        conn.doOutput = true
+        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+        val rows = JSONArray(finish(conn, CAPTURE_REVIEW_RESPONSE_MAX_BYTES).ifEmpty { "[]" })
+        if (rows.length() == 0) return null
+        if (rows.length() != 1) {
+            throw InvalidResponse("capture review write returned multiple rows")
+        }
+        val accepted = rows.optJSONObject(0)
+            ?: throw InvalidResponse("capture review write returned an invalid row")
+        if (accepted.optString("owner_id").trim() != ownerId) {
+            throw InvalidResponse("capture review ownership mismatch")
+        }
+        val parsed = captureReviewFromJson(accepted, expectedCaptureId = state.captureId)
+            ?: throw InvalidResponse("invalid accepted capture review")
+        if (!reviewWritableEquals(parsed, state)) {
+            throw InvalidResponse("capture review write returned different writable fields")
+        }
+        val requiredRevision = expected?.plus(1L) ?: 1L
+        if (parsed.revision != requiredRevision) {
+            throw InvalidResponse("capture review revision did not advance")
+        }
+        return parsed
     }
 
     /** Owner-readable processing rows for the sent captures retained locally. */
@@ -319,3 +513,9 @@ class SupabaseClient(
         e.message ?: e.javaClass.simpleName
     }
 }
+
+internal fun safeCaptureSyncIds(ids: List<String>): List<String> = ids.asSequence()
+    .map { it.trim().lowercase() }
+    .filter { SAFE_CAPTURE_SYNC_ID.matches(it) && it != "." && it != ".." }
+    .distinct()
+    .toList()

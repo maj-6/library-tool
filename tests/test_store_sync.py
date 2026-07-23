@@ -981,6 +981,12 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
     monkeypatch.setattr(server.sbase, "list_pending_captures",
                         lambda cfg, limit=50: [])
     monkeypatch.setattr(server.sbase, "push_books", lambda cfg, rows: len(rows))
+    metadata_calls = []
+    monkeypatch.setattr(
+        server.sbase,
+        "push_capture_book_metadata",
+        lambda cfg, rows: metadata_calls.append((cfg, rows)) or len(rows),
+    )
     real_sync_stores = server.store_sync.sync_stores
     calls = []
 
@@ -1034,6 +1040,10 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
     assert res["ok"] is True, res
     assert res["stores"]["builds"]["pushed"] == 1
     assert res["entries"] == entry_result
+    assert res["capture_metadata_pushed"] == 0
+    # This fixture has no signed-in user session. Owner maintenance continues,
+    # but the id-scoped phone projection is not touched with a service key alone.
+    assert metadata_calls == []
     assert fake_cloud.tables["builds"]["b1"]["data"]["title"] == "One"
     assert [call[0] for call in calls] == ["stores", "entries"]
 

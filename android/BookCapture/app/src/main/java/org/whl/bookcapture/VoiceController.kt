@@ -49,7 +49,7 @@ class VoiceController(
             "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
         const val MODEL_DIR = "vosk-model-small-en-us-0.15"
         val COMMANDS = listOf(
-            "start", "photo", "done", "cancel", "restart", "undo", "notes", "end notes",
+            "start", "photo", "done", "cancel", "restart", "undo", "edit", "notes", "end notes",
         )
 
         /** Final recognition is required for actions that seal or delete work. */
@@ -59,6 +59,18 @@ class VoiceController(
                 state = VoiceCommandState.IDLE,
                 stability = VoiceRecognitionStability.STABLE_PARTIAL,
             )?.command?.wireValue
+
+        /** Reopening mutates the capture manifest, so Edit is accepted only
+         * from a completed recognition rather than a speculative partial. */
+        internal fun commandFromFinal(text: String): String? =
+            editCommand(text) ?: StateAwareVoiceCommandPolicy.evaluate(
+                transcript = text,
+                state = VoiceCommandState.IDLE,
+                stability = VoiceRecognitionStability.FINAL,
+            )?.command?.wireValue
+
+        private fun editCommand(text: String): String? =
+            "edit".takeIf { text.trim().equals(it, ignoreCase = true) }
         // long enough to swallow the final result that trails a partial-fired
         // command; page-flipping cadence never repeats a word this fast
         private const val DEBOUNCE_MS = 1500L
@@ -263,11 +275,7 @@ class VoiceController(
         pendingPartial = ""
         if (hypothesis.isNullOrBlank()) return
         val text = try { JSONObject(hypothesis).optString("text") } catch (_: Exception) { "" }
-        val word = StateAwareVoiceCommandPolicy.evaluate(
-            transcript = text,
-            state = VoiceCommandState.IDLE,
-            stability = VoiceRecognitionStability.FINAL,
-        )?.command?.wireValue ?: return
+        val word = commandFromFinal(text) ?: return
         fire(generation, word)
     }
 

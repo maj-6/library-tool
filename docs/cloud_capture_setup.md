@@ -38,7 +38,9 @@ API keys; plus `builds`, `ia_catalog`, `corrections` and `taxonomy` for the
 working-store sync (the desktop's gitignored builds / IA-download catalog /
 WHL corrections / category taxonomy merge through these; see
 `tools/store_sync.py`). Migration 015 adds the owner-readable
-`photo_processing_jobs` queue used by the optional image processor.
+`photo_processing_jobs` queue used by the optional image processor. Migration
+017 adds `capture_book_metadata` (desktop-authored registered-book snapshots)
+and `capture_reviews` (small, shared attention/review state).
 
 On an existing project, don't re-paste everything: `python3
 tools/cloud_setup.py check` diffs the `schema_migrations` table against the
@@ -57,8 +59,7 @@ holds corrected display/OCR/thumbnail artifacts; `volumes` (public) holds
 published PDFs. Bucket creation is an owner setup task. `tools/cloud_setup.py`
 reads `SUPABASE_KEY` from the process environment for this one-time
 administration step. Use a backend-only `sb_secret_...` key or legacy
-service-role credential; it is never saved in desktop settings or distributed
-to phone/desktop users.
+service-role credential; it is never distributed to phones or ordinary users.
 
 Then check the whole thing:
 
@@ -75,7 +76,15 @@ any failure.
 
 - **Desktop**: sign in to a Library Tool account, then choose the auto-sync
   interval under Settings → Integrations → *Phone capture (Supabase)*. No
-  Supabase key is needed. A Mistral API key (Settings → Credentials) is
+  Supabase key is needed to import captures. Returning registered-book fields
+  to phones and consuming phone review changes are trusted curator operations;
+  the library owner must add the project service key under Settings →
+  Credentials → *Owner service key*. It is held only in the desktop engine's
+  protected secret store. Both that key and a signed-in user session are
+  required, and they must name the same Supabase project: the user session
+  first limits the operation to capture IDs that account may ingest, then the
+  service credential reads/writes only that exact set. A service key by itself
+  never enables phone round-trip publication. A Mistral API key (Settings → Credentials) is
   needed only for captures the phone didn't pre-OCR; it syncs through
   `profile_secrets`, so a key entered on either device follows the
   signed-in account to the other. **Test connection** in the same panel
@@ -94,6 +103,44 @@ fork maintainer's responsibility, not the user's.
 The `captures` bucket stays small: after an entry is imported the desktop
 keeps the processed photos locally under `DATA_ROOT/captures/<id>/` and (by
 default) deletes the cloud copies.
+
+When a captured entry is registered as a desktop book, an owner sync publishes
+only that capture's bounded phone projection: copyright status and any located
+registration/renewal records, WHL and Internet Archive availability, scan
+status, and remarks. Phones can read snapshots only for
+their own captures; the full service-only `books` mirror is not exposed. The
+phone may pull this state without uploading anything. Phone attention/review
+edits stay in an offline sidecar until the user presses **Sync captures**, then use a
+server-revision compare-and-set through `capture_reviews`. Capture upload and
+review publication are never started by capture completion, app resume, or
+background OCR; **Sync captures** freezes the eligible batch and its selected
+destination. A failed or interrupted batch resumes that same batch rather than
+silently including later captures or switching between LAN and cloud.
+
+Only IDs that still exist in the cloud `captures` table are published to
+`capture_book_metadata` or `capture_reviews`; direct-LAN captures therefore
+cannot violate those tables' capture foreign keys. A paired desktop provides
+the equivalent projection and review exchange at authenticated
+`POST /lan/metadata`, using a stable desktop identity and content revisions,
+without requiring a Supabase row. The LAN identity is stored atomically and is
+rotated if its compact revision ledger is lost; newer timestamps allow safe
+recovery from a restored/pruned ledger while older delayed responses stay
+stale. Metadata requests, multipart captures, photo count, and each photo are
+bounded before ingest. Removed desktop registrations are published
+as higher-revision tombstones (`book_id` empty) rather than deleting/recreating
+the projection row. Review rows are likewise updated in place; neither phone
+nor service roles receive direct table DELETE permission.
+
+Copyright display uses the curated desktop rights value while retaining the
+automated copyright result and its registration/renewal evidence. A draft WHL
+match remains **unknown**, not available. The phone rejects oversized or
+malformed projection rows independently, preserves a corrupt local review
+sidecar for recovery, and combines simultaneous nonempty desktop/phone reasons
+(or reports a length conflict) instead of silently discarding either note.
+Desktop projection publication uses per-row revision compare-and-set plus a
+small source vector (build, manual source, and tombstone timestamps), so a
+second desktop without the source-only fields cannot erase richer phone data
+or resurrect a newer tombstone.
 
 When migration 015 finds a valid processing request in an uploaded capture,
 it atomically changes that row from `pending` to `processing`. The desktop

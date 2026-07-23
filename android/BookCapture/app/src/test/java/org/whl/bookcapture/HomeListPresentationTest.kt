@@ -149,26 +149,6 @@ class HomeListPresentationTest {
     }
 
     @Test
-    fun regularTapReplacesAnyExistingSelectionWithOneScan() {
-        val selected = linkedSetOf("one", "two")
-
-        assertEquals(linkedSetOf("three"), replaceScanSelection(selected, "three"))
-        assertEquals(linkedSetOf("one", "two"), selected)
-    }
-
-    @Test
-    fun longPressTogglesOneScanWithoutClearingOtherSelections() {
-        assertEquals(
-            linkedSetOf("one", "two", "three"),
-            toggleScanSelectionAdditively(linkedSetOf("one", "two"), "three"),
-        )
-        assertEquals(
-            linkedSetOf("two"),
-            toggleScanSelectionAdditively(linkedSetOf("one", "two"), "one"),
-        )
-    }
-
-    @Test
     fun completeTextIsSuppressedAndDeliveryUsesACloudIcon() {
         assertEquals(HomeStatusPresentation(), homeStatusPresentation("complete"))
         assertEquals(

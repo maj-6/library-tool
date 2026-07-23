@@ -42,6 +42,8 @@ ANDROID_UI_DEFAULTS = SQL["014_android_ui_catalog_defaults"]
 ANDROID_UI_DEFAULTS_FLAT = " ".join(ANDROID_UI_DEFAULTS.split())
 PHOTO_PROCESSING = SQL["015_photo_processing_jobs"]
 PHOTO_PROCESSING_FLAT = " ".join(PHOTO_PROCESSING.split())
+CAPTURE_PHONE_SYNC = SQL["017_capture_phone_sync"]
+CAPTURE_PHONE_SYNC_FLAT = " ".join(CAPTURE_PHONE_SYNC.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -348,6 +350,84 @@ def test_bucket_apply_repairs_existing_public_derivative_bucket(monkeypatch):
         "file_size_limit": 32 * 1024 * 1024,
         "allowed_mime_types": ["image/jpeg", "application/json"],
     }
+
+
+# --- 017: registered-book snapshots and explicit phone review sync --------------
+
+def test_capture_phone_sync_declares_bounded_owner_scoped_state():
+    schema = cloud_setup.expected_schema(CAPTURE_PHONE_SYNC)
+    assert schema["capture_book_metadata"] == {
+        "capture_id", "owner_id", "book_id", "data", "revision", "updated_at",
+    }
+    assert schema["capture_reviews"] == {
+        "capture_id", "owner_id", "needs_attention", "attention_reason",
+        "needs_review", "review_id", "status", "revision", "updated_at",
+    }
+    assert "octet_length(data::text) <= 262144" in CAPTURE_PHONE_SYNC_FLAT
+    assert "pg_column_size(data)" not in CAPTURE_PHONE_SYNC_FLAT
+    assert "char_length(attention_reason) <= 1000" in CAPTURE_PHONE_SYNC_FLAT
+    assert "alter table public.capture_book_metadata enable row level security;" in \
+        CAPTURE_PHONE_SYNC_FLAT
+    assert "alter table public.capture_reviews enable row level security;" in \
+        CAPTURE_PHONE_SYNC_FLAT
+    assert "capture_book_metadata" in cloud_setup.ANON_CANNOT
+    assert "capture_reviews" in cloud_setup.ANON_CANNOT
+
+
+def test_capture_phone_sync_keeps_desktop_fields_service_only():
+    assert ("revoke all on public.capture_book_metadata from public, anon, authenticated;"
+            in CAPTURE_PHONE_SYNC_FLAT)
+    assert ("grant select on public.capture_book_metadata to authenticated;"
+            in CAPTURE_PHONE_SYNC_FLAT)
+    assert not re.search(
+        r"grant\s+(?:insert|update|delete)[^;]*capture_book_metadata[^;]*"
+        r"authenticated",
+        CAPTURE_PHONE_SYNC_FLAT,
+    )
+    assert ("grant select, insert, update on public.capture_book_metadata "
+            "to service_role;" in CAPTURE_PHONE_SYNC_FLAT)
+    assert "grant delete on public.capture_book_metadata" not in CAPTURE_PHONE_SYNC_FLAT
+    assert ("using (owner_id = (select auth.uid()))" in
+            CAPTURE_PHONE_SYNC_FLAT)
+
+
+def test_capture_review_phone_writes_are_column_scoped_and_revisioned():
+    assert ("grant insert ( capture_id, needs_attention, "
+            "attention_reason, needs_review ) on public.capture_reviews to "
+            "authenticated;" in CAPTURE_PHONE_SYNC_FLAT)
+    assert ("grant update ( needs_attention, attention_reason, needs_review ) "
+            "on public.capture_reviews to authenticated;" in
+            CAPTURE_PHONE_SYNC_FLAT)
+    assert "grant delete on public.capture_reviews to authenticated" not in \
+        CAPTURE_PHONE_SYNC_FLAT
+    assert "grant delete on public.capture_reviews to service_role" not in \
+        CAPTURE_PHONE_SYNC_FLAT
+
+
+def test_capture_phone_sync_retrofits_partial_tables_and_revokes_public():
+    assert "add column if not exists capture_id uuid" in CAPTURE_PHONE_SYNC_FLAT
+    assert "do $capture_phone_sync_retrofit$" in CAPTURE_PHONE_SYNC_FLAT
+    assert "drop constraint if exists capture_book_metadata_data_check" in \
+        CAPTURE_PHONE_SYNC_FLAT
+    assert ("revoke all on public.capture_reviews from public, anon, authenticated;"
+            in CAPTURE_PHONE_SYNC_FLAT)
+    assert "new.owner_id = v_owner;" in CAPTURE_PHONE_SYNC_FLAT
+    assert "new.owner_id = old.owner_id;" in CAPTURE_PHONE_SYNC_FLAT
+    assert "new.revision = old.revision + 1;" in CAPTURE_PHONE_SYNC_FLAT
+    assert "old.updated_at + interval '1 microsecond'" in CAPTURE_PHONE_SYNC_FLAT
+    assert ("set owner_id = capture.created_by from public.captures as capture"
+            in CAPTURE_PHONE_SYNC_FLAT)
+    assert "set book_id = '' where book_id is null" in CAPTURE_PHONE_SYNC_FLAT
+    assert "set needs_attention = false where needs_attention is null" in \
+        CAPTURE_PHONE_SYNC_FLAT
+    assert CAPTURE_PHONE_SYNC_FLAT.count(
+        "alter column capture_id set not null",
+    ) == 2
+    assert "primary key must be capture_id" in CAPTURE_PHONE_SYNC_FLAT
+    assert "and conkey = array[" in CAPTURE_PHONE_SYNC_FLAT
+    assert CAPTURE_PHONE_SYNC.count(
+        "owner_id = (select auth.uid())",
+    ) == 5
 
 
 # --- 009: shared collections ------------------------------------------------------

@@ -34,8 +34,11 @@ class CapturePreviewContractTest {
 
         val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
         assertTrue(source.contains("selectLastSubmittedEntry(Entries.recent(this@MainActivity))"))
-        assertTrue(source.contains("latest?.thumbnailPhoto()?.let"))
-        assertTrue(source.contains("binding.lastBookThumb.setImageBitmap(thumbnail)"))
+        assertTrue(source.contains("val photo = latest?.thumbnailDescriptor()?.displayFile"))
+        assertTrue(source.contains(
+            "decodeSampledOriented(photo, maxWidth = 360, maxHeight = 480)",
+        ))
+        assertTrue(source.contains("binding.lastBookThumb.setImageBitmap(load.bitmap)"))
         assertTrue(source.contains("binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)"))
         assertTrue(source.contains("R.string.capture_last_book_thumbnail_description"))
     }

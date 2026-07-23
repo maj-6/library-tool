@@ -54,7 +54,14 @@ def test_changelogs_use_public_release_categories_in_a_fixed_order():
     android_versions = validate_changelog(ANDROID_CHANGELOG)
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert desktop_versions[0] == project["project"]["version"]
+    # Desktop may stage one clearly-labelled unreleased section while Android
+    # publishes independently.  The packaged desktop version must still be
+    # the first concrete release immediately after that section.
+    if desktop_versions[0] == "Next prerelease":
+        assert desktop_versions.count("Next prerelease") == 1
+        assert desktop_versions[1] == project["project"]["version"]
+    else:
+        assert desktop_versions[0] == project["project"]["version"]
 
     android_build = (ROOT / "android" / "BookCapture" / "app" / "build.gradle.kts").read_text(
         encoding="utf-8"

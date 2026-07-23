@@ -238,6 +238,7 @@
         android:orientation="horizontal"
         android:baselineAligned="false"
         android:gravity="center_vertical"
+        android:importantForAccessibility="no"
         android:background="@drawable/whl_panel"
         android:paddingStart="12dp"
         android:paddingTop="8dp"
@@ -255,6 +256,7 @@
             android:background="@color/whl_face_sh"
             android:contentDescription="@string/capture_last_book_empty"
             android:foreground="@drawable/whl_thumbnail_frame"
+            android:importantForAccessibility="no"
             android:padding="1dp"
             android:scaleType="centerCrop"
             app:srcCompat="@drawable/ic_launcher_safe_fg" />
@@ -313,6 +315,14 @@
                 android:textColor="@color/whl_ink_dim"
                 android:textSize="13sp" />
         </LinearLayout>
+
+        <ImageView
+            android:id="@+id/lastBookAttention"
+            style="@style/WhlMetadataIcon"
+            android:layout_marginStart="6dp"
+            android:contentDescription="@string/home_needs_attention"
+            android:src="@drawable/ic_needs_attention"
+            android:visibility="gone" />
 
         <LinearLayout
             android:id="@+id/lastBookExtrasGroup"
