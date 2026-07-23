@@ -29,6 +29,8 @@
         ? options.normalizeLayout : (value) => value && typeof value === "object" ? value : {};
       this.normalizeEditors = typeof options.normalizeEditors === "function"
         ? options.normalizeEditors : (value) => value && typeof value === "object" ? value : {};
+      this.normalizeTools = typeof options.normalizeTools === "function"
+        ? options.normalizeTools : (value) => value && typeof value === "object" ? value : {};
     }
 
     key(profileKey) {
@@ -43,6 +45,7 @@
         profile_key: key,
         layout: clone(this.normalizeLayout(source.layout)),
         editors: clone(this.normalizeEditors(source.editors)),
+        tools: clone(this.normalizeTools(source.tools)),
       };
     }
 

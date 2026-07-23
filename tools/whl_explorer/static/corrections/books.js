@@ -841,6 +841,26 @@
     });
   }
 
+  function captureCommandTarget(book, capture) {
+    return freezeDeep({
+      key: `artifact:${capture.artifact_id}`,
+      objectType: "raster-artifact",
+      family: "image",
+      group: "source-images",
+      kind: "capture",
+      itemId: book.id,
+      id: capture.artifact_id,
+      artifactId: capture.artifact_id,
+      revision: capture.revision,
+      label: capture.label || `Capture ${capture.capture_order + 1}`,
+      effectiveCategory: capture.effective_category,
+      source: {
+        representationId: capture.representation_id || "",
+        canvasId: capture.canvas_id || "",
+      },
+    });
+  }
+
   function bookAddress(book) {
     return freezeDeep({
       itemId: book.id,
@@ -870,6 +890,10 @@
       this.documentRef = options.documentRef || this.root.ownerDocument;
       this.onNavigate = typeof options.onNavigate === "function"
         ? options.onNavigate : () => {};
+      this.onSelectionTarget = typeof options.onSelectionTarget === "function"
+        ? options.onSelectionTarget : () => {};
+      this.onHotTarget = typeof options.onHotTarget === "function"
+        ? options.onHotTarget : () => {};
       this.onStatus = typeof options.onStatus === "function"
         ? options.onStatus : () => {};
       this.filter = "";
@@ -914,6 +938,26 @@
       this.store.setSelection(address, {
         ownedByFeature: options.ownedByFeature === true,
       });
+      this.syncSelectionTarget(address, { focused: false, source: "selection" });
+    }
+
+    commandTargetForSelection(address) {
+      if (!address || !address.itemId || !address.artifactId) return null;
+      const snapshot = this.store.snapshot();
+      const book = snapshot.index && snapshot.index.books
+        .find((candidate) => candidate.id === address.itemId);
+      const capture = book && book.captures
+        .find((candidate) => candidate.artifact_id === address.artifactId);
+      return book && capture ? captureCommandTarget(book, capture) : null;
+    }
+
+    syncSelectionTarget(address, options = {}) {
+      const target = this.commandTargetForSelection(address);
+      this.onSelectionTarget(target, {
+        focused: options.focused === true,
+        source: options.source || "books",
+      });
+      return target;
     }
 
     visibleBooks(snapshot) {
@@ -1030,6 +1074,7 @@
       const captures = element(this.documentRef, "ul", "book-captures");
       setAttribute(captures, "aria-label", `Captured images for ${title}`);
       for (const capture of book.captures) {
+        const commandTarget = captureCommandTarget(book, capture);
         const item = element(this.documentRef, "li", "book-capture");
         const button = element(this.documentRef, "button", "capture-select");
         button.type = "button";
@@ -1039,8 +1084,9 @@
           `Capture ${capture.capture_order + 1}`;
         setAttribute(button, "aria-label",
           `${label}, ${category.label}, ${state}`);
-        setAttribute(button, "aria-pressed",
-          addressEqual(snapshot.selection, captureAddress(book, capture)) ? "true" : "false");
+        const captureSelected =
+          addressEqual(snapshot.selection, captureAddress(book, capture));
+        setAttribute(button, "aria-pressed", captureSelected ? "true" : "false");
         if (button.dataset) {
           button.dataset.artifactId = capture.artifact_id;
           button.dataset.category = capture.effective_category;
@@ -1070,8 +1116,30 @@
           chip,
           element(this.documentRef, "span", "capture-state", state),
         );
-        this.listenRow(button, "click", () =>
-          this.navigate(captureAddress(book, capture), "image"));
+        this.listenRow(button, "pointerenter", () =>
+          this.onHotTarget(commandTarget, { element: button, source: "books" }));
+        this.listenRow(button, "pointerleave", () =>
+          this.onHotTarget(null, { element: button, source: "books" }));
+        this.listenRow(button, "focus", () =>
+          this.onSelectionTarget(commandTarget, {
+            element: button,
+            focused: true,
+            source: "books",
+          }));
+        this.listenRow(button, "blur", () =>
+          this.onSelectionTarget(captureSelected ? commandTarget : null, {
+            element: button,
+            focused: false,
+            source: "books",
+          }));
+        this.listenRow(button, "click", () => {
+          this.onSelectionTarget(commandTarget, {
+            element: button,
+            focused: true,
+            source: "books",
+          });
+          this.navigate(captureAddress(book, capture), "image");
+        });
         item.append(button);
         captures.append(item);
       }
@@ -1110,6 +1178,7 @@
     bookAddress,
     bookNeedsAttention,
     captureAddress,
+    captureCommandTarget,
     captureState,
     compareBooks,
     normalizeAttentionEntry,

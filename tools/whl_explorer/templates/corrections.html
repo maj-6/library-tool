@@ -13,6 +13,10 @@
         href="{{ url_for('static', filename='corrections/artifacts.css') }}?v={{ corrections_artifacts_css_v }}" />
   <link rel="stylesheet"
         href="{{ url_for('static', filename='corrections/image-editor.css') }}?v={{ corrections_image_editor_css_v }}" />
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='corrections/classification.css') }}?v={{ corrections_classification_css_v }}" />
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='corrections/image-adjust-tool.css') }}?v={{ corrections_image_adjust_css_v }}" />
 </head>
 <body>
   <a class="skip-link" href="#corrections-editor">Skip to editor</a>
@@ -148,6 +152,8 @@
                   aria-label="Collapse Properties panel">›</button>
         </header>
         <div class="pane-body properties-body" id="properties-body">
+          <section class="classification-controls-host" data-classification-controls
+                   aria-label="Classification commands"></section>
           <dl class="property-list" data-properties-list>
             <div><dt>Selection</dt><dd>Nothing selected</dd></div>
           </dl>
@@ -196,6 +202,8 @@
     <footer class="statusbar" aria-label="Workbench status">
       <span data-status-message>Ready</span>
       <span data-profile-label>Profile: corrections/default</span>
+      <span class="sr-only" data-corrections-command-target
+            aria-live="polite" aria-atomic="true"></span>
     </footer>
   </div>
 
@@ -208,7 +216,12 @@
   <script src="{{ url_for('static', filename='corrections/artifacts.js') }}?v={{ corrections_artifacts_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/books.js') }}?v={{ corrections_books_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/reviews.js') }}?v={{ corrections_reviews_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/commands.js') }}?v={{ corrections_commands_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/keymap.js') }}?v={{ corrections_keymap_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/artifact-overlay.js') }}?v={{ corrections_artifact_overlay_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/classification-controls.js') }}?v={{ corrections_classification_controls_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-editor-state.js') }}?v={{ image_editor_state_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/image-adjust-tool.js') }}?v={{ corrections_image_adjust_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-editor.js') }}?v={{ corrections_image_editor_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/shell.js') }}?v={{ corrections_shell_v }}"></script>
 </body>

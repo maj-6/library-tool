@@ -1,0 +1,280 @@
+.corrections-artifact-overlay-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.properties-body > .classification-controls-host {
+  padding: 0.65rem;
+  border-bottom: 1px solid var(--corrections-border, #3b463b);
+}
+
+.classification-controls {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.classification-controls-title,
+.classification-controls-hint {
+  margin: 0;
+}
+
+.classification-controls-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+.classification-controls-hint,
+.classification-shortcut-instructions,
+.classification-shortcut-status {
+  color: var(--corrections-muted, #a9b3a9);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.classification-command-toolbar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.classification-command-button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 2.25rem;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid var(--corrections-border, #3b463b);
+  border-radius: 0.3rem;
+  background: var(--corrections-panel, #202720);
+  color: inherit;
+  text-align: left;
+}
+
+.classification-command-button:not(:disabled) {
+  cursor: pointer;
+}
+
+.classification-command-button:not(:disabled):hover {
+  border-color: var(--corrections-accent, #9ad77d);
+}
+
+.classification-command-button:focus-visible,
+.classification-shortcut-input:focus-visible,
+.classification-shortcut-reset:focus-visible,
+.classification-reset-all:focus-visible {
+  outline: 2px solid var(--focus, #ffd166);
+  outline-offset: 2px;
+}
+
+.classification-command-button:disabled {
+  opacity: 0.52;
+}
+
+.classification-command-code {
+  min-width: 2.2rem;
+  color: var(--corrections-accent, #9ad77d);
+  font: 700 0.72rem/1.1 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.classification-command-label {
+  overflow: hidden;
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.classification-command-key,
+.classification-shortcut-input {
+  font: 600 0.7rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.classification-command-key {
+  padding: 0.1rem 0.25rem;
+  border: 1px solid var(--corrections-border, #3b463b);
+  border-radius: 0.2rem;
+  background: color-mix(in srgb, var(--corrections-panel, #202720) 72%, black);
+}
+
+.classification-shortcut-editor {
+  border-top: 1px solid var(--corrections-border, #3b463b);
+  padding-top: 0.4rem;
+}
+
+.classification-shortcut-editor > summary {
+  width: max-content;
+  max-width: 100%;
+  color: var(--corrections-accent, #9ad77d);
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.classification-shortcut-instructions,
+.classification-shortcut-status {
+  margin: 0.45rem 0;
+}
+
+.classification-shortcut-list {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.classification-shortcut-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(6rem, 8rem) auto;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.classification-shortcut-label {
+  overflow: hidden;
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.classification-shortcut-input {
+  width: 100%;
+  min-width: 0;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--corrections-border, #3b463b);
+  border-radius: 0.25rem;
+  background: color-mix(in srgb, var(--corrections-panel, #202720) 68%, black);
+  color: inherit;
+  cursor: pointer;
+  text-align: center;
+}
+
+.classification-shortcut-reset,
+.classification-reset-all {
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--corrections-border, #3b463b);
+  border-radius: 0.25rem;
+  background: var(--corrections-panel, #202720);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.72rem;
+}
+
+.classification-reset-all {
+  margin-top: 0.5rem;
+}
+
+.classification-shortcut-status {
+  min-height: 1.1rem;
+}
+
+.classification-shortcut-status[data-error="true"] {
+  color: var(--corrections-danger, #ff8b85);
+}
+
+.corrections-artifact-overlay-region {
+  position: absolute;
+  min-width: 1px;
+  min-height: 1px;
+  pointer-events: none;
+}
+
+.corrections-artifact-overlay-shape {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 2px solid color-mix(in srgb, var(--accent, #65a9ff) 86%, white);
+  background: color-mix(in srgb, var(--accent, #65a9ff) 16%, transparent);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.corrections-artifact-overlay-shape:hover,
+.corrections-artifact-overlay-region[data-hot="true"]
+  .corrections-artifact-overlay-shape {
+  border-width: 3px;
+  background: color-mix(in srgb, var(--accent, #65a9ff) 28%, transparent);
+}
+
+.perspective-editor[data-active-tool="perspective"]
+  .corrections-artifact-overlay-shape,
+.perspective-editor[data-active-tool="image-adjust"]
+  .corrections-artifact-overlay-shape {
+  pointer-events: none;
+}
+
+.corrections-artifact-overlay-shape:focus-visible,
+.corrections-artifact-overlay-region[data-focused="true"]
+  .corrections-artifact-overlay-shape {
+  outline: 3px solid var(--focus, #ffd166);
+  outline-offset: 2px;
+  background: color-mix(in srgb, var(--focus, #ffd166) 24%, transparent);
+}
+
+.corrections-artifact-overlay-code {
+  position: absolute;
+  z-index: 2;
+  transform: translate(-50%, -50%);
+  min-width: 2.15em;
+  padding: 0.15rem 0.35rem;
+  border: 1px solid color-mix(in srgb, var(--panel-fg, #fff) 30%, transparent);
+  border-radius: 0.25rem;
+  background: color-mix(in srgb, var(--panel-bg, #171b22) 88%, transparent);
+  color: var(--panel-fg, #fff);
+  font: 700 0.7rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-align: center;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+[data-classification-hot="true"],
+[data-hot="true"][data-artifact-key] {
+  box-shadow: inset 3px 0 0 var(--accent, #65a9ff);
+}
+
+[data-classification-focused="true"] {
+  outline: 2px solid var(--focus, #ffd166);
+  outline-offset: -2px;
+}
+
+@media (forced-colors: active) {
+  .classification-command-button,
+  .classification-shortcut-input,
+  .classification-shortcut-reset,
+  .classification-reset-all {
+    border-color: CanvasText;
+  }
+
+  .corrections-artifact-overlay-shape {
+    border-color: Highlight;
+    background: transparent;
+    forced-color-adjust: none;
+  }
+
+  .corrections-artifact-overlay-shape:focus-visible {
+    outline-color: CanvasText;
+  }
+}
+
+@media (max-width: 720px) {
+  .classification-command-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .classification-shortcut-row {
+    grid-template-columns: minmax(0, 1fr) minmax(5.5rem, 7rem) auto;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .corrections-artifact-overlay-shape {
+    transition: background-color 80ms linear, border-width 80ms linear;
+  }
+}

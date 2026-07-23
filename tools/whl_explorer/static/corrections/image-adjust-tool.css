@@ -1,0 +1,97 @@
+.image-adjust-panel {
+  display: grid;
+  gap: 0.65rem;
+  margin-block-start: 0.85rem;
+  min-inline-size: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--corrections-border, #3b463b);
+  border-radius: 0.35rem;
+  background: color-mix(in srgb, var(--corrections-panel, #202720) 92%, black);
+}
+
+.image-adjust-panel legend {
+  padding-inline: 0.3rem;
+  font-weight: 650;
+}
+
+.image-adjust-panel[data-active="false"] {
+  opacity: 0.72;
+}
+
+.image-adjust-active-tool,
+.image-adjust-brightness-hint,
+.image-adjust-threshold,
+.image-adjust-job-status {
+  margin: 0;
+}
+
+.image-adjust-active-tool {
+  color: var(--corrections-accent, #9ad77d);
+  font-weight: 600;
+}
+
+.image-adjust-control,
+.image-adjust-ocr-control {
+  display: grid;
+  grid-template-columns: minmax(6.5rem, 1fr) minmax(4.5rem, auto);
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.image-adjust-control input {
+  inline-size: 5.5rem;
+}
+
+.image-adjust-control output {
+  justify-self: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.image-adjust-ocr-control {
+  grid-template-columns: auto 1fr;
+}
+
+.image-adjust-brightness-hint,
+.image-adjust-threshold {
+  color: var(--corrections-muted, #a9b3a9);
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+
+.image-adjust-threshold {
+  font-variant-numeric: tabular-nums;
+}
+
+.image-adjust-job-status {
+  min-block-size: 1.25em;
+  font-size: 0.86rem;
+}
+
+.perspective-image-stage .image-adjust-preview-canvas {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  image-rendering: auto;
+}
+
+.perspective-editor[data-active-tool="image-adjust"] .perspective-overlay-canvas {
+  z-index: 2;
+  opacity: 0;
+  pointer-events: auto;
+  cursor: default;
+}
+
+.perspective-image-stage:has(.perspective-overlay-canvas:focus-visible) {
+  outline: 3px solid var(--corrections-accent, #9ad77d);
+  outline-offset: 3px;
+}
+
+@media (forced-colors: active) {
+  .image-adjust-panel {
+    border-color: CanvasText;
+  }
+}

@@ -576,6 +576,8 @@
       store,
       onNavigate: options.onNavigate,
       onStatus: status,
+      onSelectionTarget: options.onSelectionTarget,
+      onHotTarget: options.onHotTarget,
     };
     const books = options.booksController || new deps.BooksPanelController(shared);
     const reviews = options.reviewsController || new ReviewsPanelController({
@@ -604,13 +606,35 @@
         return store.openWorkspace(context.workspace_id, {
           selection,
           selectionOwned: false,
+        }).then((result) => {
+          if (typeof books.syncSelectionTarget === "function") {
+            books.syncSelectionTarget(selection, {
+              focused: false,
+              source: "context",
+            });
+          }
+          return result;
         });
       },
       setSelection(selection) {
         store.setSelection(selection, { ownedByFeature: false });
+        if (typeof books.syncSelectionTarget === "function") {
+          books.syncSelectionTarget(selection, {
+            focused: false,
+            source: "selection",
+          });
+        }
       },
       refresh(reason = "manual") {
-        return store.refresh({ reason });
+        return store.refresh({ reason }).then((result) => {
+          if (typeof books.syncSelectionTarget === "function") {
+            books.syncSelectionTarget(store.snapshot().selection, {
+              focused: false,
+              source: "refresh",
+            });
+          }
+          return result;
+        });
       },
       destroy() {
         books.destroy();

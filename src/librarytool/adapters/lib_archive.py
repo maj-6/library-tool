@@ -3,7 +3,9 @@
 The planner is intentionally independent of Flask and filesystem layout.  The
 composition root supplies the format sanitizers and Replica policies while
 this adapter owns hostile-ZIP handling, merge decisions, and construction of
-the engine's immutable import plan.
+the engine's immutable import plan.  A non-empty lib/3 capture graph is
+rejected explicitly until a canonical representation/artifact import adapter
+can consume it; accepting and silently dropping that graph is forbidden.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import io
 import hashlib
 import json
 import re
+import stat
 import zipfile
 import zlib
 from collections.abc import Callable, Mapping
@@ -37,6 +40,26 @@ _TRANSLATION_MEMBER = re.compile(
     r"translations/([a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\.json"
 )
 _BOOK_ID = re.compile(r"b-[0-9a-f]{32}")
+
+
+def _safe_archive_member(name: object, *, directory: bool = False) -> bool:
+    if not isinstance(name, str) or not name or len(name) > 1024:
+        return False
+    if "\\" in name or "\x00" in name or name.startswith("/"):
+        return False
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        return False
+    if re.match(r"^[A-Za-z]:", name):
+        return False
+    candidate = name[:-1] if directory and name.endswith("/") else name
+    return bool(candidate) and all(
+        part not in ("", ".", "..") for part in candidate.split("/")
+    )
+
+
+def _is_symlink(info: zipfile.ZipInfo) -> bool:
+    mode = (int(info.external_attr) >> 16) & 0xFFFF
+    return bool(mode) and stat.S_ISLNK(mode)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -157,6 +180,48 @@ class ExistingItemLibArchivePlanner:
                 "the .lib has no valid stable book_id",
                 code="invalid_lib_book_id",
             )
+        if fmt[0] >= 3:
+            representations = book.get("representations")
+            artifacts = book.get("artifacts")
+            graph_members = [
+                name
+                for name in decoded.members
+                if (
+                    name.startswith("representations/")
+                    or name.startswith("artifacts/")
+                )
+            ]
+            graph_present = (
+                not isinstance(representations, list)
+                or not isinstance(artifacts, list)
+                or bool(representations)
+                or bool(artifacts)
+                or bool(graph_members)
+            )
+            if graph_present:
+                raise ValidationError(
+                    "capture-aware .lib/3 graphs require the canonical "
+                    "representation/artifact import adapter",
+                    code="lib3_capture_graph_import_unsupported",
+                    details={
+                        "format_version": f"{fmt[0]}.{fmt[1]}",
+                        "representations": (
+                            len(representations)
+                            if isinstance(representations, list)
+                            else None
+                        ),
+                        "artifacts": (
+                            len(artifacts)
+                            if isinstance(artifacts, list)
+                            else None
+                        ),
+                        "accepted": False,
+                        "data_discarded": False,
+                        "required_adapter": (
+                            "canonical-representation-artifact-import"
+                        ),
+                    },
+                )
 
         warnings: list[ImportWarning] = []
 
@@ -269,6 +334,22 @@ class ExistingItemLibArchivePlanner:
                         raise ValidationError(
                             f"duplicate archive member {info.filename!r}",
                             code="duplicate_lib_member",
+                        )
+                    if not _safe_archive_member(
+                        info.filename,
+                        directory=info.is_dir(),
+                    ):
+                        raise ValidationError(
+                            f"unsafe archive member {info.filename!r}",
+                            code="unsafe_lib_member",
+                            details={"member": info.filename},
+                        )
+                    if _is_symlink(info):
+                        raise ValidationError(
+                            f"symbolic-link archive member "
+                            f"{info.filename!r} is forbidden",
+                            code="unsafe_lib_member",
+                            details={"member": info.filename},
                         )
                     names.add(info.filename)
                     if info.filename == "book.json":

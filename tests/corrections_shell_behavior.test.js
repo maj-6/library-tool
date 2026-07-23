@@ -13,6 +13,13 @@ const {
   validateProfileKey,
 } = require("../tools/whl_explorer/static/corrections/ui-profile");
 const {
+  normalizeImageAdjustProfile,
+} = require("../tools/whl_explorer/static/corrections/image-adjust-tool");
+const {
+  CorrectionCommandRegistry,
+  DEFAULT_CLASSIFICATION_COMMANDS,
+} = require("../tools/whl_explorer/static/corrections/commands");
+const {
   DEFAULT_LAYOUT,
   EDITOR_MIN_HEIGHT,
   EDITOR_MIN_WIDTH,
@@ -364,24 +371,35 @@ test("layout limits preserve a usable editor at smaller non-compact widths", () 
 });
 
 
-test("UI profiles are isolated, validated, and persist presentation choices only", () => {
+test("UI profiles are isolated, validated, and persist presentation/tool choices only", () => {
   const storage = new MemoryStorage();
   const registry = createDefaultEditorRegistry();
   const store = new CorrectionsProfileStore({
     storage,
     normalizeLayout: normalizeLayoutState,
     normalizeEditors: (value) => registry.validateChoices(value),
+    normalizeTools: (value) => ({
+      imageAdjust: normalizeImageAdjustProfile(value && value.imageAdjust),
+    }),
   });
   const saved = store.save("corrections/default", {
     layout: { navigatorWidth: 410, collapsed: { tray: true } },
     editors: { image: "image-plain", text: "image-overlay" },
+    tools: {
+      imageAdjust: { lastAppliedBrightness: 24 },
+      privateLocator: "must-not-persist",
+    },
     selection: { itemId: "must-not-persist" },
     drafts: { caption: "must-not-persist" },
   });
   assert.equal(saved.schema, PROFILE_SCHEMA);
   assert.equal(saved.layout.navigatorWidth, 410);
   assert.deepEqual(saved.editors, { image: "image-plain" });
-  assert.deepEqual(Object.keys(saved).sort(), ["editors", "layout", "profile_key", "schema"]);
+  assert.deepEqual(saved.tools, {
+    imageAdjust: { lastAppliedBrightness: 24 },
+  });
+  assert.deepEqual(Object.keys(saved).sort(),
+    ["editors", "layout", "profile_key", "schema", "tools"]);
   assert.equal(store.load("corrections/default").found, true);
   assert.equal(store.load("corrections/alternate").found, false);
 
@@ -391,6 +409,108 @@ test("UI profiles are isolated, validated, and persist presentation choices only
   assert.deepEqual(broken.layout, normalizeLayoutState({}));
   assert.throws(() => validateProfileKey("corrections/../private"), TypeError);
   assert.throws(() => store.load("corrections/__proto__"), TypeError);
+});
+
+
+test("shell profile persistence restores classification remaps without domain state", () => {
+  const registry = new CorrectionCommandRegistry();
+  for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+    registry.register({ ...command, execute: async () => null });
+  }
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.classificationController = { registry };
+  shell.restoringProfile = false;
+  shell.restoreClassificationProfile({
+    bindings: {
+      "corrections.category.title-page": "ctrl+t",
+      "corrections.category.cover": "v",
+    },
+  });
+  assert.equal(registry.bindingFor("corrections.category.title-page"), "ctrl+t");
+  assert.equal(registry.bindingFor("corrections.category.cover"), "v");
+  assert.equal(registry.bindingFor("corrections.category.spine"), "s");
+
+  let saved = null;
+  shell.layout = { getState: () => ({ navigatorWidth: 300 }) };
+  shell.editorRegistry = { serializeChoices: () => ({ image: "image-overlay" }) };
+  shell.imageAdjustTool = {
+    serializeProfile: () => ({ lastAppliedBrightness: 18 }),
+  };
+  shell.profileKey = "corrections/default";
+  shell.profileStore = {
+    save(profileKey, value) { saved = { profileKey, value }; },
+  };
+  shell.updateProfileLabel = () => {};
+  shell.persistProfile();
+
+  assert.equal(saved.profileKey, "corrections/default");
+  assert.deepEqual(saved.value.tools.imageAdjust, {
+    lastAppliedBrightness: 18,
+  });
+  assert.equal(
+    saved.value.tools.classification.bindings["corrections.category.title-page"],
+    "ctrl+t",
+  );
+  assert.equal("selection" in saved.value, false);
+  assert.equal("drafts" in saved.value, false);
+
+  shell.restoreClassificationProfile(null);
+  for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+    assert.equal(registry.bindingFor(command.id), command.defaultBinding);
+  }
+});
+
+
+test("classification shortcuts stay inside their image and artifact surfaces", () => {
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.root = { dataset: {} };
+  const reviewButton = {
+    dataset: { reviewAction: "resolve" },
+    parentNode: { dataset: { trayPanel: "reviews" }, parentNode: shell.root },
+  };
+  const captureButton = {
+    dataset: { captureId: "capture-1" },
+    parentNode: { dataset: { booksList: "" }, parentNode: shell.root },
+  };
+  const editorCanvas = {
+    dataset: {},
+    parentNode: { dataset: { editorHost: "" }, parentNode: shell.root },
+  };
+  assert.equal(shell.classificationEventEligible(
+    { target: reviewButton }, null, {}), false);
+  assert.equal(shell.classificationEventEligible(
+    { target: captureButton }, null, {}), true);
+  assert.equal(shell.classificationEventEligible(
+    { target: editorCanvas }, null, {}), true);
+  assert.equal(shell.classificationEventEligible(
+    { target: reviewButton }, null, { softTarget: { id: "hovered-image" } }), false,
+    "hover state cannot escape the pane that owns the keyboard event");
+});
+
+
+test("overlay blur demotes classification focus without erasing its selected target", () => {
+  const shell = Object.create(CorrectionsShell.prototype);
+  const target = { key: "annotation:box-1" };
+  const calls = [];
+  shell.classificationController = {
+    setSelectionFocus(value) { calls.push(value); },
+  };
+  shell.demoteClassificationFocus();
+  assert.deepEqual(calls, [false]);
+
+  let retained = null;
+  shell.classificationController = {
+    stateSnapshot: () => ({ selectionTarget: target }),
+    setSelectionTarget(value, options) { retained = { value, options }; },
+  };
+  shell.demoteClassificationFocus();
+  assert.equal(retained.value, target);
+  assert.equal(retained.options.focused, false);
+
+  shell.classificationController = { mount() {} };
+  shell.root = { querySelector: () => ({}) };
+  assert.doesNotThrow(() => shell.mountClassificationControls(),
+    "partial injected controllers must not crash the workbench");
 });
 
 
@@ -659,6 +779,13 @@ test("standalone shell markup exposes accessible panes, tree, editor, tray, and 
     "large OCR or metadata documents must not become atomic live-region announcements");
   assert.match(templateSource, /data-layout-action="maximize-primary"/);
   assert.match(templateSource, /data-layout-action="reset"/);
+  assert.match(templateSource,
+    /data-classification-controls[^>]+aria-label="Classification commands"/);
+  assert.match(templateSource,
+    /data-corrections-command-target[^>]+aria-live="polite"[^>]+aria-atomic="true"/);
+  assert.match(templateSource, /corrections\/commands\.js/);
+  assert.match(templateSource, /corrections\/classification-controls\.js/);
+  assert.match(templateSource, /corrections\/image-adjust-tool\.js/);
 
   const separators = [...templateSource.matchAll(/<div[^>]+role="separator"[^>]*>/g)];
   assert.equal(separators.length, 4);
