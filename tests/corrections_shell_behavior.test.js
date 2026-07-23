@@ -772,10 +772,14 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
       list() {},
       get() {},
     },
+    corrections: {
+      queueTransform() {},
+    },
   };
   const standalone = correctionsRuntimePorts({ engineClient }, null);
   assert.equal(typeof standalone.artifacts.catalog.list, "function");
   assert.equal(typeof standalone.artifacts.resources.resolveRaster, "function");
+  assert.equal(typeof standalone.invokeCommand, "function");
 
   const desktopCorrections = { artifacts: { catalog: { list() {} } } };
   assert.equal(

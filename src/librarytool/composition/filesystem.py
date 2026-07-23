@@ -31,6 +31,8 @@ from ..adapters.filesystem import (
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
     FilesystemCorrectionRepository,
+    FilesystemCorrectionSourceSnapshotReader,
+    FilesystemCorrectionTransformStore,
     FilesystemCorrectionsArtifactRepository,
     FilesystemInterchangeRepository,
     FilesystemItemCommandRepository,
@@ -55,6 +57,10 @@ from ..engine.correction_projection import (
     reconcile_correction_aggregates,
 )
 from ..engine.corrections import CorrectionService
+from ..engine.correction_transforms import (
+    CorrectionTransformService,
+    CorrectionTransformWorker,
+)
 from ..engine.canvases import CanvasQueryService
 from ..engine.errors import RepositoryError
 from ..engine.interchange import (
@@ -98,6 +104,7 @@ from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -414,6 +421,7 @@ class CorrectionsBindings:
     capture_authority_root: Path
     representation_revision_for: CorrectionsRepresentationRevision
     lock_context_for: CatalogueLockFactory
+    job_start_context_for: ItemLockFactory | None = None
 
     def __post_init__(self) -> None:
         capture_authority_root = Path(self.capture_authority_root)
@@ -436,6 +444,11 @@ class CorrectionsBindings:
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+        if (
+            self.job_start_context_for is not None
+            and not callable(self.job_start_context_for)
+        ):
+            raise TypeError("job_start_context_for must be callable or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +692,7 @@ class FilesystemServiceGraph:
     secret_store: SecretStoreService | None = None
     provider_discovery: ProviderDiscoveryService | None = None
     correction_commands: CorrectionService | None = None
+    correction_transforms: CorrectionTransformService | None = None
     raster_artifacts: RasterArtifactProjectorPort | None = None
     spatial_annotations: SpatialAnnotationProjectorPort | None = None
 
@@ -711,7 +725,14 @@ class FilesystemServiceGraph:
             CorrectionService,
         ):
             raise TypeError("correction_commands must be a CorrectionService or None")
-
+        if self.correction_transforms is not None and not isinstance(
+            self.correction_transforms,
+            CorrectionTransformService,
+        ):
+            raise TypeError(
+                "correction_transforms must be a "
+                "CorrectionTransformService or None"
+            )
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
@@ -729,6 +750,7 @@ class FilesystemServiceGraph:
             (SECRET_STORE_SERVICE, self.secret_store),
             (PROVIDER_DISCOVERY_SERVICE, self.provider_discovery),
             (CORRECTION_SERVICE, self.correction_commands),
+            (CORRECTION_TRANSFORM_SERVICE, self.correction_transforms),
             (RASTER_ARTIFACT_QUERY_SERVICE, self.raster_artifacts),
             (
                 SPATIAL_ANNOTATION_QUERY_SERVICE,
@@ -833,6 +855,7 @@ def compose_filesystem_engine(
 
     corrections_artifacts = None
     correction_commands = None
+    correction_transforms = None
     if corrections is not None:
         corrections_lock = _ReentrantContextFactory(corrections.lock_context_for)
         corrections_base = FilesystemCorrectionsArtifactRepository(
@@ -863,6 +886,26 @@ def compose_filesystem_engine(
             corrections_base,
             corrections_base,
             correction_repository,
+        )
+        correction_source_reader = FilesystemCorrectionSourceSnapshotReader(
+            corrections_artifacts,
+            corrections_artifacts,
+            corrections_artifacts,
+        )
+        correction_transform_store = FilesystemCorrectionTransformStore(
+            resources.write_set,
+            source_snapshot_for=correction_source_reader,
+            lock_context_for=corrections_lock,
+            recover=False,
+        )
+        correction_transform_worker = CorrectionTransformWorker(
+            resources.jobs,
+            correction_transform_store,
+        )
+        correction_transforms = CorrectionTransformService(
+            resources.jobs,
+            executor=correction_transform_worker.run,
+            start_guard_for=corrections.job_start_context_for,
         )
 
     canvas_query = None
@@ -1065,6 +1108,7 @@ def compose_filesystem_engine(
         secret_store=secret_store,
         provider_discovery=(None if providers is None else providers.service),
         correction_commands=correction_commands,
+        correction_transforms=correction_transforms,
         raster_artifacts=corrections_artifacts,
         spatial_annotations=corrections_artifacts,
     )

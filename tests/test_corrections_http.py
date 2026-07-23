@@ -17,6 +17,11 @@ from librarytool.engine.correction_projection import (
     reconcile_correction_aggregates,
 )
 from librarytool.engine.corrections import CorrectionService
+from librarytool.engine.correction_transforms import (
+    CorrectionTransformCommand,
+    CorrectionTransformService,
+)
+from librarytool.engine.jobs import JobManager
 from librarytool.engine.raster_artifacts import (
     ArtifactFreshness,
     ArtifactProvenance,
@@ -30,6 +35,7 @@ from librarytool.engine.raster_artifacts import (
 )
 from librarytool.engine.runtime import (
     CORRECTION_SERVICE,
+    CORRECTION_TRANSFORM_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
 )
@@ -146,13 +152,15 @@ class _SpatialProjector:
 
 
 class _Engine:
-    def __init__(self, raster, spatial, corrections=None):
+    def __init__(self, raster, spatial, corrections=None, transforms=None):
         self.services = {
             RASTER_ARTIFACT_QUERY_SERVICE: raster,
             SPATIAL_ANNOTATION_QUERY_SERVICE: spatial,
         }
         if corrections is not None:
             self.services[CORRECTION_SERVICE] = corrections
+        if transforms is not None:
+            self.services[CORRECTION_TRANSFORM_SERVICE] = transforms
 
     def get_service(self, key):
         return self.services.get(key)
@@ -184,7 +192,7 @@ class _Resolver:
         )
 
 
-def _app(engine, resolver=None):
+def _app(engine, resolver=None, transform_submitter=None):
     app = Flask(__name__)
     app.register_blueprint(
         create_corrections_blueprint(
@@ -192,6 +200,7 @@ def _app(engine, resolver=None):
             raster_resource_resolver_for_request=(
                 None if resolver is None else lambda: resolver
             ),
+            correction_transform_submitter=transform_submitter,
         )
     )
     return app
@@ -698,3 +707,128 @@ def test_correction_mutation_transport_rejects_ambiguous_documents(tmp_path):
     assert duplicate.get_json()["code"] == "invalid_correction_mutation_document"
     assert extra.status_code == 400
     assert extra.get_json()["code"] == "invalid_correction_mutation_envelope"
+
+
+def _transform_command(artifact, operation_id="transform-op-1"):
+    return CorrectionTransformCommand(
+        item_id=artifact.key.item_id,
+        artifact_id=artifact.key.artifact_id,
+        artifact_revision=artifact.revision,
+        source_revision=artifact.resource.revision,
+        source_sha256=artifact.content_sha256,
+        quad=((0, 0), (1, 0), (1, 1), (0, 1)),
+        operation_id=operation_id,
+    )
+
+
+def test_transform_queue_is_versioned_idempotent_and_schedules_outside_http():
+    artifact = _raster("image-a")
+    jobs = JobManager(checkpoint_interval=0)
+    transforms = CorrectionTransformService(jobs)
+    submitted = []
+
+    def submitter(service, command, queued):
+        submitted.append((service, command, queued))
+
+    client = _app(
+        _Engine(
+            _RasterProjector((artifact,)),
+            _SpatialProjector(()),
+            transforms=transforms,
+        ),
+        transform_submitter=submitter,
+    ).test_client()
+    command = _transform_command(artifact)
+    path = "/api/v1/items/book-1/raster-artifacts/image-a/transforms"
+    headers = {
+        "Idempotency-Key": command.operation_id,
+        "If-Artifact-Match": f'"{artifact.revision}"',
+    }
+
+    first = client.post(path, json=command.as_dict(), headers=headers)
+    replay = client.post(path, json=command.as_dict(), headers=headers)
+
+    assert first.status_code == 202
+    assert replay.status_code == 200
+    body = first.get_json()
+    assert body["schema"] == (
+        "librarytool.correction-transform-queue-receipt/1"
+    )
+    assert body["replayed"] is False
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["job_id"] == body["job_id"]
+    assert body["job"]["kind"] == "correction.transform"
+    assert body["job"]["input_revisions"] == {
+        "artifact_id": artifact.key.artifact_id,
+        "artifact_revision": artifact.revision,
+        "operation_id": command.operation_id,
+        "source_revision": artifact.resource.revision,
+        "source_sha256": artifact.content_sha256,
+    }
+    assert "command_sha256" not in str(body)
+    assert first.headers["Location"] == (
+        f"/api/v1/jobs/{body['job_id']}"
+    )
+    assert first.headers["Cache-Control"] == "no-store"
+    assert len(jobs.list()) == 1
+    assert [value[2].created for value in submitted] == [True, False]
+
+
+def test_transform_queue_rejects_envelope_mismatch_before_registration():
+    artifact = _raster("image-a")
+    jobs = JobManager()
+    transforms = CorrectionTransformService(jobs)
+    client = _app(
+        _Engine(
+            _RasterProjector((artifact,)),
+            _SpatialProjector(()),
+            transforms=transforms,
+        ),
+        transform_submitter=lambda *_args: None,
+    ).test_client()
+    command = _transform_command(artifact)
+    payload = command.as_dict()
+    payload["artifact_revision"] = "different-revision"
+
+    response = client.post(
+        "/api/v1/items/book-1/raster-artifacts/image-a/transforms",
+        json=payload,
+        headers={
+            "Idempotency-Key": command.operation_id,
+            "If-Artifact-Match": f'"{artifact.revision}"',
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == (
+        "correction_transform_envelope_mismatch"
+    )
+    assert jobs.list() == []
+
+
+def test_transform_queue_requires_a_process_executor_before_registration():
+    artifact = _raster("image-a")
+    jobs = JobManager()
+    client = _app(
+        _Engine(
+            _RasterProjector((artifact,)),
+            _SpatialProjector(()),
+            transforms=CorrectionTransformService(jobs),
+        )
+    ).test_client()
+    command = _transform_command(artifact)
+
+    response = client.post(
+        "/api/v1/items/book-1/raster-artifacts/image-a/transforms",
+        json=command.as_dict(),
+        headers={
+            "Idempotency-Key": command.operation_id,
+            "If-Artifact-Match": f'"{artifact.revision}"',
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.get_json()["code"] == (
+        "correction_transform_executor_unavailable"
+    )
+    assert jobs.list() == []

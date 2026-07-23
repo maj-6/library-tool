@@ -23,6 +23,7 @@ from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -60,6 +61,9 @@ RASTER_ARTIFACTS_CLASSIFY_CAPABILITY = CapabilityRef(
     "library.raster-artifacts.classify"
 )
 SPATIAL_ANNOTATIONS_EDIT_CAPABILITY = CapabilityRef("library.spatial-annotations.edit")
+CORRECTION_TRANSFORMS_QUEUE_CAPABILITY = CapabilityRef(
+    "library.corrections.transforms.queue"
+)
 
 
 FIRST_PARTY_MODULE_MANIFESTS = (
@@ -144,6 +148,16 @@ FIRST_PARTY_MODULE_MANIFESTS = (
             SPATIAL_ANNOTATIONS_EDIT_CAPABILITY,
         ),
         requires=(
+            RASTER_ARTIFACTS_READ_CAPABILITY,
+            SPATIAL_ANNOTATIONS_READ_CAPABILITY,
+        ),
+    ),
+    ModuleManifest(
+        "library.corrections.transforms",
+        "1.0.0",
+        provides=(CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,),
+        requires=(
+            CapabilityRef("library.jobs"),
             RASTER_ARTIFACTS_READ_CAPABILITY,
             SPATIAL_ANNOTATIONS_READ_CAPABILITY,
         ),
@@ -260,6 +274,7 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             CapabilityRef("library.jobs"),
             RASTER_ARTIFACTS_CLASSIFY_CAPABILITY,
             SPATIAL_ANNOTATIONS_EDIT_CAPABILITY,
+            CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,
         ),
     ),
 )
@@ -417,6 +432,22 @@ def first_party_module_contributions(
             )
         )
 
+    if graph.correction_transforms is not None:
+        contributions.append(
+            ModuleContribution(
+                modules["library.corrections.transforms"],
+                bindings=(
+                    ServiceBinding(
+                        CORRECTION_TRANSFORM_SERVICE,
+                        graph.correction_transforms,
+                        modules[
+                            "library.corrections.transforms"
+                        ].provides,
+                    ),
+                ),
+            )
+        )
+
     if graph.text_layer_aggregate is not None:
         contributions.append(
             ModuleContribution(
@@ -549,6 +580,7 @@ def first_party_module_contributions(
 
 
 __all__ = [
+    "CORRECTION_TRANSFORMS_QUEUE_CAPABILITY",
     "FIRST_PARTY_MODULE_MANIFESTS",
     "FIRST_PARTY_WORKBENCH_MANIFESTS",
     "first_party_module_contributions",

@@ -382,7 +382,11 @@
         ? options.invokeCommand
         : desktopCorrections && typeof desktopCorrections.invokeCommand === "function"
           ? desktopCorrections.invokeCommand.bind(desktopCorrections)
-          : null;
+          : this.engineCorrections &&
+              typeof this.engineCorrections.invokeCommand === "function"
+            ? this.engineCorrections.invokeCommand.bind(
+              this.engineCorrections)
+            : null;
       const imageAdjustOptions = isPlainObject(options.imageAdjustOptions)
         ? options.imageAdjustOptions : {};
       this.imageAdjustTool = options.imageAdjustTool ||

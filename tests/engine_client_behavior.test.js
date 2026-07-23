@@ -238,6 +238,65 @@ function correctionMutationResult({
   };
 }
 
+function correctionTransformCommand(overrides = {}) {
+  return {
+    schema: "org.whl.correction-transform-command",
+    version: 1,
+    item_id: "book:one",
+    artifact_id: "image:one",
+    artifact_revision: "artifact-r1",
+    source_revision: "resource-r1",
+    source_sha256: "a".repeat(64),
+    quad: [[0, 0], [1, 0], [1, 1], [0, 1]],
+    adjustment: null,
+    rerun_ocr: false,
+    operation_id: "transform:one",
+    ...overrides,
+  };
+}
+
+function correctionTransformQueueResult(command, overrides = {}) {
+  const jobId = "correction-transform-abc123";
+  return {
+    ok: true,
+    schema: "librarytool.correction-transform-queue-receipt/1",
+    replayed: false,
+    operation_id: command.operation_id,
+    job_id: jobId,
+    job: {
+      id: jobId,
+      kind: "correction.transform",
+      state: "queued",
+      subject: {
+        item_id: command.item_id,
+        source_id: command.artifact_id,
+      },
+      progress: {
+        completed: 0,
+        total: 6,
+        unit: "phase",
+        phase: "queued",
+      },
+      cancellable: true,
+      revision: 1,
+      created_at: "2026-07-23T12:00:00+00:00",
+      updated_at: "2026-07-23T12:00:00+00:00",
+      finished_at: "",
+      note: "",
+      error: null,
+      input_revisions: {
+        artifact_id: command.artifact_id,
+        artifact_revision: command.artifact_revision,
+        source_revision: command.source_revision,
+        source_sha256: command.source_sha256,
+        operation_id: command.operation_id,
+      },
+      outputs: [],
+    },
+    ...overrides,
+  };
+}
+
 function manualCategoryAssignment(category = "cover") {
   return {
     category,
@@ -291,6 +350,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.corrections.clearImageCategory, "function");
   assert.equal(typeof client.corrections.assignRegionRole, "function");
   assert.equal(typeof client.corrections.clearRegionRole, "function");
+  assert.equal(typeof client.corrections.queueTransform, "function");
   assert.equal(typeof client.itemTombstones.list, "function");
   assert.equal(typeof client.itemTombstones.get, "function");
   assert.equal(typeof client.itemTombstones.restore, "function");
@@ -803,6 +863,65 @@ test("correction mutations reject unsafe commands and malformed receipts", async
     (error) => error instanceof EngineClientError &&
       error.code === "invalid-response",
   );
+});
+
+test("correction transforms own their canonical queue transport", async () => {
+  const command = correctionTransformCommand();
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(202, correctionTransformQueueResult(command));
+    },
+  });
+
+  const result = await client.corrections.queueTransform({ command });
+
+  assert.equal(result.job_id, "correction-transform-abc123");
+  assert.deepEqual(calls.map((call) => [
+    call.init.method,
+    call.url,
+    call.init.headers,
+    JSON.parse(call.init.body),
+  ]), [[
+    "POST",
+    "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/transforms",
+    {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "Idempotency-Key": "transform:one",
+      "If-Artifact-Match": "\"artifact-r1\"",
+    },
+    command,
+  ]]);
+});
+
+test("correction transform queue rejects noncanonical commands and receipts", async () => {
+  let transports = 0;
+  const command = correctionTransformCommand();
+  const client = new EngineClient({
+    transport: async () => {
+      transports += 1;
+      const body = correctionTransformQueueResult(command);
+      body.job.input_revisions.command_sha256 = "b".repeat(64);
+      return response(202, body);
+    },
+  });
+
+  await assert.rejects(
+    client.corrections.queueTransform({
+      command: { ...command, unexpected: true },
+    }),
+    TypeError,
+  );
+  assert.equal(transports, 0);
+
+  await assert.rejects(
+    client.corrections.queueTransform({ command }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response" && error.body === null,
+  );
+  assert.equal(transports, 1);
 });
 
 test("secret reads expose only versioned masked status", async () => {

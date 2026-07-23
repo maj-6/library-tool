@@ -14,7 +14,10 @@ from librarytool.composition import (
     first_party_module_contributions,
 )
 from librarytool.engine.capabilities import CapabilityRef
+from librarytool.engine.correction_transforms import CorrectionTransformService
+from librarytool.engine.corrections import CorrectionService
 from librarytool.engine.items import ItemQueryService
+from librarytool.engine.jobs import JobManager
 from librarytool.engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
@@ -114,6 +117,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.canvases": "1.0.0",
         "library.corrections.artifacts": "1.0.0",
         "library.corrections.commands": "1.0.0",
+        "library.corrections.transforms": "1.0.0",
         "library.text-layers": "1.0.0",
         "library.secrets": "1.0.0",
         "library.providers": "1.0.0",
@@ -174,6 +178,15 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.spatial-annotations.edit", 1),
     }
     assert _capabilities(correction_commands.requires) == {
+        ("library.raster-artifacts.read", 1),
+        ("library.spatial-annotations.read", 1),
+    }
+    correction_transforms = modules["library.corrections.transforms"]
+    assert _capabilities(correction_transforms.provides) == {
+        ("library.corrections.transforms.queue", 1),
+    }
+    assert _capabilities(correction_transforms.requires) == {
+        ("library.jobs", 1),
         ("library.raster-artifacts.read", 1),
         ("library.spatial-annotations.read", 1),
     }
@@ -254,6 +267,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     }
     assert _capabilities(workbenches["corrections"].enhances) == {
         ("library.jobs", 1),
+        ("library.corrections.transforms.queue", 1),
         ("library.raster-artifacts.classify", 1),
         ("library.spatial-annotations.edit", 1),
     }
@@ -603,3 +617,41 @@ def test_service_graph_rejects_half_installed_canvas_vertical():
             canvas_query=None,
             canvas_preparation=object(),
         )
+
+
+def test_service_graph_allows_independent_correction_command_modules():
+    graph = _graph()
+    commands = CorrectionService(object())
+    transforms = CorrectionTransformService(JobManager())
+
+    command_only = replace(
+        graph,
+        correction_commands=commands,
+        correction_transforms=None,
+    )
+    transform_only = replace(
+        graph,
+        correction_commands=None,
+        correction_transforms=transforms,
+    )
+
+    assert command_only.correction_commands is commands
+    assert command_only.correction_transforms is None
+    assert transform_only.correction_commands is None
+    assert transform_only.correction_transforms is transforms
+    assert {
+        contribution.manifest.id
+        for contribution in first_party_module_contributions(command_only)
+    } >= {"library.corrections.commands"}
+    assert "library.corrections.transforms" not in {
+        contribution.manifest.id
+        for contribution in first_party_module_contributions(command_only)
+    }
+    assert {
+        contribution.manifest.id
+        for contribution in first_party_module_contributions(transform_only)
+    } >= {"library.corrections.transforms"}
+    assert "library.corrections.commands" not in {
+        contribution.manifest.id
+        for contribution in first_party_module_contributions(transform_only)
+    }

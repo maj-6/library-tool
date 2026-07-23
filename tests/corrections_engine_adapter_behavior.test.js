@@ -17,6 +17,8 @@ function raster(id, kind = "captured-image", overrides = {}) {
     kind,
     label: id,
     media_type: "image/jpeg",
+    content_sha256: "a".repeat(64),
+    dimensions: { width: 1200, height: 1600, orientation: 1 },
     resource_state: "available",
     resource: {
       id: `resource:${id}`,
@@ -30,6 +32,7 @@ function raster(id, kind = "captured-image", overrides = {}) {
       canvas_id: "page-1",
       canvas_revision: "page-r1",
     },
+    extensions: {},
     ...overrides,
   };
 }
@@ -132,6 +135,14 @@ test("engine decorations preserve transport values and supply artifact model ide
   assert.equal(decoratedRaster.object_type, "raster-artifact");
   assert.equal(decoratedRaster.artifact_id, "capture:asset-1:display");
   assert.equal(decoratedRaster.group, "source-images");
+  assert.deepEqual(decoratedRaster.correction, {
+    item_id: "book-1",
+    artifact_id: "capture:asset-1:display",
+    artifact_revision: "capture:asset-1:display-r1",
+    source_revision: "capture:asset-1:display-resource-r1",
+    source_sha256: "a".repeat(64),
+    proposal: null,
+  });
   assert.equal(decoratedAnnotation.object_type, "spatial-annotation");
   assert.equal(decoratedAnnotation.annotation_id, "region:1");
   assert.equal(decoratedAnnotation.kind, "spatial-annotation");
@@ -493,4 +504,36 @@ test("classification commands delegate operation IDs and revision pins", async (
       idempotencyKey: "role-clear-op",
     }],
   ]);
+});
+
+
+test("transform commands bridge the image editor to EngineClient", async () => {
+  const calls = [];
+  const command = {
+    schema: "org.whl.correction-transform-command",
+    operation_id: "transform-op",
+  };
+  const { engineClient } = engineHarness({
+    corrections: {
+      async queueTransform(payload) {
+        calls.push(payload);
+        return { job_id: "correction-transform-job-1" };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient);
+  const signal = new AbortController().signal;
+
+  const result = await ports.invokeCommand(
+    "corrections.transform.queue",
+    { command, signal, trigger: "keyboard", resource: { id: "image-1" } },
+  );
+
+  assert.equal(result.job_id, "correction-transform-job-1");
+  assert.deepEqual(calls, [{ command, signal }]);
+  assert.equal(typeof ports.artifacts.commands.queueTransform, "function");
+  await assert.rejects(
+    ports.invokeCommand("corrections.transform.unknown", { command }),
+    (error) => error.code === "capability-unavailable",
+  );
 });

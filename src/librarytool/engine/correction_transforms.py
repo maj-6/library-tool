@@ -17,9 +17,10 @@ import math
 import re
 import threading
 from collections.abc import Mapping, MutableMapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, ContextManager, Protocol, runtime_checkable
 
 from PIL import Image
 
@@ -892,6 +893,23 @@ class OcrFollowupOutcomePort(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class CorrectionTransformExecutorPort(Protocol):
+    """Execute one command already registered by the transform service."""
+
+    def __call__(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> CorrectionTransformRunResult: ...
+
+
+@runtime_checkable
+class CorrectionTransformStartGuardPort(Protocol):
+    """Serialize a new item-scoped job against item lifecycle changes."""
+
+    def __call__(self, item_id: str) -> ContextManager[Any]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedCorrectionTransform:
     job: JobView
@@ -911,10 +929,31 @@ class QueuedCorrectionTransform:
 
 
 class CorrectionTransformService:
-    """Register exactly one logical JobManager job per operation ID."""
+    """Register one logical job and expose an injected headless executor.
 
-    def __init__(self, jobs: JobManager) -> None:
+    Queue registration remains synchronous and deterministic. A process host
+    decides where and when to call :meth:`execute_queued`, so browser/window
+    lifetime never owns the worker.
+    """
+
+    def __init__(
+        self,
+        jobs: JobManager,
+        *,
+        executor: CorrectionTransformExecutorPort | None = None,
+        start_guard_for: CorrectionTransformStartGuardPort | None = None,
+    ) -> None:
+        if executor is not None and not callable(executor):
+            raise TypeError("executor must be callable or None")
+        if start_guard_for is not None and not callable(start_guard_for):
+            raise TypeError("start_guard_for must be callable or None")
         self._jobs = jobs
+        self._executor = executor
+        self._start_guard_for = (
+            start_guard_for
+            if start_guard_for is not None
+            else lambda _item_id: nullcontext()
+        )
         self._lock = threading.Lock()
 
     @staticmethod
@@ -926,74 +965,149 @@ class CorrectionTransformService:
     def queue(self, command: CorrectionTransformCommand) -> QueuedCorrectionTransform:
         if not isinstance(command, CorrectionTransformCommand):
             raise TypeError("command must be CorrectionTransformCommand")
+        replay = self._durable_replay(command)
+        if replay is not None:
+            return replay
         job_id = self.job_id_for(command.operation_id)
-        with self._lock:
-            existing = self._jobs.get(job_id)
-            if existing is not None:
-                return self._replayed(existing, command)
-            record: MutableMapping[str, Any] = {
-                "id": job_id,
-                "kind": CORRECTION_TRANSFORM_JOB_KIND,
-                "status": "queued",
-                "subject": {
-                    "item_id": command.item_id,
-                    "source_id": command.artifact_id,
-                },
-                "total": 6,
-                "progress": JobProgress(0, 6, "phase", "queued").as_dict(),
-                "input_revisions": {
-                    "artifact_id": command.artifact_id,
-                    "artifact_revision": command.artifact_revision,
-                    "source_revision": command.source_revision,
-                    "source_sha256": command.source_sha256,
+        with self._start_guard_for(command.item_id):
+            with self._lock:
+                replay = self._durable_replay(command)
+                if replay is not None:
+                    return replay
+                existing = self._jobs.get(job_id)
+                if existing is not None:
+                    return self._replayed(existing, command)
+                record: MutableMapping[str, Any] = {
+                    "id": job_id,
+                    "kind": CORRECTION_TRANSFORM_JOB_KIND,
+                    "status": "queued",
                     "operation_id": command.operation_id,
                     "command_sha256": command.fingerprint,
-                },
-                # Private worker input. JobManager's public projection does not
-                # persist this field; a durable command adapter remains an
-                # integration responsibility.
-                "command": command.as_dict(),
-            }
-            try:
-                self._jobs.track(record, CORRECTION_TRANSFORM_JOB_KIND)
-                created = True
-            except ConflictError:
-                winner = self._jobs.get(job_id)
-                if winner is None:
-                    raise
-                return self._replayed(winner, command)
-            view = self._jobs.view(job_id)
-            if view is None:  # pragma: no cover - JobManager invariant
-                raise RuntimeError("tracked correction job is unavailable")
-            return QueuedCorrectionTransform(view, command.fingerprint, created)
+                    "subject": {
+                        "item_id": command.item_id,
+                        "source_id": command.artifact_id,
+                    },
+                    "total": 6,
+                    "progress": JobProgress(0, 6, "phase", "queued").as_dict(),
+                    "input_revisions": {
+                        "artifact_id": command.artifact_id,
+                        "artifact_revision": command.artifact_revision,
+                        "source_revision": command.source_revision,
+                        "source_sha256": command.source_sha256,
+                        "operation_id": command.operation_id,
+                        "command_sha256": command.fingerprint,
+                    },
+                    # Private worker input. JobManager's public projection does
+                    # not persist this field; a durable command adapter remains
+                    # an integration responsibility.
+                    "command": command.as_dict(),
+                }
+                try:
+                    self._jobs.track(record, CORRECTION_TRANSFORM_JOB_KIND)
+                except ConflictError:
+                    replay = self._durable_replay(command)
+                    if replay is not None:
+                        return replay
+                    winner = self._jobs.get(job_id)
+                    if winner is None:
+                        raise
+                    return self._replayed(winner, command)
+                view = self._jobs.view(job_id)
+                if view is None:  # pragma: no cover - JobManager invariant
+                    raise RuntimeError("tracked correction job is unavailable")
+                return QueuedCorrectionTransform(
+                    view,
+                    command.fingerprint,
+                    True,
+                )
 
-    @staticmethod
+    @property
+    def executable(self) -> bool:
+        return self._executor is not None
+
+    def execute_queued(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> CorrectionTransformRunResult:
+        if not isinstance(command, CorrectionTransformCommand):
+            raise TypeError("command must be CorrectionTransformCommand")
+        executor = self._executor
+        if executor is None:
+            raise RuntimeError("the correction transform executor is unavailable")
+        result = executor(command)
+        if not isinstance(result, CorrectionTransformRunResult):
+            raise TypeError("correction transform executor returned an invalid result")
+        return result
+
+    def _durable_replay(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> QueuedCorrectionTransform | None:
+        try:
+            receipt = self._jobs.command_receipt(
+                command.operation_id,
+                command.fingerprint,
+                kind=CORRECTION_TRANSFORM_JOB_KIND,
+            )
+        except ConflictError as exc:
+            if exc.code != "operation_id_conflict":
+                raise
+            raise self._operation_conflict(command) from exc
+        if receipt is None:
+            return None
+        return self._replayed(receipt.job, command)
+
+    @classmethod
     def _replayed(
-        existing: Mapping[str, Any],
+        cls,
+        existing: Mapping[str, Any] | JobView,
         command: CorrectionTransformCommand,
     ) -> QueuedCorrectionTransform:
-        inputs = existing.get("input_revisions")
+        if isinstance(existing, JobView):
+            inputs = existing.input_revisions
+            kind = existing.kind
+            item_id = existing.subject.item_id
+            source_id = existing.subject.source_id
+            view = existing
+        else:
+            inputs = existing.get("input_revisions")
+            subject = existing.get("subject")
+            kind = existing.get("kind")
+            item_id = (
+                subject.get("item_id")
+                if isinstance(subject, Mapping)
+                else None
+            )
+            source_id = (
+                subject.get("source_id")
+                if isinstance(subject, Mapping)
+                else None
+            )
+            view = JobManager.view_of(existing)
         fingerprint = inputs.get("command_sha256") if isinstance(inputs, Mapping) else None
         operation_id = inputs.get("operation_id") if isinstance(inputs, Mapping) else None
-        subject = existing.get("subject")
-        item_id = subject.get("item_id") if isinstance(subject, Mapping) else None
-        source_id = subject.get("source_id") if isinstance(subject, Mapping) else None
         if (
-            existing.get("kind") != CORRECTION_TRANSFORM_JOB_KIND
+            kind != CORRECTION_TRANSFORM_JOB_KIND
             or fingerprint != command.fingerprint
             or operation_id != command.operation_id
             or item_id != command.item_id
             or source_id != command.artifact_id
         ):
-            raise ConflictError(
-                "operation ID is already bound to a different correction command",
-                code="correction_operation_conflict",
-                details={"operation_id": command.operation_id},
-            )
+            raise cls._operation_conflict(command)
         return QueuedCorrectionTransform(
-            JobManager.view_of(existing),
+            view,
             command.fingerprint,
             False,
+        )
+
+    @staticmethod
+    def _operation_conflict(
+        command: CorrectionTransformCommand,
+    ) -> ConflictError:
+        return ConflictError(
+            "operation ID is already bound to a different correction command",
+            code="correction_operation_conflict",
+            details={"operation_id": command.operation_id},
         )
 
 
@@ -1635,9 +1749,11 @@ __all__ = [
     "CorrectionTransformCommand",
     "CorrectionTransformCommitDraft",
     "CorrectionTransformCommitResult",
+    "CorrectionTransformExecutorPort",
     "CorrectionTransformHooksPort",
     "CorrectionTransformRunResult",
     "CorrectionTransformService",
+    "CorrectionTransformStartGuardPort",
     "CorrectionTransformStorePort",
     "CorrectionTransformWorker",
     "HumanTextAssertion",
