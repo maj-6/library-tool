@@ -7,14 +7,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.lock ./
+COPY services/image_processor/requirements.lock ./
 RUN python -m pip install --no-cache-dir --upgrade pip==26.1.2 \
     && python -m pip install --no-cache-dir -r requirements.lock \
     && python -m pip install --no-cache-dir --no-deps page-dewarp==0.3.4
 
-COPY pyproject.toml README.md ./
-COPY whl_image_processor ./whl_image_processor
+COPY pyproject.toml ./librarytool/pyproject.toml
+COPY src/librarytool ./librarytool/src/librarytool
+RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation ./librarytool
+
+COPY services/image_processor/pyproject.toml services/image_processor/README.md ./
+COPY services/image_processor/whl_image_processor ./whl_image_processor
 RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && python -c "from librarytool.processing import raster; from whl_image_processor import pipeline" \
     && adduser --system --uid 10001 --group processor
 
 USER 10001:10001

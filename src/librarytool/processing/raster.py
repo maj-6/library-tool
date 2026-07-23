@@ -293,6 +293,167 @@ class RasterLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class PixelPerspectiveResult:
+    """Compatibility result for an in-memory OpenCV projective transform.
+
+    The cloud processor predates the lossless correction recipe and has an
+    observable OpenCV/JPEG pixel contract.  Keeping this lower-level result in
+    the shared kernel lets that processor delegate its perspective operation
+    without routing old captures through the newer Pillow/PNG rendition.
+    """
+
+    pixels: Any
+    source_to_output_pixel_homography: Any
+    output_width: int
+    output_height: int
+
+
+def order_pixel_quad(points: object) -> Any:
+    """Return float32 pixel points in TL/TR/BR/BL order.
+
+    This preserves the cloud processor's established sum/difference ordering
+    and NumPy return type.  It is intentionally separate from
+    :func:`validate_normalized_quad`, whose callers already know vertex
+    identity and must never have their points silently reordered.
+    """
+
+    import numpy as np
+
+    array = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    ordered = np.empty((4, 2), dtype=np.float32)
+    sums = array.sum(axis=1)
+    differences = np.diff(array, axis=1).reshape(-1)
+    ordered[0] = array[int(np.argmin(sums))]
+    ordered[2] = array[int(np.argmax(sums))]
+    ordered[1] = array[int(np.argmin(differences))]
+    ordered[3] = array[int(np.argmax(differences))]
+    if len({(float(x), float(y)) for x, y in ordered}) != 4:
+        raise ValueError("Degenerate four-point boundary")
+    return ordered
+
+
+def _bounded_pixel_destination_size(
+    quad: object,
+    *,
+    max_edge_px: int,
+    max_megapixels: int,
+    min_edge_px: int,
+) -> tuple[int, int]:
+    import numpy as np
+
+    top_left, top_right, bottom_right, bottom_left = order_pixel_quad(quad)
+    widths = (
+        float(np.linalg.norm(top_right - top_left)),
+        float(np.linalg.norm(bottom_right - bottom_left)),
+    )
+    heights = (
+        float(np.linalg.norm(bottom_left - top_left)),
+        float(np.linalg.norm(bottom_right - top_right)),
+    )
+    # Python's round and this exact operation order are part of the existing
+    # cloud rendition contract.
+    width = max(min_edge_px, int(round(sum(widths) / 2.0)))
+    height = max(min_edge_px, int(round(sum(heights) / 2.0)))
+    scale = min(
+        1.0,
+        max_edge_px / max(width, height),
+        math.sqrt(max_megapixels * 1_000_000 / max(width * height, 1)),
+    )
+    return (
+        max(min_edge_px, int(round(width * scale))),
+        max(min_edge_px, int(round(height * scale))),
+    )
+
+
+def apply_pixel_perspective_transform(
+    pixels: Any,
+    quad: object,
+    *,
+    max_edge_px: int,
+    max_megapixels: int,
+    min_edge_px: int = 32,
+) -> PixelPerspectiveResult:
+    """Rectify an RGB pixel array with the cloud-compatible OpenCV recipe.
+
+    Unlike :func:`apply_perspective_transform`, this compatibility primitive
+    does not decode, encode, or reinterpret the source.  The caller retains
+    ownership of its immutable-byte policy and derivative encoders.
+    """
+
+    import cv2
+    import numpy as np
+
+    for name, value in (
+        ("max_edge_px", max_edge_px),
+        ("max_megapixels", max_megapixels),
+        ("min_edge_px", min_edge_px),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    output_width, output_height = _bounded_pixel_destination_size(
+        quad,
+        max_edge_px=max_edge_px,
+        max_megapixels=max_megapixels,
+        min_edge_px=min_edge_px,
+    )
+    destination = np.array(
+        [
+            [0, 0],
+            [output_width - 1, 0],
+            [output_width - 1, output_height - 1],
+            [0, output_height - 1],
+        ],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(order_pixel_quad(quad), destination)
+    warped = cv2.warpPerspective(
+        pixels,
+        matrix,
+        (output_width, output_height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return PixelPerspectiveResult(
+        pixels=warped,
+        source_to_output_pixel_homography=matrix.astype(np.float64),
+        output_width=output_width,
+        output_height=output_height,
+    )
+
+
+def normalize_pixel_homography(
+    pixel_matrix: Any,
+    *,
+    source_width: int,
+    source_height: int,
+    output_width: int,
+    output_height: int,
+) -> tuple[float, ...]:
+    """Publish a pixel homography in normalized source/output coordinates."""
+
+    import numpy as np
+
+    source_scale = np.diag(
+        [max(source_width - 1, 1), max(source_height - 1, 1), 1.0]
+    )
+    output_scale_inverse = np.diag(
+        [
+            1.0 / max(output_width - 1, 1),
+            1.0 / max(output_height - 1, 1),
+            1.0,
+        ]
+    )
+    matrix = (
+        output_scale_inverse
+        @ np.asarray(pixel_matrix, dtype=np.float64)
+        @ source_scale
+    )
+    if abs(float(matrix[2, 2])) > 1e-12:
+        matrix /= matrix[2, 2]
+    return tuple(round(float(value), 12) for value in matrix.reshape(-1))
+
+
+@dataclass(frozen=True, slots=True)
 class PerspectiveTransformResult:
     """Lossless derivative and reproducible transform evidence."""
 

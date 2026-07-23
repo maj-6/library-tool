@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -108,6 +109,97 @@ def _decode_jpeg(data: bytes) -> np.ndarray:
         return np.asarray(image.convert("RGB"))
 
 
+def _preconsolidation_order_quad(points: object) -> np.ndarray:
+    array = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    ordered = np.empty((4, 2), dtype=np.float32)
+    sums = array.sum(axis=1)
+    differences = np.diff(array, axis=1).reshape(-1)
+    ordered[0] = array[int(np.argmin(sums))]
+    ordered[2] = array[int(np.argmax(sums))]
+    ordered[1] = array[int(np.argmin(differences))]
+    ordered[3] = array[int(np.argmax(differences))]
+    if len({(float(x), float(y)) for x, y in ordered}) != 4:
+        raise ValueError("Degenerate four-point boundary")
+    return ordered
+
+
+def _preconsolidation_projective_warp(
+    rgb: np.ndarray,
+    quad: object,
+    options: ProcessingOptions,
+) -> tuple[np.ndarray, np.ndarray]:
+    top_left, top_right, bottom_right, bottom_left = _preconsolidation_order_quad(quad)
+    widths = (
+        float(np.linalg.norm(top_right - top_left)),
+        float(np.linalg.norm(bottom_right - bottom_left)),
+    )
+    heights = (
+        float(np.linalg.norm(bottom_left - top_left)),
+        float(np.linalg.norm(bottom_right - top_right)),
+    )
+    output_width = max(32, int(round(sum(widths) / 2.0)))
+    output_height = max(32, int(round(sum(heights) / 2.0)))
+    scale = min(
+        1.0,
+        options.max_edge_px / max(output_width, output_height),
+        math.sqrt(
+            options.max_megapixels
+            * 1_000_000
+            / max(output_width * output_height, 1)
+        ),
+    )
+    output_width = max(32, int(round(output_width * scale)))
+    output_height = max(32, int(round(output_height * scale)))
+    destination = np.array(
+        [
+            [0, 0],
+            [output_width - 1, 0],
+            [output_width - 1, output_height - 1],
+            [0, output_height - 1],
+        ],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(
+        _preconsolidation_order_quad(quad),
+        destination,
+    )
+    warped = cv2.warpPerspective(
+        rgb,
+        matrix,
+        (output_width, output_height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return warped, matrix.astype(np.float64)
+
+
+def _preconsolidation_normalised_homography(
+    pixel_matrix: object,
+    source_width: int,
+    source_height: int,
+    output_width: int,
+    output_height: int,
+) -> tuple[float, ...]:
+    source_scale = np.diag(
+        [max(source_width - 1, 1), max(source_height - 1, 1), 1.0]
+    )
+    output_scale_inverse = np.diag(
+        [
+            1.0 / max(output_width - 1, 1),
+            1.0 / max(output_height - 1, 1),
+            1.0,
+        ]
+    )
+    matrix = (
+        output_scale_inverse
+        @ np.asarray(pixel_matrix, dtype=np.float64)
+        @ source_scale
+    )
+    if abs(float(matrix[2, 2])) > 1e-12:
+        matrix /= matrix[2, 2]
+    return tuple(round(float(value), 12) for value in matrix.reshape(-1))
+
+
 def test_invalid_and_truncated_bytes_are_permanent_input_failures() -> None:
     with pytest.raises(PermanentImageInputError, match="signature"):
         process_image(b"this is not an image", _options())
@@ -197,6 +289,48 @@ def test_derivatives_and_hashes_are_deterministic() -> None:
     assert first.display_sha256 == hashlib.sha256(first.display_jpeg).hexdigest()
     assert first.ocr_sha256 == hashlib.sha256(first.ocr_jpeg).hexdigest()
     assert first.thumbnail_sha256 == hashlib.sha256(first.thumbnail_jpeg).hexdigest()
+
+
+def test_shared_kernel_preserves_the_preconsolidation_cloud_golden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _synthetic_page()
+    options = _options()
+    consolidated = process_image(source, options)
+
+    monkeypatch.setattr(pipeline, "_order_quad", _preconsolidation_order_quad)
+    monkeypatch.setattr(
+        pipeline,
+        "_projective_warp",
+        _preconsolidation_projective_warp,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_normalised_homography",
+        _preconsolidation_normalised_homography,
+    )
+    preconsolidation = process_image(source, options)
+
+    assert consolidated == preconsolidation
+    assert consolidated.display_jpeg == preconsolidation.display_jpeg
+    assert consolidated.ocr_jpeg == preconsolidation.ocr_jpeg
+    assert consolidated.thumbnail_jpeg == preconsolidation.thumbnail_jpeg
+    assert consolidated.transform_manifest == preconsolidation.transform_manifest
+
+
+def test_cloud_pipeline_has_no_independent_projective_pixel_path() -> None:
+    source = Path(pipeline.__file__).read_text(encoding="utf-8")
+
+    assert "getPerspectiveTransform" not in source
+    assert "warpPerspective" not in source
+    assert "def _destination_size" not in source
+    assert "_raster_processing.apply_pixel_perspective_transform" in source
+    assert "_raster_processing.normalize_pixel_homography" in source
+
+
+def test_cloud_pipeline_import_does_not_load_the_engine_graph() -> None:
+    assert "librarytool.processing.raster" in sys.modules
+    assert "librarytool.engine" not in sys.modules
 
 
 def test_exif_transpose_defines_the_source_coordinate_plane() -> None:

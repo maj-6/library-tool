@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "fastapi==0.139.2",
     "httpx==0.28.1",
+    "world-herb-library==0.7.0",
     "numpy==2.4.6",
     "opencv-python-headless==4.13.0.92",
     "Pillow==12.3.0",

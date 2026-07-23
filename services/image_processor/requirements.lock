@@ -2,6 +2,8 @@
 # dependencies are exact-pinned. page-dewarp is installed separately with
 # --no-deps because its GUI OpenCV declaration is satisfied by the headless
 # OpenCV runtime below.
+# The repository-local world-herb-library package is installed separately by
+# the Dockerfile from the exact source revision used to build this image.
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.14.2

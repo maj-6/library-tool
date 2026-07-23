@@ -97,14 +97,18 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: |
+            pyproject.toml
+            services/image_processor/pyproject.toml
             services/image_processor/requirements.txt
             services/image_processor/requirements-dev.txt
             services/image_processor/requirements.lock
 
       - name: Install processor and test tools
         run: |
-          python -m pip install -r requirements-dev.txt
+          python -m pip install -r requirements.lock
+          python -m pip install pytest==9.0.2 ruff==0.15.7
           python -m pip install --no-deps page-dewarp==0.3.4
+          python -m pip install --no-deps -e ../..
           python -m pip install --no-deps -e .
 
       - name: Processor tests and lint
@@ -113,4 +117,4 @@ jobs:
           python -m ruff check whl_image_processor tests
 
       - name: Build deployable container
-        run: docker build -t whl-image-processor:ci .
+        run: docker build -f Dockerfile -t whl-image-processor:ci ../..
