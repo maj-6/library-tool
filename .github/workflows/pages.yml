@@ -1,9 +1,9 @@
 name: website
 
-# The site is plain files, so there is no build: check out, drop in the Supabase
-# config, upload website/ as the Pages artifact. The artifact's root becomes the
-# site root, which is why every link in the pages is relative -- they have to
-# survive being served from /library-tool/ rather than /.
+# Production is always live-cloud mode and fails before artifact upload if its
+# public Supabase identifiers are absent or unsafe. Manual fixture previews are
+# ordinary downloadable artifacts: they never enter the github-pages
+# environment and are never passed to deploy-pages.
 on:
   push:
     branches: [main]
@@ -12,11 +12,18 @@ on:
       - ".github/workflows/pages.yml"
       - ".github/scripts/write_config.py"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Fixture preview is downloadable only and never deploys Pages.
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - fixture-preview
 
 permissions:
-  contents: read # checkout, and nothing more
-  pages: write # create the deployment
-  id-token: write # deploy-pages proves the artifact came from this run
+  contents: read
 
 # One live site. Let a running deploy finish rather than cancelling it half-way.
 concurrency:
@@ -25,7 +32,13 @@ concurrency:
 
 jobs:
   deploy:
+    name: Deploy production Pages (live cloud required)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.mode == 'production' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout, and nothing more
+      pages: write # create the deployment
+      id-token: write # deploy-pages proves the artifact came from this run
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -33,14 +46,14 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      # Variables, not secrets: the anon key is public by design, and a secret
-      # would be masked as *** in the logs for no benefit. write_config.py
-      # refuses any key whose JWT role is not `anon`.
-      - name: Point the site at Supabase
+      # Variables, not secrets: publishable/anon keys are public by design.
+      # The validator rejects missing, malformed, expired, or privileged keys.
+      # Keep this before configure-pages and every artifact/deployment action.
+      - name: Require live Supabase configuration
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
-        run: python3 .github/scripts/write_config.py
+        run: python3 .github/scripts/write_config.py --mode production
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -53,3 +66,25 @@ jobs:
       - name: Deploy
         id: deploy
         uses: actions/deploy-pages@v4
+
+  fixture-preview:
+    name: Build fixture preview (never deployed)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'fixture-preview' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Mark fixture-only configuration
+        run: python3 .github/scripts/write_config.py --mode fixture-preview
+
+      # Deliberately not actions/upload-pages-artifact: this archive is for
+      # inspection only and cannot flow into the production Pages deployment.
+      - name: Upload fixture preview (NOT FOR PRODUCTION)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-preview-NOT-FOR-PRODUCTION-${{ github.run_id }}
+          path: website
+          retention-days: 3

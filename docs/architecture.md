@@ -220,8 +220,12 @@ Per-component detail lives in each part's own README (map at the end).
 - **Website** (`website/`, GitHub Pages) — stateless plain files, no build
   step. `assets/data.js` reads the cloud over PostgREST with the anon key
   from `assets/config.js` (gitignored); without that file it reads the
-  committed `fixtures/` instead, so the site works with no cloud at all.
-  It owns nothing; everything it shows was published from the desktop.
+  committed `fixtures/` instead, so local development works with no cloud at
+  all. Production Pages generation is fail-closed: missing, malformed,
+  expired, or privileged cloud configuration stops before artifact upload.
+  Explicit fixture previews are downloadable CI artifacts and are never sent
+  to Pages. The site owns nothing; everything it shows was published from the
+  desktop.
 - **Cloud** — Supabase (Postgres + Auth + Storage) plus a Cloudflare R2
   bucket for large objects (published PDFs, the `entries/` and `corpus/`
   mirrors). The schema ships as ordered, append-only migrations under
