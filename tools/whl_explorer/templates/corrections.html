@@ -7,6 +7,12 @@
   <link rel="icon" href="{{ url_for('static', filename='icon.png') }}" />
   <link rel="stylesheet"
         href="{{ url_for('static', filename='corrections/corrections.css') }}?v={{ corrections_css_v }}" />
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='corrections/books.css') }}?v={{ corrections_books_css_v }}" />
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='corrections/artifacts.css') }}?v={{ corrections_artifacts_css_v }}" />
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='corrections/image-editor.css') }}?v={{ corrections_image_editor_css_v }}" />
 </head>
 <body>
   <a class="skip-link" href="#corrections-editor">Skip to editor</a>
@@ -159,7 +165,8 @@
           <div class="tray-tabs" role="tablist" aria-label="Review and job tray">
             <button type="button" role="tab" id="tray-review-tab" aria-selected="true"
                     aria-controls="tray-review-panel" data-tray-tab="reviews">
-              <span id="tray-heading">Review</span><span class="pane-count">0</span>
+              <span id="tray-heading">Review</span>
+              <span class="pane-count" data-review-count>0</span>
             </button>
             <button type="button" role="tab" id="tray-jobs-tab" aria-selected="false"
                     aria-controls="tray-jobs-panel" tabindex="-1" data-tray-tab="jobs">
@@ -195,6 +202,14 @@
   <script src="{{ url_for('static', filename='corrections/editor-registry.js') }}?v={{ editor_registry_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/ui-profile.js') }}?v={{ ui_profile_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/layout-controller.js') }}?v={{ layout_controller_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/artifact-model.js') }}?v={{ artifact_model_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/artifact-editors.js') }}?v={{ artifact_editors_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/properties.js') }}?v={{ corrections_properties_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/artifacts.js') }}?v={{ corrections_artifacts_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/books.js') }}?v={{ corrections_books_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/reviews.js') }}?v={{ corrections_reviews_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/image-editor-state.js') }}?v={{ image_editor_state_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/image-editor.js') }}?v={{ corrections_image_editor_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/shell.js') }}?v={{ corrections_shell_v }}"></script>
 </body>
 </html>

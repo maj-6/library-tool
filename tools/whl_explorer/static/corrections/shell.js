@@ -3,6 +3,9 @@
     ...require("./editor-registry"),
     ...require("./ui-profile"),
     ...require("./layout-controller"),
+    ...require("./reviews"),
+    ...require("./artifacts"),
+    ...require("./image-editor"),
   } : root.LibraryToolCorrections;
   const api = factory(dependencies);
   if (typeof module === "object" && module.exports) module.exports = api;
@@ -133,16 +136,79 @@
     return value == null ? value : JSON.parse(JSON.stringify(value));
   }
 
+  function emptySelection() {
+    return {
+      itemId: null,
+      representationId: null,
+      canvasId: null,
+      artifactId: null,
+      annotationId: null,
+    };
+  }
+
+  function normalizeSelection(value, fallback = null) {
+    if (value == null) return emptySelection();
+    if (!isPlainObject(value)) throw new TypeError("selection must be an object");
+    const previous = fallback || emptySelection();
+    const read = (camel, snake) => value[camel] !== undefined
+      ? value[camel] : value[snake] !== undefined ? value[snake] : previous[camel];
+    return {
+      itemId: contextIdentifier(read("itemId", "item_id"), "selection.itemId"),
+      representationId: contextIdentifier(
+        read("representationId", "representation_id"),
+        "selection.representationId",
+      ),
+      canvasId: contextIdentifier(read("canvasId", "canvas_id"), "selection.canvasId"),
+      artifactId: contextIdentifier(
+        read("artifactId", "artifact_id"), "selection.artifactId"),
+      annotationId: contextIdentifier(
+        read("annotationId", "annotation_id"), "selection.annotationId"),
+    };
+  }
+
+  function selectionContext(context, selection) {
+    if (!context) return null;
+    const result = { ...context };
+    const mappings = [
+      ["item_id", "itemId"],
+      ["representation_id", "representationId"],
+      ["canvas_id", "canvasId"],
+      ["artifact_id", "artifactId"],
+      ["annotation_id", "annotationId"],
+    ];
+    for (const [snake, camel] of mappings) {
+      if (selection[camel]) result[snake] = selection[camel];
+      else delete result[snake];
+    }
+    return result;
+  }
+
+  function artifactSelection(item, previous = null) {
+    if (!item || typeof item !== "object") return null;
+    const source = item.source && typeof item.source === "object" ? item.source : {};
+    const objectType = String(item.objectType || item.object_type || "").toLowerCase();
+    const isAnnotation = objectType.includes("annotation") ||
+      String(item.key || "").startsWith("annotation:");
+    const isArtifact = !isAnnotation && (
+      objectType === "artifact" ||
+      objectType === "raster-artifact" ||
+      String(item.key || "").startsWith("artifact:")
+    );
+    const base = previous || emptySelection();
+    return normalizeSelection({
+      itemId: item.itemId || item.item_id || base.itemId,
+      representationId: source.representationId || source.representation_id ||
+        base.representationId,
+      canvasId: source.canvasId || source.canvas_id || base.canvasId,
+      artifactId: isArtifact ? item.id || item.artifact_id : null,
+      annotationId: isAnnotation ? item.id || item.annotation_id : null,
+    });
+  }
+
   class CorrectionsWindowState {
     constructor() {
       this.context = null;
-      this.selection = {
-        itemId: null,
-        representationId: null,
-        canvasId: null,
-        artifactId: null,
-        annotationId: null,
-      };
+      this.selection = emptySelection();
       this.resource = null;
       this.drafts = new Map();
     }
@@ -163,6 +229,11 @@
     setResource(resource) {
       this.resource = resource || null;
       return this.resource;
+    }
+
+    setSelection(value) {
+      this.selection = normalizeSelection(value, this.selection);
+      return { ...this.selection };
     }
 
     setDraft(key, value) {
@@ -225,17 +296,44 @@
       this.state = options.state || new CorrectionsWindowState();
       this.profileKey = "corrections/default";
       this.listeners = [];
+      this.selectionListeners = new Set();
       this.contextGeneration = 0;
+      this.featureContextGeneration = 0;
       this.unsubscribeContext = null;
       this.destroyed = false;
       this.activeTrayTab = "reviews";
+      const desktopCorrections = this.desktop && this.desktop.corrections || null;
+      this.booksApi = options.booksApi || desktopCorrections || null;
+      this.artifactPorts = options.artifactPorts ||
+        desktopCorrections && desktopCorrections.artifacts || {};
+      const invokeCommand = typeof options.invokeCommand === "function"
+        ? options.invokeCommand
+        : desktopCorrections && typeof desktopCorrections.invokeCommand === "function"
+          ? desktopCorrections.invokeCommand.bind(desktopCorrections)
+          : null;
+      const imageOverlayRenderer = options.imageOverlayRenderer ||
+        typeof deps.createPerspectiveImageRenderer === "function" &&
+          deps.createPerspectiveImageRenderer({
+            invokeCommand,
+            initialTool: deps.TOOLS && deps.TOOLS.PERSPECTIVE,
+            hasSelection: () => Boolean(
+              this.state.selection.artifactId || this.state.selection.annotationId),
+            clearSelection: () => this.clearResourceSelection(),
+            onCommandError: (error) => this.setStatus(
+              error && error.message || "The transform could not be queued", true),
+            onQueueResult: () => this.setStatus("Perspective transform queued"),
+          });
       this.editorRegistry = options.editorRegistry || deps.createDefaultEditorRegistry({
         documentRef: this.documentRef,
+        imageOverlayRenderer,
         onSelectionChange: () => {
           this.renderEditor();
           this.persistProfile();
         },
       });
+      if (typeof deps.registerArtifactEditors === "function") {
+        deps.registerArtifactEditors(this.editorRegistry);
+      }
       this.profileStore = options.profileStore || new deps.CorrectionsProfileStore({
         storage: options.storage || safeStorage(this.windowRef),
         normalizeLayout: deps.normalizeLayoutState,
@@ -250,6 +348,63 @@
         initialState: profile.layout,
         onChange: () => this.persistProfile(),
       });
+      this.booksFeature = options.booksFeature === false ? null :
+        options.booksFeature || this.createBooksFeature(options);
+      this.artifactsFeature = options.artifactsFeature === false ? null :
+        options.artifactsFeature || this.createArtifactsFeature(options);
+    }
+
+    createBooksFeature(options) {
+      if (options.features === false ||
+          typeof deps.createBooksAttentionFeature !== "function") return null;
+      return deps.createBooksAttentionFeature({
+        root: this.root,
+        documentRef: this.documentRef,
+        api: this.booksApi,
+        actorIdProvider: options.actorIdProvider,
+        operationIdFactory: options.reviewOperationIdFactory,
+        advanceOnResolve: options.advanceOnResolve,
+        onNavigate: (address, metadata) => this.selectAddress(address, metadata),
+        onSelectionInvalidated: () => this.clearSelection(),
+        onStatus: (message, error) => this.setStatus(message, error),
+      });
+    }
+
+    createArtifactsFeature(options) {
+      if (options.features === false ||
+          typeof deps.createArtifactsFeature !== "function") return null;
+      const treeRoot = this.root.querySelector("[data-artifacts-tree]");
+      if (!treeRoot) return null;
+      const ports = this.artifactPorts || {};
+      return deps.createArtifactsFeature({
+        treeRoot,
+        countNode: this.root.querySelector("[data-artifacts-count]"),
+        propertiesRoot: this.root.querySelector("[data-properties-list]"),
+        documentRef: this.documentRef,
+        editorRegistry: this.editorRegistry,
+        registerEditors: false,
+        catalog: ports.catalog,
+        resources: ports.resources,
+        commands: ports.commands,
+        draftStore: this.state,
+        history: options.correctionHistory,
+        operationIdFactory: options.correctionOperationIdFactory,
+        initialExpandedGroups: options.initialExpandedArtifactGroups || [
+          "generated-metadata",
+          "ocr-text",
+          "layout-regions",
+          "source-images",
+        ],
+        onResource: (resource) => this.setResource(resource),
+        onSelection: (item) => {
+          const address = artifactSelection(item, this.state.selection);
+          if (address) this.selectAddress(address, { source: "artifacts" });
+        },
+        onHotTarget: (item) => {
+          this.root.dataset.hotArtifactKey = item && item.key || "";
+        },
+        onStatus: (message, error) => this.setStatus(message, error),
+      });
     }
 
     listen(target, type, handler, options) {
@@ -263,11 +418,74 @@
       this.bindLayoutReset();
       this.bindWindowControls();
       this.bindTrayTabs();
+      if (this.booksFeature && typeof this.booksFeature.mount === "function") {
+        this.booksFeature.mount();
+      }
+      if (this.artifactsFeature && typeof this.artifactsFeature.mount === "function") {
+        this.artifactsFeature.mount();
+      }
       this.renderEditor();
-      this.renderProperties();
+      if (!this.artifactsFeature) this.renderProperties();
       this.updateProfileLabel();
       this.connectDesktopContext();
       return this;
+    }
+
+    subscribeSelection(listener) {
+      if (typeof listener !== "function") throw new TypeError("selection listener is required");
+      this.selectionListeners.add(listener);
+      listener({ ...this.state.selection });
+      return () => this.selectionListeners.delete(listener);
+    }
+
+    emitSelection(metadata = {}) {
+      const selection = Object.freeze({ ...this.state.selection });
+      for (const listener of [...this.selectionListeners]) {
+        listener(selection, metadata);
+      }
+    }
+
+    selectAddress(value, metadata = {}) {
+      const previous = { ...this.state.selection };
+      const selection = this.state.setSelection(value);
+      if (this.booksFeature && typeof this.booksFeature.setSelection === "function") {
+        this.booksFeature.setSelection(selection.itemId ? selection : null);
+      }
+      const changedItem = previous.itemId !== selection.itemId;
+      const changedDeepLink = previous.artifactId !== selection.artifactId ||
+        previous.annotationId !== selection.annotationId;
+      if (this.artifactsFeature && metadata.source !== "artifacts" &&
+          (changedItem || changedDeepLink || metadata.forceContext === true)) {
+        const context = selectionContext(this.state.context, selection);
+        void Promise.resolve()
+          .then(() => this.artifactsFeature.setContext(context))
+          .catch((error) => {
+            if (!this.destroyed) this.setStatus(
+              error && error.message || "Artifacts could not be loaded", true);
+          });
+      }
+      this.updateContextLabels();
+      this.emitSelection(metadata);
+      return selection;
+    }
+
+    clearResourceSelection() {
+      const selection = this.selectAddress({
+        ...this.state.selection,
+        artifactId: null,
+        annotationId: null,
+      }, { source: "editor", forceContext: true });
+      this.setResource(null);
+      return selection;
+    }
+
+    clearSelection() {
+      const selection = this.selectAddress(emptySelection(), {
+        source: "selection-invalidated",
+        forceContext: true,
+      });
+      this.setResource(null);
+      return selection;
     }
 
     bindEditorSelector() {
@@ -384,23 +602,53 @@
       const context = normalizeWorkbenchContext(value);
       if (context.ui_profile_key !== this.profileKey) this.applyProfile(context.ui_profile_key);
       this.state.applyContext(context);
-      const address = [context.workspace_id, context.item_id, context.representation_id]
-        .filter(Boolean).join(" · ");
-      replaceText(this.root.querySelector("[data-context-label]"), address);
-      replaceText(this.root.querySelector("[data-workspace-status]"),
-        context.item_id ? `Book ${context.item_id}` : `Workspace ${context.workspace_id}`);
+      this.updateContextLabels();
       this.renderContextNavigation();
-      if (context.artifact_id) {
-        this.setResource({
-          id: context.artifact_id,
-          label: context.artifact_id,
-          missing: true,
-        });
-      } else {
-        this.setResource(null);
-      }
+      this.setResource(null);
+      this.emitSelection({ source: "context" });
+      this.applyFeatureContext(context);
       this.setStatus("Context ready");
       return context;
+    }
+
+    updateContextLabels() {
+      const context = this.state.context;
+      if (!context) return;
+      const selection = this.state.selection;
+      const address = [
+        context.workspace_id,
+        selection.itemId,
+        selection.representationId,
+      ].filter(Boolean).join(" · ");
+      replaceText(this.root.querySelector("[data-context-label]"), address);
+      replaceText(this.root.querySelector("[data-workspace-status]"),
+        selection.itemId
+          ? `Book ${selection.itemId}`
+          : `Workspace ${context.workspace_id}`);
+    }
+
+    applyFeatureContext(context) {
+      const generation = ++this.featureContextGeneration;
+      const tasks = [];
+      if (this.booksFeature && typeof this.booksFeature.setContext === "function") {
+        tasks.push(Promise.resolve().then(() => this.booksFeature.setContext(context)));
+      }
+      if (this.artifactsFeature && typeof this.artifactsFeature.setContext === "function") {
+        tasks.push(Promise.resolve().then(() => this.artifactsFeature.setContext(context)));
+      }
+      if (!tasks.length) return Promise.resolve([]);
+      return Promise.allSettled(tasks).then((results) => {
+        if (this.destroyed || generation !== this.featureContextGeneration) return results;
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure) {
+          this.setStatus(
+            failure.reason && failure.reason.message ||
+              "One or more Corrections panels could not be loaded",
+            true,
+          );
+        }
+        return results;
+      });
     }
 
     applyProfile(profileKey) {
@@ -432,7 +680,7 @@
       this.editorRegistry.setResource(resource);
       this.refreshEditorSelector();
       this.renderEditor();
-      this.renderProperties();
+      if (!this.artifactsFeature) this.renderProperties();
     }
 
     refreshEditorSelector() {
@@ -490,7 +738,7 @@
       const books = this.root.querySelector("[data-books-list]");
       const artifacts = this.root.querySelector("[data-artifacts-tree]");
       const context = this.state.context;
-      if (books && this.documentRef) {
+      if (!this.booksFeature && books && this.documentRef) {
         books.replaceChildren();
         const row = this.documentRef.createElement("li");
         row.className = "empty-row";
@@ -498,7 +746,7 @@
           ? `Selected book: ${context.item_id}` : "No book selected";
         books.append(row);
       }
-      if (artifacts && this.documentRef) {
+      if (!this.artifactsFeature && artifacts && this.documentRef) {
         artifacts.replaceChildren();
         const row = this.documentRef.createElement("div");
         row.className = "empty-row";
@@ -520,8 +768,21 @@
     destroy() {
       this.destroyed = true;
       this.contextGeneration += 1;
+      this.featureContextGeneration += 1;
       if (typeof this.unsubscribeContext === "function") this.unsubscribeContext();
       this.unsubscribeContext = null;
+      if (this.booksFeature && typeof this.booksFeature.destroy === "function") {
+        this.booksFeature.destroy();
+      }
+      if (this.artifactsFeature && typeof this.artifactsFeature.destroy === "function") {
+        this.artifactsFeature.destroy();
+      }
+      this.booksFeature = null;
+      this.artifactsFeature = null;
+      if (this.selectionListeners) this.selectionListeners.clear();
+      if (this.editorRegistry && typeof this.editorRegistry.destroy === "function") {
+        this.editorRegistry.destroy();
+      }
       this.layout.destroy();
       for (const remove of this.listeners.splice(0)) remove();
     }
@@ -548,8 +809,11 @@
     CONTEXT_SCHEMA,
     CorrectionsShell,
     CorrectionsWindowState,
+    artifactSelection,
     installAutoBoot,
     nextTrayTab,
+    normalizeSelection,
     normalizeWorkbenchContext,
+    selectionContext,
   };
 });

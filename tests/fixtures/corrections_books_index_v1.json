@@ -1,0 +1,214 @@
+{
+  "schema": "librarytool.corrections-index/1",
+  "revision": "index-r7",
+  "books": [
+    {
+      "id": "book-herbarium",
+      "revision": "book-herbarium-r3",
+      "title": "An Herbarium",
+      "import_state": "partial",
+      "issues": [
+        "One captured image is missing"
+      ],
+      "review": {
+        "revision": "review-book-r2",
+        "state": "needs_attention",
+        "reason": "Verify the title page",
+        "history_count": 1,
+        "latest_event": {
+          "operation_id": "op-mark-book",
+          "action": "attention.mark",
+          "actor_id": "curator-1",
+          "occurred_at": "2026-07-22T18:00:00Z",
+          "before_state": "clear",
+          "after_state": "needs_attention",
+          "reason": "Verify the title page",
+          "comment": ""
+        }
+      },
+      "captures": [
+        {
+          "artifact_id": "capture-cover",
+          "revision": "capture-cover-r2",
+          "capture_order": 1,
+          "label": "Front cover",
+          "representation_id": "scan-herbarium",
+          "canvas_id": "canvas-cover",
+          "effective_category": "cover",
+          "resource_state": "available",
+          "import_state": "ready",
+          "freshness": "current",
+          "thumbnail": {
+            "url": "/api/v1/resources/thumb-cover",
+            "alt": "Front cover thumbnail",
+            "width": 160,
+            "height": 120
+          }
+        },
+        {
+          "artifact_id": "capture-title",
+          "revision": "capture-title-r1",
+          "capture_order": 0,
+          "label": "Possible title leaf",
+          "representation_id": "scan-herbarium",
+          "canvas_id": "canvas-title",
+          "effective_category": "title_page",
+          "resource_state": "missing",
+          "import_state": "partial",
+          "freshness": "untracked",
+          "thumbnail": null
+        }
+      ]
+    },
+    {
+      "id": "book-pending",
+      "revision": "book-pending-r1",
+      "title": "Zoological Botany",
+      "import_state": "pending",
+      "issues": [
+        "Capture import is still running"
+      ],
+      "review": {
+        "revision": "review-pending-r1",
+        "state": "clear",
+        "reason": "",
+        "history_count": 0,
+        "latest_event": null
+      },
+      "captures": [
+        {
+          "artifact_id": "capture-pending",
+          "revision": "capture-pending-r1",
+          "capture_order": 0,
+          "label": "Inside sample",
+          "effective_category": "content_specimen",
+          "resource_state": "unavailable",
+          "import_state": "pending",
+          "freshness": "untracked",
+          "thumbnail": null
+        }
+      ]
+    },
+    {
+      "id": "book-legacy",
+      "revision": "book-legacy-r4",
+      "title": "Materia Medica",
+      "import_state": "legacy",
+      "issues": [],
+      "review": {
+        "revision": "review-legacy-r1",
+        "state": "clear",
+        "reason": "",
+        "history_count": 0,
+        "latest_event": null
+      },
+      "captures": [
+        {
+          "artifact_id": "capture-legacy",
+          "revision": "capture-legacy-r1",
+          "capture_order": 0,
+          "label": "Legacy scan",
+          "effective_category": "other",
+          "resource_state": "available",
+          "import_state": "legacy",
+          "freshness": "untracked",
+          "thumbnail": {
+            "url": "/api/v1/resources/thumb-legacy",
+            "alt": "Legacy scan thumbnail"
+          }
+        }
+      ]
+    },
+    {
+      "id": "book-empty",
+      "revision": "book-empty-r1",
+      "title": "Materia Medica",
+      "import_state": "ready",
+      "issues": [],
+      "review": {
+        "revision": "review-empty-r1",
+        "state": "clear",
+        "reason": "",
+        "history_count": 0,
+        "latest_event": null
+      },
+      "captures": []
+    }
+  ],
+  "attention": [
+    {
+      "key": "attention-book-herbarium",
+      "target": {
+        "kind": "book",
+        "item_id": "book-herbarium"
+      },
+      "review": {
+        "revision": "review-book-r2",
+        "state": "needs_attention",
+        "reason": "Verify the title page",
+        "history_count": 1,
+        "latest_event": {
+          "operation_id": "op-mark-book",
+          "action": "attention.mark",
+          "actor_id": "curator-1",
+          "occurred_at": "2026-07-22T18:00:00Z",
+          "before_state": "clear",
+          "after_state": "needs_attention",
+          "reason": "Verify the title page",
+          "comment": ""
+        }
+      }
+    },
+    {
+      "key": "attention-image-pending",
+      "target": {
+        "kind": "image",
+        "item_id": "book-pending",
+        "artifact_id": "capture-pending"
+      },
+      "review": {
+        "revision": "review-image-r3",
+        "state": "needs_attention",
+        "reason": "Confirm the content specimen after import",
+        "history_count": 1,
+        "latest_event": {
+          "operation_id": "op-mark-image",
+          "action": "attention.mark",
+          "actor_id": "curator-2",
+          "occurred_at": "2026-07-22T18:10:00Z",
+          "before_state": "clear",
+          "after_state": "needs_attention",
+          "reason": "Confirm the content specimen after import",
+          "comment": "Raised by capture QA"
+        }
+      }
+    },
+    {
+      "key": "attention-region-herbarium",
+      "target": {
+        "kind": "region",
+        "item_id": "book-herbarium",
+        "representation_id": "scan-herbarium",
+        "canvas_id": "canvas-cover",
+        "artifact_id": "capture-cover",
+        "annotation_id": "region-illustration-1"
+      },
+      "review": {
+        "revision": "review-region-r4",
+        "state": "resolved",
+        "reason": "Check whether the boxed mark is an illustration",
+        "history_count": 2,
+        "latest_event": {
+          "operation_id": "op-resolve-region",
+          "action": "attention.resolve",
+          "actor_id": "curator-1",
+          "occurred_at": "2026-07-22T18:30:00Z",
+          "before_state": "needs_attention",
+          "after_state": "resolved",
+          "reason": "Check whether the boxed mark is an illustration",
+          "comment": "Confirmed as ILL"
+        }
+      }
+    }
+  ]
+}

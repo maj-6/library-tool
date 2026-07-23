@@ -1,0 +1,358 @@
+[data-corrections-root] .books-list,
+[data-corrections-root] .book-captures,
+[data-corrections-root] .review-list,
+[data-corrections-root] .review-audit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+[data-corrections-root] .books-list {
+  display: grid;
+  gap: 0.4rem;
+}
+
+[data-corrections-root] .books-list.is-refreshing {
+  opacity: 0.72;
+}
+
+[data-corrections-root] .corrections-book {
+  background: var(--panel-subtle, #202329);
+  border: 1px solid var(--border-subtle, #3b3f47);
+  border-left: 0.25rem solid transparent;
+  border-radius: 0.25rem;
+  min-width: 0;
+}
+
+[data-corrections-root] .corrections-book.needs-attention {
+  border-left-color: var(--attention, #f1ad3d);
+}
+
+[data-corrections-root] .book-select,
+[data-corrections-root] .capture-select,
+[data-corrections-root] .review-open {
+  color: inherit;
+  font: inherit;
+}
+
+[data-corrections-root] .book-select {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  display: flex;
+  gap: 0.45rem;
+  justify-content: space-between;
+  min-height: 2.25rem;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  width: 100%;
+}
+
+[data-corrections-root] .book-select:hover,
+[data-corrections-root] .book-select[aria-pressed="true"],
+[data-corrections-root] .capture-select:hover,
+[data-corrections-root] .capture-select[aria-pressed="true"],
+[data-corrections-root] .review-open:hover {
+  background: var(--selection-subtle, #303846);
+}
+
+[data-corrections-root] :is(
+  .book-select,
+  .capture-select,
+  .review-open,
+  .review-refresh,
+  .review-resolve,
+  .review-reopen,
+  .review-history,
+  .review-filter,
+  .review-comment
+):focus-visible {
+  outline: 2px solid var(--focus, #76a9fa);
+  outline-offset: 2px;
+}
+
+[data-corrections-root] .book-title {
+  font-weight: 650;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-corrections-root] .book-attention,
+[data-corrections-root] .book-import-state,
+[data-corrections-root] .capture-category,
+[data-corrections-root] .capture-state,
+[data-corrections-root] .review-target-kind {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 0.72rem;
+  gap: 0.2rem;
+  line-height: 1.2;
+  padding: 0.15rem 0.38rem;
+  white-space: nowrap;
+}
+
+[data-corrections-root] .book-attention {
+  background: color-mix(in srgb, var(--attention, #f1ad3d) 22%, transparent);
+  color: var(--attention-text, #ffd894);
+}
+
+[data-corrections-root] .book-attention-icon {
+  font-weight: 800;
+}
+
+[data-corrections-root] .book-import-state,
+[data-corrections-root] .capture-state {
+  background: var(--chip-subtle, #343943);
+  color: var(--text-muted, #bbc1ca);
+}
+
+[data-corrections-root] .book-captures {
+  display: flex;
+  gap: 0.35rem;
+  overflow-x: auto;
+  padding: 0 0.45rem 0.5rem;
+  scrollbar-width: thin;
+}
+
+[data-corrections-root] .book-capture {
+  flex: 0 0 6.5rem;
+  min-width: 0;
+}
+
+[data-corrections-root] .capture-select {
+  align-content: start;
+  background: var(--canvas-subtle, #17191e);
+  border: 1px solid var(--border-subtle, #3b3f47);
+  border-radius: 0.22rem;
+  cursor: pointer;
+  display: grid;
+  gap: 0.25rem;
+  min-height: 7.5rem;
+  padding: 0.3rem;
+  text-align: left;
+  width: 100%;
+}
+
+[data-corrections-root] .capture-thumbnail {
+  aspect-ratio: 4 / 3;
+  background: var(--canvas, #101216);
+  display: block;
+  height: auto;
+  object-fit: cover;
+  width: 100%;
+}
+
+[data-corrections-root] .capture-thumbnail-placeholder {
+  align-items: center;
+  color: var(--text-muted, #aeb5bf);
+  display: flex;
+  font-size: 0.72rem;
+  justify-content: center;
+  padding: 0.35rem;
+  text-align: center;
+}
+
+[data-corrections-root] .capture-category {
+  background: var(--category-chip, #2d4457);
+  color: var(--category-chip-text, #cbe8ff);
+  justify-self: start;
+  max-width: 100%;
+}
+
+[data-corrections-root] .capture-category-icon {
+  font-size: 0.85rem;
+}
+
+[data-corrections-root] .capture-state {
+  border-radius: 0.18rem;
+  justify-self: start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-corrections-root] .book-no-captures {
+  color: var(--text-muted, #aeb5bf);
+  font-size: 0.78rem;
+  margin: 0;
+  padding: 0 0.5rem 0.55rem;
+}
+
+[data-corrections-root] .books-panel-state,
+[data-corrections-root] .review-panel-state {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.75rem;
+}
+
+[data-corrections-root] .books-panel-state.is-error,
+[data-corrections-root] .review-panel-state.is-error,
+[data-corrections-root] .review-audit-error {
+  color: var(--error-text, #ffb4ad);
+}
+
+[data-corrections-root] .books-panel-state-message,
+[data-corrections-root] .review-panel-state-message {
+  color: var(--text-muted, #aeb5bf);
+  font-size: 0.82rem;
+}
+
+[data-corrections-root] .review-queue {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+[data-corrections-root] .review-toolbar {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+}
+
+[data-corrections-root] .review-filter-label,
+[data-corrections-root] .review-toggle-label,
+[data-corrections-root] .review-comment-label {
+  align-items: center;
+  display: inline-flex;
+  font-size: 0.78rem;
+  gap: 0.32rem;
+}
+
+[data-corrections-root] .review-comment-label {
+  align-items: stretch;
+  display: grid;
+  flex: 1 1 15rem;
+  gap: 0.2rem;
+}
+
+[data-corrections-root] .review-filter,
+[data-corrections-root] .review-comment {
+  background: var(--input-bg, #17191e);
+  border: 1px solid var(--border-strong, #535965);
+  border-radius: 0.2rem;
+  color: inherit;
+  font: inherit;
+  min-height: 1.9rem;
+  padding: 0.2rem 0.38rem;
+}
+
+[data-corrections-root] .review-refresh,
+[data-corrections-root] .review-resolve,
+[data-corrections-root] .review-reopen,
+[data-corrections-root] .review-history {
+  background: var(--button-bg, #343943);
+  border: 1px solid var(--border-strong, #535965);
+  border-radius: 0.2rem;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  min-height: 1.9rem;
+  padding: 0.25rem 0.55rem;
+}
+
+[data-corrections-root] :is(
+  .review-refresh,
+  .review-resolve,
+  .review-reopen,
+  .review-history
+):disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+[data-corrections-root] .review-queue-status {
+  color: var(--text-muted, #aeb5bf);
+  font-size: 0.78rem;
+  margin: 0;
+  min-height: 1.1rem;
+}
+
+[data-corrections-root] .review-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+[data-corrections-root] .review-entry {
+  background: var(--panel-subtle, #202329);
+  border: 1px solid var(--border-subtle, #3b3f47);
+  border-left: 0.25rem solid var(--attention, #f1ad3d);
+  border-radius: 0.25rem;
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.5rem;
+}
+
+[data-corrections-root] .review-entry.review-resolved {
+  border-left-color: var(--success, #63b67a);
+  opacity: 0.86;
+}
+
+[data-corrections-root] .review-entry-heading {
+  align-items: center;
+  display: flex;
+  gap: 0.45rem;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+[data-corrections-root] .review-open {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-weight: 650;
+  overflow: hidden;
+  padding: 0.2rem;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-corrections-root] .review-target-kind {
+  background: var(--chip-subtle, #343943);
+  color: var(--text-muted, #bbc1ca);
+}
+
+[data-corrections-root] .review-reason {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+[data-corrections-root] .review-entry-controls {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+[data-corrections-root] .review-audit {
+  background: var(--canvas-subtle, #17191e);
+  border-radius: 0.2rem;
+  padding: 0.5rem;
+}
+
+[data-corrections-root] .review-audit-list {
+  display: grid;
+  gap: 0.35rem;
+}
+
+[data-corrections-root] .review-audit-event {
+  border-left: 2px solid var(--border-strong, #535965);
+  display: grid;
+  font-size: 0.78rem;
+  gap: 0.15rem;
+  padding-left: 0.5rem;
+}
+
+[data-corrections-root] .review-audit-reason {
+  color: var(--text-muted, #aeb5bf);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-corrections-root] .books-list {
+    scroll-behavior: auto;
+  }
+}
