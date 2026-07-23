@@ -404,7 +404,6 @@ def _windows_open_directory_guard(path: Path) -> int:
 
     file_read_attributes = 0x00000080
     share_read = 0x00000001
-    share_write = 0x00000002
     open_existing = 3
     flag_backup_semantics = 0x02000000
     flag_open_reparse_point = 0x00200000
@@ -426,10 +425,10 @@ def _windows_open_directory_guard(path: Path) -> int:
     handle = create_file(
         str(path),
         file_read_attributes,
-        # Excluding delete sharing is defense in depth. The authority proof
-        # below does not rely on sharing semantics: it revalidates the exact
-        # canonical root-to-parent handle chain after opening the file.
-        share_read | share_write,
+        # Keep guarded components read-only while the authority proof
+        # revalidates the canonical root-to-parent handle chain. Denying
+        # write/delete sharing also prevents concurrent junction retargeting.
+        share_read,
         None,
         open_existing,
         flag_backup_semantics | flag_open_reparse_point,
