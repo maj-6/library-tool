@@ -707,6 +707,7 @@ round-trip tests.
 Companion documents:
 
 - [Architecture: data ownership and trust boundaries](architecture.md)
+- [ADR 0001: Corrections workbench and artifact ownership](adr/0001-corrections-workbench-boundary.md)
 - [Post-engine desktop UI/UX redesign specification](ui-ux-redesign-spec.md)
 - [Facsimile pipeline and current Replica implementation](facsimile-workbench-plan.md)
 - [`.lib` interchange format](lib-format.md)

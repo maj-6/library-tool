@@ -162,6 +162,11 @@ The preferred UX is that Transcribe owns the source-relative evidence and
 Edition consumes a pinned source revision. Edition may propose a source
 correction, but it must not silently rewrite reviewed transcription.
 
+[ADR 0001](adr/0001-corrections-workbench-boundary.md) applies this boundary to
+the Corrections workbench: raster sources and derivatives, spatial annotations,
+human assertions, review records, jobs, and client UI profiles each retain a
+named owner.
+
 ### 3.4 Client/engine ownership boundary
 
 The client owns transient presentation state: window and pane layout,
