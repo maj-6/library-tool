@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import threading
+import uuid
 import zipfile
 
 import libcommon as lib
@@ -119,6 +120,8 @@ def _prepare_capture(monkeypatch) -> None:
         "abc/def",
         "abc?def",
         "abc def",
+        " abcdef",
+        "a" * 65,
         "ABC",
         "abc.",
         "con",
@@ -166,6 +169,143 @@ def test_distinct_legacy_capture_ids_keep_underscore_and_period(
         capture_ids
     )
     assert len({association.book_id for association in associations}) == 2
+
+
+def test_promotion_rejects_nonportable_capture_id_without_aliasing(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+
+    refused, error = server._create_build({
+        "title": "Unsafe promotion",
+        "capture_id": "abc/def",
+    })
+    assert refused is None
+    assert error == "capture_id is not a portable identity"
+    assert lib.load_json(server.BUILDS_PATH, {}) == {}
+
+    entry_id, errors = server.ingest_capture(
+        _capture("abc_def.v2"),
+        [_jpeg("abc_def.v2")],
+        "",
+        ["photo_1.jpg"],
+        transport="lan",
+    )
+    assert entry_id
+    assert errors == []
+    build, error = server._create_build({
+        "title": "Opaque promotion",
+        "capture_id": "abc_def.v2",
+    })
+    assert error == ""
+    assert build is not None
+    assert build["capture_id"] == "abc_def.v2"
+
+    with server.app.test_client() as client:
+        response = client.patch(
+            f"/api/builds/{build['id']}",
+            json={"capture_id": "abc/def"},
+        )
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_capture_identity"
+    stored = lib.load_json(server.BUILDS_PATH, {})[build["id"]]
+    assert stored["capture_id"] == "abc_def.v2"
+
+
+def test_existing_capture_build_uuid5_is_preserved_when_archive_is_sealed(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "legacy-capture-build-id"
+    build_id = "legacy-build-123"
+    lib.save_json(server.BUILDS_PATH, {
+        build_id: {
+            "id": build_id,
+            "title": "Previously exported capture",
+            "capture_id": capture_id,
+        },
+    })
+    historical = "b-" + uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"https://librarytool.local/items/{build_id}",
+    ).hex
+
+    assert server._lib_book_id(build_id) == historical
+    entry_id, errors = server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="lan",
+    )
+
+    assert entry_id
+    assert errors == []
+    association = server._capture_archive_association(capture_id)
+    assert association is not None
+    assert association.book_id == historical
+    assert server._lib_book_id(build_id) == historical
+
+
+def test_existing_capture_build_lib_id_is_preserved_when_archive_is_sealed(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "legacy-capture-persisted-id"
+    build_id = "legacy-build-456"
+    persisted = "b-0123456789abcdef0123456789abcdef"
+    lib.save_json(server.BUILDS_PATH, {
+        build_id: {
+            "id": build_id,
+            "title": "Previously imported capture",
+            "capture_id": capture_id,
+        },
+    })
+    lib.save_json(server._lib_id_path(build_id), {"book_id": persisted})
+
+    entry_id, errors = server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="lan",
+    )
+
+    assert entry_id
+    assert errors == []
+    association = server._capture_archive_association(capture_id)
+    assert association is not None
+    assert association.book_id == persisted
+    assert server._lib_book_id(build_id) == persisted
+
+
+def test_promoted_build_reads_legacy_identity_from_capture_association(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "legacy-capture-associated-id"
+    build_id = "promoted-after-backfill"
+    preserved = "b-fedcba9876543210fedcba9876543210"
+    capture_directory = server.CAPTURES_DIR / capture_id
+    capture_directory.mkdir(parents=True)
+    (capture_directory / "orig_1.jpg").write_bytes(_jpeg(capture_id))
+    (capture_directory / "photo_1.jpg").write_bytes(_jpeg(capture_id))
+    association = server._ensure_capture_archive(
+        capture_id,
+        {
+            "id": "manual-associated",
+            "capture_id": capture_id,
+            "title": "Backfilled Capture",
+            "book_id": preserved,
+        },
+    )
+    lib.save_json(server.BUILDS_PATH, {
+        build_id: {
+            "id": build_id,
+            "title": "Promoted after backfill",
+            "capture_id": capture_id,
+        },
+    })
+
+    assert association.book_id == preserved
+    assert not server._lib_id_path(build_id).exists()
+    assert server._lib_book_id(build_id) == preserved
 
 
 def test_ingest_seals_complete_legacy_capture_and_promotion_keeps_identity(
@@ -1224,3 +1364,27 @@ def test_collection_alias_repoint_marks_linked_capture_archive_stale(
     assert stale is not None
     assert stale.state.value == "stale"
     assert stale.archive_sha256 == association.archive_sha256
+
+
+def test_lan_rejects_nonportable_id_instead_of_returning_aliased_receipt(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    monkeypatch.setattr(server, "_lan_token", lambda: "paired-secret")
+    client = server.lan_app.test_client()
+
+    response = client.post(
+        "/lan/capture",
+        headers={"X-WHL-Token": "paired-secret"},
+        data={
+            "meta": json.dumps(_capture("abc/def")),
+            "photo": (io.BytesIO(b"immutable-original"), "photo_1.jpg"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "capture id is not a portable identity"
+    }
+    assert server._capture_archive_association("abcdef") is None
+    assert lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) == {}

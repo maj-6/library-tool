@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import uuid
 from pathlib import Path
 
 import capture_lib
@@ -331,6 +332,143 @@ def test_missing_legacy_identity_is_derived_and_persisted_once(tmp_path):
     assert association is not None
     assert association.book_id == capture_book_id(capture_id)
     assert report["diagnostics"][0]["book_id"] == association.book_id
+
+
+def test_composed_backfill_preserves_historical_build_uuid5(tmp_path):
+    capture_id = "capture-existing-build"
+    build_id = "legacy-build-uuid5"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    manual_path = tmp_path / "manual_entries.json"
+    manual_path.write_text(
+        json.dumps({"manual-existing": _entry(capture_id)}),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "whl_builds.json").write_text(
+        json.dumps({
+            build_id: {
+                "id": build_id,
+                "capture_id": capture_id,
+                "title": "Existing promoted build",
+            },
+        }),
+        encoding="utf-8",
+    )
+    historical = "b-" + uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"https://librarytool.local/items/{build_id}",
+    ).hex
+
+    report = capture_lib.run_capture_archive_backfill(
+        manual_entries_path=manual_path,
+        capture_root=captures,
+        workspace_root=workspace,
+        format_module=libformat,
+        apply=True,
+    )
+    association = FilesystemCaptureArchiveRepository.inspect_association(
+        workspace,
+        capture_id,
+    )
+
+    assert report["ok"] is True
+    assert report["diagnostics"][0]["book_id"] == historical
+    assert association is not None
+    assert association.book_id == historical
+
+
+def test_composed_backfill_preserves_persisted_build_lib_id(tmp_path):
+    capture_id = "capture-existing-lib-id"
+    build_id = "legacy-build-lib-id"
+    persisted = "b-abcdef0123456789abcdef0123456789"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    manual_path = tmp_path / "manual_entries.json"
+    manual_path.write_text(
+        json.dumps({"manual-existing": _entry(capture_id)}),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    identity_path = workspace / "entries" / build_id / "ocr" / "lib-id.json"
+    identity_path.parent.mkdir(parents=True)
+    identity_path.write_text(
+        json.dumps({"book_id": persisted}),
+        encoding="utf-8",
+    )
+    (workspace / "whl_builds.json").write_text(
+        json.dumps({
+            build_id: {
+                "id": build_id,
+                "capture_id": capture_id,
+                "title": "Existing imported build",
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    report = capture_lib.run_capture_archive_backfill(
+        manual_entries_path=manual_path,
+        capture_root=captures,
+        workspace_root=workspace,
+        format_module=libformat,
+        apply=True,
+    )
+    association = FilesystemCaptureArchiveRepository.inspect_association(
+        workspace,
+        capture_id,
+    )
+
+    assert report["ok"] is True
+    assert report["diagnostics"][0]["book_id"] == persisted
+    assert association is not None
+    assert association.book_id == persisted
+
+
+def test_backfill_refuses_conflicting_existing_build_identities(tmp_path):
+    capture_id = "capture-conflicting-builds"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    manual_path = tmp_path / "manual_entries.json"
+    manual_path.write_text(
+        json.dumps({"manual-existing": _entry(capture_id)}),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "whl_builds.json").write_text(
+        json.dumps({
+            "legacy-build-a": {
+                "id": "legacy-build-a",
+                "capture_id": capture_id,
+            },
+            "legacy-build-b": {
+                "id": "legacy-build-b",
+                "capture_id": capture_id,
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    report = capture_lib.run_capture_archive_backfill(
+        manual_entries_path=manual_path,
+        capture_root=captures,
+        workspace_root=workspace,
+        format_module=libformat,
+        apply=True,
+    )
+
+    assert report["ok"] is False
+    assert report["summary"]["failed"] == 1
+    assert report["diagnostics"][0]["code"] == "capture_book_identity_invalid"
+    assert "conflicting stable book identities" in (
+        report["diagnostics"][0]["message"]
+    )
+    assert FilesystemCaptureArchiveRepository.inspect_association(
+        workspace,
+        capture_id,
+    ) is None
 
 
 def test_cli_emits_one_machine_readable_dry_run_report(tmp_path, capsys):

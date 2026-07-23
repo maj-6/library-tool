@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import sys
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +91,7 @@ _PRIVATE_LOCATOR_SUFFIXES = frozenset(
     {"file", "filename", "filepath", "locator", "path", "ref", "reference", "uri", "url"}
 )
 _DROP = object()
+_BUILD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _BIBLIOGRAPHIC_FIELDS = (
     "title",
     "subtitle",
@@ -1641,10 +1643,116 @@ def _portable_capture_id(value: Any) -> str:
     return value
 
 
-def _legacy_book_id(
+def historical_build_book_id(
+    build_id: str,
+    identity_document: Mapping[str, Any] | None = None,
+) -> str:
+    """Reproduce the stable identity used by exports before capture archives.
+
+    A persisted ``lib-id.json`` wins. Builds that were exported without one
+    historically derived their identity from the local build id, so capture
+    association backfills must use that exact UUID5 fallback rather than mint
+    a new capture-derived identity.
+    """
+
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        raise ValueError("build id is not a portable legacy identity")
+    if isinstance(identity_document, Mapping):
+        persisted = identity_document.get("book_id")
+        if isinstance(persisted, str) and _BOOK_ID_RE.fullmatch(persisted):
+            return persisted
+    return "b-" + uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"https://librarytool.local/items/{build_id}",
+    ).hex
+
+
+def discover_capture_build_identities(
+    builds: Mapping[str, Any],
+    entries_root: str | Path,
+    capture_id: str,
+) -> dict[str, str]:
+    """Discover every historical build identity attached to one capture.
+
+    The returned source labels make conflicting historical identities
+    diagnosable. Invalid capture ids are never normalized into another
+    capture's authority.
+    """
+
+    if not isinstance(builds, Mapping):
+        raise TypeError("builds must be a mapping")
+    if _portable_capture_id(capture_id) != capture_id:
+        raise ValueError("capture id is not portable")
+    root = Path(entries_root)
+    identities: dict[str, str] = {}
+    for raw_build_id in sorted(builds, key=lambda value: str(value)):
+        build = builds[raw_build_id]
+        if not isinstance(build, Mapping):
+            continue
+        if _portable_capture_id(build.get("capture_id")) != capture_id:
+            continue
+        if not isinstance(raw_build_id, str) or not _BUILD_ID_RE.fullmatch(
+            raw_build_id
+        ):
+            raise ValueError(
+                "a matching build has a nonportable legacy identity"
+            )
+        identity_path = (
+            root / raw_build_id / "ocr" / "lib-id.json"
+        )
+        try:
+            identity_path.lstat()
+        except FileNotFoundError:
+            identity_document = None
+        else:
+            try:
+                resolved_root = root.resolve(strict=True)
+                resolved_identity = identity_path.resolve(strict=True)
+                resolved_identity.relative_to(resolved_root)
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"build {raw_build_id} lib identity escaped entries root"
+                ) from exc
+            payload = _read_regular(
+                identity_path,
+                maximum=_MAX_CAPTURE_JSON_BYTES,
+                artifact=f"build {raw_build_id} lib identity",
+            )
+            try:
+                if identity_path.resolve(strict=True) != resolved_identity:
+                    raise ValueError(
+                        f"build {raw_build_id} lib identity changed location"
+                    )
+            except OSError as exc:
+                raise ValueError(
+                    f"build {raw_build_id} lib identity changed location"
+                ) from exc
+            identity_document = _json_object(
+                payload,
+                artifact=f"build {raw_build_id} lib identity",
+            )
+        identities[f"build:{raw_build_id}"] = historical_build_book_id(
+            raw_build_id,
+            identity_document,
+        )
+    return identities
+
+
+def resolve_legacy_capture_book_id(
     entry: Mapping[str, Any],
     capture_id: str,
+    *,
+    discovered_identities: Mapping[str, Any] | None = None,
 ) -> str:
+    """Resolve one capture identity without replacing any prior book id."""
+
+    if not isinstance(entry, Mapping):
+        raise TypeError("entry must be a mapping")
+    if discovered_identities is not None and not isinstance(
+        discovered_identities,
+        Mapping,
+    ):
+        raise TypeError("discovered_identities must be a mapping")
     candidates: list[tuple[str, Any]] = [
         ("book_id", entry.get("book_id")),
         ("lib_book_id", entry.get("lib_book_id")),
@@ -1653,6 +1761,14 @@ def _legacy_book_id(
     if isinstance(extra, Mapping):
         candidates.append(("extra.book_id", extra.get("book_id")))
         candidates.append(("extra.lib_book_id", extra.get("lib_book_id")))
+    if discovered_identities is not None:
+        candidates.extend(
+            (str(field_name), raw_value)
+            for field_name, raw_value in sorted(
+                discovered_identities.items(),
+                key=lambda item: str(item[0]),
+            )
+        )
     identities: dict[str, list[str]] = {}
     for field_name, raw_value in candidates:
         if raw_value in (None, ""):
@@ -1663,7 +1779,7 @@ def _legacy_book_id(
             )
         identities.setdefault(raw_value, []).append(field_name)
     if len(identities) > 1:
-        raise ValueError("manual entry contains conflicting stable book identities")
+        raise ValueError("capture has conflicting stable book identities")
     return next(iter(identities), capture_book_id(capture_id))
 
 
@@ -1770,6 +1886,9 @@ def backfill_capture_archives(
     association_lookup: (
         Callable[[str], CaptureArchiveAssociation | None] | None
     ) = None,
+    legacy_identity_lookup: (
+        Callable[[str], Mapping[str, Any] | None] | None
+    ) = None,
     apply: bool = False,
     diagnostic_limit: int = _MAX_BACKFILL_DIAGNOSTICS,
 ) -> dict[str, Any]:
@@ -1791,6 +1910,10 @@ def backfill_capture_archives(
         raise TypeError("apply requires a CaptureArchiveService")
     if association_lookup is not None and not callable(association_lookup):
         raise TypeError("association_lookup must be callable")
+    if legacy_identity_lookup is not None and not callable(
+        legacy_identity_lookup
+    ):
+        raise TypeError("legacy_identity_lookup must be callable")
     if not isinstance(apply, bool):
         raise TypeError("apply must be boolean")
     if (
@@ -1922,8 +2045,17 @@ def backfill_capture_archives(
             continue
         entry = rows[0][1]
         try:
-            book_id = _legacy_book_id(entry, capture_id)
-        except ValueError as exc:
+            discovered_identities = (
+                legacy_identity_lookup(capture_id)
+                if legacy_identity_lookup is not None
+                else None
+            )
+            book_id = resolve_legacy_capture_book_id(
+                entry,
+                capture_id,
+                discovered_identities=discovered_identities,
+            )
+        except (OSError, TypeError, ValueError) as exc:
             record(
                 _diagnostic(
                     capture_id=capture_id,
@@ -2059,6 +2191,18 @@ def _load_manual_entries(path: Path) -> dict[str, Any]:
     return _json_object(payload, artifact="manual entries catalogue")
 
 
+def _load_builds(path: Path) -> dict[str, Any]:
+    try:
+        payload = _read_regular(
+            path,
+            maximum=_MAX_CAPTURE_JSON_BYTES,
+            artifact="build catalogue",
+        )
+    except FileNotFoundError:
+        return {}
+    return _json_object(payload, artifact="build catalogue")
+
+
 def run_capture_archive_backfill(
     *,
     manual_entries_path: str | Path,
@@ -2079,6 +2223,8 @@ def run_capture_archive_backfill(
     )
 
     manual_entries = _load_manual_entries(Path(manual_entries_path))
+    workspace_root = Path(workspace_root)
+    builds = _load_builds(workspace_root / "whl_builds.json")
     materializer = Lib3CaptureArchiveMaterializer(
         format_module,
         generator="library-tool/capture-backfill-v1",
@@ -2105,6 +2251,13 @@ def run_capture_archive_backfill(
         materializer=materializer,
         service=service,
         association_lookup=association_lookup,
+        legacy_identity_lookup=lambda capture_id: (
+            discover_capture_build_identities(
+                builds,
+                workspace_root / "entries",
+                capture_id,
+            )
+        ),
         apply=apply,
         diagnostic_limit=diagnostic_limit,
     )
@@ -2206,7 +2359,10 @@ __all__ = [
     "backfill_capture_archives",
     "build_capture_archive_command",
     "build_capture_archive_source",
+    "discover_capture_build_identities",
+    "historical_build_book_id",
     "main",
+    "resolve_legacy_capture_book_id",
     "run_capture_archive_backfill",
 ]
 

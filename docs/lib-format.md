@@ -559,10 +559,15 @@ missing or corrupt assets produce a bounded diagnostic and processing
 continues, so a later apply resumes failed rows while already-associated rows
 remain unchanged.
 
-Normal intake still derives `book_id` from the capture identity. Backfill also
-accepts a valid legacy `book_id` already stored on the manual entry (including
-its legacy `extra` projection), binds that exception into the idempotency
-fingerprint, and preserves it in the archive and association. With no existing
-identity it uses the same deterministic capture-derived ID. The command never
-edits the manual catalogue, deletes or replaces capture originals, exposes a
-local path in diagnostics, or advances a cloud status/association.
+Normal intake derives `book_id` from the capture identity only when no prior
+identity exists. Intake and backfill first inspect any build already linked to
+the exact capture id: a persisted `entries/<build>/ocr/lib-id.json` wins, and a
+build without that sidecar retains the historical build-id UUID5 used by older
+exports. Backfill also accepts a valid legacy `book_id` stored on the manual
+entry (including its legacy `extra` projection), binds that exception into the
+idempotency fingerprint, and preserves it in the archive and association.
+Conflicting prior identities fail closed. Capture ids are validated verbatim;
+an invalid id is rejected rather than stripped into another capture's id. The
+command never edits the manual catalogue, deletes or replaces capture
+originals, exposes a local path in diagnostics, or advances a cloud
+status/association.

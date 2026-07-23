@@ -141,7 +141,7 @@ from librarytool.engine.contracts import (  # noqa: E402
 from librarytool.engine.capture_archives import (  # noqa: E402
     CaptureArchiveAssociation,
     CaptureArchiveService,
-    capture_book_id,
+    capture_book_id as capture_book_id,
 )
 from librarytool.engine.errors import (  # noqa: E402
     ConflictError as EngineConflictError,
@@ -2511,7 +2511,7 @@ def api_builds_update(build_id: str):
         if build_id not in builds:
             abort(404)
         b = builds[build_id]
-        before_capture_id = _clean_capture_id(b.get("capture_id"))
+        before_capture_id = _capture_archive_id(b.get("capture_id"))
         # optimistic concurrency: an editor that loaded the record before
         # another writer touched it gets the current record back, not a merge
         expect = str(payload.get("expect_updated_at") or "")
@@ -2543,7 +2543,7 @@ def api_builds_update(build_id: str):
                 candidate[f] = str(payload[f] or "").strip()
         if candidate.get("status") not in _BUILD_STATUSES:
             candidate["status"] = "draft"
-        after_capture_id = _clean_capture_id(candidate.get("capture_id"))
+        after_capture_id = _capture_archive_id(candidate.get("capture_id"))
         if before_capture_id and after_capture_id != before_capture_id:
             return jsonify({
                 "ok": False,
@@ -7538,6 +7538,11 @@ def _lib_book_id(build_id: str) -> str:
     """The book's stable UUID (docs/lib-format.md §2.4), minted on first
     export. Imported identities are persisted; older local builds use a
     deterministic fallback so a read-only export never mutates the store."""
+    doc = lib.load_json(_lib_id_path(build_id), None)
+    historical_book_id = capture_lib_compat.historical_build_book_id(
+        build_id,
+        doc if isinstance(doc, Mapping) else None,
+    )
     stored_book_id = _lib_stored_book_id(build_id)
     builds = lib.load_json(BUILDS_PATH, {}) or {}
     build = builds.get(build_id) if isinstance(builds, dict) else None
@@ -7546,45 +7551,48 @@ def _lib_book_id(build_id: str) -> str:
         if isinstance(build, dict)
         else ""
     )
-    if capture_id:
-        capture_identity = capture_book_id(capture_id)
-        linked_identity = str(build.get("capture_book_id") or "")
-        if linked_identity and not re.fullmatch(
-            r"b-[0-9a-f]{32}", linked_identity
-        ):
-            raise EngineRepositoryError(
-                "the captured item identity is invalid",
-                code="invalid_capture_book_identity",
-                details={"item_id": build_id, "capture_id": capture_id},
-            )
-        conflicting_identity = (
-            linked_identity
-            if linked_identity and linked_identity != capture_identity
-            else (
-                stored_book_id
-                if stored_book_id and stored_book_id != capture_identity
-                else ""
-            )
+    linked_identity = (
+        str(build.get("capture_book_id") or "")
+        if isinstance(build, dict)
+        else ""
+    )
+    if linked_identity and not re.fullmatch(
+        r"b-[0-9a-f]{32}",
+        linked_identity,
+    ):
+        raise EngineRepositoryError(
+            "the captured item identity is invalid",
+            code="invalid_capture_book_identity",
+            details={"item_id": build_id, "capture_id": capture_id},
         )
-        if conflicting_identity:
-            raise EngineConflictError(
-                "the capture and imported archive identities conflict",
-                code="capture_book_identity_conflict",
-                details={
-                    "item_id": build_id,
-                    "capture_id": capture_id,
-                    "capture_book_id": capture_identity,
-                    "stored_book_id": conflicting_identity,
-                },
-            )
-        # New links persist this exact identity in the catalogue transaction;
-        # legacy rows retain the same namespace-derived fallback.
-        return linked_identity or capture_identity
-    if stored_book_id:
-        return stored_book_id
-    return "b-" + uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"https://librarytool.local/items/{build_id}").hex
+    association = None
+    if capture_id:
+        # Read-only inspection avoids taking the workspace lease while callers
+        # hold the Replica merge lock. A legacy association can intentionally
+        # preserve either a persisted lib-id or the historical build-id UUID5.
+        association = FilesystemCaptureArchiveRepository.inspect_association(
+            _ensure_engine_session().write_set.root,
+            capture_id,
+        )
+    identities = {
+        value
+        for value in (
+            stored_book_id,
+            linked_identity,
+            association.book_id if association is not None else "",
+        )
+        if value
+    }
+    if len(identities) > 1:
+        raise EngineConflictError(
+            "the capture and imported archive identities conflict",
+            code="capture_book_identity_conflict",
+            details={
+                "item_id": build_id,
+                "capture_id": capture_id,
+            },
+        )
+    return next(iter(identities), historical_book_id)
 
 
 def _lib_store_book_id(build_id: str, book_id: str) -> None:
@@ -7612,8 +7620,6 @@ def _lib_import_identity_state(
         return "", ({"ok": False, "error": "item no longer exists"}, 404)
     capture_id = _capture_archive_id(build.get("capture_id"))
     linked_book_id = str(build.get("capture_book_id") or "")
-    if capture_id and not linked_book_id:
-        linked_book_id = capture_book_id(capture_id)
     if linked_book_id and not re.fullmatch(
         r"b-[0-9a-f]{32}", linked_book_id
     ):
@@ -7623,17 +7629,45 @@ def _lib_import_identity_state(
             "conflict": "book_identity_mismatch",
         }, 409)
     stored_book_id = _lib_stored_book_id(build_id)
-    if (
-        linked_book_id
-        and stored_book_id
-        and linked_book_id != stored_book_id
-    ):
+    association = (
+        FilesystemCaptureArchiveRepository.inspect_association(
+            _ensure_engine_session().write_set.root,
+            capture_id,
+        )
+        if capture_id
+        else None
+    )
+    identities = {
+        value
+        for value in (
+            linked_book_id,
+            stored_book_id,
+            association.book_id if association is not None else "",
+        )
+        if value
+    }
+    if len(identities) > 1:
         return "", ({
             "ok": False,
             "error": "the item carries conflicting stable book identities",
             "conflict": "book_identity_mismatch",
         }, 409)
-    local_book_id = linked_book_id or stored_book_id
+    identity_document = lib.load_json(_lib_id_path(build_id), None)
+    historical_book_id = capture_lib_compat.historical_build_book_id(
+        build_id,
+        (
+            identity_document
+            if isinstance(identity_document, Mapping)
+            else None
+        ),
+    )
+    # A capture-linked legacy build already has a stable historical identity,
+    # even if it predates the association sidecar. A fresh unlinked build does
+    # not: its first import is allowed to adopt the archive's identity.
+    local_book_id = next(
+        iter(identities),
+        historical_book_id if capture_id else "",
+    )
     if (
         incoming_book_id
         and local_book_id
@@ -13162,7 +13196,7 @@ def api_manual_update(entry_id: str):
             candidate.get(field) != snapshot.get(field)
             for field in archive_fields
         ):
-            stale_capture_id = _clean_capture_id(
+            stale_capture_id = _capture_archive_id(
                 candidate.get("capture_id")
             )
 
@@ -19894,6 +19928,17 @@ def _capture_archive_id(value) -> str:
     return _clean_capture_id(value)
 
 
+def _capture_build_book_identities(capture_id: str) -> dict[str, str]:
+    """Find identities used by builds that already represent this capture."""
+
+    builds = lib.load_json(BUILDS_PATH, {}) or {}
+    return capture_lib_compat.discover_capture_build_identities(
+        builds,
+        ENTRIES_DIR,
+        capture_id,
+    )
+
+
 def _capture_ingest_lock(capture_id: str) -> threading.Lock:
     """Stable bounded lock stripe for one capture's local asset publication."""
 
@@ -20281,10 +20326,22 @@ def _ensure_capture_archive(
             # Later catalogue or sidecar edits are exactly why it is stale and
             # must not prevent a lost delivery acknowledgement from converging.
             return existing
+        book_id = (
+            existing.book_id
+            if existing is not None
+            else capture_lib_compat.resolve_legacy_capture_book_id(
+                authoritative_entry,
+                capture_id,
+                discovered_identities=(
+                    _capture_build_book_identities(capture_id)
+                ),
+            )
+        )
         command = capture_lib_compat.build_capture_archive_command(
             capture_id,
             authoritative_entry,
             CAPTURES_DIR / capture_id,
+            book_id=book_id,
         )
         return service.associate(command).receipt.association
 
@@ -20527,7 +20584,7 @@ def _cloud_capture_title(cap: dict) -> str:
         title = str(source.get("title") or "").strip()
         if title:
             return title[:240]
-    capture_id = _clean_capture_id(cap.get("id"))
+    capture_id = _capture_archive_id(cap.get("id"))
     return f"Capture {capture_id[:8]}" if capture_id else "Phone capture"
 
 
@@ -21783,7 +21840,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                 indeterminate=False,
             )
             for index, cap in enumerate(pending_captures, 1):
-                capture_id = _clean_capture_id(cap.get("id"))
+                capture_id = _capture_archive_id(cap.get("id"))
                 title_hint = _cloud_capture_title(cap)
                 _cloudsync_set_stage(
                     "capture_import",
