@@ -208,6 +208,59 @@ function spatialAnnotation(overrides = {}) {
   };
 }
 
+function correctionMutationResult({
+  action,
+  operationId,
+  targets,
+  inverseAction,
+  inversePayload,
+  overrides = {},
+}) {
+  return {
+    ok: true,
+    schema: "librarytool.correction-mutation-receipt/1",
+    replayed: false,
+    receipt: {
+      action,
+      operation_id: operationId,
+      item_id: "book:one",
+      before_aggregate_revision: "corrections-r1",
+      after_aggregate_revision: "corrections-r2",
+      targets,
+      inverse: {
+        action: inverseAction,
+        expected_aggregate_revision: "corrections-r2",
+        expected_targets: targets.map((target) => ({ ...target })),
+        payload: inversePayload,
+      },
+    },
+    ...overrides,
+  };
+}
+
+function manualCategoryAssignment(category = "cover") {
+  return {
+    category,
+    origin: "manual",
+    revision: "category-manual-r1",
+    inherited_from_artifact_id: "",
+    confidence: null,
+    provenance: artifactProvenance({ origin: "human" }),
+    extensions: {},
+  };
+}
+
+function manualRoleAssignment(role = "figure") {
+  return {
+    role,
+    origin: "manual",
+    revision: "role-manual-r1",
+    confidence: null,
+    provenance: artifactProvenance({ origin: "human" }),
+    extensions: {},
+  };
+}
+
 test("EngineClient exposes the complete Replica compatibility surface", () => {
   const { client } = harness();
   assert.equal(typeof client.capabilities, "function");
@@ -234,6 +287,10 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
   assert.equal(typeof client.spatialAnnotations.list, "function");
   assert.equal(typeof client.spatialAnnotations.get, "function");
+  assert.equal(typeof client.corrections.assignImageCategory, "function");
+  assert.equal(typeof client.corrections.clearImageCategory, "function");
+  assert.equal(typeof client.corrections.assignRegionRole, "function");
+  assert.equal(typeof client.corrections.clearRegionRole, "function");
   assert.equal(typeof client.itemTombstones.list, "function");
   assert.equal(typeof client.itemTombstones.get, "function");
   assert.equal(typeof client.itemTombstones.restore, "function");
@@ -425,6 +482,327 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
     itemId: "book:one",
     canvasRevision: "bad revision",
   }), TypeError);
+});
+
+test("correction mutations own exact CAS and idempotency transport", async () => {
+  const artifactTarget = {
+    kind: "artifact",
+    target_id: "image:one",
+    before_revision: "artifact-r1",
+    after_revision: "artifact-r2",
+  };
+  const clearedArtifactTarget = {
+    ...artifactTarget,
+    before_revision: "artifact-r2",
+    after_revision: "artifact-r3",
+  };
+  const linkedTarget = {
+    kind: "artifact",
+    target_id: "figure:one",
+    before_revision: "figure-r1",
+    after_revision: "figure-r2",
+  };
+  const annotationTarget = {
+    kind: "annotation",
+    target_id: "region:one",
+    before_revision: "annotation-r1",
+    after_revision: "annotation-r2",
+  };
+  const clearedAnnotationTarget = {
+    ...annotationTarget,
+    before_revision: "annotation-r2",
+    after_revision: "annotation-r3",
+  };
+  const bodies = [
+    correctionMutationResult({
+      action: "category.assign",
+      operationId: "category:assign:1",
+      targets: [artifactTarget],
+      inverseAction: "category.clear",
+      inversePayload: { artifact_id: "image:one" },
+    }),
+    correctionMutationResult({
+      action: "category.clear",
+      operationId: "category:clear:1",
+      targets: [clearedArtifactTarget],
+      inverseAction: "category.assign",
+      inversePayload: {
+        artifact_id: "image:one",
+        assignment: manualCategoryAssignment(),
+      },
+    }),
+    correctionMutationResult({
+      action: "role.assign",
+      operationId: "role:assign:1",
+      targets: [annotationTarget, linkedTarget],
+      inverseAction: "role.clear",
+      inversePayload: {
+        annotation_id: "region:one",
+        linked_artifact_id: "figure:one",
+        linked_assignment: null,
+      },
+    }),
+    correctionMutationResult({
+      action: "role.clear",
+      operationId: "role:clear:1",
+      targets: [clearedAnnotationTarget],
+      inverseAction: "role.assign",
+      inversePayload: {
+        annotation_id: "region:one",
+        assignment: manualRoleAssignment(),
+        linked_artifact_id: "",
+        linked_assignment: null,
+      },
+    }),
+  ];
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, bodies.shift());
+    },
+  });
+
+  await client.corrections.assignImageCategory({
+    itemId: "book:one",
+    artifactId: "image:one",
+    expectedArtifactRevision: "artifact-r1",
+    category: "title_page",
+    idempotencyKey: "category:assign:1",
+  });
+  await client.corrections.clearImageCategory({
+    itemId: "book:one",
+    artifactId: "image:one",
+    expectedArtifactRevision: "artifact-r2",
+    idempotencyKey: "category:clear:1",
+  });
+  await client.corrections.assignRegionRole({
+    itemId: "book:one",
+    annotationId: "region:one",
+    expectedAnnotationRevision: "annotation-r1",
+    role: "figure",
+    linkedArtifactId: "figure:one",
+    expectedLinkedArtifactRevision: "figure-r1",
+    idempotencyKey: "role:assign:1",
+  });
+  await client.corrections.clearRegionRole({
+    itemId: "book:one",
+    annotationId: "region:one",
+    expectedAnnotationRevision: "annotation-r2",
+    idempotencyKey: "role:clear:1",
+  });
+
+  assert.deepEqual(calls.map((call) => [
+    call.init.method,
+    call.url,
+    call.init.headers,
+    JSON.parse(call.init.body),
+  ]), [
+    [
+      "PUT",
+      "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/category",
+      {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": "category:assign:1",
+        "If-Artifact-Match": "\"artifact-r1\"",
+      },
+      { category: "title_page" },
+    ],
+    [
+      "DELETE",
+      "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/category",
+      {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": "category:clear:1",
+        "If-Artifact-Match": "\"artifact-r2\"",
+      },
+      {},
+    ],
+    [
+      "PUT",
+      "/api/v1/items/book%3Aone/spatial-annotations/region%3Aone/role",
+      {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": "role:assign:1",
+        "If-Annotation-Match": "\"annotation-r1\"",
+        "If-Linked-Artifact-Match": "\"figure-r1\"",
+      },
+      { linked_artifact_id: "figure:one", role: "figure" },
+    ],
+    [
+      "DELETE",
+      "/api/v1/items/book%3Aone/spatial-annotations/region%3Aone/role",
+      {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": "role:clear:1",
+        "If-Annotation-Match": "\"annotation-r2\"",
+      },
+      { linked_artifact_id: "" },
+    ],
+  ]);
+});
+
+test("correction mutations reject unsafe commands and malformed receipts", async () => {
+  let transports = 0;
+  const target = {
+    kind: "artifact",
+    target_id: "image:one",
+    before_revision: "artifact-r1",
+    after_revision: "artifact-r2",
+  };
+  const client = new EngineClient({
+    transport: async () => {
+      transports += 1;
+      return response(200, correctionMutationResult({
+        action: "category.assign",
+        operationId: "category:assign:1",
+        targets: [target],
+        inverseAction: "category.clear",
+        inversePayload: { artifact_id: "image:one" },
+        overrides: { command_sha256: "forbidden" },
+      }));
+    },
+  });
+
+  await assert.rejects(
+    client.corrections.assignImageCategory({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "bad revision",
+      category: "cover",
+      idempotencyKey: "category:assign:1",
+    }),
+    TypeError,
+  );
+  assert.throws(() => client.corrections.assignImageCategory({
+    itemId: "book:one",
+    artifactId: "image:one",
+    expectedArtifactRevision: "artifact-r1",
+    category: "dust_jacket",
+    idempotencyKey: "category:assign:1",
+  }), TypeError);
+  assert.throws(() => client.corrections.assignRegionRole({
+    itemId: "book:one",
+    annotationId: "region:one",
+    expectedAnnotationRevision: "annotation-r1",
+    role: "figure",
+    linkedArtifactId: "figure:one",
+    idempotencyKey: "role:assign:1",
+  }), TypeError);
+  assert.equal(transports, 0);
+
+  await assert.rejects(
+    client.corrections.assignImageCategory({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "artifact-r1",
+      category: "cover",
+      idempotencyKey: "category:assign:1",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response" && error.body === null,
+  );
+  assert.equal(transports, 1);
+
+  const invalidInverse = new EngineClient({
+    transport: async () => response(200, correctionMutationResult({
+      action: "category.assign",
+      operationId: "category:assign:2",
+      targets: [target],
+      inverseAction: "attention.resolve",
+      inversePayload: { artifact_id: "image:one" },
+    })),
+  });
+  await assert.rejects(
+    invalidInverse.corrections.assignImageCategory({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "artifact-r1",
+      category: "cover",
+      idempotencyKey: "category:assign:2",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const invalidCategoryClearInverse = new EngineClient({
+    transport: async () => response(200, correctionMutationResult({
+      action: "category.clear",
+      operationId: "category:clear:invalid-inverse",
+      targets: [target],
+      inverseAction: "category.clear",
+      inversePayload: { artifact_id: "image:one" },
+    })),
+  });
+  await assert.rejects(
+    invalidCategoryClearInverse.corrections.clearImageCategory({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "artifact-r1",
+      idempotencyKey: "category:clear:invalid-inverse",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const annotationTarget = {
+    kind: "annotation",
+    target_id: "region:one",
+    before_revision: "annotation-r1",
+    after_revision: "annotation-r2",
+  };
+  const invalidRoleClearInverse = new EngineClient({
+    transport: async () => response(200, correctionMutationResult({
+      action: "role.clear",
+      operationId: "role:clear:invalid-inverse",
+      targets: [annotationTarget],
+      inverseAction: "role.clear",
+      inversePayload: {
+        annotation_id: "region:one",
+        linked_artifact_id: "",
+        linked_assignment: null,
+      },
+    })),
+  });
+  await assert.rejects(
+    invalidRoleClearInverse.corrections.clearRegionRole({
+      itemId: "book:one",
+      annotationId: "region:one",
+      expectedAnnotationRevision: "annotation-r1",
+      idempotencyKey: "role:clear:invalid-inverse",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const detachedLinkedAssignment = new EngineClient({
+    transport: async () => response(200, correctionMutationResult({
+      action: "role.assign",
+      operationId: "role:assign:detached-linked-assignment",
+      targets: [annotationTarget],
+      inverseAction: "role.clear",
+      inversePayload: {
+        annotation_id: "region:one",
+        linked_artifact_id: "",
+        linked_assignment: manualRoleAssignment(),
+      },
+    })),
+  });
+  await assert.rejects(
+    detachedLinkedAssignment.corrections.assignRegionRole({
+      itemId: "book:one",
+      annotationId: "region:one",
+      expectedAnnotationRevision: "annotation-r1",
+      role: "marginalia",
+      idempotencyKey: "role:assign:detached-linked-assignment",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
 });
 
 test("secret reads expose only versioned masked status", async () => {

@@ -8,9 +8,9 @@ transaction.
 
 Item and operation identifiers never become path components.  Their SHA-256
 digests address private aggregate and receipt documents beneath ``.engine``.
-An injected loader supplies the first canonical aggregate; once an item has
-been mutated, the durable snapshot is authoritative across repository
-re-instantiation.
+An injected loader supplies the current machine aggregate.  Hosts may also
+inject a reconciler so later OCR/layout evidence can replace machine values
+without overwriting durable human assertions.
 """
 
 from __future__ import annotations
@@ -72,6 +72,10 @@ from .recoverable_write_set import (
 
 
 AggregateLoader: TypeAlias = Callable[[str], CorrectionAggregateSnapshot | None]
+AggregateReconciler: TypeAlias = Callable[
+    [CorrectionAggregateSnapshot, CorrectionAggregateSnapshot],
+    CorrectionAggregateSnapshot,
+]
 RevisionFactory: TypeAlias = Callable[[str, str], str]
 Clock: TypeAlias = Callable[[], str]
 LockContextFactory: TypeAlias = Callable[[], ContextManager[Any]]
@@ -466,6 +470,7 @@ class FilesystemCorrectionRepository:
         write_set: RecoverableWriteSet,
         *,
         load_aggregate: AggregateLoader | None = None,
+        reconcile_aggregate: AggregateReconciler | None = None,
         revision_factory: RevisionFactory | None = None,
         clock: Clock | None = None,
         lock_context_for: LockContextFactory | None = None,
@@ -475,6 +480,7 @@ class FilesystemCorrectionRepository:
             raise TypeError("write_set must be a RecoverableWriteSet")
         for callback, name in (
             (load_aggregate, "load_aggregate"),
+            (reconcile_aggregate, "reconcile_aggregate"),
             (revision_factory, "revision_factory"),
             (clock, "clock"),
             (lock_context_for, "lock_context_for"),
@@ -483,6 +489,7 @@ class FilesystemCorrectionRepository:
                 raise TypeError(f"{name} must be callable")
         self._write_set = write_set
         self._load_aggregate = load_aggregate
+        self._reconcile_aggregate = reconcile_aggregate
         self._revision_factory = revision_factory or _default_revision
         self._clock = clock or _default_clock
         self._lock_context_for = lock_context_for or (lambda: nullcontext())
@@ -513,6 +520,7 @@ class FilesystemCorrectionRepository:
                         self._write_set,
                         operation_id=operation_id,
                         load_aggregate=self._load_aggregate,
+                        reconcile_aggregate=self._reconcile_aggregate,
                         revision_factory=self._revision_factory,
                         clock=self._clock,
                         safe_target=self._safe_target,
@@ -583,6 +591,7 @@ class FilesystemCorrectionUnitOfWork:
         *,
         operation_id: str,
         load_aggregate: AggregateLoader | None,
+        reconcile_aggregate: AggregateReconciler | None,
         revision_factory: RevisionFactory,
         clock: Clock,
         safe_target: Callable[..., Path],
@@ -590,6 +599,7 @@ class FilesystemCorrectionUnitOfWork:
         self._write_set = write_set
         self._operation_id = operation_id
         self._load_aggregate = load_aggregate
+        self._reconcile_aggregate = reconcile_aggregate
         self._revision_factory = revision_factory
         self._clock = clock
         self._safe_target = safe_target
@@ -659,10 +669,57 @@ class FilesystemCorrectionUnitOfWork:
             maximum_bytes=_MAX_AGGREGATE_BYTES,
         )
         if raw is not None:
-            aggregate = self._aggregate_from_document(raw, item_id=item_id)
+            durable = self._aggregate_from_document(raw, item_id=item_id)
+            if (
+                self._reconcile_aggregate is not None
+                and self._load_aggregate is not None
+            ):
+                live = self._load_initial(item_id)
+                aggregate = (
+                    durable
+                    if live is None
+                    else self._reconcile(
+                        live,
+                        durable,
+                        item_id=item_id,
+                    )
+                )
+            else:
+                aggregate = durable
         else:
             aggregate = self._load_initial(item_id)
         self._loaded[item_id] = aggregate
+        return aggregate
+
+    def _reconcile(
+        self,
+        live: CorrectionAggregateSnapshot,
+        durable: CorrectionAggregateSnapshot,
+        *,
+        item_id: str,
+    ) -> CorrectionAggregateSnapshot:
+        assert self._reconcile_aggregate is not None
+        try:
+            aggregate = self._reconcile_aggregate(live, durable)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction aggregate reconciler failed",
+                code="correction_aggregate_reconciliation_failed",
+                error=exc,
+                details={"item_id": item_id},
+                retryable=True,
+            ) from exc
+        if (
+            not isinstance(aggregate, CorrectionAggregateSnapshot)
+            or aggregate.item_id != item_id
+        ):
+            raise _repository_error(
+                "the correction aggregate reconciler returned invalid state",
+                code="invalid_correction_snapshot",
+                details={"item_id": item_id},
+            )
         return aggregate
 
     def stage(
@@ -811,7 +868,7 @@ class FilesystemCorrectionUnitOfWork:
             return None
         try:
             aggregate = self._load_aggregate(item_id)
-        except RepositoryError:
+        except EngineError:
             raise
         except Exception as exc:
             raise _repository_error(

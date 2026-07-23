@@ -168,3 +168,73 @@ def test_production_bridge_lists_and_serves_capture_artifacts(
     assert response.mimetype == "image/jpeg"
     assert response.headers["X-Resource-Revision"] == resource["revision"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_production_bridge_mutations_converge_across_clients(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    capture_namespace = _opaque_identity("capture", "capture-1", "asset-1")
+    display_id = f"{capture_namespace}:display"
+    path = f"/api/v1/items/book-one/raster-artifacts/{display_id}/category"
+    original = client.get(
+        f"/api/v1/items/book-one/raster-artifacts/{display_id}"
+    ).get_json()["artifact"]
+    headers = {
+        "Idempotency-Key": "bridge-category-op",
+        "If-Artifact-Match": f'"{original["revision"]}"',
+    }
+
+    first = client.put(
+        path,
+        json={"category": "title_page"},
+        headers=headers,
+    )
+    second_client = client.application.test_client()
+    observed = second_client.get(
+        f"/api/v1/items/book-one/raster-artifacts/{display_id}"
+    )
+    stale = second_client.put(
+        path,
+        json={"category": "spine"},
+        headers={
+            "Idempotency-Key": "bridge-category-stale",
+            "If-Artifact-Match": f'"{original["revision"]}"',
+        },
+    )
+    replay = second_client.put(
+        path,
+        json={"category": "title_page"},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert observed.status_code == 200
+    assert observed.get_json()["artifact"]["effective_category"] == "title_page"
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "artifact_revision_conflict"
+    assert replay.status_code == 200
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["receipt"] == first.get_json()["receipt"]
+
+
+def test_production_bridge_preserves_not_found_semantics(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    collection = client.get("/api/v1/items/missing-book/raster-artifacts")
+    mutation = client.put(
+        "/api/v1/items/missing-book/raster-artifacts/missing-image/category",
+        json={"category": "cover"},
+        headers={
+            "Idempotency-Key": "missing-category-op",
+            "If-Artifact-Match": '"missing-r1"',
+        },
+    )
+
+    assert collection.status_code == 404
+    assert collection.get_json()["code"] == "item_not_found"
+    assert mutation.status_code == 404
+    assert mutation.get_json()["code"] == "item_not_found"

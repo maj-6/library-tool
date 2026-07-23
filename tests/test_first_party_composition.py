@@ -113,6 +113,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.item-lifecycle.commands": "1.0.0",
         "library.canvases": "1.0.0",
         "library.corrections.artifacts": "1.0.0",
+        "library.corrections.commands": "1.0.0",
         "library.text-layers": "1.0.0",
         "library.secrets": "1.0.0",
         "library.providers": "1.0.0",
@@ -166,6 +167,15 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     }
     assert _capabilities(corrections.requires) == {
         ("library.items.read", 1),
+    }
+    correction_commands = modules["library.corrections.commands"]
+    assert _capabilities(correction_commands.provides) == {
+        ("library.raster-artifacts.classify", 1),
+        ("library.spatial-annotations.edit", 1),
+    }
+    assert _capabilities(correction_commands.requires) == {
+        ("library.raster-artifacts.read", 1),
+        ("library.spatial-annotations.read", 1),
     }
     native_text_layers = modules["library.text-layers"]
     assert _capabilities(native_text_layers.provides) == {
@@ -244,6 +254,8 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     }
     assert _capabilities(workbenches["corrections"].enhances) == {
         ("library.jobs", 1),
+        ("library.raster-artifacts.classify", 1),
+        ("library.spatial-annotations.edit", 1),
     }
 
 

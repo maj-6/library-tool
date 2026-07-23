@@ -70,6 +70,7 @@ function annotation(id, overrides = {}) {
 
 function engineHarness(overrides = {}) {
   const calls = {
+    corrections: [],
     rasterGet: [],
     rasterList: [],
     resourceUrl: [],
@@ -114,6 +115,9 @@ function engineHarness(overrides = {}) {
       ...overrides.spatialAnnotations,
     },
   };
+  if (overrides.corrections) {
+    engineClient.corrections = overrides.corrections;
+  }
   return { calls, engineClient };
 }
 
@@ -388,6 +392,8 @@ test("adapter fails closed when the required engine surfaces are incomplete", as
   );
   const { engineClient } = engineHarness();
   const ports = createCorrectionsEnginePorts(engineClient);
+  assert.equal(Object.hasOwn(ports.artifacts, "commands"), false,
+    "read-only engine clients do not advertise mutation commands");
   await assert.rejects(
     ports.artifacts.resources.readText(),
     (error) => error.code === "capability-unavailable",
@@ -399,4 +405,92 @@ test("adapter fails closed when the required engine surfaces are incomplete", as
     }),
     /catalog key is invalid/,
   );
+});
+
+
+test("classification commands delegate operation IDs and revision pins", async () => {
+  const invocations = [];
+  const corrections = {
+    async assignImageCategory(payload) {
+      invocations.push(["assignImageCategory", payload]);
+      return { receipt: { action: "category.assign" } };
+    },
+    async clearImageCategory(payload) {
+      invocations.push(["clearImageCategory", payload]);
+      return { receipt: { action: "category.clear" } };
+    },
+    async assignRegionRole(payload) {
+      invocations.push(["assignRegionRole", payload]);
+      return { receipt: { action: "role.assign" } };
+    },
+    async clearRegionRole(payload) {
+      invocations.push(["clearRegionRole", payload]);
+      return { receipt: { action: "role.clear" } };
+    },
+  };
+  const { engineClient } = engineHarness({ corrections });
+  const { commands } = createCorrectionsEnginePorts(engineClient).artifacts;
+  const signal = new AbortController().signal;
+
+  await commands.assignImageCategory({
+    itemId: "book-1",
+    artifactId: "image-1",
+    expectedArtifactRevision: "image-r1",
+    category: "cover",
+    operationId: "category-op",
+    signal,
+  });
+  await commands.clearImageCategory({
+    itemId: "book-1",
+    artifactId: "image-1",
+    expectedArtifactRevision: "image-r2",
+    operationId: "category-clear-op",
+  });
+  await commands.assignRegionRole({
+    itemId: "book-1",
+    annotationId: "region-1",
+    expectedAnnotationRevision: "region-r1",
+    role: "figure",
+    linkedArtifactId: "figure-1",
+    expectedLinkedArtifactRevision: "figure-r1",
+    operationId: "role-op",
+  });
+  await commands.clearRegionRole({
+    itemId: "book-1",
+    annotationId: "region-1",
+    expectedAnnotationRevision: "region-r2",
+    operationId: "role-clear-op",
+  });
+
+  assert.deepEqual(invocations, [
+    ["assignImageCategory", {
+      itemId: "book-1",
+      artifactId: "image-1",
+      expectedArtifactRevision: "image-r1",
+      category: "cover",
+      idempotencyKey: "category-op",
+      signal,
+    }],
+    ["clearImageCategory", {
+      itemId: "book-1",
+      artifactId: "image-1",
+      expectedArtifactRevision: "image-r2",
+      idempotencyKey: "category-clear-op",
+    }],
+    ["assignRegionRole", {
+      itemId: "book-1",
+      annotationId: "region-1",
+      expectedAnnotationRevision: "region-r1",
+      role: "figure",
+      linkedArtifactId: "figure-1",
+      expectedLinkedArtifactRevision: "figure-r1",
+      idempotencyKey: "role-op",
+    }],
+    ["clearRegionRole", {
+      itemId: "book-1",
+      annotationId: "region-1",
+      expectedAnnotationRevision: "region-r2",
+      idempotencyKey: "role-clear-op",
+    }],
+  ]);
 });

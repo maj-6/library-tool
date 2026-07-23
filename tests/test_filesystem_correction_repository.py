@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,7 @@ def _repository(
     recover: bool = True,
     revisions: _Revisions | None = None,
     loader=None,
+    reconciler=None,
 ) -> FilesystemCorrectionRepository:
     store = write_set or RecoverableWriteSet(root, publish_hook=hook)
     initial = aggregate or _aggregate()
@@ -150,6 +152,7 @@ def _repository(
             if loader is not None
             else lambda item_id: initial if item_id == initial.item_id else None
         ),
+        reconcile_aggregate=reconciler,
         revision_factory=revisions or _Revisions(),
         clock=lambda: "2026-07-23T12:00:00Z",
         recover=recover,
@@ -234,6 +237,62 @@ def test_category_mutation_and_exact_replay_survive_repository_restart(tmp_path)
     assert source.category(AssignmentOrigin.SUGGESTED).category == "cover"
     assert state.effective_category("crop-1").category == "title_page"
     assert replay.receipt.inverse.action == "category.clear"
+
+
+def test_explicit_reconciler_refreshes_durable_machine_evidence(tmp_path):
+    root = tmp_path / "library"
+    original = _aggregate()
+    repository = _repository(root, aggregate=original)
+    CorrectionService(repository).assign_category(
+        AssignImageCategoryCommand(
+            "book-1",
+            "source-1",
+            "source-r1",
+            "title_page",
+            "category-op",
+        )
+    )
+    live = replace(
+        original,
+        revision="aggregate-live-r2",
+        artifacts=tuple(
+            replace(value, revision="source-live-r2")
+            if value.key.artifact_id == "source-1"
+            else value
+            for value in original.artifacts
+        ),
+    )
+    calls = []
+
+    def reconcile(current, durable):
+        calls.append((current, durable))
+        return replace(
+            durable,
+            revision="aggregate-reconciled-r3",
+            artifacts=tuple(
+                replace(value, revision="source-reconciled-r3")
+                if value.key.artifact_id == "source-1"
+                else value
+                for value in durable.artifacts
+            ),
+        )
+
+    restarted = _repository(
+        root,
+        loader=lambda item_id: live if item_id == "book-1" else None,
+        reconciler=reconcile,
+    )
+
+    state = _state(restarted)
+
+    assert calls and calls[0][0] == live
+    assert calls[0][1].revision != live.revision
+    assert state.revision == "aggregate-reconciled-r3"
+    assert state.artifact("source-1").revision == "source-reconciled-r3"
+    assert (
+        state.artifact("source-1").category(AssignmentOrigin.MANUAL).category
+        == "title_page"
+    )
 
 
 def test_linked_region_and_artifact_publish_in_one_recoverable_transaction(tmp_path):

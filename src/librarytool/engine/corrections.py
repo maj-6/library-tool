@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ContextManager, Literal, Protocol, TypeAlias
@@ -72,6 +72,14 @@ ReviewAuditAction: TypeAlias = Literal[
     "attention.reopen",
     "attention.clear",
 ]
+
+CORRECTION_LINK_AUTHORITY_EXTENSION = "correction_link_authority"
+CORRECTION_TARGET_AUTHORITY_EXTENSION = "correction_target_authority"
+_CORRECTION_LINK_AUTHORITY_STATES = frozenset(
+    {"none", "single", "manual", "ambiguous", "missing", "conflict"}
+)
+_BLOCKED_CORRECTION_LINK_STATES = frozenset({"ambiguous", "missing", "conflict"})
+_CORRECTION_TARGET_AUTHORITY_STATES = frozenset({"live", "missing"})
 
 _ACTIONS = frozenset(
     {
@@ -1674,6 +1682,36 @@ class CorrectionService:
                 },
             )
 
+    @staticmethod
+    def _require_target_authority(
+        target: ArtifactCorrectionSnapshot | AnnotationCorrectionSnapshot,
+        *,
+        kind: str,
+        target_id: str,
+    ) -> None:
+        authority = target.extensions.get(CORRECTION_TARGET_AUTHORITY_EXTENSION)
+        if authority is None:
+            return
+        state = authority.get("state") if isinstance(authority, Mapping) else None
+        if (
+            not isinstance(state, str)
+            or state not in _CORRECTION_TARGET_AUTHORITY_STATES
+        ):
+            raise RepositoryError(
+                "the correction target authority is invalid",
+                code="invalid_correction_snapshot",
+                details={f"{kind}_id": target_id},
+            )
+        if state == "missing":
+            raise ConflictError(
+                "the correction target is unavailable",
+                code="correction_target_authority_conflict",
+                details={
+                    f"{kind}_id": target_id,
+                    "state": state,
+                },
+            )
+
     def _preflight(
         self,
         current: CorrectionAggregateSnapshot,
@@ -1681,6 +1719,11 @@ class CorrectionService:
     ) -> None:
         if isinstance(command, (AssignImageCategoryCommand, ClearImageCategoryCommand)):
             artifact = self._artifact(current, command.artifact_id)
+            self._require_target_authority(
+                artifact,
+                kind="artifact",
+                target_id=artifact.key.artifact_id,
+            )
             self._match_revision(
                 kind="artifact",
                 target_id=artifact.key.artifact_id,
@@ -1699,6 +1742,11 @@ class CorrectionService:
             return
         if isinstance(command, (SetManualCaptionCommand, ClearManualCaptionCommand)):
             artifact = self._artifact(current, command.artifact_id)
+            self._require_target_authority(
+                artifact,
+                kind="artifact",
+                target_id=artifact.key.artifact_id,
+            )
             self._match_revision(
                 kind="artifact",
                 target_id=artifact.key.artifact_id,
@@ -1717,6 +1765,11 @@ class CorrectionService:
             return
         if isinstance(command, AssertArtifactMetadataCommand):
             artifact = self._artifact(current, command.artifact_id)
+            self._require_target_authority(
+                artifact,
+                kind="artifact",
+                target_id=artifact.key.artifact_id,
+            )
             self._match_revision(
                 kind="artifact",
                 target_id=artifact.key.artifact_id,
@@ -1735,6 +1788,36 @@ class CorrectionService:
             return
         if isinstance(command, (AssignRegionRoleCommand, ClearRegionRoleCommand)):
             annotation = self._annotation(current, command.annotation_id)
+            self._require_target_authority(
+                annotation,
+                kind="annotation",
+                target_id=annotation.key.annotation_id,
+            )
+            authority = annotation.extensions.get(CORRECTION_LINK_AUTHORITY_EXTENSION)
+            if authority is not None:
+                state = (
+                    authority.get("state") if isinstance(authority, Mapping) else None
+                )
+                if (
+                    not isinstance(state, str)
+                    or state not in _CORRECTION_LINK_AUTHORITY_STATES
+                ):
+                    raise RepositoryError(
+                        "the annotation link authority is invalid",
+                        code="invalid_correction_snapshot",
+                        details={
+                            "annotation_id": annotation.key.annotation_id,
+                        },
+                    )
+                if state in _BLOCKED_CORRECTION_LINK_STATES:
+                    raise ConflictError(
+                        "the annotation link is ambiguous or unavailable",
+                        code="linked_artifact_authority_conflict",
+                        details={
+                            "annotation_id": annotation.key.annotation_id,
+                            "state": state,
+                        },
+                    )
             self._match_revision(
                 kind="annotation",
                 target_id=annotation.key.annotation_id,
@@ -1787,6 +1870,11 @@ class CorrectionService:
                 )
             if supplied_id:
                 linked = self._artifact(current, supplied_id)
+                self._require_target_authority(
+                    linked,
+                    kind="artifact",
+                    target_id=linked.key.artifact_id,
+                )
                 self._match_revision(
                     kind="artifact",
                     target_id=linked.key.artifact_id,
@@ -2470,6 +2558,8 @@ __all__ = [
     "ClearImageCategoryCommand",
     "ClearManualCaptionCommand",
     "ClearRegionRoleCommand",
+    "CORRECTION_LINK_AUTHORITY_EXTENSION",
+    "CORRECTION_TARGET_AUTHORITY_EXTENSION",
     "CorrectionAction",
     "CorrectionAggregateSnapshot",
     "CorrectionAuditEvent",
