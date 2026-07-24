@@ -6,3 +6,10 @@ Flask>=3.0
 pypdf>=5.0
 PyMuPDF>=1.24
 pytesseract>=0.3.13
+# Capture / Corrections perspective + raster (pyproject.toml [capture] extra).
+# The frozen desktop sidecar needs these: engine correction transforms call
+# librarytool.processing.raster, which imports cv2/numpy at runtime, so a
+# packaged build without them fails when a perspective correction is applied.
+# Pinned to the versions the cloud image processor runs the same kernel against.
+numpy==2.4.6
+opencv-python-headless==4.13.0.92
