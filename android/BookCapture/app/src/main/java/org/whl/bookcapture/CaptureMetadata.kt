@@ -70,6 +70,18 @@ class DesktopBookMetadata internal constructor(
 
     val remarks: List<String> get() = parseDesktopRemarks(dataCopy().opt("remarks"))
 
+    /**
+     * The desktop's curated bibliography for this capture, or [DesktopBibliography.EMPTY].
+     *
+     * Absent from projections written before the block existed, so an older
+     * desktop degrades to empty rather than to wrong values. This is the only
+     * route by which a real title reaches the phone: a capture's own
+     * `meta.title` exists only if the CAPTURING phone held an extraction API
+     * key, and the `books` mirror is service-role only.
+     */
+    val bibliography: DesktopBibliography
+        get() = parseDesktopBibliography(dataCopy().optJSONObject("bibliography"))
+
     internal fun semanticallyEquals(other: DesktopBookMetadata): Boolean =
         captureId == other.captureId && ownerId == other.ownerId &&
             bookId == other.bookId && revision == other.revision && dataText == other.dataText
@@ -568,6 +580,43 @@ private fun parseDesktopAvailability(value: JSONObject?): DesktopAvailability {
         detail = value.strictString("detail", 1_000).orEmpty(),
     )
 }
+
+/**
+ * The desktop's curated bibliography for one capture.
+ *
+ * Deliberately narrow: enough to identify a book on a shelf listing, not the
+ * whole catalogue record. Migration 017 publishes "a deliberately bounded
+ * snapshot for the originating capture" rather than exposing the `books` mirror,
+ * and this stays inside that boundary.
+ */
+data class DesktopBibliography(
+    val title: String = "",
+    val author: String = "",
+    val year: String = "",
+) {
+    val isEmpty: Boolean get() = title.isEmpty() && author.isEmpty() && year.isEmpty()
+
+    companion object {
+        val EMPTY = DesktopBibliography()
+    }
+}
+
+/** A malformed or absent block is EMPTY, never a partial guess: a wrong title on
+ * a shelf listing is worse than no title. */
+private fun parseDesktopBibliography(value: JSONObject?): DesktopBibliography {
+    if (value == null) return DesktopBibliography.EMPTY
+    return DesktopBibliography(
+        title = value.strictString("title", DESKTOP_BIBLIOGRAPHY_FIELD_MAX).orEmpty(),
+        author = value.strictString("author", DESKTOP_BIBLIOGRAPHY_FIELD_MAX).orEmpty(),
+        year = value.strictString("year", DESKTOP_BIBLIOGRAPHY_YEAR_MAX).orEmpty(),
+    )
+}
+
+/** Mirrors the clamps `_capture_bibliography` applies in
+ * tools/whl_explorer/server.py — the two sides must agree or a legitimate long
+ * title reads as absent. */
+internal const val DESKTOP_BIBLIOGRAPHY_FIELD_MAX = 500
+internal const val DESKTOP_BIBLIOGRAPHY_YEAR_MAX = 40
 
 private fun parseDesktopRemarks(value: Any?): List<String> = when (value) {
     is String -> listOf(value.trim()).filter { it.isNotEmpty() }

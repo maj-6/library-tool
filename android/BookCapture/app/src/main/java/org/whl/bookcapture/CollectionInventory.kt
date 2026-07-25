@@ -27,6 +27,12 @@ internal data class CollectionInventorySummary(
 internal data class CollectionInventoryItem(
     val summary: CollectionInventorySummary,
     val current: Entries.Entry?,
+    /**
+     * True when this row came from the cloud rather than this handset, so the UI
+     * can say "not on this phone" instead of claiming local media was cleared.
+     * Both cases have a null [current]; only the reason differs.
+     */
+    val remote: Boolean = false,
 )
 
 internal data class CollectionInventoryStore(

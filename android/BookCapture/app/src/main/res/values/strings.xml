@@ -171,9 +171,14 @@
     <string name="home_group_page_status">%1$s, showing scans %2$d through %3$d of %4$d.</string>
 
     <!-- Inspect keeps lightweight bibliographic summaries after delivered scan
-         media is pruned. It never implies that the tag is the collection UUID. -->
+         media is pruned, and lists what the cloud holds for a box so a reinstall
+         or a second handset still sees its contents. Distinguish the two
+         photo-less cases: inspect_book_archived means this phone captured it and
+         cleared the media, inspect_book_remote means this phone never had it.
+         Never imply that the tag is the collection UUID, and never claim the
+         cloud is empty when the phone is signed out and could not ask. -->
     <string name="inspect_scan_box">Scan box QR</string>
-    <string name="inspect_summary">%1$s &#183; %2$s recorded on this device</string>
+    <string name="inspect_summary">%1$s &#183; %2$s</string>
     <plurals name="inspect_collection_count">
         <item quantity="one">%1$d collection</item>
         <item quantity="other">%1$d collections</item>
@@ -189,7 +194,9 @@
     <string name="inspect_mode_content">Content</string>
     <string name="inspect_mode_icons">Icons</string>
     <string name="inspect_empty_collections">Create a collection before inspecting a box.</string>
-    <string name="inspect_empty_books">No books have been recorded in this collection yet.</string>
+    <string name="inspect_empty_books">No books recorded in this box on this device. Sign in to list what the cloud holds for it.</string>
+    <string name="inspect_empty_books_pending">No books recorded in this box on this device, and its cloud listing is not available yet.</string>
+    <string name="inspect_empty_books_signed_in">No books recorded in this box, on this device or in the cloud.</string>
     <string name="inspect_show_more">Show %1$d more</string>
     <string name="inspect_book_untitled">Untitled book</string>
     <plurals name="inspect_book_pages">
@@ -197,7 +204,9 @@
         <item quantity="other">%1$d pages photographed</item>
     </plurals>
     <string name="inspect_book_archived">Summary retained after local scan media was cleared</string>
+    <string name="inspect_book_remote">From the cloud &#183; not on this phone</string>
     <string name="inspect_book_unavailable">The book summary is available, but its local photos and detail view have been cleared.</string>
+    <string name="inspect_book_remote_unavailable">This book was scanned into the box on another device. Its photos and detail view are not on this phone.</string>
     <string name="inspect_scan_unknown">No collection uses tag ID %1$s.</string>
     <string name="inspect_scan_invalid">That QR code does not contain a valid collection tag ID.</string>
     <string name="inspect_scan_matched">Inspecting %1$s (%2$s)</string>
