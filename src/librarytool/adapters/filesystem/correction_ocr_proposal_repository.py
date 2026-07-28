@@ -1,0 +1,522 @@
+"""Recoverable storage for correction OCR machine proposals.
+
+The repository can read only the checksum-pinned ``ocr-ready`` output supplied
+by the transform store.  Its sole write is a new immutable proposal document;
+there is deliberately no callback for canonical text or human assertions.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+from collections.abc import Callable, Mapping
+from pathlib import Path, PurePosixPath
+from typing import Any, ContextManager, TypeAlias
+
+from ...engine.correction_ocr import (
+    CORRECTION_OCR_PROPOSAL_POLICY,
+    CorrectionOcrProviderSelection,
+    CorrectionOcrRecognition,
+    StoredCorrectionOcrProposal,
+)
+from ...engine.correction_transforms import (
+    CommittedCorrectionOutput,
+    OcrFollowupRequest,
+)
+from ...engine.errors import ConflictError, EngineError, NotFoundError, RepositoryError
+from .recoverable_write_set import (
+    RecoverableWriteSet,
+    WriteSetError,
+    _is_redirecting_path,
+)
+
+
+CorrectionOutputBytesLookup: TypeAlias = Callable[
+    [CommittedCorrectionOutput], bytes | None
+]
+LockContextFactory: TypeAlias = Callable[[], ContextManager[Any]]
+
+CORRECTION_OCR_PROPOSAL_SCHEMA = "librarytool.correction-ocr-proposal"
+CORRECTION_OCR_PROPOSAL_VERSION = 1
+_PROPOSAL_ROOT = PurePosixPath(
+    ".engine/correction-transforms/ocr-proposals"
+)
+_MAX_PROPOSAL_BYTES = 128 * 1024 * 1024
+_DOCUMENT_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "proposal_ref",
+        "operation_id",
+        "item_id",
+        "source",
+        "provider",
+        "recognition",
+        "publication_policy",
+    }
+)
+_SOURCE_FIELDS = frozenset(
+    {"kind", "artifact_id", "artifact_revision", "content_sha256"}
+)
+_PROVIDER_FIELDS = frozenset({"provider_id", "model"})
+_RECOGNITION_FIELDS = frozenset({"provider_id", "model", "payload"})
+
+
+def _repository_error(
+    message: str,
+    *,
+    code: str,
+    cause: Exception | None = None,
+    retryable: bool = False,
+) -> RepositoryError:
+    details = {"artifact": "correction_ocr_proposal"}
+    if cause is not None:
+        details["cause_type"] = type(cause).__name__
+    return RepositoryError(
+        message,
+        code=code,
+        details=details,
+        retryable=retryable,
+    )
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
+def _canonical_json(value: Mapping[str, Any]) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise _repository_error(
+            "the OCR proposal cannot be serialized",
+            code="invalid_correction_ocr_proposal",
+            cause=exc,
+        ) from exc
+
+
+def _strict_object(
+    raw: Any,
+    *,
+    fields: frozenset[str],
+    name: str,
+) -> Mapping[str, Any]:
+    if not isinstance(raw, Mapping) or frozenset(raw) != fields:
+        raise ValueError(f"{name} must contain its exact schema fields")
+    return raw
+
+
+def _source_from_dict(raw: Any) -> CommittedCorrectionOutput:
+    value = _strict_object(
+        raw,
+        fields=_SOURCE_FIELDS,
+        name="OCR proposal source",
+    )
+    return CommittedCorrectionOutput(
+        kind=value["kind"],
+        artifact_id=value["artifact_id"],
+        artifact_revision=value["artifact_revision"],
+        content_sha256=value["content_sha256"],
+    )
+
+
+def _provider_from_dict(raw: Any) -> CorrectionOcrProviderSelection:
+    value = _strict_object(
+        raw,
+        fields=_PROVIDER_FIELDS,
+        name="OCR proposal provider",
+    )
+    return CorrectionOcrProviderSelection(
+        provider_id=value["provider_id"],
+        model=value["model"],
+    )
+
+
+class FilesystemCorrectionOcrProposalRepository:
+    """Read exact transform bytes and commit provider-neutral OCR proposals."""
+
+    def __init__(
+        self,
+        write_set: RecoverableWriteSet,
+        *,
+        source_bytes_for: CorrectionOutputBytesLookup,
+        lock_context_for: LockContextFactory,
+        recover: bool = True,
+    ) -> None:
+        if not isinstance(write_set, RecoverableWriteSet):
+            raise TypeError("write_set must be a RecoverableWriteSet")
+        if not callable(source_bytes_for):
+            raise TypeError("source_bytes_for must be callable")
+        if not callable(lock_context_for):
+            raise TypeError("lock_context_for must be callable")
+        self._write_set = write_set
+        self._source_bytes_for = source_bytes_for
+        self._lock_context_for = lock_context_for
+        if recover:
+            try:
+                with self._write_set.recovery_lease():
+                    with self._lock_context_for():
+                        self._write_set.recover_all()
+            except WriteSetError as exc:
+                raise _repository_error(
+                    "the OCR proposal repository could not recover",
+                    code="correction_ocr_recovery_failed",
+                    cause=exc,
+                    retryable=True,
+                ) from exc
+            except Exception as exc:
+                raise _repository_error(
+                    "the OCR proposal authority lock is unavailable",
+                    code="correction_ocr_authority_unavailable",
+                    cause=exc,
+                    retryable=True,
+                ) from exc
+
+    def read_source(self, request: OcrFollowupRequest) -> bytes:
+        self._require_request(request)
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    value = self._source_bytes_for(request.source)
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the OCR proposal workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the corrected OCR rendition is unavailable",
+                code="correction_ocr_source_unavailable",
+                cause=exc,
+                retryable=True,
+            ) from exc
+        if value is None:
+            raise NotFoundError(
+                "the corrected OCR rendition does not exist",
+                code="correction_ocr_source_not_found",
+                details={"artifact_id": request.source.artifact_id},
+            )
+        if not isinstance(value, bytes):
+            raise _repository_error(
+                "the corrected OCR rendition is invalid",
+                code="invalid_correction_ocr_source",
+            )
+        if hashlib.sha256(value).hexdigest() != request.source.content_sha256:
+            raise _repository_error(
+                "the corrected OCR rendition checksum changed",
+                code="correction_ocr_source_checksum_mismatch",
+            )
+        return value
+
+    def find_proposal(
+        self,
+        request: OcrFollowupRequest,
+    ) -> StoredCorrectionOcrProposal | None:
+        self._require_request(request)
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    return self._find_locked(request)
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the OCR proposal workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except (ConflictError, RepositoryError):
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the OCR proposal cannot be read",
+                code="invalid_correction_ocr_proposal",
+                cause=exc,
+            ) from exc
+
+    def commit_proposal(
+        self,
+        request: OcrFollowupRequest,
+        recognition: CorrectionOcrRecognition,
+    ) -> StoredCorrectionOcrProposal:
+        self._require_request(request)
+        if not isinstance(recognition, CorrectionOcrRecognition):
+            raise TypeError("recognition must be a CorrectionOcrRecognition")
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    existing = self._find_locked(request)
+                    if existing is not None:
+                        return existing
+                    stored = StoredCorrectionOcrProposal(
+                        self.proposal_ref_for(request),
+                        request.source,
+                        CorrectionOcrProviderSelection(
+                            recognition.provider_id,
+                            recognition.model,
+                        ),
+                    )
+                    document = {
+                        "schema": CORRECTION_OCR_PROPOSAL_SCHEMA,
+                        "version": CORRECTION_OCR_PROPOSAL_VERSION,
+                        "proposal_ref": stored.proposal_ref,
+                        "operation_id": request.operation_id,
+                        "item_id": request.item_id,
+                        "source": request.source.as_dict(),
+                        "provider": stored.provider.as_dict(),
+                        "recognition": recognition.as_dict(),
+                        "publication_policy": CORRECTION_OCR_PROPOSAL_POLICY,
+                    }
+                    payload = _canonical_json(document)
+                    if len(payload) > _MAX_PROPOSAL_BYTES:
+                        raise _repository_error(
+                            "the OCR proposal exceeds its size budget",
+                            code="invalid_correction_ocr_proposal",
+                        )
+                    path = self._proposal_path(request.operation_id)
+                    if self._path_exists(path):
+                        raise ConflictError(
+                            "the OCR proposal operation already exists",
+                            code="correction_ocr_operation_conflict",
+                            details={"operation_id": request.operation_id},
+                        )
+                    transaction = self._write_set.begin(
+                        operation_id=request.operation_id,
+                        scope="correction-ocr-proposal",
+                        metadata={
+                            "item_id": request.item_id,
+                            "source_artifact_id": request.source.artifact_id,
+                            "source_sha256": request.source.content_sha256,
+                        },
+                    )
+                    transaction.stage_write(self._relative(path), payload)
+                    transaction.commit(receipt=stored.as_dict())
+                    return stored
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the OCR proposal transaction failed",
+                code=exc.code,
+                cause=exc,
+                retryable=exc.retryable,
+            ) from exc
+        except (ConflictError, RepositoryError):
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the OCR proposal transaction failed",
+                code="correction_ocr_transaction_failed",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    @staticmethod
+    def proposal_ref_for(request: OcrFollowupRequest) -> str:
+        payload = _canonical_json(request.as_dict())
+        return "cop-" + hashlib.sha256(payload).hexdigest()[:40]
+
+    def _find_locked(
+        self,
+        request: OcrFollowupRequest,
+    ) -> StoredCorrectionOcrProposal | None:
+        path = self._proposal_path(request.operation_id)
+        if not self._path_exists(path):
+            return None
+        payload = self._read_regular(path)
+        try:
+            raw = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON number {value}")
+                ),
+            )
+            document = _strict_object(
+                raw,
+                fields=_DOCUMENT_FIELDS,
+                name="OCR proposal",
+            )
+            source = _source_from_dict(document["source"])
+            provider = _provider_from_dict(document["provider"])
+            recognition_raw = _strict_object(
+                document["recognition"],
+                fields=_RECOGNITION_FIELDS,
+                name="OCR recognition",
+            )
+            recognition = CorrectionOcrRecognition(
+                recognition_raw["provider_id"],
+                recognition_raw["model"],
+                recognition_raw["payload"],
+            )
+            stored = StoredCorrectionOcrProposal(
+                document["proposal_ref"],
+                source,
+                provider,
+            )
+            if (
+                document["operation_id"] != request.operation_id
+                or document["item_id"] != request.item_id
+                or source != request.source
+            ):
+                raise ConflictError(
+                    "the OCR proposal operation belongs to another request",
+                    code="correction_ocr_operation_conflict",
+                    details={"operation_id": request.operation_id},
+                )
+            if (
+                document["schema"] != CORRECTION_OCR_PROPOSAL_SCHEMA
+                or type(document["version"]) is not int
+                or document["version"] != CORRECTION_OCR_PROPOSAL_VERSION
+                or document["publication_policy"]
+                != CORRECTION_OCR_PROPOSAL_POLICY
+                or stored.proposal_ref != self.proposal_ref_for(request)
+                or recognition.provider_id != provider.provider_id
+                or recognition.model != provider.model
+                or payload != _canonical_json(document)
+            ):
+                raise ValueError("OCR proposal is not bound to its request")
+            return stored
+        except ConflictError:
+            raise
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+            raise _repository_error(
+                "the OCR proposal is invalid",
+                code="invalid_correction_ocr_proposal",
+                cause=exc,
+            ) from exc
+
+    @staticmethod
+    def _require_request(request: OcrFollowupRequest) -> None:
+        if not isinstance(request, OcrFollowupRequest):
+            raise TypeError("request must be an OcrFollowupRequest")
+
+    def _read_regular(self, path: Path) -> bytes:
+        descriptor = -1
+        try:
+            before = path.lstat()
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or _is_redirecting_path(path)
+            ):
+                raise ValueError("OCR proposal is not a private regular file")
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (before.st_dev, before.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise ValueError("OCR proposal changed while opening")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                block = os.read(descriptor, 1 << 20)
+                if not block:
+                    break
+                total += len(block)
+                if total > _MAX_PROPOSAL_BYTES:
+                    raise ValueError("OCR proposal exceeds its size budget")
+                chunks.append(block)
+            after = path.lstat()
+            if (
+                (after.st_dev, after.st_ino, after.st_size)
+                != (opened.st_dev, opened.st_ino, opened.st_size)
+                or _is_redirecting_path(path)
+            ):
+                raise ValueError("OCR proposal changed while reading")
+            return b"".join(chunks)
+        except (OSError, ValueError) as exc:
+            raise _repository_error(
+                "the OCR proposal cannot be read safely",
+                code="invalid_correction_ocr_proposal",
+                cause=exc,
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _path_exists(self, path: Path) -> bool:
+        self._safe_target(path)
+        if not os.path.lexists(path):
+            return False
+        try:
+            info = path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise _repository_error(
+                "the OCR proposal target cannot be inspected",
+                code="invalid_correction_ocr_proposal",
+                cause=exc,
+            ) from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or _is_redirecting_path(path)
+        ):
+            raise _repository_error(
+                "the OCR proposal target is unsafe",
+                code="invalid_correction_ocr_proposal",
+            )
+        return True
+
+    def _safe_target(self, path: Path) -> Path:
+        target = Path(path)
+        try:
+            relative = target.relative_to(self._write_set.root)
+        except ValueError as exc:
+            raise _repository_error(
+                "the OCR proposal target escapes its workspace",
+                code="unsafe_correction_ocr_path",
+                cause=exc,
+            ) from exc
+        current = self._write_set.root
+        for part in relative.parts:
+            if part in {"", ".", ".."}:
+                raise _repository_error(
+                    "the OCR proposal target is unsafe",
+                    code="unsafe_correction_ocr_path",
+                )
+            current /= part
+            if _is_redirecting_path(current):
+                raise _repository_error(
+                    "the OCR proposal target crosses a redirecting path",
+                    code="unsafe_correction_ocr_path",
+                )
+        return target
+
+    def _proposal_path(self, operation_id: str) -> Path:
+        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+        return self._target(_PROPOSAL_ROOT / f"{digest}.json")
+
+    def _target(self, relative: PurePosixPath) -> Path:
+        return self._write_set.root.joinpath(*relative.parts)
+
+    def _relative(self, path: Path) -> str:
+        return path.relative_to(self._write_set.root).as_posix()
+
+__all__ = [
+    "CORRECTION_OCR_PROPOSAL_SCHEMA",
+    "CORRECTION_OCR_PROPOSAL_VERSION",
+    "CorrectionOutputBytesLookup",
+    "FilesystemCorrectionOcrProposalRepository",
+]

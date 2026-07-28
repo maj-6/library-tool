@@ -16,6 +16,9 @@ from .canvas_preparation_repository import (
 from .canvas_query_repository import FilesystemCanvasQueryRepository
 from .capture_archive_repository import FilesystemCaptureArchiveRepository
 from .correction_repository import FilesystemCorrectionRepository
+from .correction_ocr_proposal_repository import (
+    FilesystemCorrectionOcrProposalRepository,
+)
 from .correction_transform_store import FilesystemCorrectionTransformStore
 from .correction_source_snapshot import (
     CanonicalTextLayerHumanAssertionReader,
@@ -76,6 +79,7 @@ __all__ = [
     "FilesystemCanvasQueryRepository",
     "FilesystemCaptureArchiveRepository",
     "FilesystemCorrectionRepository",
+    "FilesystemCorrectionOcrProposalRepository",
     "FilesystemCorrectionTransformStore",
     "FilesystemCorrectionSourceSnapshotReader",
     "FilesystemCorrectionsArtifactRepository",
