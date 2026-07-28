@@ -1,5 +1,6 @@
 import json
 import re
+import tomllib
 from pathlib import Path
 
 
@@ -297,6 +298,19 @@ def test_release_docs_use_raw_windows_base64_not_certutil_pem():
 
 
 def test_release_source_versions_are_internally_consistent():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    image_processor = tomllib.loads(
+        (ROOT / "services" / "image_processor" / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    core_dependency = [
+        dependency
+        for dependency in image_processor["project"]["dependencies"]
+        if dependency.startswith("world-herb-library")
+    ]
+    assert core_dependency == [f"world-herb-library=={project['project']['version']}"]
+
     package = json.loads(
         (ROOT / "desktop" / "package.json").read_text(encoding="utf-8")
     )
