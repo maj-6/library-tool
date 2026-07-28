@@ -12,12 +12,15 @@ import json
 import os
 import stat
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, ContextManager, TypeAlias
 
 from ...engine.correction_ocr import (
     CORRECTION_OCR_MAX_SOURCE_BYTES,
     CORRECTION_OCR_PROPOSAL_POLICY,
+    CorrectionOcrProposalProviderView,
+    CorrectionOcrProposalView,
     CorrectionOcrProviderSelection,
     CorrectionOcrRecognition,
     StoredCorrectionOcrProposal,
@@ -57,6 +60,9 @@ _PROPOSAL_ROOT = PurePosixPath(
 _RECEIPT_ROOT = PurePosixPath(
     ".engine/receipts/correction-ocr-proposals"
 )
+_OPERATION_ROOT = PurePosixPath(
+    ".engine/receipts/correction-ocr-proposal-operations"
+)
 _MAX_PROPOSAL_BYTES = 128 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 64 * 1024
 _DOCUMENT_FIELDS = frozenset(
@@ -90,6 +96,23 @@ _RECEIPT_FIELDS = frozenset(
         "proposal_sha256",
     }
 )
+_OPERATION_SCHEMA = "librarytool.correction-ocr-proposal-operation"
+_OPERATION_VERSION = 1
+_OPERATION_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "proposal_ref",
+        "operation_id",
+        "item_id",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedCorrectionOcrProposal:
+    stored: StoredCorrectionOcrProposal
+    view: CorrectionOcrProposalView
 
 
 def _repository_error(
@@ -292,6 +315,43 @@ class FilesystemCorrectionOcrProposalRepository:
                 cause=exc,
             ) from exc
 
+    def get_proposal(
+        self,
+        item_id: str,
+        proposal_ref: str,
+    ) -> CorrectionOcrProposalView | None:
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or len(item_id) > 256
+        ):
+            raise ValueError("item_id must be a bounded identifier")
+        self._require_proposal_ref(proposal_ref)
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    loaded = self._load_locked(proposal_ref)
+                    if loaded is None or loaded.view.item_id != item_id:
+                        return None
+                    return loaded.view
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the OCR proposal workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except RepositoryError:
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the OCR proposal cannot be read",
+                code="invalid_correction_ocr_proposal",
+                cause=exc,
+            ) from exc
+
     def commit_proposal(
         self,
         request: OcrFollowupRequest,
@@ -333,6 +393,27 @@ class FilesystemCorrectionOcrProposalRepository:
                             code="invalid_correction_ocr_proposal",
                         )
                     proposal_sha256 = hashlib.sha256(payload).hexdigest()
+                    try:
+                        CorrectionOcrProposalView(
+                            proposal_ref=stored.proposal_ref,
+                            item_id=request.item_id,
+                            operation_id=request.operation_id,
+                            source=stored.source,
+                            provider=CorrectionOcrProposalProviderView(
+                                stored.provider.provider_id,
+                                stored.provider.model,
+                            ),
+                            recognition=recognition.payload,
+                            publication_policy=CORRECTION_OCR_PROPOSAL_POLICY,
+                            content_sha256=proposal_sha256,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise _repository_error(
+                            "the OCR proposal contains private or invalid "
+                            "public metadata",
+                            code="invalid_correction_ocr_proposal",
+                            cause=exc,
+                        ) from exc
                     receipt = {
                         "schema": CORRECTION_OCR_PROPOSAL_RECEIPT_SCHEMA,
                         "version": CORRECTION_OCR_PROPOSAL_RECEIPT_VERSION,
@@ -348,13 +429,23 @@ class FilesystemCorrectionOcrProposalRepository:
                             "the OCR proposal receipt exceeds its size budget",
                             code="invalid_correction_ocr_proposal",
                         )
-                    proposal_path = self._proposal_path(
+                    operation = {
+                        "schema": _OPERATION_SCHEMA,
+                        "version": _OPERATION_VERSION,
+                        "proposal_ref": stored.proposal_ref,
+                        "operation_id": request.operation_id,
+                        "item_id": request.item_id,
+                    }
+                    operation_payload = _canonical_json(operation)
+                    proposal_path = self._proposal_path(stored.proposal_ref)
+                    receipt_path = self._receipt_path(stored.proposal_ref)
+                    operation_path = self._operation_path(
                         request.operation_id
                     )
-                    receipt_path = self._receipt_path(request.operation_id)
                     if (
                         self._path_exists(proposal_path)
                         or self._path_exists(receipt_path)
+                        or self._path_exists(operation_path)
                     ):
                         raise ConflictError(
                             "the OCR proposal operation already exists",
@@ -377,6 +468,10 @@ class FilesystemCorrectionOcrProposalRepository:
                     transaction.stage_write(
                         self._relative(receipt_path),
                         receipt_payload,
+                    )
+                    transaction.stage_write(
+                        self._relative(operation_path),
+                        operation_payload,
                     )
                     transaction.commit(receipt=stored.as_dict())
                     return stored
@@ -408,8 +503,54 @@ class FilesystemCorrectionOcrProposalRepository:
         self,
         request: OcrFollowupRequest,
     ) -> StoredCorrectionOcrProposal | None:
-        proposal_path = self._proposal_path(request.operation_id)
-        receipt_path = self._receipt_path(request.operation_id)
+        expected_ref = self.proposal_ref_for(request)
+        operation_path = self._operation_path(request.operation_id)
+        operation_exists = self._path_exists(operation_path)
+        proposal_exists = self._path_exists(self._proposal_path(expected_ref))
+        receipt_exists = self._path_exists(self._receipt_path(expected_ref))
+        if not operation_exists and not proposal_exists and not receipt_exists:
+            return None
+        if not operation_exists:
+            raise _repository_error(
+                "the OCR proposal publication is incomplete",
+                code="invalid_correction_ocr_proposal",
+            )
+        operation = self._read_operation(operation_path)
+        if (
+            operation["operation_id"] != request.operation_id
+            or operation["item_id"] != request.item_id
+            or operation["proposal_ref"] != expected_ref
+        ):
+            raise ConflictError(
+                "the OCR proposal operation belongs to another request",
+                code="correction_ocr_operation_conflict",
+                details={"operation_id": request.operation_id},
+            )
+        loaded = self._load_locked(expected_ref)
+        if loaded is None:
+            raise _repository_error(
+                "the OCR proposal publication is incomplete",
+                code="invalid_correction_ocr_proposal",
+            )
+        if (
+            loaded.view.operation_id != request.operation_id
+            or loaded.view.item_id != request.item_id
+            or loaded.view.source != request.source
+        ):
+            raise ConflictError(
+                "the OCR proposal operation belongs to another request",
+                code="correction_ocr_operation_conflict",
+                details={"operation_id": request.operation_id},
+            )
+        return loaded.stored
+
+    def _load_locked(
+        self,
+        proposal_ref: str,
+    ) -> _LoadedCorrectionOcrProposal | None:
+        self._require_proposal_ref(proposal_ref)
+        proposal_path = self._proposal_path(proposal_ref)
+        receipt_path = self._receipt_path(proposal_ref)
         proposal_exists = self._path_exists(proposal_path)
         receipt_exists = self._path_exists(receipt_path)
         if not proposal_exists and not receipt_exists:
@@ -470,20 +611,18 @@ class FilesystemCorrectionOcrProposalRepository:
                 source,
                 provider,
             )
-            if (
-                document["operation_id"] != request.operation_id
-                or document["item_id"] != request.item_id
-                or source != request.source
-                or receipt["operation_id"] != request.operation_id
-                or receipt["item_id"] != request.item_id
-                or receipt["source_sha256"]
-                != request.source.content_sha256
-            ):
-                raise ConflictError(
-                    "the OCR proposal operation belongs to another request",
-                    code="correction_ocr_operation_conflict",
-                    details={"operation_id": request.operation_id},
-                )
+            bound_request = OcrFollowupRequest(
+                document["operation_id"],
+                document["item_id"],
+                source,
+            )
+            operation_path = self._operation_path(
+                bound_request.operation_id
+            )
+            if not self._path_exists(operation_path):
+                raise ValueError("OCR proposal operation claim is missing")
+            operation = self._read_operation(operation_path)
+            proposal_sha256 = hashlib.sha256(payload).hexdigest()
             if (
                 document["schema"] != CORRECTION_OCR_PROPOSAL_SCHEMA
                 or type(document["version"]) is not int
@@ -495,10 +634,17 @@ class FilesystemCorrectionOcrProposalRepository:
                 != CORRECTION_OCR_PROPOSAL_RECEIPT_VERSION
                 or document["publication_policy"]
                 != CORRECTION_OCR_PROPOSAL_POLICY
-                or stored.proposal_ref != self.proposal_ref_for(request)
+                or stored.proposal_ref != proposal_ref
+                or stored.proposal_ref != self.proposal_ref_for(bound_request)
                 or receipt["proposal_ref"] != stored.proposal_ref
                 or receipt["proposal_sha256"]
-                != hashlib.sha256(payload).hexdigest()
+                != proposal_sha256
+                or receipt["operation_id"] != bound_request.operation_id
+                or receipt["item_id"] != bound_request.item_id
+                or receipt["source_sha256"] != source.content_sha256
+                or operation["proposal_ref"] != stored.proposal_ref
+                or operation["operation_id"] != bound_request.operation_id
+                or operation["item_id"] != bound_request.item_id
                 or recognition.provider_id != provider.provider_id
                 or recognition.model != provider.model
                 or recognition.options != provider.options
@@ -506,12 +652,56 @@ class FilesystemCorrectionOcrProposalRepository:
                 or receipt_payload != _canonical_json(receipt)
             ):
                 raise ValueError("OCR proposal is not bound to its request")
-            return stored
-        except ConflictError:
-            raise
+            return _LoadedCorrectionOcrProposal(
+                stored=stored,
+                view=CorrectionOcrProposalView(
+                    proposal_ref=stored.proposal_ref,
+                    item_id=bound_request.item_id,
+                    operation_id=bound_request.operation_id,
+                    source=stored.source,
+                    provider=CorrectionOcrProposalProviderView(
+                        stored.provider.provider_id,
+                        stored.provider.model,
+                    ),
+                    recognition=recognition.payload,
+                    publication_policy=document["publication_policy"],
+                    content_sha256=proposal_sha256,
+                ),
+            )
         except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
             raise _repository_error(
                 "the OCR proposal is invalid",
+                code="invalid_correction_ocr_proposal",
+                cause=exc,
+            ) from exc
+
+    def _read_operation(self, path: Path) -> Mapping[str, Any]:
+        payload = self._read_regular(path, maximum=_MAX_RECEIPT_BYTES)
+        try:
+            raw = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON number {value}")
+                ),
+            )
+            operation = _strict_object(
+                raw,
+                fields=_OPERATION_FIELDS,
+                name="OCR proposal operation",
+            )
+            if (
+                operation["schema"] != _OPERATION_SCHEMA
+                or type(operation["version"]) is not int
+                or operation["version"] != _OPERATION_VERSION
+                or payload != _canonical_json(operation)
+            ):
+                raise ValueError("OCR proposal operation claim is invalid")
+            self._require_proposal_ref(operation["proposal_ref"])
+            return operation
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+            raise _repository_error(
+                "the OCR proposal operation claim is invalid",
                 code="invalid_correction_ocr_proposal",
                 cause=exc,
             ) from exc
@@ -520,6 +710,18 @@ class FilesystemCorrectionOcrProposalRepository:
     def _require_request(request: OcrFollowupRequest) -> None:
         if not isinstance(request, OcrFollowupRequest):
             raise TypeError("request must be an OcrFollowupRequest")
+
+    @staticmethod
+    def _require_proposal_ref(proposal_ref: object) -> None:
+        if (
+            not isinstance(proposal_ref, str)
+            or len(proposal_ref) != 44
+            or not proposal_ref.startswith("cop-")
+            or any(value not in "0123456789abcdef" for value in proposal_ref[4:])
+        ):
+            raise ValueError(
+                "proposal_ref must be an opaque OCR proposal reference"
+            )
 
     def _read_regular(self, path: Path, *, maximum: int) -> bytes:
         descriptor = -1
@@ -675,13 +877,17 @@ class FilesystemCorrectionOcrProposalRepository:
                 )
         return target
 
-    def _proposal_path(self, operation_id: str) -> Path:
-        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
-        return self._target(_PROPOSAL_ROOT / f"{digest}.json")
+    def _proposal_path(self, proposal_ref: str) -> Path:
+        self._require_proposal_ref(proposal_ref)
+        return self._target(_PROPOSAL_ROOT / f"{proposal_ref}.json")
 
-    def _receipt_path(self, operation_id: str) -> Path:
+    def _receipt_path(self, proposal_ref: str) -> Path:
+        self._require_proposal_ref(proposal_ref)
+        return self._target(_RECEIPT_ROOT / f"{proposal_ref}.json")
+
+    def _operation_path(self, operation_id: str) -> Path:
         digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
-        return self._target(_RECEIPT_ROOT / f"{digest}.json")
+        return self._target(_OPERATION_ROOT / f"{digest}.json")
 
     def _target(self, relative: PurePosixPath) -> Path:
         return self._write_set.root.joinpath(*relative.parts)

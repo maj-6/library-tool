@@ -24,6 +24,7 @@ from ..engine.runtime import (
     CANVAS_QUERY_SERVICE,
     CORRECTION_CAPTION_SERVICE,
     CORRECTION_METADATA_SERVICE,
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
@@ -78,6 +79,9 @@ CORRECTION_REVIEWS_EDIT_CAPABILITY = CapabilityRef(
 )
 CORRECTION_TRANSFORMS_QUEUE_CAPABILITY = CapabilityRef(
     "library.corrections.transforms.queue"
+)
+CORRECTION_OCR_PROPOSALS_READ_CAPABILITY = CapabilityRef(
+    "library.corrections.ocr-proposals.read"
 )
 
 
@@ -191,7 +195,10 @@ FIRST_PARTY_MODULE_MANIFESTS = (
     ModuleManifest(
         "library.corrections.transforms",
         "1.0.0",
-        provides=(CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,),
+        provides=(
+            CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,
+            CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,
+        ),
         requires=(
             CapabilityRef("library.jobs"),
             RASTER_ARTIFACTS_READ_CAPABILITY,
@@ -315,6 +322,7 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             CORRECTION_REVIEWS_READ_CAPABILITY,
             CORRECTION_REVIEWS_EDIT_CAPABILITY,
             CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,
+            CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,
         ),
     ),
 )
@@ -513,6 +521,7 @@ def first_party_module_contributions(
         )
 
     if graph.correction_transforms is not None:
+        assert graph.correction_ocr_proposals is not None
         contributions.append(
             ModuleContribution(
                 modules["library.corrections.transforms"],
@@ -520,9 +529,12 @@ def first_party_module_contributions(
                     ServiceBinding(
                         CORRECTION_TRANSFORM_SERVICE,
                         graph.correction_transforms,
-                        modules[
-                            "library.corrections.transforms"
-                        ].provides,
+                        (CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,),
+                    ),
+                    ServiceBinding(
+                        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+                        graph.correction_ocr_proposals,
+                        (CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,),
                     ),
                 ),
             )

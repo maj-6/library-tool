@@ -62,6 +62,7 @@ from ..engine.correction_projection import (
 from ..engine.correction_ocr import (
     CORRECTION_OCR_MAX_SOURCE_BYTES,
     CorrectionOcrFollowupService,
+    CorrectionOcrProposalQueryService,
     CorrectionOcrProviderPort,
 )
 from ..engine.corrections import CorrectionService
@@ -115,6 +116,7 @@ from ..engine.runtime import (
     CORRECTION_METADATA_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
@@ -858,6 +860,7 @@ class FilesystemServiceGraph:
     provider_discovery: ProviderDiscoveryService | None = None
     correction_commands: CorrectionService | None = None
     correction_transforms: CorrectionTransformService | None = None
+    correction_ocr_proposals: CorrectionOcrProposalQueryService | None = None
     raster_artifacts: RasterArtifactProjectorPort | None = None
     spatial_annotations: SpatialAnnotationProjectorPort | None = None
 
@@ -898,6 +901,21 @@ class FilesystemServiceGraph:
                 "correction_transforms must be a "
                 "CorrectionTransformService or None"
             )
+        if (self.correction_transforms is None) != (
+            self.correction_ocr_proposals is None
+        ):
+            raise ValueError(
+                "correction transform and OCR proposal query services must "
+                "be installed together"
+            )
+        if self.correction_ocr_proposals is not None and not isinstance(
+            self.correction_ocr_proposals,
+            CorrectionOcrProposalQueryService,
+        ):
+            raise TypeError(
+                "correction_ocr_proposals must be a "
+                "CorrectionOcrProposalQueryService or None"
+            )
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
@@ -918,6 +936,10 @@ class FilesystemServiceGraph:
             (CORRECTION_METADATA_SERVICE, self.correction_commands),
             (CORRECTION_REVIEW_SERVICE, self.correction_commands),
             (CORRECTION_SERVICE, self.correction_commands),
+            (
+                CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+                self.correction_ocr_proposals,
+            ),
             (CORRECTION_TRANSFORM_SERVICE, self.correction_transforms),
             (RASTER_ARTIFACT_QUERY_SERVICE, self.raster_artifacts),
             (
@@ -1058,6 +1080,7 @@ def compose_filesystem_engine(
     corrections_artifacts = None
     correction_commands = None
     correction_transforms = None
+    correction_ocr_proposals = None
     if corrections is not None:
         assert corrections_lock is not None
         corrections_base = FilesystemCorrectionsArtifactRepository(
@@ -1126,42 +1149,42 @@ def compose_filesystem_engine(
                 else None
             ),
         )
+        def correction_ocr_source_bytes_for(
+            item_id: str,
+            operation_id: str,
+            output,
+        ) -> bytes | None:
+            resolved = correction_transform_store.resolve_committed_output(
+                item_id,
+                operation_id,
+                output,
+            )
+            if resolved is None:
+                return None
+            try:
+                content = resolved.stream.read(
+                    CORRECTION_OCR_MAX_SOURCE_BYTES + 1
+                )
+                if len(content) > CORRECTION_OCR_MAX_SOURCE_BYTES:
+                    raise RepositoryError(
+                        "the corrected OCR rendition exceeds its size budget",
+                        code="correction_ocr_source_too_large",
+                    )
+                return content
+            finally:
+                resolved.stream.close()
+
+        correction_ocr_repository = FilesystemCorrectionOcrProposalRepository(
+            resources.write_set,
+            source_bytes_for=correction_ocr_source_bytes_for,
+            lock_context_for=corrections_lock,
+            recover=False,
+        )
+        correction_ocr_proposals = CorrectionOcrProposalQueryService(
+            correction_ocr_repository
+        )
         correction_ocr = None
         if corrections.ocr_provider is not None:
-
-            def correction_ocr_source_bytes_for(
-                item_id: str,
-                operation_id: str,
-                output,
-            ) -> bytes | None:
-                resolved = correction_transform_store.resolve_committed_output(
-                    item_id,
-                    operation_id,
-                    output,
-                )
-                if resolved is None:
-                    return None
-                try:
-                    content = resolved.stream.read(
-                        CORRECTION_OCR_MAX_SOURCE_BYTES + 1
-                    )
-                    if len(content) > CORRECTION_OCR_MAX_SOURCE_BYTES:
-                        raise RepositoryError(
-                            "the corrected OCR rendition exceeds its size budget",
-                            code="correction_ocr_source_too_large",
-                        )
-                    return content
-                finally:
-                    resolved.stream.close()
-
-            correction_ocr_repository = (
-                FilesystemCorrectionOcrProposalRepository(
-                    resources.write_set,
-                    source_bytes_for=correction_ocr_source_bytes_for,
-                    lock_context_for=corrections_lock,
-                    recover=False,
-                )
-            )
             correction_ocr = CorrectionOcrFollowupService(
                 resources.jobs,
                 correction_ocr_repository,
@@ -1359,6 +1382,7 @@ def compose_filesystem_engine(
         provider_discovery=(None if providers is None else providers.service),
         correction_commands=correction_commands,
         correction_transforms=correction_transforms,
+        correction_ocr_proposals=correction_ocr_proposals,
         raster_artifacts=corrections_artifacts,
         spatial_annotations=corrections_artifacts,
     )

@@ -27,17 +27,43 @@ from .correction_transforms import (
     OcrFollowupState,
 )
 from .jobs import JobFailure, JobManager, JobOutput, JobProgress, JobState, JobView
-from .errors import EngineError
+from .errors import EngineError, ValidationError
 
 
 CORRECTION_OCR_JOB_KIND = "correction.ocr-followup"
 CORRECTION_OCR_PROPOSAL_POLICY = "machine-proposal-only"
 CORRECTION_OCR_MAX_SOURCE_BYTES = 256 * 1024 * 1024
 _PORTABLE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_PROPOSAL_REF = re.compile(r"^cop-[0-9a-f]{40}$")
 _MAX_RECOGNITION_BYTES = 64 * 1024 * 1024
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 200_000
 _MAX_PROVIDER_OPTIONS_BYTES = 64 * 1024
+_PUBLIC_PRIVATE_KEYS = frozenset(
+    {
+        "absolute_path",
+        "api_key",
+        "asset_ref",
+        "credential",
+        "file",
+        "file_name",
+        "filename",
+        "filepath",
+        "local_path",
+        "locator",
+        "password",
+        "path",
+        "resource_ref",
+        "secret",
+        "secret_key",
+        "storage_key",
+        "storage_locator",
+        "storage_path",
+        "token",
+        "uri",
+        "url",
+    }
+)
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +121,30 @@ def _thaw_json(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_thaw_json(item) for item in value]
     return value
+
+
+def _normalized_public_key(value: str) -> str:
+    normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
+    return re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").casefold()
+
+
+def _require_public_payload(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = _normalized_public_key(key)
+            if (
+                normalized in _PUBLIC_PRIVATE_KEYS
+                or normalized.rsplit("_", 1)[-1]
+                in {"credential", "file", "filename", "filepath", "path", "uri", "url"}
+            ):
+                raise ValueError(
+                    "OCR proposal payload contains private execution metadata"
+                )
+            _require_public_payload(item)
+    elif isinstance(value, tuple):
+        for item in value:
+            _require_public_payload(item)
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
@@ -210,6 +260,142 @@ class StoredCorrectionOcrProposal:
             "source": self.source.as_dict(),
             "provider": self.provider.as_dict(),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionOcrProposalProviderView:
+    """Public provider identity with execution options deliberately omitted."""
+
+    provider_id: str
+    model: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "provider_id",
+            _portable(self.provider_id, "provider_id"),
+        )
+        if not isinstance(self.model, str) or len(self.model.strip()) > 512:
+            raise ValueError("model must be a bounded string")
+        object.__setattr__(self, "model", self.model.strip())
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "provider_id": self.provider_id,
+            "model": self.model,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionOcrProposalView:
+    """Immutable OCR proposal resource without private execution metadata."""
+
+    proposal_ref: str
+    item_id: str
+    operation_id: str
+    source: CommittedCorrectionOutput
+    provider: CorrectionOcrProposalProviderView
+    recognition: Mapping[str, Any]
+    publication_policy: str
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "proposal_ref",
+            _portable(self.proposal_ref, "proposal_ref"),
+        )
+        if _PROPOSAL_REF.fullmatch(self.proposal_ref) is None:
+            raise ValueError("proposal_ref must be an opaque OCR proposal reference")
+        object.__setattr__(self, "item_id", _portable(self.item_id, "item_id"))
+        object.__setattr__(
+            self,
+            "operation_id",
+            _portable(self.operation_id, "operation_id"),
+        )
+        if not isinstance(self.source, CommittedCorrectionOutput):
+            raise TypeError("source must be a CommittedCorrectionOutput")
+        if self.source.kind != "ocr-ready":
+            raise ValueError("proposal source must be the OCR-ready rendition")
+        if not isinstance(self.provider, CorrectionOcrProposalProviderView):
+            raise TypeError(
+                "provider must be a CorrectionOcrProposalProviderView"
+            )
+        if not isinstance(self.recognition, Mapping):
+            raise TypeError("recognition must be a mapping")
+        recognition = _freeze_json(self.recognition)
+        _require_public_payload(recognition)
+        if len(_canonical_json(_thaw_json(recognition))) > _MAX_RECOGNITION_BYTES:
+            raise ValueError("OCR recognition payload exceeds its size budget")
+        object.__setattr__(self, "recognition", recognition)
+        if self.publication_policy != CORRECTION_OCR_PROPOSAL_POLICY:
+            raise ValueError("publication_policy must be machine-proposal-only")
+        if (
+            not isinstance(self.content_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.content_sha256) is None
+        ):
+            raise ValueError("content_sha256 must be a lowercase SHA-256 digest")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "proposal_ref": self.proposal_ref,
+            "item_id": self.item_id,
+            "operation_id": self.operation_id,
+            "source": self.source.as_dict(),
+            "provider": self.provider.as_dict(),
+            "recognition": _thaw_json(self.recognition),
+            "publication_policy": self.publication_policy,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@runtime_checkable
+class CorrectionOcrProposalQueryRepositoryPort(Protocol):
+    """Resolve one immutable proposal without exposing storage addressing."""
+
+    def get_proposal(
+        self,
+        item_id: str,
+        proposal_ref: str,
+    ) -> CorrectionOcrProposalView | None: ...
+
+
+class CorrectionOcrProposalQueryService:
+    """Read OCR proposal artifacts through item-scoped opaque references."""
+
+    def __init__(self, repository: CorrectionOcrProposalQueryRepositoryPort) -> None:
+        if not isinstance(repository, CorrectionOcrProposalQueryRepositoryPort):
+            raise TypeError(
+                "repository must implement "
+                "CorrectionOcrProposalQueryRepositoryPort"
+            )
+        self._repository = repository
+
+    def get_proposal(
+        self,
+        item_id: str,
+        proposal_ref: str,
+    ) -> CorrectionOcrProposalView | None:
+        try:
+            item = _portable(item_id, "item_id")
+            reference = _portable(proposal_ref, "proposal_ref")
+            if _PROPOSAL_REF.fullmatch(reference) is None:
+                raise ValueError(
+                    "proposal_ref must be an opaque OCR proposal reference"
+                )
+        except ValueError as exc:
+            raise ValidationError(
+                "the OCR proposal query is invalid",
+                code="invalid_correction_ocr_proposal_query",
+            ) from exc
+        proposal = self._repository.get_proposal(item, reference)
+        if proposal is not None and (
+            not isinstance(proposal, CorrectionOcrProposalView)
+            or proposal.item_id != item
+            or proposal.proposal_ref != reference
+        ):
+            raise TypeError("OCR proposal repository returned an invalid view")
+        return proposal
 
 
 @runtime_checkable
@@ -686,6 +872,10 @@ __all__ = [
     "CORRECTION_OCR_MAX_SOURCE_BYTES",
     "CORRECTION_OCR_PROPOSAL_POLICY",
     "CorrectionOcrFollowupService",
+    "CorrectionOcrProposalQueryRepositoryPort",
+    "CorrectionOcrProposalQueryService",
+    "CorrectionOcrProposalProviderView",
+    "CorrectionOcrProposalView",
     "CorrectionOcrProposalRepositoryPort",
     "CorrectionOcrProviderPort",
     "CorrectionOcrProviderSelection",

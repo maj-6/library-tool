@@ -679,6 +679,62 @@
       artifactJsonUtf8Bytes(value) <= 32 * 1024;
   }
 
+  const OCR_PRIVATE_KEYS = new Set([
+    "api_key", "credential", "password", "secret", "secret_key", "token",
+  ]);
+
+  function isBoundedOcrJson(value, state = { nodes: 0 }, depth = 0) {
+    state.nodes += 1;
+    if (state.nodes > 200000 || depth > 32) return false;
+    if (value === null || typeof value === "boolean") return true;
+    if (typeof value === "string") {
+      return value.length <= 64 * 1024 * 1024 &&
+        !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\ud800-\udfff]/u
+          .test(value);
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) &&
+        (!Number.isInteger(value) || Number.isSafeInteger(value));
+    }
+    if (Array.isArray(value)) {
+      return value.every((entry) =>
+        isBoundedOcrJson(entry, state, depth + 1));
+    }
+    if (!isObject(value)) return false;
+    return Object.keys(value).every((key) =>
+      key.length >= 1 && key.length <= 1024 && key === key.trim() &&
+      !isPrivateArtifactKey(key) &&
+      !OCR_PRIVATE_KEYS.has(normalizedArtifactKey(key)) &&
+      isBoundedOcrJson(value[key], state, depth + 1));
+  }
+
+  function isCorrectionOcrProposal(value, itemId, proposalRef) {
+    if (!hasExactKeys(value, [
+      "proposal_ref", "item_id", "operation_id", "source", "provider",
+      "recognition", "publication_policy", "content_sha256",
+    ]) || value.proposal_ref !== proposalRef || value.item_id !== itemId ||
+        !/^cop-[0-9a-f]{40}$/.test(value.proposal_ref) ||
+        !isPortableIdentifier(value.item_id) ||
+        !isPortableIdentifier(value.operation_id) ||
+        !hasExactKeys(value.source, [
+          "kind", "artifact_id", "artifact_revision", "content_sha256",
+        ]) || value.source.kind !== "ocr-ready" ||
+        !isPortableIdentifier(value.source.artifact_id) ||
+        !isArtifactRevision(value.source.artifact_revision) ||
+        !/^[0-9a-f]{64}$/.test(value.source.content_sha256) ||
+        !hasExactKeys(value.provider, ["provider_id", "model"]) ||
+        !isPortableIdentifier(value.provider.provider_id) ||
+        typeof value.provider.model !== "string" ||
+        value.provider.model.length > 512 ||
+        value.provider.model !== value.provider.model.trim() ||
+        !isObject(value.recognition) ||
+        !isBoundedOcrJson(value.recognition) ||
+        artifactJsonUtf8Bytes(value.recognition) > 64 * 1024 * 1024 ||
+        value.publication_policy !== "machine-proposal-only" ||
+        !/^[0-9a-f]{64}$/.test(value.content_sha256)) return false;
+    return !containsCredentialField(value);
+  }
+
   function isArtifactRevision(value, optional = false) {
     if (typeof value !== "string") return false;
     if (!value) return optional;
@@ -1739,6 +1795,8 @@
           this._correctionClearRegionRole(args),
         queueTransform: (args) =>
           this._correctionQueueTransform(args),
+        getOcrProposal: (args) =>
+          this._correctionOcrProposalGet(args),
         setManualCaption: (args) =>
           this._correctionSetManualCaption(args),
         clearManualCaption: (args) =>
@@ -2655,6 +2713,36 @@
             containsCommandFingerprint(body)) {
           this._invalidResponse(
             "Engine returned an invalid correction review",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _correctionOcrProposalGet({ itemId, proposalRef, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (typeof proposalRef !== "string" ||
+          !/^cop-[0-9a-f]{40}$/.test(proposalRef)) {
+        throw new TypeError(
+          "proposalRef must be an opaque OCR proposal reference");
+      }
+      const path = `/v1/items/${encodePart(item)}/ocr-proposals/` +
+        encodePart(proposalRef);
+      return this._requestJson("GET", path, {
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "proposal",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.correction-ocr-proposal/1" ||
+            !isCorrectionOcrProposal(
+              body.proposal, item, proposalRef) ||
+            containsCommandFingerprint(body) ||
+            containsCredentialField(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid correction OCR proposal",
             "GET", path, body, undefined, status);
         }
         return body;

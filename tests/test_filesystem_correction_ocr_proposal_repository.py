@@ -13,6 +13,8 @@ from librarytool.adapters.filesystem import (
 )
 from librarytool.engine.correction_ocr import (
     CORRECTION_OCR_PROPOSAL_POLICY,
+    CorrectionOcrProposalQueryRepositoryPort,
+    CorrectionOcrProposalQueryService,
     CorrectionOcrProposalRepositoryPort,
     CorrectionOcrRecognition,
 )
@@ -124,6 +126,103 @@ def test_commit_and_find_round_trip_an_immutable_machine_proposal(tmp_path) -> N
     receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
     assert receipt["proposal_ref"] == stored.proposal_ref
     assert receipt["proposal_sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_opaque_item_scoped_query_returns_verified_public_payload(tmp_path) -> None:
+    repository = _repository(tmp_path)
+    request = _request()
+    recognition = CorrectionOcrRecognition(
+        "tesseract",
+        "local",
+        {"text": "Machine proposal", "regions": []},
+        {"tesseract": "C:\\private\\tesseract.exe"},
+    )
+    stored = repository.commit_proposal(request, recognition)
+
+    service = CorrectionOcrProposalQueryService(repository)
+    proposal = service.get_proposal(request.item_id, stored.proposal_ref)
+
+    assert proposal is not None
+    assert proposal.proposal_ref == stored.proposal_ref
+    assert proposal.item_id == request.item_id
+    assert proposal.operation_id == request.operation_id
+    assert proposal.source == request.source
+    assert proposal.provider.as_dict() == {
+        "provider_id": "tesseract",
+        "model": "local",
+    }
+    assert proposal.recognition == {
+        "text": "Machine proposal",
+        "regions": (),
+    }
+    public = proposal.as_dict()
+    assert public["recognition"] == {
+        "text": "Machine proposal",
+        "regions": [],
+    }
+    assert "options" not in public["provider"]
+    assert "C:\\\\private" not in json.dumps(public)
+    assert "credential" not in json.dumps(public).casefold()
+    assert "path" not in public
+    assert service.get_proposal("another-book", stored.proposal_ref) is None
+    assert isinstance(repository, CorrectionOcrProposalQueryRepositoryPort)
+
+
+def test_opaque_query_fails_closed_when_operation_claim_is_tampered(
+    tmp_path,
+) -> None:
+    repository = _repository(tmp_path)
+    request = _request()
+    stored = repository.commit_proposal(request, _recognition())
+    operation_path = next(
+        (
+            tmp_path
+            / ".engine"
+            / "receipts"
+            / "correction-ocr-proposal-operations"
+        ).glob("*.json")
+    )
+    operation = json.loads(operation_path.read_text(encoding="utf-8"))
+    operation["item_id"] = "another-book"
+    operation_path.write_bytes(
+        json.dumps(
+            operation,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository.get_proposal(request.item_id, stored.proposal_ref)
+
+    assert raised.value.code == "invalid_correction_ocr_proposal"
+
+
+@pytest.mark.parametrize(
+    "private_payload",
+    (
+        {"storage_path": "C:\\private\\proposal.json"},
+        {"credential": "must-not-be-persisted"},
+    ),
+)
+def test_public_proposal_rejects_private_execution_metadata(
+    tmp_path,
+    private_payload,
+) -> None:
+    repository = _repository(tmp_path)
+    recognition = CorrectionOcrRecognition(
+        "mistral",
+        "ocr-4",
+        {"text": "Machine proposal", **private_payload},
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository.commit_proposal(_request(), recognition)
+
+    assert raised.value.code == "invalid_correction_ocr_proposal"
+    assert not list(tmp_path.rglob("*.json"))
 
 
 def test_replay_returns_first_proposal_without_replacing_machine_output(tmp_path) -> None:

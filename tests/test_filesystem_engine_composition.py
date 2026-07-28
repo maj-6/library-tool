@@ -57,6 +57,7 @@ from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.correction_projection import CorrectionProjectionService
 from librarytool.engine.correction_ocr import (
     CORRECTION_OCR_JOB_KIND,
+    CorrectionOcrProposalQueryService,
     CorrectionOcrProviderSelection,
     CorrectionOcrRecognition,
 )
@@ -101,6 +102,7 @@ from librarytool.engine.runtime import (
     CANVAS_QUERY_SERVICE,
     CORRECTION_CAPTION_SERVICE,
     CORRECTION_METADATA_SERVICE,
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
@@ -912,6 +914,7 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
     assert engine.get_service(CORRECTION_METADATA_SERVICE) is None
     assert engine.get_service(CORRECTION_REVIEW_SERVICE) is None
     assert engine.get_service(CORRECTION_SERVICE) is None
+    assert engine.get_service(CORRECTION_OCR_PROPOSAL_QUERY_SERVICE) is None
     assert engine.get_service(CORRECTION_TRANSFORM_SERVICE) is None
     assert "library.corrections.artifacts" not in {
         row["id"] for row in document["modules"]
@@ -926,6 +929,7 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
         "library.corrections.metadata.edit",
         "library.corrections.reviews.read",
         "library.corrections.reviews.edit",
+        "library.corrections.ocr-proposals.read",
         "library.corrections.transforms.queue",
         "library.spatial-annotations.read",
         "library.spatial-annotations.edit",
@@ -1068,10 +1072,14 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     assert engine.require_service(CORRECTION_METADATA_SERVICE) is corrections
     assert engine.require_service(CORRECTION_REVIEW_SERVICE) is corrections
     transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    ocr_proposals = engine.require_service(
+        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE
+    )
     assert raster is spatial
     assert isinstance(raster, CorrectionProjectionService)
     assert isinstance(corrections, CorrectionService)
     assert isinstance(transforms, CorrectionTransformService)
+    assert isinstance(ocr_proposals, CorrectionOcrProposalQueryService)
     assert transforms.executable is True
     assert isinstance(raster, FilesystemRasterResourceResolverPort)
     assert raster.list_raster_artifacts("book-one") == ()
@@ -1133,6 +1141,7 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     )
     assert transform_module["status"] == "available"
     assert transform_module["provides"] == [
+        {"id": "library.corrections.ocr-proposals.read", "version": 1},
         {"id": "library.corrections.transforms.queue", "version": 1},
     ]
     workbench = next(
@@ -1421,6 +1430,45 @@ def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
     assert len(children) == 1
     assert children[0].state.value == "done"
     assert children[0].outputs[0].ref == result.ocr_followup.proposal_ref
+    canonical_before = {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and ".engine" not in path.parts
+    }
+    proposal_view = composed["engine"].require_service(
+        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE
+    ).get_proposal(
+        "book-one",
+        result.ocr_followup.proposal_ref,
+    )
+    assert proposal_view is not None
+    assert proposal_view.recognition == {
+        "text": "Machine proposal from corrected raster"
+    }
+    public_proposal = proposal_view.as_dict()
+    assert public_proposal["provider"] == {
+        "provider_id": "test-provider",
+        "model": "model-r1",
+    }
+    assert "options" not in public_proposal["provider"]
+    assert "credential" not in json.dumps(public_proposal).casefold()
+    assert "path" not in public_proposal
+    assert (
+        composed["engine"]
+        .require_service(CORRECTION_OCR_PROPOSAL_QUERY_SERVICE)
+        .get_proposal("another-book", result.ocr_followup.proposal_ref)
+        is None
+    )
+    canonical_after = {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and ".engine" not in path.parts
+    }
+    assert canonical_after == canonical_before
     proposal_path = next(
         (
             composed["write_set"].root
