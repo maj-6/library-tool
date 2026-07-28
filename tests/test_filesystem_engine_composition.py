@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import subprocess
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from PIL import Image
 from pypdf import PdfWriter
 
 from librarytool.adapters.filesystem import (
@@ -53,7 +55,10 @@ from librarytool.engine.canvases import CanvasExtent
 from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.correction_projection import CorrectionProjectionService
 from librarytool.engine.corrections import CorrectionService
-from librarytool.engine.correction_transforms import CorrectionTransformService
+from librarytool.engine.correction_transforms import (
+    CorrectionTransformCommand,
+    CorrectionTransformService,
+)
 from librarytool.engine.errors import ConflictError, RepositoryError, ValidationError
 from librarytool.engine.interchange import (
     LibImportPlan,
@@ -83,6 +88,7 @@ from librarytool.engine.providers import (
     ProviderTraits,
     StaticProviderHealthProbe,
 )
+from librarytool.processing.raster import ManualBinaryAdjustRecipe
 from librarytool.engine.translations import TranslationProvenanceService
 from librarytool.engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
@@ -920,6 +926,115 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
     }.isdisjoint(row["id"] for row in document["capabilities"])
 
 
+def _write_composition_capture(capture_root: Path) -> None:
+    def jpeg_bytes(colour: tuple[int, int, int]) -> bytes:
+        stream = io.BytesIO()
+        Image.new("RGB", (40, 30), colour).save(
+            stream,
+            format="JPEG",
+            quality=90,
+        )
+        return stream.getvalue()
+
+    original = jpeg_bytes((120, 20, 30))
+    display = jpeg_bytes((20, 120, 30))
+    directory = capture_root / "capture-1"
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = {
+        "schema": "org.whl.bookcapture.photo-assets",
+        "version": 1,
+        "capture_id": "capture-1",
+        "legacy_fallback": False,
+        "assets": [
+            {
+                "asset_id": "asset-1",
+                "capture_order": 1,
+                "capture_file": "photo_1.jpg",
+                "original": {
+                    "reference": "original_asset-1.jpg",
+                    "sha256": hashlib.sha256(original).hexdigest(),
+                    "revision": 3,
+                    "width": 40,
+                    "height": 30,
+                    "orientation": 0,
+                },
+                "display": {
+                    "reference": "photo_1.jpg",
+                    "sha256": hashlib.sha256(display).hexdigest(),
+                    "revision": 4,
+                    "width": 40,
+                    "height": 30,
+                    "orientation": 0,
+                    "recipe": "android-standardize",
+                    "recipe_version": "1",
+                },
+                "lifecycle": {"state": "completed"},
+                "role": {
+                    "suggested": "title_page",
+                    "confidence": 0.8,
+                    "algorithm": "composition-test",
+                    "algorithm_version": "1",
+                },
+                "geometry": [
+                    {
+                        "asset_id": "asset-1",
+                        "source_sha256": hashlib.sha256(original).hexdigest(),
+                        "source_revision": 3,
+                        "display_revision": 4,
+                        "coordinate_space": "display_normalized",
+                        "width": 40,
+                        "height": 30,
+                        "orientation": 0,
+                        "engine": "mistral",
+                        "model": "mistral-ocr-latest",
+                        "engine_version": "composition-test",
+                        "regions": [
+                            {
+                                "id": "figure-1",
+                                "type": "image",
+                                "confidence": 0.97,
+                                "polygon": [
+                                    [0.1, 0.2],
+                                    [0.9, 0.2],
+                                    [0.9, 0.8],
+                                    [0.1, 0.8],
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        "selections": {
+            "primary_title": {"asset_id": "asset-1"},
+            "thumbnail": {"asset_id": "asset-1"},
+        },
+        "transport": {"representation": "original", "version": 1},
+        "desktop_import": {
+            "version": 1,
+            "assets": [
+                {
+                    "order": 0,
+                    "asset_id": "asset-1",
+                    "raw_ref": "orig_1.jpg",
+                    "display_ref": "photo_1.jpg",
+                    "source_checksum": hashlib.sha256(original).hexdigest(),
+                    "derivative_checksum": hashlib.sha256(display).hexdigest(),
+                    "transport_representation": "original",
+                    "recipe": "desktop_perspective_standardize_v1",
+                    "lifecycle": "completed",
+                }
+            ],
+        },
+    }
+    (directory / "photo_assets.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+
 def test_complete_corrections_bindings_install_one_projector_and_workbench(
     tmp_path,
 ):
@@ -1077,6 +1192,108 @@ def test_corrections_source_uses_installed_native_text_layer_service(
         with text_repository._lock_context_for():
             pass
     assert lock_state == {"held": False, "entries": 1}
+
+
+def test_production_composition_reopens_projected_transform_outputs(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+    first = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    raster = first.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.kind == "processed-image"
+    )
+    assert source.resource is not None
+    command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(
+            contrast=100,
+            brightness=0,
+        ),
+        rerun_ocr=False,
+        operation_id="composition-transform-1",
+    )
+    transforms = first.require_service(CORRECTION_TRANSFORM_SERVICE)
+    transforms.queue(command)
+    run = transforms.execute_queued(command)
+    assert run.image_commit is not None
+
+    reopened = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    reopened_raster = reopened.require_service(
+        RASTER_ARTIFACT_QUERY_SERVICE
+    )
+    projected = [
+        value
+        for value in reopened_raster.list_raster_artifacts("book-one")
+        if "correction_transform" in value.extensions
+    ]
+    assert {
+        value.extensions["correction_transform"]["output_kind"]
+        for value in projected
+    } == {"corrected-display", "ocr-ready", "thumbnail"}
+    corrected = next(
+        value
+        for value in projected
+        if value.extensions["correction_transform"]["output_kind"]
+        == "corrected-display"
+    )
+    assert corrected.resource is not None
+    resolved = reopened_raster.resolve_raster_resource(
+        "book-one",
+        corrected.resource,
+    )
+    assert resolved is not None
+    try:
+        assert resolved.stream.read().startswith(b"\x89PNG\r\n\x1a\n")
+        assert resolved.content_sha256 == corrected.content_sha256
+    finally:
+        resolved.stream.close()
+
+    reopened_spatial = reopened.require_service(
+        SPATIAL_ANNOTATION_QUERY_SERVICE
+    )
+    mapped = [
+        value
+        for value in reopened_spatial.list_spatial_annotations("book-one")
+        if "correction_transform" in value.extensions
+    ]
+    assert len(mapped) == 1
+    assert mapped[0].linked_artifact_ids == (
+        corrected.key.artifact_id,
+    )
+    assert mapped[0].source.canvas_revision == corrected.revision
+    assert (
+        mapped[0].selector.coordinate_space_revision
+        == corrected.revision
+    )
 
 
 def test_native_text_layer_vertical_is_absent_without_complete_bindings(

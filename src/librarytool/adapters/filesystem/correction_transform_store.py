@@ -4,11 +4,15 @@ The transform worker builds a complete, immutable commit draft in memory.  This
 adapter owns the last concurrency boundary: it reloads the source under the
 workspace and catalogue locks, compares every command and assertion revision
 pin, and publishes four new object files, their publication envelope, and the
-idempotency receipt in one :class:`RecoverableWriteSet` transaction.
+item-scoped immutable pointer and idempotency receipt in one
+:class:`RecoverableWriteSet` transaction.
 
 Public identifiers never become path components.  Private storage uses
 SHA-256-addressed filenames below ``.engine`` and a receipt is staged last so a
-durable replay can only become visible with the complete publication.
+durable replay can only become visible with the complete publication. Public
+queries inspect only the requested item's pointer directory; legacy version-1
+publications remain replayable but are intentionally not projected because
+they do not pin a representation/canvas source scope.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, ContextManager, TypeAlias
+from typing import Any, ContextManager, Protocol, TypeAlias, runtime_checkable
 
 from ...engine.correction_transforms import (
     CORRECTION_OUTPUT_KINDS,
@@ -79,19 +83,43 @@ SourceSnapshotLookup: TypeAlias = Callable[
 ]
 LockContextFactory: TypeAlias = Callable[[], ContextManager[Any]]
 
+
+@runtime_checkable
+class CorrectionTransformOutputResolverPort(Protocol):
+    """Resolve one exact committed output without exposing private paths."""
+
+    def resolve_committed_output(
+        self,
+        item_id: str,
+        operation_id: str,
+        output: CommittedCorrectionOutput,
+    ) -> ResolvedRasterResource | None: ...
+
 CORRECTION_TRANSFORM_PUBLICATION_SCHEMA = "librarytool.correction-transform-publication"
 CORRECTION_TRANSFORM_PUBLICATION_VERSION = 2
 CORRECTION_TRANSFORM_RECEIPT_SCHEMA = "librarytool.correction-transform-receipt"
 CORRECTION_TRANSFORM_RECEIPT_VERSION = 1
+CORRECTION_TRANSFORM_ITEM_POINTER_SCHEMA = (
+    "librarytool.correction-transform-item-pointer"
+)
+CORRECTION_TRANSFORM_ITEM_POINTER_VERSION = 1
+_ITEM_INDEX_MARKER_SCHEMA = "librarytool.correction-transform-item-index"
+_ITEM_INDEX_MARKER_VERSION = 1
 
 _OBJECT_ROOT = PurePosixPath(".engine/correction-transforms/objects")
 _PUBLICATION_ROOT = PurePosixPath(".engine/correction-transforms/publications")
+_ITEM_POINTER_ROOT = PurePosixPath(".engine/correction-transforms/by-item")
+_ITEM_INDEX_MARKER = PurePosixPath(
+    ".engine/correction-transforms/item-index-v1.json"
+)
 _RECEIPT_ROOT = PurePosixPath(".engine/receipts/correction-transforms")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RECEIPT_BYTES = 1024 * 1024
+_MAX_ITEM_POINTER_BYTES = 64 * 1024
 _MAX_PUBLICATION_BYTES = 128 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
-_MAX_TRANSFORM_DOCUMENTS = 100_000
+_MAX_ITEM_TRANSFORMS = 10_000
+_MAX_LEGACY_MIGRATION_DOCUMENTS = 100_000
 _TRANSFORM_DOCUMENT_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
 _PROJECTED_RASTER_OUTPUTS = {
     "corrected-display": ("corrected-image", "Corrected display", "display"),
@@ -108,6 +136,17 @@ _RECEIPT_FIELDS = frozenset(
         "result",
     }
 )
+_ITEM_POINTER_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "item_id",
+        "operation_id",
+        "command_sha256",
+        "publication_sha256",
+    }
+)
+_ITEM_INDEX_MARKER_FIELDS = frozenset({"schema", "version"})
 _RESULT_FIELDS = frozenset({"operation_id", "outputs"})
 _COMMITTED_OUTPUT_FIELDS = frozenset(
     {"kind", "artifact_id", "artifact_revision", "content_sha256"}
@@ -126,6 +165,16 @@ _PUBLICATION_FIELDS = frozenset(
         "dropped_annotation_ids",
         "human_assertions",
         "human_assertion_policy",
+    }
+)
+_PUBLICATION_SOURCE_V1_FIELDS = frozenset(
+    {
+        "item_id",
+        "artifact_id",
+        "artifact_revision",
+        "source_revision",
+        "source_sha256",
+        "dependent_revision_pins",
     }
 )
 _PUBLICATION_SOURCE_FIELDS = frozenset(
@@ -231,6 +280,7 @@ class _TransformResourceCandidate:
     content_sha256: str
     size: int
     revision: str
+    artifact: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +291,22 @@ class _TransformProjection:
         tuple[str, str, str],
         _TransformResourceCandidate,
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _ItemPublicationPointer:
+    item_id: str
+    operation_id: str
+    command_sha256: str
+    publication_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedTransformPublication:
+    command: CorrectionTransformCommand
+    result: CorrectionTransformCommitResult
+    document: Mapping[str, Any]
+    publication_sha256: str
 
 
 def _repository_error(
@@ -405,6 +471,12 @@ class FilesystemCorrectionTransformStore:
         self._write_set = write_set
         self._source_snapshot_for = source_snapshot_for
         self._lock_context_for = lock_context_for
+        self._unindexed_v2_cache: dict[
+            str,
+            tuple[_ItemPublicationPointer, ...],
+        ] | None = None
+        self._unindexed_v2_overflow: set[str] = set()
+        self._unindexed_v2_errors: dict[str, RepositoryError] = {}
         if recover:
             try:
                 with self._write_set.recovery_lease():
@@ -467,11 +539,19 @@ class FilesystemCorrectionTransformStore:
                                 code="correction_operation_conflict",
                                 details={"operation_id": draft.command.operation_id},
                             )
-                        self._validate_replay_publication(
+                        publication = self._validate_replay_publication(
                             draft.command,
                             result,
                             publication_sha256=publication_sha256,
                         )
+                        if (
+                            publication["version"]
+                            == CORRECTION_TRANSFORM_PUBLICATION_VERSION
+                        ):
+                            self._ensure_item_pointer(
+                                draft.command,
+                                publication_sha256=publication_sha256,
+                            )
                         return result
 
                     self._validate_draft(draft)
@@ -638,6 +718,87 @@ class FilesystemCorrectionTransformStore:
                 retryable=True,
             ) from exc
 
+    def resolve_committed_output(
+        self,
+        item_id: str,
+        operation_id: str,
+        output: CommittedCorrectionOutput,
+    ) -> ResolvedRasterResource | None:
+        """Return a verified immutable snapshot for one committed descriptor.
+
+        The descriptor must match its item-scoped publication by kind,
+        artifact identity, revision, and checksum. The returned temporary
+        stream contains checksum-verified bytes and never exposes the private
+        object path.
+        """
+
+        if not isinstance(output, CommittedCorrectionOutput):
+            raise TypeError("output must be a CommittedCorrectionOutput")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise TypeError("operation_id must be a non-empty string")
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    candidate = self._committed_output_candidate_locked(
+                        item_id,
+                        operation_id,
+                        output,
+                    )
+                    if candidate is None:
+                        return None
+                    return self._snapshot_resource(candidate)
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction transform workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except RepositoryError:
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the committed correction output is unavailable",
+                code="correction_transform_resource_unavailable",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    def _committed_output_candidate_locked(
+        self,
+        item_id: str,
+        operation_id: str,
+        output: CommittedCorrectionOutput,
+    ) -> _TransformResourceCandidate | None:
+        RasterArtifactKey(item_id, "correction-transform-output")
+        validated = self._validated_operation_publication(
+            item_id,
+            operation_id,
+            verify_objects=False,
+        )
+        if validated is None:
+            return None
+        for committed, descriptor in zip(
+            validated.result.outputs,
+            validated.document["outputs"],
+            strict=True,
+        ):
+            if committed.artifact_id.casefold() != output.artifact_id.casefold():
+                continue
+            if committed != output:
+                return None
+            return _TransformResourceCandidate(
+                self._object_path(committed.artifact_id),
+                descriptor["media_type"],
+                committed.content_sha256,
+                descriptor["bytes"],
+                committed.artifact_revision,
+                committed.kind,
+            )
+        return None
+
     def _project_locked(self, item_id: str) -> _TransformProjection:
         # Validate the public scope even when no publication exists.
         RasterArtifactKey(item_id, "correction-transform-projection")
@@ -649,10 +810,8 @@ class FilesystemCorrectionTransformStore:
         ] = {}
         identities: set[str] = set()
         spatial_identities: set[str] = set()
-        for path in self._committed_publication_paths():
-            command, result, publication = self._validated_publication(path)
-            if command.item_id != item_id:
-                continue
+        for pointer in self._projection_item_pointers_locked(item_id):
+            command, result, publication = self._validated_publication(pointer)
             source_scope = self._raster_source_from_publication(publication)
             for committed, raw_output in zip(
                 result.outputs,
@@ -752,6 +911,7 @@ class FilesystemCorrectionTransformStore:
                     committed.content_sha256,
                     raw_output["bytes"],
                     resource.revision,
+                    committed.kind,
                 )
                 values.append(view)
             for annotation in self._mapped_annotation_views(
@@ -780,28 +940,389 @@ class FilesystemCorrectionTransformStore:
             resources,
         )
 
-    def _committed_publication_paths(self) -> tuple[Path, ...]:
+    def _item_publication_pointers(
+        self,
+        item_id: str,
+    ) -> tuple[_ItemPublicationPointer, ...]:
+        relative = _ITEM_POINTER_ROOT / _digest_text(item_id)
+        paths = self._authority_document_paths(
+            relative,
+            artifact="correction_transform_item_index",
+            maximum_entries=_MAX_ITEM_TRANSFORMS,
+        )
+        return tuple(
+            self._validated_item_pointer(path, item_id=item_id)
+            for _name, path in sorted(paths.items())
+        )
+
+    def _projection_item_pointers_locked(
+        self,
+        item_id: str,
+    ) -> tuple[_ItemPublicationPointer, ...]:
+        indexed = {
+            value.operation_id: value
+            for value in self._item_publication_pointers(item_id)
+        }
+        marker_path = self._target(_ITEM_INDEX_MARKER)
+        if self._path_exists(
+            marker_path,
+            artifact="correction_transform_item_index_marker",
+        ):
+            self._validate_item_index_marker(marker_path)
+            return tuple(
+                indexed[key]
+                for key in sorted(indexed)
+            )
+
+        if self._unindexed_v2_cache is None:
+            self._unindexed_v2_cache = (
+                self._scan_unindexed_v2_publications_locked()
+            )
+        if item_id in self._unindexed_v2_overflow:
+            raise RepositoryError(
+                "the unindexed correction transform history for this item "
+                "exceeds the supported projection limit",
+                code="correction_transform_item_limit",
+                details={
+                    "item_id": item_id,
+                    "limit": _MAX_ITEM_TRANSFORMS,
+                },
+            )
+        discovery_error = self._unindexed_v2_errors.get(item_id)
+        if discovery_error is not None:
+            raise discovery_error
+        for pointer in self._unindexed_v2_cache.get(item_id, ()):
+            prior = indexed.get(pointer.operation_id)
+            if prior is not None and prior != pointer:
+                raise _repository_error(
+                    "the correction transform item pointer conflicts with "
+                    "its unindexed publication",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_item_pointer",
+                )
+            indexed[pointer.operation_id] = pointer
+        return tuple(indexed[key] for key in sorted(indexed))
+
+    def _scan_unindexed_v2_publications_locked(
+        self,
+    ) -> dict[str, tuple[_ItemPublicationPointer, ...]]:
+        self._unindexed_v2_errors.clear()
         publications = self._authority_document_paths(
             _PUBLICATION_ROOT,
             artifact="correction_transform_publications",
+            maximum_entries=_MAX_LEGACY_MIGRATION_DOCUMENTS,
         )
-        receipts = self._authority_document_paths(
-            _RECEIPT_ROOT,
-            artifact="correction_transform_receipts",
-        )
-        if publications.keys() != receipts.keys():
-            raise _repository_error(
-                "correction transform receipts and publications do not match",
-                code="invalid_correction_transform_storage",
-                artifact="correction_transform_authority",
+        values: dict[str, list[_ItemPublicationPointer]] = {}
+        for _name, path in sorted(publications.items()):
+            try:
+                raw = self._read_json(
+                    path,
+                    maximum=_MAX_PUBLICATION_BYTES,
+                    artifact="correction_transform_publication",
+                )
+                publication = _strict_object(
+                    raw,
+                    fields=_PUBLICATION_FIELDS,
+                    artifact="correction_transform_publication",
+                )
+                if (
+                    publication["version"]
+                    != CORRECTION_TRANSFORM_PUBLICATION_VERSION
+                ):
+                    continue
+                command = CorrectionTransformCommand.from_dict(
+                    publication["command"]
+                )
+            except (
+                EngineError,
+                KeyError,
+                RepositoryError,
+                TypeError,
+                ValueError,
+            ):
+                # Compatibility discovery must not let one corrupt, orphaned
+                # unindexed document break unrelated item reads. Indexed
+                # documents remain strict and fail closed.
+                continue
+            if path != self._publication_path(command.operation_id):
+                self._unindexed_v2_errors.setdefault(
+                    command.item_id,
+                    _repository_error(
+                        "an unindexed correction transform publication is "
+                        "not bound to its operation",
+                        code="invalid_correction_transform_storage",
+                        artifact="correction_transform_publication",
+                    ),
+                )
+                continue
+            try:
+                validated = self._validated_operation_publication(
+                    command.item_id,
+                    command.operation_id,
+                    verify_objects=False,
+                )
+            except RepositoryError as exc:
+                self._unindexed_v2_errors.setdefault(
+                    command.item_id,
+                    exc,
+                )
+                continue
+            if validated is None:
+                self._unindexed_v2_errors.setdefault(
+                    command.item_id,
+                    _repository_error(
+                        "an unindexed correction transform publication has "
+                        "no valid receipt",
+                        code="invalid_correction_transform_storage",
+                        artifact="correction_transform_publication",
+                    ),
+                )
+                continue
+            item_values = values.setdefault(command.item_id, [])
+            if len(item_values) >= _MAX_ITEM_TRANSFORMS:
+                self._unindexed_v2_overflow.add(command.item_id)
+                continue
+            item_values.append(
+                _ItemPublicationPointer(
+                    command.item_id,
+                    command.operation_id,
+                    command.fingerprint,
+                    validated.publication_sha256,
+                )
             )
-        return tuple(publications[name] for name in sorted(publications))
+        return {
+            item_id: tuple(
+                sorted(
+                    pointers,
+                    key=lambda value: value.operation_id,
+                )
+            )
+            for item_id, pointers in values.items()
+        }
+
+    def _assert_item_pointer_capacity(self, item_id: str) -> None:
+        relative = _ITEM_POINTER_ROOT / _digest_text(item_id)
+        paths = self._authority_document_paths(
+            relative,
+            artifact="correction_transform_item_index",
+            maximum_entries=_MAX_ITEM_TRANSFORMS,
+        )
+        if len(paths) >= _MAX_ITEM_TRANSFORMS:
+            raise RepositoryError(
+                "the correction transform history for this item is full",
+                code="correction_transform_item_limit",
+                details={
+                    "item_id": item_id,
+                    "limit": _MAX_ITEM_TRANSFORMS,
+                },
+            )
+
+    def _ensure_item_index_migrated_locked(self) -> None:
+        marker_path = self._target(_ITEM_INDEX_MARKER)
+        if self._path_exists(
+            marker_path,
+            artifact="correction_transform_item_index_marker",
+        ):
+            self._validate_item_index_marker(marker_path)
+            return
+
+        publications = self._authority_document_paths(
+            _PUBLICATION_ROOT,
+            artifact="correction_transform_publications",
+            maximum_entries=_MAX_LEGACY_MIGRATION_DOCUMENTS,
+        )
+
+        existing_by_item: dict[
+            str,
+            dict[str, _ItemPublicationPointer],
+        ] = {}
+        pending: list[tuple[Path, bytes]] = []
+        for _name, path in sorted(publications.items()):
+            raw = self._read_json(
+                path,
+                maximum=_MAX_PUBLICATION_BYTES,
+                artifact="correction_transform_publication",
+            )
+            try:
+                publication = _strict_object(
+                    raw,
+                    fields=_PUBLICATION_FIELDS,
+                    artifact="correction_transform_publication",
+                )
+                command = CorrectionTransformCommand.from_dict(
+                    publication["command"]
+                )
+                if path != self._publication_path(command.operation_id):
+                    raise ValueError(
+                        "publication path is not bound to its operation"
+                    )
+                version = publication["version"]
+                if type(version) is not int or version not in {
+                    1,
+                    CORRECTION_TRANSFORM_PUBLICATION_VERSION,
+                }:
+                    raise ValueError(
+                        "publication version cannot be migrated"
+                    )
+            except (EngineError, KeyError, TypeError, ValueError) as exc:
+                raise _repository_error(
+                    "the correction transform publication is invalid",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_publication",
+                    cause=exc,
+                ) from exc
+
+            if version == 1:
+                # Version 1 has no representation/canvas scope and is never
+                # projected. Its exact receipt remains independently
+                # replayable/resolvable and must not block the v2 index.
+                continue
+            validated = self._validated_operation_publication(
+                command.item_id,
+                command.operation_id,
+                verify_objects=False,
+            )
+            if validated is None:  # pragma: no cover - parity invariant
+                raise _repository_error(
+                    "the correction transform publication has no receipt",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_publication",
+                )
+
+            item_pointers = existing_by_item.get(command.item_id)
+            if item_pointers is None:
+                item_pointers = {
+                    value.operation_id: value
+                    for value in self._item_publication_pointers(
+                        command.item_id
+                    )
+                }
+                existing_by_item[command.item_id] = item_pointers
+            expected = _ItemPublicationPointer(
+                command.item_id,
+                command.operation_id,
+                command.fingerprint,
+                validated.publication_sha256,
+            )
+            prior = item_pointers.get(command.operation_id)
+            if prior is not None:
+                if prior != expected:
+                    raise _repository_error(
+                        "the correction transform item pointer conflicts "
+                        "with its publication",
+                        code="invalid_correction_transform_storage",
+                        artifact="correction_transform_item_pointer",
+                    )
+                continue
+            if len(item_pointers) >= _MAX_ITEM_TRANSFORMS:
+                raise RepositoryError(
+                    "the correction transform history for this item is full",
+                    code="correction_transform_item_limit",
+                    details={
+                        "item_id": command.item_id,
+                        "limit": _MAX_ITEM_TRANSFORMS,
+                    },
+                )
+            pending.append(
+                (
+                    self._item_pointer_path(
+                        command.item_id,
+                        command.operation_id,
+                    ),
+                    self._item_pointer_payload(
+                        command,
+                        publication_sha256=validated.publication_sha256,
+                    ),
+                )
+            )
+            item_pointers[command.operation_id] = expected
+
+        marker_payload = _canonical_json(
+            {
+                "schema": _ITEM_INDEX_MARKER_SCHEMA,
+                "version": _ITEM_INDEX_MARKER_VERSION,
+            },
+            artifact="correction_transform_item_index_marker",
+        )
+        try:
+            transaction = self._write_set.begin(
+                operation_id="correction-transform-item-index-v1",
+                scope="correction-transform-item-index-migration",
+                metadata={
+                    "indexed_publications": len(pending),
+                    "publication_documents": len(publications),
+                },
+            )
+            for path, payload in pending:
+                transaction.stage_write(self._relative(path), payload)
+            # The marker is last so an interrupted transaction cannot claim
+            # migration completion before all item pointers are recoverable.
+            transaction.stage_write(
+                self._relative(marker_path),
+                marker_payload,
+            )
+            transaction.commit(
+                receipt={
+                    "indexed_publications": len(pending),
+                    "publication_documents": len(publications),
+                }
+            )
+            self._unindexed_v2_cache = None
+            self._unindexed_v2_overflow.clear()
+            self._unindexed_v2_errors.clear()
+        except WriteSetError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction transform item index migration failed",
+                code="correction_transform_transaction_failed",
+                artifact="correction_transform_item_index_marker",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    def _validate_item_index_marker(self, path: Path) -> None:
+        payload, _digest, _byte_count = self._read_regular(
+            path,
+            maximum=_MAX_ITEM_POINTER_BYTES,
+            artifact="correction_transform_item_index_marker",
+            collect=True,
+        )
+        raw = self._decode_json(
+            payload,
+            artifact="correction_transform_item_index_marker",
+        )
+        try:
+            marker = _strict_object(
+                raw,
+                fields=_ITEM_INDEX_MARKER_FIELDS,
+                artifact="correction_transform_item_index_marker",
+            )
+            if marker != {
+                "schema": _ITEM_INDEX_MARKER_SCHEMA,
+                "version": _ITEM_INDEX_MARKER_VERSION,
+            }:
+                raise ValueError("item index marker envelope is invalid")
+            canonical = _canonical_json(
+                marker,
+                artifact="correction_transform_item_index_marker",
+            )
+            if payload != canonical:
+                raise ValueError("item index marker is not canonical")
+        except (EngineError, KeyError, TypeError, ValueError) as exc:
+            raise _repository_error(
+                "the correction transform item index marker is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_item_index_marker",
+                cause=exc,
+            ) from exc
 
     def _authority_document_paths(
         self,
         relative: PurePosixPath,
         *,
         artifact: str,
+        maximum_entries: int,
     ) -> dict[str, Path]:
         directory = self._target(relative)
         self._safe_target(directory, artifact=artifact)
@@ -819,7 +1340,7 @@ class FilesystemCorrectionTransformStore:
             with os.scandir(directory) as entries:
                 for entry in entries:
                     count += 1
-                    if count > _MAX_TRANSFORM_DOCUMENTS:
+                    if count > maximum_entries:
                         raise ValueError(
                             "transform authority exceeds its entry budget"
                         )
@@ -857,14 +1378,125 @@ class FilesystemCorrectionTransformStore:
                 cause=exc,
             ) from exc
 
-    def _validated_publication(
+    def _validated_item_pointer(
         self,
         path: Path,
+        *,
+        item_id: str,
+    ) -> _ItemPublicationPointer:
+        payload, _digest, _byte_count = self._read_regular(
+            path,
+            maximum=_MAX_ITEM_POINTER_BYTES,
+            artifact="correction_transform_item_pointer",
+            collect=True,
+        )
+        raw = self._decode_json(
+            payload,
+            artifact="correction_transform_item_pointer",
+        )
+        try:
+            pointer = _strict_object(
+                raw,
+                fields=_ITEM_POINTER_FIELDS,
+                artifact="correction_transform_item_pointer",
+            )
+            if (
+                pointer["schema"]
+                != CORRECTION_TRANSFORM_ITEM_POINTER_SCHEMA
+                or type(pointer["version"]) is not int
+                or pointer["version"]
+                != CORRECTION_TRANSFORM_ITEM_POINTER_VERSION
+                or pointer["item_id"] != item_id
+                or not isinstance(pointer["operation_id"], str)
+                or not pointer["operation_id"]
+                or not isinstance(pointer["command_sha256"], str)
+                or _SHA256_RE.fullmatch(pointer["command_sha256"]) is None
+                or not isinstance(pointer["publication_sha256"], str)
+                or _SHA256_RE.fullmatch(pointer["publication_sha256"]) is None
+                or path
+                != self._item_pointer_path(
+                    item_id,
+                    pointer["operation_id"],
+                )
+            ):
+                raise ValueError("item pointer envelope is invalid")
+            canonical = _canonical_json(
+                pointer,
+                artifact="correction_transform_item_pointer",
+            )
+            if payload != canonical:
+                raise ValueError("item pointer is not canonical")
+            return _ItemPublicationPointer(
+                item_id,
+                pointer["operation_id"],
+                pointer["command_sha256"],
+                pointer["publication_sha256"],
+            )
+        except (EngineError, KeyError, TypeError, ValueError) as exc:
+            raise _repository_error(
+                "the correction transform item pointer is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_item_pointer",
+                cause=exc,
+            ) from exc
+
+    def _validated_publication(
+        self,
+        pointer: _ItemPublicationPointer,
     ) -> tuple[
         CorrectionTransformCommand,
         CorrectionTransformCommitResult,
         Mapping[str, Any],
     ]:
+        validated = self._validated_operation_publication(
+            pointer.item_id,
+            pointer.operation_id,
+        )
+        if validated is None:
+            raise _repository_error(
+                "the correction transform item pointer has no receipt",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_item_pointer",
+            )
+        if (
+            validated.command.fingerprint != pointer.command_sha256
+            or validated.publication_sha256
+            != pointer.publication_sha256
+        ):
+            raise _repository_error(
+                "the correction transform item pointer is not bound to its "
+                "publication receipt",
+                code="invalid_correction_transform_storage",
+                artifact="correction_transform_item_pointer",
+            )
+        if (
+            validated.document["version"]
+            != CORRECTION_TRANSFORM_PUBLICATION_VERSION
+        ):
+            raise _repository_error(
+                "legacy correction transform publications cannot be "
+                "projected without raster source scope",
+                code="unsupported_correction_transform_publication",
+                artifact="correction_transform_publication",
+            )
+        return (
+            validated.command,
+            validated.result,
+            validated.document,
+        )
+
+    def _validated_operation_publication(
+        self,
+        item_id: str,
+        operation_id: str,
+        *,
+        verify_objects: bool = True,
+    ) -> _ValidatedTransformPublication | None:
+        receipt = self._read_receipt(operation_id)
+        if receipt is None:
+            return None
+        command_sha256, publication_sha256, result = receipt
+        path = self._publication_path(operation_id)
         raw = self._read_json(
             path,
             maximum=_MAX_PUBLICATION_BYTES,
@@ -882,14 +1514,13 @@ class FilesystemCorrectionTransformStore:
             if (
                 publication["operation_id"] != command.operation_id
                 or path != self._publication_path(command.operation_id)
+                or command.operation_id != operation_id
             ):
                 raise ValueError(
                     "publication path is not bound to its operation"
                 )
-            receipt = self._read_receipt(command.operation_id)
-            if receipt is None:
-                raise ValueError("publication receipt is missing")
-            command_sha256, publication_sha256, result = receipt
+            if command.item_id != item_id:
+                return None
             if command_sha256 != command.fingerprint:
                 raise ValueError(
                     "publication command is not bound to its receipt"
@@ -898,8 +1529,14 @@ class FilesystemCorrectionTransformStore:
                 command,
                 result,
                 publication_sha256=publication_sha256,
+                verify_objects=verify_objects,
             )
-            return command, result, validated
+            return _ValidatedTransformPublication(
+                command,
+                result,
+                validated,
+                publication_sha256,
+            )
         except RepositoryError:
             raise
         except (EngineError, KeyError, TypeError, ValueError) as exc:
@@ -1312,7 +1949,7 @@ class FilesystemCorrectionTransformStore:
             raise _repository_error(
                 "a correction transform resource cannot be resolved",
                 code="correction_transform_resource_unavailable",
-                artifact="correction_transform_output",
+                artifact=candidate.artifact,
                 cause=exc,
                 retryable=True,
             ) from exc
@@ -1320,7 +1957,7 @@ class FilesystemCorrectionTransformStore:
             _payload, digest, size = self._read_regular(
                 candidate.path,
                 maximum=_MAX_OUTPUT_BYTES,
-                artifact="correction_transform_output",
+                artifact=candidate.artifact,
                 collect=False,
                 sink=snapshot,
             )
@@ -1331,7 +1968,7 @@ class FilesystemCorrectionTransformStore:
                 raise _repository_error(
                     "a correction transform resource does not match its pins",
                     code="invalid_correction_transform_storage",
-                    artifact="correction_transform_output",
+                    artifact=candidate.artifact,
                 )
             snapshot.seek(0)
             return ResolvedRasterResource(
@@ -1426,6 +2063,17 @@ class FilesystemCorrectionTransformStore:
                 code="correction_source_stale",
                 details={"expected": expected, "actual": actual},
             )
+        expected_scope = draft.source.artifact.source
+        actual_scope = live.artifact.source
+        if actual_scope != expected_scope:
+            raise ConflictError(
+                "correction source scope changed before commit",
+                code="correction_source_stale",
+                details={
+                    "expected": expected_scope.as_dict(),
+                    "actual": actual_scope.as_dict(),
+                },
+            )
         expected_dependencies = draft.source.dependent_revision_pins
         actual_dependencies = live.dependent_revision_pins
         if actual_dependencies != expected_dependencies:
@@ -1453,6 +2101,7 @@ class FilesystemCorrectionTransformStore:
         result: CorrectionTransformCommitResult,
     ) -> None:
         operation_id = draft.command.operation_id
+        self._ensure_item_index_migrated_locked()
         publication = self._publication_document(draft, result)
         try:
             self._validate_publication_document(
@@ -1495,6 +2144,10 @@ class FilesystemCorrectionTransformStore:
                 code="invalid_correction_transform_document",
                 artifact="correction_transform_receipt",
             )
+        pointer_payload = self._item_pointer_payload(
+            draft.command,
+            publication_sha256=receipt["publication_sha256"],
+        )
 
         targets: list[tuple[Path, bytes, str]] = []
         for kind in CORRECTION_OUTPUT_KINDS:
@@ -1521,6 +2174,14 @@ class FilesystemCorrectionTransformStore:
                     "correction_transform_publication",
                 ),
                 (
+                    self._item_pointer_path(
+                        draft.command.item_id,
+                        operation_id,
+                    ),
+                    pointer_payload,
+                    "correction_transform_item_pointer",
+                ),
+                (
                     self._receipt_path(operation_id),
                     receipt_payload,
                     "correction_transform_receipt",
@@ -1534,6 +2195,7 @@ class FilesystemCorrectionTransformStore:
                     code="correction_transform_target_exists",
                     artifact=artifact,
                 )
+        self._assert_item_pointer_capacity(draft.command.item_id)
 
         try:
             transaction = self._write_set.begin(
@@ -1559,6 +2221,102 @@ class FilesystemCorrectionTransformStore:
             raise _repository_error(
                 "the correction transform publication failed",
                 code="correction_transform_transaction_failed",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    def _item_pointer_payload(
+        self,
+        command: CorrectionTransformCommand,
+        *,
+        publication_sha256: str,
+    ) -> bytes:
+        pointer = {
+            "schema": CORRECTION_TRANSFORM_ITEM_POINTER_SCHEMA,
+            "version": CORRECTION_TRANSFORM_ITEM_POINTER_VERSION,
+            "item_id": command.item_id,
+            "operation_id": command.operation_id,
+            "command_sha256": command.fingerprint,
+            "publication_sha256": publication_sha256,
+        }
+        payload = _canonical_json(
+            pointer,
+            artifact="correction_transform_item_pointer",
+        )
+        if len(payload) > _MAX_ITEM_POINTER_BYTES:
+            raise _repository_error(
+                "the correction transform item pointer is too large",
+                code="invalid_correction_transform_document",
+                artifact="correction_transform_item_pointer",
+            )
+        return payload
+
+    def _ensure_item_pointer(
+        self,
+        command: CorrectionTransformCommand,
+        *,
+        publication_sha256: str,
+    ) -> None:
+        path = self._item_pointer_path(
+            command.item_id,
+            command.operation_id,
+        )
+        expected = _ItemPublicationPointer(
+            command.item_id,
+            command.operation_id,
+            command.fingerprint,
+            publication_sha256,
+        )
+        if self._path_exists(
+            path,
+            artifact="correction_transform_item_pointer",
+        ):
+            actual = self._validated_item_pointer(
+                path,
+                item_id=command.item_id,
+            )
+            if actual != expected:
+                raise _repository_error(
+                    "the correction transform item pointer conflicts with "
+                    "its publication",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_item_pointer",
+                )
+            return
+
+        self._assert_item_pointer_capacity(command.item_id)
+        payload = self._item_pointer_payload(
+            command,
+            publication_sha256=publication_sha256,
+        )
+        try:
+            transaction = self._write_set.begin(
+                operation_id=f"{command.operation_id}:item-index",
+                scope="correction-transform-item-index",
+                metadata={
+                    "item_id": command.item_id,
+                    "operation_id": command.operation_id,
+                    "command_sha256": command.fingerprint,
+                },
+            )
+            transaction.stage_write(self._relative(path), payload)
+            transaction.commit(
+                receipt={
+                    "item_id": command.item_id,
+                    "operation_id": command.operation_id,
+                    "publication_sha256": publication_sha256,
+                }
+            )
+            self._unindexed_v2_cache = None
+            self._unindexed_v2_overflow.clear()
+            self._unindexed_v2_errors.clear()
+        except WriteSetError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction transform item index could not be repaired",
+                code="correction_transform_transaction_failed",
+                artifact="correction_transform_item_pointer",
                 cause=exc,
                 retryable=True,
             ) from exc
@@ -1689,6 +2447,7 @@ class FilesystemCorrectionTransformStore:
         result: CorrectionTransformCommitResult,
         *,
         publication_sha256: str,
+        verify_objects: bool = True,
     ) -> Mapping[str, Any]:
         artifact_ids = tuple(output.artifact_id for output in result.outputs)
         if command.artifact_id.casefold() in {
@@ -1740,6 +2499,7 @@ class FilesystemCorrectionTransformStore:
                 publication,
                 command=command,
                 result=result,
+                allow_legacy=True,
             )
             canonical = _canonical_json(
                 publication,
@@ -1759,27 +2519,28 @@ class FilesystemCorrectionTransformStore:
                 artifact="correction_transform_publication",
             )
 
-        publication_outputs = publication["outputs"]
-        for committed, descriptor in zip(
-            result.outputs,
-            publication_outputs,
-            strict=True,
-        ):
-            _payload, digest, byte_count = self._read_regular(
-                self._object_path(committed.artifact_id),
-                maximum=_MAX_OUTPUT_BYTES,
-                artifact=committed.kind,
-                collect=False,
-            )
-            if (
-                digest != committed.content_sha256
-                or byte_count != descriptor["bytes"]
+        if verify_objects:
+            publication_outputs = publication["outputs"]
+            for committed, descriptor in zip(
+                result.outputs,
+                publication_outputs,
+                strict=True,
             ):
-                raise _repository_error(
-                    "a correction transform object checksum is invalid",
-                    code="invalid_correction_transform_storage",
+                _payload, digest, byte_count = self._read_regular(
+                    self._object_path(committed.artifact_id),
+                    maximum=_MAX_OUTPUT_BYTES,
                     artifact=committed.kind,
+                    collect=False,
                 )
+                if (
+                    digest != committed.content_sha256
+                    or byte_count != descriptor["bytes"]
+                ):
+                    raise _repository_error(
+                        "a correction transform object checksum is invalid",
+                        code="invalid_correction_transform_storage",
+                        artifact=committed.kind,
+                    )
         return publication
 
     def _validate_publication_document(
@@ -1788,16 +2549,23 @@ class FilesystemCorrectionTransformStore:
         *,
         command: CorrectionTransformCommand,
         result: CorrectionTransformCommitResult,
+        allow_legacy: bool = False,
     ) -> None:
         publication = _strict_object(
             raw,
             fields=_PUBLICATION_FIELDS,
             artifact="correction_transform_publication",
         )
+        version = publication["version"]
+        supported_versions = (
+            {1, CORRECTION_TRANSFORM_PUBLICATION_VERSION}
+            if allow_legacy
+            else {CORRECTION_TRANSFORM_PUBLICATION_VERSION}
+        )
         if (
             publication["schema"] != CORRECTION_TRANSFORM_PUBLICATION_SCHEMA
-            or type(publication["version"]) is not int
-            or publication["version"] != CORRECTION_TRANSFORM_PUBLICATION_VERSION
+            or type(version) is not int
+            or version not in supported_versions
             or publication["operation_id"] != command.operation_id
             or publication["command_sha256"] != command.fingerprint
             or publication["human_assertion_policy"]
@@ -1810,7 +2578,11 @@ class FilesystemCorrectionTransformStore:
 
         source = _strict_object(
             publication["source"],
-            fields=_PUBLICATION_SOURCE_FIELDS,
+            fields=(
+                _PUBLICATION_SOURCE_V1_FIELDS
+                if version == 1
+                else _PUBLICATION_SOURCE_FIELDS
+            ),
             artifact="correction_transform_source",
         )
         source_pins = {
@@ -1832,7 +2604,11 @@ class FilesystemCorrectionTransformStore:
         }:
             raise ValueError("publication source is not bound to its command")
         self._validate_dependent_revision_pins(source["dependent_revision_pins"])
-        raster_source = self._raster_source_from_publication(publication)
+        raster_source = (
+            None
+            if version == 1
+            else self._raster_source_from_publication(publication)
+        )
 
         publication_result = self._result_from_document(
             publication["result"],
@@ -1905,12 +2681,26 @@ class FilesystemCorrectionTransformStore:
         )
         for field in _HUMAN_ASSERTION_FIELDS:
             self._require_sequence(human_assertions[field], field=field)
-        self._mapped_annotation_views(
-            command,
-            result,
-            publication,
-            raster_source,
-        )
+        if raster_source is None:
+            self._require_sequence(
+                publication["mapped_annotations"],
+                field="mapped_annotations",
+            )
+            dropped = self._require_sequence(
+                publication["dropped_annotation_ids"],
+                field="dropped_annotation_ids",
+            )
+            if any(not isinstance(value, str) for value in dropped):
+                raise ValueError(
+                    "dropped annotation identities must be strings"
+                )
+        else:
+            self._mapped_annotation_views(
+                command,
+                result,
+                publication,
+                raster_source,
+            )
 
     def _validate_dependent_revision_pins(
         self,
@@ -2189,6 +2979,17 @@ class FilesystemCorrectionTransformStore:
     def _publication_path(self, operation_id: str) -> Path:
         return self._target(_PUBLICATION_ROOT / f"{_digest_text(operation_id)}.json")
 
+    def _item_pointer_path(
+        self,
+        item_id: str,
+        operation_id: str,
+    ) -> Path:
+        return self._target(
+            _ITEM_POINTER_ROOT
+            / _digest_text(item_id)
+            / f"{_digest_text(operation_id)}.json"
+        )
+
     def _receipt_path(self, operation_id: str) -> Path:
         return self._target(_RECEIPT_ROOT / f"{_digest_text(operation_id)}.json")
 
@@ -2200,10 +3001,13 @@ class FilesystemCorrectionTransformStore:
 
 
 __all__ = [
+    "CORRECTION_TRANSFORM_ITEM_POINTER_SCHEMA",
+    "CORRECTION_TRANSFORM_ITEM_POINTER_VERSION",
     "CORRECTION_TRANSFORM_PUBLICATION_SCHEMA",
     "CORRECTION_TRANSFORM_PUBLICATION_VERSION",
     "CORRECTION_TRANSFORM_RECEIPT_SCHEMA",
     "CORRECTION_TRANSFORM_RECEIPT_VERSION",
+    "CorrectionTransformOutputResolverPort",
     "FilesystemCorrectionTransformStore",
     "SourceSnapshotLookup",
 ]

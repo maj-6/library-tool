@@ -19,7 +19,10 @@ from .correction_repository import FilesystemCorrectionRepository
 from .correction_ocr_proposal_repository import (
     FilesystemCorrectionOcrProposalRepository,
 )
-from .correction_transform_store import FilesystemCorrectionTransformStore
+from .correction_transform_store import (
+    CorrectionTransformOutputResolverPort,
+    FilesystemCorrectionTransformStore,
+)
 from .correction_source_snapshot import (
     CanonicalTextLayerHumanAssertionReader,
     FilesystemCorrectionSourceSnapshotReader,
@@ -81,6 +84,7 @@ __all__ = [
     "FilesystemCorrectionRepository",
     "FilesystemCorrectionOcrProposalRepository",
     "FilesystemCorrectionTransformStore",
+    "CorrectionTransformOutputResolverPort",
     "FilesystemCorrectionSourceSnapshotReader",
     "FilesystemCorrectionsArtifactRepository",
     "FilesystemRasterResourceResolverPort",

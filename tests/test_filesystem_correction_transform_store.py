@@ -16,6 +16,7 @@ from librarytool.adapters.filesystem import (
     correction_transform_store as transform_store_module,
 )
 from librarytool.adapters.filesystem import (
+    CorrectionTransformOutputResolverPort,
     FilesystemCorrectionTransformStore,
     RecoverableWriteSet,
     WriteSetError,
@@ -162,6 +163,22 @@ def _source(
     )
 
 
+def _source_with_changed_scope() -> CorrectionSourceSnapshot:
+    source = _source()
+    return replace(
+        source,
+        artifact=replace(
+            source.artifact,
+            source=RasterSourceRef(
+                "capture-rebound",
+                "representation-r1",
+                "canvas-rebound",
+                "canvas-r1",
+            ),
+        ),
+    )
+
+
 def _command(
     source: CorrectionSourceSnapshot,
     **changes,
@@ -234,6 +251,32 @@ def _publication_path(root: Path, operation_id: str = "transform-op-1") -> Path:
     )
 
 
+def _item_pointer_path(
+    root: Path,
+    *,
+    item_id: str = "book-1",
+    operation_id: str = "transform-op-1",
+) -> Path:
+    item_digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+    return (
+        root
+        / ".engine"
+        / "correction-transforms"
+        / "by-item"
+        / item_digest
+        / f"{_operation_digest(operation_id)}.json"
+    )
+
+
+def _item_index_marker_path(root: Path) -> Path:
+    return (
+        root
+        / ".engine"
+        / "correction-transforms"
+        / "item-index-v1.json"
+    )
+
+
 def _receipt_path(root: Path, operation_id: str = "transform-op-1") -> Path:
     return (
         root
@@ -259,6 +302,35 @@ def _canonical_document(value) -> bytes:
     ).encode("ascii")
 
 
+def _downgrade_publication_to_v1(
+    root: Path,
+    *,
+    keep_item_pointer: bool,
+) -> str:
+    publication_path = _publication_path(root)
+    publication = json.loads(publication_path.read_text("ascii"))
+    publication["version"] = 1
+    del publication["source"]["raster_source"]
+    publication_payload = _canonical_document(publication)
+    publication_path.write_bytes(publication_payload)
+    publication_sha256 = hashlib.sha256(publication_payload).hexdigest()
+
+    receipt_path = _receipt_path(root)
+    receipt = json.loads(receipt_path.read_text("ascii"))
+    receipt["publication_sha256"] = publication_sha256
+    receipt_path.write_bytes(_canonical_document(receipt))
+
+    pointer_path = _item_pointer_path(root)
+    if keep_item_pointer:
+        pointer = json.loads(pointer_path.read_text("ascii"))
+        pointer["publication_sha256"] = publication_sha256
+        pointer_path.write_bytes(_canonical_document(pointer))
+    else:
+        pointer_path.unlink()
+        _item_index_marker_path(root).unlink()
+    return publication_sha256
+
+
 def _managed_files(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
@@ -276,6 +348,7 @@ def test_store_publishes_four_immutable_outputs_and_full_human_assertions(
     draft = _draft(source)
 
     assert isinstance(store, CorrectionTransformStorePort)
+    assert isinstance(store, CorrectionTransformOutputResolverPort)
     assert store.load_source(source.artifact.key) == source
     result = store.commit_transform(draft)
 
@@ -312,6 +385,17 @@ def test_store_publishes_four_immutable_outputs_and_full_human_assertions(
         "Verified transcription"
     ]
     assert _receipt_path(tmp_path).is_file()
+    pointer = json.loads(_item_pointer_path(tmp_path).read_text("ascii"))
+    assert pointer == {
+        "schema": "librarytool.correction-transform-item-pointer",
+        "version": 1,
+        "item_id": "book-1",
+        "operation_id": "transform-op-1",
+        "command_sha256": draft.command.fingerprint,
+        "publication_sha256": hashlib.sha256(
+            _publication_path(tmp_path).read_bytes()
+        ).hexdigest(),
+    }
     assert source.content == _png()
 
 
@@ -411,6 +495,80 @@ def test_store_projects_persisted_raster_outputs_and_verified_resources(
     )
 
 
+def test_store_resolves_only_an_exact_committed_output_descriptor(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    draft = _draft(source)
+    store = _store(tmp_path, _Authority(source))
+    committed = store.commit_transform(draft)
+    output = committed.output("ocr-ready")
+
+    resolved = store.resolve_committed_output(
+        "book-1",
+        "transform-op-1",
+        output,
+    )
+    assert resolved is not None
+    try:
+        assert resolved.stream.read() == draft.output("ocr-ready").content
+        assert resolved.content_sha256 == output.content_sha256
+        assert resolved.revision == output.artifact_revision
+    finally:
+        resolved.stream.close()
+
+    assert (
+        store.resolve_committed_output(
+            "book-1",
+            "transform-op-1",
+            replace(output, artifact_revision="wrong-revision"),
+        )
+        is None
+    )
+    assert (
+        store.resolve_committed_output(
+            "another-book",
+            "transform-op-1",
+            output,
+        )
+        is None
+    )
+    for mismatch in (
+        replace(output, kind="thumbnail"),
+        replace(output, content_sha256="0" * 64),
+    ):
+        assert (
+            store.resolve_committed_output(
+                "book-1",
+                "transform-op-1",
+                mismatch,
+            )
+            is None
+        )
+
+    _object_path(
+        tmp_path,
+        committed.output("thumbnail").artifact_id,
+    ).write_bytes(b"unrelated sibling tamper")
+    sibling_safe = store.resolve_committed_output(
+        "book-1",
+        "transform-op-1",
+        output,
+    )
+    assert sibling_safe is not None
+    sibling_safe.stream.close()
+
+    _object_path(tmp_path, output.artifact_id).write_bytes(b"tampered")
+    with pytest.raises(RepositoryError) as raised:
+        store.resolve_committed_output(
+            "book-1",
+            "transform-op-1",
+            output,
+        )
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == "ocr-ready"
+
+
 def test_output_projection_rejects_tampered_immutable_resources(
     tmp_path: Path,
 ) -> None:
@@ -431,12 +589,16 @@ def test_output_projection_rejects_tampered_immutable_resources(
 
 
 @pytest.mark.parametrize(
-    "missing",
-    ("publication", "receipt"),
+    ("missing", "artifact"),
+    (
+        ("publication", "correction_transform_publication"),
+        ("receipt", "correction_transform_item_pointer"),
+    ),
 )
 def test_projection_requires_exact_receipt_publication_parity(
     tmp_path: Path,
     missing: str,
+    artifact: str,
 ) -> None:
     source = _source()
     authority = _Authority(source)
@@ -454,9 +616,7 @@ def test_projection_requires_exact_receipt_publication_parity(
         store.list_raster_artifacts("book-1")
 
     assert raised.value.code == "invalid_correction_transform_storage"
-    assert raised.value.details["artifact"] == (
-        "correction_transform_authority"
-    )
+    assert raised.value.details["artifact"] == artifact
 
 
 def test_projection_rejects_hard_linked_authority_documents(
@@ -465,16 +625,16 @@ def test_projection_rejects_hard_linked_authority_documents(
     source = _source()
     store = _store(tmp_path, _Authority(source))
     store.commit_transform(_draft(source))
-    receipt = _receipt_path(tmp_path)
-    alias = receipt.with_name(f"{'f' * 64}.json")
-    os.link(receipt, alias)
+    pointer = _item_pointer_path(tmp_path)
+    alias = pointer.with_name(f"{'f' * 64}.json")
+    os.link(pointer, alias)
 
     try:
         with pytest.raises(RepositoryError) as raised:
             store.list_raster_artifacts("book-1")
         assert raised.value.code == "invalid_correction_transform_storage"
         assert raised.value.details["artifact"] == (
-            "correction_transform_receipts"
+            "correction_transform_item_index"
         )
     finally:
         alias.unlink(missing_ok=True)
@@ -489,7 +649,7 @@ def test_projection_enforces_the_transform_document_entry_budget(
     store.commit_transform(_draft(source))
     monkeypatch.setattr(
         transform_store_module,
-        "_MAX_TRANSFORM_DOCUMENTS",
+        "_MAX_ITEM_TRANSFORMS",
         0,
     )
 
@@ -498,7 +658,150 @@ def test_projection_enforces_the_transform_document_entry_budget(
 
     assert raised.value.code == "invalid_correction_transform_storage"
     assert raised.value.details["artifact"] == (
-        "correction_transform_publications"
+        "correction_transform_item_index"
+    )
+
+
+def test_store_rejects_a_transform_before_exceeding_the_item_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    monkeypatch.setattr(
+        transform_store_module,
+        "_MAX_ITEM_TRANSFORMS",
+        1,
+    )
+    store.commit_transform(_draft(source))
+    before = _managed_files(tmp_path)
+
+    with pytest.raises(RepositoryError) as raised:
+        store.commit_transform(
+            _draft(
+                source,
+                _command(source, operation_id="transform-op-2"),
+            )
+        )
+
+    assert raised.value.code == "correction_transform_item_limit"
+    assert raised.value.details == {"item_id": "book-1", "limit": 1}
+    assert _managed_files(tmp_path) == before
+    assert len(store.list_raster_artifacts("book-1")) == 3
+
+
+def test_projection_does_not_scan_global_transform_document_directories(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    for directory in (
+        _publication_path(tmp_path).parent,
+        _receipt_path(tmp_path).parent,
+    ):
+        (directory / "not-an-authority-document").write_text(
+            "unrelated",
+            encoding="ascii",
+        )
+
+    assert len(store.list_raster_artifacts("book-1")) == 3
+    assert store.list_raster_artifacts("another-book") == ()
+
+
+def test_projection_reads_pre_index_v2_without_mutating_then_migrates_on_write(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(_draft(source))
+    pointer = _item_pointer_path(tmp_path)
+    marker = _item_index_marker_path(tmp_path)
+    pointer.unlink()
+    marker.unlink()
+    before_read = _managed_files(tmp_path)
+    authority.fail = True
+
+    restarted = _store(tmp_path, authority)
+    assert len(restarted.list_raster_artifacts("book-1")) == 3
+    assert _managed_files(tmp_path) == before_read
+    assert not pointer.exists()
+    assert not marker.exists()
+
+    authority.fail = False
+    restarted.commit_transform(
+        _draft(
+            source,
+            _command(source, operation_id="transform-op-2"),
+        )
+    )
+    assert pointer.is_file()
+    assert _item_pointer_path(
+        tmp_path,
+        operation_id="transform-op-2",
+    ).is_file()
+    assert marker.is_file()
+
+
+def test_pre_index_v2_corruption_fails_only_its_item_projection(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    result = store.commit_transform(_draft(source))
+    _item_pointer_path(tmp_path).unlink()
+    _item_index_marker_path(tmp_path).unlink()
+    _object_path(
+        tmp_path,
+        result.output("thumbnail").artifact_id,
+    ).write_bytes(b"tampered")
+    before = _managed_files(tmp_path)
+
+    restarted = _store(tmp_path, _Authority(source))
+    assert restarted.list_raster_artifacts("another-book") == ()
+    with pytest.raises(RepositoryError) as raised:
+        restarted.list_raster_artifacts("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == "thumbnail"
+    assert _managed_files(tmp_path) == before
+
+
+def test_projection_rejects_a_tampered_item_pointer(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    path = _item_pointer_path(tmp_path)
+    pointer = json.loads(path.read_text("ascii"))
+    pointer["publication_sha256"] = "0" * 64
+    path.write_bytes(_canonical_document(pointer))
+
+    with pytest.raises(RepositoryError) as raised:
+        store.list_raster_artifacts("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == (
+        "correction_transform_item_pointer"
+    )
+
+
+def test_projection_rejects_a_tampered_item_index_marker(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    store = _store(tmp_path, _Authority(source))
+    store.commit_transform(_draft(source))
+    _item_index_marker_path(tmp_path).write_bytes(b"{}")
+
+    with pytest.raises(RepositoryError) as raised:
+        store.list_raster_artifacts("book-1")
+
+    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.details["artifact"] == (
+        "correction_transform_item_index_marker"
     )
 
 
@@ -508,10 +811,10 @@ def test_projection_rejects_symlinked_authority_documents(
     source = _source()
     store = _store(tmp_path, _Authority(source))
     store.commit_transform(_draft(source))
-    receipt = _receipt_path(tmp_path)
-    alias = receipt.with_name(f"{'e' * 64}.json")
+    pointer = _item_pointer_path(tmp_path)
+    alias = pointer.with_name(f"{'e' * 64}.json")
     try:
-        os.symlink(receipt, alias)
+        os.symlink(pointer, alias)
     except OSError:
         pytest.skip("file symlinks are unavailable")
 
@@ -520,38 +823,53 @@ def test_projection_rejects_symlinked_authority_documents(
             store.list_raster_artifacts("book-1")
         assert raised.value.code == "invalid_correction_transform_storage"
         assert raised.value.details["artifact"] == (
-            "correction_transform_receipts"
+            "correction_transform_item_index"
         )
     finally:
         alias.unlink(missing_ok=True)
 
 
-def test_projection_fails_closed_for_legacy_publication_without_source_scope(
+def test_projection_fails_closed_for_indexed_legacy_publication(
     tmp_path: Path,
 ) -> None:
     source = _source()
     store = _store(tmp_path, _Authority(source))
     store.commit_transform(_draft(source))
-    publication_path = _publication_path(tmp_path)
-    publication = json.loads(publication_path.read_text("ascii"))
-    publication["version"] = 1
-    del publication["source"]["raster_source"]
-    publication_payload = _canonical_document(publication)
-    publication_path.write_bytes(publication_payload)
-    receipt_path = _receipt_path(tmp_path)
-    receipt = json.loads(receipt_path.read_text("ascii"))
-    receipt["publication_sha256"] = hashlib.sha256(
-        publication_payload
-    ).hexdigest()
-    receipt_path.write_bytes(_canonical_document(receipt))
+    _downgrade_publication_to_v1(tmp_path, keep_item_pointer=True)
 
     with pytest.raises(RepositoryError) as raised:
         store.list_raster_artifacts("book-1")
 
-    assert raised.value.code == "invalid_correction_transform_storage"
+    assert raised.value.code == "unsupported_correction_transform_publication"
     assert raised.value.details["artifact"] == (
         "correction_transform_publication"
     )
+
+
+def test_legacy_v1_replay_remains_durable_but_is_not_projected(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    committed = store.commit_transform(draft)
+    _downgrade_publication_to_v1(tmp_path, keep_item_pointer=False)
+    authority.fail = True
+
+    resolved = store.resolve_committed_output(
+        "book-1",
+        "transform-op-1",
+        committed.output("ocr-ready"),
+    )
+    assert resolved is not None
+    try:
+        assert resolved.stream.read() == draft.output("ocr-ready").content
+    finally:
+        resolved.stream.close()
+    assert store.commit_transform(draft) == committed
+    assert store.list_raster_artifacts("book-1") == ()
+    assert store.list_spatial_annotations("book-1") == ()
 
 
 def test_projection_rejects_mapped_geometry_that_drops_human_assertions(
@@ -570,12 +888,15 @@ def test_projection_rejects_mapped_geometry_that_drops_human_assertions(
     ]
     publication_payload = _canonical_document(publication)
     publication_path.write_bytes(publication_payload)
+    publication_sha256 = hashlib.sha256(publication_payload).hexdigest()
     receipt_path = _receipt_path(tmp_path)
     receipt = json.loads(receipt_path.read_text("ascii"))
-    receipt["publication_sha256"] = hashlib.sha256(
-        publication_payload
-    ).hexdigest()
+    receipt["publication_sha256"] = publication_sha256
     receipt_path.write_bytes(_canonical_document(receipt))
+    pointer_path = _item_pointer_path(tmp_path)
+    pointer = json.loads(pointer_path.read_text("ascii"))
+    pointer["publication_sha256"] = publication_sha256
+    pointer_path.write_bytes(_canonical_document(pointer))
 
     with pytest.raises(RepositoryError) as raised:
         store.list_spatial_annotations("book-1")
@@ -636,6 +957,25 @@ def test_exact_replay_survives_restart_without_querying_stale_authority(
 
     assert replay == first
     assert _managed_files(tmp_path) == before
+
+
+def test_exact_replay_repairs_a_pre_index_v2_publication(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    store = _store(tmp_path, authority)
+    first = store.commit_transform(draft)
+    pointer = _item_pointer_path(tmp_path)
+    pointer.unlink()
+    authority.fail = True
+
+    replay = store.commit_transform(draft)
+
+    assert replay == first
+    assert pointer.is_file()
+    assert len(store.list_raster_artifacts("book-1")) == 3
 
 
 def test_replay_returns_original_result_after_rendered_output_drift(
@@ -706,7 +1046,7 @@ def test_concurrent_store_instances_publish_one_logical_transform(
         )
 
     assert results[0] == results[1]
-    assert len(_managed_files(tmp_path)) == 6
+    assert len(_managed_files(tmp_path)) == 8
 
 
 def test_reusing_an_operation_for_another_command_conflicts_before_source_read(
@@ -732,6 +1072,7 @@ def test_reusing_an_operation_for_another_command_conflicts_before_source_read(
     ("replacement", "code"),
     (
         (_source(artifact_revision="artifact-r2"), "correction_source_stale"),
+        (_source_with_changed_scope(), "correction_source_stale"),
         (
             _source(annotation_revision="region-r2"),
             "correction_assertions_stale",
@@ -807,7 +1148,10 @@ def test_interrupted_publication_recovers_all_outputs_before_retry(
     assert not _receipt_path(tmp_path).exists()
 
     recovered = _store(tmp_path, authority)
-    assert _managed_files(tmp_path) == {}
+    marker = _item_index_marker_path(tmp_path)
+    assert _managed_files(tmp_path) == {
+        marker.relative_to(tmp_path).as_posix(): marker.read_bytes(),
+    }
 
     result = recovered.commit_transform(draft)
     assert len(result.outputs) == 4
