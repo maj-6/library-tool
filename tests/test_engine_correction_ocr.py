@@ -379,6 +379,49 @@ def test_done_child_fails_if_its_durable_proposal_disappears() -> None:
     assert child.outputs == ()
 
 
+@pytest.mark.parametrize(
+    "provider_pin",
+    (
+        None,
+        {
+            "provider_id": "textract",
+            "model": "detect-document-text",
+            "options": {"aws_region": "us-west-2"},
+        },
+    ),
+)
+def test_done_child_replay_requires_its_exact_provider_pin(
+    provider_pin,
+) -> None:
+    jobs = JobManager(checkpoint_interval=0)
+    repository = MemoryProposalRepository()
+    service = CorrectionOcrFollowupService(
+        jobs,
+        repository,
+        Provider(),
+    )
+    request = _request()
+    service.run_ocr_followup(request, Hooks())
+    record = jobs.records[service.job_id_for(request.operation_id)]
+    inputs = dict(record["input_revisions"])
+    if provider_pin is None:
+        inputs.pop("provider")
+    else:
+        inputs["provider"] = provider_pin
+    record["input_revisions"] = inputs
+
+    replay = service.run_ocr_followup(request, Hooks())
+
+    assert replay.state is OcrFollowupState.FAILED
+    assert replay.failure.code in {
+        "invalid_ocr_provider_pin",
+        "correction_ocr_provider_pin_mismatch",
+    }
+    child = jobs.view(record["id"])
+    assert child.state.value == "failed"
+    assert child.outputs == ()
+
+
 def test_provider_failure_is_structured_on_the_child_job() -> None:
     jobs = JobManager(checkpoint_interval=0)
     service = CorrectionOcrFollowupService(

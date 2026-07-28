@@ -118,6 +118,7 @@ from librarytool.composition.filesystem import (  # noqa: E402
     ReplicaBindings,
     RepresentationBindings,
     SecretStoreBindings,
+    TextLayerAggregateBindings,
     TranslationBindings,
 )
 from librarytool.composition.first_party import (  # noqa: E402
@@ -216,6 +217,9 @@ from librarytool.engine.runtime import (  # noqa: E402
     LibraryEngine,
 )
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
+from librarytool.engine.text_layer_aggregate import (  # noqa: E402
+    TextLayerSourceSnapshot,
+)
 from librarytool.engine.translation_contracts import (  # noqa: E402
     ReplaceTranslationPageCommand,
     TranslationSourceCanvas,
@@ -5729,6 +5733,37 @@ def _corrections_representation_revision(
     return None
 
 
+def _engine_text_layer_source_snapshot(
+    item_id: str,
+    representation_id: str,
+) -> TextLayerSourceSnapshot | None:
+    """Pin native human text to the same live representation authority."""
+
+    if not _translation_item_exists(item_id):
+        return None
+    revision = _corrections_representation_revision(
+        item_id,
+        representation_id,
+    )
+    if revision is None:
+        return None
+    try:
+        return TextLayerSourceSnapshot(
+            item_id,
+            representation_id,
+            revision,
+        )
+    except (TypeError, ValueError) as exc:
+        raise EngineRepositoryError(
+            "the text-layer source cannot be represented safely",
+            code="invalid_text_layer_source_snapshot",
+            details={
+                "item_id": item_id,
+                "representation_id": representation_id,
+            },
+        ) from exc
+
+
 @contextlib.contextmanager
 def _engine_workspace_locks(_item_id: str):
     """Bridge legacy writers into the workspace lease's lock order."""
@@ -5847,6 +5882,11 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             source_reference_for=lambda source: _translation_document_name(
                 source.layer_id
             ),
+        ),
+        text_layer_aggregate=TextLayerAggregateBindings(
+            item_exists_for=_translation_item_exists,
+            source_snapshot_for=_engine_text_layer_source_snapshot,
+            layer_id_factory=lambda: lib.gen_id(),
         ),
         corrections=CorrectionsBindings(
             item_exists_for=_translation_item_exists,

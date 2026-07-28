@@ -133,6 +133,7 @@ from librarytool.engine.text_layer_aggregate import (
     TextLayerDraft,
     TextLayerSourcePin,
     TextLayerSourceSnapshot,
+    TextLayerProvenance,
     TextLayerUnitDraft,
     TextLayerUnitReplacement,
 )
@@ -1361,6 +1362,21 @@ def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
             )
 
     provider = ExactOcrProvider()
+    text_authority = {"representation_id": "", "revision": ""}
+
+    def text_source_snapshot(item_id, representation_id):
+        if (
+            item_id != "book-one"
+            or representation_id != text_authority["representation_id"]
+            or not text_authority["revision"]
+        ):
+            return None
+        return TextLayerSourceSnapshot(
+            item_id,
+            representation_id,
+            text_authority["revision"],
+        )
+
     bindings = CorrectionsBindings(
         item_exists_for=lambda item_id: item_id == "book-one",
         capture_id_for=lambda item_id: (
@@ -1378,6 +1394,11 @@ def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
         tmp_path,
         contribution_factory=first_party_module_contributions,
         corrections=bindings,
+        text_layer_aggregate=TextLayerAggregateBindings(
+            item_exists_for=lambda item_id: item_id == "book-one",
+            source_snapshot_for=text_source_snapshot,
+            layer_id_factory=lambda: "human-layer-1",
+        ),
     )
     raster = composed["engine"].require_service(
         RASTER_ARTIFACT_QUERY_SERVICE
@@ -1388,6 +1409,38 @@ def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
         if value.kind == "processed-image"
     )
     assert source.resource is not None
+    text_authority.update({
+        "representation_id": source.source.representation_id,
+        "revision": source.source.representation_revision,
+    })
+    text_layers = composed["engine"].require_service(
+        TEXT_LAYER_AGGREGATE_SERVICE
+    )
+    text_layers.create(
+        CreateTextLayerCommand(
+            "book-one",
+            TextLayerDraft(
+                source=TextLayerSourcePin(
+                    source.source.representation_id,
+                    source.source.representation_revision,
+                ),
+                units=(
+                    TextLayerUnitDraft(
+                        "capture-text",
+                        0,
+                        "Human verified transcription",
+                        provenance=TextLayerProvenance(
+                            origin="human",
+                            review_state="approved",
+                        ),
+                    ),
+                ),
+                label="Verified",
+                language="en",
+            ),
+            "composition-human-text-1",
+        )
+    )
     command = CorrectionTransformCommand(
         item_id="book-one",
         artifact_id=source.key.artifact_id,
@@ -1486,6 +1539,24 @@ def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
         "model": "model-r1",
         "options": {"layout": True},
     }
+    publication_path = next(
+        (
+            composed["write_set"].root
+            / ".engine"
+            / "correction-transforms"
+            / "publications"
+        ).glob("*.json")
+    )
+    publication = json.loads(
+        publication_path.read_text(encoding="utf-8")
+    )
+    assert [
+        value["text"]
+        for value in publication["human_assertions"]["text"]
+    ] == ["Human verified transcription"]
+    assert publication["human_assertions"]["text"][0]["origin"] == (
+        "verified"
+    )
     assert lock_state["held"] is False
     assert lock_state["entries"] > 0
 

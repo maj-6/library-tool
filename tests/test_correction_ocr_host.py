@@ -263,6 +263,45 @@ def test_production_engine_bindings_install_the_correction_ocr_provider() -> Non
         bindings.corrections.ocr_provider,
         server._EngineCorrectionOcrProvider,
     )
+    assert bindings.text_layer_aggregate is not None
+    assert bindings.text_layer_aggregate.item_exists_for is (
+        server._translation_item_exists
+    )
+    assert bindings.text_layer_aggregate.source_snapshot_for is (
+        server._engine_text_layer_source_snapshot
+    )
+
+
+def test_production_text_layer_source_uses_live_representation_revision(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "_translation_item_exists",
+        lambda item_id: item_id == "book-1",
+    )
+    monkeypatch.setattr(
+        server,
+        "_corrections_representation_revision",
+        lambda item_id, representation_id: (
+            "scan-r7"
+            if (item_id, representation_id) == ("book-1", "scan")
+            else None
+        ),
+    )
+
+    snapshot = server._engine_text_layer_source_snapshot(
+        "book-1",
+        "scan",
+    )
+
+    assert snapshot.item_id == "book-1"
+    assert snapshot.representation_id == "scan"
+    assert snapshot.revision == "scan-r7"
+    assert server._engine_text_layer_source_snapshot(
+        "book-1",
+        "missing",
+    ) is None
 
 
 def test_host_provider_honors_cancellation_before_external_work(

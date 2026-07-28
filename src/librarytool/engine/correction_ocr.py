@@ -526,6 +526,16 @@ class CorrectionOcrFollowupService:
                     )
                 if stored is not None:
                     self._validate_stored(stored, request)
+                    pin_failure = self._stored_provider_pin_failure(
+                        existing,
+                        stored,
+                    )
+                    if pin_failure is not None:
+                        return self._fail_existing(
+                            existing,
+                            request.source,
+                            pin_failure,
+                        )
                     proposals = [
                         output
                         for output in existing.outputs
@@ -777,6 +787,26 @@ class CorrectionOcrFollowupService:
             retryable=exc.retryable,
             details=exc.details,
         )
+
+    @classmethod
+    def _stored_provider_pin_failure(
+        cls,
+        job: JobView,
+        stored: StoredCorrectionOcrProposal,
+    ) -> JobFailure | None:
+        try:
+            pinned = cls._selection_from_pin(
+                job.input_revisions.get("provider")
+            )
+        except EngineError as exc:
+            return cls._failure_from_engine_error(exc)
+        if pinned != stored.provider:
+            return JobFailure(
+                "correction_ocr_provider_pin_mismatch",
+                "OCR proposal does not match the child provider pin",
+                retryable=False,
+            )
+        return None
 
     @staticmethod
     def _selection_from_pin(
