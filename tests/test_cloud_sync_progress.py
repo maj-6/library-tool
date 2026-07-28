@@ -403,6 +403,14 @@ def test_owner_phases_become_indeterminate_after_capture_meter(monkeypatch):
 
     monkeypatch.setattr(server, "_import_capture", import_one)
     owner_snapshots = []
+    association_calls = []
+    monkeypatch.setattr(
+        server,
+        "_publish_pending_cloud_capture_associations",
+        lambda owner, capture: association_calls.append(
+            (owner, capture)
+        ) or {"pushed": 1, "pending": 0, "errors": []},
+    )
 
     def sync_stores(*_args, **_kwargs):
         owner_snapshots.append(server._cloudsync_snapshot())
@@ -423,6 +431,14 @@ def test_owner_phases_become_indeterminate_after_capture_meter(monkeypatch):
         {"url": "owner"}, {"url": "capture"})
 
     assert result["ok"] is True
+    assert association_calls == [
+        ({"url": "owner"}, {"url": "capture"}),
+    ]
+    assert result["capture_associations"] == {
+        "pushed": 1,
+        "pending": 0,
+        "errors": [],
+    }
     progress = owner_snapshots[0]["progress"]
     assert progress["phase"] == "owner_stores"
     assert progress["unit"] == "operations"

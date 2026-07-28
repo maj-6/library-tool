@@ -1634,6 +1634,8 @@ def _capture_phone_sync_state() -> dict:
     published = raw.get("published_capture_ids")
     shadows = raw.get("review_shadows")
     pending = raw.get("pending_reviews")
+    association_shadows = raw.get("cloud_association_shadows")
+    pending_associations = raw.get("pending_cloud_associations")
     lan_snapshots = raw.get("lan_snapshots")
     lan_confirmations = copy.deepcopy(raw.get("lan_confirmations"))
     lan_confirmation_stream_id = copy.deepcopy(
@@ -1653,6 +1655,14 @@ def _capture_phone_sync_state() -> dict:
         if isinstance(published, list) else [],
         "review_shadows": dict(shadows) if isinstance(shadows, dict) else {},
         "pending_reviews": dict(pending) if isinstance(pending, dict) else {},
+        "cloud_association_shadows": (
+            copy.deepcopy(association_shadows)
+            if isinstance(association_shadows, dict) else {}
+        ),
+        "pending_cloud_associations": (
+            copy.deepcopy(pending_associations)
+            if isinstance(pending_associations, dict) else {}
+        ),
         "lan_snapshots": dict(lan_snapshots)
         if isinstance(lan_snapshots, dict) else {},
         # Preserve these raw so corruption cannot be silently normalized by an
@@ -1679,6 +1689,16 @@ def _update_capture_phone_sync_state(mutator) -> dict:
             if isinstance(raw.get("review_shadows"), dict) else {},
             "pending_reviews": dict(raw.get("pending_reviews"))
             if isinstance(raw.get("pending_reviews"), dict) else {},
+            "cloud_association_shadows": copy.deepcopy(
+                raw.get("cloud_association_shadows")
+            ) if isinstance(
+                raw.get("cloud_association_shadows"), dict
+            ) else {},
+            "pending_cloud_associations": copy.deepcopy(
+                raw.get("pending_cloud_associations")
+            ) if isinstance(
+                raw.get("pending_cloud_associations"), dict
+            ) else {},
             "lan_snapshots": dict(raw.get("lan_snapshots"))
             if isinstance(raw.get("lan_snapshots"), dict) else {},
             "lan_confirmation_stream_id": copy.deepcopy(
@@ -20264,13 +20284,21 @@ def _capture_archive_association(
 
 def _mark_capture_archive_stale(
         capture_id: str) -> CaptureArchiveAssociation | None:
-    """Invalidate the sealed snapshot without treating it as the live store."""
+    """Invalidate locally and queue a previously acknowledged cloud snapshot.
+
+    Catalogue edits remain entirely local: this function never leases
+    credentials or performs network I/O.  A later credentialed cloud-sync pass
+    publishes only a verified current-to-stale transition.
+    """
 
     normalized = _capture_archive_id(capture_id)
     if not normalized:
         return None
     with _capture_ingest_lock(normalized):
-        return _capture_archive_service().mark_stale(normalized)
+        association = _capture_archive_service().mark_stale(normalized)
+    if association is not None:
+        _queue_cloud_capture_stale_association(association)
+    return association
 
 
 def _invalidate_capture_archive_before_item_update(
@@ -20649,12 +20677,173 @@ def _cloud_capture_association_revision(cap: dict) -> int:
     return value
 
 
-def _publish_cloud_capture_acknowledgement(
+def _capture_association_is_exact_stale_transition(
+        current: CaptureArchiveAssociation,
+        stale: CaptureArchiveAssociation) -> bool:
+    """Whether ``stale`` changes only the frozen association state."""
+
+    if (
+        current.state is not CaptureArchiveState.CURRENT
+        or stale.state is not CaptureArchiveState.STALE
+    ):
+        return False
+    current_document = current.as_dict()
+    stale_document = stale.as_dict()
+    current_document.pop("state")
+    stale_document.pop("state")
+    return current_document == stale_document
+
+
+def _cloud_capture_association_shadow(
+        raw: object,
+        capture_id: str,
+) -> tuple[CaptureArchiveAssociation, int] | None:
+    """Parse one exact accepted cloud document/revision cursor."""
+
+    if not isinstance(raw, dict):
+        return None
+    revision = raw.get("revision")
+    try:
+        association = CaptureArchiveAssociation.from_dict(
+            raw.get("association")
+        )
+    except (EngineValidationError, TypeError, ValueError):
+        return None
+    if (
+        association.capture_id != capture_id
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision >= 9223372036854775807
+    ):
+        return None
+    return association, revision
+
+
+def _queue_cloud_capture_stale_association(
+        association: CaptureArchiveAssociation,
+) -> bool:
+    """Durably queue an exact acknowledged current-to-stale transition.
+
+    LAN-only and otherwise local captures have no accepted cloud shadow and
+    are deliberately ignored.  That keeps ordinary edits credential-free and
+    prevents a local capture id from becoming authority to write a cloud row.
+    """
+
+    if (
+        not isinstance(association, CaptureArchiveAssociation)
+        or association.state is not CaptureArchiveState.STALE
+    ):
+        return False
+    queued = False
+
+    def update(state: dict) -> None:
+        nonlocal queued
+        capture_id = association.capture_id
+        shadow = _cloud_capture_association_shadow(
+            state["cloud_association_shadows"].get(capture_id),
+            capture_id,
+        )
+        if (
+            shadow is None
+            or not _capture_association_is_exact_stale_transition(
+                shadow[0], association
+            )
+        ):
+            return
+        state["pending_cloud_associations"][capture_id] = {
+            "association": association.as_dict(),
+            "expected_revision": shadow[1],
+        }
+        queued = True
+
+    _update_capture_phone_sync_state(update)
+    return queued
+
+
+def _remember_cloud_capture_association(
+        association: CaptureArchiveAssociation,
+        accepted: dict,
+) -> None:
+    """Persist the exact RPC receipt needed for a later offline stale edit."""
+
+    revision = accepted.get("lib_association_revision")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision >= 9223372036854775807
+    ):
+        raise sbase.SyncError(
+            "capture archive publication returned an invalid revision"
+        )
+    accepted_id = accepted.get("id")
+    if accepted_id is not None and accepted_id != association.capture_id:
+        raise sbase.SyncError(
+            "capture archive publication returned another capture"
+        )
+    accepted_document = accepted.get("lib_association")
+    if accepted_document is not None:
+        try:
+            parsed = CaptureArchiveAssociation.from_dict(accepted_document)
+        except (EngineValidationError, TypeError, ValueError) as exc:
+            raise sbase.SyncError(
+                "capture archive publication returned an invalid association"
+            ) from exc
+        if parsed != association:
+            raise sbase.SyncError(
+                "capture archive publication returned another association"
+            )
+
+    def update(state: dict) -> None:
+        capture_id = association.capture_id
+        state["cloud_association_shadows"][capture_id] = {
+            "association": association.as_dict(),
+            "revision": revision,
+        }
+        pending = state["pending_cloud_associations"].get(capture_id)
+        if (
+            isinstance(pending, dict)
+            and pending.get("association") == association.as_dict()
+        ):
+            state["pending_cloud_associations"].pop(capture_id, None)
+        elif association.state is CaptureArchiveState.CURRENT:
+            # A newly accepted current snapshot supersedes any stale intent
+            # tied to an older accepted document.
+            state["pending_cloud_associations"].pop(capture_id, None)
+
+    _update_capture_phone_sync_state(update)
+
+    # Close the race where a catalogue edit became durable after the RPC
+    # committed but before its current receipt reached the local cursor file.
+    if association.state is CaptureArchiveState.CURRENT:
+        try:
+            local = _capture_archive_association(association.capture_id)
+        except EngineError as exc:
+            # The accepted receipt is already durable. A later ordinary edit
+            # (or duplicate-import repair) will retry stale discovery.
+            log.warning(
+                "could not inspect capture archive after cloud receipt: %s",
+                exc,
+            )
+            return
+        if (
+            local is not None
+            and _capture_association_is_exact_stale_transition(
+                association, local
+            )
+        ):
+            _queue_cloud_capture_stale_association(local)
+
+
+def _publish_cloud_capture_state(
         owner_cfg: dict | None,
         capture_cfg: dict,
         cap: dict,
-        association: CaptureArchiveAssociation | None) -> dict:
-    """Publish one exact current association through scoped service CAS.
+        association: CaptureArchiveAssociation,
+        *,
+        mark_imported: bool) -> dict:
+    """Publish one exact association through the two-party scoped CAS.
 
     A second immediate attempt closes the common lost-response window. The
     locked RPC accepts only the immediately preceding exact attempt as replay;
@@ -20670,28 +20859,217 @@ def _publish_cloud_capture_acknowledgement(
         not capture_id
         or not isinstance(association, CaptureArchiveAssociation)
         or association.capture_id != capture_id
-        or association.state is not CaptureArchiveState.CURRENT
+        or (
+            mark_imported
+            and association.state is not CaptureArchiveState.CURRENT
+        )
+        or (
+            not mark_imported
+            and association.state is not CaptureArchiveState.STALE
+        )
     ):
         raise sbase.SyncError(
-            "a verified current library archive is required for acknowledgement"
+            "capture archive publication state is invalid"
         )
     expected_revision = _cloud_capture_association_revision(cap)
     last_error = None
     for attempt in range(2):
         try:
-            return sbase.publish_capture_lib_association(
+            accepted = sbase.publish_capture_lib_association(
                 owner_cfg,
                 capture_cfg,
                 capture_id,
                 association.as_dict(),
                 expected_revision=expected_revision,
-                mark_imported=True,
+                mark_imported=mark_imported,
             )
+            try:
+                _remember_cloud_capture_association(association, accepted)
+            except sbase.SyncError:
+                raise
+            except Exception as exc:
+                # The remote RPC is exact-replay safe at expected_revision or
+                # expected_revision + 1. Treat a failed local receipt save as
+                # an ambiguous delivery so the bounded retry records the
+                # shadow before an imported row disappears from discovery.
+                raise sbase.SyncError(
+                    "capture archive cloud receipt could not be saved locally"
+                ) from exc
+            return accepted
         except sbase.SyncError as exc:
             last_error = exc
             if attempt:
                 raise
     raise last_error  # pragma: no cover - the bounded loop always raises/returns
+
+
+def _publish_cloud_capture_acknowledgement(
+        owner_cfg: dict | None,
+        capture_cfg: dict,
+        cap: dict,
+        association: CaptureArchiveAssociation | None) -> dict:
+    """Publish a verified current archive and atomically mark it imported."""
+
+    if (
+        not isinstance(association, CaptureArchiveAssociation)
+        or association.state is not CaptureArchiveState.CURRENT
+    ):
+        raise sbase.SyncError(
+            "a verified current library archive is required for acknowledgement"
+        )
+    return _publish_cloud_capture_state(
+        owner_cfg,
+        capture_cfg,
+        cap,
+        association,
+        mark_imported=True,
+    )
+
+
+def _publish_cloud_capture_association_only(
+        owner_cfg: dict | None,
+        capture_cfg: dict,
+        cap: dict,
+        association: CaptureArchiveAssociation | None) -> dict:
+    """Publish only an exact stale document, preserving remote status."""
+
+    if (
+        not isinstance(association, CaptureArchiveAssociation)
+        or association.state is not CaptureArchiveState.STALE
+    ):
+        raise sbase.SyncError(
+            "a verified stale library archive is required for association update"
+        )
+    return _publish_cloud_capture_state(
+        owner_cfg,
+        capture_cfg,
+        cap,
+        association,
+        mark_imported=False,
+    )
+
+
+def _pending_cloud_capture_associations(
+) -> list[tuple[CaptureArchiveAssociation, int]]:
+    """Return only still-authoritative exact stale publication intents."""
+
+    state = _capture_phone_sync_state()
+    shadows = state["cloud_association_shadows"]
+    pending = state["pending_cloud_associations"]
+    publications: list[tuple[CaptureArchiveAssociation, int]] = []
+    for capture_id in sorted(pending):
+        normalized = _capture_archive_id(capture_id)
+        raw = pending.get(capture_id)
+        if not normalized or normalized != capture_id or not isinstance(raw, dict):
+            continue
+        expected_revision = raw.get("expected_revision")
+        try:
+            association = CaptureArchiveAssociation.from_dict(
+                raw.get("association")
+            )
+        except (EngineValidationError, TypeError, ValueError):
+            continue
+        shadow = _cloud_capture_association_shadow(
+            shadows.get(capture_id),
+            capture_id,
+        )
+        if (
+            shadow is None
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision != shadow[1]
+            or association.capture_id != capture_id
+            or not _capture_association_is_exact_stale_transition(
+                shadow[0], association
+            )
+        ):
+            continue
+        publications.append((association, expected_revision))
+    return publications
+
+
+def _publish_pending_cloud_capture_associations(
+        owner_cfg: dict | None,
+        capture_cfg: dict | None,
+) -> dict:
+    """Flush the offline stale outbox only during a credentialed sync pass."""
+
+    publications = _pending_cloud_capture_associations()
+    if not owner_cfg or not capture_cfg:
+        return {
+            "pushed": 0,
+            "pending": len(publications),
+            "errors": [],
+            "skipped": "capture publication credentials unavailable",
+        }
+    pushed = 0
+    errors: list[str] = []
+    for association, expected_revision in publications:
+        cancelled = False
+        try:
+            # Serialize only the local reversion decision with stale marking.
+            # The lock is deliberately released before the network call below.
+            with _capture_ingest_lock(association.capture_id):
+                local = _capture_archive_association(
+                    association.capture_id
+                )
+                state = _capture_phone_sync_state()
+                shadow = _cloud_capture_association_shadow(
+                    state["cloud_association_shadows"].get(
+                        association.capture_id
+                    ),
+                    association.capture_id,
+                )
+                if shadow is not None and local == shadow[0]:
+                    # The catalogue truly returned to the exact
+                    # remotely-current snapshot. A stale transition waiting on
+                    # this same stripe runs after cancellation and requeues it.
+                    def cancel(candidate: dict) -> None:
+                        pending = candidate[
+                            "pending_cloud_associations"
+                        ].get(association.capture_id)
+                        if pending == {
+                            "association": association.as_dict(),
+                            "expected_revision": expected_revision,
+                        }:
+                            candidate[
+                                "pending_cloud_associations"
+                            ].pop(association.capture_id, None)
+
+                    _update_capture_phone_sync_state(cancel)
+                    cancelled = True
+        except Exception as exc:
+            errors.append(
+                f"capture {association.capture_id[:8]}: local inspection "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            continue
+        if cancelled:
+            continue
+        try:
+            # A reseal or later local change cannot make the old accepted cloud
+            # snapshot current again. The queued document remains the exact
+            # cryptographic invalidation of that shadow and must still publish.
+            _publish_cloud_capture_association_only(
+                owner_cfg,
+                capture_cfg,
+                {
+                    "id": association.capture_id,
+                    "lib_association_revision": expected_revision,
+                },
+                association,
+            )
+            pushed += 1
+        except Exception as exc:
+            errors.append(
+                f"capture {association.capture_id[:8]}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return {
+        "pushed": pushed,
+        "pending": len(_pending_cloud_capture_associations()),
+        "errors": errors,
+    }
 
 
 def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
@@ -20722,14 +21100,21 @@ def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
         }
         try:
             # Idempotently repair a lost acknowledgement from an earlier run.
-            _publish_cloud_capture_acknowledgement(
-                owner_cfg, capture_cfg, cap, association)
+            if association.state is CaptureArchiveState.CURRENT:
+                _publish_cloud_capture_acknowledgement(
+                    owner_cfg, capture_cfg, cap, association)
+            else:
+                _publish_cloud_capture_association_only(
+                    owner_cfg, capture_cfg, cap, association)
         except Exception as exc:
             result["sync_error"] = (
                 f"cloud acknowledgement failed: {type(exc).__name__}: {exc}"
             )[:500]
             return result
-        if delete_remote:                                # a lost mark left these behind
+        if (
+            delete_remote
+            and association.state is CaptureArchiveState.CURRENT
+        ):                                              # a lost mark left these behind
             try:
                 sbase.delete_photos(capture_cfg, photo_paths)
             except sbase.SyncError:
@@ -20771,8 +21156,15 @@ def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
     if new_id and on_persisted is not None:
         on_persisted(dict(result))
     try:
-        _publish_cloud_capture_acknowledgement(
-            owner_cfg, capture_cfg, cap, association)
+        if (
+            isinstance(association, CaptureArchiveAssociation)
+            and association.state is CaptureArchiveState.STALE
+        ):
+            _publish_cloud_capture_association_only(
+                owner_cfg, capture_cfg, cap, association)
+        else:
+            _publish_cloud_capture_acknowledgement(
+                owner_cfg, capture_cfg, cap, association)
     except Exception as exc:
         # The local book is already durable and must remain visible. Leave the
         # remote row pending for a later idempotent acknowledgement repair.
@@ -20782,7 +21174,12 @@ def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
         return result
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
-    if delete_remote and not errors:
+    if (
+        delete_remote
+        and not errors
+        and isinstance(association, CaptureArchiveAssociation)
+        and association.state is CaptureArchiveState.CURRENT
+    ):
         try:
             sbase.delete_photos(capture_cfg, photo_paths)
         except sbase.SyncError as exc:
@@ -22002,6 +22399,43 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                         failed=failed,
                         event=item_event,
                     )
+        association_sync: dict = {}
+        if owner_cfg and capture_cfg:
+            _cloudsync_set_stage(
+                "capture_associations",
+                "Publishing capture archive state",
+                total=0,
+                completed=0,
+                unit="operations",
+                indeterminate=True,
+            )
+            try:
+                association_sync = (
+                    _publish_pending_cloud_capture_associations(
+                        owner_cfg,
+                        capture_cfg,
+                    )
+                )
+                errors.extend(
+                    f"capture associations: {error}"
+                    for error in association_sync.get("errors", [])
+                )
+            except Exception as exc:
+                association_sync = {
+                    "pushed": 0,
+                    "pending": len(
+                        _pending_cloud_capture_associations()
+                    ),
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+                errors.append(f"capture associations: {exc}")
+        else:
+            association_sync = (
+                _publish_pending_cloud_capture_associations(
+                    owner_cfg,
+                    capture_cfg,
+                )
+            )
         pushed = metadata_pushed = 0
         review_sync: dict = {}
         stores: dict = {}
@@ -22091,6 +22525,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
                   "failed": failed, "captures_total": completed,
                   "books_pushed": pushed,
+                  "capture_associations": association_sync,
                   "capture_metadata_pushed": metadata_pushed,
                   "capture_reviews": review_sync,
                   "stores": stores,
