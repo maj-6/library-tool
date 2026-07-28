@@ -166,6 +166,46 @@ def test_durable_proposal_replay_does_not_pay_for_ocr_again_after_job_prune() ->
     assert repository.commits == 1
 
 
+def test_pruned_proposal_replay_uses_public_identity_without_leaking_private_pin() -> None:
+    executable = r"C:\Users\alice\private tools\tesseract.exe"
+    credential = "TOP-SECRET-PRUNED-PIN"
+    selection = CorrectionOcrProviderSelection(
+        "tesseract",
+        "local",
+        {"tesseract": executable, "credential": credential},
+    )
+
+    class PrivatePinnedProvider(Provider):
+        def select_provider(self):
+            return selection
+
+    jobs = JobManager(keep=0, checkpoint_interval=0)
+    repository = MemoryProposalRepository()
+    provider = PrivatePinnedProvider()
+    service = CorrectionOcrFollowupService(jobs, repository, provider)
+    request = _request()
+
+    first = service.run_ocr_followup(request, Hooks())
+    replay = service.run_ocr_followup(request, Hooks())
+    queried = service.find_ocr_followup(request)
+    receipt = jobs.command_receipt(
+        service.child_operation_id(request.operation_id),
+        service._command_sha256(request),
+        kind=CORRECTION_OCR_JOB_KIND,
+    )
+
+    assert replay == first
+    assert queried == first
+    assert provider.calls == 1
+    public = json.dumps(receipt.job.as_dict(), sort_keys=True)
+    assert executable not in public
+    assert credential not in public
+    assert receipt.job.input_revisions["provider"] == {
+        "provider_id": "tesseract",
+        "model": "local",
+    }
+
+
 def test_interrupted_child_reconciles_a_proposal_committed_before_crash() -> None:
     jobs = JobManager(checkpoint_interval=0)
     repository = MemoryProposalRepository()

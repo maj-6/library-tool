@@ -509,15 +509,16 @@ class CorrectionOcrFollowupService:
                 if stored is not None:
                     self._validate_stored(stored, request)
                     if existing is not None:
-                        provider_pin = existing.input_revisions.get("provider")
-                        if (
-                            provider_pin is not None
-                            and self._selection_from_pin(provider_pin)
-                            != stored.provider
-                        ):
+                        pin_failure = self._stored_provider_pin_failure(
+                            existing,
+                            stored,
+                        )
+                        if pin_failure is not None:
                             raise EngineError(
-                                "OCR proposal does not match the child provider pin",
-                                code="correction_ocr_provider_pin_mismatch",
+                                pin_failure.message,
+                                code=pin_failure.code,
+                                details=pin_failure.details,
+                                retryable=pin_failure.retryable,
                             )
                     return OcrFollowupOutcome(
                         OcrFollowupState.SUCCEEDED,
@@ -586,7 +587,7 @@ class CorrectionOcrFollowupService:
                 if stored is not None:
                     self._validate_stored(stored, request)
                     pin_failure = self._stored_provider_pin_failure(
-                        self._record_for(existing.job_id),
+                        existing,
                         stored,
                     )
                     if pin_failure is not None:
@@ -897,20 +898,65 @@ class CorrectionOcrFollowupService:
         }
         return inputs
 
-    @classmethod
     def _stored_provider_pin_failure(
-        cls,
-        record: Mapping[str, Any],
+        self,
+        job: JobView,
         stored: StoredCorrectionOcrProposal,
     ) -> JobFailure | None:
-        try:
-            private = JobManager.private_input_revisions(record)
-            pinned = cls._selection_from_pin(
-                private.get("provider")
+        record = self._jobs.records.get(job.job_id)
+        if record is not None:
+            private = self._jobs.private_input_revisions(record)
+            raw_pin = private.get("provider")
+            if raw_pin is None:
+                return JobFailure(
+                    "invalid_ocr_provider_pin",
+                    "OCR child provider pin is invalid",
+                    retryable=False,
+                )
+            try:
+                pinned = self._selection_from_pin(raw_pin)
+            except EngineError as exc:
+                return self._failure_from_engine_error(exc)
+            if pinned != stored.provider:
+                return JobFailure(
+                    "correction_ocr_provider_pin_mismatch",
+                    "OCR proposal does not match the child provider pin",
+                    retryable=False,
+                )
+            return None
+
+        # A pruned terminal receipt intentionally retains only the public
+        # provider identity. The integrity-checked proposal remains the
+        # authority for the exact private execution options; compare the
+        # observable identity without requiring those options to cross the
+        # job API boundary.
+        raw_public = job.input_revisions.get("provider")
+        if raw_public is None:
+            return None
+        if not isinstance(raw_public, Mapping) or set(raw_public) != {
+            "provider_id",
+            "model",
+        }:
+            return JobFailure(
+                "invalid_ocr_provider_pin",
+                "OCR child provider pin is invalid",
+                retryable=False,
             )
-        except EngineError as exc:
-            return cls._failure_from_engine_error(exc)
-        if pinned != stored.provider:
+        try:
+            identity = CorrectionOcrProviderSelection(
+                raw_public.get("provider_id"),
+                raw_public.get("model"),
+            )
+        except (TypeError, ValueError):
+            return JobFailure(
+                "invalid_ocr_provider_pin",
+                "OCR child provider pin is invalid",
+                retryable=False,
+            )
+        if (
+            identity.provider_id != stored.provider.provider_id
+            or identity.model != stored.provider.model
+        ):
             return JobFailure(
                 "correction_ocr_provider_pin_mismatch",
                 "OCR proposal does not match the child provider pin",
