@@ -21,6 +21,7 @@ from librarytool.adapters.filesystem.corrections_artifact_repository import (
 from librarytool.adapters.filesystem.recoverable_write_set import RecoverableWriteSet
 from librarytool.engine.errors import NotFoundError, RepositoryError
 from librarytool.engine.raster_artifacts import (
+    MAX_METADATA_ASSERTIONS,
     RasterArtifactKey,
     RasterArtifactProjectorPort,
     ResourceState,
@@ -1192,6 +1193,16 @@ def test_mistral_regions_and_figure_crops_project_without_rewriting(tmp_path):
     }
     assert figure_view.effective_caption is not None
     assert figure_view.effective_caption.text == "A medicinal plant"
+    assert figure_view.effective_metadata == {
+        "future": {"palette": "green"},
+    }
+    assert len(figure_view.metadata_assertions) == 1
+    metadata = figure_view.metadata_assertions[0]
+    assert metadata.name == "future"
+    assert metadata.value == {"palette": "green"}
+    assert metadata.origin.value == "imported"
+    assert metadata.provenance.origin == "ocr"
+    assert metadata.provenance.provider_id == "mistral"
     assert figure_view.extensions["extension_metadata"]["future"]["palette"] == "green"
     assert (
         figure_view.extensions["corrections_ui"]["annotation_frame"]
@@ -1237,6 +1248,34 @@ def test_mistral_regions_and_figure_crops_project_without_rewriting(tmp_path):
     ).revision != region.revision
     persisted = json.loads(layout_path.read_text(encoding="utf-8"))
     assert "rid" not in persisted["regions"]["primary"]["3"]["items"][1]
+
+
+def test_mistral_metadata_assertions_are_bounded_with_full_extensions_retained(
+    tmp_path,
+):
+    root = tmp_path / "library"
+    figure = _png_bytes((20, 130, 50), (41, 37))
+    image_dir = _entry(root) / "ocr" / "images"
+    image_dir.mkdir(parents=True)
+    (image_dir / "p3-fig.png").write_bytes(figure)
+    layout = _layout(_digest(figure))
+    extension_metadata = {
+        f"field_{index:03d}": index for index in range(129)
+    }
+    layout["images"]["p3-fig.png"]["ext"] = extension_metadata
+    _write_layout(root, layout)
+
+    raster = _repository(root, capture_ids={}).list_raster_artifacts(ITEM_ID)
+
+    assert len(raster) == 1
+    figure_view = raster[0]
+    assert len(figure_view.metadata_assertions) == (
+        MAX_METADATA_ASSERTIONS // 2
+    )
+    assert [
+        assertion.name for assertion in figure_view.metadata_assertions
+    ] == sorted(extension_metadata)[: MAX_METADATA_ASSERTIONS // 2]
+    assert figure_view.extensions["extension_metadata"] == extension_metadata
 
 
 def test_region_links_are_bounded_in_source_order(tmp_path):

@@ -16,15 +16,24 @@ from librarytool.engine.correction_projection import (
     CorrectionProjectionService,
     reconcile_correction_aggregates,
 )
-from librarytool.engine.corrections import CorrectionService
+from librarytool.engine.corrections import (
+    CorrectionAuditEvent,
+    CorrectionReviewSnapshot,
+    CorrectionService,
+)
 from librarytool.engine.correction_transforms import (
     CorrectionTransformCommand,
     CorrectionTransformService,
 )
 from librarytool.engine.jobs import JobManager
+from librarytool.engine.items import ItemView, WorkbenchState
 from librarytool.engine.raster_artifacts import (
+    ArtifactMetadataAssertion,
     ArtifactFreshness,
     ArtifactProvenance,
+    CaptionAssertion,
+    CaptionOrigin,
+    MetadataAssertionOrigin,
     RasterArtifactKey,
     RasterLineageRef,
     RasterArtifactView,
@@ -34,8 +43,12 @@ from librarytool.engine.raster_artifacts import (
     ResourceState,
 )
 from librarytool.engine.runtime import (
+    CORRECTION_CAPTION_SERVICE,
+    CORRECTION_METADATA_SERVICE,
+    CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    ITEM_QUERY_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
 )
@@ -46,6 +59,7 @@ from librarytool.engine.spatial_annotations import (
     SpatialAnnotationView,
     SpatialSourceRef,
 )
+import librarytool_http.corrections as corrections_http
 from librarytool_http.corrections import create_corrections_blueprint
 
 
@@ -152,15 +166,30 @@ class _SpatialProjector:
 
 
 class _Engine:
-    def __init__(self, raster, spatial, corrections=None, transforms=None):
+    def __init__(
+        self,
+        raster,
+        spatial,
+        corrections=None,
+        transforms=None,
+        items=None,
+    ):
         self.services = {
             RASTER_ARTIFACT_QUERY_SERVICE: raster,
             SPATIAL_ANNOTATION_QUERY_SERVICE: spatial,
         }
         if corrections is not None:
-            self.services[CORRECTION_SERVICE] = corrections
+            for key in (
+                CORRECTION_CAPTION_SERVICE,
+                CORRECTION_METADATA_SERVICE,
+                CORRECTION_REVIEW_SERVICE,
+                CORRECTION_SERVICE,
+            ):
+                self.services[key] = corrections
         if transforms is not None:
             self.services[CORRECTION_TRANSFORM_SERVICE] = transforms
+        if items is not None:
+            self.services[ITEM_QUERY_SERVICE] = items
 
     def get_service(self, key):
         return self.services.get(key)
@@ -192,7 +221,13 @@ class _Resolver:
         )
 
 
-def _app(engine, resolver=None, transform_submitter=None):
+def _app(
+    engine,
+    resolver=None,
+    transform_submitter=None,
+    actor_id_for_request=None,
+    workspace_id_for_request=None,
+):
     app = Flask(__name__)
     app.register_blueprint(
         create_corrections_blueprint(
@@ -200,6 +235,8 @@ def _app(engine, resolver=None, transform_submitter=None):
             raster_resource_resolver_for_request=(
                 None if resolver is None else lambda: resolver
             ),
+            correction_actor_id_for_request=actor_id_for_request,
+            correction_workspace_id_for_request=workspace_id_for_request,
             correction_transform_submitter=transform_submitter,
         )
     )
@@ -236,6 +273,21 @@ def _mutation_app(
 
 
 def _projected_app(tmp_path, raster_rows, spatial_rows):
+    app, _repository = _projected_harness(
+        tmp_path,
+        raster_rows,
+        spatial_rows,
+    )
+    return app
+
+
+def _projected_harness(
+    tmp_path,
+    raster_rows,
+    spatial_rows,
+    *,
+    actor_id_for_request=None,
+):
     rasters = _RasterProjector(raster_rows)
     spatial = _SpatialProjector(spatial_rows)
     aggregate = CorrectionAggregateProjector(rasters, spatial)
@@ -252,7 +304,87 @@ def _projected_app(tmp_path, raster_rows, spatial_rows):
         repository,
     )
     corrections = CorrectionService(repository)
-    return _app(_Engine(projected, projected, corrections))
+    return (
+        _app(
+            _Engine(projected, projected, corrections),
+            actor_id_for_request=actor_id_for_request,
+        ),
+        repository,
+    )
+
+
+class _ReviewService:
+    def __init__(self, review):
+        self.review = review
+        self.calls = []
+
+    def get_review(self, item_id):
+        self.calls.append(item_id)
+        return self.review
+
+
+class _ItemService:
+    def __init__(self, rows):
+        self.rows = tuple(rows)
+
+    def list_items(self):
+        return self.rows
+
+
+def _book_item(
+    item_id: str = "book-1",
+    title: str = "Book One",
+) -> ItemView:
+    return ItemView(
+        item_id=item_id,
+        revision=f"{item_id}-r1",
+        record_revision=f"{item_id}-record-r1",
+        kind="book",
+        title=title,
+        metadata={},
+        representations=(),
+        artifacts=(),
+        workbench_state=WorkbenchState(
+            item_id=item_id,
+            revision=f"{item_id}-workbench-r1",
+            readiness={},
+        ),
+    )
+
+
+def _review_with_history(count, revision):
+    state = "clear"
+    history = []
+    reason = "Caption needs checking"
+    for index in range(count):
+        if state == "clear":
+            action = "attention.mark"
+            after = "needs_attention"
+        elif state == "needs_attention":
+            action = "attention.resolve"
+            after = "resolved"
+        else:
+            action = "attention.reopen"
+            after = "needs_attention"
+        history.append(
+            CorrectionAuditEvent(
+                operation_id=f"review-audit-{index:04d}",
+                action=action,
+                actor_id="curator-1",
+                occurred_at=f"2026-07-23T12:{index:02d}:00+00:00",
+                before_state=state,
+                after_state=after,
+                reason=reason,
+                comment=f"Audit event {index}",
+            )
+        )
+        state = after
+    return CorrectionReviewSnapshot(
+        revision=revision,
+        state=state,
+        reason="" if state == "clear" else reason,
+        history=tuple(history),
+    )
 
 
 def test_raster_list_is_versioned_filterable_and_revision_paged():
@@ -518,6 +650,757 @@ def test_category_mutation_replays_and_converges_through_query_projection(
     assert stale.get_json()["code"] == "artifact_revision_conflict"
 
 
+def test_manual_caption_transport_replays_and_preserves_machine_evidence(
+    tmp_path,
+):
+    machine = CaptionAssertion(
+        "Machine caption",
+        CaptionOrigin.MACHINE,
+        "caption-machine-r1",
+        language="en",
+        confidence=0.81,
+        provenance=ArtifactProvenance(origin="mistral"),
+    )
+    client = _projected_app(
+        tmp_path,
+        (
+            replace(_raster("image-1"), caption_assertions=(machine,)),
+            _raster("figure-1", kind="extracted-figure"),
+        ),
+        (replace(_annotation("region-1"), linked_artifact_ids=("figure-1",)),),
+    ).test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1/caption"
+    headers = {
+        "Idempotency-Key": "caption-set-op",
+        "If-Artifact-Match": '"artifact-image-1-r1"',
+    }
+
+    first = client.put(
+        endpoint,
+        json={"text": "Human correction", "language": "en"},
+        headers=headers,
+    )
+    replay = client.put(
+        endpoint,
+        json={"text": "Human correction", "language": "en"},
+        headers=headers,
+    )
+
+    assert first.status_code == replay.status_code == 200
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["receipt"] == first.get_json()["receipt"]
+    receipt = first.get_json()["receipt"]
+    assert receipt["action"] == "caption.set"
+    assert receipt["inverse"] == {
+        "action": "caption.clear",
+        "expected_aggregate_revision": receipt["after_aggregate_revision"],
+        "expected_targets": receipt["targets"],
+        "payload": {"artifact_id": "image-1"},
+    }
+
+    detail = client.get(
+        "/api/v1/items/book-1/raster-artifacts/image-1"
+    ).get_json()["artifact"]
+    assert {
+        (value["origin"], value["text"])
+        for value in detail["caption_assertions"]
+    } == {
+        ("manual", "Human correction"),
+        ("machine", "Machine caption"),
+    }
+    assert detail["effective_caption"]["origin"] == "manual"
+
+    cleared = client.delete(
+        endpoint,
+        json={},
+        headers={
+            "Idempotency-Key": "caption-clear-op",
+            "If-Artifact-Match": f'"{detail["revision"]}"',
+        },
+    )
+    assert cleared.status_code == 200
+    assert cleared.get_json()["receipt"]["inverse"]["action"] == "caption.set"
+    refreshed = client.get(
+        "/api/v1/items/book-1/raster-artifacts/image-1"
+    ).get_json()["artifact"]
+    assert [(value["origin"], value["text"]) for value in refreshed[
+        "caption_assertions"
+    ]] == [("machine", "Machine caption")]
+    assert refreshed["effective_caption"]["origin"] == "machine"
+
+
+def test_manual_caption_transport_rejects_overlong_valid_language_tag(tmp_path):
+    client = _projected_app(
+        tmp_path,
+        (
+            _raster("image-1"),
+            _raster("figure-1", kind="extracted-figure"),
+        ),
+        (replace(_annotation("region-1"), linked_artifact_ids=("figure-1",)),),
+    ).test_client()
+    language = "en-" + "-".join(["abcdef"] * 10)
+
+    response = client.put(
+        "/api/v1/items/book-1/raster-artifacts/image-1/caption",
+        json={"text": "Human correction", "language": language},
+        headers={
+            "Idempotency-Key": "caption-language-too-long",
+            "If-Artifact-Match": '"artifact-image-1-r1"',
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_caption_assertion"
+
+
+def test_metadata_transport_is_conditional_replay_safe_and_reversible(tmp_path):
+    machine = ArtifactMetadataAssertion(
+        "plate_number",
+        3,
+        MetadataAssertionOrigin.MACHINE,
+        "metadata-machine-r1",
+        provenance=ArtifactProvenance(
+            origin="ocr",
+            provider_id="mistral",
+        ),
+    )
+    rows = (
+        replace(_raster("image-1"), metadata_assertions=(machine,)),
+        _raster("figure-1", kind="extracted-figure"),
+    )
+    spatial = (
+        replace(_annotation("region-1"), linked_artifact_ids=("figure-1",)),
+    )
+    app, _repository = _projected_harness(tmp_path, rows, spatial)
+    first_client = app.test_client()
+    second_client = app.test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1/metadata"
+    artifact_endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    first_view = first_client.get(artifact_endpoint).get_json()["artifact"]
+    second_view = second_client.get(artifact_endpoint).get_json()["artifact"]
+    assert first_view["revision"] == second_view["revision"]
+    assert first_view["effective_metadata"] == {"plate_number": 3}
+    headers = {
+        "Idempotency-Key": "metadata-assert-op",
+        "If-Artifact-Match": f'"{first_view["revision"]}"',
+    }
+    document = {
+        "assertions": {"caption_source": "manual", "plate_number": 7},
+        "clear_names": [],
+    }
+
+    first = first_client.patch(endpoint, json=document, headers=headers)
+    replay = first_client.patch(endpoint, json=document, headers=headers)
+
+    assert first.status_code == replay.status_code == 200
+    assert replay.get_json()["replayed"] is True
+    receipt = first.get_json()["receipt"]
+    assert receipt["action"] == "metadata.assert"
+    assert receipt["inverse"]["payload"] == {
+        "artifact_id": "image-1",
+        "restore_assertions": [],
+        "clear_names": ["caption_source", "plate_number"],
+    }
+    converged = second_client.get(artifact_endpoint).get_json()["artifact"]
+    assert {
+        (value["name"], value["origin"], value["value"])
+        for value in converged["metadata_assertions"]
+    } == {
+        ("caption_source", "manual", "manual"),
+        ("plate_number", "machine", 3),
+        ("plate_number", "manual", 7),
+    }
+    assert converged["effective_metadata"] == {
+        "caption_source": "manual",
+        "plate_number": 7,
+    }
+
+    stale = second_client.patch(
+        endpoint,
+        json={"assertions": {"plate_number": 8}, "clear_names": []},
+        headers={
+            "Idempotency-Key": "metadata-stale-op",
+            "If-Artifact-Match": f'"{second_view["revision"]}"',
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "artifact_revision_conflict"
+
+    current_revision = receipt["targets"][0]["after_revision"]
+    cleared = second_client.patch(
+        endpoint,
+        json={"assertions": {}, "clear_names": ["plate_number"]},
+        headers={
+            "Idempotency-Key": "metadata-clear-op",
+            "If-Artifact-Match": f'"{current_revision}"',
+        },
+    )
+    assert cleared.status_code == 200
+    restored = cleared.get_json()["receipt"]["inverse"]["payload"][
+        "restore_assertions"
+    ]
+    assert [(value["name"], value["value"]) for value in restored] == [
+        ("plate_number", 7)
+    ]
+    revealed = first_client.get(artifact_endpoint).get_json()["artifact"]
+    assert revealed["effective_metadata"] == {
+        "caption_source": "manual",
+        "plate_number": 3,
+    }
+    assert {
+        (value["origin"], value["value"])
+        for value in revealed["metadata_assertions"]
+        if value["name"] == "plate_number"
+    } == {("machine", 3)}
+
+
+def test_metadata_capacity_is_explicit_and_reserves_imported_evidence(tmp_path):
+    imported = tuple(
+        ArtifactMetadataAssertion(
+            f"imported_{index:03d}",
+            index,
+            MetadataAssertionOrigin.IMPORTED,
+            f"metadata-imported-{index}",
+            provenance=ArtifactProvenance(
+                origin="ocr",
+                provider_id="mistral",
+            ),
+        )
+        for index in range(64)
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (replace(_raster("image-1"), metadata_assertions=imported),),
+        (),
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    revision = client.get(endpoint).get_json()["artifact"]["revision"]
+    assertions = {
+        f"manual_{index:03d}": index for index in range(64)
+    }
+
+    accepted = client.patch(
+        f"{endpoint}/metadata",
+        json={"assertions": assertions, "clear_names": []},
+        headers={
+            "Idempotency-Key": "metadata-capacity-accepted",
+            "If-Artifact-Match": f'"{revision}"',
+        },
+    )
+
+    assert accepted.status_code == 200
+    projected = client.get(endpoint).get_json()["artifact"]
+    assert len(projected["metadata_assertions"]) == 128
+    assert projected["effective_metadata"]["manual_063"] == 63
+
+
+def test_metadata_capacity_conflict_is_typed_before_repository_stage(tmp_path):
+    imported = tuple(
+        ArtifactMetadataAssertion(
+            f"imported_{index:03d}",
+            index,
+            MetadataAssertionOrigin.IMPORTED,
+            f"metadata-imported-{index}",
+        )
+        for index in range(128)
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (replace(_raster("image-1"), metadata_assertions=imported),),
+        (),
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    revision = client.get(endpoint).get_json()["artifact"]["revision"]
+
+    rejected = client.patch(
+        f"{endpoint}/metadata",
+        json={"assertions": {"manual_override": True}, "clear_names": []},
+        headers={
+            "Idempotency-Key": "metadata-capacity-rejected",
+            "If-Artifact-Match": f'"{revision}"',
+        },
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.get_json()["code"] == (
+        "metadata_assertion_capacity_conflict"
+    )
+    assert rejected.get_json()["details"] == {
+        "artifact_id": "image-1",
+        "capacity": 128,
+        "required": 129,
+    }
+
+
+def test_metadata_effective_value_budget_conflict_is_typed_and_non_mutating(
+    tmp_path,
+):
+    large_value = ["x" * 8192, "y" * 8192]
+    imported = ArtifactMetadataAssertion(
+        "imported_large",
+        large_value,
+        MetadataAssertionOrigin.IMPORTED,
+        "metadata-imported-large",
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (
+            replace(
+                _raster("image-1"),
+                metadata_assertions=(imported,),
+            ),
+        ),
+        (),
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-1"
+    before = client.get(endpoint).get_json()["artifact"]
+
+    rejected = client.patch(
+        f"{endpoint}/metadata",
+        json={"assertions": {"manual_large": large_value}, "clear_names": []},
+        headers={
+            "Idempotency-Key": "metadata-effective-budget-rejected",
+            "If-Artifact-Match": f'"{before["revision"]}"',
+        },
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.get_json()["code"] == (
+        "metadata_assertion_capacity_conflict"
+    )
+    assert rejected.get_json()["details"] == {
+        "artifact_id": "image-1",
+        "capacity": 128,
+        "required": 2,
+        "cause_code": "invalid_artifact_extensions",
+    }
+    after = client.get(endpoint).get_json()["artifact"]
+    assert after == before
+
+
+def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
+    rows = (
+        _raster("image-1"),
+        _raster("figure-1", kind="extracted-figure"),
+    )
+    spatial = (
+        replace(_annotation("region-1"), linked_artifact_ids=("figure-1",)),
+    )
+    app, _repository = _projected_harness(tmp_path, rows, spatial)
+    first_client = app.test_client()
+    second_client = app.test_client()
+    endpoint = "/api/v1/items/book-1/corrections/review"
+    initial = first_client.get(endpoint)
+    initial_body = initial.get_json()
+    initial_review = initial_body["review"]
+    assert initial.status_code == 200
+    assert initial.headers["ETag"] == f'"{initial_review["revision"]}"'
+    assert initial_body == {
+        "ok": True,
+        "schema": "librarytool.correction-review/1",
+        "item_id": "book-1",
+        "review": {
+            "revision": initial_review["revision"],
+            "state": "clear",
+            "reason": "",
+            "history_count": 0,
+            "history_tail": [],
+        },
+    }
+    assert second_client.get(
+        endpoint,
+        headers={"If-None-Match": initial.headers["ETag"]},
+    ).status_code == 304
+
+    mark_headers = {
+        "Idempotency-Key": "review-mark-op",
+        "If-Review-Match": f'"{initial_review["revision"]}"',
+    }
+    marked = first_client.put(
+        f"{endpoint}/attention",
+        json={
+            "reason": "Caption needs checking",
+            "comment": "Found during QA",
+        },
+        headers=mark_headers,
+    )
+    replay = first_client.put(
+        f"{endpoint}/attention",
+        json={
+            "reason": "Caption needs checking",
+            "comment": "Found during QA",
+        },
+        headers=mark_headers,
+    )
+    assert marked.status_code == replay.status_code == 200
+    assert replay.get_json()["replayed"] is True
+    mark_receipt = marked.get_json()["receipt"]
+    assert mark_receipt["inverse"]["action"] == "attention.clear"
+    assert mark_receipt["targets"][0]["kind"] == "review"
+
+    stale_mark = second_client.put(
+        f"{endpoint}/attention",
+        json={
+            "reason": "A stale second opinion",
+            "comment": "",
+        },
+        headers={
+            "Idempotency-Key": "review-stale-mark-op",
+            "If-Review-Match": f'"{initial_review["revision"]}"',
+        },
+    )
+    assert stale_mark.status_code == 409
+    assert stale_mark.get_json()["code"] == "review_revision_conflict"
+
+    observed_mark = second_client.get(endpoint).get_json()["review"]
+    assert observed_mark["revision"] == mark_receipt["targets"][0]["after_revision"]
+    assert observed_mark["state"] == "needs_attention"
+    assert observed_mark["history_count"] == 1
+    assert [event["action"] for event in observed_mark["history_tail"]] == [
+        "attention.mark"
+    ]
+
+    resolved = second_client.post(
+        f"{endpoint}/resolve",
+        json={"comment": "Caption corrected"},
+        headers={
+            "Idempotency-Key": "review-resolve-op",
+            "If-Review-Match": (
+                f'"{observed_mark["revision"]}"'
+            ),
+        },
+    )
+    assert resolved.status_code == 200
+    resolve_receipt = resolved.get_json()["receipt"]
+    assert resolve_receipt["inverse"]["action"] == "attention.reopen"
+
+    stale_resolve = first_client.post(
+        f"{endpoint}/resolve",
+        json={"comment": ""},
+        headers={
+            "Idempotency-Key": "review-stale-resolve-op",
+            "If-Review-Match": f'"{observed_mark["revision"]}"',
+        },
+    )
+    assert stale_resolve.status_code == 409
+    assert stale_resolve.get_json()["code"] == "review_revision_conflict"
+
+    observed_resolution = first_client.get(endpoint).get_json()["review"]
+    assert observed_resolution["state"] == "resolved"
+    reopened = first_client.post(
+        f"{endpoint}/reopen",
+        json={"comment": "Second review requested"},
+        headers={
+            "Idempotency-Key": "review-reopen-op",
+            "If-Review-Match": (
+                f'"{observed_resolution["revision"]}"'
+            ),
+        },
+    )
+    assert reopened.status_code == 200
+    assert reopened.get_json()["receipt"]["inverse"]["action"] == (
+        "attention.resolve"
+    )
+
+    converged = second_client.get(endpoint).get_json()["review"]
+    assert converged["state"] == "needs_attention"
+    assert converged["reason"] == "Caption needs checking"
+    assert converged["history_count"] == 3
+    assert [event["action"] for event in converged["history_tail"]] == [
+        "attention.mark",
+        "attention.resolve",
+        "attention.reopen",
+    ]
+    assert {
+        event["actor_id"] for event in converged["history_tail"]
+    } == {"local-desktop"}
+    history_endpoint = f"{endpoint}/history"
+    first_page = second_client.get(
+        history_endpoint,
+        query_string={"limit": 2},
+        headers={"If-Review-Match": f'"{converged["revision"]}"'},
+    )
+    first_history = first_page.get_json()
+    assert first_page.status_code == 200
+    assert first_page.headers["ETag"] == f'"{converged["revision"]}"'
+    assert first_history == {
+        "ok": True,
+        "schema": "librarytool.correction-review-history/1",
+        "item_id": "book-1",
+        "review_revision": converged["revision"],
+        "review_state": "needs_attention",
+        "events": first_history["events"],
+        "next_cursor": first_history["next_cursor"],
+        "total": 3,
+    }
+    assert [event["action"] for event in first_history["events"]] == [
+        "attention.mark",
+        "attention.resolve",
+    ]
+    assert first_history["next_cursor"]
+    final_page = first_client.get(
+        history_endpoint,
+        query_string={
+            "limit": 2,
+            "cursor": first_history["next_cursor"],
+        },
+        headers={"If-Review-Match": f'"{converged["revision"]}"'},
+    )
+    assert final_page.status_code == 200
+    assert [event["action"] for event in final_page.get_json()["events"]] == [
+        "attention.reopen"
+    ]
+    assert final_page.get_json()["next_cursor"] is None
+    assert first_client.get(history_endpoint).status_code == 428
+    stale_history = first_client.get(
+        history_endpoint,
+        headers={"If-Review-Match": f'"{initial_review["revision"]}"'},
+    )
+    assert stale_history.status_code == 409
+    assert stale_history.get_json()["code"] == "review_revision_conflict"
+
+    stale = second_client.post(
+        f"{endpoint}/resolve",
+        json={"comment": ""},
+        headers={
+            "Idempotency-Key": "review-stale-op",
+            "If-Review-Match": f'"{initial_review["revision"]}"',
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "review_revision_conflict"
+
+
+def test_review_actor_is_server_owned_and_client_spoofing_is_rejected(
+    tmp_path,
+):
+    app, _repository = _projected_harness(
+        tmp_path,
+        (_raster("image-1"),),
+        (),
+        actor_id_for_request=lambda: "trusted-user-1",
+    )
+    client = app.test_client()
+    endpoint = "/api/v1/items/book-1/corrections/review"
+    initial = client.get(endpoint).get_json()["review"]
+    headers = {
+        "Idempotency-Key": "review-server-actor-op",
+        "If-Review-Match": f'"{initial["revision"]}"',
+    }
+
+    spoofed = client.put(
+        f"{endpoint}/attention",
+        json={
+            "reason": "Check the title leaf",
+            "actor_id": "spoofed-client",
+            "comment": "",
+        },
+        headers=headers,
+    )
+
+    assert spoofed.status_code == 400
+    assert spoofed.get_json()["code"] == "invalid_correction_mutation_envelope"
+    assert client.get(endpoint).get_json()["review"]["state"] == "clear"
+
+    marked = client.put(
+        f"{endpoint}/attention",
+        json={"reason": "Check the title leaf", "comment": ""},
+        headers=headers,
+    )
+    observed = client.get(endpoint).get_json()["review"]
+
+    assert marked.status_code == 200
+    assert observed["history_tail"][-1]["actor_id"] == "trusted-user-1"
+
+
+def test_corrections_index_rejects_ambiguous_or_inactive_workspace_scope():
+    app = _app(
+        _Engine(_RasterProjector(()), _SpatialProjector(())),
+        workspace_id_for_request=lambda: "workspace-authority",
+    )
+    client = app.test_client()
+
+    missing = client.get("/api/v1/corrections/index")
+    repeated = client.get(
+        "/api/v1/corrections/index"
+        "?workspace_id=workspace-authority&workspace_id=workspace-other"
+    )
+    mismatched = client.get(
+        "/api/v1/corrections/index?workspace_id=workspace-other"
+    )
+
+    assert missing.status_code == 400
+    assert missing.get_json()["code"] == "invalid_corrections_workspace"
+    assert repeated.status_code == 400
+    assert repeated.get_json()["code"] == "invalid_corrections_workspace"
+    assert mismatched.status_code == 409
+    assert mismatched.get_json()["code"] == "corrections_workspace_mismatch"
+
+
+def test_corrections_index_enforces_aggregate_capture_budget(monkeypatch):
+    rasters = tuple(
+        replace(
+            _raster(f"image-{index}"),
+            key=RasterArtifactKey(
+                f"book-{index}",
+                f"image-{index}",
+            ),
+            extensions={"capture_order": index},
+        )
+        for index in range(1, 3)
+    )
+    engine = _Engine(
+        _RasterProjector(rasters),
+        _SpatialProjector(()),
+        _ReviewService(CorrectionReviewSnapshot("review-r1")),
+        items=_ItemService(
+            (
+                _book_item("book-1", "Book One"),
+                _book_item("book-2", "Book Two"),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        corrections_http,
+        "CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT",
+        1,
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["code"] == (
+        "invalid_corrections_index_projection"
+    )
+    assert response.get_json()["details"] == {
+        "item_id": "book-2",
+        "maximum_captures": 1,
+    }
+
+
+def test_corrections_index_enforces_serialized_size_budget(monkeypatch):
+    raster = replace(
+        _raster("image-1"),
+        extensions={"capture_order": 0},
+    )
+    engine = _Engine(
+        _RasterProjector((raster,)),
+        _SpatialProjector(()),
+        _ReviewService(CorrectionReviewSnapshot("review-r1")),
+        items=_ItemService((_book_item(),)),
+    )
+    monkeypatch.setattr(
+        corrections_http,
+        "CORRECTIONS_INDEX_MAX_BYTES",
+        128,
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["code"] == (
+        "invalid_corrections_index_projection"
+    )
+    assert response.get_json()["details"] == {
+        "item_id": "book-1",
+        "maximum_bytes": 128,
+    }
+
+
+def test_review_snapshot_bounds_tail_and_history_pages_pin_exact_revision():
+    first_review = _review_with_history(25, "review-long-r1")
+    service = _ReviewService(first_review)
+    client = _app(
+        _Engine(
+            _RasterProjector(()),
+            _SpatialProjector(()),
+            service,
+        )
+    ).test_client()
+    endpoint = "/api/v1/items/book-1/corrections/review"
+
+    summary_response = client.get(endpoint)
+    summary = summary_response.get_json()["review"]
+    assert summary_response.status_code == 200
+    assert summary["revision"] == first_review.revision
+    assert summary["history_count"] == 25
+    assert len(summary["history_tail"]) == 8
+    assert [
+        event["operation_id"] for event in summary["history_tail"]
+    ] == [
+        event.operation_id for event in first_review.history[-8:]
+    ]
+    assert "history" not in summary
+
+    history_endpoint = f"{endpoint}/history"
+    cursor = None
+    first_cursor = None
+    events = []
+    while True:
+        response = client.get(
+            history_endpoint,
+            query_string={
+                "limit": 7,
+                **({"cursor": cursor} if cursor else {}),
+            },
+            headers={
+                "If-Review-Match": f'"{first_review.revision}"',
+            },
+        )
+        assert response.status_code == 200
+        page = response.get_json()
+        assert page["review_revision"] == first_review.revision
+        assert page["review_state"] == first_review.state.value
+        assert page["total"] == 25
+        assert len(page["events"]) <= 7
+        events.extend(page["events"])
+        cursor = page["next_cursor"]
+        if first_cursor is None:
+            first_cursor = cursor
+        if cursor is None:
+            break
+    assert [event["operation_id"] for event in events] == [
+        event.operation_id for event in first_review.history
+    ]
+
+    oversized = client.get(
+        history_endpoint,
+        query_string={"limit": 101},
+        headers={"If-Review-Match": f'"{first_review.revision}"'},
+    )
+    assert oversized.status_code == 400
+    assert oversized.get_json()["code"] == "invalid_corrections_page_limit"
+
+    second_review = _review_with_history(26, "review-long-r2")
+    service.review = second_review
+    changed = client.get(
+        history_endpoint,
+        query_string={"limit": 7, "cursor": first_cursor},
+        headers={"If-Review-Match": f'"{first_review.revision}"'},
+    )
+    assert changed.status_code == 409
+    assert changed.get_json()["code"] == "review_revision_conflict"
+    assert changed.get_json()["details"] == {
+        "actual_revision": second_review.revision,
+        "expected_revision": first_review.revision,
+    }
+
+    mixed_cursor = client.get(
+        history_endpoint,
+        query_string={"limit": 7, "cursor": first_cursor},
+        headers={"If-Review-Match": f'"{second_review.revision}"'},
+    )
+    assert mixed_cursor.status_code == 409
+    assert mixed_cursor.get_json()["code"] == "review_revision_conflict"
+
+
 def test_inherited_category_changes_detail_etag_without_changing_child_cas(
     tmp_path,
 ):
@@ -585,8 +1468,14 @@ def test_linked_region_role_mutates_annotation_and_artifact_atomically(
     annotation = client.get(
         "/api/v1/items/book-1/spatial-annotations/region-1"
     ).get_json()["annotation"]
+    artifact = client.get(
+        "/api/v1/items/book-1/raster-artifacts/figure-1"
+    ).get_json()["artifact"]
     assert annotation["effective_role"] == "figure"
     assert annotation["revision"] == receipt["targets"][0]["after_revision"]
+    assert artifact["effective_role"] == "figure"
+    assert artifact["role_assignments"][0]["origin"] == "manual"
+    assert artifact["revision"] == receipt["targets"][1]["after_revision"]
 
 
 def test_introduced_figure_link_survives_refresh_and_clears_atomically(
@@ -614,6 +1503,7 @@ def test_introduced_figure_link_survives_refresh_and_clears_atomically(
         "artifact"
     ]
     assert annotation["linked_artifact_ids"] == ["figure-1"]
+    assert figure["effective_role"] == "figure"
     clear = client.delete(
         "/api/v1/items/book-1/spatial-annotations/region-1/role",
         json={"linked_artifact_id": "figure-1"},
@@ -637,6 +1527,11 @@ def test_introduced_figure_link_survives_refresh_and_clears_atomically(
     ).get_json()["annotation"]
     assert refreshed["effective_role"] == ""
     assert refreshed["linked_artifact_ids"] == ["figure-1"]
+    refreshed_figure = client.get(
+        "/api/v1/items/book-1/raster-artifacts/figure-1"
+    ).get_json()["artifact"]
+    assert refreshed_figure["effective_role"] == ""
+    assert refreshed_figure["role_assignments"] == []
 
 
 def test_ambiguous_region_links_are_readable_but_not_mutable(tmp_path):

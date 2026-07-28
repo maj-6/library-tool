@@ -30,6 +30,8 @@ from .errors import (
     ValidationError,
 )
 from .raster_artifacts import (
+    MAX_METADATA_ASSERTIONS,
+    ArtifactMetadataAssertion,
     ArtifactProvenance,
     AssignmentOrigin,
     CaptionAssertion,
@@ -37,6 +39,7 @@ from .raster_artifacts import (
     CategoryAssignment,
     IMAGE_CATEGORIES,
     JsonMapping,
+    MetadataAssertionOrigin,
     RasterArtifactKey,
     _EMPTY_MAPPING,
     _extensions,
@@ -96,8 +99,8 @@ _ACTIONS = frozenset(
     }
 )
 _INVERSE_ACTIONS = _ACTIONS | {"attention.clear"}
+_QUERY_OPERATION_ID = "correction-review-query"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-MAX_METADATA_ASSERTIONS = 128
 MAX_AUDIT_EVENTS = 100_000
 
 
@@ -129,12 +132,6 @@ def _command_strings(value: Any, *field_names: str) -> None:
 
 def _sequence(value: Any, item_type: type, field_name: str, maximum: int) -> tuple:
     return _typed_values(value, item_type, field_name, maximum=maximum)
-
-
-class MetadataAssertionOrigin(str, Enum):
-    MANUAL = "manual"
-    MACHINE = "machine"
-    IMPORTED = "imported"
 
 
 class ReviewState(str, Enum):
@@ -198,40 +195,6 @@ class EffectiveImageCategory:
             "origin": self.origin.value,
             "assignment_revision": self.assignment_revision,
             "inherited_from_artifact_id": self.inherited_from_artifact_id,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactMetadataAssertion:
-    name: str
-    value: Any
-    origin: MetadataAssertionOrigin | str
-    revision: str
-    provenance: ArtifactProvenance = field(default_factory=ArtifactProvenance)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _identifier(self.name, "metadata.name"))
-        try:
-            origin = MetadataAssertionOrigin(self.origin)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(
-                "metadata assertion origin is invalid",
-                code="invalid_metadata_assertion",
-            ) from exc
-        object.__setattr__(self, "origin", origin)
-        object.__setattr__(self, "revision", _revision(self.revision, "revision"))
-        frozen = _extensions({"value": self.value}, "metadata.assertion")
-        object.__setattr__(self, "value", frozen["value"])
-        if not isinstance(self.provenance, ArtifactProvenance):
-            raise TypeError("provenance must be ArtifactProvenance")
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "value": _thaw(self.value),
-            "origin": self.origin.value,
-            "revision": self.revision,
-            "provenance": self.provenance.as_dict(),
         }
 
 
@@ -319,6 +282,7 @@ class ArtifactCorrectionSnapshot:
                 code="invalid_metadata_assertion",
             )
         object.__setattr__(self, "metadata_assertions", metadata)
+        _extensions(self.effective_metadata(), "effective_metadata")
         object.__setattr__(self, "extensions", _extensions(self.extensions))
 
     def category(self, origin: AssignmentOrigin) -> CategoryAssignment | None:
@@ -1250,10 +1214,27 @@ class CorrectionRepositoryPort(Protocol):
 
 
 class CorrectionService:
-    """CAS-protected, replay-safe correction mutations."""
+    """Correction review reads and CAS-protected, replay-safe mutations."""
 
     def __init__(self, repository: CorrectionRepositoryPort) -> None:
         self._repository = repository
+
+    def get_review(self, item_id: str) -> CorrectionReviewSnapshot:
+        item = self._item_id(item_id)
+        try:
+            with self._repository.unit_of_work(
+                operation_id=_QUERY_OPERATION_ID,
+            ) as unit:
+                return self._current(unit, item).review
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the correction repository failed",
+                code="correction_repository_unavailable",
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
 
     def assign_category(
         self,
@@ -1785,6 +1766,66 @@ class CorrectionService:
                     code="manual_metadata_not_found",
                     details={"artifact_id": artifact.key.artifact_id},
                 )
+            changed_names = set(command.assertions) | set(command.clear_names)
+            retained = sum(
+                1
+                for value in artifact.metadata_assertions
+                if (
+                    value.origin is not MetadataAssertionOrigin.MANUAL
+                    or value.name not in changed_names
+                )
+            )
+            required = retained + len(command.assertions)
+            if required > MAX_METADATA_ASSERTIONS:
+                raise ConflictError(
+                    "the artifact has insufficient metadata assertion capacity",
+                    code="metadata_assertion_capacity_conflict",
+                    details={
+                        "artifact_id": artifact.key.artifact_id,
+                        "capacity": MAX_METADATA_ASSERTIONS,
+                        "required": required,
+                    },
+                )
+            current_by_identity = {
+                (value.name, value.origin): value.value
+                for value in artifact.metadata_assertions
+                if not (
+                    value.origin is MetadataAssertionOrigin.MANUAL
+                    and value.name in changed_names
+                )
+            }
+            current_by_identity.update(
+                {
+                    (name, MetadataAssertionOrigin.MANUAL): value
+                    for name, value in command.assertions.items()
+                }
+            )
+            effective_metadata = {}
+            for name in sorted(
+                {identity[0] for identity in current_by_identity}
+            ):
+                for origin in (
+                    MetadataAssertionOrigin.MANUAL,
+                    MetadataAssertionOrigin.IMPORTED,
+                    MetadataAssertionOrigin.MACHINE,
+                ):
+                    identity = (name, origin)
+                    if identity in current_by_identity:
+                        effective_metadata[name] = current_by_identity[identity]
+                        break
+            try:
+                _extensions(effective_metadata, "effective_metadata")
+            except ValidationError as exc:
+                raise ConflictError(
+                    "the artifact effective metadata budget would be exceeded",
+                    code="metadata_assertion_capacity_conflict",
+                    details={
+                        "artifact_id": artifact.key.artifact_id,
+                        "capacity": MAX_METADATA_ASSERTIONS,
+                        "required": required,
+                        "cause_code": exc.code,
+                    },
+                ) from exc
             return
         if isinstance(command, (AssignRegionRoleCommand, ClearRegionRoleCommand)):
             annotation = self._annotation(current, command.annotation_id)

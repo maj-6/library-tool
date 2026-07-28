@@ -9,13 +9,20 @@
   const MAX_LINKS = 128;
   const MAX_LINEAGE = 128;
   const MAX_ASSERTIONS = 32;
-  const MAX_JSON_DEPTH = 5;
-  const MAX_JSON_KEYS = 256;
-  const MAX_JSON_ARRAY = 256;
-  const MAX_JSON_STRING = 4096;
+  const MAX_METADATA_ASSERTIONS = 128;
+  const MAX_JSON_DEPTH = 12;
+  const MAX_JSON_NODES = 512;
+  const MAX_JSON_COLLECTION = 512;
+  const MAX_JSON_STRING = 8192;
+  const MAX_METADATA_ASSERTION_ENCODED_BYTES = 32 * 1024;
   const DEFAULT_ROW_HEIGHT = 28;
   const DEFAULT_OVERSCAN = 6;
   const PORTABLE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
+  const PRIVATE_JSON_KEYS = new Set([
+    "absolute_path", "asset_ref", "file", "file_name", "filename", "filepath",
+    "local_path", "locator", "path", "resource_ref", "storage_key",
+    "storage_locator", "storage_path", "uri", "url",
+  ]);
 
   const ARTIFACT_GROUPS = Object.freeze([
     Object.freeze({ id: "generated-metadata", label: "Generated metadata" }),
@@ -108,31 +115,106 @@
     return result;
   }
 
-  function boundedJson(value, state = { keys: 0 }, depth = 0) {
-    if (depth > MAX_JSON_DEPTH) throw new TypeError("artifact data is too deeply nested");
-    if (value == null || typeof value === "boolean") return value;
-    if (typeof value === "number") {
-      if (!Number.isFinite(value)) throw new TypeError("artifact data contains a non-finite number");
-      return value;
+  function normalizedJsonKey(value) {
+    return String(value || "").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase();
+  }
+
+  function isPrivateJsonKey(value) {
+    const key = normalizedJsonKey(value);
+    return PRIVATE_JSON_KEYS.has(key) ||
+      ["file", "filename", "filepath", "locator", "path", "uri", "url"]
+        .includes(key.split("_").at(-1));
+  }
+
+  function safeJsonString(value, name = "artifact data string") {
+    if (value.length > MAX_JSON_STRING ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\ud800-\udfff]/u
+          .test(value)) {
+      throw new TypeError(`${name} is invalid`);
     }
-    if (typeof value === "string") return text(value, MAX_JSON_STRING);
-    if (Array.isArray(value)) {
-      if (value.length > MAX_JSON_ARRAY) throw new TypeError("artifact data array is too large");
-      return value.map((entry) => boundedJson(entry, state, depth + 1));
+    return value;
+  }
+
+  function utf8Length(value) {
+    let bytes = 0;
+    for (const character of value) {
+      const codePoint = character.codePointAt(0);
+      if (codePoint <= 0x7f) bytes += 1;
+      else if (codePoint <= 0x7ff) bytes += 2;
+      else if (codePoint <= 0xffff) bytes += 3;
+      else bytes += 4;
     }
-    if (!isObject(value)) throw new TypeError("artifact data must be portable JSON");
-    const keys = Object.keys(value).sort();
-    state.keys += keys.length;
-    if (state.keys > MAX_JSON_KEYS) throw new TypeError("artifact data has too many fields");
-    const result = {};
-    for (const key of keys) {
-      if (!key || key.length > 128 ||
-          ["__proto__", "constructor", "prototype"].includes(key)) {
-        throw new TypeError("artifact data contains an invalid field");
+    return bytes;
+  }
+
+  function boundedJson(value) {
+    const state = { nodes: 0, active: new Set() };
+    const clone = (entry, depth) => {
+      state.nodes += 1;
+      if (depth > MAX_JSON_DEPTH) {
+        throw new TypeError("artifact data is too deeply nested");
       }
-      result[key] = boundedJson(value[key], state, depth + 1);
+      if (state.nodes > MAX_JSON_NODES) {
+        throw new TypeError("artifact data has too many values");
+      }
+      if (entry == null || typeof entry === "boolean") return entry;
+      if (typeof entry === "number") {
+        if (!Number.isFinite(entry) ||
+            Number.isInteger(entry) && !Number.isSafeInteger(entry)) {
+          throw new TypeError("artifact data contains a non-portable number");
+        }
+        return entry;
+      }
+      if (typeof entry === "string") return safeJsonString(entry);
+      if (!Array.isArray(entry) && !isObject(entry)) {
+        throw new TypeError("artifact data must be portable JSON");
+      }
+      if (state.active.has(entry)) {
+        throw new TypeError("artifact data contains a reference cycle");
+      }
+      state.active.add(entry);
+      try {
+        if (Array.isArray(entry)) {
+          if (entry.length > MAX_JSON_COLLECTION) {
+            throw new TypeError("artifact data array is too large");
+          }
+          return entry.map((item) => clone(item, depth + 1));
+        }
+        const keys = Object.keys(entry).sort();
+        if (keys.length > MAX_JSON_COLLECTION) {
+          throw new TypeError("artifact data has too many fields");
+        }
+        const result = {};
+        for (const key of keys) {
+          if (!key || key.length > 128 || key !== key.trim() ||
+              isPrivateJsonKey(key)) {
+            throw new TypeError("artifact data contains an invalid field");
+          }
+          safeJsonString(key, "artifact data field");
+          Object.defineProperty(result, key, {
+            configurable: true,
+            enumerable: true,
+            value: clone(entry[key], depth + 1),
+            writable: true,
+          });
+        }
+        return result;
+      } finally {
+        state.active.delete(entry);
+      }
+    };
+    return clone(value, 0);
+  }
+
+  function metadataAssertionJson(name, value) {
+    const wrapper = boundedJson({ [name]: value });
+    if (utf8Length(JSON.stringify(wrapper)) >
+        MAX_METADATA_ASSERTION_ENCODED_BYTES) {
+      throw new TypeError("metadata assertion exceeds its encoded size budget");
     }
-    return result;
+    return wrapper[name];
   }
 
   function safeBoundedJson(value, fallback) {
@@ -332,6 +414,42 @@
     }));
   }
 
+  function metadataAssertionArray(value) {
+    if (!Array.isArray(value)) return Object.freeze([]);
+    return Object.freeze(
+      value.slice(0, MAX_METADATA_ASSERTIONS).flatMap((entry) => {
+        if (!isObject(entry)) return [];
+        const origin = text(entry.origin, 24).toLowerCase();
+        const name = portableId(entry.name, "metadata assertion name");
+        if (!name || !["manual", "machine", "imported"].includes(origin)) {
+          return [];
+        }
+        return [Object.freeze({
+          name,
+          value: freezeJson(metadataAssertionJson(name, entry.value)),
+          origin,
+          revision: text(entry.revision, 512),
+          provenance: freezeJson(safeBoundedJson(entry.provenance, {})),
+        })];
+      }),
+    );
+  }
+
+  function effectiveMetadataJson(raw) {
+    const value = raw.effective_metadata !== undefined ? raw.effective_metadata
+      : raw.effectiveMetadata !== undefined ? raw.effectiveMetadata
+        : raw.metadata !== undefined ? raw.metadata : {};
+    if (!isObject(value)) {
+      throw new TypeError("effective metadata must be an object");
+    }
+    const result = boundedJson(value);
+    if (utf8Length(JSON.stringify(result)) >
+        MAX_METADATA_ASSERTION_ENCODED_BYTES) {
+      throw new TypeError("effective metadata exceeds its encoded size budget");
+    }
+    return result;
+  }
+
   function effectiveCaption(assertions, supplied) {
     if (isObject(supplied)) {
       const normalized = assertionArray([supplied],
@@ -422,6 +540,9 @@
       raw.role_assignments || raw.roleAssignments,
       new Set(["manual", "machine", "imported"]),
     );
+    const metadataAssertions = metadataAssertionArray(
+      raw.metadata_assertions || raw.metadataAssertions,
+    );
     const resourceRef = normalizeResourceRef(
       raw.resource_ref || raw.resourceRef || raw.resource,
     );
@@ -465,12 +586,13 @@
       categoryAssignments,
       roleAssignments,
       captionAssertions,
+      metadataAssertions,
       effectiveCaption: effectiveCaption(
         captionAssertions,
         raw.effective_caption || raw.effectiveCaption,
       ),
       provenance: freezeJson(safeBoundedJson(raw.provenance, {})),
-      metadata: freezeJson(safeBoundedJson(raw.metadata, {})),
+      metadata: freezeJson(effectiveMetadataJson(raw)),
       resourceRef,
     };
     result.linkedKeys = normalizeLinkedKeys(raw, objectType, lineage)

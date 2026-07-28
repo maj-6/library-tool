@@ -9,6 +9,7 @@ const {
   CorrectionsIndexStore,
   CorrectionsReviewConflictError,
   normalizeCorrectionsIndex,
+  normalizeReviewDocument,
   selectionAddressFromTarget,
 } = require("../tools/whl_explorer/static/corrections/books");
 const {
@@ -31,6 +32,17 @@ function fixture() {
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolveValue, rejectValue) => {
+    resolve = resolveValue;
+    reject = rejectValue;
+  });
+  return { promise, reject, resolve };
 }
 
 
@@ -72,11 +84,12 @@ function transitionedEntry(entryValue, action, revision) {
 }
 
 
-function mutationResult(entry, revision) {
+function mutationResult(entry, revision, data = fixture()) {
   return {
     schema: CORRECTIONS_REVIEW_RESULT_SCHEMA,
     index_revision: revision,
     entry,
+    index: indexWithEntry(data, entry, revision),
   };
 }
 
@@ -133,6 +146,40 @@ function fullReviewDocument(entry) {
     },
   };
 }
+
+
+test("full review documents accept the engine audit-history capacity", () => {
+  const history = Array.from({ length: 10_001 }, (_, index) => {
+    const mark = index === 0;
+    const resolve = index % 2 === 1;
+    return reviewEvent({
+      operation_id: `audit-op-${index}`,
+      action: mark
+        ? "attention.mark"
+        : resolve
+          ? "attention.resolve"
+          : "attention.reopen",
+      before_state: mark
+        ? "clear"
+        : resolve
+          ? "needs_attention"
+          : "resolved",
+      after_state: resolve ? "resolved" : "needs_attention",
+    });
+  });
+  const document = normalizeReviewDocument({
+    schema: CORRECTIONS_REVIEW_SCHEMA,
+    target: { kind: "book", item_id: "book-1" },
+    review: {
+      revision: "review-large-r1",
+      state: "needs_attention",
+      reason: "Verify the title page",
+      history,
+    },
+  });
+
+  assert.equal(document.review.history.length, 10_001);
+});
 
 
 class MiniClassList {
@@ -331,6 +378,237 @@ test("resolve and reopen send CAS revisions, actor, operation, and comment", asy
   assert.equal(store.index.attention[0].review.state, "needs_attention");
   assert.equal(store.index.revision, "index-r9");
 });
+
+test("trusted engine reviews do not require or transmit a renderer actor",
+  async () => {
+    const data = fixture();
+    const resolved = transitionedEntry(
+      data.attention[0], "resolve", "review-book-r3");
+    let mutation;
+    const api = {
+      trustedActor: true,
+      loadIndex: async () => data,
+      async resolveReview(options) {
+        mutation = options;
+        return mutationResult(resolved, "index-r8");
+      },
+      reopenReview: async () => {
+        throw new Error("not expected");
+      },
+    };
+    const store = new CorrectionsIndexStore({ api });
+    await store.openWorkspace("workspace-1");
+    const controller = new ReviewsPanelController({
+      root: { ownerDocument: {}, querySelector: () => null },
+      documentRef: {},
+      store,
+      operationIdFactory: () => "trusted-resolve-op",
+    });
+
+    assert.deepEqual(controller.actionCapability(), {
+      enabled: true,
+      reason: "",
+    });
+    await controller.transition(
+      store.index.attention[0],
+      "resolve",
+      "Verified locally",
+    );
+    assert.deepEqual(mutation, {
+      target: data.attention[0].target,
+      expectedRevision: "review-book-r2",
+      operationId: "trusted-resolve-op",
+      comment: "Verified locally",
+      signal: undefined,
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(mutation, "actorId"),
+      false);
+  });
+
+test("partial mutation results reload the complete index before convergence",
+  async () => {
+    const data = fixture();
+    const resolved = transitionedEntry(
+      data.attention[0], "resolve", "review-book-r3");
+    const converged = indexWithEntry(data, resolved, "index-r8");
+    converged.books[1].title = "Concurrent title correction";
+    converged.books[1].revision = "book-concurrent-r2";
+    let loads = 0;
+    const store = new CorrectionsIndexStore({
+      api: {
+        async loadIndex() {
+          loads += 1;
+          return loads === 1 ? data : converged;
+        },
+        async resolveReview() {
+          return {
+            schema: CORRECTIONS_REVIEW_RESULT_SCHEMA,
+            index_revision: "index-r8",
+            entry: resolved,
+          };
+        },
+      },
+    });
+    await store.openWorkspace("workspace-1");
+
+    await store.transitionReview("resolve", {
+      entry: store.index.attention[0],
+      actorId: "curator-9",
+      operationId: "operation-resolve-partial",
+      comment: "Verified",
+    });
+
+    assert.equal(loads, 2);
+    assert.equal(store.index.revision, "index-r8");
+    assert.equal(store.index.attention[0].review.state, "resolved");
+    assert.equal(store.index.books[1].title, "Concurrent title correction");
+  });
+
+test("a review mutation re-converges after an overlapping refresh", async () => {
+  const data = fixture();
+  const mutation = deferred();
+  const refreshed = deferred();
+  const resolved = transitionedEntry(
+    data.attention[0], "resolve", "review-stale-r3");
+  const overlappingIndex = clone(data);
+  overlappingIndex.revision = "index-refresh-r9";
+  overlappingIndex.books[1].title = "Title from the overlapping refresh";
+  const convergedIndex = indexWithEntry(
+    overlappingIndex,
+    resolved,
+    "index-converged-r10",
+  );
+  let loads = 0;
+  const store = new CorrectionsIndexStore({
+    api: {
+      loadIndex() {
+        loads += 1;
+        if (loads === 1) return Promise.resolve(data);
+        if (loads === 2) return refreshed.promise;
+        return Promise.resolve(convergedIndex);
+      },
+      resolveReview: () => mutation.promise,
+    },
+  });
+  await store.openWorkspace("workspace-1");
+
+  const mutating = store.transitionReview("resolve", {
+    entry: store.index.attention[0],
+    actorId: "curator-1",
+    operationId: "resolve-racing-refresh",
+    comment: "",
+  });
+  await Promise.resolve();
+  const refreshing = store.refresh({ reason: "external" });
+  refreshed.resolve(overlappingIndex);
+  await refreshing;
+  mutation.resolve(mutationResult(resolved, "index-stale-r3"));
+  await mutating;
+
+  assert.equal(loads, 3);
+  assert.equal(store.index.revision, "index-converged-r10");
+  assert.equal(store.index.attention[0].review.state, "resolved");
+  assert.equal(store.index.books[1].title,
+    "Title from the overlapping refresh");
+});
+
+test("a review mutation cannot overwrite a newly opened workspace", async () => {
+  const data = fixture();
+  const mutation = deferred();
+  const workspaceB = deferred();
+  const resolved = transitionedEntry(
+    data.attention[0], "resolve", "review-workspace-a-r3");
+  const workspaceBIndex = clone(data);
+  workspaceBIndex.revision = "index-workspace-b-r1";
+  workspaceBIndex.books[1].title = "Workspace B";
+  const store = new CorrectionsIndexStore({
+    api: {
+      loadIndex({ workspaceId }) {
+        return workspaceId === "workspace-a"
+          ? Promise.resolve(data)
+          : workspaceB.promise;
+      },
+      resolveReview: () => mutation.promise,
+    },
+  });
+  await store.openWorkspace("workspace-a");
+
+  const mutating = store.transitionReview("resolve", {
+    entry: store.index.attention[0],
+    actorId: "curator-1",
+    operationId: "resolve-workspace-a",
+    comment: "",
+  });
+  await Promise.resolve();
+  const openingB = store.openWorkspace("workspace-b");
+  workspaceB.resolve(workspaceBIndex);
+  await openingB;
+  mutation.resolve(mutationResult(resolved, "index-workspace-a-r3"));
+  await mutating;
+
+  assert.equal(store.workspaceId, "workspace-b");
+  assert.equal(store.index.revision, "index-workspace-b-r1");
+  assert.equal(store.index.books[1].title, "Workspace B");
+});
+
+test("concurrent review requests serialize so every committed result converges",
+  async () => {
+    const data = fixture();
+    const firstMutation = deferred();
+    const secondMutation = deferred();
+    let mutations = 0;
+    const store = new CorrectionsIndexStore({
+      api: {
+        loadIndex: async () => data,
+        resolveReview() {
+          mutations += 1;
+          return mutations === 1 ? firstMutation.promise : secondMutation.promise;
+        },
+      },
+    });
+    await store.openWorkspace("workspace-1");
+    const firstSource = store.index.attention[0];
+    const secondSource = store.index.attention[1];
+
+    const first = store.transitionReview("resolve", {
+      entry: firstSource,
+      actorId: "curator-1",
+      operationId: "resolve-first",
+      comment: "",
+    });
+    const second = store.transitionReview("resolve", {
+      entry: secondSource,
+      actorId: "curator-2",
+      operationId: "resolve-second",
+      comment: "",
+    });
+    await Promise.resolve();
+    assert.equal(mutations, 1,
+      "the second request waits until the first has converged");
+    const firstEntry = transitionedEntry(
+      firstSource,
+      "resolve",
+      "review-first-r3",
+    );
+    firstMutation.resolve(mutationResult(firstEntry, "index-first-r8"));
+    await first;
+    await Promise.resolve();
+    assert.equal(mutations, 2);
+    const firstIndex = indexWithEntry(data, firstEntry, "index-first-r8");
+    const secondEntry = transitionedEntry(
+      secondSource,
+      "resolve",
+      "review-second-r4",
+    );
+    secondMutation.resolve(
+      mutationResult(secondEntry, "index-second-r9", firstIndex),
+    );
+    await second;
+
+    assert.equal(store.index.revision, "index-second-r9");
+    assert.equal(store.index.attention[0].review.revision, "review-first-r3");
+    assert.equal(store.index.attention[1].review.revision, "review-second-r4");
+  });
 
 
 test("a CAS conflict refreshes the queue instead of overwriting newer state", async () => {

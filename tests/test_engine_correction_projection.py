@@ -13,12 +13,14 @@ from librarytool.engine.corrections import (
     CorrectionAggregateSnapshot,
 )
 from librarytool.engine.raster_artifacts import (
+    ArtifactMetadataAssertion,
     ArtifactFreshness,
     ArtifactProvenance,
     AssignmentOrigin,
     CaptionAssertion,
     CaptionOrigin,
     CategoryAssignment,
+    MetadataAssertionOrigin,
     RasterArtifactKey,
     RasterArtifactView,
     RasterDimensions,
@@ -44,7 +46,9 @@ def _raster(
     revision: str | None = None,
     lineage: tuple[RasterLineageRef, ...] = (),
     categories: tuple[CategoryAssignment, ...] = (),
+    roles: tuple[SpatialRoleAssignment, ...] = (),
     captions: tuple[CaptionAssertion, ...] = (),
+    metadata: tuple[ArtifactMetadataAssertion, ...] = (),
 ) -> RasterArtifactView:
     return RasterArtifactView(
         key=RasterArtifactKey("book-1", artifact_id),
@@ -67,7 +71,9 @@ def _raster(
         freshness=ArtifactFreshness.CURRENT,
         lineage=lineage,
         category_assignments=categories,
+        role_assignments=roles,
         caption_assertions=captions,
+        metadata_assertions=metadata,
         provenance=ArtifactProvenance(origin="capture"),
     )
 
@@ -253,6 +259,18 @@ def test_reconciliation_preserves_manual_evidence_and_only_advances_for_changes(
                 "machine-caption-r1",
             ),
         ),
+        metadata=(
+            ArtifactMetadataAssertion(
+                "plate_number",
+                3,
+                MetadataAssertionOrigin.MACHINE,
+                "machine-metadata-r1",
+                provenance=ArtifactProvenance(
+                    origin="machine",
+                    provider_id="mistral",
+                ),
+            ),
+        ),
     )
     initial_annotation = _annotation(
         "region-a",
@@ -287,6 +305,13 @@ def test_reconciliation_preserves_manual_evidence_and_only_advances_for_changes(
         RoleAssignmentOrigin.MANUAL,
         "manual-role-r1",
     )
+    manual_metadata = ArtifactMetadataAssertion(
+        "plate_number",
+        4,
+        MetadataAssertionOrigin.MANUAL,
+        "manual-metadata-r1",
+        provenance=ArtifactProvenance(origin="manual"),
+    )
     durable_artifact = replace(
         live_artifact,
         revision="artifact-correction-r1",
@@ -297,6 +322,10 @@ def test_reconciliation_preserves_manual_evidence_and_only_advances_for_changes(
         caption_assertions=(
             *live_artifact.caption_assertions,
             manual_caption,
+        ),
+        metadata_assertions=(
+            *live_artifact.metadata_assertions,
+            manual_metadata,
         ),
         role_assignments=(manual_role,),
     )
@@ -334,6 +363,28 @@ def test_reconciliation_preserves_manual_evidence_and_only_advances_for_changes(
                 "machine-caption-r2",
             ),
         ),
+        metadata=(
+            ArtifactMetadataAssertion(
+                "plate_number",
+                5,
+                MetadataAssertionOrigin.MACHINE,
+                "machine-metadata-r2",
+                provenance=ArtifactProvenance(
+                    origin="machine",
+                    provider_id="mistral",
+                ),
+            ),
+            ArtifactMetadataAssertion(
+                "collection",
+                "Herbarium",
+                MetadataAssertionOrigin.IMPORTED,
+                "imported-metadata-r1",
+                provenance=ArtifactProvenance(
+                    origin="ocr",
+                    provider_id="mistral",
+                ),
+            ),
+        ),
     )
     updated_annotation = _annotation(
         "region-a",
@@ -358,6 +409,18 @@ def test_reconciliation_preserves_manual_evidence_and_only_advances_for_changes(
     assert artifact.category(AssignmentOrigin.SUGGESTED).category == "spine"
     assert artifact.caption(CaptionOrigin.MANUAL) == manual_caption
     assert artifact.caption(CaptionOrigin.MACHINE).text == "Updated machine caption"
+    assert (
+        artifact.metadata("plate_number", MetadataAssertionOrigin.MANUAL)
+        == manual_metadata
+    )
+    assert (
+        artifact.metadata("plate_number", MetadataAssertionOrigin.MACHINE).value
+        == 5
+    )
+    assert (
+        artifact.metadata("collection", MetadataAssertionOrigin.IMPORTED).value
+        == "Herbarium"
+    )
     assert artifact.role(RoleAssignmentOrigin.MANUAL) == manual_role
     assert annotation.role(RoleAssignmentOrigin.MANUAL) == manual_role
     assert annotation.role(RoleAssignmentOrigin.MACHINE).role == "body"
@@ -371,6 +434,102 @@ def test_reconciliation_preserves_manual_evidence_and_only_advances_for_changes(
     assert stable.revision == reconciled.revision
     assert stable.artifact("image-a").revision == artifact.revision
     assert stable.annotation("region-a").revision == annotation.revision
+
+
+def test_projection_service_exposes_manual_metadata_without_erasing_machine_evidence():
+    raster = _raster(
+        "image-a",
+        metadata=(
+            ArtifactMetadataAssertion(
+                "plate_number",
+                3,
+                MetadataAssertionOrigin.MACHINE,
+                "machine-metadata-r1",
+                provenance=ArtifactProvenance(
+                    origin="machine",
+                    provider_id="mistral",
+                ),
+            ),
+        ),
+    )
+    live = _project((raster,))
+    live_artifact = live.artifact("image-a")
+    assert live_artifact is not None
+    durable = replace(
+        live,
+        revision="aggregate-correction-r1",
+        artifacts=(
+            replace(
+                live_artifact,
+                revision="artifact-correction-r1",
+                metadata_assertions=(
+                    *live_artifact.metadata_assertions,
+                    ArtifactMetadataAssertion(
+                        "plate_number",
+                        4,
+                        MetadataAssertionOrigin.MANUAL,
+                        "manual-metadata-r1",
+                        provenance=ArtifactProvenance(origin="manual"),
+                    ),
+                ),
+            ),
+        ),
+    )
+    service = CorrectionProjectionService(
+        _RasterProjector((raster,)),
+        _SpatialProjector(()),
+        _ReadRepository(durable),
+    )
+
+    projected = service.get_raster_artifact(raster.key)
+
+    assert projected is not None
+    assert [
+        (value.origin.value, value.value)
+        for value in projected.metadata_assertions
+    ] == [("machine", 3), ("manual", 4)]
+    assert projected.effective_metadata == {"plate_number": 4}
+    public = projected.as_dict()
+    assert public["effective_metadata"] == {"plate_number": 4}
+    assert public["metadata_assertions"][0]["provenance"]["provider_id"] == (
+        "mistral"
+    )
+
+
+def test_projection_service_exposes_linked_artifact_role_assignments():
+    raster = _raster("image-a")
+    live = _project((raster,))
+    live_artifact = live.artifact("image-a")
+    assert live_artifact is not None
+    manual_role = SpatialRoleAssignment(
+        "figure",
+        RoleAssignmentOrigin.MANUAL,
+        "manual-role-r1",
+        provenance=ArtifactProvenance(origin="manual"),
+    )
+    durable = replace(
+        live,
+        revision="aggregate-correction-r1",
+        artifacts=(
+            replace(
+                live_artifact,
+                revision="artifact-correction-r1",
+                role_assignments=(manual_role,),
+            ),
+        ),
+    )
+    service = CorrectionProjectionService(
+        _RasterProjector((raster,)),
+        _SpatialProjector(()),
+        _ReadRepository(durable),
+    )
+
+    projected = service.get_raster_artifact(raster.key)
+
+    assert projected is not None
+    assert projected.role_assignments == (manual_role,)
+    assert projected.effective_role == "figure"
+    assert projected.as_dict()["effective_role"] == "figure"
 
 
 def test_reconciliation_marks_disappeared_targets_unavailable_until_they_return():

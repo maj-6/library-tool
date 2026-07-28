@@ -16,6 +16,7 @@
   const REVIEW_ACTIONS = new Set([
     "attention.mark", "attention.resolve", "attention.reopen", "attention.clear",
   ]);
+  const MAX_CORRECTION_AUDIT_EVENTS = 100_000;
   const TARGET_KINDS = new Set(["book", "image", "region"]);
   const IMAGE_CATEGORIES = new Set([
     "title_page", "cover", "spine", "content_specimen", "other",
@@ -198,9 +199,29 @@
     return freezeDeep(result);
   }
 
+  function sameAuditEvent(left, right) {
+    if (left === null || right === null) return left === right;
+    return [
+      "operation_id", "action", "actor_id", "occurred_at", "before_state",
+      "after_state", "reason", "comment",
+    ].every((field) => left[field] === right[field]);
+  }
+
+  function sameReviewSummary(left, right) {
+    return left.revision === right.revision &&
+      left.state === right.state &&
+      left.reason === right.reason &&
+      left.history_count === right.history_count &&
+      sameAuditEvent(left.latest_event, right.latest_event);
+  }
+
   function normalizeFullReview(value, path = "$.review") {
     exactObject(value, path, ["revision", "state", "reason", "history"]);
-    const history = boundedArray(value.history, `${path}.history`, 10_000)
+    const history = boundedArray(
+      value.history,
+      `${path}.history`,
+      MAX_CORRECTION_AUDIT_EVENTS,
+    )
       .map((entry, index) => normalizeAuditEvent(entry, `${path}.history[${index}]`));
     for (let index = 1; index < history.length; index += 1) {
       if (history[index - 1].after_state !== history[index].before_state) {
@@ -394,6 +415,25 @@
           "must identify a book in this index");
       }
     }
+    const bookAttention = new Map(attention
+      .filter((entry) => entry.target.kind === "book")
+      .map((entry) => [entry.target.item_id, entry]));
+    for (let index = 0; index < books.length; index += 1) {
+      const book = books[index];
+      const entry = bookAttention.get(book.id);
+      if (book.review.state === "clear" && entry) {
+        fail(`$.books[${index}].review`,
+          "clear book reviews cannot have a book attention entry");
+      }
+      if (book.review.state !== "clear" && !entry) {
+        fail(`$.books[${index}].review`,
+          "non-clear book reviews require one book attention entry");
+      }
+      if (entry && !sameReviewSummary(book.review, entry.review)) {
+        fail(`$.books[${index}].review`,
+          "must exactly match its book attention entry");
+      }
+    }
     return freezeDeep({
       schema: CORRECTIONS_INDEX_SCHEMA,
       revision: revision(value.revision, "$.revision"),
@@ -415,15 +455,33 @@
   }
 
   function normalizeReviewMutationResult(value) {
-    exactObject(value, "$", ["schema", "index_revision", "entry"]);
+    exactObject(value, "$", [
+      "schema", "index_revision", "entry", "index",
+    ], ["schema", "index_revision", "entry"]);
     if (value.schema !== CORRECTIONS_REVIEW_RESULT_SCHEMA) {
       fail("$.schema", `must equal ${CORRECTIONS_REVIEW_RESULT_SCHEMA}`);
     }
-    return freezeDeep({
+    const indexRevision = revision(value.index_revision, "$.index_revision");
+    const entry = normalizeAttentionEntry(value.entry, "$.entry");
+    const result = {
       schema: CORRECTIONS_REVIEW_RESULT_SCHEMA,
-      index_revision: revision(value.index_revision, "$.index_revision"),
-      entry: normalizeAttentionEntry(value.entry, "$.entry"),
-    });
+      index_revision: indexRevision,
+      entry,
+    };
+    if (value.index !== undefined) {
+      const index = normalizeCorrectionsIndex(value.index);
+      if (index.revision !== indexRevision) {
+        fail("$.index_revision", "must match the complete index revision");
+      }
+      const indexedEntry = index.attention.find((candidate) =>
+        targetIdentity(candidate.target) === targetIdentity(entry.target));
+      if (!indexedEntry || indexedEntry.key !== entry.key ||
+          !sameReviewSummary(indexedEntry.review, entry.review)) {
+        fail("$.entry", "must exactly match its entry in the complete index");
+      }
+      result.index = index;
+    }
+    return freezeDeep(result);
   }
 
   function normalizeIndexChange(value) {
@@ -538,6 +596,8 @@
       this.selection = null;
       this.selectionOwned = false;
       this.generation = 0;
+      this.mutationGeneration = 0;
+      this.mutationQueue = Promise.resolve();
       this.abortController = null;
       this.unsubscribeExternal = null;
       this.destroyed = false;
@@ -597,7 +657,15 @@
       return this.refresh({ reason: "context" });
     }
 
-    async refresh(options = {}) {
+    refresh(options = {}) {
+      return this._refresh(options);
+    }
+
+    async _refresh(options = {}, owner = null) {
+      if (owner && (
+        owner.mutationGeneration !== this.mutationGeneration ||
+        owner.workspaceId !== this.workspaceId
+      )) return null;
       if (this.destroyed) return null;
       if (!this.workspaceId) {
         this.status = this.api && typeof this.api.loadIndex === "function"
@@ -613,6 +681,7 @@
       }
       this._cancelLoad();
       const generation = ++this.generation;
+      const workspaceId = this.workspaceId;
       const controller = typeof AbortController === "function"
         ? new AbortController() : null;
       this.abortController = controller;
@@ -622,10 +691,13 @@
       this.emit();
       try {
         const value = await this.api.loadIndex({
-          workspaceId: this.workspaceId,
+          workspaceId,
           signal: controller && controller.signal,
         });
-        if (this.destroyed || generation !== this.generation) return null;
+        if (this.destroyed || generation !== this.generation ||
+            (owner &&
+              owner.mutationGeneration !== this.mutationGeneration) ||
+            workspaceId !== this.workspaceId) return null;
         const index = normalizeCorrectionsIndex(value);
         this.abortController = null;
         this.index = index;
@@ -635,7 +707,10 @@
         this.emit();
         return index;
       } catch (error) {
-        if (this.destroyed || generation !== this.generation || abortError(error)) return null;
+        if (this.destroyed || generation !== this.generation ||
+            (owner &&
+              owner.mutationGeneration !== this.mutationGeneration) ||
+            workspaceId !== this.workspaceId || abortError(error)) return null;
         this.abortController = null;
         this.status = "error";
         this.error = Object.freeze({
@@ -669,22 +744,74 @@
         throw new TypeError("review action must be resolve or reopen");
       }
       const entry = normalizeAttentionEntry(options.entry, "$.entry");
-      const actorId = identifier(options.actorId, "$.actor_id");
+      const trustedActor = this.api && this.api.trustedActor === true;
+      const actorId = trustedActor
+        ? null
+        : identifier(options.actorId, "$.actor_id");
       const operationId = identifier(options.operationId, "$.operation_id");
       const comment = safeText(options.comment || "", "$.comment", 8192);
       const methodName = action === "resolve" ? "resolveReview" : "reopenReview";
       if (!this.api || typeof this.api[methodName] !== "function") {
         throw new Error(`${action === "resolve" ? "Resolve" : "Reopen"} is unavailable`);
       }
+      const queuedWorkspaceId = this.workspaceId;
+      const precedingMutation = this.mutationQueue;
+      let releaseMutation;
+      this.mutationQueue = new Promise((resolve) => {
+        releaseMutation = resolve;
+      });
+      await precedingMutation;
       try {
-        const value = await this.api[methodName]({
+        if (this.destroyed || queuedWorkspaceId !== this.workspaceId) {
+          throw new CorrectionsReviewConflictError(
+            "The Corrections workspace changed before the queued review could run");
+        }
+        return await this._transitionReview({
+          action,
+          actorId,
+          comment,
+          entry,
+          methodName,
+          operationId,
+          signal: options.signal,
+          trustedActor,
+        });
+      } finally {
+        releaseMutation();
+      }
+    }
+
+    async _transitionReview({
+      action,
+      actorId,
+      comment,
+      entry,
+      methodName,
+      operationId,
+      signal,
+      trustedActor,
+    }) {
+      const interruptedLoad = this.status === "loading";
+      this._cancelLoad();
+      if (interruptedLoad) {
+        this.status = this.index ? "ready" : "idle";
+        this.error = null;
+        this.emit();
+      }
+      const loadGeneration = this.generation;
+      const mutationGeneration = ++this.mutationGeneration;
+      const workspaceId = this.workspaceId;
+      const owner = Object.freeze({ mutationGeneration, workspaceId });
+      try {
+        const mutation = {
           target: entry.target,
           expectedRevision: entry.review.revision,
-          actorId,
           operationId,
           comment,
-          signal: options.signal,
-        });
+          signal,
+        };
+        if (!trustedActor) mutation.actorId = actorId;
+        const value = await this.api[methodName](mutation);
         const result = normalizeReviewMutationResult(value);
         if (result.entry.key !== entry.key ||
             targetIdentity(result.entry.target) !== targetIdentity(entry.target)) {
@@ -696,17 +823,46 @@
           throw new CorrectionsContractError(
             `review mutation must return state ${expectedState}`, "$.entry.review.state");
         }
-        this.applyAttentionEntry(result.entry, result.index_revision);
+        if (this.destroyed ||
+            mutationGeneration !== this.mutationGeneration ||
+            workspaceId !== this.workspaceId) return result;
+        if (result.index && loadGeneration === this.generation) {
+          this.index = result.index;
+          this.status = "ready";
+          this.error = null;
+          this._reconcileSelection();
+          this.emit();
+        } else {
+          const converged = await this._refresh({
+            reason: "review-mutation",
+          }, owner);
+          if (!converged) {
+            if (this.destroyed ||
+                mutationGeneration !== this.mutationGeneration ||
+                workspaceId !== this.workspaceId) return result;
+            if (this.status === "ready" || this.status === "loading") {
+              return result;
+            }
+            throw new Error(
+              "The committed review could not be converged with the full index");
+          }
+        }
         return result;
       } catch (error) {
         if (!isConflict(error)) throw error;
-        await this.refresh({ reason: "conflict" });
+        if (!this.destroyed &&
+            mutationGeneration === this.mutationGeneration &&
+            workspaceId === this.workspaceId) {
+          await this._refresh({ reason: "conflict" }, owner);
+        }
         throw new CorrectionsReviewConflictError(undefined, error);
       }
     }
 
     applyAttentionEntry(entryValue, indexRevision) {
       if (!this.index) throw new Error("The Corrections index has not been loaded");
+      this._cancelLoad();
+      this.mutationGeneration += 1;
       const entry = normalizeAttentionEntry(entryValue);
       const normalizedRevision = revision(indexRevision, "$.index_revision");
       const existingIndex = this.index.attention.findIndex(
@@ -792,6 +948,7 @@
 
     destroy() {
       this.destroyed = true;
+      this.mutationGeneration += 1;
       this._cancelLoad();
       this._disconnectExternal();
       this.listeners.clear();

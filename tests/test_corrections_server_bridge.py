@@ -219,6 +219,105 @@ def test_production_bridge_mutations_converge_across_clients(
     assert replay.get_json()["receipt"] == first.get_json()["receipt"]
 
 
+def test_production_review_bridge_composes_index_and_owns_audit_actor(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    monkeypatch.setattr(
+        server,
+        "_auth_doc",
+        lambda: {"session": {"user_id": "user-bridge"}},
+    )
+    review_path = "/api/v1/items/book-one/corrections/review"
+    initial_detail = client.get(review_path)
+    initial_index = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    wrong_workspace = client.get(
+        "/api/v1/corrections/index?workspace_id=workspace-1"
+    )
+
+    assert initial_detail.status_code == 200
+    assert initial_index.status_code == 200
+    assert wrong_workspace.status_code == 409
+    assert wrong_workspace.get_json()["code"] == (
+        "corrections_workspace_mismatch"
+    )
+    initial_review = initial_detail.get_json()["review"]
+    index_body = initial_index.get_json()
+    assert index_body["schema"] == "librarytool.corrections-index/1"
+    assert [book["id"] for book in index_body["books"]] == ["book-one"]
+    assert [
+        capture["artifact_id"].endswith(":display")
+        for capture in index_body["books"][0]["captures"]
+    ] == [True]
+    assert index_body["attention"] == []
+
+    spoofed = client.put(
+        f"{review_path}/attention",
+        json={
+            "reason": "Verify the cover",
+            "actor_id": "spoofed-client",
+            "comment": "",
+        },
+        headers={
+            "Idempotency-Key": "bridge-review-spoof",
+            "If-Review-Match": f'"{initial_review["revision"]}"',
+        },
+    )
+    marked = client.put(
+        f"{review_path}/attention",
+        json={"reason": "Verify the cover", "comment": "Window one"},
+        headers={
+            "Idempotency-Key": "bridge-review-mark",
+            "If-Review-Match": f'"{initial_review["revision"]}"',
+        },
+    )
+
+    assert spoofed.status_code == 400
+    assert marked.status_code == 200
+
+    second_client = client.application.test_client()
+    observed = second_client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    ).get_json()
+    attention = observed["attention"][0]
+    assert attention["review"]["state"] == "needs_attention"
+    assert attention["review"]["latest_event"]["actor_id"] == "user-bridge"
+
+    resolved = second_client.post(
+        f"{review_path}/resolve",
+        json={"comment": "Window two verified it"},
+        headers={
+            "Idempotency-Key": "bridge-review-resolve",
+            "If-Review-Match": f'"{attention["review"]["revision"]}"',
+        },
+    )
+    stale = client.post(
+        f"{review_path}/resolve",
+        json={"comment": "Stale window"},
+        headers={
+            "Idempotency-Key": "bridge-review-stale",
+            "If-Review-Match": f'"{attention["review"]["revision"]}"',
+        },
+    )
+    reconciled = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    ).get_json()
+
+    assert resolved.status_code == 200
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "review_revision_conflict"
+    assert reconciled["attention"][0]["review"]["state"] == "resolved"
+    assert reconciled["attention"][0]["review"]["latest_event"][
+        "actor_id"
+    ] == "user-bridge"
+
+
 def test_production_bridge_preserves_not_found_semantics(
     client,
     corrections_workspace,
