@@ -38,6 +38,11 @@ def _isolate_capture_files(monkeypatch, tmp_path):
         "CAPTURE_PHONE_SYNC_STATE_PATH",
         tmp_path / "capture_phone_sync_state.json",
     )
+    monkeypatch.setattr(
+        server,
+        "CAPTURE_CLOUD_ASSOCIATION_STATE_PATH",
+        tmp_path / "capture_cloud_association_state.json",
+    )
     session = server._open_engine_session(workspace)
     aliases = {
         "_engine_session": session,
@@ -81,6 +86,26 @@ def _accepted_cloud_association(
         "lib_association": association.as_dict(),
         "lib_association_revision": revision,
         "lib_association_updated_at": "2026-07-23T12:35:00Z",
+    }
+
+
+def _scoped_cloud_association(
+        capture_id: str,
+        association=None,
+        *,
+        revision: int = 0,
+        status: str = "imported",
+) -> dict:
+    return {
+        "id": capture_id,
+        "status": status,
+        "lib_association": (
+            association.as_dict() if association is not None else None
+        ),
+        "lib_association_revision": revision,
+        "lib_association_updated_at": (
+            "2026-07-23T12:35:00Z" if association is not None else None
+        ),
     }
 
 
@@ -712,8 +737,8 @@ def test_cloud_ack_replays_when_local_receipt_save_fails_after_rpc_commit(
     assert accepted["lib_association_revision"] == 1
     assert len(publications) == 2
     assert publications[0] == publications[1]
-    assert server._capture_phone_sync_state()[
-        "cloud_association_shadows"
+    assert server._capture_cloud_association_state()[
+        "shadows"
     ][capture_id] == {
         "association": current.as_dict(),
         "revision": 1,
@@ -786,8 +811,8 @@ def test_cloud_current_to_stale_queues_offline_and_flushes_association_only(
         ),
         {"expected_revision": 1, "mark_imported": False},
     )]
-    shadow = server._capture_phone_sync_state()[
-        "cloud_association_shadows"
+    shadow = server._capture_cloud_association_state()[
+        "shadows"
     ][capture_id]
     assert shadow == {
         "association": stale.as_dict(),
@@ -898,8 +923,8 @@ def test_queued_stale_cancels_only_for_exact_shadow_current_reversion(
 
     assert result == {"pushed": 0, "pending": 0, "errors": []}
     assert calls == []
-    assert server._capture_phone_sync_state()[
-        "cloud_association_shadows"
+    assert server._capture_cloud_association_state()[
+        "shadows"
     ][capture_id]["association"] == current.as_dict()
 
 
@@ -1091,6 +1116,474 @@ def test_cloud_stale_outbox_requires_exact_accepted_current_authority(
             current,
         )
     assert calls == []
+
+
+def test_cloud_association_state_migrates_once_out_of_version_one_phone_file(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a1313131-1313-4313-8313-131313131313"
+    server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="cloud",
+    )
+    current = server._capture_archive_association(capture_id)
+    legacy_shadow = {
+        "association": current.as_dict(),
+        "revision": 4,
+    }
+    lib.save_json(server.CAPTURE_PHONE_SYNC_STATE_PATH, {
+        "version": 1,
+        "cloud_association_shadows": {capture_id: legacy_shadow},
+        "pending_cloud_associations": {},
+        "published_capture_ids": [],
+    })
+
+    migrated = server._capture_cloud_association_state()
+    server._update_capture_phone_sync_state(
+        lambda state: state["published_capture_ids"].append(capture_id)
+    )
+    rewritten_phone = lib.load_json(
+        server.CAPTURE_PHONE_SYNC_STATE_PATH,
+        {},
+    )
+    rewritten_phone["cloud_association_shadows"] = {
+        capture_id: {"association": {"corrupt": True}, "revision": 99},
+    }
+    lib.save_json(server.CAPTURE_PHONE_SYNC_STATE_PATH, rewritten_phone)
+
+    assert migrated["shadows"][capture_id] == legacy_shadow
+    assert "cloud_association_shadows" not in (
+        server._capture_phone_sync_state()
+    )
+    # A downgraded/older phone-state writer cannot overwrite the isolated
+    # cursor after its one-time migration marker is durable.
+    assert server._capture_cloud_association_state()[
+        "shadows"
+    ][capture_id] == legacy_shadow
+
+
+def test_installed_imported_stale_archive_bootstraps_shadow_then_publishes(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a1414141-1414-4414-8414-141414141414"
+    server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="cloud",
+    )
+    current = server._capture_archive_association(capture_id)
+    stale = server._mark_capture_archive_stale(capture_id)
+    assert server._pending_cloud_capture_associations() == []
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda cfg, ids, chunk=40: [
+            _scoped_cloud_association(
+                capture_id,
+                current,
+                revision=5,
+                status="imported",
+            )
+        ],
+    )
+    publications = []
+
+    def publish(*args, **kwargs):
+        publications.append((args, kwargs))
+        desired = server.CaptureArchiveAssociation.from_dict(args[3])
+        return _accepted_cloud_association(desired, 6)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        publish,
+    )
+
+    reconciled = server._reconcile_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+        capture_ids=[capture_id],
+    )
+    flushed = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+
+    assert reconciled == {
+        "observed": 1,
+        "bootstrapped": 1,
+        "published": 0,
+        "queued": 1,
+        "quarantined": 0,
+        "errors": [],
+    }
+    assert stale is not None
+    assert publications == [(
+        (
+            owner_cfg,
+            capture_cfg,
+            capture_id,
+            stale.as_dict(),
+        ),
+        {"expected_revision": 5, "mark_imported": False},
+    )]
+    assert flushed == {"pushed": 1, "pending": 0, "errors": []}
+    assert server._capture_cloud_association_state()[
+        "shadows"
+    ][capture_id] == {
+        "association": stale.as_dict(),
+        "revision": 6,
+    }
+
+
+def test_imported_null_remote_state_bootstraps_without_changing_status(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a1515151-1515-4515-8515-151515151515"
+    server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="cloud",
+    )
+    current = server._capture_archive_association(capture_id)
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, _ids, chunk=40: [
+            _scoped_cloud_association(
+                capture_id,
+                status="imported",
+            )
+        ],
+    )
+    publications = []
+
+    def publish(*args, **kwargs):
+        publications.append((args, kwargs))
+        return _accepted_cloud_association(current, 1)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        publish,
+    )
+
+    result = server._reconcile_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+        capture_ids=[capture_id],
+    )
+
+    assert result["published"] == 1
+    assert result["errors"] == []
+    assert publications[0][1] == {
+        "expected_revision": 0,
+        "mark_imported": False,
+    }
+
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, _ids, chunk=40: [{
+            **_scoped_cloud_association(capture_id, status="imported"),
+            "lib_association_revision": 1,
+        }],
+    )
+    publications.clear()
+    malformed = server._reconcile_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+        capture_ids=[capture_id],
+    )
+
+    assert malformed["published"] == 0
+    assert "null scoped state" in malformed["errors"][0]
+    assert publications == []
+
+
+def test_stale_after_durable_ingest_is_first_acknowledged_as_imported(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a1616161-1616-4616-8616-161616161616"
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+    monkeypatch.setattr(
+        server.sbase,
+        "download_photo",
+        lambda _cfg, _path: _jpeg(capture_id),
+    )
+    ingest = server.ingest_capture
+
+    def ingest_then_edit(*args, **kwargs):
+        result = ingest(*args, **kwargs)
+        server._mark_capture_archive_stale(capture_id)
+        return result
+
+    monkeypatch.setattr(server, "ingest_capture", ingest_then_edit)
+    publications = []
+    deletions = []
+
+    def publish(*args, **kwargs):
+        publications.append((args, kwargs))
+        stale = server.CaptureArchiveAssociation.from_dict(args[3])
+        return _accepted_cloud_association(stale, 1)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        publish,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "delete_photos",
+        lambda *args: deletions.append(args),
+    )
+
+    result = server._import_capture(
+        owner_cfg,
+        capture_cfg,
+        {
+            **_capture(capture_id),
+            "photos": ["phone/photo_1.jpg"],
+            "lib_association_revision": 0,
+        },
+        "",
+        True,
+    )
+
+    assert result["status"] == "imported"
+    assert result["lib_association"]["state"] == "stale"
+    assert publications[0][1] == {
+        "expected_revision": 0,
+        "mark_imported": True,
+    }
+    assert deletions == []
+
+
+def test_terminal_stale_conflicts_converge_rebase_or_quarantine(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+
+    def seed(capture_id):
+        server.ingest_capture(
+            _capture(capture_id),
+            [_jpeg(capture_id)],
+            "",
+            ["photo_1.jpg"],
+            transport="cloud",
+        )
+        current = server._capture_archive_association(capture_id)
+        server._remember_cloud_capture_association(
+            current,
+            _accepted_cloud_association(current, 1),
+        )
+        stale = server._mark_capture_archive_stale(capture_id)
+        return current, stale
+
+    applied_id = "a1717171-1717-4717-8717-171717171717"
+    applied_current, applied_stale = seed(applied_id)
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            server.sbase.SyncError("HTTP 409 on POST rpc: conflict")
+        ),
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, ids, chunk=40: [
+            _scoped_cloud_association(
+                ids[0],
+                applied_stale,
+                revision=2,
+            )
+        ],
+    )
+    applied = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+    assert applied == {"pushed": 1, "pending": 0, "errors": []}
+
+    rebase_id = "a1818181-1818-4818-8818-181818181818"
+    rebase_current, rebase_stale = seed(rebase_id)
+    attempts = []
+
+    def rebase_publish(*args, **kwargs):
+        attempts.append(kwargs["expected_revision"])
+        if len(attempts) <= 2:
+            raise server.sbase.SyncError(
+                "HTTP 409 on POST rpc: revision changed"
+            )
+        return _accepted_cloud_association(rebase_stale, 4)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        rebase_publish,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, ids, chunk=40: [
+            _scoped_cloud_association(
+                ids[0],
+                rebase_current,
+                revision=3,
+            )
+        ],
+    )
+    rebased = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+    assert rebased == {"pushed": 1, "pending": 0, "errors": []}
+    assert attempts == [1, 1, 3]
+
+    deleted_id = "a1919191-1919-4919-8919-191919191919"
+    _deleted_current, _deleted_stale = seed(deleted_id)
+    calls = 0
+
+    def deleted_publish(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise server.sbase.SyncError(
+            "HTTP 404 on POST rpc: capture missing"
+        )
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        deleted_publish,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, _ids, chunk=40: [],
+    )
+    quarantined = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+    repeated = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+
+    assert quarantined == {"pushed": 0, "pending": 0, "errors": []}
+    assert repeated == {"pushed": 0, "pending": 0, "errors": []}
+    assert calls == 2
+    state = server._capture_cloud_association_state()
+    assert deleted_id not in state["pending"]
+    assert deleted_id not in state["shadows"]
+    assert state["quarantine"][-1]["capture_id"] == deleted_id
+    assert "deleted or no longer authorized" in (
+        state["quarantine"][-1]["reason"]
+    )
+
+
+def test_authorization_quarantine_is_not_requeued_until_facts_change(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a2020202-2020-4020-8020-202020202020"
+    server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="cloud",
+    )
+    current = server._capture_archive_association(capture_id)
+    server._remember_cloud_capture_association(
+        current,
+        _accepted_cloud_association(current, 1),
+    )
+    stale = server._mark_capture_archive_stale(capture_id)
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+    calls = 0
+
+    def unauthorized(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise server.sbase.SyncError(
+            "HTTP 403 on POST rpc: authorization changed"
+        )
+
+    remote = _scoped_cloud_association(
+        capture_id,
+        current,
+        revision=1,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        unauthorized,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, _ids, chunk=40: [remote],
+    )
+
+    first = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+    reconciled = server._reconcile_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+        capture_ids=[capture_id],
+    )
+    repeated = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+
+    assert stale is not None
+    assert first == {"pushed": 0, "pending": 0, "errors": []}
+    assert reconciled["observed"] == 1
+    assert reconciled["errors"] == []
+    assert repeated == {"pushed": 0, "pending": 0, "errors": []}
+    assert calls == 2
+    state = server._capture_cloud_association_state()
+    assert state["pending"] == {}
+    assert state["shadows"][capture_id] == {
+        "association": current.as_dict(),
+        "revision": 1,
+    }
+    assert state["quarantine"][-1]["local"] == stale.as_dict()
+
+
+def test_cloud_association_quarantine_is_bounded(monkeypatch):
+    _prepare_capture(monkeypatch)
+    for index in range(
+        server._CAPTURE_CLOUD_ASSOCIATION_QUARANTINE_KEEP + 5
+    ):
+        server._capture_cloud_quarantine_intent(
+            f"capture-{index}",
+            f"terminal-{index}",
+        )
+
+    quarantine = server._capture_cloud_association_state()["quarantine"]
+    assert len(quarantine) == (
+        server._CAPTURE_CLOUD_ASSOCIATION_QUARANTINE_KEEP
+    )
+    assert quarantine[0]["capture_id"] == "capture-5"
 
 
 def test_lan_import_duplicate_and_stale_return_monotonic_confirmation(

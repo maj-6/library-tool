@@ -406,6 +406,18 @@ def test_owner_phases_become_indeterminate_after_capture_meter(monkeypatch):
     association_calls = []
     monkeypatch.setattr(
         server,
+        "_reconcile_cloud_capture_associations",
+        lambda owner, capture: {
+            "observed": 1,
+            "bootstrapped": 1,
+            "published": 0,
+            "queued": 1,
+            "quarantined": 0,
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        server,
         "_publish_pending_cloud_capture_associations",
         lambda owner, capture: association_calls.append(
             (owner, capture)
@@ -435,6 +447,11 @@ def test_owner_phases_become_indeterminate_after_capture_meter(monkeypatch):
         ({"url": "owner"}, {"url": "capture"}),
     ]
     assert result["capture_associations"] == {
+        "observed": 1,
+        "bootstrapped": 1,
+        "published": 0,
+        "queued": 1,
+        "quarantined": 0,
         "pushed": 1,
         "pending": 0,
         "errors": [],
