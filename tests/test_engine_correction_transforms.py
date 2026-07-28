@@ -250,6 +250,11 @@ class FailingOcr:
         raise RuntimeError("provider unavailable")
 
 
+class SecretLeakingOcr:
+    def run_ocr_followup(self, request, hooks):
+        raise RuntimeError("Authorization: Bearer TOP-SECRET-SENTINEL")
+
+
 class ObservingHooks:
     def __init__(self, *, cancel_at: str = "") -> None:
         self.cancel_at = cancel_at
@@ -871,6 +876,23 @@ def test_ocr_failure_is_observable_and_does_not_roll_back_image_commit() -> None
     assert public.error.code == "ocr_followup_failed"
     assert public.outputs
     assert store.commits[0].human_assertions.text[0].text == "Verified transcription"
+
+
+def test_parent_job_sanitizes_untrusted_ocr_port_exceptions() -> None:
+    source = _source()
+    command = _command(source, rerun_ocr=True)
+    jobs, queue, _store, worker = _queued(
+        source,
+        command,
+        ocr=SecretLeakingOcr(),
+    )
+
+    result = worker.run(command)
+    public = jobs.get(queue.job_id)
+
+    assert result.ocr_followup.failure.message == "OCR follow-up failed"
+    assert "TOP-SECRET-SENTINEL" not in str(result.as_dict())
+    assert "TOP-SECRET-SENTINEL" not in str(public)
 
 
 def test_ports_remain_runtime_checkable_and_framework_neutral() -> None:

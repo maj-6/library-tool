@@ -1673,7 +1673,7 @@ class CorrectionTransformWorker:
                     failure=JobFailure(
                         "ocr_followup_unavailable",
                         "OCR follow-up provider is unavailable",
-                        retryable=True,
+                        retryable=False,
                     ),
                 )
             outcome = self._ocr.run_ocr_followup(
@@ -1733,7 +1733,7 @@ class CorrectionTransformWorker:
             return JobFailure(
                 "ocr_followup_cancelled",
                 "the corrected image was committed; OCR follow-up was cancelled",
-                retryable=True,
+                retryable=False,
             )
         return None
 

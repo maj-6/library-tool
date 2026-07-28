@@ -435,7 +435,7 @@
             failure: {
               code: "ocr_followup_interrupted",
               message: "OCR follow-up status is unknown after restart",
-              retryable: true,
+              retryable: false,
             },
           };
         } else if (ocrFailureCode === "ocr_followup_cancelled" ||

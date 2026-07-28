@@ -367,7 +367,7 @@ class CorrectionOcrFollowupService:
                         JobFailure(
                             "ocr_proposal_missing",
                             "the OCR child job has no durable proposal",
-                            retryable=True,
+                            retryable=False,
                         ),
                     )
                 if existing.state is JobState.INTERRUPTED:
@@ -500,25 +500,23 @@ class CorrectionOcrFollowupService:
                     if provider_work
                     else "OCR follow-up failed"
                 ),
-                retryable=provider_work,
+                retryable=False,
                 details={"exception": type(exc).__name__},
             )
-        if "failure" in locals():
-            self._jobs.transition(
-                record,
-                "failed",
-                errors=1,
-                error=failure.message,
-                failure=failure.as_dict(),
-                note="OCR proposal failed",
-                outputs=[],
-            )
-            return OcrFollowupOutcome(
-                OcrFollowupState.FAILED,
-                source=request.source,
-                failure=failure,
-            )
-        raise RuntimeError("OCR follow-up ended without an outcome")
+        self._jobs.transition(
+            record,
+            "failed",
+            errors=1,
+            error=failure.message,
+            failure=failure.as_dict(),
+            note="OCR proposal failed",
+            outputs=[],
+        )
+        return OcrFollowupOutcome(
+            OcrFollowupState.FAILED,
+            source=request.source,
+            failure=failure,
+        )
 
     def _succeed(
         self,
@@ -674,7 +672,7 @@ class CorrectionOcrFollowupService:
         failure = job.error or JobFailure(
             "ocr_followup_incomplete",
             f"OCR follow-up is {job.state.value}",
-            retryable=True,
+            retryable=False,
         )
         return OcrFollowupOutcome(
             OcrFollowupState.FAILED,

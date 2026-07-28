@@ -855,7 +855,7 @@ test("transform polling preserves committed outputs when restart interrupts OCR"
     result.ocr_followup.failure.code,
     "ocr_followup_interrupted",
   );
-  assert.equal(result.ocr_followup.failure.retryable, true);
+  assert.equal(result.ocr_followup.failure.retryable, false);
 });
 
 

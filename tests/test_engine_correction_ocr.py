@@ -392,11 +392,33 @@ def test_provider_failure_is_structured_on_the_child_job() -> None:
 
     assert result.state is OcrFollowupState.FAILED
     assert result.failure.code == "ocr_followup_failed"
-    assert result.failure.retryable is True
+    assert result.failure.retryable is False
     child = jobs.view(service.job_id_for(request.operation_id))
     assert child.state.value == "failed"
     assert child.error.code == "ocr_followup_failed"
     assert child.outputs == ()
+
+
+def test_provider_exception_details_never_enter_public_job_state() -> None:
+    secret = "Authorization: Bearer TOP-SECRET-SENTINEL"
+
+    class LeakingProvider(Provider):
+        def recognize(self, selection, content, hooks):
+            raise RuntimeError(secret)
+
+    jobs = JobManager(checkpoint_interval=0)
+    service = CorrectionOcrFollowupService(
+        jobs,
+        MemoryProposalRepository(),
+        LeakingProvider(),
+    )
+
+    result = service.run_ocr_followup(_request(), Hooks())
+    public = jobs.get(service.job_id_for(_request().operation_id))
+
+    assert result.failure.message == "OCR provider failed"
+    assert secret not in str(result.as_dict())
+    assert secret not in str(public)
 
 
 def test_checksum_mismatch_fails_before_invoking_provider() -> None:
