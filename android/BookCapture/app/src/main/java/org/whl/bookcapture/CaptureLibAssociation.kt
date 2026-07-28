@@ -111,11 +111,75 @@ internal data class CaptureImportState(
     val confirmation: CaptureLibConfirmation?,
 )
 
+internal enum class CaptureImportStateApplyResult {
+    APPLIED,
+    UNCHANGED,
+    STALE,
+    CONFLICT,
+    MISSING,
+}
+
 internal enum class CaptureLibApplyResult {
     APPLIED,
     UNCHANGED,
     STALE,
     CONFLICT,
+}
+
+/**
+ * Converge one current cloud capture row onto its retained phone entry.
+ *
+ * Callers hold [EntryOperationLocks] for [CaptureImportState.captureId]. The
+ * archive acknowledgement lands before the manifest status so `imported` can
+ * never appear locally ahead of a promised confirmation. Conflicting or stale
+ * acknowledgements abort the status application too: upload polling and the
+ * metadata pull worker can receive the same cloud row out of order.
+ */
+internal fun applyCaptureImportState(
+    dir: File,
+    incoming: CaptureImportState,
+): CaptureImportStateApplyResult {
+    if (incoming.captureId != dir.name) return CaptureImportStateApplyResult.CONFLICT
+    val manifestFile = File(dir, "manifest.json")
+    if (!manifestFile.isFile) return CaptureImportStateApplyResult.MISSING
+
+    // Parse before writing either sidecar. Corrupt local state remains intact
+    // and the worker retries instead of landing half of a response.
+    val manifest = JSONObject(manifestFile.readText())
+    val remoteStatus = normalizeRemoteImportStatus(incoming.status)
+    val localStatus = normalizeRemoteImportStatus(manifest.optString("cloud_status"))
+    if (incoming.confirmation == null &&
+        CaptureLibAssociationStore.read(dir) != null
+    ) return CaptureImportStateApplyResult.STALE
+    val associationResult = incoming.confirmation?.let {
+        CaptureLibAssociationStore.apply(dir, it)
+    } ?: CaptureLibApplyResult.UNCHANGED
+    if (associationResult == CaptureLibApplyResult.CONFLICT) {
+        return CaptureImportStateApplyResult.CONFLICT
+    }
+    if (associationResult == CaptureLibApplyResult.STALE) {
+        return CaptureImportStateApplyResult.STALE
+    }
+
+    // Terminal outcomes are final to the phone until the cloud reports another
+    // terminal outcome. This prevents a slower, older pending/processing
+    // response from regressing a result already landed by the other worker.
+    val statusRegressed = !isRemoteImportPending(localStatus) &&
+        isRemoteImportPending(remoteStatus)
+    val statusChanged = remoteStatus != localStatus && !statusRegressed
+    if (statusChanged) {
+        Entries.atomicWrite(
+            manifestFile,
+            manifest.put("cloud_status", remoteStatus).toString(),
+        )
+    }
+    return when {
+        statusChanged || associationResult == CaptureLibApplyResult.APPLIED ->
+            CaptureImportStateApplyResult.APPLIED
+        statusRegressed ->
+            CaptureImportStateApplyResult.STALE
+        else -> CaptureImportStateApplyResult.UNCHANGED
+    }
 }
 
 internal fun captureLibAssociationFromJson(

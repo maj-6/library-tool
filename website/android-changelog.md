@@ -3,6 +3,22 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.1 — 2026-07-28
+
+Android version code: `32`.
+
+### Other Changes
+
+- Sync captures and returning to Home now refresh the selected box from the cloud, while the last complete listing remains available offline if a refresh fails.
+- Large box listings load in stable pages until the cloud reports no more rows, instead of silently stopping after the first 500 captures.
+
+### Bugfixes
+
+- Normal cloud metadata sync now brings import status and desktop archive confirmation back to retained captures after the initial upload polling window has ended.
+- Late pending responses can no longer replace a newer terminal import result or archive confirmation on the phone.
+- Cloud-only box summaries are explicitly restricted to the signed-in owner and rejected if a response contains another account, an unexpected box, a duplicate, or a nonadvancing page.
+- Account changes and overlapping refreshes can no longer stamp stale box results onto the current cache, while deleted and merged collection keys are cleaned up conservatively.
+
 ## 0.5.1 — 2026-07-28
 
 Android version code: `31`.

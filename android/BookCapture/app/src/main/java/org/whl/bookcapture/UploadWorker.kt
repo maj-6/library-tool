@@ -1237,23 +1237,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             ) continue
             try {
                 EntryOperationLocks.withLock(entry.id) {
-                    val manifestFile = File(entry.dir, "manifest.json")
-                    if (!manifestFile.isFile) return@withLock
-                    remote.confirmation?.let { confirmation ->
-                        if (CaptureLibAssociationStore.apply(
-                                entry.dir,
-                                confirmation,
-                            ) == CaptureLibApplyResult.CONFLICT
-                        ) return@withLock
-                    }
-                    if (status != normalizeRemoteImportStatus(entry.cloudStatus)) {
-                        Entries.atomicWrite(
-                            manifestFile,
-                            JSONObject(manifestFile.readText())
-                                .put("cloud_status", status)
-                                .toString(),
-                        )
-                    }
+                    val latest = Entries.find(ctx, entry.id) ?: return@withLock
+                    applyCaptureImportState(latest.dir, remote)
                 }
             } catch (_: Exception) { }
         }

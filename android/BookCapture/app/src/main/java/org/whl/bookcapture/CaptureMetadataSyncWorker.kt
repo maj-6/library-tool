@@ -158,16 +158,21 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                     }
                 }
                 for ((captureId, importState) in importRows) {
-                    val confirmation = importState.confirmation ?: continue
                     if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
                     val applied = EntryOperationLocks.withLock(captureId) {
                         val entry = Entries.find(ctx, captureId)
-                            ?: return@withLock CaptureLibApplyResult.STALE
-                        CaptureLibAssociationStore.apply(entry.dir, confirmation)
+                            ?: return@withLock CaptureImportStateApplyResult.MISSING
+                        if (!entry.uploaded || entry.deliveryTransport == "lan" ||
+                            cloudUploadOwnership(
+                                readCaptureCreator(ctx, entry.dir),
+                                owner,
+                            ) != CloudUploadOwnership.ALLOWED
+                        ) return@withLock CaptureImportStateApplyResult.MISSING
+                        applyCaptureImportState(entry.dir, importState)
                     }
-                    if (applied == CaptureLibApplyResult.CONFLICT) {
+                    if (applied == CaptureImportStateApplyResult.CONFLICT) {
                         throw CaptureMetadataStateException(
-                            "conflicting archive confirmation revision for $captureId",
+                            "conflicting cloud capture state for $captureId",
                         )
                     }
                 }

@@ -5,9 +5,11 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 
 /**
@@ -23,6 +25,7 @@ class RemoteCollectionBooksTest {
     // capture_book_metadata's parser requires uuid capture ids, matching the
     // `captures.id` uuid column the entry id is inserted into.
     private val capA = "aaaaaaaa-0000-4000-8000-000000000001"
+    private val capM = "aaaaaaaa-0000-4000-8000-000000000008"
     private val capZ = "aaaaaaaa-0000-4000-8000-00000000000f"
     private val boxA = "00000000-0000-0000-0000-00000000000a"
     private val boxB = "00000000-0000-0000-0000-00000000000b"
@@ -44,8 +47,10 @@ class RemoteCollectionBooksTest {
         title: String = "Materia Medica",
         photos: Int = 3,
         createdAt: String = "2026-07-20T11:59:45.048996+00:00",
+        owner: String = owner1,
     ): JSONObject = JSONObject()
         .put("id", id)
+        .put("created_by", owner)
         .put("created_at", createdAt)
         .put("photos", JSONArray(List(photos) { "dev/$id/photo_$it.jpg" }))
         .put(CAPTURE_COLLECTION_ID_FIELD, collectionId ?: JSONObject.NULL)
@@ -140,6 +145,187 @@ class RemoteCollectionBooksTest {
         assertEquals(1784548785000L, parseCaptureCreatedAt("2026-07-20T11:59:45Z"))
         assertEquals(0L, parseCaptureCreatedAt("not a timestamp"))
         assertEquals(0L, parseCaptureCreatedAt(""))
+    }
+
+    @Test
+    fun ownerScopedParserRejectsMissingOrForeignOwners() {
+        val missingOwner = JSONObject(captureRow(capA).toString()).apply {
+            remove("created_by")
+        }
+        assertNull(
+            remoteCollectionBookFromCaptureJson(
+                missingOwner,
+                owner1,
+            ),
+        )
+        assertNull(remoteCollectionBookFromCaptureJson(captureRow(capA, owner = owner2), owner1))
+        assertEquals(capA, remoteCollectionBookFromCaptureJson(captureRow(capA), owner1)?.captureId)
+    }
+
+    @Test
+    fun cloudCollectionPagesContinueAfterShortPagesUntilAnEmptyPage() {
+        val cursors = mutableListOf<String?>()
+        val books = collectRemoteCollectionBookPages(
+            expectedOwnerId = owner1,
+            expectedCollectionIds = setOf(boxA),
+        ) { afterId ->
+            cursors += afterId
+            when (afterId) {
+                null -> JSONArray().put(captureRow(capA))
+                capA -> JSONArray().put(captureRow(capM))
+                capM -> JSONArray().put(captureRow(capZ))
+                else -> JSONArray()
+            }
+        }
+
+        assertEquals(listOf(capA, capM, capZ), books.map { it.captureId })
+        assertEquals(listOf(null, capA, capM, capZ), cursors)
+    }
+
+    @Test
+    fun cloudCollectionPagesFailClosedOnForeignOrNonadvancingRows() {
+        assertThrows(IOException::class.java) {
+            collectRemoteCollectionBookPages(owner1, setOf(boxA)) {
+                JSONArray().put(captureRow(capA, owner = owner2))
+            }
+        }
+        assertThrows(IOException::class.java) {
+            collectRemoteCollectionBookPages(owner1, setOf(boxA)) { afterId ->
+                if (afterId == null) JSONArray().put(captureRow(capA))
+                else JSONArray().put(captureRow(capA))
+            }
+        }
+        assertThrows(IOException::class.java) {
+            collectRemoteCollectionBookPages(owner1, setOf(boxA)) {
+                JSONArray().put(captureRow(capA, collectionId = boxB))
+            }
+        }
+    }
+
+    @Test
+    fun boxQueryPinsOwnerProjectionAndStableIdCursor() {
+        val first = captureCollectionBooksPath(owner1, setOf(boxB, boxA))
+        assertEquals(
+            "/rest/v1/captures?created_by=eq.$owner1" +
+                "&meta->>scan_collection_id=in.($boxA,$boxB)" +
+                "&select=id,created_by,created_at,photos" +
+                ",$CAPTURE_COLLECTION_ID_FIELD:meta->>scan_collection_id" +
+                ",$CAPTURE_COLLECTION_NAME_FIELD:meta->>scan_collection" +
+                ",title:meta->>title,author:meta->>author,year:meta->>year" +
+                "&order=id.asc&limit=$REMOTE_COLLECTION_BOOKS_PAGE_SIZE",
+            first,
+        )
+
+        val next = captureCollectionBooksPath(owner1, setOf(boxA), afterId = capA)
+        assertEquals(
+            "/rest/v1/captures?created_by=eq.$owner1" +
+                "&meta->>scan_collection_id=in.($boxA)" +
+                "&select=id,created_by,created_at,photos" +
+                ",$CAPTURE_COLLECTION_ID_FIELD:meta->>scan_collection_id" +
+                ",$CAPTURE_COLLECTION_NAME_FIELD:meta->>scan_collection" +
+                ",title:meta->>title,author:meta->>author,year:meta->>year" +
+                "&order=id.asc&limit=$REMOTE_COLLECTION_BOOKS_PAGE_SIZE&id=gt.$capA",
+            next,
+        )
+    }
+
+    @Test
+    fun cloudFetchTrackerRearmsByOwnerAndRejectsLateResponses() {
+        val tracker = RemoteCollectionFetchTracker()
+        val original = requireNotNull(tracker.begin(owner1, boxA))
+        assertNull(tracker.begin(owner1, boxA))
+        assertTrue(tracker.begin(owner2, boxA) != null)
+
+        tracker.rearm(owner1)
+        val refreshed = requireNotNull(tracker.begin(owner1, boxA))
+        assertFalse(tracker.isCurrent(original))
+        assertTrue(tracker.isCurrent(refreshed))
+        tracker.finish(original, landed = false)
+        assertTrue(tracker.isCurrent(refreshed))
+        tracker.finish(refreshed, landed = true)
+        assertNull(tracker.begin(owner1, boxA))
+
+        tracker.rearm(owner1)
+        val failed = requireNotNull(tracker.begin(owner1, boxA))
+        tracker.finish(failed, landed = false)
+        assertTrue(tracker.begin(owner1, boxA) != null)
+    }
+
+    @Test
+    fun staleFetchGenerationCannotReplaceTheCurrentCache() {
+        val target = tempFile()
+        val tracker = RemoteCollectionFetchTracker()
+        val original = requireNotNull(tracker.begin(owner1, boxA))
+        assertTrue(
+            RemoteCollectionBooks.record(
+                target,
+                owner1,
+                boxA,
+                listOf(remoteBook("baseline")),
+            ),
+        )
+
+        tracker.rearm(owner1)
+        val refreshed = requireNotNull(tracker.begin(owner1, boxA))
+        assertFalse(
+            RemoteCollectionBooks.record(
+                target,
+                owner1,
+                boxA,
+                listOf(remoteBook("stale")),
+            ) { tracker.isCurrent(original) },
+        )
+        assertEquals(
+            listOf("baseline"),
+            readRemoteCollectionBooksStore(target, owner1)
+                .byCollection.getValue(boxA).map { it.captureId },
+        )
+        assertTrue(
+            RemoteCollectionBooks.record(
+                target,
+                owner1,
+                boxA,
+                listOf(remoteBook("fresh")),
+            ) { tracker.isCurrent(refreshed) },
+        )
+        assertEquals(
+            listOf("fresh"),
+            readRemoteCollectionBooksStore(target, owner1)
+                .byCollection.getValue(boxA).map { it.captureId },
+        )
+    }
+
+    @Test
+    fun cacheCommitDropsOnlyExplicitlyObsoleteCollectionKeys() {
+        val target = tempFile()
+        assertTrue(
+            RemoteCollectionBooks.record(
+                target,
+                owner1,
+                boxA,
+                listOf(remoteBook("box-a")),
+            ),
+        )
+        assertTrue(
+            RemoteCollectionBooks.record(
+                target,
+                owner1,
+                boxB,
+                listOf(remoteBook("box-b", boxB)),
+            ),
+        )
+
+        assertTrue(
+            RemoteCollectionBooks.record(
+                target,
+                owner1,
+                boxC,
+                listOf(remoteBook("box-c", boxC)),
+                discardCollectionIds = setOf(boxA),
+            ),
+        )
+        val stored = readRemoteCollectionBooksStore(target, owner1)
+        assertEquals(setOf(boxB, boxC), stored.byCollection.keys)
     }
 
     // --- merge closure ---------------------------------------------------------
@@ -488,5 +674,18 @@ class RemoteCollectionBooksTest {
         assertFalse(
             remoteCollectionBooksStoreFromJson("""{"version":1,"collections":{}}""").valid,
         )
+    }
+
+    @Test
+    fun inspectCloudCacheCommitIsPinnedToTheRequestOwnerAndFetchGeneration() {
+        val source = File("src/main/java/org/whl/bookcapture/HomeActivity.kt").readText()
+            .substringAfter("private fun ensureRemoteBoxListing")
+
+        assertTrue(source.contains("remoteBoxFetches.begin(owner, collectionId)"))
+        assertTrue(source.contains("commitIf = {"))
+        assertTrue(source.contains("remoteBoxFetches.isCurrent(ticket)"))
+        assertTrue(source.contains("Prefs.userId(this@HomeActivity) == owner"))
+        assertTrue(source.contains("discardCollectionIds = records.asSequence()"))
+        assertTrue(source.contains("owner = owner"))
     }
 }

@@ -130,9 +130,9 @@ class HomeActivity : AppCompatActivity() {
     private var collectionBarJob: Job? = null
     private var collectionListJob: Job? = null
     private var inspectJob: Job? = null
-    /** Boxes already listed from the cloud this session; a failed listing is
-     * removed again so the next visit retries. */
-    private val remoteBoxFetches = linkedSetOf<String>()
+    /** Owner-scoped boxes already listed from the cloud this freshness
+     * generation; failures are re-armed for the next visit. */
+    private val remoteBoxFetches = RemoteCollectionFetchTracker()
     private var workerRefreshJob: Job? = null
     private var pendingWorkerContentRefresh = false
     private var pendingCollectionRefresh = false
@@ -297,6 +297,7 @@ class HomeActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         val signedIn = Auth.signedIn(this)
+        if (signedIn) remoteBoxFetches.rearm(Prefs.userId(this))
         binding.configWarning.visibility = if (signedIn) View.GONE else View.VISIBLE
         // A previously authorized batch may resume after process death, but a
         // new upload batch is created only by the Sync captures button.
@@ -508,6 +509,13 @@ class HomeActivity : AppCompatActivity() {
         }
         val pendingReviewChanges = Entries.recent(this).any {
             CaptureMetadataStore.hasPendingReviewSync(it.dir)
+        }
+        val owner = Prefs.userId(this)
+        if (owner.isNotEmpty()) {
+            remoteBoxFetches.rearm(owner)
+            if (activeTab == HomeTab.INSPECT) {
+                inspectedCollectionId?.let(::ensureRemoteBoxListing)
+            }
         }
         val state = UploadWorker.enqueueExplicitSync(this)
         CaptureMetadataSyncWorker.enqueueExplicitSync(this)
@@ -1647,7 +1655,7 @@ class HomeActivity : AppCompatActivity() {
     }
 
     /**
-     * List the selected box from the cloud, at most once per box per session.
+     * List the selected box from the cloud once per owner/freshness generation.
      *
      * The local rows are already on screen by the time this runs, so this only
      * ever ADDS books this handset does not hold. A failure is silent by design:
@@ -1664,7 +1672,7 @@ class HomeActivity : AppCompatActivity() {
         if (!Prefs.configured(this) || !Auth.signedIn(this)) return
         val owner = Prefs.userId(this)
         if (owner.isEmpty()) return
-        if (!remoteBoxFetches.add(collectionId)) return
+        val ticket = remoteBoxFetches.begin(owner, collectionId) ?: return
         lifecycleScope.launch {
             // `record` reports whether the cache now reflects the cloud, so an
             // unwritable or corrupt store re-arms the retry exactly like a network
@@ -1673,24 +1681,10 @@ class HomeActivity : AppCompatActivity() {
             try {
                 landed = withContext(Dispatchers.IO) {
                     try {
-                        val records = Collections.allRecords(this@HomeActivity)
-                        // Deleting a box must not leave its listing cached forever.
-                        // Keep only what Inspect can still render: a delete
-                        // TOMBSTONES the row rather than removing it, so keying the
-                        // keep-set off "still present in allRecords" would never
-                        // evict anything. An empty record list means the store was
-                        // unreadable, not that every box is gone — pruning then
-                        // would discard good listings.
-                        if (records.isNotEmpty()) {
-                            RemoteCollectionBooks.prune(
-                                this@HomeActivity,
-                                records.asSequence()
-                                    .filter { !it.deleted && it.mergedInto == null }
-                                    .flatMapTo(mutableSetOf()) {
-                                        collectionMergeClosure(records, it.id)
-                                    } + collectionId,
-                            )
+                        if (!remoteBoxFetches.isCurrent(ticket)) {
+                            return@withContext false
                         }
+                        val records = Collections.allRecords(this@HomeActivity)
                         // captures.meta keeps a merge loser's uuid forever, so ask
                         // for the whole closure or the old label's books vanish.
                         val closure = collectionMergeClosure(records, collectionId)
@@ -1711,7 +1705,20 @@ class HomeActivity : AppCompatActivity() {
                         } catch (_: Exception) {
                             books
                         }
-                        RemoteCollectionBooks.record(this@HomeActivity, collectionId, enriched)
+                        RemoteCollectionBooks.record(
+                            this@HomeActivity,
+                            collectionId,
+                            enriched,
+                            owner = owner,
+                            discardCollectionIds = records.asSequence()
+                                .filter { it.deleted || it.mergedInto != null }
+                                .mapTo(mutableSetOf()) { it.id },
+                            commitIf = {
+                                remoteBoxFetches.isCurrent(ticket) &&
+                                    Auth.signedIn(this@HomeActivity) &&
+                                    Prefs.userId(this@HomeActivity) == owner
+                            },
+                        )
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: Exception) {
@@ -1720,9 +1727,8 @@ class HomeActivity : AppCompatActivity() {
                 }
             } finally {
                 // Re-arm the retry for anything that did not land, cancellation
-                // included. Touching the set only from the main dispatcher keeps
-                // it consistent with every read of it.
-                if (!landed) remoteBoxFetches.remove(collectionId)
+                // and an invalidated generation included.
+                remoteBoxFetches.finish(ticket, landed)
             }
             if (!landed) return@launch
             if (activeTab != HomeTab.INSPECT ||

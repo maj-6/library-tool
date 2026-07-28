@@ -21,13 +21,15 @@ private const val SUPABASE_ERROR_RESPONSE_MAX_BYTES = 16 * 1024
 private const val CAPTURE_REVIEW_RESPONSE_MAX_BYTES = 128 * 1024
 private const val CAPTURE_IMPORT_ROW_MAX_BYTES = 12 * 1024
 
-/** A box listing projects five short jsonb fields per row rather than the whole
- * `meta`, so [REMOTE_COLLECTION_BOOKS_LIMIT] rows stay far inside this. */
-private const val CAPTURE_COLLECTION_RESPONSE_MAX_BYTES = 1024 * 1024
+/** A box listing projects short jsonb fields rather than the whole `meta`, so a
+ * [REMOTE_COLLECTION_BOOKS_PAGE_SIZE]-row page stays bounded independently of
+ * the number of pages in the complete snapshot. */
+private const val CAPTURE_COLLECTION_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
 
 /** Collection ids reach a PostgREST `in.(...)` list unquoted, so restrict them to
  * bare uuid characters rather than trusting a synced value. */
-private val SAFE_COLLECTION_FILTER_ID = Regex("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+internal val SAFE_COLLECTION_FILTER_ID =
+    Regex("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 private class SupabaseResponseTooLarge : IOException("Supabase response is too large")
 
@@ -48,6 +50,36 @@ internal fun readBoundedSupabaseResponse(input: InputStream, maximum: Int): Byte
 
 private fun encodedStoragePath(value: String): String = value.split('/').joinToString("/") {
     URLEncoder.encode(it, Charsets.UTF_8.name()).replace("+", "%20")
+}
+
+internal fun captureCollectionBooksPath(
+    ownerId: String,
+    collectionIds: Set<String>,
+    afterId: String? = null,
+    pageSize: Int = REMOTE_COLLECTION_BOOKS_PAGE_SIZE,
+): String {
+    require(SAFE_CAPTURE_SYNC_ID.matches(ownerId)) { "invalid capture owner" }
+    require(pageSize in 1..REMOTE_COLLECTION_BOOKS_PAGE_SIZE) { "invalid page size" }
+    val ids = collectionIds.asSequence()
+        .map { it.trim().lowercase() }
+        .filter(SAFE_COLLECTION_FILTER_ID::matches)
+        .distinct()
+        .sorted()
+        .toList()
+    require(ids.isNotEmpty()) { "collection ids are required" }
+    val cursor = afterId?.trim()?.lowercase()?.let {
+        require(SAFE_CAPTURE_SYNC_ID.matches(it)) { "invalid capture cursor" }
+        "&id=gt.${URLEncoder.encode(it, Charsets.UTF_8.name())}"
+    }.orEmpty()
+    val owner = URLEncoder.encode(ownerId.lowercase(), Charsets.UTF_8.name())
+    val filter = ids.joinToString(",")
+    val select = "id,created_by,created_at,photos" +
+        ",$CAPTURE_COLLECTION_ID_FIELD:meta->>scan_collection_id" +
+        ",$CAPTURE_COLLECTION_NAME_FIELD:meta->>scan_collection" +
+        ",title:meta->>title,author:meta->>author,year:meta->>year"
+    return "/rest/v1/captures?created_by=eq.$owner" +
+        "&meta->>scan_collection_id=in.($filter)" +
+        "&select=$select&order=id.asc&limit=$pageSize$cursor"
 }
 
 internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
@@ -200,6 +232,7 @@ class SupabaseClient(
         } catch (e: Exception) {
             if (code in 200..299) throw e else ""
         }
+        if (Prefs.userId(ctx) != ownerId) throw AccountChanged()
         if (code !in 200..299) {
             throw HttpException(code, "HTTP $code: ${body.take(300)}", body)
         }
@@ -305,13 +338,14 @@ class SupabaseClient(
      * Pass the whole merge closure (see [collectionMergeClosure]); `captures.meta`
      * still carries a merge loser's uuid forever.
      *
-     * RLS (`captures_select_authorized`, 001_baseline.sql:129) scopes this to rows
-     * this account created, so it needs no service key and no new grant. Rows a
-     * different contributor filed into the same physical box are NOT returned.
+     * Capture RLS also admits rows from contributors assigned to this account
+     * for desktop ingestion. The explicit owner predicate and response check
+     * deliberately narrow Android's personal cache back to rows this account
+     * created. It needs no service key and no new grant.
      */
     internal fun capturesForCollections(
         collectionIds: Collection<String>,
-        limit: Int = REMOTE_COLLECTION_BOOKS_LIMIT,
+        pageSize: Int = REMOTE_COLLECTION_BOOKS_PAGE_SIZE,
     ): List<RemoteCollectionBook> {
         val ids = collectionIds.asSequence()
             .map { it.trim() }
@@ -319,40 +353,28 @@ class SupabaseClient(
             .distinct()
             .toList()
         if (ids.isEmpty()) return emptyList()
-        // `meta` is inside the table-wide authenticated SELECT grant, so a jsonb
-        // path filter needs no schema change. Bare uuids need no quoting, and the
-        // regex above is what guarantees that.
-        val filter = ids.joinToString(",")
-        // Project the five fields a box listing needs instead of the whole `meta`
-        // blob: it also carries the extraction dump, capture notes and the photo
-        // asset contract, which would put a 500-row listing near the response cap
-        // for nothing.
-        val conn = open(
-            "GET",
-            "$baseUrl/rest/v1/captures" +
-                "?meta->>scan_collection_id=in.($filter)" +
-                "&select=id,created_at,photos" +
-                ",$CAPTURE_COLLECTION_ID_FIELD:meta->>scan_collection_id" +
-                ",$CAPTURE_COLLECTION_NAME_FIELD:meta->>scan_collection" +
-                ",title:meta->>title,author:meta->>author,year:meta->>year" +
-                "&order=created_at.desc&limit=$limit",
-            null,
-        )
-        val rows = try {
-            JSONArray(finish(conn, CAPTURE_COLLECTION_RESPONSE_MAX_BYTES).ifEmpty { "[]" })
-        } catch (e: org.json.JSONException) {
-            throw InvalidResponse("invalid collection capture response")
+        return collectRemoteCollectionBookPages(
+            ownerId,
+            ids.map { it.lowercase() }.toSet(),
+        ) { afterId ->
+            val conn = open(
+                "GET",
+                "$baseUrl${captureCollectionBooksPath(
+                    ownerId = ownerId,
+                    collectionIds = ids.toSet(),
+                    afterId = afterId,
+                    pageSize = pageSize,
+                )}",
+                null,
+            )
+            try {
+                JSONArray(
+                    finish(conn, CAPTURE_COLLECTION_RESPONSE_MAX_BYTES).ifEmpty { "[]" },
+                )
+            } catch (e: org.json.JSONException) {
+                throw InvalidResponse("invalid collection capture response")
+            }
         }
-        val out = linkedMapOf<String, RemoteCollectionBook>()
-        for (index in 0 until rows.length()) {
-            val parsed = rows.optJSONObject(index)
-                ?.let(::remoteCollectionBookFromCaptureJson) ?: continue
-            // Fail closed on a row the filter should not have returned rather
-            // than filing a book under a box it does not belong to.
-            if (parsed.collectionId !in ids || parsed.captureId in out) continue
-            out[parsed.captureId] = parsed
-        }
-        return out.values.toList()
     }
 
     /** Desktop-authored projections for this account's retained captures.
