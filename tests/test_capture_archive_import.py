@@ -1569,6 +1569,108 @@ def test_authorization_quarantine_is_not_requeued_until_facts_change(
     assert state["quarantine"][-1]["local"] == stale.as_dict()
 
 
+def test_missing_capability_rpc_preserves_visible_predecessor_until_rollout(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+
+    def seed(capture_id):
+        server.ingest_capture(
+            _capture(capture_id),
+            [_jpeg(capture_id)],
+            "",
+            ["photo_1.jpg"],
+            transport="cloud",
+        )
+        current = server._capture_archive_association(capture_id)
+        server._remember_cloud_capture_association(
+            current,
+            _accepted_cloud_association(current, 1),
+        )
+        return current, server._mark_capture_archive_stale(capture_id)
+
+    capture_id = "a2121212-2121-4121-8121-212121212121"
+    current, stale = seed(capture_id)
+    endpoint_available = False
+    publications = []
+
+    def publish(*args, **kwargs):
+        publications.append((args, kwargs))
+        if not endpoint_available:
+            raise server.sbase.SyncError(
+                "HTTP 404 on POST rpc/prepare_capture_lib_association: "
+                "function is missing"
+            )
+        return _accepted_cloud_association(stale, 2)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        publish,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, ids, chunk=40: [
+            _scoped_cloud_association(
+                ids[0],
+                current,
+                revision=1,
+            )
+        ],
+    )
+
+    unavailable = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+
+    assert unavailable["pushed"] == 0
+    assert unavailable["pending"] == 1
+    assert len(unavailable["errors"]) == 1
+    state = server._capture_cloud_association_state()
+    assert state["pending"][capture_id] == {
+        "association": stale.as_dict(),
+        "expected_revision": 1,
+    }
+    assert state["quarantine"] == []
+
+    endpoint_available = True
+    recovered = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+
+    assert recovered == {"pushed": 1, "pending": 0, "errors": []}
+    assert [call[1]["expected_revision"] for call in publications] == [
+        1,
+        1,
+        1,
+    ]
+
+    absent_id = "a2222222-2222-4222-8222-222222222222"
+    _absent_current, absent_stale = seed(absent_id)
+    endpoint_available = False
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, _ids, chunk=40: [],
+    )
+
+    absent = server._publish_pending_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+
+    assert absent == {"pushed": 0, "pending": 0, "errors": []}
+    state = server._capture_cloud_association_state()
+    assert absent_id not in state["pending"]
+    assert absent_id not in state["shadows"]
+    assert state["quarantine"][-1]["capture_id"] == absent_id
+    assert state["quarantine"][-1]["local"] == absent_stale.as_dict()
+
+
 def test_cloud_association_quarantine_is_bounded(monkeypatch):
     _prepare_capture(monkeypatch)
     for index in range(

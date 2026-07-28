@@ -21505,14 +21505,34 @@ def _reconcile_failed_cloud_capture_publication(
     if remote_association == association:
         _remember_scoped_cloud_capture_state(remote)
         return "applied", None
-    if (
-        allow_rebase
-        and status == 409
-        and isinstance(remote_association, CaptureArchiveAssociation)
+    exact_predecessor = (
+        isinstance(remote_association, CaptureArchiveAssociation)
         and _capture_association_is_exact_stale_transition(
             remote_association,
             association,
         )
+    )
+    if exact_predecessor and status in {404, 410}:
+        # During a capability migration the capture row remains authoritative
+        # even while the prepare/publish RPC endpoint is temporarily absent.
+        # Adopt its latest cursor and preserve the exact stale intent so a
+        # later sync retries after the endpoint becomes available.
+        _remember_scoped_cloud_capture_state(remote)
+        _queue_cloud_capture_stale_association(association)
+        if (
+            allow_rebase
+            and remote["lib_association_revision"] != expected_revision
+        ):
+            return "rebase", remote["lib_association_revision"]
+        return "deferred", None
+    if status in {404, 410}:
+        # A visible scoped row proves this is endpoint/capability rollout, not
+        # capture deletion. Keep the old intent for a later exact reconcile.
+        return "deferred", None
+    if (
+        allow_rebase
+        and status == 409
+        and exact_predecessor
         and remote["lib_association_revision"] != expected_revision
     ):
         _remember_scoped_cloud_capture_state(remote)
