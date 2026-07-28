@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 private const val TRASH_STAMP = ".trashed_at"
 private const val TRASH_TTL_MS = 7L * 24 * 60 * 60 * 1000   // ~7 days
+private const val CAPTURE_STARTED_AT_FILE = "started_at"
 
 /**
  * Process-wide publication gate for queue directories and the persisted live
@@ -74,6 +75,8 @@ class CaptureSession(private val ctx: Context) {
         private set
     var photoCount: Int = 0
         private set
+    var startedAtMillis: Long? = null
+        private set
     internal var creator: CaptureCreator? = null
         private set
     internal var provenance: CaptureProvenance? = null
@@ -102,6 +105,7 @@ class CaptureSession(private val ctx: Context) {
         deleteCaptureTemps(dir)
         cleanupCommittedThumbnailDeletes(dir)
         entryId = id
+        startedAtMillis = readCaptureStartedAt(dir)
         creator = creatorFor(dir)
         provenance = readProvenance(dir)
         refreshPhotoCount()
@@ -132,7 +136,13 @@ class CaptureSession(private val ctx: Context) {
             dir.deleteRecursively()
             error("Could not persist capture provenance")
         }
+        val startedAt = System.currentTimeMillis()
+        if (!writeCaptureStartedAt(dir, startedAt)) {
+            dir.deleteRecursively()
+            error("Could not persist capture start time")
+        }
         entryId = id
+        startedAtMillis = startedAt
         creator = captureCreator
         provenance = captureProvenance
         photoCount = 0
@@ -294,6 +304,7 @@ class CaptureSession(private val ctx: Context) {
         }
         if (photoCount == 0) {                    // a truly empty entry is just dropped
             entryId = null
+            startedAtMillis = null
             creator = null
             provenance = null
             entryDir(id).deleteRecursively()
@@ -307,6 +318,7 @@ class CaptureSession(private val ctx: Context) {
             provenance ?: readProvenance(entryDir(id)))
         if (!ok) return null                      // keep collecting; user retries
         entryId = null
+        startedAtMillis = null
         creator = null
         provenance = null
         photoCount = 0
@@ -324,6 +336,7 @@ class CaptureSession(private val ctx: Context) {
         // becomes an orphan that a later manual sync can recover and deliver.
         if (!moveToTrash(id)) return null
         entryId = null
+        startedAtMillis = null
         creator = null
         provenance = null
         photoCount = 0
@@ -363,6 +376,7 @@ class CaptureSession(private val ctx: Context) {
         if (dst.exists() || !moveDirectoryWithoutCopy(src, dst)) return@exclusive false
         File(dst, TRASH_STAMP).delete()
         entryId = id
+        startedAtMillis = readCaptureStartedAt(dst)
         creator = creatorFor(dst)
         provenance = readProvenance(dst)
         photoCount = dst.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }?.size ?: 0
@@ -623,6 +637,32 @@ internal fun overrideEntryFrom(dir: File, from: String): Boolean {
 
 internal const val CAPTURE_METADATA_FILE = "capture.json"
 private val CAPTURE_TEMP_NAME = Regex("\\.capture_\\d+_[0-9a-f-]+\\.pending\\.jpg")
+
+private fun writeCaptureStartedAt(dir: File, startedAtMillis: Long): Boolean = try {
+    Entries.atomicWrite(File(dir, CAPTURE_STARTED_AT_FILE), startedAtMillis.toString())
+    true
+} catch (_: Exception) {
+    false
+}
+
+/**
+ * New captures carry an explicit start time. For an open capture made by an
+ * older build, the oldest durable sidecar is the closest available start-time
+ * estimate and keeps the timer useful after an update.
+ */
+private fun readCaptureStartedAt(dir: File): Long? {
+    val persisted = File(dir, CAPTURE_STARTED_AT_FILE)
+        .takeIf { it.isFile }
+        ?.runCatching { readText().trim().toLong() }
+        ?.getOrNull()
+        ?.takeIf { it > 0L }
+    if (persisted != null) return persisted
+    return dir.listFiles()
+        ?.asSequence()
+        ?.filter { it.isFile && it.lastModified() > 0L }
+        ?.minOfOrNull { it.lastModified() }
+        ?: dir.lastModified().takeIf { it > 0L }
+}
 
 /** Move an entry atomically enough that failure leaves the queue copy intact.
  * Queue and trash both live under filesDir, so a directory move is supported;

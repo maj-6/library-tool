@@ -45,6 +45,18 @@
                 android:textColor="@color/whl_ink"
                 android:text="@string/entry_idle" />
 
+            <TextView
+                android:id="@+id/captureElapsed"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:fontFamily="monospace"
+                android:text="@string/capture_elapsed_zero"
+                android:textColor="@color/whl_green"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+
             <Space
                 android:layout_width="0dp"
                 android:layout_height="1dp"
