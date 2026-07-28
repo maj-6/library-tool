@@ -10,11 +10,21 @@ snapshot.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from ...engine.correction_transforms import CorrectionSourceSnapshot
-from ...engine.errors import ConflictError, EngineError, RepositoryError
+from ...engine.correction_transforms import (
+    CorrectionSourceSnapshot,
+    HumanTextAssertion,
+    HumanTextOrigin,
+)
+from ...engine.errors import (
+    ConflictError,
+    EngineError,
+    NotFoundError,
+    RepositoryError,
+    ValidationError,
+)
 from ...engine.raster_artifacts import (
     RasterArtifactKey,
     RasterArtifactProjectorPort,
@@ -25,6 +35,16 @@ from ...engine.spatial_annotations import (
     SpatialAnnotationProjectorPort,
     SpatialAnnotationView,
 )
+from ...engine.text_layer_aggregate import (
+    TextLayerDocumentView,
+    TextLayerSummaryView,
+    TextLayerUnitSnapshot,
+)
+
+
+HumanTextAssertionLookup = Callable[
+    [RasterArtifactView], Sequence[HumanTextAssertion]
+]
 
 
 def _close_stream(stream: Any) -> None:
@@ -35,6 +55,168 @@ def _close_stream(stream: Any) -> None:
         close()
     except Exception:
         pass
+
+
+def _human_text_origin(
+    unit: TextLayerUnitSnapshot,
+) -> HumanTextOrigin | None:
+    """Map canonical provenance to the correction transform's protection set."""
+
+    provenance = unit.provenance
+    if provenance.review_state == "rejected":
+        return None
+    if provenance.review_state in {"reviewed", "approved"}:
+        return HumanTextOrigin.VERIFIED
+    if provenance.origin == "human":
+        return HumanTextOrigin.MANUAL
+    if provenance.origin == "import":
+        return HumanTextOrigin.IMPORTED
+    return None
+
+
+def _human_text_assertion_id(
+    item_id: str,
+    layer_id: str,
+    selector: str,
+) -> str:
+    # Keep identity stable while text/provenance revisions change. Hashing also
+    # keeps the composed identity inside the correction contract's 128-byte
+    # portable identifier bound.
+    payload = f"{item_id}\0{layer_id}\0{selector}".encode("utf-8")
+    return "txt-" + hashlib.sha256(payload).hexdigest()
+
+
+class CanonicalTextLayerHumanAssertionReader:
+    """Project protected text from the canonical text-layer query service.
+
+    Text-layer selectors are deliberately opaque, so protection is scoped to
+    the artifact's exact representation revision rather than guessing that a
+    selector names its canvas. A list/get convergence check makes a changing
+    layer fail closed; the correction store's later source reload then uses
+    each unit revision as an ordinary dependent CAS pin.
+    """
+
+    def __init__(self, text_layers: Any) -> None:
+        for method in ("list", "get"):
+            if not callable(getattr(text_layers, method, None)):
+                raise TypeError(f"text_layers must expose {method}()")
+        self._text_layers = text_layers
+
+    def __call__(
+        self,
+        artifact: RasterArtifactView,
+    ) -> tuple[HumanTextAssertion, ...]:
+        if not isinstance(artifact, RasterArtifactView):
+            raise TypeError("artifact must be RasterArtifactView")
+        item_id = artifact.key.item_id
+        representation_id = artifact.source.representation_id
+        representation_revision = artifact.source.representation_revision
+        summaries = self._text_layers.list(item_id)
+        if isinstance(summaries, (str, bytes)) or not isinstance(
+            summaries,
+            Sequence,
+        ):
+            raise RepositoryError(
+                "the text-layer query returned an invalid collection",
+                code="invalid_correction_human_text_snapshot",
+                details=artifact.key.as_dict(),
+            )
+        values = tuple(summaries)
+        if any(not isinstance(value, TextLayerSummaryView) for value in values):
+            raise RepositoryError(
+                "the text-layer query returned an invalid summary",
+                code="invalid_correction_human_text_snapshot",
+                details=artifact.key.as_dict(),
+            )
+        layer_ids = tuple(value.layer_id for value in values)
+        if (
+            any(value.item_id != item_id for value in values)
+            or len(layer_ids) != len(set(layer_ids))
+        ):
+            raise RepositoryError(
+                "the text-layer query returned an incoherent collection",
+                code="invalid_correction_human_text_snapshot",
+                details=artifact.key.as_dict(),
+            )
+
+        assertions: list[HumanTextAssertion] = []
+        for summary in values:
+            if (
+                summary.source.representation_id != representation_id
+                or summary.source.pinned_revision != representation_revision
+            ):
+                continue
+            try:
+                view = self._text_layers.get(item_id, summary.layer_id)
+            except NotFoundError as exc:
+                raise ConflictError(
+                    "a protected text layer changed while it was read",
+                    code="correction_human_text_snapshot_changed",
+                    details={
+                        **artifact.key.as_dict(),
+                        "layer_id": summary.layer_id,
+                    },
+                ) from exc
+            if not isinstance(view, TextLayerDocumentView):
+                raise RepositoryError(
+                    "the text-layer query returned an invalid document",
+                    code="invalid_correction_human_text_snapshot",
+                    details={
+                        **artifact.key.as_dict(),
+                        "layer_id": summary.layer_id,
+                    },
+                )
+            if view.summary() != summary:
+                raise ConflictError(
+                    "a protected text layer changed while it was read",
+                    code="correction_human_text_snapshot_changed",
+                    details={
+                        **artifact.key.as_dict(),
+                        "layer_id": summary.layer_id,
+                    },
+                )
+            for unit in view.document.units:
+                origin = _human_text_origin(unit)
+                if origin is None:
+                    continue
+                try:
+                    assertions.append(
+                        HumanTextAssertion(
+                            assertion_id=_human_text_assertion_id(
+                                item_id,
+                                summary.layer_id,
+                                unit.selector,
+                            ),
+                            revision=unit.unit_revision,
+                            text=unit.text,
+                            origin=origin,
+                            language=view.document.language,
+                        )
+                    )
+                except ValidationError as exc:
+                    # Canonical units permit empty and much larger text than
+                    # the transform assertion envelope. Never silently drop a
+                    # human-owned value merely because the schemas differ.
+                    raise RepositoryError(
+                        "a protected text unit cannot fit the correction snapshot",
+                        code="incompatible_correction_human_text_assertion",
+                        details={
+                            **artifact.key.as_dict(),
+                            "layer_id": summary.layer_id,
+                            "selector": unit.selector,
+                            "cause_code": exc.code,
+                        },
+                    ) from exc
+
+        assertions.sort(key=lambda value: value.assertion_id)
+        assertion_ids = tuple(value.assertion_id for value in assertions)
+        if len(assertion_ids) != len(set(assertion_ids)):
+            raise RepositoryError(
+                "protected text identities collided",
+                code="invalid_correction_human_text_snapshot",
+                details=artifact.key.as_dict(),
+            )
+        return tuple(assertions)
 
 
 class FilesystemCorrectionSourceSnapshotReader:
@@ -50,6 +232,8 @@ class FilesystemCorrectionSourceSnapshotReader:
         raster_artifacts: RasterArtifactProjectorPort,
         spatial_annotations: SpatialAnnotationProjectorPort,
         resource_resolver: Any,
+        *,
+        human_text_assertions_for: HumanTextAssertionLookup | None = None,
     ) -> None:
         for value, method, label in (
             (raster_artifacts, "get_raster_artifact", "raster_artifacts"),
@@ -66,9 +250,17 @@ class FilesystemCorrectionSourceSnapshotReader:
         ):
             if not callable(getattr(value, method, None)):
                 raise TypeError(f"{label} must expose {method}()")
+        if (
+            human_text_assertions_for is not None
+            and not callable(human_text_assertions_for)
+        ):
+            raise TypeError(
+                "human_text_assertions_for must be callable or None"
+            )
         self._raster_artifacts = raster_artifacts
         self._spatial_annotations = spatial_annotations
         self._resource_resolver = resource_resolver
+        self._human_text_assertions_for = human_text_assertions_for
 
     def __call__(
         self,
@@ -117,11 +309,13 @@ class FilesystemCorrectionSourceSnapshotReader:
                 )
             content = self._read_resolved(key, artifact, resolved)
             annotations = self._annotations_for(artifact)
+            human_text_assertions = self._human_text_assertions(artifact)
             return CorrectionSourceSnapshot(
                 artifact=artifact,
                 source_revision=artifact.resource.revision,
                 content=content,
                 annotations=annotations,
+                human_text_assertions=human_text_assertions,
             )
         except EngineError:
             raise
@@ -247,4 +441,37 @@ class FilesystemCorrectionSourceSnapshotReader:
         )
 
 
-__all__ = ["FilesystemCorrectionSourceSnapshotReader"]
+    def _human_text_assertions(
+        self,
+        artifact: RasterArtifactView,
+    ) -> tuple[HumanTextAssertion, ...]:
+        lookup = self._human_text_assertions_for
+        if lookup is None:
+            return ()
+        values = lookup(artifact)
+        if isinstance(values, (str, bytes)) or not isinstance(
+            values,
+            Sequence,
+        ):
+            raise RepositoryError(
+                "the correction human-text lookup returned an invalid collection",
+                code="invalid_correction_human_text_snapshot",
+                details=artifact.key.as_dict(),
+            )
+        assertions = tuple(values)
+        if any(
+            not isinstance(value, HumanTextAssertion)
+            for value in assertions
+        ):
+            raise RepositoryError(
+                "the correction human-text lookup returned an invalid assertion",
+                code="invalid_correction_human_text_snapshot",
+                details=artifact.key.as_dict(),
+            )
+        return assertions
+
+
+__all__ = [
+    "CanonicalTextLayerHumanAssertionReader",
+    "FilesystemCorrectionSourceSnapshotReader",
+]

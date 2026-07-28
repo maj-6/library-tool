@@ -26,6 +26,7 @@ from ._filesystem_paths import (
 
 from ..adapters.filesystem import (
     AttachedPdfAssetLookup,
+    CanonicalTextLayerHumanAssertionReader,
     FilesystemAttachedPdfInspector,
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
@@ -470,10 +471,11 @@ class TextLayerAggregateBindings:
 
     This bundle is separate from :class:`ReplicaBindings`: installing the
     revisioned aggregate must neither replace nor silently alias the legacy
-    ``replica.text-layers`` compatibility service.  Entry resolution and the
-    broad mutation lock deliberately come from the common filesystem config
-    and resources, so an optional module cannot introduce a second path or
-    locking domain.
+    ``replica.text-layers`` compatibility service. Entry resolution comes from
+    the common filesystem config, and composition selects one shared broad
+    mutation lock. When Corrections also consumes this aggregate, both use its
+    reentrant catalogue-lock adapter so the cross-aggregate snapshot cannot
+    introduce a second nested lock domain.
     """
 
     item_exists_for: TextLayerItemMembership
@@ -1005,11 +1007,45 @@ def compose_filesystem_engine(
         entries_path,
     )
 
+    corrections_lock = (
+        _ReentrantContextFactory(corrections.lock_context_for)
+        if corrections is not None
+        else None
+    )
+    text_layer_lock = (
+        corrections_lock
+        if corrections_lock is not None
+        else _ReentrantContextFactory(
+            lambda: resources.workspace_lock_context_for("")
+        )
+    )
+    native_text_layers = None
+    if text_layer_aggregate is not None:
+        native_text_layers = TextLayerAggregateService(
+            FilesystemTextLayerAggregateRepository(
+                resources.write_set,
+                item_exists_for=text_layer_aggregate.item_exists_for,
+                entry_directory_for=entry_directory_for,
+                source_snapshot_for=(
+                    text_layer_aggregate.source_snapshot_for
+                ),
+                layer_id_factory=text_layer_aggregate.layer_id_factory,
+                # Corrections source reloads query this repository while its
+                # authority lock is already held. Share the exact reentrant
+                # wrapper when both aggregates are installed so a host lock
+                # implemented with ``threading.Lock`` is not reacquired.
+                lock_context_for=text_layer_lock,
+                # Startup recovery is owned by the process host. Repeating it
+                # here would introduce a second, narrower lock domain.
+                recover=False,
+            )
+        )
+
     corrections_artifacts = None
     correction_commands = None
     correction_transforms = None
     if corrections is not None:
-        corrections_lock = _ReentrantContextFactory(corrections.lock_context_for)
+        assert corrections_lock is not None
         corrections_base = FilesystemCorrectionsArtifactRepository(
             resources.write_set,
             item_exists=corrections.item_exists_for,
@@ -1070,6 +1106,11 @@ def compose_filesystem_engine(
             corrections_artifacts,
             corrections_artifacts,
             corrections_artifacts,
+            human_text_assertions_for=(
+                CanonicalTextLayerHumanAssertionReader(native_text_layers)
+                if native_text_layers is not None
+                else None
+            ),
         )
         correction_transform_worker = CorrectionTransformWorker(
             resources.jobs,
@@ -1107,26 +1148,6 @@ def compose_filesystem_engine(
                 inspect_media=canvases.inspect_media,
                 allocate_canvas_id=canvases.allocate_canvas_id,
                 lock_context_for=canvases.lock_context_for,
-                recover=False,
-            )
-        )
-
-    native_text_layers = None
-    if text_layer_aggregate is not None:
-        native_text_layers = TextLayerAggregateService(
-            FilesystemTextLayerAggregateRepository(
-                resources.write_set,
-                item_exists_for=text_layer_aggregate.item_exists_for,
-                entry_directory_for=entry_directory_for,
-                source_snapshot_for=(
-                    text_layer_aggregate.source_snapshot_for
-                ),
-                layer_id_factory=text_layer_aggregate.layer_id_factory,
-                lock_context_for=lambda: (
-                    resources.workspace_lock_context_for("")
-                ),
-                # Startup recovery is owned by the process host.  Repeating
-                # it here would introduce a second, narrower lock domain.
                 recover=False,
             )
         )

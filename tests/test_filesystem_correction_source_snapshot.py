@@ -7,9 +7,15 @@ from dataclasses import dataclass
 import pytest
 
 from librarytool.adapters.filesystem import (
+    CanonicalTextLayerHumanAssertionReader,
     FilesystemCorrectionSourceSnapshotReader,
 )
-from librarytool.engine.errors import ConflictError
+from librarytool.engine.correction_transforms import HumanTextOrigin
+from librarytool.engine.errors import (
+    ConflictError,
+    NotFoundError,
+    RepositoryError,
+)
 from librarytool.engine.raster_artifacts import (
     RasterArtifactKey,
     RasterArtifactView,
@@ -24,6 +30,15 @@ from librarytool.engine.spatial_annotations import (
     SpatialAnnotationKey,
     SpatialAnnotationView,
     SpatialSourceRef,
+)
+from librarytool.engine.text_layer_aggregate import (
+    TextLayerDocumentSnapshot,
+    TextLayerDocumentView,
+    TextLayerDraft,
+    TextLayerProvenance,
+    TextLayerSourcePin,
+    TextLayerSourceView,
+    TextLayerUnitDraft,
 )
 
 
@@ -134,6 +149,54 @@ class _Resolver:
         )
 
 
+def _text_layer_view(
+    layer_id,
+    units,
+    *,
+    representation_id="capture",
+    source_revision="capture-r1",
+    language="en",
+):
+    document = TextLayerDocumentSnapshot.build(
+        "book-1",
+        layer_id,
+        TextLayerDraft(
+            source=TextLayerSourcePin(
+                representation_id,
+                source_revision,
+            ),
+            units=tuple(units),
+            language=language,
+        ),
+    )
+    return TextLayerDocumentView.build(
+        document,
+        TextLayerSourceView(
+            representation_id,
+            source_revision,
+            source_revision,
+            True,
+        ),
+    )
+
+
+class _TextLayers:
+    def __init__(self, views):
+        self.views = {
+            value.document.layer_id: value
+            for value in views
+        }
+        self.calls = []
+
+    def list(self, item_id):
+        self.calls.append(("list", item_id))
+        return tuple(value.summary() for value in self.views.values())
+
+    def get(self, item_id, layer_id):
+        self.calls.append(("get", item_id, layer_id))
+        return self.views[layer_id]
+
+
 def test_reader_copies_verified_bytes_and_canvas_annotations() -> None:
     content = b"immutable-raster-source"
     artifact = _artifact(content)
@@ -151,6 +214,7 @@ def test_reader_copies_verified_bytes_and_canvas_annotations() -> None:
     assert snapshot.source_revision == "bytes-r1"
     assert snapshot.content == content
     assert snapshot.annotations == (_annotation(),)
+    assert snapshot.human_text_assertions == ()
     assert spatial.calls == [("book-1", "capture", "canvas-1")]
     assert resolver.stream.closed is True
 
@@ -206,3 +270,278 @@ def test_reader_rejects_changed_bytes_and_closes_the_snapshot_stream() -> None:
 
     assert raised.value.code == "correction_source_stale"
     assert resolver.stream.closed is True
+
+
+def test_reader_projects_only_human_owned_text_for_exact_source_revision() -> None:
+    content = b"immutable-raster-source"
+    artifact = _artifact(content)
+    protected = _text_layer_view(
+        "layer-protected",
+        (
+            TextLayerUnitDraft(
+                "unit-human",
+                0,
+                "Human edit",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+            TextLayerUnitDraft(
+                "unit-import",
+                1,
+                "Imported text",
+                provenance=TextLayerProvenance(origin="import"),
+            ),
+            TextLayerUnitDraft(
+                "unit-reviewed",
+                2,
+                "Reviewed OCR",
+                provenance=TextLayerProvenance(
+                    origin="machine",
+                    review_state="reviewed",
+                ),
+            ),
+            TextLayerUnitDraft(
+                "unit-approved",
+                3,
+                "Approved derivation",
+                provenance=TextLayerProvenance(
+                    origin="derived",
+                    review_state="approved",
+                ),
+            ),
+            TextLayerUnitDraft(
+                "unit-machine",
+                4,
+                "Unreviewed OCR",
+                provenance=TextLayerProvenance(origin="machine"),
+            ),
+            TextLayerUnitDraft(
+                "unit-rejected",
+                5,
+                "Rejected edit",
+                provenance=TextLayerProvenance(
+                    origin="human",
+                    review_state="rejected",
+                ),
+            ),
+        ),
+    )
+    stale = _text_layer_view(
+        "layer-stale",
+        (
+            TextLayerUnitDraft(
+                "unit-old",
+                0,
+                "Old human text",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+        source_revision="capture-r0",
+    )
+    text_layers = _TextLayers((protected, stale))
+    reader = FilesystemCorrectionSourceSnapshotReader(
+        _Raster(artifact),
+        _Spatial(()),
+        _Resolver(artifact, content),
+        human_text_assertions_for=(
+            CanonicalTextLayerHumanAssertionReader(text_layers)
+        ),
+    )
+
+    snapshot = reader(artifact.key)
+
+    assertions = {
+        assertion.text: assertion
+        for assertion in snapshot.human_text_assertions
+    }
+    units = {
+        unit.text: unit
+        for unit in protected.document.units
+    }
+    assert set(assertions) == {
+        "Human edit",
+        "Imported text",
+        "Reviewed OCR",
+        "Approved derivation",
+    }
+    assert assertions["Human edit"].origin is HumanTextOrigin.MANUAL
+    assert assertions["Imported text"].origin is HumanTextOrigin.IMPORTED
+    assert assertions["Reviewed OCR"].origin is HumanTextOrigin.VERIFIED
+    assert assertions["Approved derivation"].origin is HumanTextOrigin.VERIFIED
+    assert all(value.language == "en" for value in assertions.values())
+    assert all(
+        assertions[text].revision == units[text].unit_revision
+        for text in assertions
+    )
+    assert text_layers.calls == [
+        ("list", "book-1"),
+        ("get", "book-1", "layer-protected"),
+    ]
+
+
+def test_human_text_identity_is_stable_while_unit_revision_tracks_edits() -> None:
+    artifact = _artifact(b"source")
+    before = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                "Before",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+    )
+    after = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                "After",
+                provenance=TextLayerProvenance(
+                    origin="human",
+                    review_state="reviewed",
+                ),
+            ),
+        ),
+    )
+
+    first = CanonicalTextLayerHumanAssertionReader(_TextLayers((before,)))(
+        artifact
+    )[0]
+    second = CanonicalTextLayerHumanAssertionReader(_TextLayers((after,)))(
+        artifact
+    )[0]
+
+    assert first.assertion_id == second.assertion_id
+    assert first.revision != second.revision
+    assert first.origin is HumanTextOrigin.MANUAL
+    assert second.origin is HumanTextOrigin.VERIFIED
+
+
+def test_human_text_reader_rejects_a_layer_that_changes_between_reads() -> None:
+    artifact = _artifact(b"source")
+    before = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                "Before",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+    )
+    after = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                "After",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+    )
+
+    class ChangingTextLayers:
+        def list(self, _item_id):
+            return (before.summary(),)
+
+        def get(self, _item_id, _layer_id):
+            return after
+
+    with pytest.raises(ConflictError) as raised:
+        CanonicalTextLayerHumanAssertionReader(ChangingTextLayers())(
+            artifact
+        )
+
+    assert raised.value.code == "correction_human_text_snapshot_changed"
+
+
+def test_human_text_reader_fails_closed_when_a_listed_layer_disappears() -> None:
+    artifact = _artifact(b"source")
+    view = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                "Protected",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+    )
+
+    class MissingTextLayer:
+        def list(self, _item_id):
+            return (view.summary(),)
+
+        def get(self, _item_id, _layer_id):
+            raise NotFoundError(
+                "gone",
+                code="text_layer_not_found",
+            )
+
+    with pytest.raises(ConflictError) as raised:
+        CanonicalTextLayerHumanAssertionReader(MissingTextLayer())(artifact)
+
+    assert raised.value.code == "correction_human_text_snapshot_changed"
+
+
+def test_human_text_reader_rejects_an_incomplete_document_projection() -> None:
+    artifact = _artifact(b"source")
+    view = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                "Protected",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+    )
+
+    class IncompleteTextLayer:
+        def list(self, _item_id):
+            return (view.summary(),)
+
+        def get(self, _item_id, _layer_id):
+            return None
+
+    with pytest.raises(RepositoryError) as raised:
+        CanonicalTextLayerHumanAssertionReader(IncompleteTextLayer())(
+            artifact
+        )
+
+    assert raised.value.code == "invalid_correction_human_text_snapshot"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "x" * 1_000_001],
+    ids=("empty", "oversized"),
+)
+def test_human_text_reader_never_silently_drops_incompatible_text(text) -> None:
+    artifact = _artifact(b"source")
+    view = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                text,
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        CanonicalTextLayerHumanAssertionReader(_TextLayers((view,)))(
+            artifact
+        )
+
+    assert raised.value.code == (
+        "incompatible_correction_human_text_assertion"
+    )

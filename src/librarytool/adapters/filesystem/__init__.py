@@ -18,6 +18,7 @@ from .capture_archive_repository import FilesystemCaptureArchiveRepository
 from .correction_repository import FilesystemCorrectionRepository
 from .correction_transform_store import FilesystemCorrectionTransformStore
 from .correction_source_snapshot import (
+    CanonicalTextLayerHumanAssertionReader,
     FilesystemCorrectionSourceSnapshotReader,
 )
 from .corrections_artifact_repository import (
@@ -64,6 +65,7 @@ __all__ = [
     "ATTACHED_PDF_PARSER_ISOLATION",
     "ATTACHED_PDF_SNAPSHOT_EVIDENCE_PROFILE",
     "AttachedPdfAssetLookup",
+    "CanonicalTextLayerHumanAssertionReader",
     "EMPTY_MANAGED_TREE_REVISION",
     "FilesystemAttachedPdfAssetSnapshot",
     "FilesystemAttachedPdfInspector",

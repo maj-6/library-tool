@@ -16,6 +16,7 @@ import pytest
 from pypdf import PdfWriter
 
 from librarytool.adapters.filesystem import (
+    CanonicalTextLayerHumanAssertionReader,
     EMPTY_MANAGED_TREE_REVISION,
     FilesystemAttachedPdfAssetSnapshot,
     FilesystemCanvasEvidence,
@@ -1021,6 +1022,61 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     assert workbench["visible"] is True
     assert workbench["status"] == "available"
     assert workbench["requires"] == module["provides"]
+
+
+def test_corrections_source_uses_installed_native_text_layer_service(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    lock_state = {"held": False, "entries": 0}
+
+    @contextmanager
+    def non_reentrant_authority_lock():
+        if lock_state["held"]:
+            raise RuntimeError("authority lock was reacquired")
+        lock_state["held"] = True
+        lock_state["entries"] += 1
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
+
+    corrections = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda _item_id: None,
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=non_reentrant_authority_lock,
+    )
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=corrections,
+        text_layer_aggregate=_native_text_layer_bindings(),
+    )["engine"]
+
+    text_layers = engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE)
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    worker = transforms._executor.__self__
+    source_reader = worker._store._source_snapshot_for
+    assertion_reader = source_reader._human_text_assertions_for
+    text_repository = text_layers._repository
+
+    assert isinstance(
+        assertion_reader,
+        CanonicalTextLayerHumanAssertionReader,
+    )
+    assert assertion_reader._text_layers is text_layers
+    assert worker._store._lock_context_for is (
+        text_repository._lock_context_for
+    )
+    with worker._store._lock_context_for():
+        with text_repository._lock_context_for():
+            pass
+    assert lock_state == {"held": False, "entries": 1}
 
 
 def test_native_text_layer_vertical_is_absent_without_complete_bindings(
