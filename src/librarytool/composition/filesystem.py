@@ -26,10 +26,12 @@ from ._filesystem_paths import (
 
 from ..adapters.filesystem import (
     AttachedPdfAssetLookup,
+    CanonicalTextLayerHumanAssertionReader,
     FilesystemAttachedPdfInspector,
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
+    FilesystemCorrectionOcrProposalRepository,
     FilesystemCorrectionRepository,
     FilesystemCorrectionSourceSnapshotReader,
     FilesystemCorrectionTransformStore,
@@ -56,6 +58,12 @@ from ..engine.correction_projection import (
     CorrectionAggregateProjector,
     CorrectionProjectionService,
     reconcile_correction_aggregates,
+)
+from ..engine.correction_ocr import (
+    CORRECTION_OCR_MAX_SOURCE_BYTES,
+    CorrectionOcrFollowupService,
+    CorrectionOcrProposalQueryService,
+    CorrectionOcrProviderPort,
 )
 from ..engine.corrections import CorrectionService
 from ..engine.correction_transforms import (
@@ -108,6 +116,7 @@ from ..engine.runtime import (
     CORRECTION_METADATA_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
@@ -435,6 +444,7 @@ class CorrectionsBindings:
     representation_revision_for: CorrectionsRepresentationRevision
     lock_context_for: CatalogueLockFactory
     job_start_context_for: ItemLockFactory | None = None
+    ocr_provider: CorrectionOcrProviderPort | None = None
 
     def __post_init__(self) -> None:
         capture_authority_root = Path(self.capture_authority_root)
@@ -462,6 +472,13 @@ class CorrectionsBindings:
             and not callable(self.job_start_context_for)
         ):
             raise TypeError("job_start_context_for must be callable or None")
+        if (
+            self.ocr_provider is not None
+            and not isinstance(self.ocr_provider, CorrectionOcrProviderPort)
+        ):
+            raise TypeError(
+                "ocr_provider must implement CorrectionOcrProviderPort or be None"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,10 +487,11 @@ class TextLayerAggregateBindings:
 
     This bundle is separate from :class:`ReplicaBindings`: installing the
     revisioned aggregate must neither replace nor silently alias the legacy
-    ``replica.text-layers`` compatibility service.  Entry resolution and the
-    broad mutation lock deliberately come from the common filesystem config
-    and resources, so an optional module cannot introduce a second path or
-    locking domain.
+    ``replica.text-layers`` compatibility service. Entry resolution comes from
+    the common filesystem config, and composition selects one shared broad
+    mutation lock. When Corrections also consumes this aggregate, both use its
+    reentrant catalogue-lock adapter so the cross-aggregate snapshot cannot
+    introduce a second nested lock domain.
     """
 
     item_exists_for: TextLayerItemMembership
@@ -842,6 +860,7 @@ class FilesystemServiceGraph:
     provider_discovery: ProviderDiscoveryService | None = None
     correction_commands: CorrectionService | None = None
     correction_transforms: CorrectionTransformService | None = None
+    correction_ocr_proposals: CorrectionOcrProposalQueryService | None = None
     raster_artifacts: RasterArtifactProjectorPort | None = None
     spatial_annotations: SpatialAnnotationProjectorPort | None = None
 
@@ -882,6 +901,21 @@ class FilesystemServiceGraph:
                 "correction_transforms must be a "
                 "CorrectionTransformService or None"
             )
+        if (self.correction_transforms is None) != (
+            self.correction_ocr_proposals is None
+        ):
+            raise ValueError(
+                "correction transform and OCR proposal query services must "
+                "be installed together"
+            )
+        if self.correction_ocr_proposals is not None and not isinstance(
+            self.correction_ocr_proposals,
+            CorrectionOcrProposalQueryService,
+        ):
+            raise TypeError(
+                "correction_ocr_proposals must be a "
+                "CorrectionOcrProposalQueryService or None"
+            )
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
@@ -902,6 +936,10 @@ class FilesystemServiceGraph:
             (CORRECTION_METADATA_SERVICE, self.correction_commands),
             (CORRECTION_REVIEW_SERVICE, self.correction_commands),
             (CORRECTION_SERVICE, self.correction_commands),
+            (
+                CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+                self.correction_ocr_proposals,
+            ),
             (CORRECTION_TRANSFORM_SERVICE, self.correction_transforms),
             (RASTER_ARTIFACT_QUERY_SERVICE, self.raster_artifacts),
             (
@@ -1005,11 +1043,46 @@ def compose_filesystem_engine(
         entries_path,
     )
 
+    corrections_lock = (
+        _ReentrantContextFactory(corrections.lock_context_for)
+        if corrections is not None
+        else None
+    )
+    text_layer_lock = (
+        corrections_lock
+        if corrections_lock is not None
+        else _ReentrantContextFactory(
+            lambda: resources.workspace_lock_context_for("")
+        )
+    )
+    native_text_layers = None
+    if text_layer_aggregate is not None:
+        native_text_layers = TextLayerAggregateService(
+            FilesystemTextLayerAggregateRepository(
+                resources.write_set,
+                item_exists_for=text_layer_aggregate.item_exists_for,
+                entry_directory_for=entry_directory_for,
+                source_snapshot_for=(
+                    text_layer_aggregate.source_snapshot_for
+                ),
+                layer_id_factory=text_layer_aggregate.layer_id_factory,
+                # Corrections source reloads query this repository while its
+                # authority lock is already held. Share the exact reentrant
+                # wrapper when both aggregates are installed so a host lock
+                # implemented with ``threading.Lock`` is not reacquired.
+                lock_context_for=text_layer_lock,
+                # Startup recovery is owned by the process host. Repeating it
+                # here would introduce a second, narrower lock domain.
+                recover=False,
+            )
+        )
+
     corrections_artifacts = None
     correction_commands = None
     correction_transforms = None
+    correction_ocr_proposals = None
     if corrections is not None:
-        corrections_lock = _ReentrantContextFactory(corrections.lock_context_for)
+        assert corrections_lock is not None
         corrections_base = FilesystemCorrectionsArtifactRepository(
             resources.write_set,
             item_exists=corrections.item_exists_for,
@@ -1070,15 +1143,64 @@ def compose_filesystem_engine(
             corrections_artifacts,
             corrections_artifacts,
             corrections_artifacts,
+            human_text_assertions_for=(
+                CanonicalTextLayerHumanAssertionReader(native_text_layers)
+                if native_text_layers is not None
+                else None
+            ),
         )
+        def correction_ocr_source_bytes_for(
+            item_id: str,
+            operation_id: str,
+            output,
+        ) -> bytes | None:
+            resolved = correction_transform_store.resolve_committed_output(
+                item_id,
+                operation_id,
+                output,
+            )
+            if resolved is None:
+                return None
+            try:
+                content = resolved.stream.read(
+                    CORRECTION_OCR_MAX_SOURCE_BYTES + 1
+                )
+                if len(content) > CORRECTION_OCR_MAX_SOURCE_BYTES:
+                    raise RepositoryError(
+                        "the corrected OCR rendition exceeds its size budget",
+                        code="correction_ocr_source_too_large",
+                    )
+                return content
+            finally:
+                resolved.stream.close()
+
+        correction_ocr_repository = FilesystemCorrectionOcrProposalRepository(
+            resources.write_set,
+            source_bytes_for=correction_ocr_source_bytes_for,
+            lock_context_for=corrections_lock,
+            recover=False,
+        )
+        correction_ocr_proposals = CorrectionOcrProposalQueryService(
+            correction_ocr_repository
+        )
+        correction_ocr = None
+        if corrections.ocr_provider is not None:
+            correction_ocr = CorrectionOcrFollowupService(
+                resources.jobs,
+                correction_ocr_repository,
+                corrections.ocr_provider,
+            )
         correction_transform_worker = CorrectionTransformWorker(
             resources.jobs,
             correction_transform_store,
+            ocr=correction_ocr,
         )
         correction_transforms = CorrectionTransformService(
             resources.jobs,
             executor=correction_transform_worker.run,
             start_guard_for=corrections.job_start_context_for,
+            committed_transforms=correction_transform_store,
+            ocr_outcomes=correction_ocr,
         )
 
     canvas_query = None
@@ -1107,26 +1229,6 @@ def compose_filesystem_engine(
                 inspect_media=canvases.inspect_media,
                 allocate_canvas_id=canvases.allocate_canvas_id,
                 lock_context_for=canvases.lock_context_for,
-                recover=False,
-            )
-        )
-
-    native_text_layers = None
-    if text_layer_aggregate is not None:
-        native_text_layers = TextLayerAggregateService(
-            FilesystemTextLayerAggregateRepository(
-                resources.write_set,
-                item_exists_for=text_layer_aggregate.item_exists_for,
-                entry_directory_for=entry_directory_for,
-                source_snapshot_for=(
-                    text_layer_aggregate.source_snapshot_for
-                ),
-                layer_id_factory=text_layer_aggregate.layer_id_factory,
-                lock_context_for=lambda: (
-                    resources.workspace_lock_context_for("")
-                ),
-                # Startup recovery is owned by the process host.  Repeating
-                # it here would introduce a second, narrower lock domain.
                 recover=False,
             )
         )
@@ -1282,6 +1384,7 @@ def compose_filesystem_engine(
         provider_discovery=(None if providers is None else providers.service),
         correction_commands=correction_commands,
         correction_transforms=correction_transforms,
+        correction_ocr_proposals=correction_ocr_proposals,
         raster_artifacts=corrections_artifacts,
         spatial_annotations=corrections_artifacts,
     )

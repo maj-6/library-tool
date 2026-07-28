@@ -7,8 +7,9 @@ shell, or future Qt/Godot client may choose a different executor while sharing
 the same observable lifecycle contract.
 
 During the incremental migration, workers may keep their existing mutable job
-dictionaries.  ``JobManager`` serializes lifecycle mutations and exposes only
-an allowlisted public snapshot to repositories and clients.
+dictionaries.  ``JobManager`` serializes lifecycle mutations, persists a
+narrow private execution-pin envelope for restart replay, and exposes only an
+allowlisted credential-free snapshot to clients.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -33,6 +35,8 @@ log = logging.getLogger(__name__)
 
 ACTIVE_JOB_STATES = ("queued", "running", "cancelling")
 _OPERATION_RECEIPTS_KEY = "$operation_receipts"
+_PRIVATE_INPUT_REVISIONS_FIELD = "_private_input_revisions"
+_PUBLIC_PROVIDER_PIN_FIELDS = ("provider_id", "model")
 _PORTABLE_OPERATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _COMMAND_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_JOB_FIELDS = (
@@ -143,7 +147,7 @@ class JobFailure:
             "retryable": self.retryable,
         }
         if self.details:
-            value["details"] = dict(self.details)
+            value["details"] = deepcopy(dict(self.details))
         return value
 
 
@@ -178,7 +182,7 @@ class JobView:
             "finished_at": self.finished_at,
             "note": self.note,
             "error": self.error.as_dict() if self.error is not None else None,
-            "input_revisions": dict(self.input_revisions),
+            "input_revisions": deepcopy(dict(self.input_revisions)),
             "outputs": [output.as_dict() for output in self.outputs],
         }
 
@@ -301,8 +305,28 @@ class JobManager:
         return _STATUS_STATES.get(str(status or ""), "running")
 
     @staticmethod
-    def interruption_note(kind: object) -> str:
+    def interruption_note(
+        kind: object,
+        outputs: object = (),
+    ) -> str:
         value = str(kind or "")
+        if value == "correction.transform" and isinstance(
+            outputs,
+            (list, tuple),
+        ):
+            committed = {
+                str(output.get("kind") or "")
+                for output in outputs
+                if isinstance(output, Mapping)
+                and not bool(output.get("partial"))
+            }
+            if {
+                "corrected-display",
+                "ocr-ready",
+                "thumbnail",
+                "transform-manifest",
+            } <= committed:
+                return "image committed; OCR follow-up interrupted by restart"
         if value == "ocr" or value.startswith("translate") or value == "annotate":
             return "interrupted by restart — progressive output kept"
         if value == "publish":
@@ -310,9 +334,107 @@ class JobManager:
         return "interrupted by restart — output not written"
 
     @staticmethod
-    def public(job: Mapping[str, Any]) -> dict[str, Any]:
-        """Return the stable, credential-free client/persistence projection."""
-        return {key: job.get(key) for key in PUBLIC_JOB_FIELDS if key in job}
+    def private_input_revisions(
+        job: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return engine-private execution pins from one mutable job record.
+
+        These values are persisted for exact restart replay but are never part
+        of :class:`JobView`, command receipts, events, or public job snapshots.
+        A worker that changes them must perform an ordinary lifecycle
+        transition or checkpoint so the replacement is durably saved.
+        """
+
+        value = job.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+        return deepcopy(dict(value)) if isinstance(value, Mapping) else {}
+
+    @staticmethod
+    def set_private_input_revisions(
+        job: MutableMapping[str, Any],
+        revisions: Mapping[str, Any],
+    ) -> None:
+        """Replace engine-private execution pins on a worker-owned record."""
+
+        if not isinstance(job, MutableMapping):
+            raise TypeError("job must be a mutable mapping")
+        if not isinstance(revisions, Mapping):
+            raise TypeError("private input revisions must be a mapping")
+        job[_PRIVATE_INPUT_REVISIONS_FIELD] = deepcopy(dict(revisions))
+
+    @staticmethod
+    def _public_input_revisions(job: Mapping[str, Any]) -> dict[str, Any]:
+        raw = job.get("input_revisions")
+        revisions = deepcopy(dict(raw)) if isinstance(raw, Mapping) else {}
+        provider = revisions.get("provider")
+        if isinstance(provider, Mapping):
+            # Provider execution options may contain a local executable path
+            # or a credential-shaped extension supplied by a future adapter.
+            # Only stable provider identity belongs in observable job state.
+            revisions["provider"] = {
+                field_name: deepcopy(provider[field_name])
+                for field_name in _PUBLIC_PROVIDER_PIN_FIELDS
+                if field_name in provider
+            }
+        return revisions
+
+    @classmethod
+    def _migrate_private_input_revisions(
+        cls,
+        job: MutableMapping[str, Any],
+    ) -> None:
+        """Move legacy provider options behind the private persistence seam."""
+
+        raw_private = job.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+        if raw_private is not None and not isinstance(raw_private, Mapping):
+            raise ValueError("private input revisions must be a mapping")
+        private = (
+            deepcopy(dict(raw_private))
+            if isinstance(raw_private, Mapping)
+            else {}
+        )
+        raw_revisions = job.get("input_revisions")
+        revisions = (
+            deepcopy(dict(raw_revisions))
+            if isinstance(raw_revisions, Mapping)
+            else {}
+        )
+        provider = revisions.get("provider")
+        if isinstance(provider, Mapping) and "options" in provider:
+            private.setdefault("provider", deepcopy(dict(provider)))
+            revisions["provider"] = {
+                field_name: deepcopy(provider[field_name])
+                for field_name in _PUBLIC_PROVIDER_PIN_FIELDS
+                if field_name in provider
+            }
+            job["input_revisions"] = revisions
+        if private:
+            job[_PRIVATE_INPUT_REVISIONS_FIELD] = private
+        else:
+            job.pop(_PRIVATE_INPUT_REVISIONS_FIELD, None)
+
+    @classmethod
+    def public(cls, job: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the stable, credential-free client projection."""
+
+        result = {
+            key: deepcopy(job.get(key))
+            for key in PUBLIC_JOB_FIELDS
+            if key in job
+        }
+        if "input_revisions" in result:
+            result["input_revisions"] = cls._public_input_revisions(job)
+        return result
+
+    @classmethod
+    def _persistent(cls, job: MutableMapping[str, Any]) -> dict[str, Any]:
+        """Return a private on-disk record plus its public lifecycle fields."""
+
+        cls._migrate_private_input_revisions(job)
+        result = cls.public(job)
+        private = job.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+        if isinstance(private, Mapping) and private:
+            result[_PRIVATE_INPUT_REVISIONS_FIELD] = deepcopy(dict(private))
+        return result
 
     def list(
         self,
@@ -568,6 +690,7 @@ class JobManager:
             job.setdefault("subject", self._subject(job).as_dict())
             job.setdefault("input_revisions", {})
             job.setdefault("outputs", [])
+            self._migrate_private_input_revisions(job)
             self._records[job_id] = job
             if operation_id:
                 self._operation_receipts[operation_id] = {
@@ -645,6 +768,210 @@ class JobManager:
                 self._transition_locked(job, "cancelling", event_type="cancel-requested")
             return dict(job)
 
+    def retry_interrupted(self, job_id: str) -> JobView | None:
+        """Requeue one restart-interrupted job without changing its identity.
+
+        A caller must still own the job-specific idempotency and input
+        validation before invoking this generic lifecycle operation. Terminal
+        success, failure, and cancellation are never reopened. Correction
+        transform parents are release-gated and must converge durable outputs
+        or use a new operation instead of being reset.
+        """
+
+        job_id = str(job_id or "")
+        with self._lock:
+            job = self._records.get(job_id)
+            if job is None:
+                return None
+            state = str(job.get("state") or self.state_of(job.get("status")))
+            if state != JobState.INTERRUPTED.value:
+                raise ConflictError(
+                    "only an interrupted job can be retried",
+                    code="job_not_interrupted",
+                    details={"job_id": job_id, "state": state},
+                )
+            if job.get("outputs"):
+                raise ConflictError(
+                    "an interrupted job with committed outputs cannot be reset",
+                    code="job_outputs_committed",
+                    details={"job_id": job_id, "state": state},
+                )
+            if str(job.get("kind") or "") == "correction.transform":
+                raise ConflictError(
+                    "interrupted correction transforms cannot be reset",
+                    code="job_retry_forbidden",
+                    details={"job_id": job_id, "state": state},
+                )
+            total = max(0, self._integer(job.get("total"), 0))
+            raw_progress = job.get("progress")
+            progress = (
+                raw_progress
+                if isinstance(raw_progress, Mapping)
+                else {}
+            )
+            self._cancel_events[job_id] = threading.Event()
+            job.pop("_checkpoint_at", None)
+            job.pop("cancel_requested", None)
+            self._transition_locked(
+                job,
+                "queued",
+                event_type="retried",
+                done=0,
+                errors=0,
+                error="",
+                failure=None,
+                outputs=[],
+                finished_at="",
+                cancellable=True,
+                progress=JobProgress(
+                    0,
+                    total,
+                    str(progress.get("unit") or ""),
+                    "queued",
+                ).as_dict(),
+                note="queued after restart",
+            )
+            return self.view_of(job)
+
+    def reconcile_interrupted(
+        self,
+        job_id: str,
+        status: str,
+        **fields: Any,
+    ) -> JobView | None:
+        """Attach durable outcomes to interrupted work without resuming it.
+
+        Reconciliation may keep the job interrupted or converge it to terminal
+        success. It cannot reopen work, turn it into cancellation/failure, or
+        remove an output/input pin already present in durable history.
+        """
+
+        job_id = str(job_id or "")
+        target_state = self.state_of(status)
+        if target_state not in {
+            JobState.INTERRUPTED.value,
+            JobState.DONE.value,
+        }:
+            raise ValidationError(
+                "interrupted jobs may only remain interrupted or converge to done",
+                code="invalid_job_reconciliation",
+                details={"job_id": job_id, "status": str(status or "")},
+            )
+        allowed_fields = {
+            "done",
+            "total",
+            "errors",
+            "error",
+            "note",
+            "progress",
+            "input_revisions",
+            "outputs",
+            "failure",
+        }
+        unknown = set(fields) - allowed_fields
+        if unknown:
+            raise ValidationError(
+                "job reconciliation contains unsupported fields",
+                code="invalid_job_reconciliation",
+                details={"fields": sorted(unknown)},
+            )
+
+        with self._lock:
+            live = self._records.get(job_id)
+            operation_id = self._operation_by_job_id.get(job_id, "")
+            receipt = self._operation_receipts.get(operation_id)
+            receipt_job = (
+                receipt.get("job")
+                if isinstance(receipt, Mapping)
+                else None
+            )
+            raw = live if live is not None else receipt_job
+            if not isinstance(raw, Mapping):
+                return None
+            current_state = str(
+                raw.get("state") or self.state_of(raw.get("status"))
+            )
+            if current_state != JobState.INTERRUPTED.value:
+                return self.view_of(raw)
+
+            candidate = self.public(raw)
+            if "input_revisions" in fields:
+                current_inputs = candidate.get("input_revisions")
+                proposed_inputs = fields["input_revisions"]
+                if not isinstance(proposed_inputs, Mapping):
+                    raise ValidationError(
+                        "job reconciliation input revisions must be an object",
+                        code="invalid_job_reconciliation",
+                    )
+                existing = (
+                    current_inputs
+                    if isinstance(current_inputs, Mapping)
+                    else {}
+                )
+                if any(
+                    key not in proposed_inputs
+                    or proposed_inputs[key] != value
+                    for key, value in existing.items()
+                ):
+                    raise ConflictError(
+                        "job reconciliation would change an existing input pin",
+                        code="job_reconciliation_conflict",
+                        details={"job_id": job_id},
+                    )
+            if "outputs" in fields:
+                current_outputs = tuple(self.view_of(candidate).outputs)
+                output_candidate = dict(candidate)
+                output_candidate["outputs"] = fields["outputs"]
+                proposed_outputs = tuple(self.view_of(output_candidate).outputs)
+                if any(output not in proposed_outputs for output in current_outputs):
+                    raise ConflictError(
+                        "job reconciliation would remove a committed output",
+                        code="job_reconciliation_conflict",
+                        details={"job_id": job_id},
+                    )
+
+            copied_fields = deepcopy(fields)
+            unchanged = (
+                self.state_of(candidate.get("state") or candidate.get("status"))
+                == target_state
+                and all(candidate.get(key) == value for key, value in copied_fields.items())
+            )
+            if unchanged:
+                return self.view_of(candidate)
+
+            if live is not None:
+                transition_fields = dict(copied_fields)
+                if target_state == JobState.DONE.value:
+                    # Rehydration assigned the interruption timestamp. A
+                    # later evidence-backed completion gets its own terminal
+                    # time so retention orders it by the actual convergence.
+                    transition_fields["finished_at"] = ""
+                self._transition_locked(
+                    live,
+                    status,
+                    event_type="reconciled",
+                    **transition_fields,
+                )
+                return self.view_of(live)
+
+            candidate.update(copied_fields)
+            candidate["status"] = status
+            candidate["state"] = target_state
+            now = self._timestamp()
+            self._touch_locked(candidate, timestamp=now)
+            if target_state == JobState.DONE.value:
+                candidate["finished_at"] = now
+            elif target_state not in ACTIVE_JOB_STATES and not candidate.get(
+                "finished_at"
+            ):
+                candidate["finished_at"] = now
+            if receipt is not None:
+                receipt["job"] = self.public(candidate)
+            self._prune_command_receipts_locked()
+            self._save_locked()
+            self._emit_locked("reconciled", candidate)
+            return self.view_of(candidate)
+
     def is_cancelled(self, job: Mapping[str, Any]) -> bool:
         event = self._cancel_events.get(str(job.get("id") or ""))
         return event is not None and event.is_set()
@@ -713,7 +1040,21 @@ class JobManager:
                     or not isinstance(raw, Mapping)
                 ):
                     continue
-                job: MutableMapping[str, Any] = self.public(raw)
+                candidate: MutableMapping[str, Any] = deepcopy(dict(raw))
+                try:
+                    self._migrate_private_input_revisions(candidate)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise ValueError(
+                            "job history contains invalid private input revisions"
+                        ) from None
+                    candidate.pop(_PRIVATE_INPUT_REVISIONS_FIELD, None)
+                job = self.public(candidate)
+                private = candidate.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+                if isinstance(private, Mapping) and private:
+                    job[_PRIVATE_INPUT_REVISIONS_FIELD] = deepcopy(
+                        dict(private)
+                    )
                 job["id"] = job_id
                 job.setdefault("cancellable", True)
                 job["revision"] = max(1, self._integer(job.get("revision"), 1))
@@ -725,7 +1066,10 @@ class JobManager:
                 job.setdefault("outputs", [])
                 if job.get("state") in ACTIVE_JOB_STATES or not job.get("state"):
                     job["status"] = job["state"] = "interrupted"
-                    job["note"] = self.interruption_note(job.get("kind"))
+                    job["note"] = self.interruption_note(
+                        job.get("kind"),
+                        job.get("outputs"),
+                    )
                     job["finished_at"] = job.get("finished_at") or now
                     job["updated_at"] = now
                     job["revision"] = self._integer(job.get("revision"), 0) + 1
@@ -793,11 +1137,11 @@ class JobManager:
                     str(failure_raw.get("code") or "job_failed"),
                     message,
                     bool(failure_raw.get("retryable")),
-                    dict(details) if isinstance(details, Mapping) else {},
+                    deepcopy(dict(details)) if isinstance(details, Mapping) else {},
                 )
         elif job.get("error"):
             failure = JobFailure("job_failed", str(job.get("error")))
-        revisions = job.get("input_revisions")
+        revisions = cls._public_input_revisions(job)
         return JobView(
             job_id=str(job.get("id") or ""),
             kind=str(job.get("kind") or ""),
@@ -825,7 +1169,9 @@ class JobManager:
             finished_at=str(job.get("finished_at") or ""),
             note=str(job.get("note") or ""),
             error=failure,
-            input_revisions=dict(revisions) if isinstance(revisions, Mapping) else {},
+            input_revisions=(
+                revisions
+            ),
             outputs=tuple(outputs),
         )
 
@@ -924,9 +1270,11 @@ class JobManager:
         if self._repository is None:
             return
         for job in self._records.values():
+            self._migrate_private_input_revisions(job)
             self._refresh_command_receipt_locked(job)
         snapshot = {
-            job_id: self.public(job) for job_id, job in self._records.items()
+            job_id: self._persistent(job)
+            for job_id, job in self._records.items()
         }
         if self._operation_receipts:
             snapshot[_OPERATION_RECEIPTS_KEY] = {

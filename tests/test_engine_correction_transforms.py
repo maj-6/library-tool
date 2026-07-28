@@ -4,19 +4,30 @@ import hashlib
 import io
 import json
 import threading
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from PIL import Image
 
+from librarytool.engine.correction_ocr import (
+    CorrectionOcrFollowupService,
+    CorrectionOcrProviderSelection,
+    CorrectionOcrRecognition,
+    StoredCorrectionOcrProposal,
+)
 from librarytool.engine.correction_transforms import (
     CORRECTION_OUTPUT_KINDS,
+    CORRECTION_TRANSFORM_JOB_KIND,
     CommittedCorrectionOutput,
+    CommittedCorrectionTransform,
     CorrectionSourceSnapshot,
     CorrectionTransformCommand,
     CorrectionTransformCommitDraft,
     CorrectionTransformCommitResult,
+    CorrectionTransformDependencyPins,
     CorrectionTransformHooksPort,
     CorrectionTransformService,
     CorrectionTransformStorePort,
@@ -28,7 +39,7 @@ from librarytool.engine.correction_transforms import (
     OcrFollowupState,
 )
 from librarytool.engine.errors import ConflictError, ValidationError
-from librarytool.engine.jobs import JobManager, JobProgress
+from librarytool.engine.jobs import JobManager, JobOutput, JobProgress, JobState
 from librarytool.engine.raster_artifacts import (
     CaptionAssertion,
     CategoryAssignment,
@@ -160,6 +171,7 @@ class MemoryStore:
         self.assertions_stale_on_second_load = False
         self.stale_during_commit = False
         self.by_operation: dict[str, tuple[str, CorrectionTransformCommitResult]] = {}
+        self.publications: dict[str, CommittedCorrectionTransform] = {}
 
     def load_source(self, key):
         assert key == self.source.artifact.key
@@ -213,7 +225,25 @@ class MemoryStore:
         )
         result = CorrectionTransformCommitResult(draft.command.operation_id, outputs)
         self.by_operation[draft.command.operation_id] = (draft.command.fingerprint, result)
+        self.publications[draft.command.operation_id] = CommittedCorrectionTransform(
+            draft.command,
+            result,
+            CorrectionTransformDependencyPins.from_dict(
+                draft.source.dependent_revision_pins
+            ),
+        )
         return result
+
+    def find_committed_transform(self, command):
+        publication = self.publications.get(command.operation_id)
+        if publication is None:
+            return None
+        if publication.command != command:
+            raise ConflictError(
+                "operation reused",
+                code="correction_operation_conflict",
+            )
+        return publication
 
 
 class InvalidOutputIdentityStore(MemoryStore):
@@ -250,6 +280,11 @@ class FailingOcr:
         raise RuntimeError("provider unavailable")
 
 
+class SecretLeakingOcr:
+    def run_ocr_followup(self, request, hooks):
+        raise RuntimeError("Authorization: Bearer TOP-SECRET-SENTINEL")
+
+
 class ObservingHooks:
     def __init__(self, *, cancel_at: str = "") -> None:
         self.cancel_at = cancel_at
@@ -263,6 +298,126 @@ class ObservingHooks:
         self.progress.append(progress)
         if progress.phase == self.cancel_at:
             self.cancelled = True
+
+
+class MemoryJobHistory:
+    def __init__(self) -> None:
+        self.value = {}
+
+    def load(self):
+        return deepcopy(self.value)
+
+    def save(self, value):
+        self.value = deepcopy(value)
+
+
+class AdvancingClock:
+    def __init__(self) -> None:
+        self.value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def now(self):
+        current = self.value
+        self.value += timedelta(seconds=1)
+        return current
+
+
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
+class CrashAfterCommitStore(MemoryStore):
+    def __init__(self, source: CorrectionSourceSnapshot) -> None:
+        super().__init__(source)
+        self.crash_after_commit = True
+
+    def commit_transform(self, draft):
+        result = super().commit_transform(draft)
+        if self.crash_after_commit:
+            raise SimulatedProcessCrash
+        return result
+
+
+class MemoryOcrProposalRepository:
+    def __init__(self, store: MemoryStore) -> None:
+        self.store = store
+        self.stored: StoredCorrectionOcrProposal | None = None
+        self.commits = 0
+
+    def read_source(self, request):
+        draft = self.store.commits[-1]
+        content = draft.output("ocr-ready").content
+        assert hashlib.sha256(content).hexdigest() == request.source.content_sha256
+        return content
+
+    def find_proposal(self, request):
+        if self.stored is not None:
+            assert self.stored.source == request.source
+        return self.stored
+
+    def commit_proposal(self, request, recognition):
+        self.commits += 1
+        self.stored = StoredCorrectionOcrProposal(
+            "ocr-proposal-crash-recovery",
+            request.source,
+            CorrectionOcrProviderSelection(
+                recognition.provider_id,
+                recognition.model,
+                recognition.options,
+            ),
+        )
+        return self.stored
+
+
+class CountingOcrProvider:
+    def __init__(self) -> None:
+        self.selections = 0
+        self.recognitions = 0
+        self.forbid_work = False
+
+    def select_provider(self):
+        if self.forbid_work:
+            raise AssertionError("reconciliation must not select an OCR provider")
+        self.selections += 1
+        return CorrectionOcrProviderSelection("test-ocr", "test-model")
+
+    def recognize(self, selection, content, hooks):
+        if self.forbid_work:
+            raise AssertionError("reconciliation must not invoke OCR")
+        self.recognitions += 1
+        return CorrectionOcrRecognition(
+            selection.provider_id,
+            selection.model,
+            {"text": "durable proposal", "bytes": len(content)},
+            selection.options,
+        )
+
+
+class FailingCountingOcrProvider(CountingOcrProvider):
+    def recognize(self, selection, content, hooks):
+        if self.forbid_work:
+            raise AssertionError("reconciliation must not invoke OCR")
+        self.recognitions += 1
+        raise RuntimeError("provider unavailable")
+
+
+class CrashAfterChildSuccess:
+    def __init__(self, child: CorrectionOcrFollowupService) -> None:
+        self.child = child
+
+    def run_ocr_followup(self, request, hooks):
+        outcome = self.child.run_ocr_followup(request, hooks)
+        assert outcome.state is OcrFollowupState.SUCCEEDED
+        raise SimulatedProcessCrash
+
+
+class CrashAfterChildFailure:
+    def __init__(self, child: CorrectionOcrFollowupService) -> None:
+        self.child = child
+
+    def run_ocr_followup(self, request, hooks):
+        outcome = self.child.run_ocr_followup(request, hooks)
+        assert outcome.state is OcrFollowupState.FAILED
+        raise SimulatedProcessCrash
 
 
 def _queued(
@@ -371,6 +526,11 @@ def test_queue_is_idempotent_and_operation_reuse_conflicts() -> None:
     assert len(jobs.list()) == 1
     assert first.job.subject.item_id == "book-1"
     assert first.job.subject.source_id == "source-image"
+    assert first.job.input_revisions["transform"] == {
+        "quad": [list(point) for point in FULL_FRAME],
+        "adjustment": command.adjustment.as_dict(),
+        "rerun_ocr": False,
+    }
     with pytest.raises(ConflictError) as conflict:
         service.queue(_command(source, adjustment=None))
     assert conflict.value.code == "correction_operation_conflict"
@@ -399,6 +559,337 @@ def test_queue_replays_terminal_outcome_after_live_history_is_pruned() -> None:
     with pytest.raises(ConflictError) as conflict:
         service.queue(_command(source, adjustment=None))
     assert conflict.value.code == "correction_operation_conflict"
+
+
+def test_interrupted_transform_replays_without_rescheduling_committed_work() -> None:
+    source = _source()
+    command = _command(source)
+    jobs = JobManager(checkpoint_interval=0)
+    store = MemoryStore(source)
+    worker = CorrectionTransformWorker(jobs, store)
+    service = CorrectionTransformService(jobs, executor=worker.run)
+    queued = service.queue(command)
+    first = service.execute_queued(command)
+    record = jobs.records[queued.job_id]
+    # Private claim state is process-local and absent after rehydration.
+    record.pop("_correction_worker_claimed", None)
+    jobs.transition(
+        record,
+        "interrupted",
+        note="process stopped after image commit",
+    )
+
+    replay = service.queue(command)
+
+    assert replay.created is False
+    assert replay.job_id == queued.job_id
+    assert replay.job.state.value == "interrupted"
+    assert replay.job.outputs == tuple(
+        JobOutput(output.kind, output.artifact_id)
+        for output in first.image_commit.outputs
+    )
+    assert len(store.commits) == 1
+    with pytest.raises(ConflictError) as raised:
+        service.execute_queued(command)
+    assert raised.value.code == "correction_job_already_claimed"
+    assert len(store.commits) == 1
+
+
+@pytest.mark.parametrize(
+    ("rerun_ocr", "expected_state", "expected_note"),
+    (
+        (
+            True,
+            JobState.INTERRUPTED,
+            "image committed; OCR follow-up interrupted by restart",
+        ),
+        (False, JobState.DONE, "correction complete"),
+    ),
+)
+def test_restart_reconciles_image_commit_without_rerunning_work(
+    rerun_ocr: bool,
+    expected_state: JobState,
+    expected_note: str,
+) -> None:
+    source = _source()
+    command = _command(source, rerun_ocr=rerun_ocr)
+    history = MemoryJobHistory()
+    first_jobs = JobManager(history, checkpoint_interval=0)
+    store = CrashAfterCommitStore(source)
+    first_worker = CorrectionTransformWorker(first_jobs, store)
+    first_service = CorrectionTransformService(
+        first_jobs,
+        executor=first_worker.run,
+        committed_transforms=store,
+    )
+    queued = first_service.queue(command)
+
+    with pytest.raises(SimulatedProcessCrash):
+        first_service.execute_queued(command)
+
+    assert len(store.commits) == 1
+    assert first_jobs.view(queued.job_id).outputs == ()
+    loads_after_crash = store.loads
+    original_dependencies = source.dependent_revision_pins
+    store.crash_after_commit = False
+    store.source = replace(
+        source,
+        artifact=replace(source.artifact, revision="artifact-r2"),
+        source_revision="bytes-r2",
+        annotations=(
+            replace(source.annotations[0], revision="region-1-r9"),
+        ),
+        human_text_assertions=(
+            replace(source.human_text_assertions[0], revision="text-r9"),
+        ),
+    )
+
+    reopened_jobs = JobManager(history, checkpoint_interval=0)
+    reopened_jobs.rehydrate(strict=True)
+    replay_service = CorrectionTransformService(
+        reopened_jobs,
+        committed_transforms=store,
+    )
+    interrupted = reopened_jobs.view(queued.job_id)
+    assert interrupted.state is JobState.INTERRUPTED
+    assert interrupted.outputs == ()
+
+    replay = replay_service.queue(command)
+
+    assert replay.created is False
+    assert replay.job.state is expected_state
+    assert replay.job.note == expected_note
+    assert replay.job.outputs == tuple(
+        JobOutput(output.kind, output.artifact_id)
+        for output in store.publications[command.operation_id].result.outputs
+    )
+    assert (
+        replay.job.input_revisions["dependent_assertions"]
+        == original_dependencies
+    )
+    assert store.loads == loads_after_crash
+    assert len(store.commits) == 1
+
+    revision = replay.job.revision
+    reopened_jobs.request_cancel(replay.job_id)
+    cancelled = reopened_jobs.view(replay.job_id)
+    assert cancelled.state is expected_state
+    assert cancelled.outputs == replay.job.outputs
+    repeated = replay_service.queue(command)
+    assert repeated.job.revision == revision
+    assert len(store.commits) == 1
+
+
+def test_durable_transform_reconstructs_an_evicted_parent_receipt() -> None:
+    source = _source()
+    command = _command(source, rerun_ocr=False)
+    history = MemoryJobHistory()
+    clock = AdvancingClock()
+    first_jobs = JobManager(
+        history,
+        keep=0,
+        receipt_keep=1,
+        utcnow=clock.now,
+        checkpoint_interval=0,
+    )
+    store = MemoryStore(source)
+    worker = CorrectionTransformWorker(first_jobs, store)
+    service = CorrectionTransformService(
+        first_jobs,
+        executor=worker.run,
+        committed_transforms=store,
+    )
+    service.queue(command)
+    service.execute_queued(command)
+
+    newer = {
+        "id": "newer-terminal-job",
+        "operation_id": "newer-operation",
+        "command_sha256": "f" * 64,
+        "status": "running",
+    }
+    first_jobs.track(newer, "other.job")
+    first_jobs.transition(newer, "done")
+    assert first_jobs.command_receipt(
+        command.operation_id,
+        command.fingerprint,
+        kind=CORRECTION_TRANSFORM_JOB_KIND,
+    ) is None
+
+    loads_after_commit = store.loads
+    store.source = replace(
+        source,
+        artifact=replace(source.artifact, revision="artifact-r8"),
+        source_revision="bytes-r8",
+        annotations=(
+            replace(source.annotations[0], revision="region-1-r8"),
+        ),
+        human_text_assertions=(
+            replace(source.human_text_assertions[0], revision="text-r8"),
+        ),
+    )
+    reopened_jobs = JobManager(
+        history,
+        keep=0,
+        receipt_keep=1,
+        utcnow=clock.now,
+        checkpoint_interval=0,
+    )
+    reopened_jobs.rehydrate(strict=True)
+    replay_service = CorrectionTransformService(
+        reopened_jobs,
+        committed_transforms=store,
+    )
+
+    with pytest.raises(ConflictError) as conflicting:
+        replay_service.queue(replace(command, adjustment=None))
+    assert conflicting.value.code == "correction_operation_conflict"
+
+    replay = replay_service.queue(command)
+
+    assert replay.created is False
+    assert replay.job.state is JobState.DONE
+    assert replay.job.note == "correction complete"
+    assert len(replay.job.outputs) == 4
+    assert replay.job.input_revisions["dependent_assertions"] == (
+        source.dependent_revision_pins
+    )
+    assert store.loads == loads_after_commit
+    assert len(store.commits) == 1
+    durable = reopened_jobs.command_receipt(
+        command.operation_id,
+        command.fingerprint,
+        kind=CORRECTION_TRANSFORM_JOB_KIND,
+    )
+    assert durable is not None
+    assert durable.job == replay.job
+
+
+def test_restart_reconciles_child_success_without_rerunning_image_or_ocr() -> None:
+    source = _source()
+    command = _command(source, rerun_ocr=True)
+    history = MemoryJobHistory()
+    first_jobs = JobManager(history, checkpoint_interval=0)
+    store = MemoryStore(source)
+    repository = MemoryOcrProposalRepository(store)
+    provider = CountingOcrProvider()
+    child = CorrectionOcrFollowupService(first_jobs, repository, provider)
+    worker = CorrectionTransformWorker(
+        first_jobs,
+        store,
+        ocr=CrashAfterChildSuccess(child),
+    )
+    service = CorrectionTransformService(
+        first_jobs,
+        executor=worker.run,
+        committed_transforms=store,
+        ocr_outcomes=child,
+    )
+    queued = service.queue(command)
+
+    with pytest.raises(SimulatedProcessCrash):
+        service.execute_queued(command)
+
+    assert len(store.commits) == 1
+    assert repository.commits == 1
+    assert provider.selections == 1
+    assert provider.recognitions == 1
+    parent_before_restart = first_jobs.view(queued.job_id)
+    assert parent_before_restart.state is JobState.RUNNING
+    assert len(parent_before_restart.outputs) == 4
+    child_before_restart = first_jobs.view(child.job_id_for(command.operation_id))
+    assert child_before_restart.state is JobState.DONE
+
+    reopened_jobs = JobManager(history, checkpoint_interval=0)
+    reopened_jobs.rehydrate(strict=True)
+    provider.forbid_work = True
+    reopened_child = CorrectionOcrFollowupService(
+        reopened_jobs,
+        repository,
+        provider,
+    )
+    replay_service = CorrectionTransformService(
+        reopened_jobs,
+        committed_transforms=store,
+        ocr_outcomes=reopened_child,
+    )
+
+    replay = replay_service.queue(command)
+
+    assert replay.created is False
+    assert replay.job.state is JobState.DONE
+    assert replay.job.note == "correction complete"
+    assert len(replay.job.outputs) == 5
+    assert replay.job.outputs[-1] == JobOutput(
+        "ocr-proposal",
+        "ocr-proposal-crash-recovery",
+    )
+    assert len(store.commits) == 1
+    assert repository.commits == 1
+    assert provider.selections == 1
+    assert provider.recognitions == 1
+
+    reopened_jobs.request_cancel(replay.job_id)
+    assert reopened_jobs.view(replay.job_id).outputs == replay.job.outputs
+    repeated = replay_service.queue(command)
+    assert repeated.job.outputs == replay.job.outputs
+    assert len(store.commits) == 1
+    assert repository.commits == 1
+
+
+def test_restart_reconciles_child_failure_without_rerunning_provider() -> None:
+    source = _source()
+    command = _command(source, rerun_ocr=True)
+    history = MemoryJobHistory()
+    first_jobs = JobManager(history, checkpoint_interval=0)
+    store = MemoryStore(source)
+    repository = MemoryOcrProposalRepository(store)
+    provider = FailingCountingOcrProvider()
+    child = CorrectionOcrFollowupService(first_jobs, repository, provider)
+    worker = CorrectionTransformWorker(
+        first_jobs,
+        store,
+        ocr=CrashAfterChildFailure(child),
+    )
+    service = CorrectionTransformService(
+        first_jobs,
+        executor=worker.run,
+        committed_transforms=store,
+        ocr_outcomes=child,
+    )
+    service.queue(command)
+
+    with pytest.raises(SimulatedProcessCrash):
+        service.execute_queued(command)
+
+    failed_child = first_jobs.view(child.job_id_for(command.operation_id))
+    assert failed_child.state is JobState.FAILED
+    assert failed_child.error.code == "ocr_followup_failed"
+    assert provider.recognitions == 1
+    assert repository.commits == 0
+
+    reopened_jobs = JobManager(history, checkpoint_interval=0)
+    reopened_jobs.rehydrate(strict=True)
+    provider.forbid_work = True
+    reopened_child = CorrectionOcrFollowupService(
+        reopened_jobs,
+        repository,
+        provider,
+    )
+    replay = CorrectionTransformService(
+        reopened_jobs,
+        committed_transforms=store,
+        ocr_outcomes=reopened_child,
+    ).queue(command)
+
+    assert replay.created is False
+    assert replay.job.state is JobState.DONE
+    assert replay.job.note == "image committed; OCR follow-up failed"
+    assert replay.job.error.code == "ocr_followup_failed"
+    assert len(replay.job.outputs) == 4
+    assert len(store.commits) == 1
+    assert provider.recognitions == 1
+    assert repository.commits == 0
 
 
 def test_queue_registration_runs_inside_injected_item_start_guard() -> None:
@@ -825,7 +1316,30 @@ def test_ocr_failure_is_observable_and_does_not_roll_back_image_commit() -> None
     assert job["state"] == "done"
     assert job["errors"] == 1
     assert len(job["outputs"]) == 4
+    assert job["failure"]["code"] == "ocr_followup_failed"
+    assert job["failure"]["retryable"] is False
+    assert job["error"] == "OCR follow-up failed"
+    public = jobs.view(queue.job_id)
+    assert public.error.code == "ocr_followup_failed"
+    assert public.outputs
     assert store.commits[0].human_assertions.text[0].text == "Verified transcription"
+
+
+def test_parent_job_sanitizes_untrusted_ocr_port_exceptions() -> None:
+    source = _source()
+    command = _command(source, rerun_ocr=True)
+    jobs, queue, _store, worker = _queued(
+        source,
+        command,
+        ocr=SecretLeakingOcr(),
+    )
+
+    result = worker.run(command)
+    public = jobs.get(queue.job_id)
+
+    assert result.ocr_followup.failure.message == "OCR follow-up failed"
+    assert "TOP-SECRET-SENTINEL" not in str(result.as_dict())
+    assert "TOP-SECRET-SENTINEL" not in str(public)
 
 
 def test_ports_remain_runtime_checkable_and_framework_neutral() -> None:

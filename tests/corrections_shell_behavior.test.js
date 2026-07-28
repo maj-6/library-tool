@@ -901,6 +901,9 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
       resolveCorrections() {},
       reopenCorrections() {},
     },
+    jobs: {
+      get() {},
+    },
   };
   const standalone = correctionsRuntimePorts({ engineClient }, null);
   assert.equal(typeof standalone.artifacts.catalog.list, "function");
@@ -910,6 +913,7 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
   assert.equal(typeof standalone.books.getReview, "function");
   assert.equal(typeof standalone.books.resolveReview, "function");
   assert.equal(typeof standalone.books.reopenReview, "function");
+  assert.equal(typeof standalone.transforms.subscribeResults, "function");
   assert.equal(standalone.books.trustedActor, true);
 
   const desktopCorrections = { artifacts: { catalog: { list() {} } } };

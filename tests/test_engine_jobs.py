@@ -93,6 +93,56 @@ def test_track_transition_and_public_snapshot_are_transport_neutral():
     assert "secret" not in history.value[record["id"]]
 
 
+def test_rehydrate_migrates_legacy_provider_options_behind_private_pin():
+    executable = r"C:\Users\alice\private tools\tesseract.exe"
+    credential = "TOP-SECRET-LEGACY-PIN"
+    provider = {
+        "provider_id": "tesseract",
+        "model": "local",
+        "options": {
+            "tesseract": executable,
+            "credential": credential,
+        },
+    }
+    history = MemoryHistory({
+        "legacy-ocr-child": {
+            "id": "legacy-ocr-child",
+            "kind": "correction.ocr-followup",
+            "state": "running",
+            "status": "running",
+            "input_revisions": {"provider": provider},
+        },
+    })
+    jobs = manager(history)
+
+    jobs.rehydrate(strict=True)
+
+    record = jobs.records["legacy-ocr-child"]
+    assert jobs.private_input_revisions(record)["provider"] == provider
+    assert jobs.view("legacy-ocr-child").input_revisions["provider"] == {
+        "provider_id": "tesseract",
+        "model": "local",
+    }
+    assert history.value["legacy-ocr-child"]["input_revisions"]["provider"] == {
+        "provider_id": "tesseract",
+        "model": "local",
+    }
+    assert (
+        history.value["legacy-ocr-child"]["_private_input_revisions"][
+            "provider"
+        ]
+        == provider
+    )
+    for value in (
+        jobs.get("legacy-ocr-child"),
+        jobs.list(),
+        [event.as_dict() for event in jobs.events_after(0)],
+    ):
+        public = json.dumps(value, sort_keys=True)
+        assert executable not in public
+        assert credential not in public
+
+
 def test_command_receipt_replays_terminal_outcome_after_prune_and_restart():
     history = MemoryHistory()
     jobs = manager(history, keep=0)
@@ -297,6 +347,287 @@ def test_rehydrate_marks_only_active_work_interrupted():
     assert published is not None and published["note"] == \
         "interrupted by restart — not applied"
     assert jobs.get("done-1")["state"] == "done"
+
+
+def test_rehydrate_reports_committed_correction_outputs_truthfully():
+    outputs = [
+        {"kind": kind, "ref": f"ref-{kind}", "partial": False}
+        for kind in (
+            "corrected-display",
+            "ocr-ready",
+            "thumbnail",
+            "transform-manifest",
+        )
+    ]
+    history = MemoryHistory({
+        "transform": {
+            "id": "transform",
+            "kind": "correction.transform",
+            "state": "running",
+            "status": "running",
+            "outputs": outputs,
+        },
+    })
+    jobs = manager(history)
+
+    jobs.rehydrate()
+
+    recovered = jobs.get("transform")
+    assert recovered["state"] == "interrupted"
+    assert recovered["outputs"] == outputs
+    assert recovered["note"] == (
+        "image committed; OCR follow-up interrupted by restart"
+    )
+
+
+def test_retry_interrupted_preserves_identity_and_inputs_but_resets_lifecycle():
+    history = MemoryHistory({
+        "correction-1": {
+            "id": "correction-1",
+            "kind": "correction.ocr-followup",
+            "state": "running",
+            "status": "running",
+            "done": 4,
+            "total": 6,
+            "errors": 1,
+            "error": "process stopped",
+            "failure": {
+                "code": "process_stopped",
+                "message": "process stopped",
+                "retryable": True,
+            },
+            "outputs": [],
+            "input_revisions": {
+                "operation_id": "operation-1",
+                "command_sha256": "a" * 64,
+            },
+            "progress": {
+                "completed": 4,
+                "total": 6,
+                "unit": "phase",
+                "phase": "committing-image",
+            },
+        },
+    })
+    jobs = manager(history)
+    jobs.rehydrate()
+
+    retried = jobs.retry_interrupted("correction-1")
+
+    assert retried.state.value == "queued"
+    assert retried.job_id == "correction-1"
+    assert retried.input_revisions == {
+        "operation_id": "operation-1",
+        "command_sha256": "a" * 64,
+    }
+    assert retried.outputs == ()
+    assert retried.error is None
+    assert retried.finished_at == ""
+    assert retried.progress.as_dict() == {
+        "completed": 0,
+        "total": 6,
+        "unit": "phase",
+        "phase": "queued",
+    }
+    assert jobs.is_cancelled(jobs.records["correction-1"]) is False
+    assert [event.type for event in jobs.events_after(0)][-1] == "retried"
+    with pytest.raises(ConflictError) as raised:
+        jobs.retry_interrupted("correction-1")
+    assert raised.value.code == "job_not_interrupted"
+    assert jobs.retry_interrupted("missing") is None
+
+
+def test_retry_interrupted_refuses_to_erase_committed_outputs():
+    history = MemoryHistory({
+        "correction-1": {
+            "id": "correction-1",
+            "kind": "correction.transform",
+            "state": "running",
+            "status": "running",
+            "outputs": [
+                {"kind": "corrected-display", "ref": "output-1"}
+            ],
+        },
+    })
+    jobs = manager(history)
+    jobs.rehydrate()
+
+    with pytest.raises(ConflictError) as raised:
+        jobs.retry_interrupted("correction-1")
+
+    assert raised.value.code == "job_outputs_committed"
+    assert jobs.view("correction-1").outputs[0].ref == "output-1"
+
+
+def test_retry_interrupted_never_resets_a_correction_transform_parent():
+    history = MemoryHistory({
+        "correction-1": {
+            "id": "correction-1",
+            "kind": "correction.transform",
+            "state": "running",
+            "status": "running",
+            "outputs": [],
+        },
+    })
+    jobs = manager(history)
+    jobs.rehydrate()
+
+    with pytest.raises(ConflictError) as raised:
+        jobs.retry_interrupted("correction-1")
+
+    assert raised.value.code == "job_retry_forbidden"
+    assert jobs.view("correction-1").state is JobState.INTERRUPTED
+
+
+def test_reconcile_interrupted_converges_a_pruned_command_receipt():
+    history = MemoryHistory()
+    digest = "a" * 64
+    first = manager(history, keep=0)
+    record = {
+        "id": "correction-1",
+        "kind": "correction.transform",
+        "status": "running",
+        "operation_id": "correction-operation-1",
+        "command_sha256": digest,
+        "input_revisions": {
+            "artifact_revision": "artifact-r1",
+            "command_sha256": digest,
+        },
+    }
+    first.track(record, "correction.transform")
+
+    reopened = manager(history, keep=0)
+    reopened.rehydrate(strict=True)
+    assert reopened.view(record["id"]) is None
+    interrupted = reopened.command_receipt(
+        record["operation_id"],
+        digest,
+        kind="correction.transform",
+    )
+    assert interrupted.job.state is JobState.INTERRUPTED
+    interrupted_finished_at = interrupted.job.finished_at
+
+    reconciled = reopened.reconcile_interrupted(
+        record["id"],
+        "done",
+        input_revisions={
+            **record["input_revisions"],
+            "dependent_assertions": {"spatial_annotations": []},
+        },
+        outputs=[
+            {"kind": "corrected-display", "ref": "corrected-1"},
+        ],
+        done=6,
+        total=6,
+        errors=0,
+        error="",
+        failure=None,
+        note="correction complete",
+        progress={
+            "completed": 6,
+            "total": 6,
+            "unit": "phase",
+            "phase": "complete",
+        },
+    )
+
+    assert reconciled.state is JobState.DONE
+    assert reconciled.finished_at > interrupted_finished_at
+    assert reconciled.outputs[0].ref == "corrected-1"
+    replay = reopened.command_receipt(
+        record["operation_id"],
+        digest,
+        kind="correction.transform",
+    )
+    assert replay.job == reconciled
+
+    restarted = manager(history, keep=0)
+    restarted.rehydrate(strict=True)
+    durable = restarted.command_receipt(
+        record["operation_id"],
+        digest,
+        kind="correction.transform",
+    )
+    assert durable.job.state is JobState.DONE
+    assert durable.job.outputs == reconciled.outputs
+
+
+def test_reconcile_interrupted_cannot_remove_outputs_or_change_input_pins():
+    history = MemoryHistory({
+        "correction-1": {
+            "id": "correction-1",
+            "kind": "correction.transform",
+            "state": "running",
+            "status": "running",
+            "input_revisions": {"artifact_revision": "artifact-r1"},
+            "outputs": [
+                {"kind": "corrected-display", "ref": "corrected-1"},
+            ],
+        },
+    })
+    jobs = manager(history)
+    jobs.rehydrate(strict=True)
+
+    with pytest.raises(ConflictError) as output_conflict:
+        jobs.reconcile_interrupted(
+            "correction-1",
+            "interrupted",
+            input_revisions={"artifact_revision": "artifact-r1"},
+            outputs=[],
+        )
+    assert output_conflict.value.code == "job_reconciliation_conflict"
+    with pytest.raises(ConflictError) as input_conflict:
+        jobs.reconcile_interrupted(
+            "correction-1",
+            "interrupted",
+            input_revisions={"artifact_revision": "artifact-r2"},
+            outputs=[
+                {"kind": "corrected-display", "ref": "corrected-1"},
+            ],
+        )
+    assert input_conflict.value.code == "job_reconciliation_conflict"
+    current = jobs.view("correction-1")
+    assert current.state is JobState.INTERRUPTED
+    assert current.input_revisions["artifact_revision"] == "artifact-r1"
+    assert current.outputs[0].ref == "corrected-1"
+
+
+def test_nested_public_job_values_are_defensive_snapshots():
+    history = MemoryHistory()
+    jobs = manager(history)
+    record = {
+        "input_revisions": {
+            "transform": {
+                "quad": [[0.0, 0.0], [1.0, 0.0]],
+                "rerun_ocr": True,
+            }
+        },
+        "failure": {
+            "code": "provider_failed",
+            "message": "safe",
+            "details": {"nested": ["original"]},
+        },
+    }
+    jobs.track(record, "correction.transform")
+
+    public = jobs.get(record["id"])
+    view = jobs.view(record["id"])
+    event = jobs.events_after(0)[0]
+    public["input_revisions"]["transform"]["rerun_ocr"] = False
+    view.input_revisions["transform"]["quad"][0][0] = 9.0
+    view.error.details["nested"].append("changed")
+    event_dict = event.as_dict()
+    event_dict["job"]["input_revisions"]["transform"]["quad"][0][1] = 8.0
+
+    current = jobs.view(record["id"])
+    assert current.input_revisions["transform"] == {
+        "quad": [[0.0, 0.0], [1.0, 0.0]],
+        "rerun_ocr": True,
+    }
+    assert current.error.details == {"nested": ["original"]}
+    assert history.value[record["id"]]["input_revisions"] == (
+        current.input_revisions
+    )
 
 
 @pytest.mark.parametrize("failure", (OSError("unreadable"), ValueError("bad")))

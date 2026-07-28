@@ -55,6 +55,7 @@ MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 MISTRAL_CHAT_URL = "https://api.mistral.ai/v1/chat/completions"
 OCR_MODEL = "mistral-ocr-latest"
 EXTRACT_MODEL = "mistral-small-latest"
+MISTRAL_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 STANDARD_WIDTH = 1600     # px; preserves title-page readability
 STANDARD_QUALITY = 82     # JPEG quality for the stored copy
@@ -125,19 +126,54 @@ def ocr_preprocess(img_bytes: bytes) -> bytes:
 
 # --- 4. Mistral OCR --------------------------------------------------------------
 
-def _mistral_post(url: str, payload: dict, api_key: str, timeout: float) -> dict:
+def _mistral_post(
+        url: str,
+        payload: dict,
+        api_key: str,
+        timeout: float,
+        *,
+        maximum_response_bytes: int = MISTRAL_MAX_RESPONSE_BYTES,
+) -> dict:
+    if (
+        not isinstance(maximum_response_bytes, int)
+        or isinstance(maximum_response_bytes, bool)
+        or maximum_response_bytes <= 0
+    ):
+        raise ValueError("maximum_response_bytes must be a positive integer")
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}",
                  "Content-Type": "application/json",
                  "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace"))
+        declared = None
+        try:
+            raw_declared = resp.headers.get("Content-Length")
+            if raw_declared is not None:
+                declared = int(raw_declared)
+        except (AttributeError, TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > maximum_response_bytes:
+            raise RuntimeError("Mistral response exceeds its size limit")
+        encoded = resp.read(maximum_response_bytes + 1)
+    if len(encoded) > maximum_response_bytes:
+        raise RuntimeError("Mistral response exceeds its size limit")
+    try:
+        decoded = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError(
+            "Mistral returned an invalid JSON response"
+        ) from None
+    if not isinstance(decoded, dict):
+        raise RuntimeError("Mistral returned an invalid JSON response")
+    return decoded
 
 
 def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
                       want_images: bool = False,
-                      want_blocks: bool = False) -> list[dict]:
+                      want_blocks: bool = False,
+                      *,
+                      model: str | None = None) -> list[dict]:
     """OCR one image via Mistral; returns the raw page dicts.
 
     Each page carries `markdown`, `dimensions` {width, height, dpi}, and —
@@ -151,7 +187,7 @@ def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
     mime = "image/png" if img_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
     b64 = base64.b64encode(img_bytes).decode("ascii")
     payload = {
-        "model": OCR_MODEL,
+        "model": str(model or OCR_MODEL).strip() or OCR_MODEL,
         "document": {"type": "image_url",
                      "image_url": f"data:{mime};base64,{b64}"},
     }

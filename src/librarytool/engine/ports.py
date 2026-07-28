@@ -158,10 +158,15 @@ class TranslationPolicyPort(Protocol):
 
 
 class JobHistoryRepositoryPort(Protocol):
-    """Credential-free persistence for jobs and idempotency receipts."""
+    """Private persistence for jobs and public idempotency receipts.
+
+    A job record may contain engine-private execution pins needed for exact
+    restart replay.  Query services must project records through ``JobView``;
+    repositories never expose their persistence mapping directly to clients.
+    """
 
     def load(self) -> Mapping[str, Mapping[str, Any]]:
         """Return the last persistence snapshot, or an empty mapping."""
 
     def save(self, jobs: Mapping[str, Mapping[str, Any]]) -> None:
-        """Atomically replace the credential-free persistence snapshot."""
+        """Atomically replace the private persistence snapshot."""

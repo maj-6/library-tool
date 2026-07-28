@@ -46,6 +46,7 @@ from librarytool.engine.correction_transforms import (
     CorrectionTransformService,
     QueuedCorrectionTransform,
 )
+from librarytool.engine.correction_ocr import CorrectionOcrProposalQueryService
 from librarytool.engine.items import ItemQueryService, ItemView
 from librarytool.engine.raster_artifacts import (
     RasterArtifactKey,
@@ -59,6 +60,7 @@ from librarytool.engine.runtime import (
     CORRECTION_METADATA_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     ITEM_QUERY_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
@@ -93,6 +95,7 @@ _CORRECTION_ACTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CORRECTIONS_IDENTIFIER_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$"
 )
+_OCR_PROPOSAL_REF_RE = re.compile(r"^cop-[0-9a-f]{40}$")
 _UNSAFE_TEXT_RE = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]"
 )
@@ -282,6 +285,53 @@ def _correction_transform_service(
         CORRECTION_TRANSFORM_SERVICE,
         "correction transform",
     )
+
+
+def _correction_ocr_proposal_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionOcrProposalQueryService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+        "correction ocr proposal",
+    )
+
+
+def _correction_ocr_proposal_detail(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    proposal_ref: str,
+) -> Response:
+    if _OCR_PROPOSAL_REF_RE.fullmatch(proposal_ref) is None:
+        raise ValidationError(
+            "the OCR proposal reference is invalid",
+            code="invalid_correction_ocr_proposal_ref",
+        )
+    proposal = _correction_ocr_proposal_service(
+        engine_for_request
+    ).get_proposal(item_id, proposal_ref)
+    if proposal is None:
+        raise NotFoundError(
+            "the OCR proposal does not exist",
+            code="correction_ocr_proposal_not_found",
+            details={
+                "item_id": item_id,
+                "proposal_ref": proposal_ref,
+            },
+        )
+    response = jsonify(
+        {
+            "ok": True,
+            "schema": "librarytool.correction-ocr-proposal/1",
+            "proposal": proposal.as_dict(),
+        }
+    )
+    response.cache_control.private = True
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.set_etag(proposal.content_sha256, weak=False)
+    return response
 
 
 def _correction_actor_id(
@@ -1873,6 +1923,19 @@ def create_corrections_blueprint(
                 correction_transform_submitter,
                 item_id,
                 artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/ocr-proposals/<proposal_ref>"
+    )
+    def get_correction_ocr_proposal(item_id: str, proposal_ref: str):
+        try:
+            return _correction_ocr_proposal_detail(
+                engine_for_request,
+                item_id,
+                proposal_ref,
             )
         except EngineError as error:
             return _error_response(error)

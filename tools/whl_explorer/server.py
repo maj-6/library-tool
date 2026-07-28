@@ -118,6 +118,7 @@ from librarytool.composition.filesystem import (  # noqa: E402
     ReplicaBindings,
     RepresentationBindings,
     SecretStoreBindings,
+    TextLayerAggregateBindings,
     TranslationBindings,
 )
 from librarytool.composition.first_party import (  # noqa: E402
@@ -153,9 +154,15 @@ from librarytool.engine.errors import (  # noqa: E402
     ValidationError as EngineValidationError,
 )
 from librarytool.engine.correction_transforms import (  # noqa: E402
+    CorrectionTransformCancelled,
     CorrectionTransformCommand,
+    CorrectionTransformHooksPort,
     CorrectionTransformService,
     QueuedCorrectionTransform,
+)
+from librarytool.engine.correction_ocr import (  # noqa: E402
+    CorrectionOcrProviderSelection,
+    CorrectionOcrRecognition,
 )
 from librarytool.engine.jobs import (  # noqa: E402
     ACTIVE_JOB_STATES,
@@ -210,6 +217,9 @@ from librarytool.engine.runtime import (  # noqa: E402
     LibraryEngine,
 )
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
+from librarytool.engine.text_layer_aggregate import (  # noqa: E402
+    TextLayerSourceSnapshot,
+)
 from librarytool.engine.translation_contracts import (  # noqa: E402
     ReplaceTranslationPageCommand,
     TranslationSourceCanvas,
@@ -5723,6 +5733,37 @@ def _corrections_representation_revision(
     return None
 
 
+def _engine_text_layer_source_snapshot(
+    item_id: str,
+    representation_id: str,
+) -> TextLayerSourceSnapshot | None:
+    """Pin native human text to the same live representation authority."""
+
+    if not _translation_item_exists(item_id):
+        return None
+    revision = _corrections_representation_revision(
+        item_id,
+        representation_id,
+    )
+    if revision is None:
+        return None
+    try:
+        return TextLayerSourceSnapshot(
+            item_id,
+            representation_id,
+            revision,
+        )
+    except (TypeError, ValueError) as exc:
+        raise EngineRepositoryError(
+            "the text-layer source cannot be represented safely",
+            code="invalid_text_layer_source_snapshot",
+            details={
+                "item_id": item_id,
+                "representation_id": representation_id,
+            },
+        ) from exc
+
+
 @contextlib.contextmanager
 def _engine_workspace_locks(_item_id: str):
     """Bridge legacy writers into the workspace lease's lock order."""
@@ -5842,6 +5883,11 @@ def _engine_host_bindings() -> FilesystemHostBindings:
                 source.layer_id
             ),
         ),
+        text_layer_aggregate=TextLayerAggregateBindings(
+            item_exists_for=_translation_item_exists,
+            source_snapshot_for=_engine_text_layer_source_snapshot,
+            layer_id_factory=lambda: lib.gen_id(),
+        ),
         corrections=CorrectionsBindings(
             item_exists_for=_translation_item_exists,
             capture_id_for=_corrections_capture_id,
@@ -5854,6 +5900,7 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             ),
             lock_context_for=lambda: _engine_workspace_locks(""),
             job_start_context_for=_correction_transform_job_start_guard,
+            ocr_provider=_EngineCorrectionOcrProvider(),
         ),
         workspace_lock_context_for=_engine_workspace_locks,
         recovery_lock_context=_engine_recovery_locks,
@@ -9599,9 +9646,12 @@ def api_pdf_pageimg():
 # plus `interrupted` for work a restart cut short. Entries are the SAME dicts
 # the per-kind registries hold, so the existing pollers keep their legacy
 # fields (`status` strings) while /api/jobs and the snapshot read the
-# canonical ones (`state`). The snapshot — an allowlist, never credentials,
-# request payloads, or prompt text — lands in DATA_ROOT/output/jobs.json on
-# every state transition, so after a restart a poll gets an honest
+# canonical ones (`state`). Public views are an allowlist and never expose
+# credentials, request payloads, prompt text, or private execution pins. The
+# on-disk snapshot may additionally retain the engine's narrow private
+# provider-pin envelope so interrupted work resumes with the same execution
+# selection. It lands in DATA_ROOT/output/jobs.json on every state transition,
+# so after a restart a poll gets an honest
 # "interrupted" answer instead of a 404. Cancellation is cooperative: a
 # threading.Event per job (never serialized), checked by each worker at its
 # natural boundary (OCR page, analyze chunk, publish stage).
@@ -9885,6 +9935,46 @@ def api_jobs_cancel(job_id: str):
 
 
 # --- OCR processing jobs -----------------------------------------------------------
+
+# Preflight the same outer payload envelope enforced by
+# CorrectionOcrRecognition.  Mistral's decoded-image ceiling leaves room in
+# that envelope for text, regions, and base64 expansion.
+_CORRECTION_OCR_JSON_MAX_DEPTH = 32
+_CORRECTION_OCR_JSON_MAX_NODES = 200_000
+_CORRECTION_OCR_JSON_MAX_STRING_BYTES = 64 * 1024 * 1024
+_CORRECTION_OCR_JSON_MAX_ENCODED_BYTES = 64 * 1024 * 1024
+_CORRECTION_OCR_CLAUDE_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+_CORRECTION_OCR_MISTRAL_MAX_PAGES = 128
+_CORRECTION_OCR_MISTRAL_MAX_IMAGES = 256
+_CORRECTION_OCR_MISTRAL_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+_CORRECTION_OCR_MISTRAL_MAX_TOTAL_IMAGE_BYTES = 32 * 1024 * 1024
+_CORRECTION_OCR_MISTRAL_DATA_URL = re.compile(
+    r"^data:image/(?:gif|jpe?g|png|webp);base64,$",
+    re.IGNORECASE,
+)
+
+
+def _bounded_ocr_http_response(
+        response,
+        *,
+        maximum_bytes: int,
+        provider: str,
+) -> bytes:
+    """Read a provider response without retaining an unbounded body."""
+
+    declared = None
+    try:
+        raw_declared = response.headers.get("Content-Length")
+        if raw_declared is not None:
+            declared = int(raw_declared)
+    except (AttributeError, TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > maximum_bytes:
+        raise RuntimeError(f"{provider} OCR response exceeds its size limit")
+    encoded = response.read(maximum_bytes + 1)
+    if len(encoded) > maximum_bytes:
+        raise RuntimeError(f"{provider} OCR response exceeds its size limit")
+    return encoded
 # Pages are rasterized (PyMuPDF) and run through the chosen OCR service;
 # every finished page is merged into ONE compiled OCR file in the entry
 # folder (ocr/compiled.txt) and saved immediately, so results from
@@ -9893,6 +9983,7 @@ def api_jobs_cancel(job_id: str):
 
 _ocr_jobs: dict[str, dict] = {}
 _ocr_jobs_lock = threading.Lock()
+_tesseract_runner_lock = threading.Lock()
 # Serializes the page-scoped deduplication check with registration of a new
 # Replica detection job.  General OCR batches remain intentionally independent;
 # this lock only prevents two clients from paying for the same region proposal
@@ -9928,12 +10019,21 @@ def _ocr_tesseract(png: bytes, cfg: dict) -> dict:
     from pytesseract import Output
     from PIL import Image
     import io as _io
-    exe = (cfg.get("tesseract") or "").strip() or _TESSERACT_DEFAULT
-    if Path(exe).is_file():
-        pytesseract.pytesseract.tesseract_cmd = exe
+    exe = str(cfg.get("tesseract") or "").strip()
+    if not exe or not Path(exe).is_file():
+        raise RuntimeError("Pinned Tesseract executable is unavailable")
     img = Image.open(_io.BytesIO(png))
     iw, ih = img.size
-    data = pytesseract.image_to_data(img, output_type=Output.DICT)
+    with _tesseract_runner_lock:
+        previous_executable = pytesseract.pytesseract.tesseract_cmd
+        pytesseract.pytesseract.tesseract_cmd = exe
+        try:
+            data = pytesseract.image_to_data(
+                img,
+                output_type=Output.DICT,
+            )
+        finally:
+            pytesseract.pytesseract.tesseract_cmd = previous_executable
     words: list[dict] = []
     grouped: dict[tuple, list[str]] = {}
     line_ids: dict[tuple, int] = {}    # (block,par,line) -> reading-order id
@@ -9983,9 +10083,15 @@ def _ocr_claude(png: bytes, cfg: dict) -> str:
         raise RuntimeError("Anthropic API key not configured (Settings > Credentials)")
     import base64
     model = (cfg.get("claude_model") or "").strip() or "claude-haiku-4-5-20251001"
+    try:
+        max_tokens = max(1024, min(32000, int(
+            cfg.get("max_tokens") or _ocr_max_tokens()
+        )))
+    except (TypeError, ValueError):
+        max_tokens = 8192
     body = json.dumps({
         "model": model,
-        "max_tokens": _ocr_max_tokens(),
+        "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": [
             {"type": "image", "source": {
                 "type": "base64", "media_type": "image/png",
@@ -10003,8 +10109,35 @@ def _ocr_claude(png: bytes, cfg: dict) -> str:
                  "x-api-key": key,
                  "anthropic-version": "2023-06-01"})
     with urllib.request.urlopen(req, timeout=180) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return "".join(blk.get("text", "") for blk in data.get("content", []))
+        encoded = _bounded_ocr_http_response(
+            resp,
+            maximum_bytes=_CORRECTION_OCR_CLAUDE_MAX_RESPONSE_BYTES,
+            provider="Anthropic",
+        )
+    try:
+        data = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError(
+            "Anthropic OCR returned an invalid JSON response"
+        ) from None
+    if not isinstance(data, Mapping):
+        raise RuntimeError("Anthropic OCR returned an invalid JSON response")
+    content = data.get("content", [])
+    if not isinstance(content, list):
+        raise RuntimeError("Anthropic OCR returned an invalid JSON response")
+    text_parts = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            raise RuntimeError(
+                "Anthropic OCR returned an invalid JSON response"
+            )
+        text = block.get("text", "")
+        if not isinstance(text, str):
+            raise RuntimeError(
+                "Anthropic OCR returned an invalid JSON response"
+            )
+        text_parts.append(text)
+    return "".join(text_parts)
 
 
 def _ocr_textract(png: bytes, cfg: dict) -> str:
@@ -10051,6 +10184,51 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
     return {"text": text, "words": words}
 
 
+def _mistral_image_base64_descriptor(value: object) -> tuple[str, int, int]:
+    """Validate one encoded figure and report its payload offset/byte count."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            "the Mistral OCR response contains invalid image data"
+        )
+    offset = 0
+    if value[:5].lower() == "data:":
+        comma = value.find(",", 0, 128)
+        if (
+            comma < 0
+            or _CORRECTION_OCR_MISTRAL_DATA_URL.fullmatch(
+                value[:comma + 1]
+            ) is None
+        ):
+            raise ValueError(
+                "the Mistral OCR response contains invalid image data"
+            )
+        offset = comma + 1
+    encoded_length = len(value) - offset
+    maximum_encoded = (
+        (_CORRECTION_OCR_MISTRAL_MAX_IMAGE_BYTES + 2) // 3
+    ) * 4
+    if encoded_length > maximum_encoded:
+        raise ValueError("a Mistral OCR image exceeds its size limit")
+    if encoded_length == 0 or encoded_length % 4:
+        raise ValueError(
+            "the Mistral OCR response contains invalid image data"
+        )
+    padding = 2 if value.endswith("==") else (1 if value.endswith("=") else 0)
+    first_padding = value.find("=", offset)
+    if first_padding >= 0 and first_padding != len(value) - padding:
+        raise ValueError(
+            "the Mistral OCR response contains invalid image data"
+        )
+    decoded_length = (encoded_length // 4) * 3 - padding
+    if (
+        decoded_length <= 0
+        or decoded_length > _CORRECTION_OCR_MISTRAL_MAX_IMAGE_BYTES
+    ):
+        raise ValueError("a Mistral OCR image exceeds its size limit")
+    return value, offset, decoded_length
+
+
 def _ocr_mistral(png: bytes, cfg: dict) -> dict:
     """Mistral returns markdown, the figures it cut out of the page, and
     (OCR-4, include_blocks) typed text blocks in reading order. The result
@@ -10067,40 +10245,129 @@ def _ocr_mistral(png: bytes, cfg: dict) -> dict:
     if not key:
         raise RuntimeError("Mistral API key not configured (Settings > Credentials)")
     import base64
-    pages = capture.mistral_ocr_pages(png, key, want_images=True,
-                                      want_blocks=True)
-    markdown = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    pages = capture.mistral_ocr_pages(
+        png,
+        key,
+        want_images=True,
+        want_blocks=True,
+        model=str(cfg.get("mistral_model") or "").strip() or None,
+    )
+    if not isinstance(pages, list):
+        raise ValueError("the Mistral OCR response has invalid pages")
+    if len(pages) > _CORRECTION_OCR_MISTRAL_MAX_PAGES:
+        raise ValueError("the Mistral OCR response has too many pages")
+
+    page_records = []
+    encoded_images = []
+    image_count = 0
+    total_image_bytes = 0
+    for pg in pages:
+        if not isinstance(pg, Mapping):
+            raise ValueError("the Mistral OCR response has invalid pages")
+        page_images = pg.get("images") or []
+        if not isinstance(page_images, list):
+            raise ValueError(
+                "the Mistral OCR response has invalid image records"
+            )
+        image_count += len(page_images)
+        if image_count > _CORRECTION_OCR_MISTRAL_MAX_IMAGES:
+            raise ValueError("the Mistral OCR response has too many images")
+        dim = pg.get("dimensions") or {}
+        if not isinstance(dim, Mapping):
+            raise ValueError(
+                "the Mistral OCR response has invalid dimensions"
+            )
+        try:
+            pw = float(dim.get("width") or 0)
+            ph = float(dim.get("height") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "the Mistral OCR response has invalid dimensions"
+            ) from None
+        if (
+            not math.isfinite(pw)
+            or not math.isfinite(ph)
+            or pw < 0
+            or ph < 0
+        ):
+            raise ValueError(
+                "the Mistral OCR response has invalid dimensions"
+            )
+        page_records.append((pg, dim, pw, ph))
+        for im in page_images:
+            if not isinstance(im, Mapping):
+                raise ValueError(
+                    "the Mistral OCR response has invalid image records"
+                )
+            encoded, offset, decoded_length = (
+                _mistral_image_base64_descriptor(im.get("image_base64"))
+            )
+            total_image_bytes += decoded_length
+            if (
+                total_image_bytes
+                > _CORRECTION_OCR_MISTRAL_MAX_TOTAL_IMAGE_BYTES
+            ):
+                raise ValueError(
+                    "Mistral OCR images exceed their aggregate size limit"
+                )
+            encoded_images.append(
+                (im, encoded, offset, decoded_length, pw, ph)
+            )
+
+    markdown_parts = []
+    for pg in pages:
+        page_markdown = pg.get("markdown", "")
+        if not isinstance(page_markdown, str):
+            raise ValueError(
+                "the Mistral OCR response has invalid page text"
+            )
+        markdown_parts.append(page_markdown)
+    markdown = "\n\n".join(markdown_parts).strip()
     regions: list[dict] = []
     dims = None
     images = []
-    for pg in pages:
-        dim = pg.get("dimensions") or {}
-        pw, ph = float(dim.get("width") or 0), float(dim.get("height") or 0)
+    for pg, dim, pw, ph in page_records:
         if dims is None and (pw > 0 or ph > 0):
-            dims = {"w": int(pw), "h": int(ph),
-                    "dpi": int(dim.get("dpi") or 0)}
-        regions.extend(layout_roles.regions_from_blocks(pg.get("blocks"), dim))
-        for im in pg.get("images") or []:
-            b64 = str(im.get("image_base64") or "")
-            if "," in b64[:64]:                 # strip a data: URL prefix
-                b64 = b64.split(",", 1)[1]
             try:
-                raw = base64.b64decode(b64)
-            except Exception:
-                continue
-            if not raw:
-                continue
-            bbox = None
-            if pw > 0 and ph > 0:
+                dpi = int(dim.get("dpi") or 0)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    "the Mistral OCR response has invalid dimensions"
+                ) from None
+            dims = {"w": int(pw), "h": int(ph), "dpi": dpi}
+        regions.extend(layout_roles.regions_from_blocks(pg.get("blocks"), dim))
+    for im, encoded, offset, decoded_length, pw, ph in encoded_images:
+        payload = encoded[offset:] if offset else encoded
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (ValueError, TypeError):
+            raise ValueError(
+                "the Mistral OCR response contains invalid image data"
+            ) from None
+        if len(raw) != decoded_length:
+            raise ValueError(
+                "the Mistral OCR response contains invalid image data"
+            )
+        bbox = None
+        if pw > 0 and ph > 0:
+            try:
                 x0 = float(im.get("top_left_x") or 0)
                 y0 = float(im.get("top_left_y") or 0)
                 x1 = float(im.get("bottom_right_x") or 0)
                 y1 = float(im.get("bottom_right_y") or 0)
-                bbox = {"x": round(x0 / pw, 5), "y": round(y0 / ph, 5),
-                        "w": round(max(0.0, x1 - x0) / pw, 5),
-                        "h": round(max(0.0, y1 - y0) / ph, 5)}
-            images.append({"id": str(im.get("id") or f"img-{len(images)}.jpeg"),
-                           "data": raw, "bbox": bbox})
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "the Mistral OCR response has invalid image bounds"
+                ) from None
+            if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+                raise ValueError(
+                    "the Mistral OCR response has invalid image bounds"
+                )
+            bbox = {"x": round(x0 / pw, 5), "y": round(y0 / ph, 5),
+                    "w": round(max(0.0, x1 - x0) / pw, 5),
+                    "h": round(max(0.0, y1 - y0) / ph, 5)}
+        images.append({"id": str(im.get("id") or f"img-{len(images)}.jpeg"),
+                       "data": raw, "bbox": bbox})
     if regions and layout_roles.coverage(regions, markdown) >= 0.7:
         text = layout_roles.compose_text(regions)
     else:
@@ -10114,6 +10381,339 @@ _OCR_SERVICES = {
     "textract": _ocr_textract,
     "mistral": _ocr_mistral,
 }
+
+
+def _json_string_sizes(
+        value: str,
+        *,
+        maximum_utf8_bytes: int,
+        maximum_json_bytes: int,
+) -> tuple[int, int]:
+    """Return UTF-8 and encoded JSON byte sizes without copying the string."""
+
+    utf8_bytes = 0
+    json_bytes = 2
+    for character in value:
+        codepoint = ord(character)
+        if 0xd800 <= codepoint <= 0xdfff:
+            raise ValueError(
+                "OCR provider output contains an invalid string"
+            )
+        if codepoint <= 0x7f:
+            width = 1
+        elif codepoint <= 0x7ff:
+            width = 2
+        elif codepoint <= 0xffff:
+            width = 3
+        else:
+            width = 4
+        utf8_bytes += width
+        if character in {'"', "\\"}:
+            json_bytes += 2
+        elif codepoint < 0x20:
+            json_bytes += 2 if character in "\b\f\n\r\t" else 6
+        else:
+            json_bytes += width
+        if utf8_bytes > maximum_utf8_bytes:
+            raise ValueError(
+                "OCR provider output exceeds its string budget"
+            )
+        if json_bytes > maximum_json_bytes:
+            raise ValueError(
+                "OCR provider output exceeds its encoded size budget"
+            )
+    return utf8_bytes, json_bytes
+
+
+class _CorrectionOcrJsonBudget:
+    """Incrementally bound provider normalization before its final JSON copy."""
+
+    __slots__ = (
+        "encoded_bytes",
+        "max_depth",
+        "max_encoded_bytes",
+        "max_nodes",
+        "max_string_bytes",
+        "nodes",
+        "string_bytes",
+    )
+
+    def __init__(
+            self,
+            *,
+            max_depth: int = _CORRECTION_OCR_JSON_MAX_DEPTH,
+            max_nodes: int = _CORRECTION_OCR_JSON_MAX_NODES,
+            max_string_bytes: int = _CORRECTION_OCR_JSON_MAX_STRING_BYTES,
+            max_encoded_bytes: int = _CORRECTION_OCR_JSON_MAX_ENCODED_BYTES,
+    ) -> None:
+        self.max_depth = max_depth
+        self.max_nodes = max_nodes
+        self.max_string_bytes = max_string_bytes
+        self.max_encoded_bytes = max_encoded_bytes
+        self.nodes = 0
+        self.string_bytes = 0
+        self.encoded_bytes = 0
+
+    def enter(self, *, depth: int) -> None:
+        if depth > self.max_depth:
+            raise ValueError("OCR provider output is nested too deeply")
+        self.reserve_nodes(1)
+
+    def reserve_nodes(self, count: int) -> None:
+        if count > self.max_nodes - self.nodes:
+            raise ValueError("OCR provider output exceeds its node budget")
+        self.nodes += count
+
+    def require_node_capacity(self, count: int) -> None:
+        if count > self.max_nodes - self.nodes:
+            raise ValueError("OCR provider output exceeds its node budget")
+
+    def reserve_encoded(self, count: int) -> None:
+        if count > self.max_encoded_bytes - self.encoded_bytes:
+            raise ValueError(
+                "OCR provider output exceeds its encoded size budget"
+            )
+        self.encoded_bytes += count
+
+    def reserve_string(self, value: str) -> None:
+        remaining = self.max_string_bytes - self.string_bytes
+        if len(value) > remaining:
+            raise ValueError("OCR provider output exceeds its string budget")
+        remaining_encoded = self.max_encoded_bytes - self.encoded_bytes
+        if len(value) + 2 > remaining_encoded:
+            raise ValueError(
+                "OCR provider output exceeds its encoded size budget"
+            )
+        utf8_bytes, json_bytes = _json_string_sizes(
+            value,
+            maximum_utf8_bytes=remaining,
+            maximum_json_bytes=remaining_encoded,
+        )
+        self.reserve_encoded(json_bytes)
+        self.string_bytes += utf8_bytes
+
+    def reserve_binary(self, length: int) -> int:
+        encoded_length = ((length + 2) // 3) * 4
+        fixed_strings = len("encoding") + len("base64") + len("data")
+        if (
+            fixed_strings + encoded_length
+            > self.max_string_bytes - self.string_bytes
+        ):
+            raise ValueError("OCR provider output exceeds its string budget")
+        wrapper_bytes = len('{"encoding":"base64","data":""}'.encode("ascii"))
+        self.reserve_encoded(wrapper_bytes + encoded_length)
+        self.reserve_nodes(2)
+        self.string_bytes += fixed_strings + encoded_length
+        return encoded_length
+
+
+def _reserve_correction_ocr_json_value(
+        value,
+        *,
+        depth: int = 0,
+        budget: _CorrectionOcrJsonBudget,
+) -> None:
+    budget.enter(depth=depth)
+    if value is None:
+        budget.reserve_encoded(4)
+        return
+    if isinstance(value, str):
+        budget.reserve_string(value)
+        return
+    if isinstance(value, bool):
+        budget.reserve_encoded(4 if value else 5)
+        return
+    if isinstance(value, int):
+        if value.bit_length() > (
+            budget.max_encoded_bytes - budget.encoded_bytes + 1
+        ) * 4:
+            raise ValueError(
+                "OCR provider output exceeds its encoded size budget"
+            )
+        try:
+            encoded_integer = str(value)
+        except ValueError:
+            raise ValueError(
+                "OCR provider output contains an invalid number"
+            ) from None
+        budget.reserve_encoded(len(encoded_integer))
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                "OCR provider output contains a non-finite number"
+            )
+        budget.reserve_encoded(len(json.dumps(value).encode("ascii")))
+        return
+    if isinstance(value, bytes):
+        budget.reserve_binary(len(value))
+        return
+    if isinstance(value, Mapping):
+        value_count = len(value)
+        budget.require_node_capacity(value_count)
+        budget.reserve_encoded(
+            2 + max(0, value_count - 1) + value_count
+        )
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("OCR provider output keys must be strings")
+            budget.reserve_string(key)
+            _reserve_correction_ocr_json_value(
+                item,
+                depth=depth + 1,
+                budget=budget,
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        budget.require_node_capacity(len(value))
+        budget.reserve_encoded(2 + max(0, len(value) - 1))
+        for item in value:
+            _reserve_correction_ocr_json_value(
+                item,
+                depth=depth + 1,
+                budget=budget,
+            )
+        return
+    raise ValueError(
+        f"OCR provider output contains unsupported {type(value).__name__}"
+    )
+
+
+def _convert_correction_ocr_json_value(value):
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, bytes):
+        return {
+            "encoding": "base64",
+            "data": base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, Mapping):
+        return {
+            key: _convert_correction_ocr_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _convert_correction_ocr_json_value(item)
+            for item in value
+        ]
+    raise ValueError(
+        f"OCR provider output contains unsupported {type(value).__name__}"
+    )
+
+
+def _correction_ocr_json_value(
+        value,
+        *,
+        depth: int = 0,
+        budget: _CorrectionOcrJsonBudget | None = None,
+):
+    """Preflight then normalize provider output to credential-free JSON."""
+
+    if budget is None:
+        budget = _CorrectionOcrJsonBudget()
+    _reserve_correction_ocr_json_value(
+        value,
+        depth=depth,
+        budget=budget,
+    )
+    return _convert_correction_ocr_json_value(value)
+
+
+class _EngineCorrectionOcrProvider:
+    """Adapt the existing OCR providers to proposal-only correction jobs."""
+
+    def select_provider(self) -> CorrectionOcrProviderSelection:
+        settings = _client_settings()
+        service = str(settings.get("ocrService") or "tesseract").strip().lower()
+        if service not in _OCR_SERVICES:
+            service = "tesseract"
+        request_config = _ocr_request_cfg({})
+        model = ""
+        if service == "mistral":
+            model = str(
+                getattr(capture, "OCR_MODEL", "mistral-ocr-latest")
+            ).strip() or "mistral-ocr-latest"
+        elif service == "claude":
+            model = str(
+                settings.get("ocrClaudeModel")
+                or "claude-haiku-4-5-20251001"
+            ).strip() or "claude-haiku-4-5-20251001"
+        elif service == "textract":
+            model = "detect-document-text"
+        elif service == "tesseract":
+            model = "local"
+        options = {}
+        if service == "mistral":
+            options["mistral_model"] = model
+        elif service == "tesseract":
+            configured = str(
+                request_config.get("tesseract") or ""
+            ).strip()
+            configured_path = Path(configured) if configured else None
+            if configured_path is not None and configured_path.is_file():
+                executable = str(configured_path.resolve())
+            elif configured:
+                executable = str(shutil.which(configured) or configured)
+            elif Path(_TESSERACT_DEFAULT).is_file():
+                executable = str(Path(_TESSERACT_DEFAULT).resolve())
+            else:
+                executable = str(
+                    shutil.which("tesseract") or _TESSERACT_DEFAULT
+                )
+            options["tesseract"] = executable
+        elif service == "claude":
+            options = {
+                "claude_model": model,
+                "max_tokens": _ocr_max_tokens(),
+            }
+        elif service == "textract":
+            options["aws_region"] = str(
+                request_config.get("aws_region") or "us-east-1"
+            ).strip() or "us-east-1"
+        return CorrectionOcrProviderSelection(service, model, options)
+
+    def recognize(
+        self,
+        selection: CorrectionOcrProviderSelection,
+        content: bytes,
+        hooks: CorrectionTransformHooksPort,
+    ) -> CorrectionOcrRecognition:
+        if not isinstance(selection, CorrectionOcrProviderSelection):
+            raise TypeError("selection must be a CorrectionOcrProviderSelection")
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("OCR-ready content must be non-empty bytes")
+        if hooks.is_cancelled():
+            raise CorrectionTransformCancelled
+        runner = _OCR_SERVICES.get(selection.provider_id)
+        if runner is None:
+            raise RuntimeError(
+                f"unsupported OCR service: {selection.provider_id}"
+            )
+        base_cfg = dict(selection.options)
+        with _ocr_execution_cfg(
+            selection.provider_id,
+            base_cfg,
+        ) as execution_cfg:
+            result = runner(content, execution_cfg)
+        if hooks.is_cancelled():
+            raise CorrectionTransformCancelled
+        if isinstance(result, Mapping):
+            payload = _correction_ocr_json_value(result)
+        elif result is None or isinstance(result, str):
+            payload = _correction_ocr_json_value(
+                {"text": result or ""}
+            )
+        else:
+            raise ValueError(
+                "OCR provider output must be a mapping or string"
+            )
+        return CorrectionOcrRecognition(
+            selection.provider_id,
+            selection.model,
+            payload,
+            selection.options,
+        )
 
 
 def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
@@ -11047,7 +11647,11 @@ def api_v1_replica_region_detection_job(build_id: str):
 
 
 def _ocr_job_state(job: dict) -> dict:
-    return {k: v for k, v in job.items() if k != "cfg"}
+    return {
+        key: value
+        for key, value in job.items()
+        if key not in {"cfg", "_private_input_revisions"}
+    }
 
 
 @app.route("/api/ocr/job/<job_id>")
@@ -11073,8 +11677,7 @@ def api_ocr_job_cancel(job_id: str):
         if not job:
             abort(404)
     snapshot = _job_request_cancel(job_id, fallback=job)
-    return jsonify({"ok": True,
-                    "job": {k: v for k, v in snapshot.items() if k != "cfg"}})
+    return jsonify({"ok": True, "job": _ocr_job_state(snapshot)})
 
 
 # --- trash (recoverable deletes) ------------------------------------------------------

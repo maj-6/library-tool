@@ -14,6 +14,7 @@ from librarytool.composition import (
     first_party_module_contributions,
 )
 from librarytool.engine.capabilities import CapabilityRef
+from librarytool.engine.correction_ocr import CorrectionOcrProposalQueryService
 from librarytool.engine.correction_transforms import CorrectionTransformService
 from librarytool.engine.corrections import CorrectionService
 from librarytool.engine.items import ItemQueryService
@@ -54,6 +55,11 @@ class _EmptyItemRepository:
 
     def list_artifact_records(self, _item_id, _item_record=None):
         return ()
+
+
+class _EmptyCorrectionOcrProposalRepository:
+    def get_proposal(self, _item_id, _proposal_ref):
+        return None
 
 
 class _NeverCalledSecretRepository:
@@ -212,6 +218,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     }
     correction_transforms = modules["library.corrections.transforms"]
     assert _capabilities(correction_transforms.provides) == {
+        ("library.corrections.ocr-proposals.read", 1),
         ("library.corrections.transforms.queue", 1),
     }
     assert _capabilities(correction_transforms.requires) == {
@@ -296,6 +303,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     }
     assert _capabilities(workbenches["corrections"].enhances) == {
         ("library.jobs", 1),
+        ("library.corrections.ocr-proposals.read", 1),
         ("library.corrections.transforms.queue", 1),
         ("library.corrections.captions.edit", 1),
         ("library.corrections.metadata.edit", 1),
@@ -656,6 +664,9 @@ def test_service_graph_allows_independent_correction_command_modules():
     graph = _graph()
     commands = CorrectionService(object())
     transforms = CorrectionTransformService(JobManager())
+    proposals = CorrectionOcrProposalQueryService(
+        _EmptyCorrectionOcrProposalRepository()
+    )
 
     command_only = replace(
         graph,
@@ -666,12 +677,14 @@ def test_service_graph_allows_independent_correction_command_modules():
         graph,
         correction_commands=None,
         correction_transforms=transforms,
+        correction_ocr_proposals=proposals,
     )
 
     assert command_only.correction_commands is commands
     assert command_only.correction_transforms is None
     assert transform_only.correction_commands is None
     assert transform_only.correction_transforms is transforms
+    assert transform_only.correction_ocr_proposals is proposals
     command_contributions = first_party_module_contributions(command_only)
     assert {
         contribution.manifest.id

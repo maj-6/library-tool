@@ -16,8 +16,15 @@ from .canvas_preparation_repository import (
 from .canvas_query_repository import FilesystemCanvasQueryRepository
 from .capture_archive_repository import FilesystemCaptureArchiveRepository
 from .correction_repository import FilesystemCorrectionRepository
-from .correction_transform_store import FilesystemCorrectionTransformStore
+from .correction_ocr_proposal_repository import (
+    FilesystemCorrectionOcrProposalRepository,
+)
+from .correction_transform_store import (
+    CorrectionTransformOutputResolverPort,
+    FilesystemCorrectionTransformStore,
+)
 from .correction_source_snapshot import (
+    CanonicalTextLayerHumanAssertionReader,
     FilesystemCorrectionSourceSnapshotReader,
 )
 from .corrections_artifact_repository import (
@@ -64,6 +71,7 @@ __all__ = [
     "ATTACHED_PDF_PARSER_ISOLATION",
     "ATTACHED_PDF_SNAPSHOT_EVIDENCE_PROFILE",
     "AttachedPdfAssetLookup",
+    "CanonicalTextLayerHumanAssertionReader",
     "EMPTY_MANAGED_TREE_REVISION",
     "FilesystemAttachedPdfAssetSnapshot",
     "FilesystemAttachedPdfInspector",
@@ -74,7 +82,9 @@ __all__ = [
     "FilesystemCanvasQueryRepository",
     "FilesystemCaptureArchiveRepository",
     "FilesystemCorrectionRepository",
+    "FilesystemCorrectionOcrProposalRepository",
     "FilesystemCorrectionTransformStore",
+    "CorrectionTransformOutputResolverPort",
     "FilesystemCorrectionSourceSnapshotReader",
     "FilesystemCorrectionsArtifactRepository",
     "FilesystemRasterResourceResolverPort",

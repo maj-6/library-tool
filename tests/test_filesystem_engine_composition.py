@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import subprocess
@@ -13,14 +14,17 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from PIL import Image
 from pypdf import PdfWriter
 
 from librarytool.adapters.filesystem import (
+    CanonicalTextLayerHumanAssertionReader,
     EMPTY_MANAGED_TREE_REVISION,
     FilesystemAttachedPdfAssetSnapshot,
     FilesystemCanvasEvidence,
     FilesystemCanvasInspection,
     FilesystemCanvasObservation,
+    FilesystemCorrectionSourceSnapshotReader,
     FilesystemRasterResourceResolverPort,
     RecoverableWriteSet,
     RecoveryRequiredError,
@@ -51,8 +55,17 @@ from librarytool.engine.canvas_commands import (
 from librarytool.engine.canvases import CanvasExtent
 from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.correction_projection import CorrectionProjectionService
+from librarytool.engine.correction_ocr import (
+    CORRECTION_OCR_JOB_KIND,
+    CorrectionOcrProposalQueryService,
+    CorrectionOcrProviderSelection,
+    CorrectionOcrRecognition,
+)
 from librarytool.engine.corrections import CorrectionService
-from librarytool.engine.correction_transforms import CorrectionTransformService
+from librarytool.engine.correction_transforms import (
+    CorrectionTransformCommand,
+    CorrectionTransformService,
+)
 from librarytool.engine.errors import ConflictError, RepositoryError, ValidationError
 from librarytool.engine.interchange import (
     LibImportPlan,
@@ -82,12 +95,14 @@ from librarytool.engine.providers import (
     ProviderTraits,
     StaticProviderHealthProbe,
 )
+from librarytool.processing.raster import ManualBinaryAdjustRecipe
 from librarytool.engine.translations import TranslationProvenanceService
 from librarytool.engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
     CORRECTION_CAPTION_SERVICE,
     CORRECTION_METADATA_SERVICE,
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
@@ -118,6 +133,7 @@ from librarytool.engine.text_layer_aggregate import (
     TextLayerDraft,
     TextLayerSourcePin,
     TextLayerSourceSnapshot,
+    TextLayerProvenance,
     TextLayerUnitDraft,
     TextLayerUnitReplacement,
 )
@@ -899,6 +915,7 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
     assert engine.get_service(CORRECTION_METADATA_SERVICE) is None
     assert engine.get_service(CORRECTION_REVIEW_SERVICE) is None
     assert engine.get_service(CORRECTION_SERVICE) is None
+    assert engine.get_service(CORRECTION_OCR_PROPOSAL_QUERY_SERVICE) is None
     assert engine.get_service(CORRECTION_TRANSFORM_SERVICE) is None
     assert "library.corrections.artifacts" not in {
         row["id"] for row in document["modules"]
@@ -913,10 +930,120 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
         "library.corrections.metadata.edit",
         "library.corrections.reviews.read",
         "library.corrections.reviews.edit",
+        "library.corrections.ocr-proposals.read",
         "library.corrections.transforms.queue",
         "library.spatial-annotations.read",
         "library.spatial-annotations.edit",
     }.isdisjoint(row["id"] for row in document["capabilities"])
+
+
+def _write_composition_capture(capture_root: Path) -> None:
+    def jpeg_bytes(colour: tuple[int, int, int]) -> bytes:
+        stream = io.BytesIO()
+        Image.new("RGB", (40, 30), colour).save(
+            stream,
+            format="JPEG",
+            quality=90,
+        )
+        return stream.getvalue()
+
+    original = jpeg_bytes((120, 20, 30))
+    display = jpeg_bytes((20, 120, 30))
+    directory = capture_root / "capture-1"
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = {
+        "schema": "org.whl.bookcapture.photo-assets",
+        "version": 1,
+        "capture_id": "capture-1",
+        "legacy_fallback": False,
+        "assets": [
+            {
+                "asset_id": "asset-1",
+                "capture_order": 1,
+                "capture_file": "photo_1.jpg",
+                "original": {
+                    "reference": "original_asset-1.jpg",
+                    "sha256": hashlib.sha256(original).hexdigest(),
+                    "revision": 3,
+                    "width": 40,
+                    "height": 30,
+                    "orientation": 0,
+                },
+                "display": {
+                    "reference": "photo_1.jpg",
+                    "sha256": hashlib.sha256(display).hexdigest(),
+                    "revision": 4,
+                    "width": 40,
+                    "height": 30,
+                    "orientation": 0,
+                    "recipe": "android-standardize",
+                    "recipe_version": "1",
+                },
+                "lifecycle": {"state": "completed"},
+                "role": {
+                    "suggested": "title_page",
+                    "confidence": 0.8,
+                    "algorithm": "composition-test",
+                    "algorithm_version": "1",
+                },
+                "geometry": [
+                    {
+                        "asset_id": "asset-1",
+                        "source_sha256": hashlib.sha256(original).hexdigest(),
+                        "source_revision": 3,
+                        "display_revision": 4,
+                        "coordinate_space": "display_normalized",
+                        "width": 40,
+                        "height": 30,
+                        "orientation": 0,
+                        "engine": "mistral",
+                        "model": "mistral-ocr-latest",
+                        "engine_version": "composition-test",
+                        "regions": [
+                            {
+                                "id": "figure-1",
+                                "type": "image",
+                                "confidence": 0.97,
+                                "polygon": [
+                                    [0.1, 0.2],
+                                    [0.9, 0.2],
+                                    [0.9, 0.8],
+                                    [0.1, 0.8],
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        "selections": {
+            "primary_title": {"asset_id": "asset-1"},
+            "thumbnail": {"asset_id": "asset-1"},
+        },
+        "transport": {"representation": "original", "version": 1},
+        "desktop_import": {
+            "version": 1,
+            "assets": [
+                {
+                    "order": 0,
+                    "asset_id": "asset-1",
+                    "raw_ref": "orig_1.jpg",
+                    "display_ref": "photo_1.jpg",
+                    "source_checksum": hashlib.sha256(original).hexdigest(),
+                    "derivative_checksum": hashlib.sha256(display).hexdigest(),
+                    "transport_representation": "original",
+                    "recipe": "desktop_perspective_standardize_v1",
+                    "lifecycle": "completed",
+                }
+            ],
+        },
+    }
+    (directory / "photo_assets.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
 
 
 def test_complete_corrections_bindings_install_one_projector_and_workbench(
@@ -946,10 +1073,14 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     assert engine.require_service(CORRECTION_METADATA_SERVICE) is corrections
     assert engine.require_service(CORRECTION_REVIEW_SERVICE) is corrections
     transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    ocr_proposals = engine.require_service(
+        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE
+    )
     assert raster is spatial
     assert isinstance(raster, CorrectionProjectionService)
     assert isinstance(corrections, CorrectionService)
     assert isinstance(transforms, CorrectionTransformService)
+    assert isinstance(ocr_proposals, CorrectionOcrProposalQueryService)
     assert transforms.executable is True
     assert isinstance(raster, FilesystemRasterResourceResolverPort)
     assert raster.list_raster_artifacts("book-one") == ()
@@ -1011,6 +1142,7 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     )
     assert transform_module["status"] == "available"
     assert transform_module["provides"] == [
+        {"id": "library.corrections.ocr-proposals.read", "version": 1},
         {"id": "library.corrections.transforms.queue", "version": 1},
     ]
     workbench = next(
@@ -1021,6 +1153,412 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     assert workbench["visible"] is True
     assert workbench["status"] == "available"
     assert workbench["requires"] == module["provides"]
+
+
+def test_corrections_source_uses_installed_native_text_layer_service(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    lock_state = {"held": False, "entries": 0}
+
+    @contextmanager
+    def non_reentrant_authority_lock():
+        if lock_state["held"]:
+            raise RuntimeError("authority lock was reacquired")
+        lock_state["held"] = True
+        lock_state["entries"] += 1
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
+
+    corrections = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda _item_id: None,
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=non_reentrant_authority_lock,
+    )
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=corrections,
+        text_layer_aggregate=_native_text_layer_bindings(),
+    )["engine"]
+
+    text_layers = engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE)
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    worker = transforms._executor.__self__
+    source_lookup = worker._store._source_snapshot_for
+    source_reader = next(
+        cell.cell_contents
+        for cell in (source_lookup.__closure__ or ())
+        if isinstance(
+            cell.cell_contents,
+            FilesystemCorrectionSourceSnapshotReader,
+        )
+    )
+    assertion_reader = source_reader._human_text_assertions_for
+    text_repository = text_layers._repository
+
+    assert isinstance(
+        assertion_reader,
+        CanonicalTextLayerHumanAssertionReader,
+    )
+    assert assertion_reader._text_layers is text_layers
+    assert worker._store._lock_context_for is (
+        text_repository._lock_context_for
+    )
+    with worker._store._lock_context_for():
+        with text_repository._lock_context_for():
+            pass
+    assert lock_state == {"held": False, "entries": 1}
+
+
+def test_production_composition_reopens_projected_transform_outputs(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+    first = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    raster = first.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.kind == "processed-image"
+    )
+    assert source.resource is not None
+    command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(
+            contrast=100,
+            brightness=0,
+        ),
+        rerun_ocr=False,
+        operation_id="composition-transform-1",
+    )
+    transforms = first.require_service(CORRECTION_TRANSFORM_SERVICE)
+    transforms.queue(command)
+    run = transforms.execute_queued(command)
+    assert run.image_commit is not None
+
+    reopened = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    reopened_raster = reopened.require_service(
+        RASTER_ARTIFACT_QUERY_SERVICE
+    )
+    projected = [
+        value
+        for value in reopened_raster.list_raster_artifacts("book-one")
+        if "correction_transform" in value.extensions
+    ]
+    assert {
+        value.extensions["correction_transform"]["output_kind"]
+        for value in projected
+    } == {"corrected-display", "ocr-ready", "thumbnail"}
+    corrected = next(
+        value
+        for value in projected
+        if value.extensions["correction_transform"]["output_kind"]
+        == "corrected-display"
+    )
+    assert corrected.resource is not None
+    resolved = reopened_raster.resolve_raster_resource(
+        "book-one",
+        corrected.resource,
+    )
+    assert resolved is not None
+    try:
+        assert resolved.stream.read().startswith(b"\x89PNG\r\n\x1a\n")
+        assert resolved.content_sha256 == corrected.content_sha256
+    finally:
+        resolved.stream.close()
+
+    reopened_spatial = reopened.require_service(
+        SPATIAL_ANNOTATION_QUERY_SERVICE
+    )
+    mapped = [
+        value
+        for value in reopened_spatial.list_spatial_annotations("book-one")
+        if "correction_transform" in value.extensions
+    ]
+    assert len(mapped) == 1
+    assert mapped[0].linked_artifact_ids == (
+        corrected.key.artifact_id,
+    )
+    assert mapped[0].source.canvas_revision == corrected.revision
+    assert (
+        mapped[0].selector.coordinate_space_revision
+        == corrected.revision
+    )
+
+
+def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    lock_state = {"held": False, "entries": 0}
+
+    @contextmanager
+    def non_reentrant_authority_lock():
+        if lock_state["held"]:
+            raise RuntimeError("authority lock was reacquired")
+        lock_state["held"] = True
+        lock_state["entries"] += 1
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
+
+    class ExactOcrProvider:
+        def __init__(self):
+            self.contents = []
+            self.selections = []
+
+        def select_provider(self):
+            return CorrectionOcrProviderSelection(
+                "test-provider",
+                "model-r1",
+                {"layout": True},
+            )
+
+        def recognize(self, selection, content, hooks):
+            assert hooks.is_cancelled() is False
+            self.contents.append(content)
+            self.selections.append(selection)
+            return CorrectionOcrRecognition(
+                selection.provider_id,
+                selection.model,
+                {"text": "Machine proposal from corrected raster"},
+                selection.options,
+            )
+
+    provider = ExactOcrProvider()
+    text_authority = {"representation_id": "", "revision": ""}
+
+    def text_source_snapshot(item_id, representation_id):
+        if (
+            item_id != "book-one"
+            or representation_id != text_authority["representation_id"]
+            or not text_authority["revision"]
+        ):
+            return None
+        return TextLayerSourceSnapshot(
+            item_id,
+            representation_id,
+            text_authority["revision"],
+        )
+
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=non_reentrant_authority_lock,
+        ocr_provider=provider,
+    )
+    composed = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+        text_layer_aggregate=TextLayerAggregateBindings(
+            item_exists_for=lambda item_id: item_id == "book-one",
+            source_snapshot_for=text_source_snapshot,
+            layer_id_factory=lambda: "human-layer-1",
+        ),
+    )
+    raster = composed["engine"].require_service(
+        RASTER_ARTIFACT_QUERY_SERVICE
+    )
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.kind == "processed-image"
+    )
+    assert source.resource is not None
+    text_authority.update({
+        "representation_id": source.source.representation_id,
+        "revision": source.source.representation_revision,
+    })
+    text_layers = composed["engine"].require_service(
+        TEXT_LAYER_AGGREGATE_SERVICE
+    )
+    text_layers.create(
+        CreateTextLayerCommand(
+            "book-one",
+            TextLayerDraft(
+                source=TextLayerSourcePin(
+                    source.source.representation_id,
+                    source.source.representation_revision,
+                ),
+                units=(
+                    TextLayerUnitDraft(
+                        "capture-text",
+                        0,
+                        "Human verified transcription",
+                        provenance=TextLayerProvenance(
+                            origin="human",
+                            review_state="approved",
+                        ),
+                    ),
+                ),
+                label="Verified",
+                language="en",
+            ),
+            "composition-human-text-1",
+        )
+    )
+    command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(
+            contrast=100,
+            brightness=0,
+        ),
+        rerun_ocr=True,
+        operation_id="composition-transform-ocr-1",
+    )
+    transforms = composed["engine"].require_service(
+        CORRECTION_TRANSFORM_SERVICE
+    )
+
+    queued = transforms.queue(command)
+    result = transforms.execute_queued(command)
+
+    assert result.ocr_followup.state.value == "succeeded"
+    assert result.ocr_followup.proposal_ref.startswith("cop-")
+    assert len(provider.contents) == 1
+    assert provider.contents[0].startswith(b"\x89PNG\r\n\x1a\n")
+    assert provider.selections == [
+        CorrectionOcrProviderSelection(
+            "test-provider",
+            "model-r1",
+            {"layout": True},
+        )
+    ]
+    parent = composed["jobs"].view(queued.job_id)
+    assert parent.state.value == "done"
+    assert parent.outputs[-1].kind == "ocr-proposal"
+    children = composed["jobs"].list_views(
+        kinds=(CORRECTION_OCR_JOB_KIND,),
+        item_id="book-one",
+    )
+    assert len(children) == 1
+    assert children[0].state.value == "done"
+    assert children[0].outputs[0].ref == result.ocr_followup.proposal_ref
+    canonical_before = {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and ".engine" not in path.parts
+    }
+    proposal_view = composed["engine"].require_service(
+        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE
+    ).get_proposal(
+        "book-one",
+        result.ocr_followup.proposal_ref,
+    )
+    assert proposal_view is not None
+    assert proposal_view.recognition == {
+        "text": "Machine proposal from corrected raster"
+    }
+    public_proposal = proposal_view.as_dict()
+    assert public_proposal["provider"] == {
+        "provider_id": "test-provider",
+        "model": "model-r1",
+    }
+    assert "options" not in public_proposal["provider"]
+    assert "credential" not in json.dumps(public_proposal).casefold()
+    assert "path" not in public_proposal
+    assert (
+        composed["engine"]
+        .require_service(CORRECTION_OCR_PROPOSAL_QUERY_SERVICE)
+        .get_proposal("another-book", result.ocr_followup.proposal_ref)
+        is None
+    )
+    canonical_after = {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and ".engine" not in path.parts
+    }
+    assert canonical_after == canonical_before
+    proposal_path = next(
+        (
+            composed["write_set"].root
+            / ".engine"
+            / "correction-transforms"
+            / "ocr-proposals"
+        ).glob("*.json")
+    )
+    proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+    assert proposal["recognition"]["payload"]["text"] == (
+        "Machine proposal from corrected raster"
+    )
+    assert proposal["provider"] == {
+        "provider_id": "test-provider",
+        "model": "model-r1",
+        "options": {"layout": True},
+    }
+    publication_path = next(
+        (
+            composed["write_set"].root
+            / ".engine"
+            / "correction-transforms"
+            / "publications"
+        ).glob("*.json")
+    )
+    publication = json.loads(
+        publication_path.read_text(encoding="utf-8")
+    )
+    assert [
+        value["text"]
+        for value in publication["human_assertions"]["text"]
+    ] == ["Human verified transcription"]
+    assert publication["human_assertions"]["text"][0]["origin"] == (
+        "verified"
+    )
+    assert lock_state["held"] is False
+    assert lock_state["entries"] > 0
 
 
 def test_native_text_layer_vertical_is_absent_without_complete_bindings(

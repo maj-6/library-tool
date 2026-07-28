@@ -22,8 +22,14 @@ from librarytool.engine.corrections import (
     CorrectionService,
 )
 from librarytool.engine.correction_transforms import (
+    CommittedCorrectionOutput,
     CorrectionTransformCommand,
     CorrectionTransformService,
+)
+from librarytool.engine.correction_ocr import (
+    CORRECTION_OCR_PROPOSAL_POLICY,
+    CorrectionOcrProposalProviderView,
+    CorrectionOcrProposalView,
 )
 from librarytool.engine.jobs import JobManager
 from librarytool.engine.items import ItemView, WorkbenchState
@@ -45,6 +51,7 @@ from librarytool.engine.raster_artifacts import (
 from librarytool.engine.runtime import (
     CORRECTION_CAPTION_SERVICE,
     CORRECTION_METADATA_SERVICE,
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
@@ -200,6 +207,7 @@ class _Engine:
         spatial,
         corrections=None,
         transforms=None,
+        ocr_proposals=None,
         items=None,
     ):
         self.services = {
@@ -216,6 +224,10 @@ class _Engine:
                 self.services[key] = corrections
         if transforms is not None:
             self.services[CORRECTION_TRANSFORM_SERVICE] = transforms
+        if ocr_proposals is not None:
+            self.services[CORRECTION_OCR_PROPOSAL_QUERY_SERVICE] = (
+                ocr_proposals
+            )
         if items is not None:
             self.services[ITEM_QUERY_SERVICE] = items
 
@@ -352,6 +364,22 @@ class _ReviewService:
     def get_review(self, item_id):
         self.calls.append(item_id)
         return self.review
+
+
+class _OcrProposalService:
+    def __init__(self, proposal):
+        self.proposal = proposal
+        self.calls = []
+
+    def get_proposal(self, item_id, proposal_ref):
+        self.calls.append((item_id, proposal_ref))
+        if (
+            self.proposal is None
+            or self.proposal.item_id != item_id
+            or self.proposal.proposal_ref != proposal_ref
+        ):
+            return None
+        return self.proposal
 
 
 class _ItemService:
@@ -1710,6 +1738,105 @@ def test_correction_mutation_transport_rejects_ambiguous_documents(tmp_path):
     assert extra.get_json()["code"] == "invalid_correction_mutation_envelope"
 
 
+def _ocr_proposal_view(
+    *,
+    item_id="book-1",
+    proposal_ref="cop-" + "a" * 40,
+):
+    source = CommittedCorrectionOutput(
+        "ocr-ready",
+        "corrected-ocr-ready",
+        "corrected-r1",
+        "b" * 64,
+    )
+    return CorrectionOcrProposalView(
+        proposal_ref=proposal_ref,
+        item_id=item_id,
+        operation_id="transform-op-1",
+        source=source,
+        provider=CorrectionOcrProposalProviderView(
+            "mistral",
+            "mistral-ocr-latest",
+        ),
+        recognition={
+            "text": "Machine proposal",
+            "regions": [{"role": "marginalia"}],
+        },
+        publication_policy=CORRECTION_OCR_PROPOSAL_POLICY,
+        content_sha256="c" * 64,
+    )
+
+
+def test_ocr_proposal_resource_is_versioned_item_scoped_and_private():
+    proposal = _ocr_proposal_view()
+    service = _OcrProposalService(proposal)
+    client = _app(
+        _Engine(
+            _RasterProjector(()),
+            _SpatialProjector(()),
+            ocr_proposals=service,
+        )
+    ).test_client()
+    path = (
+        "/api/v1/items/book-1/ocr-proposals/"
+        f"{proposal.proposal_ref}"
+    )
+
+    response = client.get(path)
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "schema": "librarytool.correction-ocr-proposal/1",
+        "proposal": proposal.as_dict(),
+    }
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert response.headers["Pragma"] == "no-cache"
+    assert response.headers["ETag"] == f'"{proposal.content_sha256}"'
+    assert service.calls == [("book-1", proposal.proposal_ref)]
+    serialized = response.get_data(as_text=True).casefold()
+    assert "credential" not in serialized
+    assert "storage_path" not in serialized
+    assert "options" not in serialized
+
+    wrong_item = client.get(
+        "/api/v1/items/another-book/ocr-proposals/"
+        f"{proposal.proposal_ref}"
+    )
+    assert wrong_item.status_code == 404
+    assert wrong_item.get_json()["code"] == "correction_ocr_proposal_not_found"
+
+
+def test_ocr_proposal_resource_rejects_invalid_refs_and_missing_module():
+    proposal = _ocr_proposal_view()
+    service = _OcrProposalService(proposal)
+    client = _app(
+        _Engine(
+            _RasterProjector(()),
+            _SpatialProjector(()),
+            ocr_proposals=service,
+        )
+    ).test_client()
+
+    invalid = client.get(
+        "/api/v1/items/book-1/ocr-proposals/not-an-opaque-ref"
+    )
+    missing = _app(
+        _Engine(_RasterProjector(()), _SpatialProjector(()))
+    ).test_client().get(
+        "/api/v1/items/book-1/ocr-proposals/"
+        f"{proposal.proposal_ref}"
+    )
+
+    assert invalid.status_code == 400
+    assert invalid.get_json()["code"] == "invalid_correction_ocr_proposal_ref"
+    assert service.calls == []
+    assert missing.status_code == 503
+    assert missing.get_json()["code"] == (
+        "correction_ocr_proposal_module_unavailable"
+    )
+
+
 def _transform_command(artifact, operation_id="transform-op-1"):
     return CorrectionTransformCommand(
         item_id=artifact.key.item_id,
@@ -1765,6 +1892,15 @@ def test_transform_queue_is_versioned_idempotent_and_schedules_outside_http():
         "operation_id": command.operation_id,
         "source_revision": artifact.resource.revision,
         "source_sha256": artifact.content_sha256,
+        "transform": {
+            "quad": [list(point) for point in command.quad],
+            "adjustment": (
+                command.adjustment.as_dict()
+                if command.adjustment is not None
+                else None
+            ),
+            "rerun_ocr": command.rerun_ocr,
+        },
     }
     assert "command_sha256" not in str(body)
     assert first.headers["Location"] == (

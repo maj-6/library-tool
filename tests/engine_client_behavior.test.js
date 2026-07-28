@@ -294,10 +294,46 @@ function correctionTransformQueueResult(command, overrides = {}) {
         source_revision: command.source_revision,
         source_sha256: command.source_sha256,
         operation_id: command.operation_id,
+        transform: {
+          quad: command.quad.map((point) => [...point]),
+          adjustment: command.adjustment,
+          rerun_ocr: command.rerun_ocr,
+        },
       },
       outputs: [],
     },
     ...overrides,
+  };
+}
+
+function correctionOcrProposalResult(overrides = {}) {
+  const proposal = {
+    proposal_ref: `cop-${"a".repeat(40)}`,
+    item_id: "book:one",
+    operation_id: "transform:one",
+    source: {
+      kind: "ocr-ready",
+      artifact_id: "corrected:ocr-ready",
+      artifact_revision: "corrected-r1",
+      content_sha256: "b".repeat(64),
+    },
+    provider: {
+      provider_id: "mistral",
+      model: "mistral-ocr-latest",
+    },
+    recognition: {
+      text: "Machine proposal",
+      regions: [{ role: "marginalia", box: [0.1, 0.2, 0.3, 0.4] }],
+    },
+    publication_policy: "machine-proposal-only",
+    content_sha256: "c".repeat(64),
+    ...(overrides.proposal || {}),
+  };
+  return {
+    ok: true,
+    schema: "librarytool.correction-ocr-proposal/1",
+    proposal,
+    ...(overrides.envelope || {}),
   };
 }
 
@@ -444,6 +480,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.corrections.assignRegionRole, "function");
   assert.equal(typeof client.corrections.clearRegionRole, "function");
   assert.equal(typeof client.corrections.queueTransform, "function");
+  assert.equal(typeof client.corrections.getOcrProposal, "function");
   assert.equal(typeof client.corrections.setManualCaption, "function");
   assert.equal(typeof client.corrections.clearManualCaption, "function");
   assert.equal(typeof client.corrections.assertArtifactMetadata, "function");
@@ -1722,6 +1759,105 @@ test("correction transforms own their canonical queue transport", async () => {
   ]]);
 });
 
+test("correction OCR proposals use an opaque item-scoped read resource",
+  async () => {
+    const calls = [];
+    const body = correctionOcrProposalResult();
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, body);
+      },
+    });
+
+    const result = await client.corrections.getOcrProposal({
+      itemId: "book:one",
+      proposalRef: `cop-${"a".repeat(40)}`,
+    });
+
+    assert.deepEqual(result, body);
+    assert.deepEqual(calls.map((call) => [
+      call.init.method,
+      call.url,
+      call.init.cache,
+      call.init.headers,
+    ]), [[
+      "GET",
+      `/api/v1/items/book%3Aone/ocr-proposals/cop-${"a".repeat(40)}`,
+      "no-store",
+      { Accept: "application/json" },
+    ]]);
+    assert.equal(Object.hasOwn(result.proposal.provider, "options"), false);
+  });
+
+test("correction OCR proposal reads reject private or noncanonical payloads",
+  async () => {
+    let transports = 0;
+    const invalidInput = new EngineClient({
+      transport: async () => {
+        transports += 1;
+        return response(200, correctionOcrProposalResult());
+      },
+    });
+    assert.throws(
+      () => invalidInput.corrections.getOcrProposal({
+        itemId: "book:one",
+        proposalRef: "proposal:one",
+      }),
+      TypeError,
+    );
+    assert.equal(transports, 0);
+
+    const invalidBodies = [
+      correctionOcrProposalResult({
+        envelope: { unexpected: true },
+      }),
+      correctionOcrProposalResult({
+        proposal: {
+          item_id: "another-book",
+        },
+      }),
+      correctionOcrProposalResult({
+        proposal: {
+          provider: {
+            provider_id: "tesseract",
+            model: "local",
+            options: { tesseract: "C:\\private\\tesseract.exe" },
+          },
+        },
+      }),
+      correctionOcrProposalResult({
+        proposal: {
+          recognition: {
+            text: "Machine proposal",
+            storage_path: "C:\\private\\proposal.json",
+          },
+        },
+      }),
+      correctionOcrProposalResult({
+        proposal: {
+          recognition: {
+            text: "Machine proposal",
+            credential: "must-not-cross-the-boundary",
+          },
+        },
+      }),
+    ];
+    for (const body of invalidBodies) {
+      const client = new EngineClient({
+        transport: async () => response(200, body),
+      });
+      await assert.rejects(
+        client.corrections.getOcrProposal({
+          itemId: "book:one",
+          proposalRef: `cop-${"a".repeat(40)}`,
+        }),
+        (error) => error instanceof EngineClientError &&
+          error.code === "invalid-response",
+      );
+    }
+  });
+
 test("correction transform queue rejects noncanonical commands and receipts", async () => {
   let transports = 0;
   const command = correctionTransformCommand();
@@ -1748,6 +1884,32 @@ test("correction transform queue rejects noncanonical commands and receipts", as
       error.code === "invalid-response" && error.body === null,
   );
   assert.equal(transports, 1);
+
+  const mismatchedPins = new EngineClient({
+    transport: async () => {
+      const body = correctionTransformQueueResult(command);
+      body.job.input_revisions.transform.rerun_ocr = true;
+      return response(202, body);
+    },
+  });
+  await assert.rejects(
+    mismatchedPins.corrections.queueTransform({ command }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const missingPins = new EngineClient({
+    transport: async () => {
+      const body = correctionTransformQueueResult(command);
+      delete body.job.input_revisions.transform;
+      return response(202, body);
+    },
+  });
+  await assert.rejects(
+    missingPins.corrections.queueTransform({ command }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
 });
 
 test("secret reads expose only versioned masked status", async () => {

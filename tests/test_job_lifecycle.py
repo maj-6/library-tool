@@ -330,6 +330,62 @@ def test_versioned_job_transport_filters_and_cancels(client):
         _finish(second["id"])
 
 
+def test_private_ocr_provider_pin_never_crosses_job_http_boundaries(client):
+    executable = r"C:\Users\alice\private tools\tesseract.exe"
+    credential = "TOP-SECRET-JOB-HTTP-SENTINEL"
+    job = {
+        "id": "private-ocr-http-pin",
+        "build_id": "private-pin-book",
+        "kind": "correction.ocr-followup",
+        "status": "running",
+        "subject": {
+            "item_id": "private-pin-book",
+            "source_id": "corrected-ocr-ready",
+        },
+        "input_revisions": {
+            "provider": {
+                "provider_id": "tesseract",
+                "model": "local",
+            },
+        },
+    }
+    server._job_manager.set_private_input_revisions(job, {
+        "provider": {
+            "provider_id": "tesseract",
+            "model": "local",
+            "options": {
+                "tesseract": executable,
+                "credential": credential,
+            },
+        },
+    })
+    server._job_track(job, "correction.ocr-followup")
+    try:
+        responses = (
+            client.get("/api/jobs"),
+            client.get("/api/v1/jobs?kind=correction.ocr-followup"),
+            client.get(f"/api/v1/jobs/{job['id']}"),
+            client.get("/api/v1/job-events?after=0&limit=500"),
+            client.post(f"/api/jobs/{job['id']}/cancel"),
+            client.post(f"/api/v1/jobs/{job['id']}/cancel"),
+        )
+        for response in responses:
+            assert response.status_code == 200
+            payload = response.get_data(as_text=True)
+            assert executable not in payload
+            assert credential not in payload
+        detail = responses[2].get_json()["job"]
+        assert detail["input_revisions"]["provider"] == {
+            "provider_id": "tesseract",
+            "model": "local",
+        }
+    finally:
+        with server._jobs_lock:
+            server._jobs.pop(job["id"], None)
+            server._jobs_events.pop(job["id"], None)
+            server._job_manager._save_locked()
+
+
 def test_cancel_race_cannot_overwrite_worker_terminal_state(client):
     """A worker finishing during Event.set must win after cancellation.
 

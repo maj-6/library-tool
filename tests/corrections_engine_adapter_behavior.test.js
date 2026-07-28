@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const {
+  correctionTransformJob,
   createCorrectionsEnginePorts,
   decorateRasterArtifact,
   decorateSpatialAnnotation,
@@ -132,7 +133,107 @@ function engineHarness(overrides = {}) {
   if (overrides.corrections) {
     engineClient.corrections = overrides.corrections;
   }
+  if (overrides.jobs) {
+    engineClient.jobs = overrides.jobs;
+  }
   return { calls, engineClient };
+}
+
+
+function transformCommand(overrides = {}) {
+  return {
+    schema: "org.whl.correction-transform-command",
+    version: 1,
+    item_id: "book-1",
+    artifact_id: "capture-1",
+    artifact_revision: "artifact-r1",
+    source_revision: "source-r1",
+    source_sha256: "a".repeat(64),
+    quad: [[0, 0], [1, 0], [1, 1], [0, 1]],
+    adjustment: {
+      schema: "org.whl.raster.manual-binary-adjust",
+      version: 1,
+      algorithm: "grayscale-threshold-blend-v1",
+      contrast_percent: 100,
+      brightness_percent: 12,
+      threshold: 112,
+      threshold_rule:
+        "round_half_up(127.5 - brightness_percent * 1.275), clamped_0_255",
+      comparison: "grayscale_value > threshold",
+    },
+    rerun_ocr: true,
+    operation_id: "transform-op-1",
+    ...overrides,
+  };
+}
+
+
+function transformJob(command, overrides = {}) {
+  return {
+    id: "correction-transform-job-1",
+    kind: "correction.transform",
+    state: "queued",
+    subject: {
+      item_id: command.item_id,
+      source_id: command.artifact_id,
+    },
+    progress: { completed: 0, total: 6, unit: "phase", phase: "queued" },
+    cancellable: true,
+    revision: 1,
+    created_at: "2026-07-27T12:00:00Z",
+    updated_at: "2026-07-27T12:00:00Z",
+    finished_at: "",
+    note: "queued",
+    error: null,
+    input_revisions: {
+      artifact_id: command.artifact_id,
+      artifact_revision: command.artifact_revision,
+      source_revision: command.source_revision,
+      source_sha256: command.source_sha256,
+      operation_id: command.operation_id,
+      transform: {
+        quad: command.quad.map((point) => [...point]),
+        adjustment: { ...command.adjustment },
+        rerun_ocr: command.rerun_ocr,
+      },
+    },
+    outputs: [],
+    ...overrides,
+  };
+}
+
+
+function transformOutputs() {
+  return [
+    {
+      kind: "corrected-display",
+      ref: "result-corrected-display-1",
+      partial: false,
+    },
+    { kind: "ocr-ready", ref: "result-ocr-ready-1", partial: false },
+    { kind: "thumbnail", ref: "result-thumbnail-1", partial: false },
+    {
+      kind: "transform-manifest",
+      ref: "result-transform-manifest-1",
+      partial: false,
+    },
+  ];
+}
+
+
+function manualScheduler() {
+  const scheduled = [];
+  return {
+    cancelSchedule(token) {
+      token.cancelled = true;
+    },
+    schedule(callback, delay) {
+      const token = { callback, cancelled: false, delay };
+      scheduled.push(token);
+      return token;
+    },
+    scheduled,
+  };
 }
 
 
@@ -548,6 +649,255 @@ test("transform commands bridge the image editor to EngineClient", async () => {
     (error) => error.code === "capability-unavailable",
   );
 });
+
+
+test("transform polling converts a terminal image commit and OCR failure", {
+  timeout: 1000,
+}, async () => {
+  const command = transformCommand();
+  const scheduler = manualScheduler();
+  const jobReads = [];
+  const activeJob = transformJob(command);
+  const runningJob = transformJob(command, {
+    state: "running",
+    progress: {
+      completed: 2,
+      total: 6,
+      unit: "phase",
+      phase: "transforming",
+    },
+    revision: 2,
+    updated_at: "2026-07-27T12:00:01Z",
+    note: "transforming",
+  });
+  const terminalJob = transformJob(command, {
+    state: "done",
+    progress: { completed: 6, total: 6, unit: "phase", phase: "complete" },
+    cancellable: false,
+    revision: 4,
+    updated_at: "2026-07-27T12:00:02Z",
+    finished_at: "2026-07-27T12:00:02Z",
+    note: "image committed; provider unavailable",
+    error: {
+      code: "ocr_followup_unavailable",
+      message: "OCR provider is unavailable",
+      retryable: true,
+    },
+    input_revisions: {
+      ...activeJob.input_revisions,
+      command_sha256: "b".repeat(64),
+    },
+    outputs: transformOutputs(),
+  });
+  const { engineClient } = engineHarness({
+    corrections: {
+      async queueTransform() {
+        return {
+          job_id: activeJob.id,
+          operation_id: command.operation_id,
+          job: activeJob,
+        };
+      },
+    },
+    jobs: {
+      async get(args) {
+        jobReads.push(args);
+        return {
+          ok: true,
+          job: jobReads.length === 1 ? runningJob : terminalJob,
+        };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient, {
+    transformPolling: scheduler,
+  });
+  const observed = deferred();
+  const unsubscribe = ports.transforms.subscribeResults(
+    (result, observedCommand) => observed.resolve([result, observedCommand]),
+  );
+
+  await ports.invokeCommand("corrections.transform.queue", { command });
+  assert.equal(scheduler.scheduled.length, 1);
+  scheduler.scheduled.shift().callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.scheduled.length, 1);
+  scheduler.scheduled.shift().callback();
+  const [result, observedCommand] = await observed.promise;
+
+  assert.deepEqual(jobReads, [
+    { jobId: activeJob.id },
+    { jobId: activeJob.id },
+  ]);
+  assert.equal(result.terminal_state, "done");
+  assert.equal(result.operation_id, command.operation_id);
+  assert.deepEqual(
+    result.image_commit.outputs.map((output) => output.kind),
+    ["corrected-display", "ocr-ready", "thumbnail", "transform-manifest"],
+  );
+  assert.equal(result.ocr_followup.state, "failed");
+  assert.equal(
+    result.ocr_followup.failure.code,
+    "ocr_followup_unavailable",
+  );
+  assert.deepEqual(result.ocr_followup.source, {
+    kind: "ocr-ready",
+    artifact_id: "result-ocr-ready-1",
+  });
+  assert.equal(result.failure, null);
+  assert.deepEqual(observedCommand, command);
+  const normalized = correctionTransformJob(
+    terminalJob, command, activeJob.id,
+  );
+  assert.equal(
+    Object.hasOwn(normalized.input_revisions, "command_sha256"),
+    false,
+  );
+  unsubscribe();
+});
+
+
+test("transform polling rejects a completed job without committed outputs", {
+  timeout: 1000,
+}, async () => {
+  const command = transformCommand({ rerun_ocr: false });
+  const scheduler = manualScheduler();
+  const activeJob = transformJob(command);
+  const invalidTerminal = transformJob(command, {
+    state: "done",
+    progress: { completed: 6, total: 6, unit: "phase", phase: "complete" },
+    cancellable: false,
+    revision: 2,
+    updated_at: "2026-07-27T12:00:02Z",
+    finished_at: "2026-07-27T12:00:02Z",
+    note: "correction complete",
+  });
+  const { engineClient } = engineHarness({
+    corrections: {
+      async queueTransform() {
+        return { job_id: activeJob.id, job: activeJob };
+      },
+    },
+    jobs: {
+      async get() {
+        return { ok: true, job: invalidTerminal };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient, {
+    transformPolling: scheduler,
+  });
+  const observed = deferred();
+  ports.transforms.subscribeResults((result) => observed.resolve(result));
+
+  await ports.invokeCommand("corrections.transform.queue", { command });
+  scheduler.scheduled.shift().callback();
+  const result = await observed.promise;
+
+  assert.equal(result.terminal_state, "failed");
+  assert.equal(result.image_commit, null);
+  assert.equal(result.ocr_followup, null);
+  assert.equal(result.failure.code, "invalid-transform-job-result");
+  assert.equal(result.failure.retryable, false);
+});
+
+
+test("transform polling preserves committed outputs when restart interrupts OCR", {
+  timeout: 1000,
+}, async () => {
+  const command = transformCommand();
+  const scheduler = manualScheduler();
+  const activeJob = transformJob(command);
+  const interrupted = transformJob(command, {
+    state: "interrupted",
+    progress: {
+      completed: 5,
+      total: 6,
+      unit: "phase",
+      phase: "image-committed",
+    },
+    cancellable: false,
+    revision: 4,
+    updated_at: "2026-07-27T12:00:02Z",
+    finished_at: "2026-07-27T12:00:02Z",
+    note: "image committed; OCR follow-up interrupted by restart",
+    outputs: transformOutputs(),
+  });
+  const { engineClient } = engineHarness({
+    corrections: {
+      async queueTransform() {
+        return { job_id: activeJob.id, job: activeJob };
+      },
+    },
+    jobs: {
+      async get() {
+        return { ok: true, job: interrupted };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient, {
+    transformPolling: scheduler,
+  });
+  const observed = deferred();
+  ports.transforms.subscribeResults((result) => observed.resolve(result));
+
+  await ports.invokeCommand("corrections.transform.queue", { command });
+  scheduler.scheduled.shift().callback();
+  const result = await observed.promise;
+
+  assert.equal(result.terminal_state, "interrupted");
+  assert.deepEqual(
+    result.image_commit.outputs.map((output) => output.kind),
+    ["corrected-display", "ocr-ready", "thumbnail", "transform-manifest"],
+  );
+  assert.equal(result.ocr_followup.state, "failed");
+  assert.equal(
+    result.ocr_followup.failure.code,
+    "ocr_followup_interrupted",
+  );
+  assert.equal(result.ocr_followup.failure.retryable, false);
+});
+
+
+test("transform polling rejects a response missing exact transform pins", {
+  timeout: 1000,
+}, async () => {
+  const command = transformCommand();
+  const scheduler = manualScheduler();
+  const activeJob = transformJob(command);
+  const invalid = transformJob(command, {
+    input_revisions: {
+      ...activeJob.input_revisions,
+    },
+  });
+  delete invalid.input_revisions.transform;
+  const { engineClient } = engineHarness({
+    corrections: {
+      async queueTransform() {
+        return { job_id: activeJob.id, job: activeJob };
+      },
+    },
+    jobs: {
+      async get() {
+        return { ok: true, job: invalid };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient, {
+    transformPolling: scheduler,
+  });
+  const observed = deferred();
+  ports.transforms.subscribeResults((result) => observed.resolve(result));
+
+  await ports.invokeCommand("corrections.transform.queue", { command });
+  scheduler.scheduled.shift().callback();
+  const result = await observed.promise;
+
+  assert.equal(result.terminal_state, "failed");
+  assert.equal(result.image_commit, null);
+  assert.equal(result.failure.code, "invalid-transform-job-result");
+});
+
 
 test("caption metadata and review commands delegate operation IDs", async () => {
   const invocations = [];

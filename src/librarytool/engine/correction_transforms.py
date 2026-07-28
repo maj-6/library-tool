@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import math
 import re
 import threading
@@ -31,8 +32,15 @@ from librarytool.processing.raster import (
     validate_normalized_quad,
 )
 
-from .errors import ConflictError, ValidationError
-from .jobs import JobFailure, JobManager, JobOutput, JobProgress, JobView
+from .errors import ConflictError, EngineError, ValidationError
+from .jobs import (
+    JobFailure,
+    JobManager,
+    JobOutput,
+    JobProgress,
+    JobState,
+    JobView,
+)
 from .raster_artifacts import (
     ArtifactProvenance,
     AssignmentOrigin,
@@ -43,12 +51,15 @@ from .raster_artifacts import (
     RasterArtifactView,
     RasterDimensions,
 )
+
 from .spatial_annotations import (
     NormalizedPoint,
     RoleAssignmentOrigin,
     SpatialAnnotationView,
     SpatialRoleAssignment,
 )
+
+log = logging.getLogger(__name__)
 
 
 CORRECTION_TRANSFORM_JOB_KIND = "correction.transform"
@@ -776,6 +787,100 @@ class CorrectionTransformCommitResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class CorrectionTransformDependencyPins:
+    """Immutable assertion revisions captured by a committed transform."""
+
+    spatial_annotations: tuple[tuple[str, str], ...] = ()
+    human_text_assertions: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name, values in (
+            ("spatial_annotations", self.spatial_annotations),
+            ("human_text_assertions", self.human_text_assertions),
+        ):
+            frozen = tuple(tuple(value) for value in values)
+            if any(len(value) != 2 for value in frozen):
+                raise ValueError(f"{field_name} pins must contain identity/revision pairs")
+            identities: set[str] = set()
+            for identity, revision in frozen:
+                normalized = _identifier(identity, f"{field_name}.identity").casefold()
+                _revision(revision, f"{field_name}.revision")
+                if normalized in identities:
+                    raise ValueError(f"{field_name} pins must have unique identities")
+                identities.add(normalized)
+            object.__setattr__(self, field_name, frozen)
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any],
+    ) -> "CorrectionTransformDependencyPins":
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "spatial_annotations",
+            "human_text_assertions",
+        }:
+            raise ValueError("dependent revision pins have invalid fields")
+
+        def parse(field_name: str, identity_field: str) -> tuple[tuple[str, str], ...]:
+            values = raw[field_name]
+            if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+                raise ValueError(f"{field_name} pins must be a sequence")
+            result: list[tuple[str, str]] = []
+            for value in values:
+                if not isinstance(value, Mapping) or set(value) != {
+                    identity_field,
+                    "revision",
+                }:
+                    raise ValueError(f"{field_name} pin has invalid fields")
+                result.append((value[identity_field], value["revision"]))
+            return tuple(result)
+
+        return cls(
+            spatial_annotations=parse("spatial_annotations", "annotation_id"),
+            human_text_assertions=parse(
+                "human_text_assertions",
+                "assertion_id",
+            ),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "spatial_annotations": [
+                {"annotation_id": identity, "revision": revision}
+                for identity, revision in self.spatial_annotations
+            ],
+            "human_text_assertions": [
+                {"assertion_id": identity, "revision": revision}
+                for identity, revision in self.human_text_assertions
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedCorrectionTransform:
+    """Durable transform publication used to converge restart-interrupted jobs."""
+
+    command: CorrectionTransformCommand
+    result: CorrectionTransformCommitResult
+    dependent_revision_pins: CorrectionTransformDependencyPins
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.command, CorrectionTransformCommand):
+            raise TypeError("command must be a CorrectionTransformCommand")
+        if not isinstance(self.result, CorrectionTransformCommitResult):
+            raise TypeError("result must be a CorrectionTransformCommitResult")
+        if self.result.operation_id != self.command.operation_id:
+            raise ValueError("committed transform result does not match its command")
+        if not isinstance(
+            self.dependent_revision_pins,
+            CorrectionTransformDependencyPins,
+        ):
+            raise TypeError(
+                "dependent_revision_pins must be CorrectionTransformDependencyPins"
+            )
+
+
 @runtime_checkable
 class CorrectionTransformStorePort(Protocol):
     """Source reader and atomic compare-and-swap output publisher.
@@ -795,6 +900,16 @@ class CorrectionTransformStorePort(Protocol):
         self,
         draft: CorrectionTransformCommitDraft,
     ) -> CorrectionTransformCommitResult: ...
+
+
+@runtime_checkable
+class CorrectionTransformResultQueryPort(Protocol):
+    """Look up an exact durable publication without consulting live source state."""
+
+    def find_committed_transform(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> CommittedCorrectionTransform | None: ...
 
 
 @runtime_checkable
@@ -883,6 +998,16 @@ class OcrFollowupPort(Protocol):
 
 
 @runtime_checkable
+class OcrFollowupQueryPort(Protocol):
+    """Read a terminal OCR outcome without starting or resuming provider work."""
+
+    def find_ocr_followup(
+        self,
+        request: OcrFollowupRequest,
+    ) -> OcrFollowupOutcome | None: ...
+
+
+@runtime_checkable
 class OcrFollowupOutcomePort(Protocol):
     """Persist the OCR outcome separately from the committed image."""
 
@@ -942,13 +1067,30 @@ class CorrectionTransformService:
         *,
         executor: CorrectionTransformExecutorPort | None = None,
         start_guard_for: CorrectionTransformStartGuardPort | None = None,
+        committed_transforms: CorrectionTransformResultQueryPort | None = None,
+        ocr_outcomes: OcrFollowupQueryPort | None = None,
     ) -> None:
         if executor is not None and not callable(executor):
             raise TypeError("executor must be callable or None")
         if start_guard_for is not None and not callable(start_guard_for):
             raise TypeError("start_guard_for must be callable or None")
+        if committed_transforms is not None and not isinstance(
+            committed_transforms,
+            CorrectionTransformResultQueryPort,
+        ):
+            raise TypeError(
+                "committed_transforms must implement "
+                "CorrectionTransformResultQueryPort"
+            )
+        if ocr_outcomes is not None and not isinstance(
+            ocr_outcomes,
+            OcrFollowupQueryPort,
+        ):
+            raise TypeError("ocr_outcomes must implement OcrFollowupQueryPort")
         self._jobs = jobs
         self._executor = executor
+        self._committed_transforms = committed_transforms
+        self._ocr_outcomes = ocr_outcomes
         self._start_guard_for = (
             start_guard_for
             if start_guard_for is not None
@@ -967,59 +1109,90 @@ class CorrectionTransformService:
             raise TypeError("command must be CorrectionTransformCommand")
         replay = self._durable_replay(command)
         if replay is not None:
-            return replay
+            return self._reconcile_interrupted(command, replay)
+        committed = self._find_committed_transform(command)
+        if committed is not None:
+            return self._register_committed_replay(command, committed)
         job_id = self.job_id_for(command.operation_id)
         with self._start_guard_for(command.item_id):
             with self._lock:
                 replay = self._durable_replay(command)
                 if replay is not None:
-                    return replay
-                existing = self._jobs.get(job_id)
-                if existing is not None:
-                    return self._replayed(existing, command)
-                record: MutableMapping[str, Any] = {
-                    "id": job_id,
-                    "kind": CORRECTION_TRANSFORM_JOB_KIND,
-                    "status": "queued",
-                    "operation_id": command.operation_id,
-                    "command_sha256": command.fingerprint,
-                    "subject": {
-                        "item_id": command.item_id,
-                        "source_id": command.artifact_id,
-                    },
-                    "total": 6,
-                    "progress": JobProgress(0, 6, "phase", "queued").as_dict(),
-                    "input_revisions": {
-                        "artifact_id": command.artifact_id,
-                        "artifact_revision": command.artifact_revision,
-                        "source_revision": command.source_revision,
-                        "source_sha256": command.source_sha256,
-                        "operation_id": command.operation_id,
-                        "command_sha256": command.fingerprint,
-                    },
-                    # Private worker input. JobManager's public projection does
-                    # not persist this field; a durable command adapter remains
-                    # an integration responsibility.
-                    "command": command.as_dict(),
-                }
-                try:
-                    self._jobs.track(record, CORRECTION_TRANSFORM_JOB_KIND)
-                except ConflictError:
-                    replay = self._durable_replay(command)
-                    if replay is not None:
-                        return replay
-                    winner = self._jobs.get(job_id)
-                    if winner is None:
-                        raise
-                    return self._replayed(winner, command)
-                view = self._jobs.view(job_id)
-                if view is None:  # pragma: no cover - JobManager invariant
-                    raise RuntimeError("tracked correction job is unavailable")
-                return QueuedCorrectionTransform(
-                    view,
-                    command.fingerprint,
-                    True,
-                )
+                    queued = replay
+                else:
+                    existing = self._jobs.get(job_id)
+                    if existing is not None:
+                        queued = self._replayed(existing, command)
+                    else:
+                        record = self._job_record(command, job_id)
+                        try:
+                            self._jobs.track(
+                                record,
+                                CORRECTION_TRANSFORM_JOB_KIND,
+                            )
+                        except ConflictError:
+                            replay = self._durable_replay(command)
+                            if replay is not None:
+                                queued = replay
+                            else:
+                                winner = self._jobs.get(job_id)
+                                if winner is None:
+                                    raise
+                                queued = self._replayed(winner, command)
+                        else:
+                            view = self._jobs.view(job_id)
+                            if view is None:  # pragma: no cover
+                                raise RuntimeError(
+                                    "tracked correction job is unavailable"
+                                )
+                            queued = QueuedCorrectionTransform(
+                                view,
+                                command.fingerprint,
+                                True,
+                            )
+        # Result queries may acquire workspace/authority locks. They must run
+        # after the item-start guard has released its host catalogue locks.
+        return self._reconcile_interrupted(command, queued)
+
+    @staticmethod
+    def _job_record(
+        command: CorrectionTransformCommand,
+        job_id: str,
+    ) -> MutableMapping[str, Any]:
+        return {
+            "id": job_id,
+            "kind": CORRECTION_TRANSFORM_JOB_KIND,
+            "status": "queued",
+            "operation_id": command.operation_id,
+            "command_sha256": command.fingerprint,
+            "subject": {
+                "item_id": command.item_id,
+                "source_id": command.artifact_id,
+            },
+            "total": 6,
+            "progress": JobProgress(0, 6, "phase", "queued").as_dict(),
+            "input_revisions": {
+                "artifact_id": command.artifact_id,
+                "artifact_revision": command.artifact_revision,
+                "source_revision": command.source_revision,
+                "source_sha256": command.source_sha256,
+                "operation_id": command.operation_id,
+                "command_sha256": command.fingerprint,
+                "transform": {
+                    "quad": [[x, y] for x, y in command.quad],
+                    "adjustment": (
+                        command.adjustment.as_dict()
+                        if command.adjustment is not None
+                        else None
+                    ),
+                    "rerun_ocr": command.rerun_ocr,
+                },
+            },
+            # The submitted command remains process-private. Every value
+            # required to validate and retry after restart is also present in
+            # the allowlisted input projection above.
+            "command": command.as_dict(),
+        }
 
     @property
     def executable(self) -> bool:
@@ -1034,6 +1207,24 @@ class CorrectionTransformService:
         executor = self._executor
         if executor is None:
             raise RuntimeError("the correction transform executor is unavailable")
+        job_id = self.job_id_for(command.operation_id)
+        view = self._jobs.view(job_id)
+        if view is None or view.state not in {
+            JobState.QUEUED,
+            JobState.CANCELLING,
+        }:
+            raise ConflictError(
+                "correction transform job is already claimed or terminal",
+                code="correction_job_already_claimed",
+                details={
+                    "job_id": job_id,
+                    "state": (
+                        view.state.value
+                        if view is not None
+                        else "unavailable"
+                    ),
+                },
+            )
         result = executor(command)
         if not isinstance(result, CorrectionTransformRunResult):
             raise TypeError("correction transform executor returned an invalid result")
@@ -1056,6 +1247,195 @@ class CorrectionTransformService:
         if receipt is None:
             return None
         return self._replayed(receipt.job, command)
+
+    def _reconcile_interrupted(
+        self,
+        command: CorrectionTransformCommand,
+        replay: QueuedCorrectionTransform,
+        committed: CommittedCorrectionTransform | None = None,
+    ) -> QueuedCorrectionTransform:
+        """Converge durable side effects without reopening interrupted work."""
+
+        if (
+            replay.job.state is not JobState.INTERRUPTED
+            or self._committed_transforms is None
+        ):
+            return replay
+        if committed is None:
+            committed = self._find_committed_transform(command)
+        if committed is None:
+            return replay
+
+        inputs = dict(self._job_record(command, replay.job_id)["input_revisions"])
+        inputs["dependent_assertions"] = (
+            committed.dependent_revision_pins.as_dict()
+        )
+        outputs = [
+            JobOutput(value.kind, value.artifact_id).as_dict()
+            for value in committed.result.outputs
+        ]
+        status = "interrupted"
+        note = "image committed; OCR follow-up interrupted by restart"
+        done = 5
+        errors = 0
+        failure: JobFailure | None = None
+
+        if not command.rerun_ocr:
+            status = "done"
+            note = "correction complete"
+            done = 6
+        elif self._ocr_outcomes is not None:
+            source = committed.result.output("ocr-ready")
+            outcome = self._ocr_outcomes.find_ocr_followup(
+                OcrFollowupRequest(
+                    command.operation_id,
+                    command.item_id,
+                    source,
+                )
+            )
+            if outcome is not None:
+                if (
+                    outcome.state is OcrFollowupState.NOT_REQUESTED
+                    or outcome.source != source
+                ):
+                    raise ConflictError(
+                        "durable OCR outcome does not match its corrected rendition",
+                        code="correction_ocr_outcome_mismatch",
+                        details={"operation_id": command.operation_id},
+                    )
+                status = (
+                    "done"
+                    if outcome.state is OcrFollowupState.SUCCEEDED
+                    else "done (with errors)"
+                )
+                done = 6
+                if outcome.state is OcrFollowupState.SUCCEEDED:
+                    outputs.append(
+                        JobOutput(
+                            "ocr-proposal",
+                            outcome.proposal_ref,
+                        ).as_dict()
+                    )
+                    note = "correction complete"
+                elif outcome.state is OcrFollowupState.FAILED:
+                    errors = 1
+                    failure = outcome.failure
+                    note = "image committed; OCR follow-up failed"
+                else:
+                    errors = 1
+                    failure = JobFailure(
+                        "ocr_followup_cancelled",
+                        "the corrected image was committed; OCR follow-up was cancelled",
+                        retryable=False,
+                    )
+                    note = "image committed; OCR follow-up cancelled"
+
+        reconciled = self._jobs.reconcile_interrupted(
+            replay.job_id,
+            status,
+            input_revisions=inputs,
+            outputs=outputs,
+            progress=JobProgress(
+                done,
+                6,
+                "phase",
+                "complete" if done == 6 else "image-committed",
+            ).as_dict(),
+            done=done,
+            total=6,
+            errors=errors,
+            failure=failure.as_dict() if failure is not None else None,
+            error=failure.message if failure is not None else "",
+            note=note,
+        )
+        if reconciled is None:  # pragma: no cover - command receipt invariant
+            raise RuntimeError("interrupted correction job disappeared")
+        return QueuedCorrectionTransform(
+            reconciled,
+            command.fingerprint,
+            False,
+        )
+
+    def _find_committed_transform(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> CommittedCorrectionTransform | None:
+        query = self._committed_transforms
+        if query is None:
+            return None
+        committed = query.find_committed_transform(command)
+        if committed is None:
+            return None
+        if (
+            not isinstance(committed, CommittedCorrectionTransform)
+            or committed.command != command
+            or committed.command.fingerprint != command.fingerprint
+        ):
+            raise ConflictError(
+                "durable correction publication does not match its command",
+                code="correction_commit_mismatch",
+                details={"operation_id": command.operation_id},
+            )
+        return committed
+
+    def _register_committed_replay(
+        self,
+        command: CorrectionTransformCommand,
+        committed: CommittedCorrectionTransform,
+    ) -> QueuedCorrectionTransform:
+        """Restore a bounded-away job receipt from transform authority."""
+
+        job_id = self.job_id_for(command.operation_id)
+        with self._lock:
+            replay = self._durable_replay(command)
+            if replay is not None:
+                queued = replay
+            else:
+                existing = self._jobs.get(job_id)
+                if existing is not None:
+                    queued = self._replayed(existing, command)
+                    if queued.job.state is not JobState.INTERRUPTED:
+                        raise ConflictError(
+                            "durable correction output has an active job",
+                            code="correction_job_already_claimed",
+                            details={
+                                "job_id": job_id,
+                                "state": queued.job.state.value,
+                            },
+                        )
+                else:
+                    record = self._job_record(command, job_id)
+                    record["status"] = "interrupted"
+                    record["note"] = (
+                        "durable correction publication recovered after "
+                        "job history retention"
+                    )
+                    try:
+                        self._jobs.track(
+                            record,
+                            CORRECTION_TRANSFORM_JOB_KIND,
+                        )
+                    except ConflictError:
+                        replay = self._durable_replay(command)
+                        if replay is None:
+                            raise
+                        queued = replay
+                    else:
+                        replay = self._durable_replay(command)
+                        if replay is None:
+                            raise RuntimeError(
+                                "recovered correction receipt was not retained"
+                            )
+                        queued = QueuedCorrectionTransform(
+                            replay.job,
+                            command.fingerprint,
+                            False,
+                        )
+        return self._reconcile_interrupted(
+            command,
+            queued,
+            committed,
+        )
 
     @classmethod
     def _replayed(
@@ -1596,6 +1976,10 @@ class CorrectionTransformWorker:
             note = "image committed; OCR follow-up cancelled"
         if recorder_failure is not None:
             note = "image committed; OCR outcome recording failed"
+        followup_failure = self._followup_failure(
+            outcome,
+            recorder_failure=recorder_failure,
+        )
         self._jobs.transition(
             record,
             "done (with errors)" if has_followup_error else "done",
@@ -1604,6 +1988,16 @@ class CorrectionTransformWorker:
             done=6,
             total=6,
             errors=1 if has_followup_error else 0,
+            failure=(
+                followup_failure.as_dict()
+                if followup_failure is not None
+                else None
+            ),
+            error=(
+                followup_failure.message
+                if followup_failure is not None
+                else ""
+            ),
             note=note,
         )
         return CorrectionTransformRunResult(
@@ -1633,7 +2027,7 @@ class CorrectionTransformWorker:
                     failure=JobFailure(
                         "ocr_followup_unavailable",
                         "OCR follow-up provider is unavailable",
-                        retryable=True,
+                        retryable=False,
                     ),
                 )
             outcome = self._ocr.run_ocr_followup(
@@ -1649,17 +2043,53 @@ class CorrectionTransformWorker:
             return outcome
         except CorrectionTransformCancelled:
             return OcrFollowupOutcome(OcrFollowupState.CANCELLED, source=source)
+        except EngineError as exc:
+            return OcrFollowupOutcome(
+                OcrFollowupState.FAILED,
+                source=source,
+                failure=JobFailure(
+                    exc.code,
+                    exc.message,
+                    retryable=exc.retryable,
+                    details=exc.details,
+                ),
+            )
         except Exception as exc:
+            log.exception("correction OCR follow-up port failed")
             return OcrFollowupOutcome(
                 OcrFollowupState.FAILED,
                 source=source,
                 failure=JobFailure(
                     "ocr_followup_failed",
-                    str(exc) or type(exc).__name__,
-                    retryable=True,
+                    "OCR follow-up failed",
+                    retryable=False,
                     details={"exception": type(exc).__name__},
                 ),
             )
+
+    @staticmethod
+    def _followup_failure(
+        outcome: OcrFollowupOutcome,
+        *,
+        recorder_failure: Exception | None,
+    ) -> JobFailure | None:
+        if recorder_failure is not None:
+            return JobFailure(
+                "ocr_outcome_recording_failed",
+                "the corrected image was committed, but its OCR outcome "
+                "could not be recorded",
+                retryable=True,
+                details={"exception": type(recorder_failure).__name__},
+            )
+        if outcome.state is OcrFollowupState.FAILED:
+            return outcome.failure
+        if outcome.state is OcrFollowupState.CANCELLED:
+            return JobFailure(
+                "ocr_followup_cancelled",
+                "the corrected image was committed; OCR follow-up was cancelled",
+                retryable=False,
+            )
+        return None
 
     @staticmethod
     def _validate_commit_result(
@@ -1742,6 +2172,7 @@ __all__ = [
     "CORRECTION_OUTPUT_KINDS",
     "CORRECTION_TRANSFORM_JOB_KIND",
     "CommittedCorrectionOutput",
+    "CommittedCorrectionTransform",
     "CorrectionHumanAssertions",
     "CorrectionOutputDraft",
     "CorrectionSourceSnapshot",
@@ -1749,8 +2180,10 @@ __all__ = [
     "CorrectionTransformCommand",
     "CorrectionTransformCommitDraft",
     "CorrectionTransformCommitResult",
+    "CorrectionTransformDependencyPins",
     "CorrectionTransformExecutorPort",
     "CorrectionTransformHooksPort",
+    "CorrectionTransformResultQueryPort",
     "CorrectionTransformRunResult",
     "CorrectionTransformService",
     "CorrectionTransformStartGuardPort",
@@ -1762,6 +2195,7 @@ __all__ = [
     "OcrFollowupOutcome",
     "OcrFollowupOutcomePort",
     "OcrFollowupPort",
+    "OcrFollowupQueryPort",
     "OcrFollowupRequest",
     "OcrFollowupState",
     "PreservedSpatialAssertions",

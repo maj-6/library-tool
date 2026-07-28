@@ -15,6 +15,69 @@
       "processed-images",
       "generated-images",
     ]);
+    const ACTIVE_TRANSFORM_JOB_STATES = new Set([
+      "queued", "running", "cancelling",
+    ]);
+    const TERMINAL_TRANSFORM_JOB_STATES = new Set([
+      "cancelled", "failed", "done", "interrupted",
+    ]);
+    const CORRECTION_IMAGE_OUTPUT_KINDS = Object.freeze([
+      "corrected-display", "ocr-ready", "thumbnail", "transform-manifest",
+    ]);
+    const CORRECTION_JOB_OUTPUT_KINDS =
+      new Set([...CORRECTION_IMAGE_OUTPUT_KINDS, "ocr-proposal"]);
+    const PORTABLE_JOB_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+    function isPlainObject(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const prototype = Object.getPrototypeOf(value);
+      return prototype === Object.prototype || prototype === null;
+    }
+
+    function hasExactKeys(value, keys) {
+      if (!isPlainObject(value)) return false;
+      const actual = Object.keys(value).sort();
+      const expected = [...keys].sort();
+      return actual.length === expected.length &&
+        actual.every((key, index) => key === expected[index]);
+    }
+
+    function portableJobValue(value) {
+      return typeof value === "string" && PORTABLE_JOB_VALUE_RE.test(value);
+    }
+
+    function artifactJobRevision(value) {
+      return typeof value === "string" && value.length >= 1 &&
+        value.length <= 512 && /^[\x21-\x7e]+$/.test(value) &&
+        !/["\\]/.test(value);
+    }
+
+    function invalidTransformResult(message) {
+      const error = new Error(message);
+      error.code = "invalid-transform-job-result";
+      error.retryable = false;
+      return error;
+    }
+
+    function cloneJson(value) {
+      return value == null ? value : JSON.parse(JSON.stringify(value));
+    }
+
+    function sameJsonValue(left, right) {
+      if (left === right) return true;
+      if (Array.isArray(left) || Array.isArray(right)) {
+        return Array.isArray(left) && Array.isArray(right) &&
+          left.length === right.length &&
+          left.every((value, index) => sameJsonValue(value, right[index]));
+      }
+      if (!isPlainObject(left) || !isPlainObject(right)) return false;
+      const keys = Object.keys(left);
+      return keys.length === Object.keys(right).length &&
+        keys.every(
+          (key) => Object.hasOwn(right, key) &&
+            sameJsonValue(left[key], right[key]),
+        );
+    }
 
     function capabilityError(capability) {
       const error = new Error(`${capability} is not available`);
@@ -148,7 +211,421 @@
         artifactId.endsWith(":display");
     }
 
-    function correctionCommandPort(client) {
+    function correctionTransformJob(value, command, expectedJobId = "") {
+      if (!isPlainObject(command) ||
+          !portableJobValue(command.item_id) ||
+          !portableJobValue(command.artifact_id) ||
+          !portableJobValue(command.operation_id) ||
+          !artifactJobRevision(command.artifact_revision) ||
+          !artifactJobRevision(command.source_revision) ||
+          typeof command.source_sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/.test(command.source_sha256) ||
+          typeof command.rerun_ocr !== "boolean") {
+        throw invalidTransformResult("the tracked correction command is invalid");
+      }
+      if (!hasExactKeys(value, [
+        "id", "kind", "state", "subject", "progress", "cancellable",
+        "revision", "created_at", "updated_at", "finished_at", "note", "error",
+        "input_revisions", "outputs",
+      ]) || !portableJobValue(value.id) ||
+          (expectedJobId && value.id !== expectedJobId) ||
+          value.kind !== "correction.transform" ||
+          (!ACTIVE_TRANSFORM_JOB_STATES.has(value.state) &&
+            !TERMINAL_TRANSFORM_JOB_STATES.has(value.state)) ||
+          !hasExactKeys(value.subject, ["item_id", "source_id"]) ||
+          value.subject.item_id !== command.item_id ||
+          value.subject.source_id !== command.artifact_id ||
+          !hasExactKeys(value.progress, [
+            "completed", "total", "unit", "phase",
+          ]) ||
+          !Number.isSafeInteger(value.progress.completed) ||
+          value.progress.completed < 0 ||
+          !Number.isSafeInteger(value.progress.total) ||
+          value.progress.total < value.progress.completed ||
+          typeof value.progress.unit !== "string" ||
+          typeof value.progress.phase !== "string" ||
+          typeof value.cancellable !== "boolean" ||
+          !Number.isSafeInteger(value.revision) || value.revision < 1 ||
+          typeof value.created_at !== "string" ||
+          typeof value.updated_at !== "string" ||
+          typeof value.finished_at !== "string" ||
+          typeof value.note !== "string" ||
+          !isPlainObject(value.input_revisions) ||
+          !Array.isArray(value.outputs)) {
+        throw invalidTransformResult(
+          "the correction transform job does not match its queued command",
+        );
+      }
+      const inputs = value.input_revisions;
+      const inputKeys = Object.keys(inputs);
+      const allowedInputKeys = new Set([
+        "artifact_id", "artifact_revision", "source_revision", "source_sha256",
+        "operation_id", "command_sha256", "dependent_assertions", "transform",
+      ]);
+      if (!inputKeys.every((key) => allowedInputKeys.has(key)) ||
+          inputs.artifact_id !== command.artifact_id ||
+          inputs.artifact_revision !== command.artifact_revision ||
+          inputs.source_revision !== command.source_revision ||
+          inputs.source_sha256 !== command.source_sha256 ||
+          inputs.operation_id !== command.operation_id ||
+          !Object.hasOwn(inputs, "transform") ||
+          !hasExactKeys(
+              inputs.transform,
+              ["quad", "adjustment", "rerun_ocr"],
+            ) ||
+              !sameJsonValue(inputs.transform.quad, command.quad) ||
+              !sameJsonValue(
+                inputs.transform.adjustment,
+                command.adjustment,
+              ) ||
+              inputs.transform.rerun_ocr !== command.rerun_ocr ||
+          (Object.hasOwn(inputs, "command_sha256") &&
+            (typeof inputs.command_sha256 !== "string" ||
+              !/^[0-9a-f]{64}$/.test(inputs.command_sha256)))) {
+        throw invalidTransformResult(
+          "the correction transform job input revisions are invalid",
+        );
+      }
+      if (value.error !== null) {
+        const failureKeys = Object.keys(value.error || {}).sort().join(",");
+        if (!isPlainObject(value.error) ||
+            !["code,message,retryable", "code,details,message,retryable"]
+              .includes(failureKeys) ||
+            typeof value.error.code !== "string" ||
+            typeof value.error.message !== "string" ||
+            typeof value.error.retryable !== "boolean" ||
+            (Object.hasOwn(value.error, "details") &&
+              !isPlainObject(value.error.details))) {
+          throw invalidTransformResult(
+            "the correction transform job failure is invalid",
+          );
+        }
+      }
+      const refs = new Set();
+      for (const output of value.outputs) {
+        if (!hasExactKeys(output, ["kind", "ref", "partial"]) ||
+            !CORRECTION_JOB_OUTPUT_KINDS.has(output.kind) ||
+            !portableJobValue(output.ref) ||
+            typeof output.partial !== "boolean" ||
+            refs.has(output.ref)) {
+          throw invalidTransformResult(
+            "the correction transform job outputs are invalid",
+          );
+        }
+        refs.add(output.ref);
+      }
+      return Object.freeze({
+        ...value,
+        subject: Object.freeze({ ...value.subject }),
+        progress: Object.freeze({ ...value.progress }),
+        error: value.error && Object.freeze(cloneJson(value.error)),
+        input_revisions: Object.freeze(
+          Object.fromEntries(
+            Object.entries(inputs)
+              .filter(([key]) => key !== "command_sha256")
+              .map(([key, entry]) => [key, cloneJson(entry)]),
+          ),
+        ),
+        outputs: Object.freeze(
+          value.outputs.map((output) => Object.freeze({ ...output })),
+        ),
+      });
+    }
+
+    function correctionTransformJobEnvelope(value, command, expectedJobId) {
+      if (!hasExactKeys(value, ["ok", "job"]) || value.ok !== true) {
+        throw invalidTransformResult(
+          "the correction transform job response is invalid",
+        );
+      }
+      return correctionTransformJob(value.job, command, expectedJobId);
+    }
+
+    function correctionTransformTerminalResult(job, command) {
+      if (ACTIVE_TRANSFORM_JOB_STATES.has(job.state)) return null;
+      if (!TERMINAL_TRANSFORM_JOB_STATES.has(job.state)) {
+        throw invalidTransformResult(
+          "the correction transform job has an unknown terminal state",
+        );
+      }
+      const byKind = new Map();
+      for (const output of job.outputs) {
+        if (byKind.has(output.kind)) {
+          throw invalidTransformResult(
+            "the correction transform job repeats an output kind",
+          );
+        }
+        byKind.set(output.kind, output);
+      }
+      const presentImageKinds = CORRECTION_IMAGE_OUTPUT_KINDS.filter(
+        (kind) => byKind.has(kind),
+      );
+      const imageCommitted =
+        presentImageKinds.length === CORRECTION_IMAGE_OUTPUT_KINDS.length;
+      if (presentImageKinds.length > 0 && !imageCommitted) {
+        throw invalidTransformResult(
+          "the correction transform job has an incomplete image commit",
+        );
+      }
+      if (job.state === "done" && !imageCommitted) {
+        throw invalidTransformResult(
+          "a completed correction transform has no image outputs",
+        );
+      }
+      if (imageCommitted && CORRECTION_IMAGE_OUTPUT_KINDS.some(
+        (kind) => byKind.get(kind).partial === true,
+      )) {
+        throw invalidTransformResult(
+          "a correction image commit cannot contain partial outputs",
+        );
+      }
+      const ocrProposal = byKind.get("ocr-proposal") || null;
+      if (ocrProposal && ocrProposal.partial === true) {
+        throw invalidTransformResult(
+          "a correction OCR proposal cannot be partial",
+        );
+      }
+      if (ocrProposal && (!imageCommitted || command.rerun_ocr !== true)) {
+        throw invalidTransformResult(
+          "the correction transform has an unexpected OCR proposal",
+        );
+      }
+
+      const ocrSource = imageCommitted
+        ? {
+            kind: "ocr-ready",
+            artifact_id: byKind.get("ocr-ready").ref,
+          }
+        : null;
+      let ocrFollowup = {
+        state: "not_requested",
+        source: null,
+        proposal_ref: "",
+        failure: null,
+      };
+      if (imageCommitted && command.rerun_ocr === true) {
+        const ocrFailureCode = job.error && String(job.error.code || "");
+        const hasOcrFailure = /^ocr_(?:followup|outcome)_/.test(
+          ocrFailureCode,
+        );
+        if (ocrFailureCode === "ocr_outcome_recording_failed" ||
+            /ocr outcome recording failed/i.test(job.note)) {
+          ocrFollowup = {
+            state: "failed",
+            source: ocrSource,
+            proposal_ref: "",
+            failure: cloneJson(job.error) || {
+              code: "ocr_outcome_recording_failed",
+              message: job.note,
+              retryable: true,
+            },
+          };
+        } else if (ocrProposal) {
+          ocrFollowup = {
+            state: "succeeded",
+            source: ocrSource,
+            proposal_ref: ocrProposal.ref,
+            failure: null,
+          };
+        } else if (job.state === "interrupted") {
+          ocrFollowup = {
+            state: "failed",
+            source: ocrSource,
+            proposal_ref: "",
+            failure: {
+              code: "ocr_followup_interrupted",
+              message: "OCR follow-up status is unknown after restart",
+              retryable: false,
+            },
+          };
+        } else if (ocrFailureCode === "ocr_followup_cancelled" ||
+                   /ocr follow-up cancelled/i.test(job.note)) {
+          ocrFollowup = {
+            state: "cancelled",
+            source: ocrSource,
+            proposal_ref: "",
+            failure: null,
+          };
+        } else if (hasOcrFailure ||
+                   /ocr follow-up failed/i.test(job.note)) {
+          ocrFollowup = {
+            state: "failed",
+            source: ocrSource,
+            proposal_ref: "",
+            failure: cloneJson(job.error) || {
+              code: "ocr_followup_failed",
+              message: job.note || "OCR follow-up failed",
+              retryable: true,
+            },
+          };
+        } else {
+          throw invalidTransformResult(
+            "the requested OCR follow-up has no observable outcome",
+          );
+        }
+      }
+
+      return Object.freeze({
+        job_id: job.id,
+        operation_id: command.operation_id,
+        terminal_state: job.state,
+        image_commit: imageCommitted
+          ? Object.freeze({
+              operation_id: command.operation_id,
+              outputs: Object.freeze(
+                CORRECTION_IMAGE_OUTPUT_KINDS.map((kind) => Object.freeze({
+                  kind,
+                  artifact_id: byKind.get(kind).ref,
+                })),
+              ),
+            })
+          : null,
+        ocr_followup: Object.freeze(ocrFollowup),
+        cancelled_before_commit: job.state === "cancelled" && !imageCommitted,
+        failure: !imageCommitted && job.state !== "cancelled"
+          ? cloneJson(job.error) || {
+              code: `correction_transform_${job.state}`,
+              message: job.note || `Correction transform ${job.state}`,
+              retryable: job.state === "interrupted",
+            }
+          : null,
+      });
+    }
+
+    function correctionTransformPollingPort(client, options = {}) {
+      if (!client || !client.jobs || typeof client.jobs.get !== "function") {
+        return null;
+      }
+      const schedule = typeof options.schedule === "function"
+        ? options.schedule
+        : (callback, delay) => setTimeout(callback, delay);
+      const cancelSchedule = typeof options.cancelSchedule === "function"
+        ? options.cancelSchedule
+        : (token) => clearTimeout(token);
+      const pollIntervalMs = Number.isFinite(options.pollIntervalMs)
+        ? Math.max(25, Math.floor(options.pollIntervalMs)) : 400;
+      const retryIntervalMs = Number.isFinite(options.retryIntervalMs)
+        ? Math.max(pollIntervalMs, Math.floor(options.retryIntervalMs)) : 1200;
+      const listeners = new Set();
+      const pending = new Map();
+      let timer = null;
+      let polling = false;
+
+      function emit(result, command) {
+        for (const listener of [...listeners]) {
+          try {
+            listener(result, command);
+          } catch (error) {
+            // One workbench observer must not prevent other windows from
+            // converging on the same durable job result.
+          }
+        }
+      }
+
+      function monitorFailure(entry, error) {
+        return Object.freeze({
+          job_id: entry.jobId,
+          operation_id: entry.command.operation_id,
+          terminal_state: "failed",
+          image_commit: null,
+          ocr_followup: null,
+          cancelled_before_commit: false,
+          failure: {
+            code: String(error && error.code || "transform_job_unavailable"),
+            message: String(
+              error && error.message ||
+              "The correction transform result is unavailable",
+            ),
+            retryable: error && error.retryable === true,
+          },
+        });
+      }
+
+      function schedulePoll(delay = pollIntervalMs) {
+        if (timer != null || polling || !listeners.size || !pending.size) return;
+        timer = schedule(() => {
+          timer = null;
+          void poll();
+        }, delay);
+      }
+
+      async function poll() {
+        if (polling || !listeners.size || !pending.size) return;
+        polling = true;
+        let retry = false;
+        try {
+          for (const [jobId, entry] of [...pending]) {
+            try {
+              const response = await client.jobs.get({ jobId });
+              const job = correctionTransformJobEnvelope(
+                response, entry.command, jobId,
+              );
+              const terminal = correctionTransformTerminalResult(
+                job, entry.command,
+              );
+              if (!terminal) continue;
+              pending.delete(jobId);
+              emit(terminal, entry.command);
+            } catch (error) {
+              const permanent = error && error.retryable === false ||
+                error && error.status === 404;
+              if (!permanent) {
+                retry = true;
+                continue;
+              }
+              pending.delete(jobId);
+              emit(monitorFailure(entry, error), entry.command);
+            }
+          }
+        } finally {
+          polling = false;
+        }
+        if (pending.size && listeners.size) {
+          schedulePoll(retry ? retryIntervalMs : pollIntervalMs);
+        }
+      }
+
+      function track(queueResult, command) {
+        const jobId = queueResult && (
+          queueResult.job_id || queueResult.jobId
+        );
+        if (!portableJobValue(jobId)) {
+          throw invalidTransformResult(
+            "the correction transform queue receipt has no valid job id",
+          );
+        }
+        if (queueResult.job) {
+          correctionTransformJob(queueResult.job, command, jobId);
+        }
+        pending.set(jobId, {
+          jobId,
+          command: cloneJson(command),
+        });
+        schedulePoll();
+      }
+
+      function subscribeResults(listener) {
+        if (typeof listener !== "function") {
+          throw new TypeError("transform result listener is required");
+        }
+        listeners.add(listener);
+        schedulePoll(25);
+        return () => {
+          listeners.delete(listener);
+          if (!listeners.size && timer != null) {
+            cancelSchedule(timer);
+            timer = null;
+          }
+        };
+      }
+
+      return Object.freeze({
+        subscribeResults,
+        track,
+      });
+    }
+
+    function correctionCommandPort(client, transformPolling = null) {
       const corrections = client && client.corrections;
       if (!corrections || typeof corrections !== "object") return null;
       const commands = {};
@@ -185,9 +662,13 @@
         });
       }
       if (typeof corrections.queueTransform === "function") {
-        commands.queueTransform = ({
+        commands.queueTransform = async ({
           command, signal,
-        } = {}) => corrections.queueTransform({ command, signal });
+        } = {}) => {
+          const result = await corrections.queueTransform({ command, signal });
+          if (transformPolling) transformPolling.track(result, command);
+          return result;
+        };
       }
       if (typeof corrections.setManualCaption === "function") {
         commands.setManualCaption = ({
@@ -592,9 +1073,15 @@
       return Object.freeze(books);
     }
 
-    function createCorrectionsEnginePorts(engineClient) {
+    function createCorrectionsEnginePorts(engineClient, options = {}) {
       const client = requireEngineClient(engineClient);
-      const commands = correctionCommandPort(client);
+      const portOptions = isPlainObject(options) ? options : {};
+      const transformPolling = correctionTransformPollingPort(
+        client,
+        isPlainObject(portOptions.transformPolling)
+          ? portOptions.transformPolling : {},
+      );
+      const commands = correctionCommandPort(client, transformPolling);
       const reviews = correctionReviewPort(client);
       const books = correctionBooksPort(client);
 
@@ -743,10 +1230,18 @@
         ...(books ? { books } : {}),
         ...(reviews ? { reviews } : {}),
         ...(invokeCommand ? { invokeCommand } : {}),
+        ...(transformPolling ? {
+          transforms: Object.freeze({
+            subscribeResults: transformPolling.subscribeResults,
+          }),
+        } : {}),
       });
     }
 
     return {
+      correctionTransformJob,
+      correctionTransformTerminalResult,
+      correctionTransformPollingPort,
       createCorrectionsEnginePorts,
       decorateRasterArtifact,
       decorateSpatialAnnotation,

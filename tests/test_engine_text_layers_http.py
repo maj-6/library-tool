@@ -647,12 +647,8 @@ def test_engine_errors_have_exact_http_classes(text_layer_http):
     )
 
 
-def test_server_registers_transport_without_binding_production_storage(client):
+def test_server_registers_transport_with_production_text_layer_storage(client):
     response = client.get("/api/v1/items/not-present/text-layers")
-    assert response.status_code == 503
-    assert response.get_json() == {
-        "ok": False,
-        "error": "the text layer aggregate module is unavailable",
-        "code": "text_layer_module_unavailable",
-        "retryable": True,
-    }
+    assert response.status_code == 404
+    assert response.get_json()["code"] == "item_not_found"
+    assert response.cache_control.no_store is True
