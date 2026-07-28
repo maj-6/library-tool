@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The compact CH / WHL / IA row, as a <merge> so it drops into any horizontal
+  container on any book surface (home rows, detail header, inspect cells)
+  without adding a wrapper level.
+
+  Slot order is fixed — CH, WHL, IA — so position alone identifies the source
+  once you have seen the row twice.
+
+  CH is an ImageButton rather than an ImageView because it is the only
+  interactive slot: tap approves a proposed match, long press rejects it. It
+  keeps its 48dp target and its space even when it has nothing to say, so
+  resolving states never reflows the row and shifts the icons beside it.
+-->
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/chAvailability"
+        style="@style/WhlMetadataIconButton"
+        android:contentDescription="@string/catalog_ch_label"
+        android:src="@drawable/ic_ch_list"
+        android:visibility="gone" />
+
+    <ImageView
+        android:id="@+id/whlAvailability"
+        style="@style/WhlMetadataIcon"
+        android:contentDescription="@string/home_whl_available"
+        android:src="@drawable/ic_whl_available"
+        android:visibility="gone" />
+
+    <ImageView
+        android:id="@+id/internetArchiveAvailability"
+        style="@style/WhlMetadataIcon"
+        android:contentDescription="@string/home_ia_available"
+        android:src="@drawable/ic_archive_available"
+        android:visibility="gone" />
+
+</merge>

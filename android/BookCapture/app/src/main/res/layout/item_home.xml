@@ -107,19 +107,10 @@
                     android:contentDescription="@string/home_copyright_status"
                     android:visibility="gone" />
 
-                <ImageView
-                    android:id="@+id/whlAvailability"
-                    style="@style/WhlMetadataIcon"
-                    android:contentDescription="@string/home_whl_available"
-                    android:src="@drawable/ic_whl_available"
-                    android:visibility="gone" />
-
-                <ImageView
-                    android:id="@+id/internetArchiveAvailability"
-                    style="@style/WhlMetadataIcon"
-                    android:contentDescription="@string/home_ia_available"
-                    android:src="@drawable/ic_archive_available"
-                    android:visibility="gone" />
+                <!-- CH / WHL / IA. Shared with every other book surface; the
+                     ids stay the same as before so existing binding and the
+                     accessibility summary are unaffected. -->
+                <include layout="@layout/view_catalog_indicators" />
 
                 <ImageView
                     android:id="@+id/scanStatus"

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  One field in the CH merge preview.
+
+  The origin stripe down the left is the primary signal: colour alone would
+  fail for the ~8% of men with a colour-vision deficiency, so an adopted field
+  also carries a "CH" tag and a conflict shows the two values stacked and
+  labelled. The stripe just makes the pattern scannable at speed.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:paddingTop="7dp"
+    android:paddingBottom="7dp">
+
+    <View
+        android:id="@+id/originStripe"
+        android:layout_width="3dp"
+        android:layout_height="match_parent"
+        android:layout_marginEnd="10dp"
+        android:background="@color/whl_blue2" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/fieldLabel"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textSize="12sp"
+                android:textAllCaps="true"
+                android:textColor="?android:attr/textColorSecondary" />
+
+            <TextView
+                android:id="@+id/originTag"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingStart="6dp"
+                android:paddingEnd="6dp"
+                android:paddingTop="1dp"
+                android:paddingBottom="1dp"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                android:visibility="gone"
+                android:text="@string/ch_merge_tag_ch" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/mergedValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="1dp"
+            android:textSize="15sp"
+            android:textColor="?android:attr/textColorPrimary" />
+
+        <!-- Shown only for a conflict: what CH says instead, explicitly marked
+             as NOT applied so the preview cannot be misread as an overwrite. -->
+        <TextView
+            android:id="@+id/alternateValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:textSize="13sp"
+            android:visibility="gone"
+            android:textColor="?android:attr/textColorSecondary" />
+
+    </LinearLayout>
+
+</LinearLayout>
