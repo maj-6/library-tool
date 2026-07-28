@@ -43,6 +43,35 @@
     <string name="home_scan_status">Scan status</string>
     <string name="home_scan_status_value">Scan status: %1$s</string>
     <string name="home_availability_detail">%1$s: %2$s</string>
+    <!-- CH master-list indicator. The gesture hint is part of the description
+         because the glyph alone cannot say it, and this control has no label. -->
+    <string name="catalog_ch_label">CH master list</string>
+    <string name="catalog_ch_proposed">Possible CH match: %1$s. Tap to approve, long press to reject.</string>
+    <string name="catalog_ch_confirmed">On the CH list as %1$s</string>
+    <string name="catalog_ch_absent">Not on the CH list</string>
+    <string name="catalog_ch_absent_rejected">Not on the CH list, match rejected</string>
+    <string name="catalog_ch_unchecked">CH list not checked yet</string>
+    <string name="catalog_ch_approved_toast">Merged from CH: %1$s</string>
+    <string name="catalog_ch_rejected_toast">CH match rejected</string>
+    <string name="catalog_ch_undo">Undo</string>
+    <!-- CH merge preview. "Kept" means the scanned value was retained and CH's
+         differing value was NOT applied — say it explicitly, because a second
+         line under a value otherwise reads as "changed to this". -->
+    <string name="ch_merge_failed">Could not write the merged metadata</string>
+    <string name="ch_merge_tag_ch">CH</string>
+    <string name="ch_merge_tag_kept">KEPT YOURS</string>
+    <string name="ch_merge_conflict_alt">CH has: %1$s (not applied)</string>
+    <string name="ch_merge_a11y_adopted">%1$s, %2$s, filled from the CH list</string>
+    <string name="ch_merge_a11y_conflict">%1$s, %2$s, kept from your scan. CH has %3$s, not applied</string>
+    <string name="ch_merge_a11y_unchanged">%1$s, %2$s</string>
+    <plurals name="ch_merge_adopted">
+        <item quantity="one">%d field filled from CH</item>
+        <item quantity="other">%d fields filled from CH</item>
+    </plurals>
+    <plurals name="ch_merge_conflicts">
+        <item quantity="one">%d disagreement, yours kept</item>
+        <item quantity="other">%d disagreements, yours kept</item>
+    </plurals>
     <string name="home_remarks">Remarks</string>
     <plurals name="home_remarks_count">
         <item quantity="one">%1$d remark</item>

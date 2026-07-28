@@ -158,10 +158,21 @@ class HomeListResourceTest {
         val scanRow = xml("src/main/res/layout/item_home.xml")
         assertFalse(hasElementWithId(scanRow, "selected"))
         assertFalse(hasElementWithId(scanRow, "openDetails"))
+        // The catalogue indicators moved into a shared <merge> so every book
+        // surface renders the identical row. They must still reach this row, so
+        // resolve the include rather than dropping the guarantee.
+        val indicators = xml("src/main/res/layout/view_catalog_indicators.xml")
+        assertTrue(
+            "item_home must include view_catalog_indicators",
+            File("src/main/res/layout/item_home.xml").readText()
+                .contains("@layout/view_catalog_indicators"),
+        )
         for (id in listOf(
-            "copyrightStatus", "whlAvailability", "internetArchiveAvailability",
-            "scanStatus", "remarksStatus", "attentionStatus",
+            "copyrightStatus", "scanStatus", "remarksStatus", "attentionStatus",
         )) assertNotNull(elementById(scanRow, id))
+        for (id in listOf(
+            "chAvailability", "whlAvailability", "internetArchiveAvailability",
+        )) assertNotNull(elementById(indicators, id))
 
         val plate = xml("src/main/res/drawable/whl_icon_plate.xml")
         assertEquals(0, plate.getElementsByTagName("stroke").length)

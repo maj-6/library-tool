@@ -44,6 +44,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityHomeBinding
 import org.json.JSONObject
+import java.io.File
 import java.util.UUID
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.roundToInt
@@ -1762,6 +1763,12 @@ class HomeActivity : AppCompatActivity() {
             R.id.state,
             R.id.waitingIndicator,
             R.id.stateIcon,
+            // chAvailability is deliberately absent: it is an interactive
+            // control, and everything in this list is made
+            // IMPORTANT_FOR_ACCESSIBILITY_NO so it folds into the row summary.
+            // Folding it in would hide approve/reject from TalkBack entirely.
+            // The interactive copyrightStatus button is excluded for the same
+            // reason.
             R.id.whlAvailability,
             R.id.internetArchiveAvailability,
             R.id.scanStatus,
@@ -1801,6 +1808,151 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * The compact CH / WHL / IA row.
+     *
+     * One glyph per source, tinted by tone, so the three slots stay the same
+     * size and position whatever they are saying — a row that reflows as
+     * answers arrive makes the whole list jump under your thumb.
+     *
+     * CH is the only interactive slot, and only while a match is unreviewed:
+     * tap approves, long press rejects. Both return true so the gesture does
+     * not fall through to the row's own long-press, which marks the book as
+     * needing attention.
+     */
+    private fun bindCatalogIndicators(row: View, entry: Entries.Entry) {
+        val state = ChMatchStore.read(entry.dir)
+        val presentation = CatalogIndicatorPresenter.from(entry, state)
+
+        fun paint(view: ImageView, indicator: CatalogIndicator?) {
+            val tone = indicator?.tone ?: CatalogTone.HIDDEN
+            // PENDING is transient — the bundled index answers in milliseconds —
+            // so it shows nothing rather than flashing a placeholder per row.
+            val shown = tone == CatalogTone.CONFIRMED ||
+                tone == CatalogTone.PROPOSED ||
+                tone == CatalogTone.ABSENT
+            view.visibility = if (shown) View.VISIBLE else View.GONE
+            if (!shown) return
+            view.setColorFilter(
+                getColor(
+                    when (tone) {
+                        CatalogTone.PROPOSED -> R.color.whl_amber
+                        CatalogTone.ABSENT -> R.color.whl_blue2
+                        else -> R.color.whl_green
+                    },
+                ),
+            )
+            // A settled negative is real information but not news; muting it
+            // keeps a list of mostly-absent books readable.
+            view.alpha = if (tone == CatalogTone.ABSENT) 0.45f else 1f
+            view.contentDescription = indicator?.description
+        }
+
+        paint(row.findViewById(R.id.whlAvailability), presentation.of(CatalogSource.WHL))
+        paint(row.findViewById(R.id.internetArchiveAvailability), presentation.of(CatalogSource.IA))
+
+        val chView = row.findViewById<androidx.appcompat.widget.AppCompatImageButton>(
+            R.id.chAvailability,
+        )
+        val ch = presentation.of(CatalogSource.CH)
+        paint(chView, ch)
+
+        when {
+            ch?.actionable == true -> {
+                chView.isClickable = true
+                chView.isLongClickable = true
+                chView.setOnClickListener { decideChMatch(row, entry, ChDecision.APPROVED, state) }
+                chView.setOnLongClickListener {
+                    decideChMatch(row, entry, ChDecision.REJECTED, state)
+                    true
+                }
+            }
+            // An approved match stays inspectable: what a merge did to your
+            // record should not be a one-time notification you can miss.
+            ch?.tone == CatalogTone.CONFIRMED -> {
+                chView.isClickable = true
+                chView.isLongClickable = false
+                chView.setOnClickListener {
+                    ChMergeDialog.show(this, chMergePreview(entry, state))
+                }
+                chView.setOnLongClickListener(null)
+            }
+            else -> {
+                chView.setOnClickListener(null)
+                chView.setOnLongClickListener(null)
+                chView.isClickable = false
+                chView.isLongClickable = false
+            }
+        }
+    }
+
+    private fun chMergePreview(entry: Entries.Entry, state: ChMatchState): ChMergePreview {
+        val meta = runCatching { entry.bookJsonText()?.let(::JSONObject) }.getOrNull()
+        return ChMergePresenter.preview(ChMergePresenter.scanFields(meta), state.candidate)
+    }
+
+    /**
+     * Record an approve/reject and offer to undo it.
+     *
+     * The decision is written before the snackbar is shown, so closing the app
+     * mid-undo keeps the decision rather than losing it; Undo restores the
+     * exact prior state rather than reconstructing "unreviewed", which would
+     * discard a previous decision if one was being changed.
+     */
+    private fun decideChMatch(
+        row: View,
+        entry: Entries.Entry,
+        decision: ChDecision,
+        previous: ChMatchState,
+    ) {
+        // Snapshot the exact persisted bytes before touching them. Undo restores
+        // this verbatim rather than re-deriving the record, so unknown keys the
+        // extraction contract may have grown survive an undo untouched.
+        val metaFile = File(entry.dir, "meta.json")
+        val priorMeta: String? = runCatching {
+            metaFile.takeIf { it.isFile }?.readText()
+        }.getOrNull()
+
+        var preview: ChMergePreview? = null
+        if (decision == ChDecision.APPROVED) {
+            val meta = runCatching { priorMeta?.let(::JSONObject) }.getOrNull()
+            preview = ChMergePresenter.preview(ChMergePresenter.scanFields(meta), previous.candidate)
+            runCatching {
+                Entries.atomicWrite(metaFile, ChMergePresenter.apply(meta, preview).toString())
+            }.onFailure {
+                Toast.makeText(this, R.string.ch_merge_failed, Toast.LENGTH_LONG).show()
+                return
+            }
+        }
+
+        ChMatchStore.write(entry.dir, previous.copy(decision = decision))
+
+        fun undo() {
+            ChMatchStore.write(entry.dir, previous)
+            if (decision == ChDecision.APPROVED) {
+                runCatching {
+                    if (priorMeta == null) metaFile.delete()
+                    else Entries.atomicWrite(metaFile, priorMeta)
+                }
+            }
+            refreshHome()
+        }
+
+        if (decision == ChDecision.APPROVED && preview != null) {
+            ChMergeDialog.show(this, preview, ::undo)
+        } else {
+            com.google.android.material.snackbar.Snackbar
+                .make(
+                    row,
+                    getString(R.string.catalog_ch_rejected_toast),
+                    com.google.android.material.snackbar.Snackbar.LENGTH_LONG,
+                )
+                .setAction(R.string.catalog_ch_undo) { undo() }
+                .show()
+        }
+        bindCatalogIndicators(row, entry)
+    }
+
     private fun bindDesktopMetadata(row: View, entry: Entries.Entry) {
         val desktop = entry.desktopBook
         val copyrightView = row.findViewById<androidx.appcompat.widget.AppCompatImageButton>(
@@ -1838,20 +1990,7 @@ class HomeActivity : AppCompatActivity() {
             copyrightView.setOnLongClickListener(null)
         }
 
-        row.findViewById<ImageView>(R.id.whlAvailability).apply {
-            val availability = desktop?.whl
-            visibility = if (availability?.available == true) View.VISIBLE else View.GONE
-            contentDescription = availability?.detail?.takeIf(String::isNotBlank)?.let {
-                getString(R.string.home_availability_detail, getString(R.string.home_whl_available), it)
-            } ?: getString(R.string.home_whl_available)
-        }
-        row.findViewById<ImageView>(R.id.internetArchiveAvailability).apply {
-            val availability = desktop?.internetArchive
-            visibility = if (availability?.available == true) View.VISIBLE else View.GONE
-            contentDescription = availability?.detail?.takeIf(String::isNotBlank)?.let {
-                getString(R.string.home_availability_detail, getString(R.string.home_ia_available), it)
-            } ?: getString(R.string.home_ia_available)
-        }
+        bindCatalogIndicators(row, entry)
         row.findViewById<ImageView>(R.id.scanStatus).apply {
             val status = desktop?.scanStatus.orEmpty().trim()
             val actionable = status.isNotEmpty() &&
