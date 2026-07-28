@@ -180,13 +180,20 @@ class CaptureLibAssociationTest {
     }
 
     @Test
-    fun streamRotationAndBoundedRevisionResetCanAdvance() {
-        val local = confirmation(revision = 9)
+    fun newerTimestampAllowsLegitimateStreamRotationAfterLedgerLoss() {
+        val local = confirmation(
+            revision = 9,
+            updatedAt = "2026-07-23T12:35:00+00:00",
+        )
         assertEquals(
             CaptureLibApplyResult.APPLIED,
             captureLibMergeResult(
                 local,
-                confirmation(revision = 1, publisher = captureId),
+                confirmation(
+                    revision = 1,
+                    updatedAt = "2026-07-23T12:35:01+00:00",
+                    publisher = captureId,
+                ),
             ),
         )
         assertEquals(
@@ -207,6 +214,30 @@ class CaptureLibAssociationTest {
                     revision = 2,
                     updatedAt = "2026-07-24T12:35:00+00:00",
                 ),
+            ),
+        )
+    }
+
+    @Test
+    fun delayedPreviousStreamCannotOverwriteRotatedConfirmation() {
+        val rotated = confirmation(
+            revision = 1,
+            updatedAt = "2026-07-23T12:35:02+00:00",
+            publisher = captureId,
+        )
+        val delayedPreviousStream = confirmation(
+            revision = 10,
+            updatedAt = "2026-07-23T12:35:01+00:00",
+        )
+        assertEquals(
+            CaptureLibApplyResult.STALE,
+            captureLibMergeResult(rotated, delayedPreviousStream),
+        )
+        assertEquals(
+            CaptureLibApplyResult.CONFLICT,
+            captureLibMergeResult(
+                rotated,
+                delayedPreviousStream.copy(updatedAt = rotated.updatedAt),
             ),
         )
     }

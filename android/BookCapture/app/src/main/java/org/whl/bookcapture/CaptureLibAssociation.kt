@@ -274,7 +274,19 @@ internal fun captureLibMergeResult(
 ): CaptureLibApplyResult {
     if (local == null) return CaptureLibApplyResult.APPLIED
     if (local.captureId != incoming.captureId) return CaptureLibApplyResult.CONFLICT
-    if (local.streamId != incoming.streamId) return CaptureLibApplyResult.APPLIED
+    if (local.streamId != incoming.streamId) {
+        // A desktop rotates its stream before restarting the revision ledger.
+        // The server timestamp is the only ordering signal that survives that
+        // reset: accepting every changed stream would let a delayed response
+        // from the retired stream overwrite the newer confirmation.
+        return when {
+            timestampAfter(incoming.updatedAt, local.updatedAt) ->
+                CaptureLibApplyResult.APPLIED
+            timestampBefore(incoming.updatedAt, local.updatedAt) ->
+                CaptureLibApplyResult.STALE
+            else -> CaptureLibApplyResult.CONFLICT
+        }
+    }
     if (incoming.revision < local.revision) {
         // A deleted/recreated cloud row may restart at revision one. Its newer
         // server timestamp is the bounded reset signal; ordinary delayed rows
