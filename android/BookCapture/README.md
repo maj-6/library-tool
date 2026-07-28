@@ -1,7 +1,7 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.1` (version code 31) is the Android
-companion for Library Tool. It photographs books, runs OCR and catalog
+Library Tool Capture `0.5.2-alpha.1` (version code 32) is the Android
+prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
 

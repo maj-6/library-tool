@@ -172,10 +172,16 @@ class CaptureSyncTest {
         val poll = upload.substringAfter("private suspend fun pollImports(")
             .substringBefore("private suspend fun syncCloudPhotoJob(")
         assertTrue(poll.contains("client.captureImportStates(waitingForImport.map { it.id })"))
-        assertTrue(
-            poll.indexOf("CaptureLibAssociationStore.apply(") <
-                poll.indexOf(".put(\"cloud_status\", status)"),
-        )
+        assertTrue(poll.contains("applyCaptureImportState(latest.dir, remote)"))
+
+        val shared = File(
+            "src/main/java/org/whl/bookcapture/CaptureLibAssociation.kt",
+        ).readText().substringAfter("internal fun applyCaptureImportState(")
+            .substringBefore("internal fun captureLibAssociationFromJson(")
+        val sharedAssociationWrite = shared.indexOf("CaptureLibAssociationStore.apply(")
+        val sharedStatusWrite = shared.indexOf("Entries.atomicWrite(")
+        assertTrue(sharedAssociationWrite >= 0)
+        assertTrue(sharedStatusWrite > sharedAssociationWrite)
     }
 
     @Test

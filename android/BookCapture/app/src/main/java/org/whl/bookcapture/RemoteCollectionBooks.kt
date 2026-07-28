@@ -4,6 +4,7 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.math.BigDecimal
 import java.time.OffsetDateTime
 
@@ -45,8 +46,61 @@ internal data class RemoteCollectionBooksStore(
 internal const val REMOTE_COLLECTION_BOOKS_FILE = "remote_collection_books.json"
 internal const val REMOTE_COLLECTION_BOOKS_VERSION = 1
 
-/** Matches the desktop's own per-request ceiling on a box listing. */
-internal const val REMOTE_COLLECTION_BOOKS_LIMIT = 500
+/** Per-request page size. PostgREST may return fewer rows; an empty page, not a
+ * short one, is the only end-of-snapshot signal. */
+internal const val REMOTE_COLLECTION_BOOKS_PAGE_SIZE = 500
+
+/** Refuse an implausibly large or non-terminating snapshot explicitly instead
+ * of silently caching a prefix forever. */
+internal const val REMOTE_COLLECTION_BOOKS_MAX_ROWS = 50_000
+
+internal data class RemoteCollectionFetchTicket(
+    val owner: String,
+    val collectionId: String,
+    val generation: Long,
+)
+
+/**
+ * Tracks owner-scoped cloud box snapshots across Activity refreshes.
+ *
+ * A rearm invalidates both completed and in-flight work. Cache writers check
+ * [isCurrent] after entering [RemoteCollectionBooks]' serialized commit
+ * boundary, so the generation monitor itself never spans disk I/O.
+ */
+internal class RemoteCollectionFetchTracker {
+    private data class Key(val owner: String, val collectionId: String)
+
+    private val generations = linkedMapOf<Key, Long>()
+    private var nextGeneration = 0L
+
+    @Synchronized
+    fun begin(owner: String, collectionId: String): RemoteCollectionFetchTicket? {
+        if (owner.isEmpty() || collectionId.isEmpty()) return null
+        val key = Key(owner, collectionId)
+        if (key in generations) return null
+        nextGeneration += 1
+        val generation = nextGeneration
+        generations[key] = generation
+        return RemoteCollectionFetchTicket(owner, collectionId, generation)
+    }
+
+    @Synchronized
+    fun rearm(owner: String) {
+        generations.keys.removeAll { it.owner == owner }
+    }
+
+    @Synchronized
+    fun isCurrent(ticket: RemoteCollectionFetchTicket): Boolean =
+        generations[Key(ticket.owner, ticket.collectionId)] == ticket.generation
+
+    @Synchronized
+    fun finish(ticket: RemoteCollectionFetchTicket, landed: Boolean) {
+        val key = Key(ticket.owner, ticket.collectionId)
+        if (!landed && generations[key] == ticket.generation) {
+            generations.remove(key)
+        }
+    }
+}
 
 internal object RemoteCollectionBooks {
 
@@ -63,17 +117,25 @@ internal object RemoteCollectionBooks {
         readRemoteCollectionBooksStore(File(ctx.filesDir, REMOTE_COLLECTION_BOOKS_FILE), owner)
 
     /**
-     * Replace one collection's cached listing. Scoped to a single key so a fetch
-     * for one box can never discard another box's good cache — but a store owned
-     * by another account is replaced wholesale rather than merged into.
+     * Replace one collection's cached listing. [discardCollectionIds] contains
+     * only explicit tombstones/merge losers from the authoritative collection
+     * log, so concurrent fetches never infer that a newly created box is dead.
+     * A store owned by another account is replaced wholesale rather than merged.
      */
     fun record(
         ctx: Context,
         collectionId: String,
         books: List<RemoteCollectionBook>,
         owner: String = Prefs.userId(ctx),
+        discardCollectionIds: Set<String> = emptySet(),
+        commitIf: () -> Boolean = { true },
     ): Boolean = record(
-        File(ctx.filesDir, REMOTE_COLLECTION_BOOKS_FILE), owner, collectionId, books,
+        File(ctx.filesDir, REMOTE_COLLECTION_BOOKS_FILE),
+        owner,
+        collectionId,
+        books,
+        discardCollectionIds,
+        commitIf,
     )
 
     internal fun record(
@@ -81,11 +143,18 @@ internal object RemoteCollectionBooks {
         owner: String,
         collectionId: String,
         books: List<RemoteCollectionBook>,
+        discardCollectionIds: Set<String> = emptySet(),
+        commitIf: () -> Boolean = { true },
     ): Boolean = synchronized(this) {
+        // Check only after entering the cache's write order. If an older fetch
+        // was already writing when a refresh re-armed the tracker, every newer
+        // accepted write queues behind it and therefore remains the final one.
+        if (!commitIf()) return@synchronized false
         if (collectionId.isEmpty() || owner.isEmpty()) return@synchronized false
         val stored = readRemoteCollectionBooksStore(target, owner)
         if (!stored.valid) return@synchronized false
         val updated = LinkedHashMap(stored.byCollection)
+        discardCollectionIds.forEach(updated::remove)
         updated[collectionId] = books
         if (target.isFile && stored.owner == owner &&
             updated == stored.byCollection
@@ -116,6 +185,64 @@ internal object RemoteCollectionBooks {
             return@synchronized true
         }
         saveRemoteCollectionBooksStore(target, stored.copy(byCollection = updated, owner = owner))
+    }
+}
+
+/**
+ * Consume a complete owner/collection-scoped capture snapshot.
+ *
+ * The broad capture RLS policy also lets curator accounts ingest assigned
+ * contributors. Android's personal box cache is narrower, so every returned
+ * row is checked again against [expectedOwnerId] and [expectedCollectionIds].
+ * Any malformed, foreign, duplicate, out-of-order, or oversized snapshot fails
+ * before callers replace the last good cache.
+ */
+internal fun collectRemoteCollectionBookPages(
+    expectedOwnerId: String,
+    expectedCollectionIds: Set<String>,
+    maximumRows: Int = REMOTE_COLLECTION_BOOKS_MAX_ROWS,
+    fetchPage: (afterId: String?) -> JSONArray,
+): List<RemoteCollectionBook> {
+    require(SAFE_CAPTURE_SYNC_ID.matches(expectedOwnerId)) { "invalid capture owner" }
+    require(maximumRows > 0) { "maximum rows must be positive" }
+    val collectionIds = expectedCollectionIds.asSequence()
+        .map { it.trim().lowercase() }
+        .filter(SAFE_COLLECTION_FILTER_ID::matches)
+        .toSet()
+    if (collectionIds.isEmpty()) return emptyList()
+
+    val books = linkedMapOf<String, RemoteCollectionBook>()
+    var afterId: String? = null
+    var rowCount = 0
+    while (true) {
+        val rows = fetchPage(afterId)
+        if (rows.length() == 0) return books.values.toList()
+        if (rows.length() > maximumRows - rowCount) {
+            throw IOException("cloud collection capture snapshot is too large")
+        }
+        rowCount += rows.length()
+
+        var previousId = afterId
+        for (index in 0 until rows.length()) {
+            val row = rows.optJSONObject(index)
+                ?: throw IOException("invalid cloud collection capture row")
+            val captureId = captureRowString(row, "id").lowercase()
+            if (!SAFE_CAPTURE_SYNC_ID.matches(captureId) ||
+                (previousId != null && captureId <= previousId)
+            ) {
+                throw IOException("cloud collection capture pagination did not advance")
+            }
+            previousId = captureId
+            val parsed = remoteCollectionBookFromCaptureJson(row, expectedOwnerId)
+                ?: throw IOException("invalid owner-scoped cloud collection capture row")
+            if (parsed.collectionId.lowercase() !in collectionIds ||
+                books.putIfAbsent(parsed.captureId, parsed) != null
+            ) {
+                throw IOException("duplicate or out-of-scope cloud collection capture row")
+            }
+        }
+        afterId = previousId
+            ?: throw IOException("cloud collection capture pagination did not advance")
     }
 }
 
@@ -199,7 +326,13 @@ internal const val CAPTURE_COLLECTION_NAME_FIELD = "collection_name"
  * capturing phone had no extraction API key; such a row must still list, or the
  * box looks empty.
  */
-internal fun remoteCollectionBookFromCaptureJson(row: JSONObject): RemoteCollectionBook? {
+internal fun remoteCollectionBookFromCaptureJson(
+    row: JSONObject,
+    expectedOwnerId: String? = null,
+): RemoteCollectionBook? {
+    if (expectedOwnerId != null &&
+        captureRowString(row, "created_by").lowercase() != expectedOwnerId.trim().lowercase()
+    ) return null
     val captureId = captureRowString(row, "id")
     if (captureId.isEmpty()) return null
     val collectionId = captureRowString(row, CAPTURE_COLLECTION_ID_FIELD)

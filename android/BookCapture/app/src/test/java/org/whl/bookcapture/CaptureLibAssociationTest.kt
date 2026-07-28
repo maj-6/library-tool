@@ -281,4 +281,135 @@ class CaptureLibAssociationTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun cloudImportStatePersistsNormalizedStatusWithoutDroppingManifestFields() {
+        val root = Files.createTempDirectory("capture-import-state").toFile()
+        val dir = root.resolve(captureId).apply { mkdirs() }
+        val manifest = dir.resolve("manifest.json")
+        try {
+            manifest.writeText(
+                JSONObject()
+                    .put("cloud_status", "pending")
+                    .put("preserve_me", "yes")
+                    .toString(),
+            )
+            val remote = CaptureImportState(captureId, "  IMPORTED  ", null)
+
+            assertEquals(
+                CaptureImportStateApplyResult.APPLIED,
+                applyCaptureImportState(dir, remote),
+            )
+            val stored = JSONObject(manifest.readText())
+            assertEquals("imported", stored.getString("cloud_status"))
+            assertEquals("yes", stored.getString("preserve_me"))
+            assertEquals(
+                CaptureImportStateApplyResult.UNCHANGED,
+                applyCaptureImportState(dir, remote),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun conflictingAssociationCannotAdvanceStatusPartially() {
+        val root = Files.createTempDirectory("capture-import-conflict").toFile()
+        val dir = root.resolve(captureId).apply { mkdirs() }
+        val manifest = dir.resolve("manifest.json")
+        try {
+            manifest.writeText(JSONObject().put("cloud_status", "pending").toString())
+            val accepted = confirmation(revision = 4)
+            assertEquals(
+                CaptureLibApplyResult.APPLIED,
+                CaptureLibAssociationStore.apply(dir, accepted),
+            )
+            val conflicting = confirmation(revision = 4, state = "stale")
+
+            assertEquals(
+                CaptureImportStateApplyResult.CONFLICT,
+                applyCaptureImportState(
+                    dir,
+                    CaptureImportState(captureId, "imported", conflicting),
+                ),
+            )
+            assertEquals("pending", JSONObject(manifest.readText()).getString("cloud_status"))
+            assertEquals(accepted, CaptureLibAssociationStore.read(dir))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun staleCloudResponsesCannotRegressATerminalStatus() {
+        val root = Files.createTempDirectory("capture-import-stale").toFile()
+        val dir = root.resolve(captureId).apply { mkdirs() }
+        val manifest = dir.resolve("manifest.json")
+        try {
+            manifest.writeText(JSONObject().put("cloud_status", "imported").toString())
+            val current = confirmation(revision = 5)
+            assertEquals(
+                CaptureLibApplyResult.APPLIED,
+                CaptureLibAssociationStore.apply(dir, current),
+            )
+
+            assertEquals(
+                CaptureImportStateApplyResult.STALE,
+                applyCaptureImportState(
+                    dir,
+                    CaptureImportState(captureId, "pending", current),
+                ),
+            )
+            assertEquals("imported", JSONObject(manifest.readText()).getString("cloud_status"))
+            assertEquals(
+                CaptureImportStateApplyResult.STALE,
+                applyCaptureImportState(
+                    dir,
+                    CaptureImportState(captureId, "processing", confirmation(revision = 4)),
+                ),
+            )
+            assertEquals(
+                CaptureImportStateApplyResult.STALE,
+                applyCaptureImportState(
+                    dir,
+                    CaptureImportState(captureId, "pending", null),
+                ),
+            )
+            assertEquals("imported", JSONObject(manifest.readText()).getString("cloud_status"))
+            assertEquals(current, CaptureLibAssociationStore.read(dir))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun cloudImportStateRejectsMismatchedOrUnmaterializedCaptures() {
+        val root = Files.createTempDirectory("capture-import-missing").toFile()
+        val dir = root.resolve(captureId).apply { mkdirs() }
+        try {
+            assertEquals(
+                CaptureImportStateApplyResult.MISSING,
+                applyCaptureImportState(
+                    dir,
+                    CaptureImportState(captureId, "imported", null),
+                ),
+            )
+            dir.resolve("manifest.json").writeText(
+                JSONObject().put("cloud_status", "pending").toString(),
+            )
+            assertEquals(
+                CaptureImportStateApplyResult.CONFLICT,
+                applyCaptureImportState(
+                    dir,
+                    CaptureImportState(streamId, "imported", null),
+                ),
+            )
+            assertEquals(
+                "pending",
+                JSONObject(dir.resolve("manifest.json").readText()).getString("cloud_status"),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }
