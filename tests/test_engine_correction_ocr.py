@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
+from librarytool.adapters.filesystem import FilesystemJobHistoryRepository
 from librarytool.engine.correction_ocr import (
     CORRECTION_OCR_JOB_KIND,
     CORRECTION_OCR_PROPOSAL_POLICY,
@@ -138,7 +140,6 @@ def test_followup_runs_as_separate_job_and_publishes_only_a_proposal() -> None:
     assert child.input_revisions["provider"] == {
         "provider_id": "tesseract",
         "model": "5.4",
-        "options": {},
     }
     assert [output.as_dict() for output in child.outputs] == [
         {
@@ -375,9 +376,11 @@ def test_interrupted_child_reuses_its_persisted_provider_selection() -> None:
     assert result.state is OcrFollowupState.SUCCEEDED
     assert provider.select_calls == 0
     assert provider.selections == [pinned]
-    assert jobs.view(record["id"]).input_revisions["provider"] == (
-        pinned.as_dict()
-    )
+    assert jobs.view(record["id"]).input_revisions["provider"] == {
+        "provider_id": pinned.provider_id,
+        "model": pinned.model,
+    }
+    assert jobs.private_input_revisions(record)["provider"] == pinned.as_dict()
 
 
 def test_durable_proposal_restores_provider_pin_after_job_history_loss() -> None:
@@ -408,7 +411,12 @@ def test_durable_proposal_restores_provider_pin_after_job_history_loss() -> None
 
     assert replay.state is OcrFollowupState.SUCCEEDED
     child = reopened_jobs.view(service.job_id_for(request.operation_id))
-    assert child.input_revisions["provider"] == (
+    assert child.input_revisions["provider"] == {
+        "provider_id": repository.stored.provider.provider_id,
+        "model": repository.stored.provider.model,
+    }
+    record = reopened_jobs.records[child.job_id]
+    assert reopened_jobs.private_input_revisions(record)["provider"] == (
         repository.stored.provider.as_dict()
     )
 
@@ -537,12 +545,12 @@ def test_done_child_replay_requires_its_exact_provider_pin(
     request = _request()
     service.run_ocr_followup(request, Hooks())
     record = jobs.records[service.job_id_for(request.operation_id)]
-    inputs = dict(record["input_revisions"])
+    inputs = jobs.private_input_revisions(record)
     if provider_pin is None:
         inputs.pop("provider")
     else:
         inputs["provider"] = provider_pin
-    record["input_revisions"] = inputs
+    jobs.set_private_input_revisions(record, inputs)
 
     replay = service.run_ocr_followup(request, Hooks())
 
@@ -596,6 +604,119 @@ def test_provider_exception_details_never_enter_public_job_state() -> None:
     assert result.failure.message == "OCR provider failed"
     assert secret not in str(result.as_dict())
     assert secret not in str(public)
+
+
+def test_private_provider_pin_survives_restart_without_crossing_job_views(
+    tmp_path,
+) -> None:
+    executable = r"C:\Users\alice\private tools\tesseract.exe"
+    credential = "TOP-SECRET-CREDENTIAL-SENTINEL"
+    selection = CorrectionOcrProviderSelection(
+        "tesseract",
+        "local",
+        {
+            "tesseract": executable,
+            "credential": credential,
+        },
+    )
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    class CrashAfterSelection(Provider):
+        def select_provider(self):
+            return selection
+
+        def recognize(self, selection, content, hooks):
+            raise SimulatedProcessCrash
+
+    history = FilesystemJobHistoryRepository(tmp_path / "jobs.json")
+    repository = MemoryProposalRepository()
+    first_jobs = JobManager(
+        history,
+        checkpoint_interval=0,
+        event_keep=100,
+    )
+    first_service = CorrectionOcrFollowupService(
+        first_jobs,
+        repository,
+        CrashAfterSelection(),
+    )
+    request = _request()
+
+    with pytest.raises(SimulatedProcessCrash):
+        first_service.run_ocr_followup(request, Hooks())
+
+    job_id = first_service.job_id_for(request.operation_id)
+    record = first_jobs.records[job_id]
+    assert first_jobs.private_input_revisions(record)["provider"] == (
+        selection.as_dict()
+    )
+    public_values = [
+        first_jobs.get(job_id),
+        first_jobs.list(),
+        first_jobs.view(job_id).as_dict(),
+        [event.as_dict() for event in first_jobs.events_after(0)],
+    ]
+    for value in public_values:
+        encoded = json.dumps(value, sort_keys=True)
+        assert executable not in encoded
+        assert credential not in encoded
+    persisted = history.load()
+    assert persisted[job_id]["_private_input_revisions"]["provider"] == (
+        selection.as_dict()
+    )
+    assert executable not in json.dumps(
+        persisted["$operation_receipts"],
+        sort_keys=True,
+    )
+    assert credential not in json.dumps(
+        persisted["$operation_receipts"],
+        sort_keys=True,
+    )
+
+    class ReplayProvider(Provider):
+        def __init__(self):
+            super().__init__()
+            self.select_calls = 0
+
+        def select_provider(self):
+            self.select_calls += 1
+            raise AssertionError("restart replay must use the private pin")
+
+    replay_provider = ReplayProvider()
+    reopened_jobs = JobManager(
+        history,
+        checkpoint_interval=0,
+        event_keep=100,
+    )
+    reopened_jobs.rehydrate(strict=True)
+    reopened = reopened_jobs.records[job_id]
+    assert reopened_jobs.private_input_revisions(reopened)["provider"] == (
+        selection.as_dict()
+    )
+    for value in (
+        reopened_jobs.get(job_id),
+        reopened_jobs.list(),
+        reopened_jobs.view(job_id).as_dict(),
+        [event.as_dict() for event in reopened_jobs.events_after(0)],
+    ):
+        encoded = json.dumps(value, sort_keys=True)
+        assert executable not in encoded
+        assert credential not in encoded
+
+    result = CorrectionOcrFollowupService(
+        reopened_jobs,
+        repository,
+        replay_provider,
+    ).run_ocr_followup(request, Hooks())
+
+    assert result.state is OcrFollowupState.SUCCEEDED
+    assert replay_provider.select_calls == 0
+    assert replay_provider.selections == [selection]
+    terminal = reopened_jobs.view(job_id).as_dict()
+    assert executable not in json.dumps(terminal, sort_keys=True)
+    assert credential not in json.dumps(terminal, sort_keys=True)
 
 
 def test_checksum_mismatch_fails_before_invoking_provider() -> None:

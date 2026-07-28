@@ -586,7 +586,7 @@ class CorrectionOcrFollowupService:
                 if stored is not None:
                     self._validate_stored(stored, request)
                     pin_failure = self._stored_provider_pin_failure(
-                        existing,
+                        self._record_for(existing.job_id),
                         stored,
                     )
                     if pin_failure is not None:
@@ -725,23 +725,20 @@ class CorrectionOcrFollowupService:
                 return self._cancel(request.source, record)
 
             provider_work = True
-            inputs = dict(record.get("input_revisions") or {})
-            provider_pin = inputs.get("provider")
-            if provider_pin is None:
+            selection = self._provider_selection_for_record(record)
+            if selection is None:
                 selection = self._provider.select_provider()
                 if not isinstance(selection, CorrectionOcrProviderSelection):
                     raise EngineError(
                         "OCR provider selection is invalid",
                         code="invalid_ocr_provider_selection",
                     )
-                inputs["provider"] = selection.as_dict()
+                inputs = self._install_provider_pin(record, selection)
                 self._jobs.transition(
                     record,
                     "running",
                     input_revisions=inputs,
                 )
-            else:
-                selection = self._selection_from_pin(provider_pin)
 
             hooks.report_progress(JobProgress(2, 4, "phase", "recognizing"))
             recognition = self._provider.recognize(selection, content, hooks)
@@ -798,15 +795,13 @@ class CorrectionOcrFollowupService:
         stored: StoredCorrectionOcrProposal,
         record: MutableMapping[str, Any],
     ) -> OcrFollowupOutcome:
-        inputs = dict(record.get("input_revisions") or {})
-        provider = stored.provider.as_dict()
-        pinned = inputs.get("provider")
-        if pinned is not None and pinned != provider:
+        pinned = self._provider_selection_for_record(record)
+        if pinned is not None and pinned != stored.provider:
             raise EngineError(
                 "OCR proposal does not match the child provider pin",
                 code="correction_ocr_provider_pin_mismatch",
             )
-        inputs["provider"] = provider
+        inputs = self._install_provider_pin(record, stored.provider)
         output = JobOutput("ocr-proposal", stored.proposal_ref).as_dict()
         self._jobs.transition(
             record,
@@ -869,15 +864,49 @@ class CorrectionOcrFollowupService:
             details=exc.details,
         )
 
+    def _provider_selection_for_record(
+        self,
+        record: Mapping[str, Any],
+    ) -> CorrectionOcrProviderSelection | None:
+        private = self._jobs.private_input_revisions(record)
+        raw = private.get("provider")
+        if raw is None:
+            return None
+        return self._selection_from_pin(raw)
+
+    def _install_provider_pin(
+        self,
+        record: MutableMapping[str, Any],
+        selection: CorrectionOcrProviderSelection,
+    ) -> dict[str, Any]:
+        if not isinstance(selection, CorrectionOcrProviderSelection):
+            raise TypeError("selection must be a CorrectionOcrProviderSelection")
+        private = self._jobs.private_input_revisions(record)
+        existing = private.get("provider")
+        if existing is not None and self._selection_from_pin(existing) != selection:
+            raise EngineError(
+                "OCR proposal does not match the child provider pin",
+                code="correction_ocr_provider_pin_mismatch",
+            )
+        private["provider"] = selection.as_dict()
+        self._jobs.set_private_input_revisions(record, private)
+        inputs = dict(record.get("input_revisions") or {})
+        inputs["provider"] = {
+            "provider_id": selection.provider_id,
+            "model": selection.model,
+        }
+        return inputs
+
     @classmethod
     def _stored_provider_pin_failure(
         cls,
-        job: JobView,
+        record: Mapping[str, Any],
         stored: StoredCorrectionOcrProposal,
     ) -> JobFailure | None:
         try:
+            private = JobManager.private_input_revisions(record)
             pinned = cls._selection_from_pin(
-                job.input_revisions.get("provider")
+                private.get("provider")
             )
         except EngineError as exc:
             return cls._failure_from_engine_error(exc)

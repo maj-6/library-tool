@@ -9646,9 +9646,12 @@ def api_pdf_pageimg():
 # plus `interrupted` for work a restart cut short. Entries are the SAME dicts
 # the per-kind registries hold, so the existing pollers keep their legacy
 # fields (`status` strings) while /api/jobs and the snapshot read the
-# canonical ones (`state`). The snapshot — an allowlist, never credentials,
-# request payloads, or prompt text — lands in DATA_ROOT/output/jobs.json on
-# every state transition, so after a restart a poll gets an honest
+# canonical ones (`state`). Public views are an allowlist and never expose
+# credentials, request payloads, prompt text, or private execution pins. The
+# on-disk snapshot may additionally retain the engine's narrow private
+# provider-pin envelope so interrupted work resumes with the same execution
+# selection. It lands in DATA_ROOT/output/jobs.json on every state transition,
+# so after a restart a poll gets an honest
 # "interrupted" answer instead of a 404. Cancellation is cooperative: a
 # threading.Event per job (never serialized), checked by each worker at its
 # natural boundary (OCR page, analyze chunk, publish stage).
@@ -11644,7 +11647,11 @@ def api_v1_replica_region_detection_job(build_id: str):
 
 
 def _ocr_job_state(job: dict) -> dict:
-    return {k: v for k, v in job.items() if k != "cfg"}
+    return {
+        key: value
+        for key, value in job.items()
+        if key not in {"cfg", "_private_input_revisions"}
+    }
 
 
 @app.route("/api/ocr/job/<job_id>")
@@ -11670,8 +11677,7 @@ def api_ocr_job_cancel(job_id: str):
         if not job:
             abort(404)
     snapshot = _job_request_cancel(job_id, fallback=job)
-    return jsonify({"ok": True,
-                    "job": {k: v for k, v in snapshot.items() if k != "cfg"}})
+    return jsonify({"ok": True, "job": _ocr_job_state(snapshot)})
 
 
 # --- trash (recoverable deletes) ------------------------------------------------------

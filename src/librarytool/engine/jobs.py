@@ -7,8 +7,9 @@ shell, or future Qt/Godot client may choose a different executor while sharing
 the same observable lifecycle contract.
 
 During the incremental migration, workers may keep their existing mutable job
-dictionaries.  ``JobManager`` serializes lifecycle mutations and exposes only
-an allowlisted public snapshot to repositories and clients.
+dictionaries.  ``JobManager`` serializes lifecycle mutations, persists a
+narrow private execution-pin envelope for restart replay, and exposes only an
+allowlisted credential-free snapshot to clients.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ log = logging.getLogger(__name__)
 
 ACTIVE_JOB_STATES = ("queued", "running", "cancelling")
 _OPERATION_RECEIPTS_KEY = "$operation_receipts"
+_PRIVATE_INPUT_REVISIONS_FIELD = "_private_input_revisions"
+_PUBLIC_PROVIDER_PIN_FIELDS = ("provider_id", "model")
 _PORTABLE_OPERATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _COMMAND_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_JOB_FIELDS = (
@@ -331,13 +334,107 @@ class JobManager:
         return "interrupted by restart — output not written"
 
     @staticmethod
-    def public(job: Mapping[str, Any]) -> dict[str, Any]:
-        """Return the stable, credential-free client/persistence projection."""
-        return {
+    def private_input_revisions(
+        job: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return engine-private execution pins from one mutable job record.
+
+        These values are persisted for exact restart replay but are never part
+        of :class:`JobView`, command receipts, events, or public job snapshots.
+        A worker that changes them must perform an ordinary lifecycle
+        transition or checkpoint so the replacement is durably saved.
+        """
+
+        value = job.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+        return deepcopy(dict(value)) if isinstance(value, Mapping) else {}
+
+    @staticmethod
+    def set_private_input_revisions(
+        job: MutableMapping[str, Any],
+        revisions: Mapping[str, Any],
+    ) -> None:
+        """Replace engine-private execution pins on a worker-owned record."""
+
+        if not isinstance(job, MutableMapping):
+            raise TypeError("job must be a mutable mapping")
+        if not isinstance(revisions, Mapping):
+            raise TypeError("private input revisions must be a mapping")
+        job[_PRIVATE_INPUT_REVISIONS_FIELD] = deepcopy(dict(revisions))
+
+    @staticmethod
+    def _public_input_revisions(job: Mapping[str, Any]) -> dict[str, Any]:
+        raw = job.get("input_revisions")
+        revisions = deepcopy(dict(raw)) if isinstance(raw, Mapping) else {}
+        provider = revisions.get("provider")
+        if isinstance(provider, Mapping):
+            # Provider execution options may contain a local executable path
+            # or a credential-shaped extension supplied by a future adapter.
+            # Only stable provider identity belongs in observable job state.
+            revisions["provider"] = {
+                field_name: deepcopy(provider[field_name])
+                for field_name in _PUBLIC_PROVIDER_PIN_FIELDS
+                if field_name in provider
+            }
+        return revisions
+
+    @classmethod
+    def _migrate_private_input_revisions(
+        cls,
+        job: MutableMapping[str, Any],
+    ) -> None:
+        """Move legacy provider options behind the private persistence seam."""
+
+        raw_private = job.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+        if raw_private is not None and not isinstance(raw_private, Mapping):
+            raise ValueError("private input revisions must be a mapping")
+        private = (
+            deepcopy(dict(raw_private))
+            if isinstance(raw_private, Mapping)
+            else {}
+        )
+        raw_revisions = job.get("input_revisions")
+        revisions = (
+            deepcopy(dict(raw_revisions))
+            if isinstance(raw_revisions, Mapping)
+            else {}
+        )
+        provider = revisions.get("provider")
+        if isinstance(provider, Mapping) and "options" in provider:
+            private.setdefault("provider", deepcopy(dict(provider)))
+            revisions["provider"] = {
+                field_name: deepcopy(provider[field_name])
+                for field_name in _PUBLIC_PROVIDER_PIN_FIELDS
+                if field_name in provider
+            }
+            job["input_revisions"] = revisions
+        if private:
+            job[_PRIVATE_INPUT_REVISIONS_FIELD] = private
+        else:
+            job.pop(_PRIVATE_INPUT_REVISIONS_FIELD, None)
+
+    @classmethod
+    def public(cls, job: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the stable, credential-free client projection."""
+
+        result = {
             key: deepcopy(job.get(key))
             for key in PUBLIC_JOB_FIELDS
             if key in job
         }
+        if "input_revisions" in result:
+            result["input_revisions"] = cls._public_input_revisions(job)
+        return result
+
+    @classmethod
+    def _persistent(cls, job: MutableMapping[str, Any]) -> dict[str, Any]:
+        """Return a private on-disk record plus its public lifecycle fields."""
+
+        cls._migrate_private_input_revisions(job)
+        result = cls.public(job)
+        private = job.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+        if isinstance(private, Mapping) and private:
+            result[_PRIVATE_INPUT_REVISIONS_FIELD] = deepcopy(dict(private))
+        return result
 
     def list(
         self,
@@ -593,6 +690,7 @@ class JobManager:
             job.setdefault("subject", self._subject(job).as_dict())
             job.setdefault("input_revisions", {})
             job.setdefault("outputs", [])
+            self._migrate_private_input_revisions(job)
             self._records[job_id] = job
             if operation_id:
                 self._operation_receipts[operation_id] = {
@@ -942,7 +1040,21 @@ class JobManager:
                     or not isinstance(raw, Mapping)
                 ):
                     continue
-                job: MutableMapping[str, Any] = self.public(raw)
+                candidate: MutableMapping[str, Any] = deepcopy(dict(raw))
+                try:
+                    self._migrate_private_input_revisions(candidate)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise ValueError(
+                            "job history contains invalid private input revisions"
+                        ) from None
+                    candidate.pop(_PRIVATE_INPUT_REVISIONS_FIELD, None)
+                job = self.public(candidate)
+                private = candidate.get(_PRIVATE_INPUT_REVISIONS_FIELD)
+                if isinstance(private, Mapping) and private:
+                    job[_PRIVATE_INPUT_REVISIONS_FIELD] = deepcopy(
+                        dict(private)
+                    )
                 job["id"] = job_id
                 job.setdefault("cancellable", True)
                 job["revision"] = max(1, self._integer(job.get("revision"), 1))
@@ -1029,7 +1141,7 @@ class JobManager:
                 )
         elif job.get("error"):
             failure = JobFailure("job_failed", str(job.get("error")))
-        revisions = job.get("input_revisions")
+        revisions = cls._public_input_revisions(job)
         return JobView(
             job_id=str(job.get("id") or ""),
             kind=str(job.get("kind") or ""),
@@ -1058,9 +1170,7 @@ class JobManager:
             note=str(job.get("note") or ""),
             error=failure,
             input_revisions=(
-                deepcopy(dict(revisions))
-                if isinstance(revisions, Mapping)
-                else {}
+                revisions
             ),
             outputs=tuple(outputs),
         )
@@ -1160,9 +1270,11 @@ class JobManager:
         if self._repository is None:
             return
         for job in self._records.values():
+            self._migrate_private_input_revisions(job)
             self._refresh_command_receipt_locked(job)
         snapshot = {
-            job_id: self.public(job) for job_id, job in self._records.items()
+            job_id: self._persistent(job)
+            for job_id, job in self._records.items()
         }
         if self._operation_receipts:
             snapshot[_OPERATION_RECEIPTS_KEY] = {

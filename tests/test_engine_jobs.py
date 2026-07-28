@@ -93,6 +93,56 @@ def test_track_transition_and_public_snapshot_are_transport_neutral():
     assert "secret" not in history.value[record["id"]]
 
 
+def test_rehydrate_migrates_legacy_provider_options_behind_private_pin():
+    executable = r"C:\Users\alice\private tools\tesseract.exe"
+    credential = "TOP-SECRET-LEGACY-PIN"
+    provider = {
+        "provider_id": "tesseract",
+        "model": "local",
+        "options": {
+            "tesseract": executable,
+            "credential": credential,
+        },
+    }
+    history = MemoryHistory({
+        "legacy-ocr-child": {
+            "id": "legacy-ocr-child",
+            "kind": "correction.ocr-followup",
+            "state": "running",
+            "status": "running",
+            "input_revisions": {"provider": provider},
+        },
+    })
+    jobs = manager(history)
+
+    jobs.rehydrate(strict=True)
+
+    record = jobs.records["legacy-ocr-child"]
+    assert jobs.private_input_revisions(record)["provider"] == provider
+    assert jobs.view("legacy-ocr-child").input_revisions["provider"] == {
+        "provider_id": "tesseract",
+        "model": "local",
+    }
+    assert history.value["legacy-ocr-child"]["input_revisions"]["provider"] == {
+        "provider_id": "tesseract",
+        "model": "local",
+    }
+    assert (
+        history.value["legacy-ocr-child"]["_private_input_revisions"][
+            "provider"
+        ]
+        == provider
+    )
+    for value in (
+        jobs.get("legacy-ocr-child"),
+        jobs.list(),
+        [event.as_dict() for event in jobs.events_after(0)],
+    ):
+        public = json.dumps(value, sort_keys=True)
+        assert executable not in public
+        assert credential not in public
+
+
 def test_command_receipt_replays_terminal_outcome_after_prune_and_restart():
     history = MemoryHistory()
     jobs = manager(history, keep=0)
