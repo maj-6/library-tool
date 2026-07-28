@@ -78,8 +78,18 @@ def test_changelogs_use_public_release_categories_in_a_fixed_order():
         encoding="utf-8"
     )
     android_version = re.search(r'versionName\s*=\s*"([^"]+)"', android_build)
+    android_code = re.search(r"\bversionCode\s*=\s*(\d+)", android_build)
+    changelog_code = re.search(
+        r"^##\s+.+?\s+—\s+\d{4}-\d{2}-\d{2}\n\n"
+        r"Android version code: `(\d+)`\.$",
+        ANDROID_CHANGELOG,
+        re.MULTILINE,
+    )
     assert android_version
+    assert android_code
+    assert changelog_code
     assert android_versions[0] == android_version.group(1)
+    assert changelog_code.group(1) == android_code.group(1)
 
 
 def test_changelog_avoids_internal_release_note_terms():
