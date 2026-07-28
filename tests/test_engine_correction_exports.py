@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import librarytool.engine as engine
 from librarytool.engine import (
+    correction_ocr,
     correction_transforms,
     corrections,
     raster_artifacts,
@@ -12,6 +13,7 @@ from librarytool.engine import (
 def test_correction_contracts_are_available_from_the_public_engine_package() -> None:
     expected = (
         set(corrections.__all__)
+        | set(correction_ocr.__all__)
         | set(correction_transforms.__all__)
         | set(raster_artifacts.__all__)
         | set(spatial_annotations.__all__)

@@ -371,6 +371,11 @@ def test_queue_is_idempotent_and_operation_reuse_conflicts() -> None:
     assert len(jobs.list()) == 1
     assert first.job.subject.item_id == "book-1"
     assert first.job.subject.source_id == "source-image"
+    assert first.job.input_revisions["transform"] == {
+        "quad": [list(point) for point in FULL_FRAME],
+        "adjustment": command.adjustment.as_dict(),
+        "rerun_ocr": False,
+    }
     with pytest.raises(ConflictError) as conflict:
         service.queue(_command(source, adjustment=None))
     assert conflict.value.code == "correction_operation_conflict"
@@ -825,6 +830,12 @@ def test_ocr_failure_is_observable_and_does_not_roll_back_image_commit() -> None
     assert job["state"] == "done"
     assert job["errors"] == 1
     assert len(job["outputs"]) == 4
+    assert job["failure"]["code"] == "ocr_followup_failed"
+    assert job["failure"]["retryable"] is True
+    assert job["error"] == "provider unavailable"
+    public = jobs.view(queue.job_id)
+    assert public.error.code == "ocr_followup_failed"
+    assert public.outputs
     assert store.commits[0].human_assertions.text[0].text == "Verified transcription"
 
 

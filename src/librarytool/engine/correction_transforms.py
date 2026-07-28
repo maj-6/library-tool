@@ -996,6 +996,17 @@ class CorrectionTransformService:
                         "source_sha256": command.source_sha256,
                         "operation_id": command.operation_id,
                         "command_sha256": command.fingerprint,
+                        "transform": {
+                            "quad": [
+                                [x, y] for x, y in command.quad
+                            ],
+                            "adjustment": (
+                                command.adjustment.as_dict()
+                                if command.adjustment is not None
+                                else None
+                            ),
+                            "rerun_ocr": command.rerun_ocr,
+                        },
                     },
                     # Private worker input. JobManager's public projection does
                     # not persist this field; a durable command adapter remains
@@ -1596,6 +1607,10 @@ class CorrectionTransformWorker:
             note = "image committed; OCR follow-up cancelled"
         if recorder_failure is not None:
             note = "image committed; OCR outcome recording failed"
+        followup_failure = self._followup_failure(
+            outcome,
+            recorder_failure=recorder_failure,
+        )
         self._jobs.transition(
             record,
             "done (with errors)" if has_followup_error else "done",
@@ -1604,6 +1619,16 @@ class CorrectionTransformWorker:
             done=6,
             total=6,
             errors=1 if has_followup_error else 0,
+            failure=(
+                followup_failure.as_dict()
+                if followup_failure is not None
+                else None
+            ),
+            error=(
+                followup_failure.message
+                if followup_failure is not None
+                else ""
+            ),
             note=note,
         )
         return CorrectionTransformRunResult(
@@ -1660,6 +1685,30 @@ class CorrectionTransformWorker:
                     details={"exception": type(exc).__name__},
                 ),
             )
+
+    @staticmethod
+    def _followup_failure(
+        outcome: OcrFollowupOutcome,
+        *,
+        recorder_failure: Exception | None,
+    ) -> JobFailure | None:
+        if recorder_failure is not None:
+            return JobFailure(
+                "ocr_outcome_recording_failed",
+                "the corrected image was committed, but its OCR outcome "
+                "could not be recorded",
+                retryable=True,
+                details={"exception": type(recorder_failure).__name__},
+            )
+        if outcome.state is OcrFollowupState.FAILED:
+            return outcome.failure
+        if outcome.state is OcrFollowupState.CANCELLED:
+            return JobFailure(
+                "ocr_followup_cancelled",
+                "the corrected image was committed; OCR follow-up was cancelled",
+                retryable=True,
+            )
+        return None
 
     @staticmethod
     def _validate_commit_result(
