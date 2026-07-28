@@ -9,6 +9,7 @@ const {
   PROPOSAL_SCHEMA,
   TOOLS,
   createImageEditorState,
+  reduceImageEditorState,
   serializeCorrectionTransformCommand,
 } = require("../tools/whl_explorer/static/corrections/image-editor-state");
 const {
@@ -107,7 +108,10 @@ function committedResult(operationId, ocrState = "not_requested") {
     image_commit: {
       operation_id: operationId,
       outputs: [
-        { kind: "display", artifact_id: "display-1" },
+        {
+          kind: "corrected-display",
+          artifact_id: "corrected-display-1",
+        },
         { kind: "ocr-ready", artifact_id: "ocr-ready-1" },
         { kind: "thumbnail", artifact_id: "thumbnail-1" },
         { kind: "transform-manifest", artifact_id: "manifest-1" },
@@ -190,7 +194,7 @@ function mountedHarness(options = {}) {
     surface,
     toolbar,
     dispatch(action) {
-      if (action.type === "SET_TOOL") state = { ...state, tool: action.tool };
+      state = reduceImageEditorState(state, action);
       return state;
     },
     getPins: pins,
@@ -620,7 +624,11 @@ test("remembered brightness changes only after a real committed image result", (
   assert.deepEqual(tool.serializeProfile(), { lastAppliedBrightness: 5 });
 
   const appliedCommand = command("adjust-applied", 33, true);
-  composed.onQueueResult({ job_id: "job-applied" }, appliedCommand, { id: "a" });
+  composed.onQueueResult(
+    { job_id: "job-adjust-applied" },
+    appliedCommand,
+    { id: "a" },
+  );
   const applied = tool.observeTransformResult(
     committedResult("adjust-applied", "failed"),
   );
@@ -637,6 +645,116 @@ test("remembered brightness changes only after a real committed image result", (
   const newWindow = createImageAdjustTool({ profile: tool.serializeProfile() });
   assert.equal(newWindow.getState().brightness, 33);
   assert.equal(newWindow.getState().rememberedBrightness, 33);
+});
+
+
+test("a validated terminal commit completes the queued mounted editor", () => {
+  const harness = mountedHarness({
+    profile: { lastAppliedBrightness: 4 },
+  });
+  const { controller, tool } = harness;
+  const queuedCommand = command("adjust-converged", 36, true);
+  controller.dispatch({ type: "SET_TOOL", tool: TOOLS.IMAGE_ADJUST });
+  controller.dispatch({ type: "QUEUE_STARTED", command: queuedCommand });
+  controller.dispatch({
+    type: "QUEUE_ACCEPTED",
+    jobId: "job-adjust-converged",
+  });
+  tool.handleQueueAccepted(
+    { job_id: "job-adjust-converged" },
+    queuedCommand,
+    controller.resource,
+  );
+
+  const result = tool.observeTransformResult(
+    committedResult("adjust-converged", "failed"),
+  );
+
+  assert.equal(result.imageCommitted, true);
+  assert.equal(result.invalidImageCommit, false);
+  assert.equal(result.editorSettled, true);
+  assert.equal(result.terminalState, "done");
+  assert.equal(controller.getState().submission.status, "complete");
+  assert.deepEqual(tool.serializeProfile(), { lastAppliedBrightness: 36 });
+  assert.equal(result.ocrOutcome.state, "failed");
+  assert.deepEqual(tool.getState().pendingOperationIds, []);
+  harness.cleanup();
+});
+
+
+test("empty terminal outputs reset the editor without remembering brightness", () => {
+  const harness = mountedHarness({
+    profile: { lastAppliedBrightness: 8 },
+  });
+  const { controller, tool } = harness;
+  const queuedCommand = command("adjust-invalid-output", 49, true);
+  controller.dispatch({ type: "SET_TOOL", tool: TOOLS.IMAGE_ADJUST });
+  controller.dispatch({ type: "QUEUE_STARTED", command: queuedCommand });
+  controller.dispatch({
+    type: "QUEUE_ACCEPTED",
+    jobId: "job-adjust-invalid-output",
+  });
+  tool.handleQueueAccepted(
+    { job_id: "job-adjust-invalid-output" },
+    queuedCommand,
+    controller.resource,
+  );
+  const invalid = committedResult("adjust-invalid-output", "succeeded");
+  invalid.terminal_state = "done";
+  invalid.image_commit.outputs = [];
+
+  const result = tool.observeTransformResult(invalid);
+
+  assert.equal(result.imageCommitted, false);
+  assert.equal(result.invalidImageCommit, true);
+  assert.equal(result.editorSettled, true);
+  assert.equal(controller.getState().submission.status, "idle");
+  assert.deepEqual(tool.serializeProfile(), { lastAppliedBrightness: 8 });
+  assert.equal(result.ocrOutcome, null);
+  assert.deepEqual(tool.getState().pendingOperationIds, []);
+  harness.cleanup();
+});
+
+
+test("cancellation before commit resets the queued mounted editor", () => {
+  const harness = mountedHarness({
+    profile: { lastAppliedBrightness: -6 },
+  });
+  const { controller, tool } = harness;
+  const queuedCommand = command("adjust-cancelled-mounted", 54, true);
+  controller.dispatch({ type: "SET_TOOL", tool: TOOLS.IMAGE_ADJUST });
+  controller.dispatch({ type: "QUEUE_STARTED", command: queuedCommand });
+  controller.dispatch({
+    type: "QUEUE_ACCEPTED",
+    jobId: "job-adjust-cancelled-mounted",
+  });
+  tool.handleQueueAccepted(
+    { job_id: "job-adjust-cancelled-mounted" },
+    queuedCommand,
+    controller.resource,
+  );
+
+  const result = tool.observeTransformResult({
+    job_id: "job-adjust-cancelled-mounted",
+    operation_id: "adjust-cancelled-mounted",
+    terminal_state: "cancelled",
+    image_commit: null,
+    ocr_followup: {
+      state: "not_requested",
+      source: null,
+      proposal_ref: "",
+      failure: null,
+    },
+    cancelled_before_commit: true,
+    failure: null,
+  });
+
+  assert.equal(result.imageCommitted, false);
+  assert.equal(result.editorSettled, true);
+  assert.equal(controller.getState().submission.status, "idle");
+  assert.deepEqual(tool.serializeProfile(), { lastAppliedBrightness: -6 });
+  assert.equal(result.ocrOutcome, null);
+  harness.cleanup();
 });
 
 

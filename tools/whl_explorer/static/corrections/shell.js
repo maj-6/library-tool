@@ -422,7 +422,11 @@
               typeof desktopCorrections.transforms.subscribeResults === "function"
             ? desktopCorrections.transforms.subscribeResults.bind(
               desktopCorrections.transforms)
-            : null;
+            : this.engineCorrections && this.engineCorrections.transforms &&
+                typeof this.engineCorrections.transforms.subscribeResults === "function"
+              ? this.engineCorrections.transforms.subscribeResults.bind(
+                this.engineCorrections.transforms)
+              : null;
       let imageRendererOptions = {
         invokeCommand,
         initialTool: deps.TOOLS && deps.TOOLS.PERSPECTIVE,

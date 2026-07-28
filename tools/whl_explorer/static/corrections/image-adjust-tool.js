@@ -31,6 +31,13 @@
   const TERMINAL_OCR_STATES = new Set([
     "not_requested", "succeeded", "failed", "cancelled",
   ]);
+  const TERMINAL_JOB_STATES = new Set([
+    "cancelled", "failed", "done", "interrupted",
+  ]);
+  const COMMITTED_OUTPUT_KINDS = new Set([
+    "corrected-display", "ocr-ready", "thumbnail", "transform-manifest",
+  ]);
+  const PORTABLE_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
   let toolSequence = 0;
 
   function isPlainObject(value) {
@@ -359,8 +366,37 @@
     const outer = operationIdentifier(result.operation_id);
     const inner = operationIdentifier(result.image_commit.operation_id);
     if (!outer || !inner || outer !== inner ||
-        !Array.isArray(result.image_commit.outputs)) return "";
+        !Array.isArray(result.image_commit.outputs) ||
+        result.image_commit.outputs.length !== COMMITTED_OUTPUT_KINDS.size) {
+      return "";
+    }
+    const kinds = new Set();
+    const artifactIds = new Set();
+    for (const output of result.image_commit.outputs) {
+      const kind = output && typeof output.kind === "string"
+        ? output.kind : "";
+      const artifactId = output && typeof output.artifact_id === "string" &&
+        PORTABLE_IDENTIFIER_RE.test(output.artifact_id)
+        ? output.artifact_id : "";
+      if (!COMMITTED_OUTPUT_KINDS.has(kind) || kinds.has(kind) ||
+          !artifactId || artifactIds.has(artifactId)) return "";
+      kinds.add(kind);
+      artifactIds.add(artifactId);
+    }
+    if (kinds.size !== COMMITTED_OUTPUT_KINDS.size) return "";
     return outer;
+  }
+
+  function terminalJobState(result, imageCommitted) {
+    const supplied = result && result.terminal_state;
+    if (TERMINAL_JOB_STATES.has(supplied)) return supplied;
+    if (result && result.cancelled_before_commit === true) return "cancelled";
+    if (imageCommitted) return "done";
+    if (result && isPlainObject(result.failure)) return "failed";
+    if (result && Object.prototype.hasOwnProperty.call(result, "image_commit")) {
+      return "failed";
+    }
+    return "";
   }
 
   class ImageAdjustTool {
@@ -804,6 +840,38 @@
       }
     }
 
+    settleMountedEditor(
+      result,
+      command,
+      pending,
+      terminalState,
+      imageCommitted,
+      operationId,
+    ) {
+      const record = this.mountRecord;
+      if (!record || record.disposed || !terminalState || !command ||
+          !operationId || command.operationId !== operationId) return false;
+      const state = record.controller.getState();
+      const submission = state && state.submission;
+      const submitted = canonicalCommand(submission && submission.command);
+      if (!submission || submission.status !== "queued" || !submitted ||
+          submitted.operationId !== command.operationId) return false;
+      const resultJobId = operationIdentifier(
+        result && (result.job_id || result.jobId),
+      );
+      const pendingJobId = operationIdentifier(pending && pending.jobId);
+      const submittedJobId = operationIdentifier(submission.jobId);
+      if ((resultJobId && pendingJobId && resultJobId !== pendingJobId) ||
+          (resultJobId && submittedJobId && resultJobId !== submittedJobId) ||
+          (pendingJobId && submittedJobId && pendingJobId !== submittedJobId)) {
+        return false;
+      }
+      record.controller.dispatch({
+        type: imageCommitted ? "QUEUE_COMPLETED" : "QUEUE_RESET",
+      });
+      return true;
+    }
+
     observeTransformResult(result, suppliedCommand = null) {
       const operationId = operationIdentifier(
         result && (result.operation_id ||
@@ -812,7 +880,17 @@
       const pending = this.pending.get(operationId);
       const command = canonicalCommand(suppliedCommand) || pending || null;
       const committedId = committedOperation(result);
-      const imageCommitted = Boolean(committedId);
+      const pendingJobId = operationIdentifier(pending && pending.jobId);
+      const resultJobId = operationIdentifier(
+        result && (result.job_id || result.jobId),
+      );
+      const jobIdentityValid = !pendingJobId || !resultJobId ||
+        pendingJobId === resultJobId;
+      const imageCommitted = Boolean(committedId && jobIdentityValid);
+      const invalidImageCommit = Boolean(
+        result && isPlainObject(result.image_commit) && !imageCommitted,
+      );
+      const terminalState = terminalJobState(result, imageCommitted);
       let profileChanged = false;
 
       if (imageCommitted && command &&
@@ -837,7 +915,8 @@
         }
       }
 
-      const ocrOutcome = normalizedOcrOutcome(result && result.ocr_followup);
+      const ocrOutcome = imageCommitted
+        ? normalizedOcrOutcome(result && result.ocr_followup) : null;
       if (ocrOutcome) {
         this.lastOcrOutcome = ocrOutcome;
         const detail = { operationId, imageCommitted };
@@ -849,27 +928,41 @@
         }
       }
 
-      if (operationId && (imageCommitted ||
-          result && result.cancelled_before_commit === true ||
-          ocrOutcome)) {
-        this.pending.delete(operationId);
-      }
+      const editorSettled = this.settleMountedEditor(
+        result, command, pending, terminalState, imageCommitted, operationId,
+      );
+      if (operationId && terminalState) this.pending.delete(operationId);
       const record = this.mountRecord;
       if (record && !record.disposed && operationId) {
-        if (imageCommitted && ocrOutcome && ocrOutcome.state === "failed") {
+        if (invalidImageCommit) {
+          record.jobStatus.textContent =
+            "Image adjustment output was rejected; source and saved brightness " +
+            "are unchanged.";
+        } else if (imageCommitted && ocrOutcome && ocrOutcome.state === "failed") {
           record.jobStatus.textContent =
             "Image adjustment applied; OCR follow-up failed.";
+        } else if (imageCommitted && ocrOutcome &&
+                   ocrOutcome.state === "cancelled") {
+          record.jobStatus.textContent =
+            "Image adjustment applied; OCR follow-up was cancelled.";
         } else if (imageCommitted) {
           record.jobStatus.textContent = "Image adjustment applied.";
         } else if (result && result.cancelled_before_commit === true) {
           record.jobStatus.textContent =
             "Image adjustment cancelled; source and saved brightness are unchanged.";
+        } else if (terminalState) {
+          record.jobStatus.textContent =
+            "Image adjustment failed; source and saved brightness are unchanged.";
         }
       }
       return {
         recognized: Boolean(operationId),
         operationId,
         imageCommitted,
+        invalidImageCommit,
+        jobIdentityValid,
+        terminalState,
+        editorSettled,
         profileChanged,
         profile: this.serializeProfile(),
         ocrOutcome,
