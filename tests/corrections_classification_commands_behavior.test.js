@@ -53,6 +53,31 @@ function annotation(overrides = {}) {
 }
 
 
+function revisionTarget(kind, id, before, after) {
+  return {
+    kind,
+    target_id: id,
+    before_revision: before,
+    after_revision: after,
+  };
+}
+
+
+function mutationResult(targets, inverseAction = "role.clear") {
+  return {
+    receipt: {
+      item_id: "book-1",
+      targets,
+      inverse: {
+        action: inverseAction,
+        expected_targets: targets.map((target) => ({ ...target })),
+        payload: {},
+      },
+    },
+  };
+}
+
+
 function harness(options = {}) {
   const documentRef = fakeDocument();
   documentRef.hasFocus = () => true;
@@ -230,6 +255,246 @@ test("region classification is one CAS-pinned linked-artifact transaction and un
 });
 
 
+test("linked role receipts refresh every changed target after apply and undo", async () => {
+  const appliedTargets = [
+    revisionTarget("annotation", "region-1", "region-r1", "region-r2"),
+    revisionTarget("artifact", "figure-1", "figure-r4", "figure-r5"),
+  ];
+  const undoneTargets = [
+    revisionTarget("annotation", "region-1", "region-r2", "region-r3"),
+    revisionTarget("artifact", "figure-1", "figure-r5", "figure-r6"),
+  ];
+  const refreshes = [];
+  let controller;
+  const built = harness({
+    port: {
+      async assignRegionRole() {
+        controller.setSelectionTarget(image({
+          key: "artifact:unrelated",
+          id: "unrelated",
+          revision: "unrelated-r1",
+        }));
+        return mutationResult(appliedTargets);
+      },
+      async executeInverse() {
+        return mutationResult(undoneTargets, "role.assign");
+      },
+    },
+    resolveLinkedArtifact() {
+      return {
+        key: "artifact:figure-1",
+        objectType: "raster-artifact",
+        itemId: "book-1",
+        id: "figure-1",
+        revision: "figure-r4",
+      };
+    },
+    async refreshTarget(target, detail) {
+      refreshes.push({
+        key: target.key,
+        revision: target.revision,
+        reason: detail.reason,
+      });
+    },
+  });
+  controller = built.controller;
+  controller.setSelectionTarget(annotation());
+
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.marginalia);
+
+  assert.deepEqual(refreshes, [
+    { key: "annotation:region-1", revision: "region-r2", reason: "committed" },
+    { key: "artifact:figure-1", revision: "figure-r5", reason: "committed" },
+  ]);
+  assert.equal(
+    controller.stateSnapshot().selectionTarget.key,
+    "artifact:unrelated",
+    "receipt refresh must not import the command's old target into selection state",
+  );
+
+  refreshes.length = 0;
+  controller.setSelectionTarget(image({
+    key: "artifact:other-selection",
+    id: "other-selection",
+    revision: "other-r1",
+  }));
+  await controller.undoLast();
+
+  assert.deepEqual(refreshes, [
+    {
+      key: "annotation:region-1",
+      revision: "region-r3",
+      reason: "undo-committed",
+    },
+    {
+      key: "artifact:figure-1",
+      revision: "figure-r6",
+      reason: "undo-committed",
+    },
+  ]);
+  assert.equal(
+    controller.stateSnapshot().selectionTarget.key,
+    "artifact:other-selection",
+    "undo refresh must use its receipt instead of the current selection",
+  );
+});
+
+
+test("source image refresh targets retain their group across receipts and undo", async () => {
+  const applied = [
+    revisionTarget("artifact", "scan-1", "scan-r1", "scan-r2"),
+  ];
+  const undone = [
+    revisionTarget("artifact", "scan-1", "scan-r2", "scan-r3"),
+  ];
+  const refreshes = [];
+  const { controller } = harness({
+    port: {
+      async assignImageCategory() {
+        return mutationResult(applied, "category.clear");
+      },
+      async executeInverse() {
+        return mutationResult(undone, "category.assign");
+      },
+    },
+    async refreshTarget(target, detail) {
+      refreshes.push({
+        group: target.group,
+        key: target.key,
+        reason: detail.reason,
+        revision: target.revision,
+      });
+    },
+  });
+  controller.setSelectionTarget(image());
+
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.cover);
+  await controller.undoLast();
+
+  assert.deepEqual(refreshes, [
+    {
+      group: "source-images",
+      key: "artifact:scan-1",
+      reason: "committed",
+      revision: "scan-r2",
+    },
+    {
+      group: "source-images",
+      key: "artifact:scan-1",
+      reason: "undo-committed",
+      revision: "scan-r3",
+    },
+  ]);
+});
+
+
+test("linked role conflicts force both target refreshes even when one fails", async () => {
+  const conflict = Object.assign(new Error("changed elsewhere"), {
+    code: "annotation_revision_conflict",
+    status: 409,
+  });
+  const refreshFailure = new Error("annotation reload unavailable");
+  const refreshes = [];
+  const conflicts = [];
+  const history = [];
+  const { controller } = harness({
+    port: {
+      async assignRegionRole() {
+        throw conflict;
+      },
+    },
+    history: { push: (entry) => history.push(entry) },
+    resolveLinkedArtifact() {
+      return {
+        key: "artifact:figure-1",
+        objectType: "raster-artifact",
+        itemId: "book-1",
+        id: "figure-1",
+        revision: "figure-r4",
+      };
+    },
+    async refreshTarget(target, detail) {
+      refreshes.push([target.key, detail.reason]);
+      if (target.key === "annotation:region-1") throw refreshFailure;
+    },
+    async onConflict(error, detail) {
+      conflicts.push({ error, detail });
+    },
+  });
+  controller.setSelectionTarget(annotation());
+
+  await assert.rejects(
+    controller.invoke(CLASSIFICATION_COMMAND_IDS.illustration),
+    (error) => error === conflict,
+  );
+
+  assert.deepEqual(refreshes, [
+    ["annotation:region-1", "conflict"],
+    ["artifact:figure-1", "conflict"],
+  ]);
+  assert.deepEqual(conflict.refreshErrors, [refreshFailure]);
+  assert.deepEqual(
+    conflicts[0].detail.targets.map((target) => target.key),
+    ["annotation:region-1", "artifact:figure-1"],
+  );
+  assert.equal(history.length, 0);
+});
+
+
+test("linked role undo conflicts refresh recorded targets, not current selection", async () => {
+  const targets = [
+    revisionTarget("annotation", "region-1", "region-r1", "region-r2"),
+    revisionTarget("artifact", "figure-1", "figure-r4", "figure-r5"),
+  ];
+  const conflict = Object.assign(new Error("undo changed elsewhere"), {
+    code: "artifact_revision_conflict",
+    status: 409,
+  });
+  const refreshes = [];
+  const { controller } = harness({
+    port: {
+      async assignRegionRole() {
+        return mutationResult(targets);
+      },
+      async executeInverse() {
+        throw conflict;
+      },
+    },
+    resolveLinkedArtifact() {
+      return {
+        key: "artifact:figure-1",
+        objectType: "raster-artifact",
+        itemId: "book-1",
+        id: "figure-1",
+        revision: "figure-r4",
+      };
+    },
+    async refreshTarget(target, detail) {
+      refreshes.push([target.key, detail.reason]);
+    },
+  });
+  controller.setSelectionTarget(annotation());
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.marginalia);
+
+  refreshes.length = 0;
+  controller.setSelectionTarget(image({
+    key: "artifact:unrelated",
+    id: "unrelated",
+    revision: "unrelated-r1",
+  }));
+  await assert.rejects(controller.undoLast(), (error) => error === conflict);
+
+  assert.deepEqual(refreshes, [
+    ["annotation:region-1", "undo-conflict"],
+    ["artifact:figure-1", "undo-conflict"],
+  ]);
+  assert.equal(
+    controller.stateSnapshot().selectionTarget.key,
+    "artifact:unrelated",
+  );
+});
+
+
 test("raw spatial annotation link ids resolve the linked artifact transaction", async () => {
   const requests = [];
   const { calls, controller } = harness({
@@ -310,7 +575,9 @@ test("conflicts refresh current state without retrying or recording a false undo
       },
     },
     history: { push: (entry) => history.push(entry) },
-    async refreshTarget() {
+    async refreshTarget(target, detail) {
+      assert.equal(target.group, "source-images");
+      assert.equal(detail.reason, "conflict");
       refreshes += 1;
     },
     async onConflict(error) {

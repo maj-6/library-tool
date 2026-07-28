@@ -391,6 +391,8 @@
         this.contextGeneration += 1;
         this.abortContextWork();
         this.abortSelectionWork();
+        this.detailCache.clear();
+        this.detailInflight.clear();
         this.resetGroups();
         this.expandedGroups = expanded;
         this.selectedKey = "";

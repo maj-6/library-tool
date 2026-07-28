@@ -280,7 +280,7 @@ def test_production_bridge_mutations_converge_across_clients(
     assert replay.get_json()["receipt"] == first.get_json()["receipt"]
 
 
-def test_production_review_bridge_composes_index_and_reconciles_cas(
+def test_production_review_bridge_owns_actor_and_reconciles_cas(
     client,
     corrections_workspace,
     monkeypatch,
@@ -296,11 +296,18 @@ def test_production_review_bridge_composes_index_and_reconciles_cas(
     review_path = f"/api/v1/items/{BOOK_ID}/corrections/review"
     initial_detail = client.get(review_path)
     initial_index = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    wrong_workspace = client.get(
         "/api/v1/corrections/index?workspace_id=workspace-1"
     )
 
     assert initial_detail.status_code == 200
     assert initial_index.status_code == 200
+    assert wrong_workspace.status_code == 409
+    assert wrong_workspace.get_json()["code"] == (
+        "corrections_workspace_mismatch"
+    )
     initial_review = initial_detail.get_json()["review"]
     index_body = initial_index.get_json()
     assert index_body["schema"] == "librarytool.corrections-index/1"
@@ -311,6 +318,18 @@ def test_production_review_bridge_composes_index_and_reconciles_cas(
     ] == [True]
     assert index_body["attention"] == []
 
+    spoofed = client.put(
+        f"{review_path}/attention",
+        json={
+            "reason": "Verify the cover",
+            "actor_id": "spoofed-client",
+            "comment": "",
+        },
+        headers={
+            "Idempotency-Key": "bridge-review-spoof",
+            "If-Review-Match": f'"{initial_review["revision"]}"',
+        },
+    )
     marked = client.put(
         f"{review_path}/attention",
         json={"reason": "Verify the cover", "comment": "Window one"},
@@ -319,11 +338,13 @@ def test_production_review_bridge_composes_index_and_reconciles_cas(
             "If-Review-Match": f'"{initial_review["revision"]}"',
         },
     )
+
+    assert spoofed.status_code == 400
     assert marked.status_code == 200
 
     second_client = client.application.test_client()
     observed = second_client.get(
-        "/api/v1/corrections/index?workspace_id=workspace-1"
+        "/api/v1/corrections/index?workspace_id=local-library"
     ).get_json()
     attention = observed["attention"][0]
     assert attention["review"]["state"] == "needs_attention"
@@ -346,7 +367,7 @@ def test_production_review_bridge_composes_index_and_reconciles_cas(
         },
     )
     reconciled = client.get(
-        "/api/v1/corrections/index?workspace_id=workspace-1"
+        "/api/v1/corrections/index?workspace_id=local-library"
     ).get_json()
 
     assert resolved.status_code == 200

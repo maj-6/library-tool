@@ -157,7 +157,20 @@ def test_lan_metadata_roundtrip_applies_and_acknowledges_phone_review(
     body = first.get_json()
     assert body["errors"] == []
     assert body["books"][0]["book_id"] == ""
-    assert body["books"][0]["data"]["registered"] is False
+    # An imported-but-unregistered capture is projected in full: `book_id` stays
+    # empty (which is what the phone reads as "not registered") but the row now
+    # carries the desktop's curated bibliography over LAN as well as over the
+    # cloud. `registered: False` is reserved for a tombstone or an unknown
+    # capture, so a live row does not carry it.
+    book_data = body["books"][0]["data"]
+    assert "registered" not in book_data
+    assert book_data["bibliography"] == {
+        "title": "Herbal", "author": "", "year": "",
+    }
+    # The BUILD clock component must stay empty for an unregistered target, or
+    # registering and unregistering would move it backwards.
+    assert book_data["projection_source"]["build_updated_at"] == ""
+    assert book_data["projection_source"]["manual_updated_at"] != ""
     assert body["reviews"][0]["needs_review"] is True
     assert body["reviews"][0]["attention_reason"] == "Check edition"
     assert body["associations"] == []

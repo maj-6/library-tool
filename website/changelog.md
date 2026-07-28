@@ -4,20 +4,25 @@ Stable releases are listed newest first. Prerelease changes are included in the
 next stable release. These notes are also available in the desktop app under
 Help → View changelog.
 
-## Next prerelease — 2026-07-22
+## Next prerelease — 2026-07-25
 
 ### Additions
 
 - Desktop capture sync now publishes registered-book copyright records and status, WHL and Internet Archive availability, scan status, remarks, and review state back to the originating Android capture.
 - Phone Needs attention reasons and Needs review requests now join the desktop attention and review workflow through either account cloud sync or a paired LAN connection.
+- The desktop now publishes the title, author and year it holds for a capture back to the phone, so scanning a box QR lists its books with real names.
+- Captures that have been imported but not yet registered as catalogue entries are published too, so a freshly scanned crate lists with the titles typed on the desktop.
 
 ### Other Changes
 
 - Phone round-trip state uses owner-scoped, revisioned projections and preserves unregister/delete tombstones so stale catalog badges are removed safely.
+- A capture's own recorded title is preferred over the desktop's, and the placeholder given to an untitled capture is never published as if it were a title.
 
 ### Bugfixes
 
 - Kept cloud and paired-LAN capture identities separate during metadata sync and preserved concurrent phone and desktop review edits.
+- Editing a Catalogs entry now advances its revision, so corrected titles, copyright, scan status and remarks reach the phone instead of being silently rejected as unchanged.
+- Unregistering a capture again, and re-registering one from a second desktop, no longer lose the title and author already recorded for it.
 
 ## 0.7.0 — 2026-07-15
 

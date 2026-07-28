@@ -32,6 +32,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
 import com.google.android.material.button.MaterialButton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -89,6 +90,13 @@ class HomeActivity : AppCompatActivity() {
         val collectionPaths: Map<String, String>,
         val currentCollectionId: String?,
         val itemsByCollection: Map<String, List<InspectBookSnapshot>>,
+        /**
+         * Boxes the cloud has actually answered for, cached listing included when
+         * that answer was "nothing". Absence means no answer yet — never "empty" —
+         * so an empty box is never described as empty in the cloud on the strength
+         * of a listing that failed or never ran.
+         */
+        val cloudListedCollections: Set<String>,
     )
 
     private data class CollectionListSnapshot(
@@ -122,6 +130,9 @@ class HomeActivity : AppCompatActivity() {
     private var collectionBarJob: Job? = null
     private var collectionListJob: Job? = null
     private var inspectJob: Job? = null
+    /** Boxes already listed from the cloud this session; a failed listing is
+     * removed again so the next visit retries. */
+    private val remoteBoxFetches = linkedSetOf<String>()
     private var workerRefreshJob: Job? = null
     private var pendingWorkerContentRefresh = false
     private var pendingCollectionRefresh = false
@@ -922,7 +933,10 @@ class HomeActivity : AppCompatActivity() {
                 val collections = records
                     .filter { !it.deleted && it.mergedInto == null }
                     .sortedBy { (paths[it.id] ?: it.name).lowercase() }
-                val itemsByCollection = CollectionInventory.items(this@HomeActivity)
+                // Local rows first so mergeCollectionBookItems keeps them over
+                // their cloud twins, then the cached cloud listing so a box lists
+                // books this handset never had (or has since pruned).
+                val localRows = CollectionInventory.items(this@HomeActivity)
                     .also { loadContext.ensureActive() }
                     .mapNotNull { item ->
                         loadContext.ensureActive()
@@ -930,19 +944,41 @@ class HomeActivity : AppCompatActivity() {
                             item.summary.collectionId,
                             records,
                         ) ?: return@mapNotNull null
-                        collectionId to InspectBookSnapshot(
-                            item = item,
-                            titleLabel = item.summary.title.ifEmpty {
-                                getString(R.string.inspect_book_untitled)
-                            },
-                            statusLabel = item.current?.let {
-                                Entries.statusLabel(this@HomeActivity, it)
-                            },
-                        )
+                        collectionId to item
                     }
+                val cachedBoxes = RemoteCollectionBooks.read(this@HomeActivity).byCollection
+                loadContext.ensureActive()
+                // "We asked the cloud about THIS box" is only true for a key that
+                // is still live. A key that has since merged away was a query for
+                // the LOSER's captures; the survivor has its own that were never
+                // fetched, so crediting it would let the empty state claim the
+                // cloud is empty for a box it never queried.
+                val cloudListed = cachedBoxes.keys.filterTo(mutableSetOf()) {
+                    resolvedLiveCollectionId(it, records) == it
+                }
+                val remoteRows = cachedBoxes.flatMap { (cachedCollectionId, books) ->
+                    loadContext.ensureActive()
+                    val collectionId = resolvedLiveCollectionId(
+                        cachedCollectionId,
+                        records,
+                    ) ?: return@flatMap emptyList()
+                    books.map { collectionId to it.toInventoryItem() }
+                }
+                val itemsByCollection = (localRows + remoteRows)
                     .groupBy({ it.first }, { it.second })
                     .mapValues { (_, items) ->
-                        items.sortedWith(
+                        loadContext.ensureActive()
+                        mergeCollectionBookItems(items).map { item ->
+                            InspectBookSnapshot(
+                                item = item,
+                                titleLabel = item.summary.title.ifEmpty {
+                                    getString(R.string.inspect_book_untitled)
+                                },
+                                statusLabel = item.current?.let {
+                                    Entries.statusLabel(this@HomeActivity, it)
+                                },
+                            )
+                        }.sortedWith(
                             compareBy<InspectBookSnapshot> {
                                 it.titleLabel.lowercase()
                             }.thenByDescending { it.item.summary.createdAt },
@@ -956,6 +992,7 @@ class HomeActivity : AppCompatActivity() {
                         Prefs.currentCollectionId(this@HomeActivity),
                     )?.id,
                     itemsByCollection = itemsByCollection,
+                    cloudListedCollections = cloudListed,
                 )
             }
             inspectJob = null
@@ -1006,6 +1043,10 @@ class HomeActivity : AppCompatActivity() {
             ?: collections.firstOrNull { it.id == snapshot.currentCollectionId }
             ?: collections.first()
         inspectedCollectionId = selected.id
+        // The local rows are already rendered below; this only adds the books the
+        // cloud knows about and this phone does not. Idempotent per session, so
+        // the show-more path can re-render without re-fetching.
+        ensureRemoteBoxListing(selected.id)
 
         var selectedChip: View? = null
         val inflater = LayoutInflater.from(this)
@@ -1089,7 +1130,19 @@ class HomeActivity : AppCompatActivity() {
 
         if (selectedItems.isEmpty()) {
             binding.inspectEmpty.visibility = View.VISIBLE
-            binding.inspectEmpty.text = getString(R.string.inspect_empty_books)
+            // Three distinct truths, and only the last one may say the cloud is
+            // empty: signed out (cannot ask), asked-but-no-answer (offline or the
+            // listing failed), and answered-with-nothing.
+            val canAsk = Prefs.configured(this) && Auth.signedIn(this) &&
+                Prefs.userId(this).isNotEmpty()
+            binding.inspectEmpty.text = getString(
+                when {
+                    !canAsk -> R.string.inspect_empty_books
+                    selected.id in snapshot.cloudListedCollections ->
+                        R.string.inspect_empty_books_signed_in
+                    else -> R.string.inspect_empty_books_pending
+                },
+            )
             return
         }
         binding.inspectEmpty.visibility = View.GONE
@@ -1172,10 +1225,12 @@ class HomeActivity : AppCompatActivity() {
                 summary.photoCount,
                 summary.photoCount,
             )
-            details += if (item.current == null) {
-                getString(R.string.inspect_book_archived)
-            } else {
-                snapshot.statusLabel.orEmpty()
+            details += when {
+                item.current != null -> snapshot.statusLabel.orEmpty()
+                // Both cases are photo-less, but "media was cleared" would be a
+                // lie about a book this phone never captured.
+                item.remote -> getString(R.string.inspect_book_remote)
+                else -> getString(R.string.inspect_book_archived)
             }
         }
         view.findViewById<TextView>(R.id.inspectSubtitle).text =
@@ -1193,7 +1248,8 @@ class HomeActivity : AppCompatActivity() {
             if (item.current != null) openEntryDetails(summary.entryId)
             else Toast.makeText(
                 this,
-                R.string.inspect_book_unavailable,
+                if (item.remote) R.string.inspect_book_remote_unavailable
+                else R.string.inspect_book_unavailable,
                 Toast.LENGTH_LONG,
             ).show()
         }
@@ -1588,6 +1644,92 @@ class HomeActivity : AppCompatActivity() {
     private fun cancelInspectLoading() {
         inspectJob?.cancel()
         inspectJob = null
+    }
+
+    /**
+     * List the selected box from the cloud, at most once per box per session.
+     *
+     * The local rows are already on screen by the time this runs, so this only
+     * ever ADDS books this handset does not hold. A failure is silent by design:
+     * an offline phone must keep showing the box it already knows, and a cached
+     * listing from an earlier visit stays valid.
+     *
+     * Deliberately NOT cancelled when the user picks another chip. Each box writes
+     * its own cache key, and cancelling would leave the abandoned box marked as
+     * already-fetched with nothing to show. `lifecycleScope` still tears every
+     * in-flight listing down with the activity.
+     */
+    private fun ensureRemoteBoxListing(collectionId: String) {
+        if (collectionId.isEmpty()) return
+        if (!Prefs.configured(this) || !Auth.signedIn(this)) return
+        val owner = Prefs.userId(this)
+        if (owner.isEmpty()) return
+        if (!remoteBoxFetches.add(collectionId)) return
+        lifecycleScope.launch {
+            // `record` reports whether the cache now reflects the cloud, so an
+            // unwritable or corrupt store re-arms the retry exactly like a network
+            // failure does.
+            var landed = false
+            try {
+                landed = withContext(Dispatchers.IO) {
+                    try {
+                        val records = Collections.allRecords(this@HomeActivity)
+                        // Deleting a box must not leave its listing cached forever.
+                        // Keep only what Inspect can still render: a delete
+                        // TOMBSTONES the row rather than removing it, so keying the
+                        // keep-set off "still present in allRecords" would never
+                        // evict anything. An empty record list means the store was
+                        // unreadable, not that every box is gone — pruning then
+                        // would discard good listings.
+                        if (records.isNotEmpty()) {
+                            RemoteCollectionBooks.prune(
+                                this@HomeActivity,
+                                records.asSequence()
+                                    .filter { !it.deleted && it.mergedInto == null }
+                                    .flatMapTo(mutableSetOf()) {
+                                        collectionMergeClosure(records, it.id)
+                                    } + collectionId,
+                            )
+                        }
+                        // captures.meta keeps a merge loser's uuid forever, so ask
+                        // for the whole closure or the old label's books vanish.
+                        val closure = collectionMergeClosure(records, collectionId)
+                        val client = SupabaseClient(this@HomeActivity, owner)
+                        val books = client.capturesForCollections(closure)
+                        // Most captures carry no title of their own (extraction
+                        // needs an API key), so fill the blanks from the desktop's
+                        // curated projection. Failing that lookup must not lose the
+                        // listing — an untitled row still tells you the box holds
+                        // a book.
+                        val enriched = try {
+                            enrichRemoteCollectionBooks(
+                                books,
+                                client.desktopBookMetadata(books.map { it.captureId }),
+                            )
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            books
+                        }
+                        RemoteCollectionBooks.record(this@HomeActivity, collectionId, enriched)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        false
+                    }
+                }
+            } finally {
+                // Re-arm the retry for anything that did not land, cancellation
+                // included. Touching the set only from the main dispatcher keeps
+                // it consistent with every read of it.
+                if (!landed) remoteBoxFetches.remove(collectionId)
+            }
+            if (!landed) return@launch
+            if (activeTab != HomeTab.INSPECT ||
+                !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            ) return@launch
+            refreshInspect()
+        }
     }
 
     private fun releaseDynamicThumbnails() {

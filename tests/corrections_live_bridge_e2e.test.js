@@ -82,7 +82,7 @@ test("production EngineClient completes the representative Corrections flow", {
   const markedRevision = operationRevision(marked, "review", itemId);
 
   const books = await firstClient.corrections.index({
-    workspaceId: "release-e2e",
+    workspaceId: "local-library",
   });
   assert.equal(books.books.length, 1);
   assert.equal(books.books[0].id, itemId);
@@ -356,5 +356,13 @@ test("production EngineClient completes the representative Corrections flow", {
   );
   const finalReview = await reopened.corrections.getReview({ itemId });
   assert.equal(finalReview.review.state, "needs_attention");
-  assert.equal(finalReview.review.history.length, 3);
+  assert.equal(finalReview.review.history_count, 3);
+  assert.equal(finalReview.review.history_tail.length, 3);
+  const finalHistory = await reopened.corrections.listReviewHistory({
+    itemId,
+    reviewRevision: finalReview.review.revision,
+    limit: 10,
+  });
+  assert.equal(finalHistory.events.length, 3);
+  assert.equal(finalHistory.next_cursor, null);
 });

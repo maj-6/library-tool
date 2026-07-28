@@ -10,6 +10,17 @@ const {
 );
 
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolveValue, rejectValue) => {
+    resolve = resolveValue;
+    reject = rejectValue;
+  });
+  return { promise, reject, resolve };
+}
+
+
 function raster(id, kind = "captured-image", overrides = {}) {
   return {
     key: { item_id: "book-1", artifact_id: id },
@@ -632,162 +643,616 @@ test("caption metadata and review commands delegate operation IDs", async () => 
       itemId: "book-1",
       expectedReviewRevision: "review-r1",
       reason: "Caption needs checking",
-      actorId: "curator-1",
       comment: "",
       idempotencyKey: "attention-op",
     }],
     ["resolveCorrections", {
       itemId: "book-1",
       expectedReviewRevision: "review-r2",
-      actorId: "curator-1",
       comment: "Corrected",
       idempotencyKey: "resolve-op",
     }],
     ["reopenCorrections", {
       itemId: "book-1",
       expectedReviewRevision: "review-r3",
-      actorId: "curator-2",
       comment: "Second look",
       idempotencyKey: "reopen-op",
     }],
   ]);
 });
-test("engine books port owns review translation and trusted actor identity",
+
+test("review reads resolve item context through the dedicated adapter port",
   async () => {
-    const calls = [];
-    let state = "needs_attention";
-    let revision = "review-r1";
-    let indexRevision = 1;
-    const target = { kind: "book", item_id: "book-1" };
-    const summary = () => {
-      const action = state === "resolved"
-        ? "attention.resolve"
-        : revision === "review-r3"
-          ? "attention.reopen"
-          : "attention.mark";
-      const beforeState = action === "attention.mark"
-        ? "clear"
-        : action === "attention.resolve"
-          ? "needs_attention"
-          : "resolved";
-      return {
-        revision,
-        state,
-        reason: "Check the title leaf",
-        history_count: revision === "review-r1" ? 1
-          : revision === "review-r2" ? 2 : 3,
-        latest_event: {
-        operation_id: `${action}:op`,
-        action,
-        actor_id: "local-desktop",
-        occurred_at: "2026-07-23T18:00:00Z",
-        before_state: beforeState,
-        after_state: state,
-        reason: "Check the title leaf",
-        comment: "",
-        },
-      };
-    };
-    const index = () => ({
-      schema: "librarytool.corrections-index/1",
-      revision: `index-r${indexRevision}`,
-      books: [{
-        id: "book-1",
-        revision: `book-r${indexRevision}`,
-        title: "A Herbal",
-        import_state: "ready",
-        issues: [],
-        review: summary(),
-        captures: [],
-      }],
-      attention: [{
-        key: "attention:book-1",
-        target,
-        review: summary(),
-      }],
-    });
+    const invocations = [];
+    const signal = new AbortController().signal;
     const { engineClient } = engineHarness({
       corrections: {
-        async index(payload) {
-          calls.push(["index", payload]);
-          return index();
-        },
         async getReview(payload) {
-          calls.push(["getReview", payload]);
+          invocations.push(payload);
           return {
-            schema: "librarytool.corrections-review/1",
-            target,
+            item_id: "book-1",
             review: {
-              revision,
-              state,
-              reason: "Check the title leaf",
-              history: [],
+              revision: "review-r3",
+              state: "resolved",
+              reason: "Caption needed checking",
+              history_count: 2,
+              history_tail: [
+                { action: "attention.mark" },
+                { action: "attention.resolve" },
+              ],
             },
           };
         },
-        async resolveCorrections(payload) {
-          calls.push(["resolveCorrections", payload]);
-          state = "resolved";
-          revision = "review-r2";
-          indexRevision += 1;
-          return { receipt: { action: "attention.resolve" } };
-        },
-        async reopenCorrections(payload) {
-          calls.push(["reopenCorrections", payload]);
-          state = "needs_attention";
-          revision = "review-r3";
-          indexRevision += 1;
-          return { receipt: { action: "attention.reopen" } };
+        async listReviewHistory(payload) {
+          invocations.push(payload);
+          return {
+            item_id: "book-1",
+            review_revision: "review-r3",
+            review_state: "resolved",
+            events: [{ action: "attention.resolve" }],
+            next_cursor: "next-page",
+            total: 2,
+          };
         },
       },
     });
-    const { books } = createCorrectionsEnginePorts(engineClient);
-    const signal = new AbortController().signal;
+    const ports = createCorrectionsEnginePorts(engineClient);
 
-    assert.equal(books.trustedActor, true);
-    await books.loadIndex({ workspaceId: "workspace-1", signal });
-    await books.getReview({ target, signal });
-    const resolved = await books.resolveReview({
-      target,
-      expectedRevision: "review-r1",
-      operationId: "resolve-op",
-      comment: "Corrected",
+    const review = await ports.reviews.get({
+      context: { item_id: "book-1" },
       signal,
     });
-    const reopened = await books.reopenReview({
+
+    assert.deepEqual(review, {
+      itemId: "book-1",
+      revision: "review-r3",
+      state: "resolved",
+      reason: "Caption needed checking",
+      history_count: 2,
+      history_tail: [
+        { action: "attention.mark" },
+        { action: "attention.resolve" },
+      ],
+    });
+    assert.equal(Object.isFrozen(review), true);
+    const page = await ports.reviews.listHistory({
+      context: { item_id: "book-1" },
+      reviewRevision: "review-r3",
+      cursor: "history-page",
+      limit: 25,
+      signal,
+    });
+    assert.deepEqual(page, {
+      itemId: "book-1",
+      revision: "review-r3",
+      state: "resolved",
+      events: [{ action: "attention.resolve" }],
+      nextCursor: "next-page",
+      total: 2,
+    });
+    assert.equal(Object.isFrozen(page), true);
+    assert.equal(Object.isFrozen(page.events), true);
+    assert.deepEqual(invocations, [
+      { itemId: "book-1", signal },
+      {
+        itemId: "book-1",
+        reviewRevision: "review-r3",
+        cursor: "history-page",
+        limit: 25,
+        signal,
+      },
+    ]);
+  });
+
+test("production books port pins audit paging and trusts the server actor",
+  async () => {
+    const mark = {
+      operation_id: "review-mark-1",
+      action: "attention.mark",
+      actor_id: "server-user",
+      occurred_at: "2026-07-23T12:00:00Z",
+      before_state: "clear",
+      after_state: "needs_attention",
+      reason: "Check the title leaf",
+      comment: "",
+    };
+    const resolve = {
+      operation_id: "review-resolve-1",
+      action: "attention.resolve",
+      actor_id: "server-user",
+      occurred_at: "2026-07-23T12:05:00Z",
+      before_state: "needs_attention",
+      after_state: "resolved",
+      reason: mark.reason,
+      comment: "Verified",
+    };
+    const invocations = [];
+    let indexRevision = 1;
+    const index = (state, revision, event) => {
+      const review = {
+        revision,
+        state,
+        reason: mark.reason,
+        history_count: event === mark ? 1 : 2,
+        latest_event: event,
+      };
+      return {
+        schema: "librarytool.corrections-index/1",
+        revision: `index-r${indexRevision}`,
+        books: [{
+          id: "book-1",
+          revision: "book-r1",
+          title: "A Herbal",
+          import_state: "ready",
+          issues: [],
+          review: { ...review },
+          captures: [],
+        }, {
+          id: "book-2",
+          revision: `book-r${indexRevision}`,
+          title: indexRevision === 1 ? "Second book" : "Second book updated",
+          import_state: "ready",
+          issues: [],
+          review: {
+            revision: "review-clear-r1",
+            state: "clear",
+            reason: "",
+            history_count: 0,
+            latest_event: null,
+          },
+          captures: [],
+        }],
+        attention: [{
+        key: "attention:book-1",
+        target: { kind: "book", item_id: "book-1" },
+          review,
+        }],
+      };
+    };
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index(payload) {
+          invocations.push(["index", payload]);
+          return index(
+            indexRevision === 1 ? "needs_attention" : "resolved",
+            indexRevision === 1 ? "review-r2" : "review-r3",
+            indexRevision === 1 ? mark : resolve,
+          );
+        },
+        async getReview(payload) {
+          invocations.push(["getReview", payload]);
+          return {
+            item_id: "book-1",
+            review: {
+              revision: "review-r3",
+              state: "resolved",
+              reason: mark.reason,
+              history_count: 2,
+              history_tail: [mark, resolve],
+            },
+          };
+        },
+        async listReviewHistory(payload) {
+          invocations.push(["listReviewHistory", payload]);
+          return {
+            item_id: "book-1",
+            review_revision: "review-r3",
+            review_state: "resolved",
+            events: payload.cursor ? [resolve] : [mark],
+            next_cursor: payload.cursor ? null : "history-page-2",
+            total: 2,
+          };
+        },
+        async resolveCorrections(payload) {
+          invocations.push(["resolveCorrections", payload]);
+          indexRevision = 2;
+          return {
+            receipt: {
+              targets: [{
+                kind: "review",
+                target_id: "book-1",
+                before_revision: "review-r2",
+                after_revision: "review-r3",
+              }],
+            },
+          };
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient);
+    const signal = new AbortController().signal;
+    const target = { kind: "book", item_id: "book-1" };
+
+    await ports.books.loadIndex({ workspaceId: "workspace-1", signal });
+    const document = await ports.books.getReview({ target, signal });
+    const result = await ports.books.resolveReview({
       target,
       expectedRevision: "review-r2",
-      operationId: "reopen-op",
-      comment: "Second look",
+      operationId: "resolve-op-1",
+      comment: "Verified",
       signal,
     });
 
-    assert.equal(resolved.schema,
-      "librarytool.corrections-review-result/1");
-    assert.equal(resolved.entry.review.state, "resolved");
-    assert.equal(reopened.entry.review.state, "needs_attention");
-    assert.deepEqual(calls, [
+    assert.equal(ports.books.trustedActor, true);
+    assert.deepEqual(
+      document.review.history.map((event) => event.action),
+      ["attention.mark", "attention.resolve"],
+    );
+    assert.equal(result.index_revision, "index-r2");
+    assert.equal(result.entry.review.state, "resolved");
+    assert.equal(result.index.books[1].title, "Second book updated",
+      "the complete converged index retains unrelated concurrent changes");
+    assert.deepEqual(invocations, [
       ["index", { workspaceId: "workspace-1", signal }],
       ["getReview", { itemId: "book-1", signal }],
-      ["resolveCorrections", {
+      ["listReviewHistory", {
         itemId: "book-1",
-        expectedReviewRevision: "review-r1",
-        idempotencyKey: "resolve-op",
-        comment: "Corrected",
+        reviewRevision: "review-r3",
+        cursor: null,
+        limit: 100,
         signal,
       }],
-      ["index", { workspaceId: "workspace-1", signal }],
-      ["reopenCorrections", {
+      ["listReviewHistory", {
+        itemId: "book-1",
+        reviewRevision: "review-r3",
+        cursor: "history-page-2",
+        limit: 100,
+        signal,
+      }],
+      ["resolveCorrections", {
         itemId: "book-1",
         expectedReviewRevision: "review-r2",
-        idempotencyKey: "reopen-op",
-        comment: "Second look",
+        idempotencyKey: "resolve-op-1",
+        comment: "Verified",
         signal,
       }],
       ["index", { workspaceId: "workspace-1", signal }],
     ]);
-    assert.equal(
-      JSON.stringify(calls).includes("actorId"),
-      false,
+  });
+
+test("production books port ignores a late aborted workspace load", async () => {
+  const workspaceA = deferred();
+  const workspaceB = deferred();
+  const indexCalls = [];
+  const review = {
+    revision: "review-r2",
+    state: "resolved",
+    reason: "Check the title leaf",
+    history_count: 2,
+    latest_event: {
+      operation_id: "resolve-op",
+      action: "attention.resolve",
+      actor_id: "server-user",
+      occurred_at: "2026-07-23T12:05:00Z",
+      before_state: "needs_attention",
+      after_state: "resolved",
+      reason: "Check the title leaf",
+      comment: "Verified",
+    },
+  };
+  const converged = {
+    schema: "librarytool.corrections-index/1",
+    revision: "index-r2",
+    books: [{
+      id: "book-1",
+      revision: "book-r1",
+      title: "A Herbal",
+      import_state: "ready",
+      issues: [],
+      review: { ...review },
+      captures: [],
+    }],
+    attention: [{
+      key: "attention:book-1",
+      target: { kind: "book", item_id: "book-1" },
+      review: { ...review },
+    }],
+  };
+  const { engineClient } = engineHarness({
+    corrections: {
+      index(payload) {
+        indexCalls.push(payload);
+        if (indexCalls.length === 1) return workspaceA.promise;
+        if (indexCalls.length === 2) return workspaceB.promise;
+        return Promise.resolve(converged);
+      },
+      async getReview() {
+        throw new Error("not expected");
+      },
+      async listReviewHistory() {
+        throw new Error("not expected");
+      },
+      async resolveCorrections() {
+        return {
+          receipt: {
+            targets: [{
+              kind: "review",
+              target_id: "book-1",
+              before_revision: "review-r1",
+              after_revision: "review-r2",
+            }],
+          },
+        };
+      },
+    },
+  });
+  const books = createCorrectionsEnginePorts(engineClient).books;
+  const superseded = new AbortController();
+  const openingA = books.loadIndex({
+    workspaceId: "workspace-a",
+    signal: superseded.signal,
+  });
+  superseded.abort();
+  const openingB = books.loadIndex({ workspaceId: "workspace-b" });
+
+  workspaceB.resolve({});
+  await openingB;
+  workspaceA.resolve({});
+  await openingA;
+  const result = await books.resolveReview({
+    target: { kind: "book", item_id: "book-1" },
+    expectedRevision: "review-r1",
+    operationId: "resolve-op",
+  });
+
+  assert.equal(result.index_revision, "index-r2");
+  assert.equal(indexCalls.length, 3);
+  assert.equal(indexCalls[2].workspaceId, "workspace-b",
+    "the late aborted load cannot reclaim adapter workspace authority");
+});
+
+test("same-workspace refresh does not invalidate mutation convergence",
+  async () => {
+    const mutation = deferred();
+    let indexCalls = 0;
+    const review = {
+      revision: "review-r2",
+      state: "resolved",
+      reason: "Check the title leaf",
+      history_count: 2,
+      latest_event: {
+        operation_id: "resolve-op",
+        action: "attention.resolve",
+        actor_id: "server-user",
+        occurred_at: "2026-07-23T12:05:00Z",
+        before_state: "needs_attention",
+        after_state: "resolved",
+        reason: "Check the title leaf",
+        comment: "Verified",
+      },
+    };
+    const converged = {
+      schema: "librarytool.corrections-index/1",
+      revision: "index-r2",
+      books: [{
+        id: "book-1",
+        revision: "book-r1",
+        title: "A Herbal",
+        import_state: "ready",
+        issues: [],
+        review: { ...review },
+        captures: [],
+      }],
+      attention: [{
+        key: "attention:book-1",
+        target: { kind: "book", item_id: "book-1" },
+        review: { ...review },
+      }],
+    };
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          indexCalls += 1;
+          return indexCalls < 3 ? {} : converged;
+        },
+        async getReview() {
+          throw new Error("not expected");
+        },
+        async listReviewHistory() {
+          throw new Error("not expected");
+        },
+        resolveCorrections: () => mutation.promise,
+      },
+    });
+    const books = createCorrectionsEnginePorts(engineClient).books;
+    const target = { kind: "book", item_id: "book-1" };
+    await books.loadIndex({ workspaceId: "workspace-a" });
+
+    const mutating = books.resolveReview({
+      target,
+      expectedRevision: "review-r1",
+      operationId: "resolve-op",
+    });
+    await books.loadIndex({ workspaceId: "workspace-a" });
+    mutation.resolve({
+      receipt: {
+        targets: [{
+          kind: "review",
+          target_id: "book-1",
+          before_revision: "review-r1",
+          after_revision: "review-r2",
+        }],
+      },
+    });
+    const result = await mutating;
+
+    assert.equal(result.index_revision, "index-r2");
+    assert.equal(indexCalls, 3);
+  });
+
+test("production books port rejects summary and paged audit drift", async () => {
+  const event = {
+    operation_id: "review-mark-1",
+    action: "attention.mark",
+    actor_id: "server-user",
+    occurred_at: "2026-07-23T12:00:00Z",
+    before_state: "clear",
+    after_state: "needs_attention",
+    reason: "Check the title leaf",
+    comment: "",
+  };
+  const { engineClient } = engineHarness({
+    corrections: {
+      async index() {
+        return {};
+      },
+      async getReview() {
+        return {
+          item_id: "book-1",
+          review: {
+            revision: "review-r2",
+            state: "needs_attention",
+            reason: event.reason,
+            history_count: 1,
+            history_tail: [{ ...event, comment: "different evidence" }],
+          },
+        };
+      },
+      async listReviewHistory() {
+        return {
+          item_id: "book-1",
+          review_revision: "review-r2",
+          review_state: "needs_attention",
+          events: [event],
+          next_cursor: null,
+          total: 1,
+        };
+      },
+    },
+  });
+  const books = createCorrectionsEnginePorts(engineClient).books;
+
+  await assert.rejects(
+    books.getReview({
+      target: { kind: "book", item_id: "book-1" },
+    }),
+    (error) => error.code === "invalid-corrections-review-history",
+  );
+});
+
+test("production books port surfaces post-receipt review drift", async () => {
+  let indexCalls = 0;
+  const review = (revision, state) => ({
+    revision,
+    state,
+    reason: "Check the title leaf",
+    history_count: state === "resolved" ? 2 : 3,
+    latest_event: {
+      operation_id: `operation-${revision}`,
+      action: state === "resolved"
+        ? "attention.resolve" : "attention.reopen",
+      actor_id: "server-user",
+      occurred_at: "2026-07-23T12:05:00Z",
+      before_state: state === "resolved"
+        ? "needs_attention" : "resolved",
+      after_state: state,
+      reason: "Check the title leaf",
+      comment: "",
+    },
+  });
+  const index = (summary) => ({
+    schema: "librarytool.corrections-index/1",
+    revision: `index-${summary.revision}`,
+    books: [{
+      id: "book-1",
+      revision: "book-r1",
+      title: "A Herbal",
+      import_state: "ready",
+      issues: [],
+      review: { ...summary },
+      captures: [],
+    }],
+    attention: [{
+      key: "attention:book-1",
+      target: { kind: "book", item_id: "book-1" },
+      review: { ...summary },
+    }],
+  });
+  const { engineClient } = engineHarness({
+    corrections: {
+      async index() {
+        indexCalls += 1;
+        return index(indexCalls === 1
+          ? review("review-r2", "needs_attention")
+          : review("review-r4", "needs_attention"));
+      },
+      async getReview() {
+        throw new Error("not expected");
+      },
+      async listReviewHistory() {
+        throw new Error("not expected");
+      },
+      async resolveCorrections() {
+        return {
+          receipt: {
+            targets: [{
+              kind: "review",
+              target_id: "book-1",
+              before_revision: "review-r2",
+              after_revision: "review-r3",
+            }],
+          },
+        };
+      },
+    },
+  });
+  const books = createCorrectionsEnginePorts(engineClient).books;
+  const target = { kind: "book", item_id: "book-1" };
+  await books.loadIndex({ workspaceId: "workspace-1" });
+
+  await assert.rejects(
+    books.resolveReview({
+      target,
+      expectedRevision: "review-r2",
+      operationId: "resolve-op-1",
+    }),
+    (error) => error.code === "review_revision_conflict" &&
+      error.status === 409,
+  );
+  assert.equal(indexCalls, 2);
+});
+
+test("production books port bounds unique zero-progress history cursors",
+  async () => {
+    let pageCalls = 0;
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          return {};
+        },
+        async getReview() {
+          return {
+            item_id: "book-1",
+            review: {
+              revision: "review-r1",
+              state: "clear",
+              reason: "",
+              history_count: 0,
+              history_tail: [],
+            },
+          };
+        },
+        async listReviewHistory() {
+          pageCalls += 1;
+          return {
+            item_id: "book-1",
+            review_revision: "review-r1",
+            review_state: "clear",
+            events: [],
+            next_cursor: `unique-cursor-${pageCalls}`,
+            total: 0,
+          };
+        },
+      },
+    });
+    const books = createCorrectionsEnginePorts(engineClient).books;
+
+    await assert.rejects(
+      books.getReview({
+        target: { kind: "book", item_id: "book-1" },
+      }),
+      (error) => error.code === "invalid-corrections-review-history" &&
+        /declared total/.test(error.message),
     );
+    assert.equal(pageCalls, 1);
   });

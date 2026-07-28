@@ -3,6 +3,21 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.1-alpha.11 — 2026-07-25
+
+Android version code: `30`.
+
+### Additions
+
+- Scanning a box QR now lists every book recorded in that box from your account in the cloud, not only the ones still held on the phone. A reinstalled or second phone sees the whole crate.
+- Books listed from the cloud are labelled as such and show the title, author and year the desktop has for them.
+
+### Other Changes
+
+- A box listing is kept on the device after it is fetched, so a crate browsed once stays readable offline, and it is discarded when a different account signs in.
+- A box's listing covers the tags it absorbed through a merge, so books recorded under a retired label still appear under the surviving box.
+- Inspect now distinguishes a book whose local photos were cleared from one this phone never captured, and no longer reports an empty box as empty in the cloud when it could not reach it.
+
 ## 0.5.1-alpha.10 — 2026-07-22
 
 Android version code: `29`.

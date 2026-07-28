@@ -640,6 +640,120 @@ test("overlay blur demotes classification focus without erasing its selected tar
 });
 
 
+test("category apply, undo, and conflict refresh expanded artifacts once", async () => {
+  const artifactRefreshes = [];
+  const detailRefreshes = [];
+  const bookRefreshes = [];
+  const source = {
+    key: "artifact:capture-1",
+    group: "source-images",
+    revision: "capture-r1",
+  };
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    artifactsFeature: {
+      items: new Map([[source.key, source]]),
+      async refresh(options) {
+        artifactRefreshes.push(options);
+      },
+      async reloadDetail(key) {
+        detailRefreshes.push(key);
+        return this.items.get(key) || null;
+      },
+    },
+    booksFeature: {
+      async refresh(reason) { bookRefreshes.push(reason); },
+    },
+    setStatus() {},
+  });
+  const syntheticTarget = {
+    key: source.key,
+    objectType: "raster-artifact",
+    family: "image",
+  };
+
+  await shell.refreshClassificationTarget(syntheticTarget, {
+    command: {
+      id: "corrections.category.cover",
+      action: "category.assign",
+    },
+    reason: "committed",
+  });
+  await shell.refreshClassificationTarget(syntheticTarget, {
+    command: {
+      id: "corrections.category.cover.undo",
+      action: "inverse.execute",
+    },
+    undo: { commandId: "corrections.category.cover" },
+    reason: "undo-committed",
+  });
+  await shell.refreshClassificationTarget(syntheticTarget, {
+    command: {
+      id: "corrections.category.cover",
+      action: "category.assign",
+    },
+    reason: "conflict",
+  });
+
+  assert.deepEqual(artifactRefreshes, [
+    { preserveSelection: true, reason: "category-inheritance" },
+    { preserveSelection: true, reason: "category-inheritance" },
+    { preserveSelection: true, reason: "category-inheritance" },
+  ]);
+  assert.deepEqual(detailRefreshes, []);
+  assert.deepEqual(bookRefreshes, [
+    "classification",
+    "classification",
+    "classification",
+  ]);
+});
+
+
+test("multi-target role convergence reloads exact details without collection storms", async () => {
+  const artifactRefreshes = [];
+  const detailRefreshes = [];
+  const bookRefreshes = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    artifactsFeature: {
+      items: new Map(),
+      async refresh(options) { artifactRefreshes.push(options); },
+      async reloadDetail(key) {
+        detailRefreshes.push(key);
+        return { key };
+      },
+    },
+    booksFeature: {
+      async refresh(reason) { bookRefreshes.push(reason); },
+    },
+    setStatus() {},
+  });
+  const detail = {
+    command: {
+      id: "corrections.region.illustration",
+      action: "role.assign",
+    },
+    reason: "committed",
+  };
+
+  await shell.refreshClassificationTarget({
+    key: "annotation:region-1",
+    group: "layout-regions",
+  }, detail);
+  await shell.refreshClassificationTarget({
+    key: "artifact:figure-1",
+    group: "extracted-figures",
+  }, detail);
+
+  assert.deepEqual(detailRefreshes, [
+    "annotation:region-1",
+    "artifact:figure-1",
+  ]);
+  assert.deepEqual(artifactRefreshes, []);
+  assert.deepEqual(bookRefreshes, []);
+});
+
+
 test("selection, resources, and drafts remain independent per window instance", () => {
   const first = new CorrectionsWindowState();
   const second = new CorrectionsWindowState();
@@ -781,12 +895,22 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
     },
     corrections: {
       queueTransform() {},
+      index() {},
+      getReview() {},
+      listReviewHistory() {},
+      resolveCorrections() {},
+      reopenCorrections() {},
     },
   };
   const standalone = correctionsRuntimePorts({ engineClient }, null);
   assert.equal(typeof standalone.artifacts.catalog.list, "function");
   assert.equal(typeof standalone.artifacts.resources.resolveRaster, "function");
   assert.equal(typeof standalone.invokeCommand, "function");
+  assert.equal(typeof standalone.books.loadIndex, "function");
+  assert.equal(typeof standalone.books.getReview, "function");
+  assert.equal(typeof standalone.books.resolveReview, "function");
+  assert.equal(typeof standalone.books.reopenReview, "function");
+  assert.equal(standalone.books.trustedActor, true);
 
   const desktopCorrections = { artifacts: { catalog: { list() {} } } };
   assert.equal(

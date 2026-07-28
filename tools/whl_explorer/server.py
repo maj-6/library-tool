@@ -272,6 +272,9 @@ app.register_blueprint(
         correction_actor_id_for_request=(
             lambda: _local_correction_actor_id()
         ),
+        correction_workspace_id_for_request=(
+            lambda: _local_correction_workspace_id()
+        ),
         correction_transform_submitter=(
             lambda service, command, queued: _submit_correction_transform(
                 service,
@@ -621,6 +624,12 @@ def _local_correction_actor_id() -> str:
     ):
         return value
     return "local-desktop"
+
+
+def _local_correction_workspace_id() -> str:
+    """Return the workspace owned by this desktop engine session."""
+
+    return "local-library"
 
 
 def _auth_cfg() -> dict | None:
@@ -1304,7 +1313,7 @@ def _repoint_collection_aliases(aliases: dict[str, str]) -> int:
                 raise RuntimeError(
                     "manual entries changed while collection aliases were applied"
                 )
-            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries_after)
+            _save_manual_entries(entries_after)
     if client_dirty:
         with _client_state_lock:
             current = lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}
@@ -3297,7 +3306,7 @@ def _remap_category_ids(fn) -> int:
                 raise RuntimeError(
                     "manual entries changed while category ids were remapped"
                 )
-            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries_after)
+            _save_manual_entries(entries_after)
     if state_dirty:
         with _client_state_lock:
             if lib.load_json(lib.CLIENT_STATE_PATH, {}) != state_before:
@@ -3503,7 +3512,7 @@ def api_categories_adopt():
                     and not entries[key].get("category_ids"):
                 entries[key]["category_ids"] = ids_for(labs)
                 assigned += 1
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     with _client_state_lock:
         state = lib.load_json(lib.CLIENT_STATE_PATH, {})
         by_key = {str(p[0]): p[1] for p in state.get("checked") or []
@@ -12996,6 +13005,45 @@ _manual_lock = threading.Lock()
 _CS_BACKUP_KEEP = 40
 
 
+def _manual_entry_fingerprint(entry) -> str:
+    """Everything about a manual entry except its own revision token."""
+    if not isinstance(entry, dict):
+        return ""
+    return json.dumps(
+        {k: v for k, v in entry.items() if k != "updated_at"},
+        sort_keys=True, ensure_ascii=False, default=str,
+    )
+
+
+def _save_manual_entries(entries: dict) -> None:
+    """Persist manual entries, advancing ``updated_at`` on every changed row.
+
+    ``updated_at`` is this store's revision token and the ``manual_updated_at``
+    component of a phone capture's projection vector clock
+    (:func:`_capture_book_metadata_rows`).  Without it, correcting a title in the
+    Catalogs table changes the projected ``data`` while every clock component
+    stays byte-identical, so ``push_capture_book_metadata`` rejects the row as
+    "equal projection source" and the correction can never reach the phone.  The
+    same silent stall applies to copyright, scan status and remarks.
+
+    Stamped centrally, against the on-disk state, for two reasons: the token must
+    be monotonic per entry (see :func:`_build_updated_at`), and a future
+    manual-entry writer must not be able to forget it.  Callers hold
+    ``_manual_lock`` and have not yet written, so the file still holds the
+    pre-edit rows to compare against.
+    """
+    prior = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    for entry_id, entry in (entries or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        before = prior.get(entry_id) if isinstance(prior, dict) else None
+        if _manual_entry_fingerprint(entry) == _manual_entry_fingerprint(before):
+            continue
+        entry["updated_at"] = _build_updated_at(
+            str((before or {}).get("updated_at") or ""))
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+
+
 def _backup_client_state(state, old_n, new_n):
     """Snapshot the current client_state before a write that shrinks the checked
     list, so a bad sync (e.g. a near-empty client clobbering a full set) is
@@ -13220,7 +13268,7 @@ def api_manual_add():
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         entry["id"] = lib.gen_id(set(entries))
         entries[entry["id"]] = entry
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     activity("added", "manual entry", detail=entry.get("title", ""))
     return jsonify({"ok": True, "entry": entry})
 
@@ -13308,7 +13356,7 @@ def api_manual_update(entry_id: str):
             }), 409
         assert candidate is not None
         entries[entry_id] = candidate
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     return jsonify({"ok": True, "entry": candidate})
 
 
@@ -13328,7 +13376,7 @@ def api_manual_restore():
         _canonicalize_collection_link(entry)
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         entries[eid] = entry
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     return jsonify({"ok": True, "entry": entry})
 
 
@@ -13341,7 +13389,7 @@ def api_manual_delete(entry_id: str):
         record = entries[entry_id]
         title = record.get("title", "")
         del entries[entry_id]
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     _trash_put("manual_entry", f"Manual entry: {title or entry_id}",
                {"entry_id": entry_id}, {},
                {"record.json": json.dumps(record, ensure_ascii=False)})
@@ -13368,7 +13416,7 @@ def api_manual_scans(entry_id: str):
             abort(404)
         e = entries[entry_id]
         e["scans"] = scans
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -13400,7 +13448,7 @@ def api_manual_verify(entry_id: str):
         if verdict != "rejected":
             # A manually located source only exists alongside a rejected match.
             (e.get("manual_urls") or {}).pop(source, None)
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -13426,7 +13474,7 @@ def api_manual_source(entry_id: str):
             urls[source] = url
         else:
             urls.pop(source, None)
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+        _save_manual_entries(entries)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -20584,7 +20632,7 @@ def _ingest_capture_locked(cap: dict, raw_photos: list[bytes],
         if duplicate_entry is None:
             entry["id"] = lib.gen_id(set(entries))
             entries[entry["id"]] = entry
-            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+            _save_manual_entries(entries)
 
     if duplicate_entry is not None:
         _ensure_capture_archive(cap_id, duplicate_entry)
@@ -21856,7 +21904,7 @@ def _set_target_attention(target: dict, incoming: dict,
             desired = _attention_merge(current, incoming, desktop_reason)
             if desired != current:
                 entry["attention"] = desired
-                lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+                _save_manual_entries(entries)
         return
 
     operation_digest = hashlib.sha256(json.dumps({
@@ -22188,6 +22236,63 @@ def _capture_source_availability(source: dict | None, name: str) -> dict:
     )
 
 
+_CAPTURE_BIBLIOGRAPHY_FIELD_MAX = 500
+_CAPTURE_BIBLIOGRAPHY_YEAR_MAX = 40
+# `_ingest_capture_locked` stamps this so a capture with no extracted title can
+# never be lost from the Catalogs table. It is a placeholder, not a title, and
+# publishing it to a phone would put "(untitled capture 2ec86526)" on a shelf
+# listing — worse than publishing nothing, because the phone renders a blank
+# title as "Untitled book".
+_CAPTURE_TITLE_PLACEHOLDER = re.compile(
+    r"^\(untitled capture [0-9a-fA-F]{8}\)$")
+
+
+def _capture_bibliography(build: dict, source: dict | None) -> dict:
+    """Enough of the desktop's curated record to name a book on a shelf listing.
+
+    The phone scans a box's QR tag and lists every book filed into it, including
+    captures that are no longer on that handset.  Those rows have no title of
+    their own: a capture's ``meta`` carries one only when the capturing phone had
+    an extraction API key, and the ``books`` mirror is service-role only.  This
+    block is the only route by which a real title reaches a phone.
+
+    Deliberately three fields, not the whole catalogue record — migration 017
+    publishes "a deliberately bounded snapshot for the originating capture", and
+    widening this is a rights and payload decision, not a formatting one.
+
+    **The build wins over the manual row.**  For a phone capture the manual row
+    is the MACHINE-generated ingest record — `_ingest_capture_locked` fills it
+    from extraction output, or stamps the untitled placeholder when there was
+    none — while the build is where a curator actually types.  Reading the manual
+    row first publishes the placeholder over a corrected title, and leaves the
+    Editor unable to fix it.
+
+    Clamps must match ``DESKTOP_BIBLIOGRAPHY_FIELD_MAX`` in
+    android/BookCapture/app/src/main/java/org/whl/bookcapture/CaptureMetadata.kt,
+    or a legitimately long title reads as absent on the phone.
+    """
+    source = source if isinstance(source, dict) else {}
+    build = build if isinstance(build, dict) else {}
+
+    def pick(fields: tuple[str, ...], limit: int) -> str:
+        for record in (build, source):
+            for field in fields:
+                value = str(record.get(field) or "").strip()
+                if value and not _CAPTURE_TITLE_PLACEHOLDER.match(value):
+                    return value[:limit]
+        return ""
+
+    return {
+        "title": pick(("title",), _CAPTURE_BIBLIOGRAPHY_FIELD_MAX),
+        # The two stores spell this differently and BOTH must be read: a manual
+        # row has `author` (lib.MANUAL_ENTRY_FIELDS) while a build has `authors`
+        # (_BUILD_FIELDS / BUILD_FIELDS in static/app.js). Reading one spelling
+        # silently blanks the author for every build-only replica.
+        "author": pick(("authors", "author"), _CAPTURE_BIBLIOGRAPHY_FIELD_MAX),
+        "year": pick(("year",), _CAPTURE_BIBLIOGRAPHY_YEAR_MAX),
+    }
+
+
 def _capture_scan_status(source: dict | None) -> str:
     """The Catalogs table's SCAN/UPLOAD/approved decision, compactly."""
     source = source if isinstance(source, dict) else {}
@@ -22401,7 +22506,13 @@ def _capture_retained_projection_evidence(data: dict) -> dict:
     separate owner-only column/table.
     """
     out = {}
-    for key in ("copyright", "availability", "scan_status", "remarks"):
+    # `bibliography` belongs here for the same reason as the rest: it prefers the
+    # build but falls back to the manual row, which a replica does not have. Omit
+    # it and an unregister -> re-register-by-a-replica cycle blanks author/year
+    # permanently, because the owning desktop's replay then compares "equal" and
+    # push_capture_book_metadata refuses it.
+    for key in ("bibliography", "copyright", "availability", "scan_status",
+                "remarks"):
         value = data.get(key)
         if value not in (None, "", [], {}):
             out[key] = json.loads(json.dumps(value, ensure_ascii=False))
@@ -22461,6 +22572,20 @@ def _merge_capture_projection_with_existing(row: dict,
         if (str(desired.get("scan_status") or "") in ("", "unknown") and
                 previous_facts.get("scan_status")):
             desired["scan_status"] = previous_facts["scan_status"]
+        # Bibliography prefers the manual row, which a build-only replica does
+        # not have. Retain per field rather than wholesale: the replica's build
+        # may legitimately carry a newer title while author/year live only on the
+        # manual row that another desktop owns. Never let an empty field win.
+        old_biblio = previous_facts.get("bibliography")
+        new_biblio = desired.get("bibliography")
+        if isinstance(old_biblio, dict):
+            if not isinstance(new_biblio, dict):
+                new_biblio = {}
+                desired["bibliography"] = new_biblio
+            for key in ("title", "author", "year"):
+                if not str(new_biblio.get(key) or "").strip() and \
+                        str(old_biblio.get(key) or "").strip():
+                    new_biblio[key] = old_biblio[key]
         old_remarks = previous_facts.get("remarks")
         new_remarks = desired.get("remarks")
         if isinstance(old_remarks, list) and isinstance(new_remarks, list):
@@ -22508,7 +22633,13 @@ def _merge_capture_projection_with_existing(row: dict,
             copyright_data.get("status") or ""
         )[:500]
 
-    if not local_registered:
+    # Gate on TOMBSTONE-ness, not on registration. Now that unregistered captures
+    # are projected too, `not local_registered` also matches a LIVE row — and
+    # since `previous_facts` is the envelope itself when one exists, the envelope
+    # would re-snapshot from itself, freeze, and later hand those stale facts to a
+    # replica that re-registers the capture. Only a tombstone writes
+    # `registered: False`, so that is the reliable marker.
+    if desired.get("registered") is False:
         retained_evidence = _capture_retained_projection_evidence(previous_facts)
         if retained_evidence:
             desired_source["_retained_desktop_evidence"] = retained_evidence
@@ -22590,15 +22721,19 @@ def _capture_book_metadata_rows(builds: dict | None = None,
         capture_id = _canonical_capture_id(value.get("capture_id"))
         if capture_id:
             sources[capture_id] = value
+    # Imported-but-unregistered captures are projected too, or a freshly scanned
+    # crate lists on the phone with no titles at all: the only capture -> build
+    # path in the UI is the BUILD button over `approvedSources()`, which needs a
+    # located scan or PDF. An unregistered row publishes `book_id = ""`, which is
+    # what the phone reads as "not registered".
     selected = {
-        capture_id: (target["id"], target["record"])
+        capture_id: (target["id"], target["record"], target["kind"] == "build")
         for capture_id, target in _capture_targets(builds, manual_entries).items()
-        if target["kind"] == "build"
     }
 
     prepared = []
     renewal_ids = set()
-    for capture_id, (build_id, build) in selected.items():
+    for capture_id, (build_id, build, registered) in selected.items():
         source = sources.get(capture_id)
         checks_row = source.get("checks") \
             if isinstance(source, dict) and isinstance(source.get("checks"), dict) else {}
@@ -22611,7 +22746,8 @@ def _capture_book_metadata_rows(builds: dict | None = None,
         if renewal_id:
             renewal_ids.add(renewal_id)
         prepared.append((capture_id, build_id, build, source, display_status,
-                         automated_status, curated_status, renewal_id))
+                         automated_status, curated_status, renewal_id,
+                         registered))
 
     renewal_records = {}
     cached = registration_cache
@@ -22630,10 +22766,17 @@ def _capture_book_metadata_rows(builds: dict | None = None,
 
     rows = []
     for (capture_id, build_id, build, source, copyright_status,
-         automated_status, curated_status, renewal_id) in prepared:
+         automated_status, curated_status, renewal_id,
+         registered) in prepared:
         rights = str(build.get("rights") or "")[:200]
+        # For an unregistered target `build` IS the manual row, so reading its
+        # stamp here would put a manual timestamp into the BUILD clock component.
+        # Unregistering would then move that component BACKWARDS, the merge would
+        # score the row "stale", and the unregister would never reach the cloud —
+        # the phone would show the book as registered forever. Leave it empty and
+        # let the merge carry the previous build stamp forward.
         build_stamp = _capture_projection_stamp(
-            build.get("updated_at") or build.get("created_at"))
+            build.get("updated_at") or build.get("created_at")) if registered else ""
         manual_stamp = _capture_projection_stamp(
             (source or {}).get("updated_at") or (source or {}).get("created_at"))
         evidence_stamp = _capture_registration_evidence_stamp(
@@ -22666,6 +22809,7 @@ def _capture_book_metadata_rows(builds: dict | None = None,
                 "tombstone_updated_at": "",
                 "manual_present": isinstance(source, dict),
             },
+            "bibliography": _capture_bibliography(build, source),
             "copyright": copyright_data,
             "availability": {
                 "whl": _capture_source_availability(source, "whl"),
@@ -22673,10 +22817,20 @@ def _capture_book_metadata_rows(builds: dict | None = None,
                     source, "internet_archive"),
             },
             "scan_status": _capture_scan_status(source),
-            "catalog_status": str(build.get("status") or "")[:80],
+            # A catalogue status belongs to a build. `api_manual_restore`
+            # reinserts a client-supplied row verbatim, so an unregistered target
+            # could otherwise smuggle one in.
+            "catalog_status": (str(build.get("status") or "")[:80]
+                               if registered else ""),
             "remarks": _capture_remarks(build, source),
         }
-        rows.append({"capture_id": capture_id, "book_id": build_id, "data": data})
+        rows.append({
+            "capture_id": capture_id,
+            # An unregistered capture has no book id, and the phone's
+            # `DesktopBookMetadata.registered` is exactly `book_id != ""`.
+            "book_id": build_id if registered else "",
+            "data": data,
+        })
     tombstone_updated_at = tombstone_updated_at \
         if isinstance(tombstone_updated_at, dict) else {}
     for capture_id in sorted({
@@ -22733,10 +22887,10 @@ def _publish_capture_book_metadata(owner_cfg: dict, capture_cfg: dict) -> int:
         if (capture_id := _canonical_capture_id(value))
     }
     targets = _capture_targets(builds, manual_entries)
-    local_current = {
-        capture_id for capture_id, target in targets.items()
-        if target["kind"] == "build"
-    }
+    # Every target is publishable, registered or not — matching `selected` in
+    # `_capture_book_metadata_rows`. A capture is tombstoned when it stops being a
+    # target at all (its entry was deleted), not when it merely loses its build.
+    local_current = set(targets)
     # Discover rows written by prerelease builds before the local cursor file
     # existed.  The service credential is still scoped to capture ids already
     # present in this desktop's own manual/build stores.
@@ -23269,7 +23423,7 @@ def _migrate_stored_paths() -> None:
                 e["local_pdf"] = rel
                 changed = True
         if changed:
-            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+            _save_manual_entries(entries)
 
 
 # --- LAN capture (offline phone -> desktop, bypassing the cloud) --------------

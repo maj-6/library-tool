@@ -226,6 +226,41 @@ internal fun findCollectionByTagId(
     return null
 }
 
+/**
+ * Every collection id whose captures belong to [liveId]: the live id itself plus
+ * every merge loser that resolves to it through the authoritative chain.
+ *
+ * A merge repoints the desktop's own catalogue (`_repoint_collection_aliases` in
+ * tools/whl_explorer/server.py) but NOTHING ever rewrites `captures.meta` in the
+ * cloud — the frozen snapshot is deliberately immutable. So a cloud read keyed on
+ * the survivor alone silently loses every book captured under the old label.
+ * Query the whole closure instead.
+ */
+internal fun collectionMergeClosure(
+    collections: List<BookCollection>,
+    liveId: String,
+): Set<String> {
+    if (liveId.isEmpty()) return emptySet()
+    val byId = collections.associateBy { it.id }
+    val closure = linkedSetOf(liveId)
+    for (candidate in collections) {
+        if (candidate.id == liveId || candidate.id.isEmpty()) continue
+        var cursor = candidate
+        val visited = mutableSetOf<String>()
+        while (visited.add(cursor.id)) {
+            // Only a merge aliases identity. An ordinary delete does not, so a
+            // deleted box's books must not surface under an unrelated survivor.
+            val survivorId = cursor.mergedInto ?: break
+            if (survivorId == liveId) {
+                closure += candidate.id
+                break
+            }
+            cursor = byId[survivorId] ?: break
+        }
+    }
+    return closure
+}
+
 /** Collapse whitespace and clip. Names are compared case-insensitively for
  * duplicates but stored as typed, so "Storage" doesn't become "storage". */
 internal fun normalizeCollectionField(value: String): String =

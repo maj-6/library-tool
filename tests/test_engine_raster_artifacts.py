@@ -7,11 +7,13 @@ import pytest
 
 from librarytool.engine.errors import ValidationError
 from librarytool.engine.raster_artifacts import (
+    ArtifactMetadataAssertion,
     ArtifactFreshness,
     ArtifactProvenance,
     CategoryAssignment,
     CaptionAssertion,
     CORRECTIONS_WORKBENCH_ID,
+    MetadataAssertionOrigin,
     RASTER_ARTIFACTS_READ_CAPABILITY,
     RasterArtifactKey,
     RasterArtifactProjectorPort,
@@ -21,6 +23,10 @@ from librarytool.engine.raster_artifacts import (
     RasterResourceRef,
     RasterSourceRef,
     ResourceState,
+)
+from librarytool.engine.spatial_annotations import (
+    RoleAssignmentOrigin,
+    SpatialRoleAssignment,
 )
 
 
@@ -68,6 +74,12 @@ def test_raster_view_exposes_revisioned_source_lineage_and_assertions():
         inherited_from_artifact_id="source-photo",
     )
     manual = CategoryAssignment("content_specimen", "manual", "category-human-r1")
+    manual_role = SpatialRoleAssignment(
+        "figure",
+        RoleAssignmentOrigin.MANUAL,
+        "role-human-r1",
+        provenance=ArtifactProvenance(origin="manual"),
+    )
     machine_caption = CaptionAssertion(
         "A machine caption",
         "machine",
@@ -80,6 +92,31 @@ def test_raster_view_exposes_revisioned_source_lineage_and_assertions():
         "caption-human-r1",
         language="en",
     )
+    machine_metadata = ArtifactMetadataAssertion(
+        "plate_number",
+        3,
+        MetadataAssertionOrigin.MACHINE,
+        "metadata-machine-r1",
+        provenance=ArtifactProvenance(
+            origin="machine",
+            provider_id="mistral",
+            model="mistral-ocr-latest",
+        ),
+    )
+    manual_metadata = ArtifactMetadataAssertion(
+        "plate_number",
+        4,
+        MetadataAssertionOrigin.MANUAL,
+        "metadata-human-r1",
+        provenance=ArtifactProvenance(origin="manual"),
+    )
+    imported_metadata = ArtifactMetadataAssertion(
+        "collection",
+        {"name": "Herbarium", "shelf": ["A", 12]},
+        MetadataAssertionOrigin.IMPORTED,
+        "metadata-import-r1",
+        provenance=ArtifactProvenance(origin="ocr", provider_id="mistral"),
+    )
     extensions = {"future": {"nested": [1, True, None]}}
     view = _artifact(
         kind="processed-image",
@@ -89,7 +126,13 @@ def test_raster_view_exposes_revisioned_source_lineage_and_assertions():
             RasterLineageRef("earlier-edit", "edit-r2", "rework_of"),
         ),
         category_assignments=(machine, inherited, manual),
+        role_assignments=(manual_role,),
         caption_assertions=(machine_caption, manual_caption),
+        metadata_assertions=(
+            machine_metadata,
+            manual_metadata,
+            imported_metadata,
+        ),
         provenance=ArtifactProvenance(
             origin="transform",
             provider_id="desktop",
@@ -102,6 +145,7 @@ def test_raster_view_exposes_revisioned_source_lineage_and_assertions():
     extensions["future"]["nested"].append("mutated")
 
     assert view.effective_category == "content_specimen"
+    assert view.effective_role == "figure"
     assert view.effective_caption is manual_caption
     assert view.source.canvas_revision == "canvas-r1"
     assert view.freshness is ArtifactFreshness.STALE
@@ -112,6 +156,27 @@ def test_raster_view_exposes_revisioned_source_lineage_and_assertions():
     public = view.as_dict()
     assert public["extensions"] == {"future": {"nested": [1, True, None]}}
     assert public["effective_caption"]["text"] == "The corrected caption"
+    assert public["effective_role"] == "figure"
+    assert public["role_assignments"][0]["revision"] == "role-human-r1"
+    assert public["effective_metadata"] == {
+        "collection": {"name": "Herbarium", "shelf": ["A", 12]},
+        "plate_number": 4,
+    }
+    assert [
+        (value["name"], value["origin"], value["value"])
+        for value in public["metadata_assertions"]
+    ] == [
+        ("plate_number", "machine", 3),
+        ("plate_number", "manual", 4),
+        (
+            "collection",
+            "imported",
+            {"name": "Herbarium", "shelf": ["A", 12]},
+        ),
+    ]
+    assert public["metadata_assertions"][0]["provenance"]["model"] == (
+        "mistral-ocr-latest"
+    )
     assert public["resource"] == {
         "id": "resource:image-1",
         "revision": "bytes-r1",
@@ -124,6 +189,70 @@ def test_raster_view_exposes_revisioned_source_lineage_and_assertions():
     json.dumps(view.as_dict(), allow_nan=False)
     with pytest.raises(FrozenInstanceError):
         view.revision = "artifact-r2"
+
+
+def test_metadata_assertions_preserve_origins_and_reject_ambiguous_or_private_state():
+    machine = ArtifactMetadataAssertion(
+        "folio",
+        "12r",
+        "machine",
+        "metadata-machine-r1",
+    )
+    manual = ArtifactMetadataAssertion(
+        "folio",
+        "12v",
+        "manual",
+        "metadata-manual-r1",
+    )
+    view = _artifact(metadata_assertions=(machine, manual))
+
+    assert view.effective_metadata == {"folio": "12v"}
+    assert [value.origin.value for value in view.metadata_assertions] == [
+        "machine",
+        "manual",
+    ]
+
+    with pytest.raises(ValidationError) as duplicate:
+        _artifact(metadata_assertions=(machine, machine))
+    assert duplicate.value.code == "invalid_metadata_assertion"
+
+    with pytest.raises(ValidationError) as private:
+        ArtifactMetadataAssertion(
+            "local-path",
+            "C:\\private\\folio.jpg",
+            "machine",
+            "metadata-private-r1",
+        )
+    assert private.value.code == "private_artifact_extension"
+
+    with pytest.raises(ValidationError) as invalid_origin:
+        ArtifactMetadataAssertion(
+            "folio",
+            "12r",
+            "suggested",
+            "metadata-origin-r1",
+        )
+    assert invalid_origin.value.code == "invalid_metadata_assertion"
+
+    large_value = ["x" * 8192, "y" * 8192]
+    with pytest.raises(ValidationError) as aggregate:
+        _artifact(
+            metadata_assertions=(
+                ArtifactMetadataAssertion(
+                    "first",
+                    large_value,
+                    "imported",
+                    "metadata-first-r1",
+                ),
+                ArtifactMetadataAssertion(
+                    "second",
+                    large_value,
+                    "manual",
+                    "metadata-second-r1",
+                ),
+            ),
+        )
+    assert aggregate.value.code == "invalid_artifact_extensions"
 
 
 def test_caption_language_matches_the_first_party_client_contract():

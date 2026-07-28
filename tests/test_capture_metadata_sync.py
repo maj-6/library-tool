@@ -136,6 +136,11 @@ def test_desktop_snapshot_contains_phone_list_and_popup_fields():
         "captured-herbal"
     assert data["scan_status"] == "approved"
     assert data["remarks"] == ["Shelf note", "Binding is fragile"]
+    assert data["bibliography"] == {
+        "title": "A Captured Herbal",
+        "author": "A. Author",
+        "year": "1928",
+    }
     assert "review" not in data
 
 
@@ -154,6 +159,329 @@ def test_snapshot_uses_newest_registered_build_and_skips_non_cloud_ids():
     assert [(row["capture_id"], row["book_id"]) for row in rows] == [
         (CAPTURE_ID, "new"),
     ]
+
+
+def test_bibliography_reads_both_author_spellings_and_prefers_the_build():
+    """The phone's box listing has no other source of a title.
+
+    A capture's own ``meta`` carries title/author only when the capturing phone
+    held an extraction API key, so this block is it.  The two desktop stores spell
+    the author field differently — ``author`` in lib.MANUAL_ENTRY_FIELDS,
+    ``authors`` in _BUILD_FIELDS — and both must be read.
+
+    The BUILD wins: for a phone capture the manual row is the machine-generated
+    ingest record, while the build is where a curator types.
+    """
+    build = {"title": "Curated Title", "authors": "B. Builder", "year": "1930"}
+    source = {"title": "Ingested Title", "author": "S. Source", "year": "1928"}
+
+    assert server._capture_bibliography(build, source) == {
+        "title": "Curated Title", "author": "B. Builder", "year": "1930",
+    }
+    # A build-only replica still yields a real author despite the plural spelling.
+    assert server._capture_bibliography(build, None) == {
+        "title": "Curated Title", "author": "B. Builder", "year": "1930",
+    }
+    # Blank build fields fall through to the manual row rather than winning as "".
+    assert server._capture_bibliography(
+        {"title": "", "authors": "  ", "year": ""}, source,
+    ) == {"title": "Ingested Title", "author": "S. Source", "year": "1928"}
+    # Always empty strings, never None, so the phone's strict string parse
+    # cannot reject the block.
+    assert server._capture_bibliography({}, None) == {
+        "title": "", "author": "", "year": "",
+    }
+
+
+def test_bibliography_never_publishes_the_untitled_capture_placeholder():
+    """`_ingest_capture_locked` stamps "(untitled capture <8 hex>)" so a capture
+    with no extracted title is not lost from the Catalogs table. That is a
+    placeholder, not a title: putting it on a phone's shelf listing is worse than
+    publishing nothing, because a blank renders as "Untitled book".
+
+    This owner's phones have no extraction API key, so this is the DEFAULT path,
+    not an edge case.
+    """
+    placeholder = "(untitled capture 2ec86526)"
+    # The exact shape ingest writes, verified against server.py's own stamp.
+    assert placeholder == f"(untitled capture {CAPTURE_ID[:8]})"
+
+    source = {"title": placeholder, "author": "", "year": ""}
+    build = {"title": "Materia Medica Americana", "authors": "J. Schoepf",
+             "year": "1787"}
+    assert server._capture_bibliography(build, source) == {
+        "title": "Materia Medica Americana", "author": "J. Schoepf",
+        "year": "1787",
+    }
+    # With nothing curated anywhere the title is BLANK, not the placeholder.
+    assert server._capture_bibliography({}, source)["title"] == ""
+    assert server._capture_bibliography({"title": placeholder}, None)["title"] == ""
+    # A real title that merely looks similar is not suppressed.
+    assert server._capture_bibliography(
+        {"title": "Untitled capture notes, 1873"}, None,
+    )["title"] == "Untitled capture notes, 1873"
+
+
+def test_unregistered_capture_is_projected_with_an_empty_book_id():
+    """A freshly imported crate must list WITH titles on the phone.
+
+    The only capture -> build path in the UI is the BUILD button over
+    `approvedSources()`, which needs a located scan or PDF, so a photos-only
+    capture would otherwise never get a projection at all.
+    """
+    source = {"id": "manual-1", "capture_id": CAPTURE_ID,
+              "title": "Curated By Hand", "author": "S. Source", "year": "1928",
+              "created_at": "2026-07-19T10:00:00+00:00"}
+    rows = server._capture_book_metadata_rows(
+        builds={}, manual_entries={"manual-1": source},
+        reviews={}, registration_cache={},
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["capture_id"] == CAPTURE_ID
+    assert row["book_id"] == ""            # the phone reads this as unregistered
+    assert row["data"]["bibliography"] == {
+        "title": "Curated By Hand", "author": "S. Source", "year": "1928",
+    }
+    # A live row is not a tombstone.
+    assert "registered" not in row["data"]
+    # A manual row's own stamp must never land in the BUILD clock component, and
+    # a catalogue status belongs to a build.
+    assert row["data"]["projection_source"]["build_updated_at"] == ""
+    assert row["data"]["catalog_status"] == ""
+
+
+def test_register_then_unregister_keeps_the_projection_clock_moving_forward():
+    """Unregistering must reach the cloud.
+
+    If a manual row's stamp were read into `build_updated_at`, unregistering
+    would move that component BACKWARDS, the merge would score the row "stale",
+    `push_capture_book_metadata` would refuse it, and the phone would show the
+    book as registered forever.
+    """
+    source = {"id": "manual-1", "capture_id": CAPTURE_ID, "title": "Herbal",
+              "author": "S. Source", "created_at": "2026-07-19T10:00:00+00:00"}
+    build = {"id": "book-1", "capture_id": CAPTURE_ID, "title": "Herbal",
+             "status": "ready", "updated_at": "2026-07-20T12:00:00+00:00"}
+
+    def rows_for(builds):
+        return server._capture_book_metadata_rows(
+            builds=builds, manual_entries={"manual-1": source},
+            reviews={}, registration_cache={},
+        )[0]
+
+    unregistered = rows_for({})
+    registered = rows_for({"book-1": build})
+    assert registered["book_id"] == "book-1"
+    assert registered["data"]["catalog_status"] == "ready"
+
+    # (a) live row -> (b) registered
+    merged_registered = server._merge_capture_projection_with_existing(
+        registered,
+        {**unregistered, "revision": 1, "updated_at": "2026-07-19T10:00:01Z"},
+    )
+    assert supabase_sync._projection_freshness(
+        merged_registered["data"], unregistered["data"]) == "newer"
+
+    # (b) registered -> (c) unregistered again
+    merged_unregistered = server._merge_capture_projection_with_existing(
+        rows_for({}),
+        {**merged_registered, "revision": 2,
+         "updated_at": "2026-07-20T12:00:01Z"},
+    )
+    assert merged_unregistered["book_id"] == ""
+    assert supabase_sync._projection_freshness(
+        merged_unregistered["data"], merged_registered["data"]) == "newer"
+    # The build component is carried forward, never regressed (stamps are
+    # canonicalized to microsecond precision).
+    assert merged_unregistered["data"]["projection_source"][
+        "build_updated_at"] == registered["data"]["projection_source"][
+        "build_updated_at"] != ""
+
+    # (d) the entry is deleted entirely -> tombstone, still moving forward
+    tombstone = server._capture_book_metadata_rows(
+        builds={}, manual_entries={}, reviews={}, registration_cache={},
+        tombstone_capture_ids=[CAPTURE_ID],
+        tombstone_updated_at={CAPTURE_ID: "2026-07-21T12:00:00+00:00"},
+    )[0]
+    merged_tombstone = server._merge_capture_projection_with_existing(
+        tombstone,
+        {**merged_unregistered, "revision": 3,
+         "updated_at": "2026-07-20T12:00:02Z"},
+    )
+    assert merged_tombstone["data"]["registered"] is False
+    assert supabase_sync._projection_freshness(
+        merged_tombstone["data"], merged_unregistered["data"]) == "newer"
+
+
+def test_a_live_unregistered_row_never_carries_the_retained_envelope():
+    """The envelope is a tombstone handoff. Writing it onto a LIVE unregistered
+    row would make it re-snapshot from itself, freeze, and later feed stale facts
+    to a replica that re-registers the capture."""
+    source = {"id": "manual-1", "capture_id": CAPTURE_ID, "title": "Herbal",
+              "created_at": "2026-07-19T10:00:00+00:00",
+              "checks": {"copyright_status": "NEW status"}}
+    live = server._capture_book_metadata_rows(
+        builds={}, manual_entries={"manual-1": source},
+        reviews={}, registration_cache={},
+    )[0]
+    older_cloud = server._capture_book_metadata_rows(
+        builds={}, manual_entries={"manual-1": {
+            **source, "checks": {"copyright_status": "OLD status"}}},
+        reviews={}, registration_cache={},
+    )[0]
+
+    merged = server._merge_capture_projection_with_existing(
+        live, {**older_cloud, "revision": 1, "updated_at": "2026-07-19T10:00:01Z"},
+    )
+    assert "_retained_desktop_evidence" not in merged["data"]["projection_source"]
+    assert merged["data"]["copyright"]["automated_status"] == "NEW status"
+
+
+def test_manual_entry_edits_advance_the_projection_clock(tmp_path, monkeypatch):
+    """Without a monotonic `updated_at` on the manual store, correcting a title
+    changes `data` while every clock component stays equal, and
+    `push_capture_book_metadata` refuses the row as "equal projection source" —
+    so the correction can never reach the phone."""
+    manual_path = tmp_path / "manual_entries.json"
+    monkeypatch.setattr(lib, "MANUAL_ENTRIES_PATH", manual_path)
+    entry = {"id": "manual-1", "capture_id": CAPTURE_ID, "title": "Wrong Title",
+             "created_at": "2026-07-19T10:00:00+00:00"}
+    server._save_manual_entries({"manual-1": dict(entry)})
+    first = lib.load_json(manual_path, {})["manual-1"]
+    assert first["updated_at"]
+
+    before = server._capture_book_metadata_rows(
+        builds={}, manual_entries={"manual-1": first},
+        reviews={}, registration_cache={},
+    )[0]
+
+    server._save_manual_entries(
+        {"manual-1": {**first, "title": "Corrected Title"}})
+    second = lib.load_json(manual_path, {})["manual-1"]
+    assert second["updated_at"] > first["updated_at"]
+
+    after = server._capture_book_metadata_rows(
+        builds={}, manual_entries={"manual-1": second},
+        reviews={}, registration_cache={},
+    )[0]
+    assert after["data"]["bibliography"]["title"] == "Corrected Title"
+    assert supabase_sync._projection_freshness(
+        after["data"], before["data"]) == "newer"
+
+    # An unchanged save must NOT churn the token, or every sync would republish.
+    server._save_manual_entries({"manual-1": dict(second)})
+    assert lib.load_json(manual_path, {})["manual-1"]["updated_at"] == \
+        second["updated_at"]
+
+
+def test_bibliography_survives_an_unregister_reregister_cycle():
+    """A tombstone carries the block internally, so a replica that re-registers
+    the capture does not blank author/year permanently — the owning desktop's
+    replay would compare "equal" and be refused."""
+    build = {"id": "book-1", "capture_id": CAPTURE_ID, "title": "Herbal",
+             "updated_at": "2026-07-20T12:00:00Z"}
+    source = {"id": "manual-1", "capture_id": CAPTURE_ID, "title": "Herbal",
+              "author": "S. Source", "year": "1928"}
+    rich = server._capture_book_metadata_rows(
+        builds={"book-1": build}, manual_entries={"manual-1": source},
+        reviews={}, registration_cache={},
+    )[0]
+    assert rich["data"]["bibliography"]["author"] == "S. Source"
+
+    tombstone = server._capture_book_metadata_rows(
+        builds={}, manual_entries={}, reviews={}, registration_cache={},
+        tombstone_capture_ids=[CAPTURE_ID],
+        tombstone_updated_at={CAPTURE_ID: "2026-07-23T12:00:00+00:00"},
+    )[0]
+    merged_tombstone = server._merge_capture_projection_with_existing(
+        tombstone, {**rich, "revision": 3, "updated_at": "2026-07-22T12:00:00Z"},
+    )
+    # Carried in the underscored desktop envelope, NOT in the phone-visible data.
+    assert "bibliography" not in merged_tombstone["data"]
+    retained = merged_tombstone["data"]["projection_source"][
+        "_retained_desktop_evidence"]
+    assert retained["bibliography"]["author"] == "S. Source"
+
+    # A replica re-registers: it has the build but never had the manual row.
+    replica = server._capture_book_metadata_rows(
+        builds={"book-1": build}, manual_entries={},
+        reviews={}, registration_cache={},
+    )[0]
+    restored = server._merge_capture_projection_with_existing(
+        replica,
+        {**merged_tombstone, "revision": 4,
+         "updated_at": "2026-07-23T12:01:00Z"},
+    )
+    assert restored["data"]["bibliography"] == {
+        "title": "Herbal", "author": "S. Source", "year": "1928",
+    }
+
+
+def test_bibliography_clamps_match_the_phones_parser():
+    long_title = "T" * 900
+    biblio = server._capture_bibliography(
+        {}, {"title": long_title, "author": "A" * 900, "year": "Y" * 90},
+    )
+    # DESKTOP_BIBLIOGRAPHY_FIELD_MAX / _YEAR_MAX in CaptureMetadata.kt reject a
+    # longer value outright, so an over-long field must be clamped here.
+    assert len(biblio["title"]) == 500
+    assert len(biblio["author"]) == 500
+    assert len(biblio["year"]) == 40
+
+
+def test_build_only_replica_never_blanks_a_richer_cloud_bibliography():
+    build = {"id": "book-1", "capture_id": CAPTURE_ID, "title": "Herbal",
+             "updated_at": "2026-07-20T12:00:00Z"}
+    source = {"id": "manual-1", "capture_id": CAPTURE_ID, "title": "Herbal",
+              "author": "S. Source", "year": "1928",
+              "updated_at": "2026-07-21T12:00:00Z"}
+    rich = server._capture_book_metadata_rows(
+        builds={"book-1": build}, manual_entries={"manual-1": source},
+        reviews={}, registration_cache={},
+    )[0]
+    assert rich["data"]["bibliography"]["author"] == "S. Source"
+
+    # The replica has the build but not the manual row, so its own block has no
+    # author/year. Publishing it must not erase what the owning desktop wrote.
+    build_only = server._capture_book_metadata_rows(
+        builds={"book-1": build}, manual_entries={},
+        reviews={}, registration_cache={},
+    )[0]
+    assert build_only["data"]["bibliography"]["author"] == ""
+
+    merged = server._merge_capture_projection_with_existing(
+        build_only,
+        {**rich, "revision": 4, "updated_at": "2026-07-21T12:01:00Z"},
+    )
+    assert merged["data"]["bibliography"] == {
+        "title": "Herbal", "author": "S. Source", "year": "1928",
+    }
+
+
+def test_build_only_replica_may_still_advance_a_bibliography_field():
+    build = {"id": "book-1", "capture_id": CAPTURE_ID, "title": "Corrected Title",
+             "updated_at": "2026-07-22T12:00:00Z"}
+    stale = server._capture_book_metadata_rows(
+        builds={"book-1": {**build, "title": "Old Title"}},
+        manual_entries={"manual-1": {
+            "id": "manual-1", "capture_id": CAPTURE_ID, "title": "Old Title",
+            "author": "S. Source",
+        }},
+        reviews={}, registration_cache={},
+    )[0]
+    build_only = server._capture_book_metadata_rows(
+        builds={"book-1": build}, manual_entries={},
+        reviews={}, registration_cache={},
+    )[0]
+
+    merged = server._merge_capture_projection_with_existing(
+        build_only, {**stale, "revision": 2, "updated_at": "2026-07-22T12:01:00Z"},
+    )
+    # Retention is per field and only fills BLANKS: a non-empty newer title wins,
+    # while the author it cannot see is carried forward.
+    assert merged["data"]["bibliography"]["title"] == "Corrected Title"
+    assert merged["data"]["bibliography"]["author"] == "S. Source"
 
 
 def test_build_only_second_desktop_preserves_source_rich_cloud_projection():

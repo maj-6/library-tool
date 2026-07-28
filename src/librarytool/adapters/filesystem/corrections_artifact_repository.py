@@ -38,12 +38,15 @@ from PIL import Image, UnidentifiedImageError
 from ...engine.errors import EngineError, NotFoundError, RepositoryError, ValidationError
 from ...engine.raster_artifacts import (
     IMAGE_CATEGORIES,
+    ArtifactMetadataAssertion,
     ArtifactFreshness,
     ArtifactProvenance,
     AssignmentOrigin,
     CaptionAssertion,
     CaptionOrigin,
     CategoryAssignment,
+    MAX_METADATA_ASSERTIONS,
+    MetadataAssertionOrigin,
     RasterArtifactKey,
     RasterArtifactProjectorPort,
     RasterArtifactView,
@@ -701,6 +704,46 @@ def _public_extensions(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return value
 
 
+def _public_metadata_assertions(
+    value: Mapping[str, Any],
+    *,
+    artifact_id: str,
+) -> tuple[ArtifactMetadataAssertion, ...]:
+    public = _public_extensions(value)
+    if set(public) == {"quarantine"} and "quarantine" not in value:
+        return ()
+    assertions: list[ArtifactMetadataAssertion] = []
+    for name in sorted(public):
+        if len(assertions) >= MAX_METADATA_ASSERTIONS // 2:
+            break
+        if name == "caption" or not _IDENTIFIER_RE.fullmatch(name):
+            continue
+        try:
+            assertions.append(
+                ArtifactMetadataAssertion(
+                    name,
+                    public[name],
+                    MetadataAssertionOrigin.IMPORTED,
+                    _digest_revision(
+                        "metadata",
+                        {
+                            "artifact_id": artifact_id,
+                            "name": name,
+                            "value": public[name],
+                            "origin": "imported",
+                        },
+                    ),
+                    provenance=ArtifactProvenance(
+                        origin="ocr",
+                        provider_id="mistral",
+                    ),
+                )
+            )
+        except ValidationError:
+            continue
+    return tuple(assertions)
+
+
 def _public_text(value: Any, *, maximum: int) -> str:
     if not isinstance(value, str):
         return ""
@@ -804,6 +847,7 @@ class _FigureDraft:
     annotation_id: str
     annotation_revision: str
     caption: CaptionAssertion | None
+    metadata_assertions: tuple[ArtifactMetadataAssertion, ...]
     rework_of: str
 
 
@@ -2573,6 +2617,7 @@ class FilesystemCorrectionsArtifactRepository(
                 ),
                 lineage=lineage,
                 caption_assertions=captions,
+                metadata_assertions=draft.metadata_assertions,
                 provenance=ArtifactProvenance(
                     origin="ocr",
                     provider_id="mistral",
@@ -2769,6 +2814,10 @@ class FilesystemCorrectionsArtifactRepository(
                 value,
                 annotation_id=annotation_id,
             )
+            metadata_assertions = _public_metadata_assertions(
+                value.get("ext") if isinstance(value.get("ext"), Mapping) else {},
+                artifact_id=artifact_id,
+            )
             public_extensions = _public_extensions(
                 {
                     "corrections_ui": {"annotation_frame": "crop"},
@@ -2789,6 +2838,9 @@ class FilesystemCorrectionsArtifactRepository(
                 "resource_state": observation.state.value,
                 "selector": selector.as_dict() if selector else None,
                 "caption": caption.as_dict() if caption else None,
+                "metadata_assertions": [
+                    assertion.as_dict() for assertion in metadata_assertions
+                ],
                 "rework_of": value.get("rework_of"),
                 "extensions": public_extensions,
             }
@@ -2816,6 +2868,7 @@ class FilesystemCorrectionsArtifactRepository(
                         },
                     ),
                     caption=caption,
+                    metadata_assertions=metadata_assertions,
                     rework_of=(
                         str(value.get("rework_of"))
                         if isinstance(value.get("rework_of"), str)

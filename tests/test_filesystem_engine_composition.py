@@ -86,6 +86,9 @@ from librarytool.engine.translations import TranslationProvenanceService
 from librarytool.engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
+    CORRECTION_CAPTION_SERVICE,
+    CORRECTION_METADATA_SERVICE,
+    CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     INTERCHANGE_SERVICE,
@@ -892,6 +895,9 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
 
     assert engine.get_service(RASTER_ARTIFACT_QUERY_SERVICE) is None
     assert engine.get_service(SPATIAL_ANNOTATION_QUERY_SERVICE) is None
+    assert engine.get_service(CORRECTION_CAPTION_SERVICE) is None
+    assert engine.get_service(CORRECTION_METADATA_SERVICE) is None
+    assert engine.get_service(CORRECTION_REVIEW_SERVICE) is None
     assert engine.get_service(CORRECTION_SERVICE) is None
     assert engine.get_service(CORRECTION_TRANSFORM_SERVICE) is None
     assert "library.corrections.artifacts" not in {
@@ -903,6 +909,10 @@ def test_corrections_vertical_is_absent_without_explicit_bindings(tmp_path):
     assert {
         "library.raster-artifacts.read",
         "library.raster-artifacts.classify",
+        "library.corrections.captions.edit",
+        "library.corrections.metadata.edit",
+        "library.corrections.reviews.read",
+        "library.corrections.reviews.edit",
         "library.corrections.transforms.queue",
         "library.spatial-annotations.read",
         "library.spatial-annotations.edit",
@@ -932,6 +942,9 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
     spatial = engine.require_service(SPATIAL_ANNOTATION_QUERY_SERVICE)
     corrections = engine.require_service(CORRECTION_SERVICE)
+    assert engine.require_service(CORRECTION_CAPTION_SERVICE) is corrections
+    assert engine.require_service(CORRECTION_METADATA_SERVICE) is corrections
+    assert engine.require_service(CORRECTION_REVIEW_SERVICE) is corrections
     transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
     assert raster is spatial
     assert isinstance(raster, CorrectionProjectionService)
@@ -963,6 +976,34 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
         {"id": "library.raster-artifacts.classify", "version": 1},
         {"id": "library.spatial-annotations.edit", "version": 1},
     ]
+    specialized_modules = {
+        row["id"]: row
+        for row in document["modules"]
+        if row["id"] in {
+            "library.corrections.captions",
+            "library.corrections.metadata",
+            "library.corrections.reviews",
+        }
+    }
+    assert {
+        module_id: module["provides"]
+        for module_id, module in specialized_modules.items()
+    } == {
+        "library.corrections.captions": [
+            {"id": "library.corrections.captions.edit", "version": 1},
+        ],
+        "library.corrections.metadata": [
+            {"id": "library.corrections.metadata.edit", "version": 1},
+        ],
+        "library.corrections.reviews": [
+            {"id": "library.corrections.reviews.edit", "version": 1},
+            {"id": "library.corrections.reviews.read", "version": 1},
+        ],
+    }
+    assert all(
+        module["status"] == "available"
+        for module in specialized_modules.values()
+    )
     transform_module = next(
         row
         for row in document["modules"]

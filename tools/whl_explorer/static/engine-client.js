@@ -655,11 +655,50 @@
       isBoundedArtifactJson(value[key], state, depth + 1));
   }
 
+  function artifactJsonUtf8Bytes(value) {
+    let encoded;
+    try {
+      encoded = JSON.stringify(value);
+    } catch (_error) {
+      return Number.POSITIVE_INFINITY;
+    }
+    if (typeof encoded !== "string") return Number.POSITIVE_INFINITY;
+    let bytes = 0;
+    for (const character of encoded) {
+      const codePoint = character.codePointAt(0);
+      if (codePoint <= 0x7f) bytes += 1;
+      else if (codePoint <= 0x7ff) bytes += 2;
+      else if (codePoint <= 0xffff) bytes += 3;
+      else bytes += 4;
+    }
+    return bytes;
+  }
+
+  function isArtifactExtensionJson(value) {
+    return isBoundedArtifactJson(value) &&
+      artifactJsonUtf8Bytes(value) <= 32 * 1024;
+  }
+
   function isArtifactRevision(value, optional = false) {
     if (typeof value !== "string") return false;
     if (!value) return optional;
     return value.length <= 512 && /^[\x21-\x7e]+$/.test(value) &&
       !/["\\]/.test(value);
+  }
+
+  function sameArtifactJson(left, right) {
+    if (left === right) return true;
+    if (Array.isArray(left) || Array.isArray(right)) {
+      return Array.isArray(left) && Array.isArray(right) &&
+        left.length === right.length &&
+        left.every((value, index) => sameArtifactJson(value, right[index]));
+    }
+    if (!isObject(left) || !isObject(right)) return false;
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return leftKeys.length === rightKeys.length &&
+      leftKeys.every((key, index) =>
+        key === rightKeys[index] && sameArtifactJson(left[key], right[key]));
   }
 
   function correctionText(value, name, maximum, allowEmpty = true) {
@@ -689,7 +728,7 @@
   }
 
   function correctionMetadata(assertions, clearNames) {
-    if (!isObject(assertions) || !isBoundedArtifactJson(assertions)) {
+    if (!isObject(assertions) || !isArtifactExtensionJson(assertions)) {
       throw new TypeError("assertions must be bounded portable metadata");
     }
     const assertedNames = Object.keys(assertions);
@@ -720,7 +759,7 @@
       (value.operation_id === "" || isPortableIdentifier(value.operation_id)) &&
       typeof value.generated_at === "string" &&
       value.generated_at.length <= 128 &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isRasterSource(value) {
@@ -765,17 +804,39 @@
         Number.isFinite(value.confidence) &&
         value.confidence >= 0 && value.confidence <= 1) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isArtifactMetadataAssertion(value) {
     return hasExactKeys(value, [
       "name", "value", "origin", "revision", "provenance",
     ]) && isPortableIdentifier(value.name) &&
+      !isPrivateArtifactKey(value.name) &&
       ["manual", "machine", "imported"].includes(value.origin) &&
       isArtifactRevision(value.revision) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.value);
+      isArtifactExtensionJson({ [value.name]: value.value });
+  }
+
+  function isEffectiveArtifactMetadata(assertions, value) {
+    if (!isObject(value) || !isArtifactExtensionJson(value)) return false;
+    const identities = assertions.map((assertion) =>
+      `${assertion.name}\u0000${assertion.origin}`);
+    if (new Set(identities).size !== identities.length) return false;
+    const expected = {};
+    const names = [...new Set(assertions.map((assertion) => assertion.name))]
+      .sort();
+    for (const name of names) {
+      for (const origin of ["manual", "imported", "machine"]) {
+        const assertion = assertions.find((candidate) =>
+          candidate.name === name && candidate.origin === origin);
+        if (assertion) {
+          expected[name] = assertion.value;
+          break;
+        }
+      }
+    }
+    return sameArtifactJson(value, expected);
   }
 
   function isCategoryAssignment(value) {
@@ -792,7 +853,7 @@
         Number.isFinite(value.confidence) &&
         value.confidence >= 0 && value.confidence <= 1) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isRoleAssignment(value) {
@@ -805,11 +866,20 @@
         Number.isFinite(value.confidence) &&
         value.confidence >= 0 && value.confidence <= 1) &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function hasUniqueOrigins(values) {
     return new Set(values.map((value) => value.origin)).size === values.length;
+  }
+
+  function isEffectiveRole(assignments, value) {
+    if (typeof value !== "string") return false;
+    for (const origin of ["manual", "imported", "machine"]) {
+      const assignment = assignments.find((entry) => entry.origin === origin);
+      if (assignment) return value === assignment.role;
+    }
+    return value === "";
   }
 
   function isRasterArtifactView(value, itemId, artifactId = null) {
@@ -817,7 +887,9 @@
       "key", "revision", "kind", "label", "media_type", "content_sha256",
       "dimensions", "source", "resource_state", "resource", "freshness",
       "lineage", "category_assignments", "effective_category",
-      "caption_assertions", "effective_caption", "provenance", "extensions",
+      "role_assignments", "effective_role",
+      "caption_assertions", "effective_caption", "metadata_assertions",
+      "effective_metadata", "provenance", "extensions",
     ]) || !hasExactKeys(value.key, ["item_id", "artifact_id"]) ||
         value.key.item_id !== itemId ||
         (artifactId !== null && value.key.artifact_id !== artifactId) ||
@@ -847,14 +919,26 @@
         !value.category_assignments.every(isCategoryAssignment) ||
         !hasUniqueOrigins(value.category_assignments) ||
         !ARTIFACT_CATEGORIES.has(value.effective_category) ||
+        !Array.isArray(value.role_assignments) ||
+        value.role_assignments.length > 3 ||
+        !value.role_assignments.every(isRoleAssignment) ||
+        !hasUniqueOrigins(value.role_assignments) ||
+        !isEffectiveRole(value.role_assignments, value.effective_role) ||
         !Array.isArray(value.caption_assertions) ||
         value.caption_assertions.length > 32 ||
         !value.caption_assertions.every(isArtifactCaption) ||
         !hasUniqueOrigins(value.caption_assertions) ||
         !(value.effective_caption === null ||
           isArtifactCaption(value.effective_caption)) ||
+        !Array.isArray(value.metadata_assertions) ||
+        value.metadata_assertions.length > 128 ||
+        !value.metadata_assertions.every(isArtifactMetadataAssertion) ||
+        !isEffectiveArtifactMetadata(
+          value.metadata_assertions,
+          value.effective_metadata,
+        ) ||
         !isArtifactProvenance(value.provenance) ||
-        !isBoundedArtifactJson(value.extensions)) return false;
+        !isArtifactExtensionJson(value.extensions)) return false;
     if (value.resource_state === "available") {
       if (!hasExactKeys(value.resource, ["id", "revision", "variant"]) ||
           !isPortableIdentifier(value.resource.id) ||
@@ -874,6 +958,249 @@
       lineageKeys.add(key);
     }
     return true;
+  }
+
+  const CORRECTION_REVIEW_STATES =
+    new Set(["clear", "needs_attention", "resolved"]);
+  const CORRECTION_REVIEW_HISTORY_PAGE_LIMIT = 100;
+  const CORRECTION_REVIEW_HISTORY_TAIL_LIMIT = 8;
+  const MAX_CORRECTION_AUDIT_EVENTS = 100000;
+  const CORRECTION_REVIEW_TRANSITIONS = Object.freeze({
+    "attention.mark": ["clear", "needs_attention"],
+    "attention.resolve": ["needs_attention", "resolved"],
+    "attention.reopen": ["resolved", "needs_attention"],
+    "attention.clear": ["needs_attention", "clear"],
+  });
+
+  function isCorrectionAuditEvent(value) {
+    if (!hasExactKeys(value, [
+      "operation_id", "action", "actor_id", "occurred_at",
+      "before_state", "after_state", "reason", "comment",
+    ]) || !isPortableIdentifier(value.operation_id) ||
+        !isPortableIdentifier(value.actor_id) ||
+        typeof value.occurred_at !== "string" ||
+        value.occurred_at.length < 1 || value.occurred_at.length > 128 ||
+        typeof value.reason !== "string" || value.reason.length > 2048 ||
+        typeof value.comment !== "string" || value.comment.length > 8192 ||
+        !CORRECTION_REVIEW_STATES.has(value.before_state) ||
+        !CORRECTION_REVIEW_STATES.has(value.after_state) ||
+        !Object.prototype.hasOwnProperty.call(
+          CORRECTION_REVIEW_TRANSITIONS,
+          value.action,
+        ) ||
+        ![
+          value.before_state,
+          value.after_state,
+        ].every((state, index) =>
+          state === CORRECTION_REVIEW_TRANSITIONS[value.action][index])) {
+      return false;
+    }
+    try {
+      correctionText(value.occurred_at, "occurred_at", 128, false);
+      correctionText(value.reason, "reason", 2048);
+      correctionText(value.comment, "comment", 8192);
+    } catch (_error) {
+      return false;
+    }
+    return value.action !== "attention.mark" || !!value.reason.trim();
+  }
+
+  function isContinuousAuditEvents(history) {
+    const operationIds = history.map((event) => event.operation_id);
+    if (new Set(operationIds).size !== operationIds.length) return false;
+    for (let index = 1; index < history.length; index += 1) {
+      if (history[index - 1].after_state !==
+          history[index].before_state) return false;
+    }
+    return true;
+  }
+
+  function isCorrectionReviewSummary(value) {
+    if (!hasExactKeys(value, [
+      "revision", "state", "reason", "history_count", "history_tail",
+    ]) ||
+        !isArtifactRevision(value.revision) ||
+        !CORRECTION_REVIEW_STATES.has(value.state) ||
+        typeof value.reason !== "string" || value.reason.length > 2048 ||
+        !Number.isSafeInteger(value.history_count) ||
+        value.history_count < 0 ||
+        value.history_count > MAX_CORRECTION_AUDIT_EVENTS ||
+        !Array.isArray(value.history_tail) ||
+        value.history_tail.length !== Math.min(
+          value.history_count,
+          CORRECTION_REVIEW_HISTORY_TAIL_LIMIT,
+        ) ||
+        !value.history_tail.every(isCorrectionAuditEvent) ||
+        !isContinuousAuditEvents(value.history_tail)) return false;
+    try {
+      correctionText(value.reason, "reason", 2048);
+    } catch (_error) {
+      return false;
+    }
+    if (value.state === "clear" ? value.reason !== "" :
+        !value.reason.trim()) return false;
+    return value.history_tail.length === 0 ||
+      value.history_tail.at(-1).after_state === value.state;
+  }
+
+  const CORRECTIONS_IMPORT_STATES = new Set([
+    "ready", "pending", "legacy", "partial", "missing", "unavailable",
+  ]);
+
+  function hasAllowedKeys(value, allowed, required = allowed) {
+    if (!isObject(value)) return false;
+    const allowedKeys = new Set(allowed);
+    return Object.keys(value).every((key) => allowedKeys.has(key)) &&
+      required.every((key) =>
+        Object.prototype.hasOwnProperty.call(value, key));
+  }
+
+  function isCorrectionsText(value, maximum, allowEmpty = true) {
+    try {
+      correctionText(value, "value", maximum, allowEmpty);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function isCorrectionsIndexReview(value) {
+    return hasExactKeys(value, [
+      "revision", "state", "reason", "history_count", "latest_event",
+    ]) &&
+      isArtifactRevision(value.revision) &&
+      CORRECTION_REVIEW_STATES.has(value.state) &&
+      isCorrectionsText(value.reason, 2048) &&
+      Number.isSafeInteger(value.history_count) &&
+      value.history_count >= 0 &&
+      value.history_count <= MAX_CORRECTION_AUDIT_EVENTS &&
+      (value.state === "clear" ? value.reason === "" :
+        !!value.reason.trim()) &&
+      (value.latest_event === null
+        ? value.history_count === 0
+        : value.history_count > 0 &&
+          isCorrectionAuditEvent(value.latest_event) &&
+          value.latest_event.after_state === value.state);
+  }
+
+  function sameCorrectionsAuditEvent(left, right) {
+    if (left === null || right === null) return left === right;
+    return [
+      "operation_id", "action", "actor_id", "occurred_at", "before_state",
+      "after_state", "reason", "comment",
+    ].every((field) => left[field] === right[field]);
+  }
+
+  function sameCorrectionsIndexReview(left, right) {
+    return left.revision === right.revision &&
+      left.state === right.state &&
+      left.reason === right.reason &&
+      left.history_count === right.history_count &&
+      sameCorrectionsAuditEvent(left.latest_event, right.latest_event);
+  }
+
+  function isCorrectionsThumbnail(value) {
+    if (value === null) return true;
+    if (!hasAllowedKeys(
+      value,
+      ["url", "alt", "width", "height"],
+      ["url", "alt"],
+    ) || !isCorrectionsText(value.url, 4096, false) ||
+        !isCorrectionsText(value.alt, 512)) return false;
+    for (const name of ["width", "height"]) {
+      if (value[name] !== undefined &&
+          (!Number.isSafeInteger(value[name]) || value[name] < 1)) {
+        return false;
+      }
+    }
+    return !/^(?:javascript|file|filesystem):/i.test(value.url) &&
+      (!/^data:/i.test(value.url) || /^data:image\//i.test(value.url));
+  }
+
+  function isCorrectionsCapture(value) {
+    if (!hasAllowedKeys(value, [
+      "artifact_id", "revision", "capture_order", "label",
+      "representation_id", "canvas_id", "effective_category",
+      "resource_state", "import_state", "freshness", "thumbnail",
+    ], [
+      "artifact_id", "revision", "capture_order", "label",
+      "effective_category", "resource_state", "import_state", "freshness",
+      "thumbnail",
+    ]) || !isPortableIdentifier(value.artifact_id) ||
+        !isArtifactRevision(value.revision) ||
+        !Number.isSafeInteger(value.capture_order) ||
+        value.capture_order < 0 ||
+        !isCorrectionsText(value.label, 512) ||
+        !ARTIFACT_CATEGORIES.has(value.effective_category) ||
+        !ARTIFACT_RESOURCE_STATES.has(value.resource_state) ||
+        !CORRECTIONS_IMPORT_STATES.has(value.import_state) ||
+        !ARTIFACT_FRESHNESS.has(value.freshness) ||
+        !isCorrectionsThumbnail(value.thumbnail)) return false;
+    for (const name of ["representation_id", "canvas_id"]) {
+      if (value[name] !== undefined &&
+          !isPortableIdentifier(value[name])) return false;
+    }
+    return value.resource_state === "available" ||
+      value.thumbnail === null;
+  }
+
+  function isCorrectionsBook(value) {
+    if (!hasExactKeys(value, [
+      "id", "revision", "title", "import_state", "issues", "review",
+      "captures",
+    ]) || !isPortableIdentifier(value.id) ||
+        !isArtifactRevision(value.revision) ||
+        !isCorrectionsText(value.title, 2048) ||
+        !CORRECTIONS_IMPORT_STATES.has(value.import_state) ||
+        !Array.isArray(value.issues) || value.issues.length > 1024 ||
+        !value.issues.every((issue) =>
+          isCorrectionsText(issue, 2048, false)) ||
+        !isCorrectionsIndexReview(value.review) ||
+        !Array.isArray(value.captures) || value.captures.length > 100000 ||
+        !value.captures.every(isCorrectionsCapture)) return false;
+    const artifactIds = value.captures.map((capture) =>
+      capture.artifact_id.toLowerCase());
+    const orders = value.captures.map((capture) => capture.capture_order);
+    return new Set(artifactIds).size === artifactIds.length &&
+      new Set(orders).size === orders.length;
+  }
+
+  function isCorrectionsAttentionEntry(value) {
+    return hasExactKeys(value, ["key", "target", "review"]) &&
+      isPortableIdentifier(value.key) &&
+      hasExactKeys(value.target, ["kind", "item_id"]) &&
+      value.target.kind === "book" &&
+      isPortableIdentifier(value.target.item_id) &&
+      isCorrectionsIndexReview(value.review) &&
+      value.review.state !== "clear";
+  }
+
+  function isCorrectionsIndex(value) {
+    if (!hasExactKeys(value, [
+      "schema", "revision", "books", "attention",
+    ]) || value.schema !== "librarytool.corrections-index/1" ||
+        !isArtifactRevision(value.revision) ||
+        !Array.isArray(value.books) || value.books.length > 100000 ||
+        !value.books.every(isCorrectionsBook) ||
+        !Array.isArray(value.attention) ||
+        value.attention.length > 1000000 ||
+        !value.attention.every(isCorrectionsAttentionEntry)) return false;
+    const books = new Map(value.books.map((book) => [book.id, book]));
+    const attentionByBook = new Map(value.attention.map((entry) =>
+      [entry.target.item_id, entry]));
+    const bookIds = value.books.map((book) => book.id.toLowerCase());
+    const keys = value.attention.map((entry) => entry.key.toLowerCase());
+    const targets = value.attention.map((entry) => entry.target.item_id);
+    return new Set(bookIds).size === bookIds.length &&
+      new Set(keys).size === keys.length &&
+      new Set(targets).size === targets.length &&
+      targets.every((itemId) => books.has(itemId)) &&
+      value.books.every((book) => {
+        const entry = attentionByBook.get(book.id);
+        if (book.review.state === "clear") return entry === undefined;
+        return entry !== undefined &&
+          sameCorrectionsIndexReview(book.review, entry.review);
+      });
   }
 
   function isPolygonSelector(value, canvasRevision) {
@@ -915,8 +1242,7 @@
       value.role_assignments.length <= 3 &&
       value.role_assignments.every(isRoleAssignment) &&
       hasUniqueOrigins(value.role_assignments) &&
-      (value.effective_role === "" ||
-        isPortableIdentifier(value.effective_role)) &&
+      isEffectiveRole(value.role_assignments, value.effective_role) &&
       Array.isArray(value.caption_assertions) &&
       value.caption_assertions.length <= 32 &&
       value.caption_assertions.every(isArtifactCaption) &&
@@ -927,7 +1253,7 @@
       new Set(value.linked_artifact_ids).size ===
         value.linked_artifact_ids.length &&
       isArtifactProvenance(value.provenance) &&
-      isBoundedArtifactJson(value.extensions);
+      isArtifactExtensionJson(value.extensions);
   }
 
   function isItemTombstone(value) {
@@ -1177,188 +1503,6 @@
       isCorrectionInversePayload(inverse, expected);
   }
 
-  const CORRECTIONS_IDENTIFIER =
-    /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
-  const CORRECTIONS_REVIEW_STATES =
-    new Set(["clear", "needs_attention", "resolved"]);
-  const CORRECTIONS_REVIEW_ACTIONS = new Set([
-    "attention.mark", "attention.resolve", "attention.reopen",
-    "attention.clear",
-  ]);
-  const CORRECTIONS_IMPORT_STATES = new Set([
-    "ready", "pending", "legacy", "partial", "missing", "unavailable",
-  ]);
-
-  function hasAllowedKeys(value, allowed, required) {
-    if (!isObject(value)) return false;
-    const keys = Object.keys(value);
-    const allowedSet = new Set(allowed);
-    return keys.every((key) => allowedSet.has(key)) &&
-      required.every((key) =>
-        Object.prototype.hasOwnProperty.call(value, key));
-  }
-
-  function isCorrectionsIdentifier(value) {
-    return typeof value === "string" && CORRECTIONS_IDENTIFIER.test(value);
-  }
-
-  function isCorrectionsText(value, maximum, allowEmpty = true) {
-    return typeof value === "string" && value.length <= maximum &&
-      !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value) &&
-      (allowEmpty || !!value.trim());
-  }
-
-  function isCorrectionsAuditEvent(value) {
-    return hasExactKeys(value, [
-      "operation_id", "action", "actor_id", "occurred_at", "before_state",
-      "after_state", "reason", "comment",
-    ]) && isCorrectionsIdentifier(value.operation_id) &&
-      CORRECTIONS_REVIEW_ACTIONS.has(value.action) &&
-      isCorrectionsIdentifier(value.actor_id) &&
-      typeof value.occurred_at === "string" &&
-      /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z$/.test(
-        value.occurred_at) &&
-      Number.isFinite(Date.parse(value.occurred_at)) &&
-      CORRECTIONS_REVIEW_STATES.has(value.before_state) &&
-      CORRECTIONS_REVIEW_STATES.has(value.after_state) &&
-      isCorrectionsText(value.reason, 2048) &&
-      isCorrectionsText(value.comment, 8192) &&
-      (value.action !== "attention.mark" || !!value.reason.trim());
-  }
-
-  function isCorrectionsReviewState(value) {
-    return isArtifactRevision(value.revision) &&
-      CORRECTIONS_REVIEW_STATES.has(value.state) &&
-      isCorrectionsText(value.reason, 2048) &&
-      (value.state === "clear" ? value.reason === "" : !!value.reason.trim());
-  }
-
-  function isCorrectionsReviewSummary(value) {
-    return hasExactKeys(value, [
-      "revision", "state", "reason", "history_count", "latest_event",
-    ]) && isCorrectionsReviewState(value) &&
-      Number.isSafeInteger(value.history_count) &&
-      value.history_count >= 0 &&
-      (value.latest_event === null
-        ? value.history_count === 0
-        : value.history_count > 0 &&
-          isCorrectionsAuditEvent(value.latest_event) &&
-          value.latest_event.after_state === value.state);
-  }
-
-  function isCorrectionsFullReview(value) {
-    if (!hasExactKeys(value, [
-      "revision", "state", "reason", "history",
-    ]) || !isCorrectionsReviewState(value) ||
-        !Array.isArray(value.history) || value.history.length > 10000 ||
-        !value.history.every(isCorrectionsAuditEvent)) return false;
-    for (let index = 1; index < value.history.length; index += 1) {
-      if (value.history[index - 1].after_state !==
-          value.history[index].before_state) return false;
-    }
-    return !value.history.length ||
-      value.history[value.history.length - 1].after_state === value.state;
-  }
-
-  function isCorrectionsBookTarget(value, itemId = null) {
-    return hasExactKeys(value, ["kind", "item_id"]) &&
-      value.kind === "book" &&
-      isPortableIdentifier(value.item_id) &&
-      (itemId === null || value.item_id === itemId);
-  }
-
-  function isCorrectionsThumbnail(value) {
-    if (value === null) return true;
-    if (!hasAllowedKeys(
-      value,
-      ["url", "alt", "width", "height"],
-      ["url", "alt"],
-    ) || !isCorrectionsText(value.url, 4096, false) ||
-        !isCorrectionsText(value.alt, 512)) return false;
-    for (const name of ["width", "height"]) {
-      if (value[name] !== undefined &&
-          (!Number.isSafeInteger(value[name]) || value[name] < 1)) return false;
-    }
-    return !/^(?:javascript|file|filesystem):/i.test(value.url) &&
-      (!/^data:/i.test(value.url) || /^data:image\//i.test(value.url));
-  }
-
-  function isCorrectionsCapture(value) {
-    if (!hasAllowedKeys(value, [
-      "artifact_id", "revision", "capture_order", "label",
-      "representation_id", "canvas_id", "effective_category",
-      "resource_state", "import_state", "freshness", "thumbnail",
-    ], [
-      "artifact_id", "revision", "capture_order", "label",
-      "effective_category", "resource_state", "import_state", "freshness",
-      "thumbnail",
-    ]) || !isPortableIdentifier(value.artifact_id) ||
-        !isArtifactRevision(value.revision) ||
-        !Number.isSafeInteger(value.capture_order) ||
-        value.capture_order < 0 ||
-        !isCorrectionsText(value.label, 512) ||
-        !ARTIFACT_CATEGORIES.has(value.effective_category) ||
-        !ARTIFACT_RESOURCE_STATES.has(value.resource_state) ||
-        !CORRECTIONS_IMPORT_STATES.has(value.import_state) ||
-        !ARTIFACT_FRESHNESS.has(value.freshness) ||
-        !isCorrectionsThumbnail(value.thumbnail)) return false;
-    for (const name of ["representation_id", "canvas_id"]) {
-      if (value[name] !== undefined &&
-          !isPortableIdentifier(value[name])) return false;
-    }
-    return value.resource_state === "available" ||
-      value.thumbnail === null;
-  }
-
-  function isCorrectionsBook(value) {
-    if (!hasExactKeys(value, [
-      "id", "revision", "title", "import_state", "issues", "review",
-      "captures",
-    ]) || !isPortableIdentifier(value.id) ||
-        !isArtifactRevision(value.revision) ||
-        !isCorrectionsText(value.title, 2048) ||
-        !CORRECTIONS_IMPORT_STATES.has(value.import_state) ||
-        !Array.isArray(value.issues) || value.issues.length > 1024 ||
-        !value.issues.every((issue) =>
-          isCorrectionsText(issue, 2048, false)) ||
-        !isCorrectionsReviewSummary(value.review) ||
-        !Array.isArray(value.captures) || value.captures.length > 100000 ||
-        !value.captures.every(isCorrectionsCapture)) return false;
-    const ids = value.captures.map((capture) =>
-      capture.artifact_id.toLowerCase());
-    const orders = value.captures.map((capture) => capture.capture_order);
-    return new Set(ids).size === ids.length &&
-      new Set(orders).size === orders.length;
-  }
-
-  function isCorrectionsAttentionEntry(value) {
-    return hasExactKeys(value, ["key", "target", "review"]) &&
-      isCorrectionsIdentifier(value.key) &&
-      isCorrectionsBookTarget(value.target) &&
-      isCorrectionsReviewSummary(value.review) &&
-      value.review.state !== "clear";
-  }
-
-  function isCorrectionsIndex(value) {
-    if (!hasExactKeys(value, [
-      "schema", "revision", "books", "attention",
-    ]) || value.schema !== "librarytool.corrections-index/1" ||
-        !isArtifactRevision(value.revision) ||
-        !Array.isArray(value.books) || value.books.length > 100000 ||
-        !value.books.every(isCorrectionsBook) ||
-        !Array.isArray(value.attention) ||
-        value.attention.length > 1000000 ||
-        !value.attention.every(isCorrectionsAttentionEntry)) return false;
-    const books = new Set(value.books.map((book) => book.id));
-    const bookIds = value.books.map((book) => book.id.toLowerCase());
-    const keys = value.attention.map((entry) => entry.key.toLowerCase());
-    const targets = value.attention.map((entry) => entry.target.item_id);
-    return new Set(bookIds).size === bookIds.length &&
-      new Set(keys).size === keys.length &&
-      new Set(targets).size === targets.length &&
-      targets.every((itemId) => books.has(itemId));
-  }
-
   const CORRECTION_TRANSFORM_COMMAND_FIELDS = [
     "schema", "version", "item_id", "artifact_id", "artifact_revision",
     "source_revision", "source_sha256", "quad", "adjustment", "rerun_ocr",
@@ -1564,8 +1708,6 @@
       this.corrections = Object.freeze({
         index: (args) =>
           this._correctionsIndex(args),
-        getReview: (args) =>
-          this._correctionReviewGet(args),
         assignImageCategory: (args) =>
           this._correctionAssignImageCategory(args),
         clearImageCategory: (args) =>
@@ -1582,6 +1724,10 @@
           this._correctionClearManualCaption(args),
         assertArtifactMetadata: (args) =>
           this._correctionAssertArtifactMetadata(args),
+        getReview: (args) =>
+          this._correctionReviewGet(args),
+        listReviewHistory: (args) =>
+          this._correctionReviewHistoryList(args),
         markAttention: (args) =>
           this._correctionMarkAttention(args),
         resolveCorrections: (args) =>
@@ -2307,64 +2453,6 @@
       });
     }
 
-    _correctionsIndex({ workspaceId, signal } = {}) {
-      if (!isCorrectionsIdentifier(workspaceId)) {
-        throw new TypeError(
-          "workspaceId is required and must be a portable identifier");
-      }
-      const path = "/v1/corrections/index";
-      return this._requestJson("GET", path, {
-        query: { workspace_id: workspaceId },
-        signal,
-        cache: "no-cache",
-        includeStatus: true,
-      }).then(({ body, status }) => {
-        const index = body && {
-          schema: body.schema,
-          revision: body.revision,
-          books: body.books,
-          attention: body.attention,
-        };
-        if (status !== 200 || !hasExactKeys(body, [
-          "ok", "schema", "revision", "books", "attention",
-        ]) || body.ok !== true || !isCorrectionsIndex(index) ||
-            containsCommandFingerprint(body)) {
-          this._invalidResponse(
-            "Engine returned an invalid Corrections index",
-            "GET", path, body, undefined, status);
-        }
-        return index;
-      });
-    }
-
-    _correctionReviewGet({ itemId, signal } = {}) {
-      const item = portableIdentifier(itemId, "itemId");
-      const path = `/v1/items/${encodePart(item)}/corrections/review`;
-      return this._requestJson("GET", path, {
-        signal,
-        cache: "no-cache",
-        includeStatus: true,
-      }).then(({ body, status }) => {
-        const document = body && {
-          schema: body.schema,
-          target: body.target,
-          review: body.review,
-        };
-        if (status !== 200 || !hasExactKeys(body, [
-          "ok", "schema", "target", "review",
-        ]) || body.ok !== true ||
-            document.schema !== "librarytool.corrections-review/1" ||
-            !isCorrectionsBookTarget(document.target, item) ||
-            !isCorrectionsFullReview(document.review) ||
-            containsCommandFingerprint(body)) {
-          this._invalidResponse(
-            "Engine returned an invalid correction review",
-            "GET", path, body, undefined, status);
-        }
-        return document;
-      });
-    }
-
     _correctionAssignImageCategory({ itemId, artifactId,
       expectedArtifactRevision, category, idempotencyKey, signal } = {}) {
       if (!ARTIFACT_CATEGORIES.has(category)) {
@@ -2502,8 +2590,138 @@
       });
     }
 
-    _correctionMarkAttention({ itemId, expectedReviewRevision,
-      reason, comment = "", idempotencyKey, signal } = {}) {
+    _correctionsIndex({ workspaceId, signal } = {}) {
+      const workspace = portableIdentifier(workspaceId, "workspaceId");
+      const path = "/v1/corrections/index";
+      return this._requestJson("GET", path, {
+        query: { workspace_id: workspace },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const index = body && {
+          schema: body.schema,
+          revision: body.revision,
+          books: body.books,
+          attention: body.attention,
+        };
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "revision", "books", "attention",
+        ]) || body.ok !== true || !isCorrectionsIndex(index) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid Corrections index",
+            "GET", path, body, undefined, status);
+        }
+        return index;
+      });
+    }
+
+    _correctionReviewGet({ itemId, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const path = `/v1/items/${encodePart(item)}/corrections/review`;
+      return this._requestJson("GET", path, {
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "item_id", "review",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.correction-review/1" ||
+            body.item_id !== item ||
+            !isCorrectionReviewSummary(body.review) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid correction review",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _correctionReviewHistoryList({ itemId, reviewRevision, cursor,
+      limit = 100, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (!isArtifactRevision(reviewRevision)) {
+        throw new TypeError("reviewRevision is not a valid review revision");
+      }
+      if (cursor != null && cursor !== "" &&
+          (typeof cursor !== "string" || cursor.length > 2048)) {
+        throw new TypeError("cursor must be a bounded opaque string");
+      }
+      if (!Number.isSafeInteger(limit) || limit < 1 ||
+          limit > CORRECTION_REVIEW_HISTORY_PAGE_LIMIT) {
+        throw new TypeError(
+          `limit must be an integer from 1 to ${
+            CORRECTION_REVIEW_HISTORY_PAGE_LIMIT}`);
+      }
+      const path =
+        `/v1/items/${encodePart(item)}/corrections/review/history`;
+      return this._requestJson("GET", path, {
+        headers: {
+          "If-Review-Match": quoteRevision(
+            reviewRevision,
+            "reviewRevision",
+          ),
+        },
+        query: { cursor, limit },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const events = body && body.events;
+        const eventIds = Array.isArray(events)
+          ? events.map((event) => event.operation_id)
+          : [];
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "item_id", "review_revision", "review_state",
+          "events", "next_cursor", "total",
+        ]) && body.ok === true &&
+          body.schema === "librarytool.correction-review-history/1" &&
+          body.item_id === item &&
+          body.review_revision === reviewRevision &&
+          CORRECTION_REVIEW_STATES.has(body.review_state) &&
+          Array.isArray(events) && events.length <= limit &&
+          events.every(isCorrectionAuditEvent) &&
+          isContinuousAuditEvents(events) &&
+          new Set(eventIds).size === eventIds.length &&
+          (body.next_cursor === null ||
+            typeof body.next_cursor === "string" &&
+            body.next_cursor.length >= 1 &&
+            body.next_cursor.length <= 2048) &&
+          Number.isSafeInteger(body.total) && body.total >= 0 &&
+          body.total <= MAX_CORRECTION_AUDIT_EVENTS &&
+          body.total >= events.length &&
+          (body.total === 0 || events.length > 0) &&
+          (body.next_cursor === null || events.length === limit) &&
+          (cursor || (
+            events.length === Math.min(limit, body.total) &&
+            (body.next_cursor !== null) === (body.total > events.length)
+          )) &&
+          (body.next_cursor !== null || events.length === 0 ||
+            events.at(-1).after_state === body.review_state) &&
+          (body.total !== 0 ||
+            events.length === 0 && body.next_cursor === null) &&
+          !containsCommandFingerprint(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid correction review history page",
+            "GET", path, body, { cursor, limit }, status);
+        }
+        return body;
+      });
+    }
+
+    _correctionMarkAttention(args = {}) {
+      if (Object.prototype.hasOwnProperty.call(args, "actorId") ||
+          Object.prototype.hasOwnProperty.call(args, "actor_id")) {
+        throw new TypeError("correction review actors are server-owned");
+      }
+      const {
+        itemId, expectedReviewRevision, reason, comment = "",
+        idempotencyKey, signal,
+      } = args;
       return this._correctionReviewMutation({
         action: "attention.mark",
         method: "PUT",
@@ -2517,8 +2735,14 @@
       });
     }
 
-    _correctionResolve({ itemId, expectedReviewRevision,
-      comment = "", idempotencyKey, signal } = {}) {
+    _correctionResolve(args = {}) {
+      if (Object.prototype.hasOwnProperty.call(args, "actorId") ||
+          Object.prototype.hasOwnProperty.call(args, "actor_id")) {
+        throw new TypeError("correction review actors are server-owned");
+      }
+      const {
+        itemId, expectedReviewRevision, comment = "", idempotencyKey, signal,
+      } = args;
       return this._correctionReviewMutation({
         action: "attention.resolve",
         method: "POST",
@@ -2531,8 +2755,14 @@
       });
     }
 
-    _correctionReopen({ itemId, expectedReviewRevision,
-      comment = "", idempotencyKey, signal } = {}) {
+    _correctionReopen(args = {}) {
+      if (Object.prototype.hasOwnProperty.call(args, "actorId") ||
+          Object.prototype.hasOwnProperty.call(args, "actor_id")) {
+        throw new TypeError("correction review actors are server-owned");
+      }
+      const {
+        itemId, expectedReviewRevision, comment = "", idempotencyKey, signal,
+      } = args;
       return this._correctionReviewMutation({
         action: "attention.reopen",
         method: "POST",
