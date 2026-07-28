@@ -153,9 +153,15 @@ from librarytool.engine.errors import (  # noqa: E402
     ValidationError as EngineValidationError,
 )
 from librarytool.engine.correction_transforms import (  # noqa: E402
+    CorrectionTransformCancelled,
     CorrectionTransformCommand,
+    CorrectionTransformHooksPort,
     CorrectionTransformService,
     QueuedCorrectionTransform,
+)
+from librarytool.engine.correction_ocr import (  # noqa: E402
+    CorrectionOcrProviderSelection,
+    CorrectionOcrRecognition,
 )
 from librarytool.engine.jobs import (  # noqa: E402
     ACTIVE_JOB_STATES,
@@ -10114,6 +10120,98 @@ _OCR_SERVICES = {
     "textract": _ocr_textract,
     "mistral": _ocr_mistral,
 }
+
+
+def _correction_ocr_json_value(value, *, depth: int = 0):
+    """Convert legacy provider output into credential-free proposal JSON."""
+
+    if depth > 32:
+        raise ValueError("OCR provider output is nested too deeply")
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, bytes):
+        return {
+            "encoding": "base64",
+            "data": base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("OCR provider output keys must be strings")
+        return {
+            key: _correction_ocr_json_value(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _correction_ocr_json_value(item, depth=depth + 1)
+            for item in value
+        ]
+    raise ValueError(
+        f"OCR provider output contains unsupported {type(value).__name__}"
+    )
+
+
+class _EngineCorrectionOcrProvider:
+    """Adapt the existing OCR providers to proposal-only correction jobs."""
+
+    def select_provider(self) -> CorrectionOcrProviderSelection:
+        settings = _client_settings()
+        service = str(settings.get("ocrService") or "tesseract").strip().lower()
+        if service not in _OCR_SERVICES:
+            service = "tesseract"
+        model = ""
+        if service == "mistral":
+            model = str(
+                getattr(capture, "OCR_MODEL", "mistral-ocr-latest")
+            )
+        elif service == "claude":
+            model = str(
+                settings.get("ocrClaudeModel")
+                or "claude-haiku-4-5-20251001"
+            )
+        elif service == "textract":
+            model = "detect-document-text"
+        elif service == "tesseract":
+            model = "local"
+        return CorrectionOcrProviderSelection(service, model)
+
+    def recognize(
+        self,
+        selection: CorrectionOcrProviderSelection,
+        content: bytes,
+        hooks: CorrectionTransformHooksPort,
+    ) -> CorrectionOcrRecognition:
+        if not isinstance(selection, CorrectionOcrProviderSelection):
+            raise TypeError("selection must be a CorrectionOcrProviderSelection")
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("OCR-ready content must be non-empty bytes")
+        if hooks.is_cancelled():
+            raise CorrectionTransformCancelled
+        runner = _OCR_SERVICES.get(selection.provider_id)
+        if runner is None:
+            raise RuntimeError(
+                f"unsupported OCR service: {selection.provider_id}"
+            )
+        base_cfg = _ocr_request_cfg({})
+        if selection.provider_id == "claude":
+            base_cfg["claude_model"] = selection.model
+        with _ocr_execution_cfg(
+            selection.provider_id,
+            base_cfg,
+        ) as execution_cfg:
+            result = runner(content, execution_cfg)
+        if hooks.is_cancelled():
+            raise CorrectionTransformCancelled
+        payload = (
+            _correction_ocr_json_value(result)
+            if isinstance(result, Mapping)
+            else {"text": str(result or "")}
+        )
+        return CorrectionOcrRecognition(
+            selection.provider_id,
+            selection.model,
+            payload,
+        )
 
 
 def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
