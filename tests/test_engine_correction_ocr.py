@@ -20,6 +20,7 @@ from librarytool.engine.correction_transforms import (
     OcrFollowupRequest,
     OcrFollowupState,
 )
+from librarytool.engine.errors import ConflictError
 from librarytool.engine.jobs import JobManager
 
 
@@ -186,6 +187,105 @@ def test_interrupted_child_reconciles_a_proposal_committed_before_crash() -> Non
     child = jobs.view(service.job_id_for(request.operation_id))
     assert child.state.value == "done"
     assert child.outputs[0].ref == first.proposal_ref
+
+
+def test_outcome_query_prefers_durable_proposal_without_mutating_child() -> None:
+    jobs = JobManager(checkpoint_interval=0)
+    repository = MemoryProposalRepository()
+    provider = Provider()
+    service = CorrectionOcrFollowupService(jobs, repository, provider)
+    request = _request()
+    first = service.run_ocr_followup(request, Hooks())
+    record = jobs.records[service.job_id_for(request.operation_id)]
+    jobs.transition(
+        record,
+        "cancelled",
+        outputs=[],
+        note="stale cancellation after proposal publication",
+    )
+
+    recovered = service.find_ocr_followup(request)
+
+    assert recovered == first
+    assert jobs.view(record["id"]).state.value == "cancelled"
+    assert jobs.view(record["id"]).outputs == ()
+    assert provider.calls == 1
+    assert repository.commits == 1
+
+
+def test_outcome_query_does_not_resume_interrupted_child() -> None:
+    jobs = JobManager(checkpoint_interval=0)
+    repository = MemoryProposalRepository()
+    provider = Provider()
+    service = CorrectionOcrFollowupService(jobs, repository, provider)
+    request = _request()
+    record = {
+        "id": service.job_id_for(request.operation_id),
+        "kind": CORRECTION_OCR_JOB_KIND,
+        "status": "running",
+        "subject": {
+            "item_id": request.item_id,
+            "source_id": request.source.artifact_id,
+        },
+        "input_revisions": {
+            "parent_operation_id": request.operation_id,
+            "artifact_id": request.source.artifact_id,
+            "artifact_revision": request.source.artifact_revision,
+            "source_sha256": request.source.content_sha256,
+            "publication_policy": CORRECTION_OCR_PROPOSAL_POLICY,
+            "command_sha256": service._command_sha256(request),
+        },
+    }
+    jobs.track(record, CORRECTION_OCR_JOB_KIND)
+    jobs.transition(record, "interrupted")
+
+    assert service.find_ocr_followup(request) is None
+    assert jobs.view(record["id"]).state.value == "interrupted"
+    assert repository.reads == 0
+    assert provider.calls == 0
+
+
+def test_outcome_query_recovers_pruned_failed_child_receipt() -> None:
+    jobs = JobManager(keep=0, checkpoint_interval=0)
+    repository = MemoryProposalRepository()
+    service = CorrectionOcrFollowupService(
+        jobs,
+        repository,
+        FailingProvider(),
+    )
+    request = _request()
+    failed = service.run_ocr_followup(request, Hooks())
+
+    assert failed.state is OcrFollowupState.FAILED
+    assert jobs.view(service.job_id_for(request.operation_id)) is None
+
+    recovered = service.find_ocr_followup(request)
+
+    assert recovered == failed
+    assert recovered.failure.code == "ocr_followup_failed"
+    assert repository.reads == 1
+    assert repository.commits == 0
+
+
+def test_outcome_query_recovers_pruned_cancelled_child_receipt() -> None:
+    jobs = JobManager(keep=0, checkpoint_interval=0)
+    repository = MemoryProposalRepository()
+    provider = Provider()
+    service = CorrectionOcrFollowupService(jobs, repository, provider)
+    request = _request()
+    cancelled = service.run_ocr_followup(
+        request,
+        Hooks(cancelled=True),
+    )
+
+    assert cancelled.state is OcrFollowupState.CANCELLED
+    assert jobs.view(service.job_id_for(request.operation_id)) is None
+
+    recovered = service.find_ocr_followup(request)
+
+    assert recovered == cancelled
+    assert repository.reads == 0
+    assert provider.calls == 0
 
 
 def test_interrupted_child_without_proposal_retries_exact_source() -> None:
@@ -360,6 +460,40 @@ def test_existing_child_requires_every_exact_request_pin(
         service.run_ocr_followup(request, Hooks())
 
     assert provider.calls == 0
+
+
+def test_outcome_query_normalizes_invalid_child_pins_to_engine_conflict() -> None:
+    jobs = JobManager(checkpoint_interval=0)
+    service = CorrectionOcrFollowupService(
+        jobs,
+        MemoryProposalRepository(),
+        Provider(),
+    )
+    request = _request()
+    record = {
+        "id": service.job_id_for(request.operation_id),
+        "kind": CORRECTION_OCR_JOB_KIND,
+        "status": "interrupted",
+        "subject": {
+            "item_id": request.item_id,
+            "source_id": request.source.artifact_id,
+        },
+        "input_revisions": {
+            "parent_operation_id": request.operation_id,
+            "artifact_id": "different-artifact",
+            "artifact_revision": request.source.artifact_revision,
+            "source_sha256": request.source.content_sha256,
+            "publication_policy": CORRECTION_OCR_PROPOSAL_POLICY,
+            "command_sha256": service._command_sha256(request),
+        },
+    }
+    jobs.track(record, CORRECTION_OCR_JOB_KIND)
+    jobs.transition(record, "interrupted")
+
+    with pytest.raises(ConflictError) as raised:
+        service.find_ocr_followup(request)
+
+    assert raised.value.code == "correction_ocr_reconciliation_conflict"
 
 
 def test_done_child_fails_if_its_durable_proposal_disappears() -> None:

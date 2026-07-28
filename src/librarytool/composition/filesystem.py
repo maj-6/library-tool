@@ -1199,6 +1199,8 @@ def compose_filesystem_engine(
             resources.jobs,
             executor=correction_transform_worker.run,
             start_guard_for=corrections.job_start_context_for,
+            committed_transforms=correction_transform_store,
+            ocr_outcomes=correction_ocr,
         )
 
     canvas_query = None

@@ -409,6 +409,139 @@ def test_retry_interrupted_refuses_to_erase_committed_outputs():
     assert jobs.view("correction-1").outputs[0].ref == "output-1"
 
 
+def test_retry_interrupted_never_resets_a_correction_transform_parent():
+    history = MemoryHistory({
+        "correction-1": {
+            "id": "correction-1",
+            "kind": "correction.transform",
+            "state": "running",
+            "status": "running",
+            "outputs": [],
+        },
+    })
+    jobs = manager(history)
+    jobs.rehydrate()
+
+    with pytest.raises(ConflictError) as raised:
+        jobs.retry_interrupted("correction-1")
+
+    assert raised.value.code == "job_retry_forbidden"
+    assert jobs.view("correction-1").state is JobState.INTERRUPTED
+
+
+def test_reconcile_interrupted_converges_a_pruned_command_receipt():
+    history = MemoryHistory()
+    digest = "a" * 64
+    first = manager(history, keep=0)
+    record = {
+        "id": "correction-1",
+        "kind": "correction.transform",
+        "status": "running",
+        "operation_id": "correction-operation-1",
+        "command_sha256": digest,
+        "input_revisions": {
+            "artifact_revision": "artifact-r1",
+            "command_sha256": digest,
+        },
+    }
+    first.track(record, "correction.transform")
+
+    reopened = manager(history, keep=0)
+    reopened.rehydrate(strict=True)
+    assert reopened.view(record["id"]) is None
+    interrupted = reopened.command_receipt(
+        record["operation_id"],
+        digest,
+        kind="correction.transform",
+    )
+    assert interrupted.job.state is JobState.INTERRUPTED
+    interrupted_finished_at = interrupted.job.finished_at
+
+    reconciled = reopened.reconcile_interrupted(
+        record["id"],
+        "done",
+        input_revisions={
+            **record["input_revisions"],
+            "dependent_assertions": {"spatial_annotations": []},
+        },
+        outputs=[
+            {"kind": "corrected-display", "ref": "corrected-1"},
+        ],
+        done=6,
+        total=6,
+        errors=0,
+        error="",
+        failure=None,
+        note="correction complete",
+        progress={
+            "completed": 6,
+            "total": 6,
+            "unit": "phase",
+            "phase": "complete",
+        },
+    )
+
+    assert reconciled.state is JobState.DONE
+    assert reconciled.finished_at > interrupted_finished_at
+    assert reconciled.outputs[0].ref == "corrected-1"
+    replay = reopened.command_receipt(
+        record["operation_id"],
+        digest,
+        kind="correction.transform",
+    )
+    assert replay.job == reconciled
+
+    restarted = manager(history, keep=0)
+    restarted.rehydrate(strict=True)
+    durable = restarted.command_receipt(
+        record["operation_id"],
+        digest,
+        kind="correction.transform",
+    )
+    assert durable.job.state is JobState.DONE
+    assert durable.job.outputs == reconciled.outputs
+
+
+def test_reconcile_interrupted_cannot_remove_outputs_or_change_input_pins():
+    history = MemoryHistory({
+        "correction-1": {
+            "id": "correction-1",
+            "kind": "correction.transform",
+            "state": "running",
+            "status": "running",
+            "input_revisions": {"artifact_revision": "artifact-r1"},
+            "outputs": [
+                {"kind": "corrected-display", "ref": "corrected-1"},
+            ],
+        },
+    })
+    jobs = manager(history)
+    jobs.rehydrate(strict=True)
+
+    with pytest.raises(ConflictError) as output_conflict:
+        jobs.reconcile_interrupted(
+            "correction-1",
+            "interrupted",
+            input_revisions={"artifact_revision": "artifact-r1"},
+            outputs=[],
+        )
+    assert output_conflict.value.code == "job_reconciliation_conflict"
+    with pytest.raises(ConflictError) as input_conflict:
+        jobs.reconcile_interrupted(
+            "correction-1",
+            "interrupted",
+            input_revisions={"artifact_revision": "artifact-r2"},
+            outputs=[
+                {"kind": "corrected-display", "ref": "corrected-1"},
+            ],
+        )
+    assert input_conflict.value.code == "job_reconciliation_conflict"
+    current = jobs.view("correction-1")
+    assert current.state is JobState.INTERRUPTED
+    assert current.input_revisions["artifact_revision"] == "artifact-r1"
+    assert current.outputs[0].ref == "corrected-1"
+
+
 def test_nested_public_job_values_are_defensive_snapshots():
     history = MemoryHistory()
     jobs = manager(history)

@@ -27,7 +27,7 @@ from .correction_transforms import (
     OcrFollowupState,
 )
 from .jobs import JobFailure, JobManager, JobOutput, JobProgress, JobState, JobView
-from .errors import EngineError, ValidationError
+from .errors import ConflictError, EngineError, ValidationError
 
 
 CORRECTION_OCR_JOB_KIND = "correction.ocr-followup"
@@ -492,6 +492,65 @@ class CorrectionOcrFollowupService:
     def _command_sha256(request: OcrFollowupRequest) -> str:
         return hashlib.sha256(_canonical_json(request.as_dict())).hexdigest()
 
+    def find_ocr_followup(
+        self,
+        request: OcrFollowupRequest,
+    ) -> OcrFollowupOutcome | None:
+        """Read a durable/terminal child outcome without starting provider work."""
+
+        if not isinstance(request, OcrFollowupRequest):
+            raise TypeError("request must be an OcrFollowupRequest")
+        with self._lock:
+            try:
+                existing = self._existing_job(request)
+                if existing is not None:
+                    self._validate_existing(existing, request)
+                stored = self._repository.find_proposal(request)
+                if stored is not None:
+                    self._validate_stored(stored, request)
+                    if existing is not None:
+                        provider_pin = existing.input_revisions.get("provider")
+                        if (
+                            provider_pin is not None
+                            and self._selection_from_pin(provider_pin)
+                            != stored.provider
+                        ):
+                            raise EngineError(
+                                "OCR proposal does not match the child provider pin",
+                                code="correction_ocr_provider_pin_mismatch",
+                            )
+                    return OcrFollowupOutcome(
+                        OcrFollowupState.SUCCEEDED,
+                        source=stored.source,
+                        proposal_ref=stored.proposal_ref,
+                    )
+                if existing is None or existing.state in {
+                    JobState.QUEUED,
+                    JobState.RUNNING,
+                    JobState.CANCELLING,
+                    JobState.INTERRUPTED,
+                }:
+                    return None
+                if existing.state is JobState.DONE:
+                    return OcrFollowupOutcome(
+                        OcrFollowupState.FAILED,
+                        source=request.source,
+                        failure=JobFailure(
+                            "ocr_proposal_missing",
+                            "the OCR child job has no durable proposal",
+                            retryable=False,
+                        ),
+                    )
+                return self._outcome_from_job(existing, request.source)
+            except EngineError:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise ConflictError(
+                    "durable OCR child state does not match its parent request",
+                    code="correction_ocr_reconciliation_conflict",
+                    details={"cause_type": type(exc).__name__},
+                ) from exc
+
     def run_ocr_followup(
         self,
         request: OcrFollowupRequest,
@@ -502,7 +561,7 @@ class CorrectionOcrFollowupService:
         if not isinstance(hooks, CorrectionTransformHooksPort):
             raise TypeError("hooks must implement CorrectionTransformHooksPort")
         with self._lock:
-            existing = self._jobs.view(self.job_id_for(request.operation_id))
+            existing = self._existing_job(request)
             if existing is not None:
                 self._validate_existing(existing, request)
                 try:
@@ -552,6 +611,12 @@ class CorrectionOcrFollowupService:
                             source=stored.source,
                             proposal_ref=stored.proposal_ref,
                         )
+                    if existing.job_id not in self._jobs.records:
+                        return OcrFollowupOutcome(
+                            OcrFollowupState.SUCCEEDED,
+                            source=stored.source,
+                            proposal_ref=stored.proposal_ref,
+                        )
                     return self._succeed(
                         stored,
                         self._record_for(existing.job_id),
@@ -568,8 +633,11 @@ class CorrectionOcrFollowupService:
                     )
                 if existing.state is JobState.INTERRUPTED:
                     retried = self._jobs.retry_interrupted(existing.job_id)
-                    if retried is None:  # pragma: no cover - manager invariant
-                        raise RuntimeError("interrupted OCR child disappeared")
+                    if retried is None:
+                        return self._outcome_from_job(
+                            existing,
+                            request.source,
+                        )
                     record = self._record_for(existing.job_id)
                     return self._execute(
                         request,
@@ -602,6 +670,17 @@ class CorrectionOcrFollowupService:
             self._jobs.track(record, CORRECTION_OCR_JOB_KIND)
             child_hooks = _ChildHooks(self._jobs, record, hooks)
             return self._execute(request, record, child_hooks)
+
+    def _existing_job(self, request: OcrFollowupRequest) -> JobView | None:
+        existing = self._jobs.view(self.job_id_for(request.operation_id))
+        if existing is not None:
+            return existing
+        receipt = self._jobs.command_receipt(
+            self.child_operation_id(request.operation_id),
+            self._command_sha256(request),
+            kind=CORRECTION_OCR_JOB_KIND,
+        )
+        return receipt.job if receipt is not None else None
 
     def _record_for(self, job_id: str) -> MutableMapping[str, Any]:
         record = self._jobs.records.get(job_id)
@@ -764,15 +843,17 @@ class CorrectionOcrFollowupService:
         source: CommittedCorrectionOutput,
         failure: JobFailure,
     ) -> OcrFollowupOutcome:
-        self._jobs.transition(
-            self._record_for(job.job_id),
-            "failed",
-            errors=1,
-            error=failure.message,
-            failure=failure.as_dict(),
-            note="OCR proposal is unavailable",
-            outputs=[],
-        )
+        record = self._jobs.records.get(job.job_id)
+        if record is not None:
+            self._jobs.transition(
+                record,
+                "failed",
+                errors=1,
+                error=failure.message,
+                failure=failure.as_dict(),
+                note="OCR proposal is unavailable",
+                outputs=[],
+            )
         return OcrFollowupOutcome(
             OcrFollowupState.FAILED,
             source=source,

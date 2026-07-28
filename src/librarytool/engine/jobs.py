@@ -675,7 +675,9 @@ class JobManager:
 
         A caller must still own the job-specific idempotency and input
         validation before invoking this generic lifecycle operation. Terminal
-        success, failure, and cancellation are never reopened.
+        success, failure, and cancellation are never reopened. Correction
+        transform parents are release-gated and must converge durable outputs
+        or use a new operation instead of being reset.
         """
 
         job_id = str(job_id or "")
@@ -694,6 +696,12 @@ class JobManager:
                 raise ConflictError(
                     "an interrupted job with committed outputs cannot be reset",
                     code="job_outputs_committed",
+                    details={"job_id": job_id, "state": state},
+                )
+            if str(job.get("kind") or "") == "correction.transform":
+                raise ConflictError(
+                    "interrupted correction transforms cannot be reset",
+                    code="job_retry_forbidden",
                     details={"job_id": job_id, "state": state},
                 )
             total = max(0, self._integer(job.get("total"), 0))
@@ -726,6 +734,145 @@ class JobManager:
                 note="queued after restart",
             )
             return self.view_of(job)
+
+    def reconcile_interrupted(
+        self,
+        job_id: str,
+        status: str,
+        **fields: Any,
+    ) -> JobView | None:
+        """Attach durable outcomes to interrupted work without resuming it.
+
+        Reconciliation may keep the job interrupted or converge it to terminal
+        success. It cannot reopen work, turn it into cancellation/failure, or
+        remove an output/input pin already present in durable history.
+        """
+
+        job_id = str(job_id or "")
+        target_state = self.state_of(status)
+        if target_state not in {
+            JobState.INTERRUPTED.value,
+            JobState.DONE.value,
+        }:
+            raise ValidationError(
+                "interrupted jobs may only remain interrupted or converge to done",
+                code="invalid_job_reconciliation",
+                details={"job_id": job_id, "status": str(status or "")},
+            )
+        allowed_fields = {
+            "done",
+            "total",
+            "errors",
+            "error",
+            "note",
+            "progress",
+            "input_revisions",
+            "outputs",
+            "failure",
+        }
+        unknown = set(fields) - allowed_fields
+        if unknown:
+            raise ValidationError(
+                "job reconciliation contains unsupported fields",
+                code="invalid_job_reconciliation",
+                details={"fields": sorted(unknown)},
+            )
+
+        with self._lock:
+            live = self._records.get(job_id)
+            operation_id = self._operation_by_job_id.get(job_id, "")
+            receipt = self._operation_receipts.get(operation_id)
+            receipt_job = (
+                receipt.get("job")
+                if isinstance(receipt, Mapping)
+                else None
+            )
+            raw = live if live is not None else receipt_job
+            if not isinstance(raw, Mapping):
+                return None
+            current_state = str(
+                raw.get("state") or self.state_of(raw.get("status"))
+            )
+            if current_state != JobState.INTERRUPTED.value:
+                return self.view_of(raw)
+
+            candidate = self.public(raw)
+            if "input_revisions" in fields:
+                current_inputs = candidate.get("input_revisions")
+                proposed_inputs = fields["input_revisions"]
+                if not isinstance(proposed_inputs, Mapping):
+                    raise ValidationError(
+                        "job reconciliation input revisions must be an object",
+                        code="invalid_job_reconciliation",
+                    )
+                existing = (
+                    current_inputs
+                    if isinstance(current_inputs, Mapping)
+                    else {}
+                )
+                if any(
+                    key not in proposed_inputs
+                    or proposed_inputs[key] != value
+                    for key, value in existing.items()
+                ):
+                    raise ConflictError(
+                        "job reconciliation would change an existing input pin",
+                        code="job_reconciliation_conflict",
+                        details={"job_id": job_id},
+                    )
+            if "outputs" in fields:
+                current_outputs = tuple(self.view_of(candidate).outputs)
+                output_candidate = dict(candidate)
+                output_candidate["outputs"] = fields["outputs"]
+                proposed_outputs = tuple(self.view_of(output_candidate).outputs)
+                if any(output not in proposed_outputs for output in current_outputs):
+                    raise ConflictError(
+                        "job reconciliation would remove a committed output",
+                        code="job_reconciliation_conflict",
+                        details={"job_id": job_id},
+                    )
+
+            copied_fields = deepcopy(fields)
+            unchanged = (
+                self.state_of(candidate.get("state") or candidate.get("status"))
+                == target_state
+                and all(candidate.get(key) == value for key, value in copied_fields.items())
+            )
+            if unchanged:
+                return self.view_of(candidate)
+
+            if live is not None:
+                transition_fields = dict(copied_fields)
+                if target_state == JobState.DONE.value:
+                    # Rehydration assigned the interruption timestamp. A
+                    # later evidence-backed completion gets its own terminal
+                    # time so retention orders it by the actual convergence.
+                    transition_fields["finished_at"] = ""
+                self._transition_locked(
+                    live,
+                    status,
+                    event_type="reconciled",
+                    **transition_fields,
+                )
+                return self.view_of(live)
+
+            candidate.update(copied_fields)
+            candidate["status"] = status
+            candidate["state"] = target_state
+            now = self._timestamp()
+            self._touch_locked(candidate, timestamp=now)
+            if target_state == JobState.DONE.value:
+                candidate["finished_at"] = now
+            elif target_state not in ACTIVE_JOB_STATES and not candidate.get(
+                "finished_at"
+            ):
+                candidate["finished_at"] = now
+            if receipt is not None:
+                receipt["job"] = self.public(candidate)
+            self._prune_command_receipts_locked()
+            self._save_locked()
+            self._emit_locked("reconciled", candidate)
+            return self.view_of(candidate)
 
     def is_cancelled(self, job: Mapping[str, Any]) -> bool:
         event = self._cancel_events.get(str(job.get("id") or ""))

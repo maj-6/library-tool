@@ -26,6 +26,7 @@ from librarytool.engine.correction_transforms import (
     CorrectionHumanAssertions,
     CorrectionSourceSnapshot,
     CorrectionTransformCommand,
+    CorrectionTransformResultQueryPort,
     CorrectionTransformStorePort,
     HumanTextAssertion,
     _build_commit_draft,
@@ -348,6 +349,7 @@ def test_store_publishes_four_immutable_outputs_and_full_human_assertions(
     draft = _draft(source)
 
     assert isinstance(store, CorrectionTransformStorePort)
+    assert isinstance(store, CorrectionTransformResultQueryPort)
     assert isinstance(store, CorrectionTransformOutputResolverPort)
     assert store.load_source(source.artifact.key) == source
     result = store.commit_transform(draft)
@@ -397,6 +399,42 @@ def test_store_publishes_four_immutable_outputs_and_full_human_assertions(
         ).hexdigest(),
     }
     assert source.content == _png()
+
+
+def test_committed_transform_query_uses_original_pins_after_live_drift(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    command = _command(source)
+    store = _store(tmp_path, authority)
+    committed = store.commit_transform(_draft(source, command))
+    calls_after_commit = authority.calls
+    authority.source = replace(
+        source,
+        artifact=replace(source.artifact, revision="artifact-r9"),
+        source_revision="bytes-r9",
+        annotations=(_annotation("region-r9"),),
+        human_text_assertions=(
+            replace(source.human_text_assertions[0], revision="text-r9"),
+        ),
+    )
+    authority.fail = True
+
+    replay = store.find_committed_transform(command)
+
+    assert replay is not None
+    assert replay.command == command
+    assert replay.result == committed
+    assert replay.dependent_revision_pins.as_dict() == (
+        source.dependent_revision_pins
+    )
+    assert authority.calls == calls_after_commit
+
+    with pytest.raises(ConflictError) as conflict:
+        store.find_committed_transform(replace(command, adjustment=None))
+    assert conflict.value.code == "correction_operation_conflict"
+    assert authority.calls == calls_after_commit
 
 
 def test_store_projects_persisted_raster_outputs_and_verified_resources(

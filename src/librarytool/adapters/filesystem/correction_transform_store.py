@@ -31,11 +31,13 @@ from typing import Any, ContextManager, Protocol, TypeAlias, runtime_checkable
 from ...engine.correction_transforms import (
     CORRECTION_OUTPUT_KINDS,
     CommittedCorrectionOutput,
+    CommittedCorrectionTransform,
     CorrectionHumanAssertions,
     CorrectionSourceSnapshot,
     CorrectionTransformCommand,
     CorrectionTransformCommitDraft,
     CorrectionTransformCommitResult,
+    CorrectionTransformDependencyPins,
 )
 from ...engine.errors import (
     ConflictError,
@@ -575,6 +577,67 @@ class FilesystemCorrectionTransformStore:
             raise _repository_error(
                 "the correction transform transaction failed",
                 code="correction_transform_transaction_failed",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    def find_committed_transform(
+        self,
+        command: CorrectionTransformCommand,
+    ) -> CommittedCorrectionTransform | None:
+        """Read one exact publication without comparing current source state."""
+
+        if not isinstance(command, CorrectionTransformCommand):
+            raise TypeError("command must be a CorrectionTransformCommand")
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    validated = self._validated_operation_publication(
+                        command.item_id,
+                        command.operation_id,
+                    )
+                    if validated is None:
+                        if self._read_receipt(command.operation_id) is not None:
+                            raise ConflictError(
+                                "correction operation was reused for another command",
+                                code="correction_operation_conflict",
+                                details={
+                                    "operation_id": command.operation_id,
+                                },
+                            )
+                        return None
+                    if (
+                        validated.command != command
+                        or validated.command.fingerprint != command.fingerprint
+                    ):
+                        raise ConflictError(
+                            "correction operation was reused for another command",
+                            code="correction_operation_conflict",
+                            details={"operation_id": command.operation_id},
+                        )
+                    source = validated.document["source"]
+                    return CommittedCorrectionTransform(
+                        validated.command,
+                        validated.result,
+                        CorrectionTransformDependencyPins.from_dict(
+                            source["dependent_revision_pins"]
+                        ),
+                    )
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction transform workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except (ConflictError, RepositoryError):
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the committed correction transform is unavailable",
+                code="correction_transform_replay_unavailable",
                 cause=exc,
                 retryable=True,
             ) from exc
