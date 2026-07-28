@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en" data-mantine-color-scheme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- No remote origins: the renderer talks only to Supabase over fetch. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://*.supabase.co wss://*.supabase.co"
+    />
+    <title>Work Overview</title>
+    <style>
+      /* Paint the chrome colour before React mounts, so startup is not a
+         white flash in front of a dark app. */
+      html, body, #root { height: 100%; margin: 0; background: #0b0c0e; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

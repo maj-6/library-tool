@@ -1,0 +1,50 @@
+/* App-wide rules that Mantine's theme cannot express. */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden; /* the timeline owns all scrolling */
+}
+
+/* Dragging the timeline must not paint a text selection across every label. */
+.wo-timeline,
+.wo-timeline * {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Thin scrollbars: the sidebar and lane stack are dense, and a default-width
+   bar eats space that belongs to content. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #333944 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #333944;
+  border-radius: 5px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #434a58;
+}
+
+/* Respect a reduced-motion preference: the timeline's eased moves are the one
+   place this app animates meaningfully. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

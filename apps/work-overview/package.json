@@ -1,0 +1,62 @@
+{
+  "name": "whl-work-overview",
+  "productName": "Work Overview",
+  "version": "0.1.0",
+  "description": "Session timeline for Library Tool cataloguing work",
+  "author": "Andrew James Miller",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.cjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"npm:dev:electron\"",
+    "dev:electron": "wait-on tcp:5183 && cross-env WORK_OVERVIEW_DEV_URL=http://localhost:5183 electron .",
+    "build:renderer": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "build": "npm run build:renderer && npm run build:electron",
+    "start": "npm run build && electron .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mantine/core": "^8.3.4",
+    "@mantine/dates": "^8.3.4",
+    "@mantine/hooks": "^8.3.4",
+    "@supabase/supabase-js": "^2.58.0",
+    "@tabler/icons-react": "^3.35.0",
+    "dayjs": "^1.11.18",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.1",
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "43.1.1",
+    "electron-builder": "26.15.3",
+    "esbuild": "^0.25.10",
+    "jsdom": "^27.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "vitest": "^3.2.4",
+    "wait-on": "^9.0.1"
+  },
+  "build": {
+    "appId": "org.worldherblibrary.workoverview",
+    "productName": "Work Overview",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ]
+  }
+}
