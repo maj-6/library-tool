@@ -294,6 +294,11 @@ function correctionTransformQueueResult(command, overrides = {}) {
         source_revision: command.source_revision,
         source_sha256: command.source_sha256,
         operation_id: command.operation_id,
+        transform: {
+          quad: command.quad.map((point) => [...point]),
+          adjustment: command.adjustment,
+          rerun_ocr: command.rerun_ocr,
+        },
       },
       outputs: [],
     },
@@ -1748,6 +1753,32 @@ test("correction transform queue rejects noncanonical commands and receipts", as
       error.code === "invalid-response" && error.body === null,
   );
   assert.equal(transports, 1);
+
+  const mismatchedPins = new EngineClient({
+    transport: async () => {
+      const body = correctionTransformQueueResult(command);
+      body.job.input_revisions.transform.rerun_ocr = true;
+      return response(202, body);
+    },
+  });
+  await assert.rejects(
+    mismatchedPins.corrections.queueTransform({ command }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const missingPins = new EngineClient({
+    transport: async () => {
+      const body = correctionTransformQueueResult(command);
+      delete body.job.input_revisions.transform;
+      return response(202, body);
+    },
+  });
+  await assert.rejects(
+    missingPins.corrections.queueTransform({ command }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
 });
 
 test("secret reads expose only versioned masked status", async () => {

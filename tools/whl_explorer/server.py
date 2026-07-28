@@ -5860,6 +5860,7 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             ),
             lock_context_for=lambda: _engine_workspace_locks(""),
             job_start_context_for=_correction_transform_job_start_guard,
+            ocr_provider=_EngineCorrectionOcrProvider(),
         ),
         workspace_lock_context_for=_engine_workspace_locks,
         recovery_lock_context=_engine_recovery_locks,
@@ -9899,6 +9900,7 @@ def api_jobs_cancel(job_id: str):
 
 _ocr_jobs: dict[str, dict] = {}
 _ocr_jobs_lock = threading.Lock()
+_tesseract_runner_lock = threading.Lock()
 # Serializes the page-scoped deduplication check with registration of a new
 # Replica detection job.  General OCR batches remain intentionally independent;
 # this lock only prevents two clients from paying for the same region proposal
@@ -9934,12 +9936,21 @@ def _ocr_tesseract(png: bytes, cfg: dict) -> dict:
     from pytesseract import Output
     from PIL import Image
     import io as _io
-    exe = (cfg.get("tesseract") or "").strip() or _TESSERACT_DEFAULT
-    if Path(exe).is_file():
-        pytesseract.pytesseract.tesseract_cmd = exe
+    exe = str(cfg.get("tesseract") or "").strip()
+    if not exe or not Path(exe).is_file():
+        raise RuntimeError("Pinned Tesseract executable is unavailable")
     img = Image.open(_io.BytesIO(png))
     iw, ih = img.size
-    data = pytesseract.image_to_data(img, output_type=Output.DICT)
+    with _tesseract_runner_lock:
+        previous_executable = pytesseract.pytesseract.tesseract_cmd
+        pytesseract.pytesseract.tesseract_cmd = exe
+        try:
+            data = pytesseract.image_to_data(
+                img,
+                output_type=Output.DICT,
+            )
+        finally:
+            pytesseract.pytesseract.tesseract_cmd = previous_executable
     words: list[dict] = []
     grouped: dict[tuple, list[str]] = {}
     line_ids: dict[tuple, int] = {}    # (block,par,line) -> reading-order id
@@ -9989,9 +10000,15 @@ def _ocr_claude(png: bytes, cfg: dict) -> str:
         raise RuntimeError("Anthropic API key not configured (Settings > Credentials)")
     import base64
     model = (cfg.get("claude_model") or "").strip() or "claude-haiku-4-5-20251001"
+    try:
+        max_tokens = max(1024, min(32000, int(
+            cfg.get("max_tokens") or _ocr_max_tokens()
+        )))
+    except (TypeError, ValueError):
+        max_tokens = 8192
     body = json.dumps({
         "model": model,
-        "max_tokens": _ocr_max_tokens(),
+        "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": [
             {"type": "image", "source": {
                 "type": "base64", "media_type": "image/png",
@@ -10073,8 +10090,13 @@ def _ocr_mistral(png: bytes, cfg: dict) -> dict:
     if not key:
         raise RuntimeError("Mistral API key not configured (Settings > Credentials)")
     import base64
-    pages = capture.mistral_ocr_pages(png, key, want_images=True,
-                                      want_blocks=True)
+    pages = capture.mistral_ocr_pages(
+        png,
+        key,
+        want_images=True,
+        want_blocks=True,
+        model=str(cfg.get("mistral_model") or "").strip() or None,
+    )
     markdown = "\n\n".join(p.get("markdown", "") for p in pages).strip()
     regions: list[dict] = []
     dims = None
@@ -10159,21 +10181,50 @@ class _EngineCorrectionOcrProvider:
         service = str(settings.get("ocrService") or "tesseract").strip().lower()
         if service not in _OCR_SERVICES:
             service = "tesseract"
+        request_config = _ocr_request_cfg({})
         model = ""
         if service == "mistral":
             model = str(
                 getattr(capture, "OCR_MODEL", "mistral-ocr-latest")
-            )
+            ).strip() or "mistral-ocr-latest"
         elif service == "claude":
             model = str(
                 settings.get("ocrClaudeModel")
                 or "claude-haiku-4-5-20251001"
-            )
+            ).strip() or "claude-haiku-4-5-20251001"
         elif service == "textract":
             model = "detect-document-text"
         elif service == "tesseract":
             model = "local"
-        return CorrectionOcrProviderSelection(service, model)
+        options = {}
+        if service == "mistral":
+            options["mistral_model"] = model
+        elif service == "tesseract":
+            configured = str(
+                request_config.get("tesseract") or ""
+            ).strip()
+            configured_path = Path(configured) if configured else None
+            if configured_path is not None and configured_path.is_file():
+                executable = str(configured_path.resolve())
+            elif configured:
+                executable = str(shutil.which(configured) or configured)
+            elif Path(_TESSERACT_DEFAULT).is_file():
+                executable = str(Path(_TESSERACT_DEFAULT).resolve())
+            else:
+                executable = str(
+                    shutil.which("tesseract") or _TESSERACT_DEFAULT
+                )
+            options["tesseract"] = executable
+        elif service == "claude":
+            options = {
+                "claude_model": model,
+                "max_tokens": _ocr_max_tokens(),
+            }
+        elif service == "textract":
+            options["aws_region"] = str(
+                request_config.get("aws_region") or "us-east-1"
+            ).strip() or "us-east-1"
+        return CorrectionOcrProviderSelection(service, model, options)
 
     def recognize(
         self,
@@ -10192,9 +10243,7 @@ class _EngineCorrectionOcrProvider:
             raise RuntimeError(
                 f"unsupported OCR service: {selection.provider_id}"
             )
-        base_cfg = _ocr_request_cfg({})
-        if selection.provider_id == "claude":
-            base_cfg["claude_model"] = selection.model
+        base_cfg = dict(selection.options)
         with _ocr_execution_cfg(
             selection.provider_id,
             base_cfg,
@@ -10211,6 +10260,7 @@ class _EngineCorrectionOcrProvider:
             selection.provider_id,
             selection.model,
             payload,
+            selection.options,
         )
 
 

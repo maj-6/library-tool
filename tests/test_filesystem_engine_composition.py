@@ -24,6 +24,7 @@ from librarytool.adapters.filesystem import (
     FilesystemCanvasEvidence,
     FilesystemCanvasInspection,
     FilesystemCanvasObservation,
+    FilesystemCorrectionSourceSnapshotReader,
     FilesystemRasterResourceResolverPort,
     RecoverableWriteSet,
     RecoveryRequiredError,
@@ -54,6 +55,11 @@ from librarytool.engine.canvas_commands import (
 from librarytool.engine.canvases import CanvasExtent
 from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.correction_projection import CorrectionProjectionService
+from librarytool.engine.correction_ocr import (
+    CORRECTION_OCR_JOB_KIND,
+    CorrectionOcrProviderSelection,
+    CorrectionOcrRecognition,
+)
 from librarytool.engine.corrections import CorrectionService
 from librarytool.engine.correction_transforms import (
     CorrectionTransformCommand,
@@ -1176,7 +1182,15 @@ def test_corrections_source_uses_installed_native_text_layer_service(
     text_layers = engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE)
     transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
     worker = transforms._executor.__self__
-    source_reader = worker._store._source_snapshot_for
+    source_lookup = worker._store._source_snapshot_for
+    source_reader = next(
+        cell.cell_contents
+        for cell in (source_lookup.__closure__ or ())
+        if isinstance(
+            cell.cell_contents,
+            FilesystemCorrectionSourceSnapshotReader,
+        )
+    )
     assertion_reader = source_reader._human_text_assertions_for
     text_repository = text_layers._repository
 
@@ -1294,6 +1308,138 @@ def test_production_composition_reopens_projected_transform_outputs(
         mapped[0].selector.coordinate_space_revision
         == corrected.revision
     )
+
+
+def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    lock_state = {"held": False, "entries": 0}
+
+    @contextmanager
+    def non_reentrant_authority_lock():
+        if lock_state["held"]:
+            raise RuntimeError("authority lock was reacquired")
+        lock_state["held"] = True
+        lock_state["entries"] += 1
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
+
+    class ExactOcrProvider:
+        def __init__(self):
+            self.contents = []
+            self.selections = []
+
+        def select_provider(self):
+            return CorrectionOcrProviderSelection(
+                "test-provider",
+                "model-r1",
+                {"layout": True},
+            )
+
+        def recognize(self, selection, content, hooks):
+            assert hooks.is_cancelled() is False
+            self.contents.append(content)
+            self.selections.append(selection)
+            return CorrectionOcrRecognition(
+                selection.provider_id,
+                selection.model,
+                {"text": "Machine proposal from corrected raster"},
+                selection.options,
+            )
+
+    provider = ExactOcrProvider()
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: (
+            capture_root / capture_id
+        ),
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=non_reentrant_authority_lock,
+        ocr_provider=provider,
+    )
+    composed = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )
+    raster = composed["engine"].require_service(
+        RASTER_ARTIFACT_QUERY_SERVICE
+    )
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.kind == "processed-image"
+    )
+    assert source.resource is not None
+    command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(
+            contrast=100,
+            brightness=0,
+        ),
+        rerun_ocr=True,
+        operation_id="composition-transform-ocr-1",
+    )
+    transforms = composed["engine"].require_service(
+        CORRECTION_TRANSFORM_SERVICE
+    )
+
+    queued = transforms.queue(command)
+    result = transforms.execute_queued(command)
+
+    assert result.ocr_followup.state.value == "succeeded"
+    assert result.ocr_followup.proposal_ref.startswith("cop-")
+    assert len(provider.contents) == 1
+    assert provider.contents[0].startswith(b"\x89PNG\r\n\x1a\n")
+    assert provider.selections == [
+        CorrectionOcrProviderSelection(
+            "test-provider",
+            "model-r1",
+            {"layout": True},
+        )
+    ]
+    parent = composed["jobs"].view(queued.job_id)
+    assert parent.state.value == "done"
+    assert parent.outputs[-1].kind == "ocr-proposal"
+    children = composed["jobs"].list_views(
+        kinds=(CORRECTION_OCR_JOB_KIND,),
+        item_id="book-one",
+    )
+    assert len(children) == 1
+    assert children[0].state.value == "done"
+    assert children[0].outputs[0].ref == result.ocr_followup.proposal_ref
+    proposal_path = next(
+        (
+            composed["write_set"].root
+            / ".engine"
+            / "correction-transforms"
+            / "ocr-proposals"
+        ).glob("*.json")
+    )
+    proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+    assert proposal["recognition"]["payload"]["text"] == (
+        "Machine proposal from corrected raster"
+    )
+    assert proposal["provider"] == {
+        "provider_id": "test-provider",
+        "model": "model-r1",
+        "options": {"layout": True},
+    }
+    assert lock_state["held"] is False
+    assert lock_state["entries"] > 0
 
 
 def test_native_text_layer_vertical_is_absent_without_complete_bindings(

@@ -31,6 +31,7 @@ from ..adapters.filesystem import (
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
+    FilesystemCorrectionOcrProposalRepository,
     FilesystemCorrectionRepository,
     FilesystemCorrectionSourceSnapshotReader,
     FilesystemCorrectionTransformStore,
@@ -57,6 +58,11 @@ from ..engine.correction_projection import (
     CorrectionAggregateProjector,
     CorrectionProjectionService,
     reconcile_correction_aggregates,
+)
+from ..engine.correction_ocr import (
+    CORRECTION_OCR_MAX_SOURCE_BYTES,
+    CorrectionOcrFollowupService,
+    CorrectionOcrProviderPort,
 )
 from ..engine.corrections import CorrectionService
 from ..engine.correction_transforms import (
@@ -436,6 +442,7 @@ class CorrectionsBindings:
     representation_revision_for: CorrectionsRepresentationRevision
     lock_context_for: CatalogueLockFactory
     job_start_context_for: ItemLockFactory | None = None
+    ocr_provider: CorrectionOcrProviderPort | None = None
 
     def __post_init__(self) -> None:
         capture_authority_root = Path(self.capture_authority_root)
@@ -463,6 +470,13 @@ class CorrectionsBindings:
             and not callable(self.job_start_context_for)
         ):
             raise TypeError("job_start_context_for must be callable or None")
+        if (
+            self.ocr_provider is not None
+            and not isinstance(self.ocr_provider, CorrectionOcrProviderPort)
+        ):
+            raise TypeError(
+                "ocr_provider must implement CorrectionOcrProviderPort or be None"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1112,9 +1126,51 @@ def compose_filesystem_engine(
                 else None
             ),
         )
+        correction_ocr = None
+        if corrections.ocr_provider is not None:
+
+            def correction_ocr_source_bytes_for(
+                item_id: str,
+                operation_id: str,
+                output,
+            ) -> bytes | None:
+                resolved = correction_transform_store.resolve_committed_output(
+                    item_id,
+                    operation_id,
+                    output,
+                )
+                if resolved is None:
+                    return None
+                try:
+                    content = resolved.stream.read(
+                        CORRECTION_OCR_MAX_SOURCE_BYTES + 1
+                    )
+                    if len(content) > CORRECTION_OCR_MAX_SOURCE_BYTES:
+                        raise RepositoryError(
+                            "the corrected OCR rendition exceeds its size budget",
+                            code="correction_ocr_source_too_large",
+                        )
+                    return content
+                finally:
+                    resolved.stream.close()
+
+            correction_ocr_repository = (
+                FilesystemCorrectionOcrProposalRepository(
+                    resources.write_set,
+                    source_bytes_for=correction_ocr_source_bytes_for,
+                    lock_context_for=corrections_lock,
+                    recover=False,
+                )
+            )
+            correction_ocr = CorrectionOcrFollowupService(
+                resources.jobs,
+                correction_ocr_repository,
+                corrections.ocr_provider,
+            )
         correction_transform_worker = CorrectionTransformWorker(
             resources.jobs,
             correction_transform_store,
+            ocr=correction_ocr,
         )
         correction_transforms = CorrectionTransformService(
             resources.jobs,

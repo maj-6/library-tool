@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, ContextManager, TypeAlias
 
 from ...engine.correction_ocr import (
+    CORRECTION_OCR_MAX_SOURCE_BYTES,
     CORRECTION_OCR_PROPOSAL_POLICY,
     CorrectionOcrProviderSelection,
     CorrectionOcrRecognition,
@@ -26,6 +27,12 @@ from ...engine.correction_transforms import (
     OcrFollowupRequest,
 )
 from ...engine.errors import ConflictError, EngineError, NotFoundError, RepositoryError
+from .corrections_artifact_repository import (
+    _AuthorityDirectorySnapshot,
+    _AuthoritySnapshot,
+    _finish_verified_regular,
+    _open_verified_regular,
+)
 from .recoverable_write_set import (
     RecoverableWriteSet,
     WriteSetError,
@@ -34,16 +41,24 @@ from .recoverable_write_set import (
 
 
 CorrectionOutputBytesLookup: TypeAlias = Callable[
-    [CommittedCorrectionOutput], bytes | None
+    [str, str, CommittedCorrectionOutput], bytes | None
 ]
 LockContextFactory: TypeAlias = Callable[[], ContextManager[Any]]
 
 CORRECTION_OCR_PROPOSAL_SCHEMA = "librarytool.correction-ocr-proposal"
 CORRECTION_OCR_PROPOSAL_VERSION = 1
+CORRECTION_OCR_PROPOSAL_RECEIPT_SCHEMA = (
+    "librarytool.correction-ocr-proposal-receipt"
+)
+CORRECTION_OCR_PROPOSAL_RECEIPT_VERSION = 1
 _PROPOSAL_ROOT = PurePosixPath(
     ".engine/correction-transforms/ocr-proposals"
 )
+_RECEIPT_ROOT = PurePosixPath(
+    ".engine/receipts/correction-ocr-proposals"
+)
 _MAX_PROPOSAL_BYTES = 128 * 1024 * 1024
+_MAX_RECEIPT_BYTES = 64 * 1024
 _DOCUMENT_FIELDS = frozenset(
     {
         "schema",
@@ -60,8 +75,21 @@ _DOCUMENT_FIELDS = frozenset(
 _SOURCE_FIELDS = frozenset(
     {"kind", "artifact_id", "artifact_revision", "content_sha256"}
 )
-_PROVIDER_FIELDS = frozenset({"provider_id", "model"})
-_RECOGNITION_FIELDS = frozenset({"provider_id", "model", "payload"})
+_PROVIDER_FIELDS = frozenset({"provider_id", "model", "options"})
+_RECOGNITION_FIELDS = frozenset(
+    {"provider_id", "model", "options", "payload"}
+)
+_RECEIPT_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "proposal_ref",
+        "operation_id",
+        "item_id",
+        "source_sha256",
+        "proposal_sha256",
+    }
+)
 
 
 def _repository_error(
@@ -142,6 +170,7 @@ def _provider_from_dict(raw: Any) -> CorrectionOcrProviderSelection:
     return CorrectionOcrProviderSelection(
         provider_id=value["provider_id"],
         model=value["model"],
+        options=value["options"],
     )
 
 
@@ -188,9 +217,15 @@ class FilesystemCorrectionOcrProposalRepository:
     def read_source(self, request: OcrFollowupRequest) -> bytes:
         self._require_request(request)
         try:
-            with self._write_set.workspace_lease():
-                with self._lock_context_for():
-                    value = self._source_bytes_for(request.source)
+            # The resolver owns the source authority and returns an immutable,
+            # checksum-pinned snapshot. Acquiring this repository's proposal
+            # lock around it would nest the host's non-reentrant catalogue
+            # lock when the production transform store is used.
+            value = self._source_bytes_for(
+                request.item_id,
+                request.operation_id,
+                request.source,
+            )
         except WriteSetError as exc:
             raise _repository_error(
                 "the OCR proposal workspace is unavailable",
@@ -217,6 +252,11 @@ class FilesystemCorrectionOcrProposalRepository:
             raise _repository_error(
                 "the corrected OCR rendition is invalid",
                 code="invalid_correction_ocr_source",
+            )
+        if len(value) > CORRECTION_OCR_MAX_SOURCE_BYTES:
+            raise _repository_error(
+                "the corrected OCR rendition exceeds its size budget",
+                code="correction_ocr_source_too_large",
             )
         if hashlib.sha256(value).hexdigest() != request.source.content_sha256:
             raise _repository_error(
@@ -272,6 +312,7 @@ class FilesystemCorrectionOcrProposalRepository:
                         CorrectionOcrProviderSelection(
                             recognition.provider_id,
                             recognition.model,
+                            recognition.options,
                         ),
                     )
                     document = {
@@ -291,8 +332,30 @@ class FilesystemCorrectionOcrProposalRepository:
                             "the OCR proposal exceeds its size budget",
                             code="invalid_correction_ocr_proposal",
                         )
-                    path = self._proposal_path(request.operation_id)
-                    if self._path_exists(path):
+                    proposal_sha256 = hashlib.sha256(payload).hexdigest()
+                    receipt = {
+                        "schema": CORRECTION_OCR_PROPOSAL_RECEIPT_SCHEMA,
+                        "version": CORRECTION_OCR_PROPOSAL_RECEIPT_VERSION,
+                        "proposal_ref": stored.proposal_ref,
+                        "operation_id": request.operation_id,
+                        "item_id": request.item_id,
+                        "source_sha256": request.source.content_sha256,
+                        "proposal_sha256": proposal_sha256,
+                    }
+                    receipt_payload = _canonical_json(receipt)
+                    if len(receipt_payload) > _MAX_RECEIPT_BYTES:
+                        raise _repository_error(
+                            "the OCR proposal receipt exceeds its size budget",
+                            code="invalid_correction_ocr_proposal",
+                        )
+                    proposal_path = self._proposal_path(
+                        request.operation_id
+                    )
+                    receipt_path = self._receipt_path(request.operation_id)
+                    if (
+                        self._path_exists(proposal_path)
+                        or self._path_exists(receipt_path)
+                    ):
                         raise ConflictError(
                             "the OCR proposal operation already exists",
                             code="correction_ocr_operation_conflict",
@@ -307,7 +370,14 @@ class FilesystemCorrectionOcrProposalRepository:
                             "source_sha256": request.source.content_sha256,
                         },
                     )
-                    transaction.stage_write(self._relative(path), payload)
+                    transaction.stage_write(
+                        self._relative(proposal_path),
+                        payload,
+                    )
+                    transaction.stage_write(
+                        self._relative(receipt_path),
+                        receipt_payload,
+                    )
                     transaction.commit(receipt=stored.as_dict())
                     return stored
         except WriteSetError as exc:
@@ -338,11 +408,38 @@ class FilesystemCorrectionOcrProposalRepository:
         self,
         request: OcrFollowupRequest,
     ) -> StoredCorrectionOcrProposal | None:
-        path = self._proposal_path(request.operation_id)
-        if not self._path_exists(path):
+        proposal_path = self._proposal_path(request.operation_id)
+        receipt_path = self._receipt_path(request.operation_id)
+        proposal_exists = self._path_exists(proposal_path)
+        receipt_exists = self._path_exists(receipt_path)
+        if not proposal_exists and not receipt_exists:
             return None
-        payload = self._read_regular(path)
+        if proposal_exists != receipt_exists:
+            raise _repository_error(
+                "the OCR proposal publication is incomplete",
+                code="invalid_correction_ocr_proposal",
+            )
+        payload = self._read_regular(
+            proposal_path,
+            maximum=_MAX_PROPOSAL_BYTES,
+        )
+        receipt_payload = self._read_regular(
+            receipt_path,
+            maximum=_MAX_RECEIPT_BYTES,
+        )
         try:
+            raw_receipt = json.loads(
+                receipt_payload.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON number {value}")
+                ),
+            )
+            receipt = _strict_object(
+                raw_receipt,
+                fields=_RECEIPT_FIELDS,
+                name="OCR proposal receipt",
+            )
             raw = json.loads(
                 payload.decode("utf-8"),
                 object_pairs_hook=_unique_object,
@@ -366,6 +463,7 @@ class FilesystemCorrectionOcrProposalRepository:
                 recognition_raw["provider_id"],
                 recognition_raw["model"],
                 recognition_raw["payload"],
+                recognition_raw["options"],
             )
             stored = StoredCorrectionOcrProposal(
                 document["proposal_ref"],
@@ -376,6 +474,10 @@ class FilesystemCorrectionOcrProposalRepository:
                 document["operation_id"] != request.operation_id
                 or document["item_id"] != request.item_id
                 or source != request.source
+                or receipt["operation_id"] != request.operation_id
+                or receipt["item_id"] != request.item_id
+                or receipt["source_sha256"]
+                != request.source.content_sha256
             ):
                 raise ConflictError(
                     "the OCR proposal operation belongs to another request",
@@ -386,12 +488,22 @@ class FilesystemCorrectionOcrProposalRepository:
                 document["schema"] != CORRECTION_OCR_PROPOSAL_SCHEMA
                 or type(document["version"]) is not int
                 or document["version"] != CORRECTION_OCR_PROPOSAL_VERSION
+                or receipt["schema"]
+                != CORRECTION_OCR_PROPOSAL_RECEIPT_SCHEMA
+                or type(receipt["version"]) is not int
+                or receipt["version"]
+                != CORRECTION_OCR_PROPOSAL_RECEIPT_VERSION
                 or document["publication_policy"]
                 != CORRECTION_OCR_PROPOSAL_POLICY
                 or stored.proposal_ref != self.proposal_ref_for(request)
+                or receipt["proposal_ref"] != stored.proposal_ref
+                or receipt["proposal_sha256"]
+                != hashlib.sha256(payload).hexdigest()
                 or recognition.provider_id != provider.provider_id
                 or recognition.model != provider.model
+                or recognition.options != provider.options
                 or payload != _canonical_json(document)
+                or receipt_payload != _canonical_json(receipt)
             ):
                 raise ValueError("OCR proposal is not bound to its request")
             return stored
@@ -409,9 +521,10 @@ class FilesystemCorrectionOcrProposalRepository:
         if not isinstance(request, OcrFollowupRequest):
             raise TypeError("request must be an OcrFollowupRequest")
 
-    def _read_regular(self, path: Path) -> bytes:
+    def _read_regular(self, path: Path, *, maximum: int) -> bytes:
         descriptor = -1
         try:
+            authority = self._authority_snapshot(path)
             before = path.lstat()
             if (
                 not stat.S_ISREG(before.st_mode)
@@ -419,15 +532,11 @@ class FilesystemCorrectionOcrProposalRepository:
                 or _is_redirecting_path(path)
             ):
                 raise ValueError("OCR proposal is not a private regular file")
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-            opened = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_nlink != 1
-                or (before.st_dev, before.st_ino)
-                != (opened.st_dev, opened.st_ino)
-            ):
-                raise ValueError("OCR proposal changed while opening")
+            descriptor, opened = _open_verified_regular(
+                path,
+                before,
+                authority=authority,
+            )
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -435,16 +544,18 @@ class FilesystemCorrectionOcrProposalRepository:
                 if not block:
                     break
                 total += len(block)
-                if total > _MAX_PROPOSAL_BYTES:
-                    raise ValueError("OCR proposal exceeds its size budget")
+                if total > maximum:
+                    raise ValueError(
+                        "OCR proposal document exceeds its size budget"
+                    )
                 chunks.append(block)
-            after = path.lstat()
-            if (
-                (after.st_dev, after.st_ino, after.st_size)
-                != (opened.st_dev, opened.st_ino, opened.st_size)
-                or _is_redirecting_path(path)
-            ):
-                raise ValueError("OCR proposal changed while reading")
+            _finish_verified_regular(
+                path,
+                descriptor,
+                named_before=before,
+                opened_before=opened,
+            )
+            self._authority_snapshot(path)
             return b"".join(chunks)
         except (OSError, ValueError) as exc:
             raise _repository_error(
@@ -457,7 +568,7 @@ class FilesystemCorrectionOcrProposalRepository:
                 os.close(descriptor)
 
     def _path_exists(self, path: Path) -> bool:
-        self._safe_target(path)
+        self._authority_snapshot(path)
         if not os.path.lexists(path):
             return False
         try:
@@ -478,6 +589,66 @@ class FilesystemCorrectionOcrProposalRepository:
                 code="invalid_correction_ocr_proposal",
             )
         return True
+
+    def _authority_snapshot(self, path: Path) -> _AuthoritySnapshot:
+        target = self._safe_target(path)
+        root = self._write_set.root
+        relative = target.relative_to(root)
+        try:
+            named_root = root.lstat()
+            resolved_root = root.resolve(strict=True)
+        except OSError as exc:
+            raise _repository_error(
+                "the OCR proposal authority root cannot be inspected",
+                code="unsafe_correction_ocr_path",
+                cause=exc,
+            ) from exc
+        if _is_redirecting_path(root) or not stat.S_ISDIR(named_root.st_mode):
+            raise _repository_error(
+                "the OCR proposal authority root is unsafe",
+                code="unsafe_correction_ocr_path",
+            )
+
+        directories: list[_AuthorityDirectorySnapshot] = []
+        current = root
+        for part in relative.parts[:-1]:
+            current /= part
+            if _is_redirecting_path(current):
+                raise _repository_error(
+                    "the OCR proposal target crosses a redirecting path",
+                    code="unsafe_correction_ocr_path",
+                )
+            try:
+                named_directory = current.lstat()
+            except FileNotFoundError:
+                named_directory = None
+            except OSError as exc:
+                raise _repository_error(
+                    "the OCR proposal authority path cannot be inspected",
+                    code="unsafe_correction_ocr_path",
+                    cause=exc,
+                ) from exc
+            if (
+                named_directory is not None
+                and not stat.S_ISDIR(named_directory.st_mode)
+            ):
+                raise _repository_error(
+                    "an OCR proposal authority component is not a directory",
+                    code="unsafe_correction_ocr_path",
+                )
+            directories.append(
+                _AuthorityDirectorySnapshot(current, named_directory)
+            )
+
+        try:
+            target.resolve(strict=False).relative_to(resolved_root)
+        except (OSError, ValueError) as exc:
+            raise _repository_error(
+                "the OCR proposal target escapes its workspace",
+                code="unsafe_correction_ocr_path",
+                cause=exc,
+            ) from exc
+        return _AuthoritySnapshot(root, named_root, tuple(directories))
 
     def _safe_target(self, path: Path) -> Path:
         target = Path(path)
@@ -508,6 +679,10 @@ class FilesystemCorrectionOcrProposalRepository:
         digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
         return self._target(_PROPOSAL_ROOT / f"{digest}.json")
 
+    def _receipt_path(self, operation_id: str) -> Path:
+        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+        return self._target(_RECEIPT_ROOT / f"{digest}.json")
+
     def _target(self, relative: PurePosixPath) -> Path:
         return self._write_set.root.joinpath(*relative.parts)
 
@@ -517,6 +692,8 @@ class FilesystemCorrectionOcrProposalRepository:
 __all__ = [
     "CORRECTION_OCR_PROPOSAL_SCHEMA",
     "CORRECTION_OCR_PROPOSAL_VERSION",
+    "CORRECTION_OCR_PROPOSAL_RECEIPT_SCHEMA",
+    "CORRECTION_OCR_PROPOSAL_RECEIPT_VERSION",
     "CorrectionOutputBytesLookup",
     "FilesystemCorrectionOcrProposalRepository",
 ]

@@ -28,7 +28,7 @@ from librarytool.engine.correction_transforms import (
     OcrFollowupState,
 )
 from librarytool.engine.errors import ConflictError, ValidationError
-from librarytool.engine.jobs import JobManager, JobProgress
+from librarytool.engine.jobs import JobManager, JobOutput, JobProgress
 from librarytool.engine.raster_artifacts import (
     CaptionAssertion,
     CategoryAssignment,
@@ -404,6 +404,40 @@ def test_queue_replays_terminal_outcome_after_live_history_is_pruned() -> None:
     with pytest.raises(ConflictError) as conflict:
         service.queue(_command(source, adjustment=None))
     assert conflict.value.code == "correction_operation_conflict"
+
+
+def test_interrupted_transform_replays_without_rescheduling_committed_work() -> None:
+    source = _source()
+    command = _command(source)
+    jobs = JobManager(checkpoint_interval=0)
+    store = MemoryStore(source)
+    worker = CorrectionTransformWorker(jobs, store)
+    service = CorrectionTransformService(jobs, executor=worker.run)
+    queued = service.queue(command)
+    first = service.execute_queued(command)
+    record = jobs.records[queued.job_id]
+    # Private claim state is process-local and absent after rehydration.
+    record.pop("_correction_worker_claimed", None)
+    jobs.transition(
+        record,
+        "interrupted",
+        note="process stopped after image commit",
+    )
+
+    replay = service.queue(command)
+
+    assert replay.created is False
+    assert replay.job_id == queued.job_id
+    assert replay.job.state.value == "interrupted"
+    assert replay.job.outputs == tuple(
+        JobOutput(output.kind, output.artifact_id)
+        for output in first.image_commit.outputs
+    )
+    assert len(store.commits) == 1
+    with pytest.raises(ConflictError) as raised:
+        service.execute_queued(command)
+    assert raised.value.code == "correction_job_already_claimed"
+    assert len(store.commits) == 1
 
 
 def test_queue_registration_runs_inside_injected_item_start_guard() -> None:
@@ -831,8 +865,8 @@ def test_ocr_failure_is_observable_and_does_not_roll_back_image_commit() -> None
     assert job["errors"] == 1
     assert len(job["outputs"]) == 4
     assert job["failure"]["code"] == "ocr_followup_failed"
-    assert job["failure"]["retryable"] is True
-    assert job["error"] == "provider unavailable"
+    assert job["failure"]["retryable"] is False
+    assert job["error"] == "OCR follow-up failed"
     public = jobs.view(queue.job_id)
     assert public.error.code == "ocr_followup_failed"
     assert public.outputs

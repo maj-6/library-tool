@@ -1765,6 +1765,15 @@ def test_transform_queue_is_versioned_idempotent_and_schedules_outside_http():
         "operation_id": command.operation_id,
         "source_revision": artifact.resource.revision,
         "source_sha256": artifact.content_sha256,
+        "transform": {
+            "quad": [list(point) for point in command.quad],
+            "adjustment": (
+                command.adjustment.as_dict()
+                if command.adjustment is not None
+                else None
+            ),
+            "rerun_ocr": command.rerun_ocr,
+        },
     }
     assert "command_sha256" not in str(body)
     assert first.headers["Location"] == (

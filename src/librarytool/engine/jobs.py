@@ -18,6 +18,7 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -143,7 +144,7 @@ class JobFailure:
             "retryable": self.retryable,
         }
         if self.details:
-            value["details"] = dict(self.details)
+            value["details"] = deepcopy(dict(self.details))
         return value
 
 
@@ -178,7 +179,7 @@ class JobView:
             "finished_at": self.finished_at,
             "note": self.note,
             "error": self.error.as_dict() if self.error is not None else None,
-            "input_revisions": dict(self.input_revisions),
+            "input_revisions": deepcopy(dict(self.input_revisions)),
             "outputs": [output.as_dict() for output in self.outputs],
         }
 
@@ -301,8 +302,28 @@ class JobManager:
         return _STATUS_STATES.get(str(status or ""), "running")
 
     @staticmethod
-    def interruption_note(kind: object) -> str:
+    def interruption_note(
+        kind: object,
+        outputs: object = (),
+    ) -> str:
         value = str(kind or "")
+        if value == "correction.transform" and isinstance(
+            outputs,
+            (list, tuple),
+        ):
+            committed = {
+                str(output.get("kind") or "")
+                for output in outputs
+                if isinstance(output, Mapping)
+                and not bool(output.get("partial"))
+            }
+            if {
+                "corrected-display",
+                "ocr-ready",
+                "thumbnail",
+                "transform-manifest",
+            } <= committed:
+                return "image committed; OCR follow-up interrupted by restart"
         if value == "ocr" or value.startswith("translate") or value == "annotate":
             return "interrupted by restart — progressive output kept"
         if value == "publish":
@@ -312,7 +333,11 @@ class JobManager:
     @staticmethod
     def public(job: Mapping[str, Any]) -> dict[str, Any]:
         """Return the stable, credential-free client/persistence projection."""
-        return {key: job.get(key) for key in PUBLIC_JOB_FIELDS if key in job}
+        return {
+            key: deepcopy(job.get(key))
+            for key in PUBLIC_JOB_FIELDS
+            if key in job
+        }
 
     def list(
         self,
@@ -645,6 +670,63 @@ class JobManager:
                 self._transition_locked(job, "cancelling", event_type="cancel-requested")
             return dict(job)
 
+    def retry_interrupted(self, job_id: str) -> JobView | None:
+        """Requeue one restart-interrupted job without changing its identity.
+
+        A caller must still own the job-specific idempotency and input
+        validation before invoking this generic lifecycle operation. Terminal
+        success, failure, and cancellation are never reopened.
+        """
+
+        job_id = str(job_id or "")
+        with self._lock:
+            job = self._records.get(job_id)
+            if job is None:
+                return None
+            state = str(job.get("state") or self.state_of(job.get("status")))
+            if state != JobState.INTERRUPTED.value:
+                raise ConflictError(
+                    "only an interrupted job can be retried",
+                    code="job_not_interrupted",
+                    details={"job_id": job_id, "state": state},
+                )
+            if job.get("outputs"):
+                raise ConflictError(
+                    "an interrupted job with committed outputs cannot be reset",
+                    code="job_outputs_committed",
+                    details={"job_id": job_id, "state": state},
+                )
+            total = max(0, self._integer(job.get("total"), 0))
+            raw_progress = job.get("progress")
+            progress = (
+                raw_progress
+                if isinstance(raw_progress, Mapping)
+                else {}
+            )
+            self._cancel_events[job_id] = threading.Event()
+            job.pop("_checkpoint_at", None)
+            job.pop("cancel_requested", None)
+            self._transition_locked(
+                job,
+                "queued",
+                event_type="retried",
+                done=0,
+                errors=0,
+                error="",
+                failure=None,
+                outputs=[],
+                finished_at="",
+                cancellable=True,
+                progress=JobProgress(
+                    0,
+                    total,
+                    str(progress.get("unit") or ""),
+                    "queued",
+                ).as_dict(),
+                note="queued after restart",
+            )
+            return self.view_of(job)
+
     def is_cancelled(self, job: Mapping[str, Any]) -> bool:
         event = self._cancel_events.get(str(job.get("id") or ""))
         return event is not None and event.is_set()
@@ -725,7 +807,10 @@ class JobManager:
                 job.setdefault("outputs", [])
                 if job.get("state") in ACTIVE_JOB_STATES or not job.get("state"):
                     job["status"] = job["state"] = "interrupted"
-                    job["note"] = self.interruption_note(job.get("kind"))
+                    job["note"] = self.interruption_note(
+                        job.get("kind"),
+                        job.get("outputs"),
+                    )
                     job["finished_at"] = job.get("finished_at") or now
                     job["updated_at"] = now
                     job["revision"] = self._integer(job.get("revision"), 0) + 1
@@ -793,7 +878,7 @@ class JobManager:
                     str(failure_raw.get("code") or "job_failed"),
                     message,
                     bool(failure_raw.get("retryable")),
-                    dict(details) if isinstance(details, Mapping) else {},
+                    deepcopy(dict(details)) if isinstance(details, Mapping) else {},
                 )
         elif job.get("error"):
             failure = JobFailure("job_failed", str(job.get("error")))
@@ -825,7 +910,11 @@ class JobManager:
             finished_at=str(job.get("finished_at") or ""),
             note=str(job.get("note") or ""),
             error=failure,
-            input_revisions=dict(revisions) if isinstance(revisions, Mapping) else {},
+            input_revisions=(
+                deepcopy(dict(revisions))
+                if isinstance(revisions, Mapping)
+                else {}
+            ),
             outputs=tuple(outputs),
         )
 

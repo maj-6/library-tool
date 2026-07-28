@@ -63,6 +63,22 @@
       return value == null ? value : JSON.parse(JSON.stringify(value));
     }
 
+    function sameJsonValue(left, right) {
+      if (left === right) return true;
+      if (Array.isArray(left) || Array.isArray(right)) {
+        return Array.isArray(left) && Array.isArray(right) &&
+          left.length === right.length &&
+          left.every((value, index) => sameJsonValue(value, right[index]));
+      }
+      if (!isPlainObject(left) || !isPlainObject(right)) return false;
+      const keys = Object.keys(left);
+      return keys.length === Object.keys(right).length &&
+        keys.every(
+          (key) => Object.hasOwn(right, key) &&
+            sameJsonValue(left[key], right[key]),
+        );
+    }
+
     function capabilityError(capability) {
       const error = new Error(`${capability} is not available`);
       error.code = "capability-unavailable";
@@ -244,7 +260,7 @@
       const inputKeys = Object.keys(inputs);
       const allowedInputKeys = new Set([
         "artifact_id", "artifact_revision", "source_revision", "source_sha256",
-        "operation_id", "command_sha256", "dependent_assertions",
+        "operation_id", "command_sha256", "dependent_assertions", "transform",
       ]);
       if (!inputKeys.every((key) => allowedInputKeys.has(key)) ||
           inputs.artifact_id !== command.artifact_id ||
@@ -252,6 +268,17 @@
           inputs.source_revision !== command.source_revision ||
           inputs.source_sha256 !== command.source_sha256 ||
           inputs.operation_id !== command.operation_id ||
+          !Object.hasOwn(inputs, "transform") ||
+          !hasExactKeys(
+              inputs.transform,
+              ["quad", "adjustment", "rerun_ocr"],
+            ) ||
+              !sameJsonValue(inputs.transform.quad, command.quad) ||
+              !sameJsonValue(
+                inputs.transform.adjustment,
+                command.adjustment,
+              ) ||
+              inputs.transform.rerun_ocr !== command.rerun_ocr ||
           (Object.hasOwn(inputs, "command_sha256") &&
             (typeof inputs.command_sha256 !== "string" ||
               !/^[0-9a-f]{64}$/.test(inputs.command_sha256)))) {
@@ -377,7 +404,12 @@
         failure: null,
       };
       if (imageCommitted && command.rerun_ocr === true) {
-        if (/ocr outcome recording failed/i.test(job.note)) {
+        const ocrFailureCode = job.error && String(job.error.code || "");
+        const hasOcrFailure = /^ocr_(?:followup|outcome)_/.test(
+          ocrFailureCode,
+        );
+        if (ocrFailureCode === "ocr_outcome_recording_failed" ||
+            /ocr outcome recording failed/i.test(job.note)) {
           ocrFollowup = {
             state: "failed",
             source: ocrSource,
@@ -395,15 +427,27 @@
             proposal_ref: ocrProposal.ref,
             failure: null,
           };
-        } else if (/ocr follow-up cancelled/i.test(job.note) ||
-                   job.state === "interrupted") {
+        } else if (job.state === "interrupted") {
+          ocrFollowup = {
+            state: "failed",
+            source: ocrSource,
+            proposal_ref: "",
+            failure: {
+              code: "ocr_followup_interrupted",
+              message: "OCR follow-up status is unknown after restart",
+              retryable: true,
+            },
+          };
+        } else if (ocrFailureCode === "ocr_followup_cancelled" ||
+                   /ocr follow-up cancelled/i.test(job.note)) {
           ocrFollowup = {
             state: "cancelled",
             source: ocrSource,
             proposal_ref: "",
             failure: null,
           };
-        } else if (/ocr follow-up failed/i.test(job.note)) {
+        } else if (hasOcrFailure ||
+                   /ocr follow-up failed/i.test(job.note)) {
           ocrFollowup = {
             state: "failed",
             source: ocrSource,

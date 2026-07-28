@@ -1561,6 +1561,25 @@
       isPortableIdentifier(value.operation_id);
   }
 
+  function isCorrectionTransformInput(value, command) {
+    if (!hasExactKeys(value, ["quad", "adjustment", "rerun_ocr"]) ||
+        value.rerun_ocr !== command.rerun_ocr ||
+        !Array.isArray(value.quad) ||
+        value.quad.length !== command.quad.length ||
+        !value.quad.every((point, index) =>
+          Array.isArray(point) &&
+          point.length === 2 &&
+          point[0] === command.quad[index][0] &&
+          point[1] === command.quad[index][1]) ||
+        !isCorrectionAdjustment(value.adjustment)) return false;
+    if (value.adjustment === null || command.adjustment === null) {
+      return value.adjustment === command.adjustment;
+    }
+    return CORRECTION_ADJUSTMENT_FIELDS.every(
+      (field) => value.adjustment[field] === command.adjustment[field],
+    );
+  }
+
   function isCorrectionTransformJob(value, command) {
     if (!hasExactKeys(value, [
       "id", "kind", "state", "subject", "progress", "cancellable",
@@ -1594,14 +1613,16 @@
     const inputKeys = Object.keys(inputs);
     const allowedInputKeys = new Set([
       "artifact_id", "artifact_revision", "source_revision", "source_sha256",
-      "operation_id", "dependent_assertions",
+      "operation_id", "dependent_assertions", "transform",
     ]);
     if (!inputKeys.every((key) => allowedInputKeys.has(key)) ||
         inputs.artifact_id !== command.artifact_id ||
         inputs.artifact_revision !== command.artifact_revision ||
         inputs.source_revision !== command.source_revision ||
         inputs.source_sha256 !== command.source_sha256 ||
-        inputs.operation_id !== command.operation_id) return false;
+        inputs.operation_id !== command.operation_id ||
+        !Object.hasOwn(inputs, "transform") ||
+        !isCorrectionTransformInput(inputs.transform, command)) return false;
     if (value.error !== null &&
         (!isObject(value.error) || typeof value.error.code !== "string" ||
           typeof value.error.message !== "string" ||

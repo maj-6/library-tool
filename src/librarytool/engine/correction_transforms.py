@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import math
 import re
 import threading
@@ -31,8 +32,14 @@ from librarytool.processing.raster import (
     validate_normalized_quad,
 )
 
-from .errors import ConflictError, ValidationError
-from .jobs import JobFailure, JobManager, JobOutput, JobProgress, JobView
+from .errors import ConflictError, EngineError, ValidationError
+from .jobs import (
+    JobFailure,
+    JobManager,
+    JobOutput,
+    JobProgress,
+    JobView,
+)
 from .raster_artifacts import (
     ArtifactProvenance,
     AssignmentOrigin,
@@ -43,12 +50,15 @@ from .raster_artifacts import (
     RasterArtifactView,
     RasterDimensions,
 )
+
 from .spatial_annotations import (
     NormalizedPoint,
     RoleAssignmentOrigin,
     SpatialAnnotationView,
     SpatialRoleAssignment,
 )
+
+log = logging.getLogger(__name__)
 
 
 CORRECTION_TRANSFORM_JOB_KIND = "correction.transform"
@@ -977,42 +987,7 @@ class CorrectionTransformService:
                 existing = self._jobs.get(job_id)
                 if existing is not None:
                     return self._replayed(existing, command)
-                record: MutableMapping[str, Any] = {
-                    "id": job_id,
-                    "kind": CORRECTION_TRANSFORM_JOB_KIND,
-                    "status": "queued",
-                    "operation_id": command.operation_id,
-                    "command_sha256": command.fingerprint,
-                    "subject": {
-                        "item_id": command.item_id,
-                        "source_id": command.artifact_id,
-                    },
-                    "total": 6,
-                    "progress": JobProgress(0, 6, "phase", "queued").as_dict(),
-                    "input_revisions": {
-                        "artifact_id": command.artifact_id,
-                        "artifact_revision": command.artifact_revision,
-                        "source_revision": command.source_revision,
-                        "source_sha256": command.source_sha256,
-                        "operation_id": command.operation_id,
-                        "command_sha256": command.fingerprint,
-                        "transform": {
-                            "quad": [
-                                [x, y] for x, y in command.quad
-                            ],
-                            "adjustment": (
-                                command.adjustment.as_dict()
-                                if command.adjustment is not None
-                                else None
-                            ),
-                            "rerun_ocr": command.rerun_ocr,
-                        },
-                    },
-                    # Private worker input. JobManager's public projection does
-                    # not persist this field; a durable command adapter remains
-                    # an integration responsibility.
-                    "command": command.as_dict(),
-                }
+                record = self._job_record(command, job_id)
                 try:
                     self._jobs.track(record, CORRECTION_TRANSFORM_JOB_KIND)
                 except ConflictError:
@@ -1031,6 +1006,46 @@ class CorrectionTransformService:
                     command.fingerprint,
                     True,
                 )
+
+    @staticmethod
+    def _job_record(
+        command: CorrectionTransformCommand,
+        job_id: str,
+    ) -> MutableMapping[str, Any]:
+        return {
+            "id": job_id,
+            "kind": CORRECTION_TRANSFORM_JOB_KIND,
+            "status": "queued",
+            "operation_id": command.operation_id,
+            "command_sha256": command.fingerprint,
+            "subject": {
+                "item_id": command.item_id,
+                "source_id": command.artifact_id,
+            },
+            "total": 6,
+            "progress": JobProgress(0, 6, "phase", "queued").as_dict(),
+            "input_revisions": {
+                "artifact_id": command.artifact_id,
+                "artifact_revision": command.artifact_revision,
+                "source_revision": command.source_revision,
+                "source_sha256": command.source_sha256,
+                "operation_id": command.operation_id,
+                "command_sha256": command.fingerprint,
+                "transform": {
+                    "quad": [[x, y] for x, y in command.quad],
+                    "adjustment": (
+                        command.adjustment.as_dict()
+                        if command.adjustment is not None
+                        else None
+                    ),
+                    "rerun_ocr": command.rerun_ocr,
+                },
+            },
+            # The submitted command remains process-private. Every value
+            # required to validate and retry after restart is also present in
+            # the allowlisted input projection above.
+            "command": command.as_dict(),
+        }
 
     @property
     def executable(self) -> bool:
@@ -1674,14 +1689,26 @@ class CorrectionTransformWorker:
             return outcome
         except CorrectionTransformCancelled:
             return OcrFollowupOutcome(OcrFollowupState.CANCELLED, source=source)
+        except EngineError as exc:
+            return OcrFollowupOutcome(
+                OcrFollowupState.FAILED,
+                source=source,
+                failure=JobFailure(
+                    exc.code,
+                    exc.message,
+                    retryable=exc.retryable,
+                    details=exc.details,
+                ),
+            )
         except Exception as exc:
+            log.exception("correction OCR follow-up port failed")
             return OcrFollowupOutcome(
                 OcrFollowupState.FAILED,
                 source=source,
                 failure=JobFailure(
                     "ocr_followup_failed",
-                    str(exc) or type(exc).__name__,
-                    retryable=True,
+                    "OCR follow-up failed",
+                    retryable=False,
                     details={"exception": type(exc).__name__},
                 ),
             )

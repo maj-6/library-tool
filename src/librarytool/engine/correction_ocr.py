@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import threading
 from collections.abc import Mapping, MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
@@ -26,13 +27,19 @@ from .correction_transforms import (
     OcrFollowupState,
 )
 from .jobs import JobFailure, JobManager, JobOutput, JobProgress, JobState, JobView
+from .errors import EngineError
 
 
 CORRECTION_OCR_JOB_KIND = "correction.ocr-followup"
 CORRECTION_OCR_PROPOSAL_POLICY = "machine-proposal-only"
+CORRECTION_OCR_MAX_SOURCE_BYTES = 256 * 1024 * 1024
 _PORTABLE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _MAX_RECOGNITION_BYTES = 64 * 1024 * 1024
 _MAX_JSON_DEPTH = 32
+_MAX_JSON_NODES = 200_000
+_MAX_PROVIDER_OPTIONS_BYTES = 64 * 1024
+
+log = logging.getLogger(__name__)
 
 
 def _portable(value: object, field_name: str, *, optional: bool = False) -> str:
@@ -44,7 +51,17 @@ def _portable(value: object, field_name: str, *, optional: bool = False) -> str:
     return text
 
 
-def _freeze_json(value: Any, *, depth: int = 0) -> Any:
+def _freeze_json(
+    value: Any,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> Any:
+    if budget is None:
+        budget = [0]
+    budget[0] += 1
+    if budget[0] > _MAX_JSON_NODES:
+        raise ValueError("OCR recognition payload contains too many values")
     if depth > _MAX_JSON_DEPTH:
         raise ValueError("OCR recognition payload is nested too deeply")
     if value is None or isinstance(value, (str, bool, int)):
@@ -58,10 +75,17 @@ def _freeze_json(value: Any, *, depth: int = 0) -> Any:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("OCR recognition payload keys must be strings")
-            frozen[key] = _freeze_json(item, depth=depth + 1)
+            frozen[key] = _freeze_json(
+                item,
+                depth=depth + 1,
+                budget=budget,
+            )
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item, depth=depth + 1) for item in value)
+        return tuple(
+            _freeze_json(item, depth=depth + 1, budget=budget)
+            for item in value
+        )
     raise ValueError("OCR recognition payload must contain only JSON values")
 
 
@@ -89,6 +113,7 @@ class CorrectionOcrProviderSelection:
 
     provider_id: str
     model: str = ""
+    options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -96,11 +121,22 @@ class CorrectionOcrProviderSelection:
             "provider_id",
             _portable(self.provider_id, "provider_id"),
         )
-        if not isinstance(self.model, str) or len(self.model) > 512:
+        if not isinstance(self.model, str) or len(self.model.strip()) > 512:
             raise ValueError("model must be a bounded string")
+        object.__setattr__(self, "model", self.model.strip())
+        if not isinstance(self.options, Mapping):
+            raise TypeError("options must be a mapping")
+        frozen = _freeze_json(self.options)
+        if len(_canonical_json(_thaw_json(frozen))) > _MAX_PROVIDER_OPTIONS_BYTES:
+            raise ValueError("provider options exceed their size budget")
+        object.__setattr__(self, "options", frozen)
 
-    def as_dict(self) -> dict[str, str]:
-        return {"provider_id": self.provider_id, "model": self.model}
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "model": self.model,
+            "options": _thaw_json(self.options),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +146,7 @@ class CorrectionOcrRecognition:
     provider_id: str
     model: str
     payload: Mapping[str, Any]
+    options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -117,20 +154,31 @@ class CorrectionOcrRecognition:
             "provider_id",
             _portable(self.provider_id, "provider_id"),
         )
-        if not isinstance(self.model, str) or len(self.model) > 512:
+        if not isinstance(self.model, str) or len(self.model.strip()) > 512:
             raise ValueError("model must be a bounded string")
+        object.__setattr__(self, "model", self.model.strip())
         if not isinstance(self.payload, Mapping):
             raise TypeError("payload must be a mapping")
+        if not isinstance(self.options, Mapping):
+            raise TypeError("options must be a mapping")
         frozen = _freeze_json(self.payload)
         encoded = _canonical_json(_thaw_json(frozen))
         if len(encoded) > _MAX_RECOGNITION_BYTES:
             raise ValueError("OCR recognition payload exceeds its size budget")
         object.__setattr__(self, "payload", frozen)
+        frozen_options = _freeze_json(self.options)
+        if (
+            len(_canonical_json(_thaw_json(frozen_options)))
+            > _MAX_PROVIDER_OPTIONS_BYTES
+        ):
+            raise ValueError("provider options exceed their size budget")
+        object.__setattr__(self, "options", frozen_options)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "provider_id": self.provider_id,
             "model": self.model,
+            "options": _thaw_json(self.options),
             "payload": _thaw_json(self.payload),
         }
 
@@ -271,6 +319,67 @@ class CorrectionOcrFollowupService:
             existing = self._jobs.view(self.job_id_for(request.operation_id))
             if existing is not None:
                 self._validate_existing(existing, request)
+                try:
+                    stored = self._repository.find_proposal(request)
+                except EngineError as exc:
+                    return self._fail_existing(
+                        existing,
+                        request.source,
+                        self._failure_from_engine_error(exc),
+                    )
+                except Exception:
+                    log.exception("unexpected OCR proposal replay failure")
+                    return self._fail_existing(
+                        existing,
+                        request.source,
+                        JobFailure(
+                            "ocr_proposal_unavailable",
+                            "OCR proposal storage is unavailable",
+                            retryable=False,
+                        ),
+                    )
+                if stored is not None:
+                    self._validate_stored(stored, request)
+                    proposals = [
+                        output
+                        for output in existing.outputs
+                        if output.kind == "ocr-proposal"
+                        and not output.partial
+                    ]
+                    if (
+                        existing.state is JobState.DONE
+                        and len(proposals) == 1
+                        and proposals[0].ref == stored.proposal_ref
+                    ):
+                        return OcrFollowupOutcome(
+                            OcrFollowupState.SUCCEEDED,
+                            source=stored.source,
+                            proposal_ref=stored.proposal_ref,
+                        )
+                    return self._succeed(
+                        stored,
+                        self._record_for(existing.job_id),
+                    )
+                if existing.state is JobState.DONE:
+                    return self._fail_existing(
+                        existing,
+                        request.source,
+                        JobFailure(
+                            "ocr_proposal_missing",
+                            "the OCR child job has no durable proposal",
+                            retryable=True,
+                        ),
+                    )
+                if existing.state is JobState.INTERRUPTED:
+                    retried = self._jobs.retry_interrupted(existing.job_id)
+                    if retried is None:  # pragma: no cover - manager invariant
+                        raise RuntimeError("interrupted OCR child disappeared")
+                    record = self._record_for(existing.job_id)
+                    return self._execute(
+                        request,
+                        record,
+                        _ChildHooks(self._jobs, record, hooks),
+                    )
                 return self._outcome_from_job(existing, request.source)
 
             record: MutableMapping[str, Any] = {
@@ -298,6 +407,12 @@ class CorrectionOcrFollowupService:
             child_hooks = _ChildHooks(self._jobs, record, hooks)
             return self._execute(request, record, child_hooks)
 
+    def _record_for(self, job_id: str) -> MutableMapping[str, Any]:
+        record = self._jobs.records.get(job_id)
+        if record is None:
+            raise RuntimeError("OCR child job record is unavailable")
+        return record
+
     def _execute(
         self,
         request: OcrFollowupRequest,
@@ -307,6 +422,7 @@ class CorrectionOcrFollowupService:
         if hooks.is_cancelled():
             return self._cancel(request.source, record)
         self._jobs.transition(record, "running")
+        provider_work = False
         try:
             hooks.report_progress(JobProgress(1, 4, "phase", "reading-rendition"))
             stored = self._repository.find_proposal(request)
@@ -316,18 +432,41 @@ class CorrectionOcrFollowupService:
 
             content = self._repository.read_source(request)
             if not isinstance(content, bytes):
-                raise TypeError("OCR proposal repository returned mutable source bytes")
+                raise EngineError(
+                    "the corrected OCR rendition is invalid",
+                    code="invalid_correction_ocr_source",
+                )
+            if len(content) > CORRECTION_OCR_MAX_SOURCE_BYTES:
+                raise EngineError(
+                    "the corrected OCR rendition exceeds its size budget",
+                    code="correction_ocr_source_too_large",
+                )
             if hashlib.sha256(content).hexdigest() != request.source.content_sha256:
-                raise ValueError("OCR rendition bytes do not match the committed checksum")
+                raise EngineError(
+                    "the corrected OCR rendition checksum changed",
+                    code="correction_ocr_source_checksum_mismatch",
+                )
             if hooks.is_cancelled():
                 return self._cancel(request.source, record)
 
-            selection = self._provider.select_provider()
-            if not isinstance(selection, CorrectionOcrProviderSelection):
-                raise TypeError("OCR provider returned an invalid selection")
+            provider_work = True
             inputs = dict(record.get("input_revisions") or {})
-            inputs["provider"] = selection.as_dict()
-            self._jobs.transition(record, "running", input_revisions=inputs)
+            provider_pin = inputs.get("provider")
+            if provider_pin is None:
+                selection = self._provider.select_provider()
+                if not isinstance(selection, CorrectionOcrProviderSelection):
+                    raise EngineError(
+                        "OCR provider selection is invalid",
+                        code="invalid_ocr_provider_selection",
+                    )
+                inputs["provider"] = selection.as_dict()
+                self._jobs.transition(
+                    record,
+                    "running",
+                    input_revisions=inputs,
+                )
+            else:
+                selection = self._selection_from_pin(provider_pin)
 
             hooks.report_progress(JobProgress(2, 4, "phase", "recognizing"))
             recognition = self._provider.recognize(selection, content, hooks)
@@ -336,6 +475,7 @@ class CorrectionOcrFollowupService:
             if (
                 recognition.provider_id != selection.provider_id
                 or recognition.model != selection.model
+                or recognition.options != selection.options
             ):
                 raise ValueError("OCR recognition does not match its pinned provider")
             if hooks.is_cancelled():
@@ -349,13 +489,21 @@ class CorrectionOcrFollowupService:
             return self._succeed(stored, record)
         except CorrectionTransformCancelled:
             return self._cancel(request.source, record)
+        except EngineError as exc:
+            failure = self._failure_from_engine_error(exc)
         except Exception as exc:
+            log.exception("correction OCR follow-up failed")
             failure = JobFailure(
                 "ocr_followup_failed",
-                str(exc) or type(exc).__name__,
-                retryable=True,
+                (
+                    "OCR provider failed"
+                    if provider_work
+                    else "OCR follow-up failed"
+                ),
+                retryable=provider_work,
                 details={"exception": type(exc).__name__},
             )
+        if "failure" in locals():
             self._jobs.transition(
                 record,
                 "failed",
@@ -370,12 +518,22 @@ class CorrectionOcrFollowupService:
                 source=request.source,
                 failure=failure,
             )
+        raise RuntimeError("OCR follow-up ended without an outcome")
 
     def _succeed(
         self,
         stored: StoredCorrectionOcrProposal,
         record: MutableMapping[str, Any],
     ) -> OcrFollowupOutcome:
+        inputs = dict(record.get("input_revisions") or {})
+        provider = stored.provider.as_dict()
+        pinned = inputs.get("provider")
+        if pinned is not None and pinned != provider:
+            raise EngineError(
+                "OCR proposal does not match the child provider pin",
+                code="correction_ocr_provider_pin_mismatch",
+            )
+        inputs["provider"] = provider
         output = JobOutput("ocr-proposal", stored.proposal_ref).as_dict()
         self._jobs.transition(
             record,
@@ -383,6 +541,7 @@ class CorrectionOcrFollowupService:
             done=4,
             total=4,
             progress=JobProgress(4, 4, "phase", "complete").as_dict(),
+            input_revisions=inputs,
             outputs=[output],
             note="OCR proposal ready",
         )
@@ -405,6 +564,62 @@ class CorrectionOcrFollowupService:
         )
         return OcrFollowupOutcome(OcrFollowupState.CANCELLED, source=source)
 
+    def _fail_existing(
+        self,
+        job: JobView,
+        source: CommittedCorrectionOutput,
+        failure: JobFailure,
+    ) -> OcrFollowupOutcome:
+        self._jobs.transition(
+            self._record_for(job.job_id),
+            "failed",
+            errors=1,
+            error=failure.message,
+            failure=failure.as_dict(),
+            note="OCR proposal is unavailable",
+            outputs=[],
+        )
+        return OcrFollowupOutcome(
+            OcrFollowupState.FAILED,
+            source=source,
+            failure=failure,
+        )
+
+    @staticmethod
+    def _failure_from_engine_error(exc: EngineError) -> JobFailure:
+        return JobFailure(
+            exc.code,
+            exc.message,
+            retryable=exc.retryable,
+            details=exc.details,
+        )
+
+    @staticmethod
+    def _selection_from_pin(
+        raw: object,
+    ) -> CorrectionOcrProviderSelection:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "provider_id",
+            "model",
+            "options",
+        }:
+            raise EngineError(
+                "OCR child provider pin is invalid",
+                code="invalid_ocr_provider_pin",
+            )
+        try:
+            return CorrectionOcrProviderSelection(
+                raw["provider_id"],
+                raw["model"],
+                raw["options"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise EngineError(
+                "OCR child provider pin is invalid",
+                code="invalid_ocr_provider_pin",
+                details={"cause_type": type(exc).__name__},
+            ) from exc
+
     @staticmethod
     def _validate_stored(
         stored: StoredCorrectionOcrProposal,
@@ -426,9 +641,12 @@ class CorrectionOcrFollowupService:
             or job.subject.item_id != request.item_id
             or job.subject.source_id != request.source.artifact_id
             or pins.get("parent_operation_id") != request.operation_id
+            or pins.get("artifact_id") != request.source.artifact_id
             or pins.get("artifact_revision")
             != request.source.artifact_revision
             or pins.get("source_sha256") != request.source.content_sha256
+            or pins.get("command_sha256")
+            != CorrectionOcrFollowupService._command_sha256(request)
             or pins.get("publication_policy")
             != CORRECTION_OCR_PROPOSAL_POLICY
         ):
@@ -467,6 +685,7 @@ class CorrectionOcrFollowupService:
 
 __all__ = [
     "CORRECTION_OCR_JOB_KIND",
+    "CORRECTION_OCR_MAX_SOURCE_BYTES",
     "CORRECTION_OCR_PROPOSAL_POLICY",
     "CorrectionOcrFollowupService",
     "CorrectionOcrProposalRepositoryPort",
