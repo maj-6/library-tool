@@ -582,6 +582,7 @@ class CaptureMetadataSyncTest {
         assertTrue(cloud.contains("readBoundedSupabaseResponse"))
         assertTrue(cloud.contains("fetchDesktopBookMetadataIsolated"))
         assertTrue(cloud.contains("fetchCaptureReviewsIsolated"))
+        assertTrue(cloud.contains("fetchCaptureImportStatesIsolated"))
     }
 
     @Test

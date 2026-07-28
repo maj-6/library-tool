@@ -603,6 +603,21 @@ class CorrectionProjectionService(
             None,
         )
 
+    def get_correction_review(
+        self,
+        item_id: str,
+    ) -> CorrectionReviewSnapshot:
+        """Return the durable item review through the projection boundary.
+
+        Review state lives in the same reconciled correction aggregate as
+        raster and annotation assertions.  Keeping this read on the projection
+        service prevents HTTP and renderer code from reaching into the
+        persistence adapter or reconstructing audit state client-side.
+        """
+
+        with self._repository.unit_of_work(operation_id=_QUERY_OPERATION_ID) as unit:
+            return self._state(unit.get(item_id), item_id).review
+
     def list_spatial_annotations(
         self,
         item_id: str,

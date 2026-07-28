@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ...engine.capture_archives import (
+    CAPTURE_LIB_MAX_ARCHIVE_BYTES,
     AssociateCaptureArchiveCommand,
     CaptureArchiveAssociation,
     CaptureArchiveDisposition,
@@ -39,7 +40,14 @@ _ASSOCIATION_ROOT = PurePosixPath(".engine/capture-lib/associations")
 _RECEIPT_ROOT = PurePosixPath(".engine/receipts/capture-lib")
 _ARCHIVE_ROOT = PurePosixPath(".engine/capture-lib/objects")
 _MAX_DOCUMENT_BYTES = 128 * 1024
-_MAX_ARCHIVE_BYTES = 250 * 1024 * 1024
+_MAX_ARCHIVE_BYTES = CAPTURE_LIB_MAX_ARCHIVE_BYTES
+
+
+class _ReadOnlyWorkspaceRoot:
+    __slots__ = ("root",)
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
 
 
 def _canonical_json(value: Any, *, artifact: str) -> bytes:
@@ -147,6 +155,40 @@ class FilesystemCaptureArchiveRepository:
                     retryable=True,
                 ) from exc
 
+    @classmethod
+    def inspect_association(
+        cls,
+        workspace_root: str | Path,
+        capture_id: str,
+    ) -> CaptureArchiveAssociation | None:
+        """Verify one association without creating locks or workspace files."""
+
+        capture_book_id(capture_id)
+        configured = Path(workspace_root)
+        if not os.path.lexists(configured):
+            return None
+        try:
+            info = configured.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or _is_redirecting_path(configured)
+            ):
+                raise ValueError("workspace root is redirecting or invalid")
+            root = configured.resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise _repository_failure(
+                "the capture archive workspace cannot be inspected read-only",
+                code="invalid_capture_archive_storage",
+                cause=exc,
+                retryable=True,
+            ) from exc
+        repository = cls.__new__(cls)
+        repository._write_set = _ReadOnlyWorkspaceRoot(root)
+        association = repository._read_association(capture_id)
+        if association is not None:
+            repository._validate_archive(association)
+        return association
+
     def replay(
         self,
         command: AssociateCaptureArchiveCommand,
@@ -227,11 +269,6 @@ class FilesystemCaptureArchiveRepository:
                         "the capture archive is too large",
                         code="capture_archive_too_large",
                         details={"maximum_bytes": _MAX_ARCHIVE_BYTES},
-                    )
-                if publication.book_id != capture_book_id(publication.capture_id):
-                    raise RepositoryError(
-                        "the capture publication has a non-canonical book identity",
-                        code="invalid_capture_archive_publication",
                     )
                 association = publication.association
                 archive_path = self._archive_path(association.archive_sha256)
@@ -330,7 +367,7 @@ class FilesystemCaptureArchiveRepository:
                     return None
                 self._validate_existing_source(
                     capture_id=command.source.capture_id,
-                    book_id=capture_book_id(command.source.capture_id),
+                    book_id=command.book_id,
                     source_revision=command.source.source_revision,
                     source_fingerprint=command.source.fingerprint,
                     existing=existing,
@@ -466,9 +503,14 @@ class FilesystemCaptureArchiveRepository:
         existing: CaptureArchiveAssociation,
     ) -> None:
         if existing.book_id != book_id:
-            raise RepositoryError(
-                "the capture association has a non-canonical book identity",
-                code="invalid_capture_archive_storage",
+            raise ConflictError(
+                "the capture already has another stable book identity",
+                code="capture_book_identity_conflict",
+                details={
+                    "capture_id": capture_id,
+                    "current_book_id": existing.book_id,
+                    "requested_book_id": book_id,
+                },
             )
         if existing.source_revision != source_revision:
             raise ConflictError(
@@ -644,12 +686,6 @@ class FilesystemCaptureArchiveRepository:
         if association.capture_id != capture_id:
             raise RepositoryError(
                 "the capture archive association belongs to another capture",
-                code="invalid_capture_archive_storage",
-                details={"artifact": "capture_archive_association"},
-            )
-        if association.book_id != capture_book_id(capture_id):
-            raise RepositoryError(
-                "the capture archive association has a non-canonical book identity",
                 code="invalid_capture_archive_storage",
                 details={"artifact": "capture_archive_association"},
             )

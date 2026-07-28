@@ -227,6 +227,17 @@ def test_managed_row_validation_retains_strict_legacy_failures(
         codec.decode("book-one", row)
 
 
+def test_managed_row_accepts_portable_opaque_capture_identity():
+    row = _managed_row()
+    row["capture_id"] = "phone_1.v2-source"
+    codec = _codec(lambda _previous: "unused")
+
+    snapshot = codec.decode("book-one", row)
+
+    assert snapshot.item_id == "book-one"
+    assert row["capture_id"] == "phone_1.v2-source"
+
+
 def test_manifest_validation_remains_an_explicit_host_dependency():
     manifest = _ManifestValidator()
     manifest.failure = ValueError("manifest rejected by representation adapter")

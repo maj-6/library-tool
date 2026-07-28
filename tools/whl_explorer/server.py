@@ -141,7 +141,8 @@ from librarytool.engine.contracts import (  # noqa: E402
 from librarytool.engine.capture_archives import (  # noqa: E402
     CaptureArchiveAssociation,
     CaptureArchiveService,
-    capture_book_id,
+    CaptureArchiveState,
+    capture_book_id as capture_book_id,
 )
 from librarytool.engine.errors import (  # noqa: E402
     ConflictError as EngineConflictError,
@@ -1631,6 +1632,74 @@ _reviews_lock = threading.Lock()
 _REVIEW_KINDS = ("key", "row", "build")
 CAPTURE_PHONE_SYNC_STATE_PATH = lib.OUTPUT_DIR / "capture_phone_sync_state.json"
 _capture_phone_sync_state_lock = threading.Lock()
+CAPTURE_CLOUD_ASSOCIATION_STATE_PATH = (
+    lib.OUTPUT_DIR / "capture_cloud_association_state.json"
+)
+_capture_cloud_association_state_lock = threading.Lock()
+_CAPTURE_CLOUD_ASSOCIATION_QUARANTINE_KEEP = 128
+
+
+def _normalized_capture_cloud_association_state(raw: object) -> dict:
+    value = raw if isinstance(raw, dict) else {}
+    shadows = value.get("shadows")
+    pending = value.get("pending")
+    quarantine = value.get("quarantine")
+    return {
+        "version": 1,
+        "legacy_imported": value.get("legacy_imported") is True,
+        "shadows": copy.deepcopy(shadows)
+        if isinstance(shadows, dict) else {},
+        "pending": copy.deepcopy(pending)
+        if isinstance(pending, dict) else {},
+        "quarantine": copy.deepcopy(quarantine[-(
+            _CAPTURE_CLOUD_ASSOCIATION_QUARANTINE_KEEP
+        ):]) if isinstance(quarantine, list) else [],
+    }
+
+
+def _capture_cloud_association_state() -> dict:
+    """Load the downgrade-safe cloud association cursor/outbox.
+
+    Prerelease builds briefly stored these fields in the shared version-1
+    phone cursor. Import them exactly once before any newer phone-state write
+    can discard fields unknown to an older binary.
+    """
+
+    with _capture_cloud_association_state_lock:
+        raw = lib.load_json(CAPTURE_CLOUD_ASSOCIATION_STATE_PATH, {}) or {}
+        state = _normalized_capture_cloud_association_state(raw)
+        if not state["legacy_imported"]:
+            with _capture_phone_sync_state_lock:
+                legacy = (
+                    lib.load_json(CAPTURE_PHONE_SYNC_STATE_PATH, {}) or {}
+                )
+            if isinstance(legacy, dict):
+                shadows = legacy.get("cloud_association_shadows")
+                pending = legacy.get("pending_cloud_associations")
+                if isinstance(shadows, dict) and not state["shadows"]:
+                    state["shadows"] = copy.deepcopy(shadows)
+                if isinstance(pending, dict) and not state["pending"]:
+                    state["pending"] = copy.deepcopy(pending)
+            state["legacy_imported"] = True
+            lib.save_json(CAPTURE_CLOUD_ASSOCIATION_STATE_PATH, state)
+        return copy.deepcopy(state)
+
+
+def _update_capture_cloud_association_state(mutator) -> dict:
+    """Atomically mutate the isolated association cursor/outbox."""
+
+    _capture_cloud_association_state()
+    with _capture_cloud_association_state_lock:
+        raw = lib.load_json(CAPTURE_CLOUD_ASSOCIATION_STATE_PATH, {}) or {}
+        state = _normalized_capture_cloud_association_state(raw)
+        state["legacy_imported"] = True
+        mutator(state)
+        state["version"] = 1
+        state["quarantine"] = state["quarantine"][-(
+            _CAPTURE_CLOUD_ASSOCIATION_QUARANTINE_KEEP
+        ):]
+        lib.save_json(CAPTURE_CLOUD_ASSOCIATION_STATE_PATH, state)
+        return copy.deepcopy(state)
 
 
 def _capture_phone_sync_state() -> dict:
@@ -1643,6 +1712,13 @@ def _capture_phone_sync_state() -> dict:
     shadows = raw.get("review_shadows")
     pending = raw.get("pending_reviews")
     lan_snapshots = raw.get("lan_snapshots")
+    lan_confirmations = copy.deepcopy(raw.get("lan_confirmations"))
+    lan_confirmation_stream_id = copy.deepcopy(
+        raw.get("lan_confirmation_stream_id")
+    )
+    lan_confirmation_fingerprint = copy.deepcopy(
+        raw.get("lan_confirmation_fingerprint")
+    )
     lan_owner_id = str(raw.get("lan_owner_id") or "")
     try:
         lan_owner_id = str(uuid.UUID(lan_owner_id)) if lan_owner_id else ""
@@ -1656,12 +1732,21 @@ def _capture_phone_sync_state() -> dict:
         "pending_reviews": dict(pending) if isinstance(pending, dict) else {},
         "lan_snapshots": dict(lan_snapshots)
         if isinstance(lan_snapshots, dict) else {},
+        # Preserve these raw so corruption cannot be silently normalized by an
+        # unrelated metadata/review sync before confirmation publication sees
+        # it and rotates to a fresh stream.
+        "lan_confirmation_stream_id": lan_confirmation_stream_id,
+        "lan_confirmation_fingerprint": lan_confirmation_fingerprint,
+        "lan_confirmations": lan_confirmations,
         "lan_owner_id": lan_owner_id,
     }
 
 
 def _update_capture_phone_sync_state(mutator) -> dict:
     """Atomically merge one cursor mutation with concurrent LAN ingest."""
+    # Preserve prerelease cloud fields in their isolated file before this
+    # version-1 writer intentionally drops unknown keys.
+    _capture_cloud_association_state()
     with _capture_phone_sync_state_lock:
         raw = lib.load_json(CAPTURE_PHONE_SYNC_STATE_PATH, {}) or {}
         if not isinstance(raw, dict):
@@ -1676,6 +1761,13 @@ def _update_capture_phone_sync_state(mutator) -> dict:
             if isinstance(raw.get("pending_reviews"), dict) else {},
             "lan_snapshots": dict(raw.get("lan_snapshots"))
             if isinstance(raw.get("lan_snapshots"), dict) else {},
+            "lan_confirmation_stream_id": copy.deepcopy(
+                raw.get("lan_confirmation_stream_id")
+            ),
+            "lan_confirmation_fingerprint": copy.deepcopy(
+                raw.get("lan_confirmation_fingerprint")
+            ),
+            "lan_confirmations": copy.deepcopy(raw.get("lan_confirmations")),
             "lan_owner_id": str(raw.get("lan_owner_id") or ""),
         }
         mutator(state)
@@ -2520,7 +2612,7 @@ def api_builds_update(build_id: str):
         if build_id not in builds:
             abort(404)
         b = builds[build_id]
-        before_capture_id = _clean_capture_id(b.get("capture_id"))
+        before_capture_id = _capture_archive_id(b.get("capture_id"))
         # optimistic concurrency: an editor that loaded the record before
         # another writer touched it gets the current record back, not a merge
         expect = str(payload.get("expect_updated_at") or "")
@@ -2552,7 +2644,7 @@ def api_builds_update(build_id: str):
                 candidate[f] = str(payload[f] or "").strip()
         if candidate.get("status") not in _BUILD_STATUSES:
             candidate["status"] = "draft"
-        after_capture_id = _clean_capture_id(candidate.get("capture_id"))
+        after_capture_id = _capture_archive_id(candidate.get("capture_id"))
         if before_capture_id and after_capture_id != before_capture_id:
             return jsonify({
                 "ok": False,
@@ -7547,6 +7639,11 @@ def _lib_book_id(build_id: str) -> str:
     """The book's stable UUID (docs/lib-format.md §2.4), minted on first
     export. Imported identities are persisted; older local builds use a
     deterministic fallback so a read-only export never mutates the store."""
+    doc = lib.load_json(_lib_id_path(build_id), None)
+    historical_book_id = capture_lib_compat.historical_build_book_id(
+        build_id,
+        doc if isinstance(doc, Mapping) else None,
+    )
     stored_book_id = _lib_stored_book_id(build_id)
     builds = lib.load_json(BUILDS_PATH, {}) or {}
     build = builds.get(build_id) if isinstance(builds, dict) else None
@@ -7555,45 +7652,48 @@ def _lib_book_id(build_id: str) -> str:
         if isinstance(build, dict)
         else ""
     )
-    if capture_id:
-        capture_identity = capture_book_id(capture_id)
-        linked_identity = str(build.get("capture_book_id") or "")
-        if linked_identity and not re.fullmatch(
-            r"b-[0-9a-f]{32}", linked_identity
-        ):
-            raise EngineRepositoryError(
-                "the captured item identity is invalid",
-                code="invalid_capture_book_identity",
-                details={"item_id": build_id, "capture_id": capture_id},
-            )
-        conflicting_identity = (
-            linked_identity
-            if linked_identity and linked_identity != capture_identity
-            else (
-                stored_book_id
-                if stored_book_id and stored_book_id != capture_identity
-                else ""
-            )
+    linked_identity = (
+        str(build.get("capture_book_id") or "")
+        if isinstance(build, dict)
+        else ""
+    )
+    if linked_identity and not re.fullmatch(
+        r"b-[0-9a-f]{32}",
+        linked_identity,
+    ):
+        raise EngineRepositoryError(
+            "the captured item identity is invalid",
+            code="invalid_capture_book_identity",
+            details={"item_id": build_id, "capture_id": capture_id},
         )
-        if conflicting_identity:
-            raise EngineConflictError(
-                "the capture and imported archive identities conflict",
-                code="capture_book_identity_conflict",
-                details={
-                    "item_id": build_id,
-                    "capture_id": capture_id,
-                    "capture_book_id": capture_identity,
-                    "stored_book_id": conflicting_identity,
-                },
-            )
-        # New links persist this exact identity in the catalogue transaction;
-        # legacy rows retain the same namespace-derived fallback.
-        return linked_identity or capture_identity
-    if stored_book_id:
-        return stored_book_id
-    return "b-" + uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"https://librarytool.local/items/{build_id}").hex
+    association = None
+    if capture_id:
+        # Read-only inspection avoids taking the workspace lease while callers
+        # hold the Replica merge lock. A legacy association can intentionally
+        # preserve either a persisted lib-id or the historical build-id UUID5.
+        association = FilesystemCaptureArchiveRepository.inspect_association(
+            _ensure_engine_session().write_set.root,
+            capture_id,
+        )
+    identities = {
+        value
+        for value in (
+            stored_book_id,
+            linked_identity,
+            association.book_id if association is not None else "",
+        )
+        if value
+    }
+    if len(identities) > 1:
+        raise EngineConflictError(
+            "the capture and imported archive identities conflict",
+            code="capture_book_identity_conflict",
+            details={
+                "item_id": build_id,
+                "capture_id": capture_id,
+            },
+        )
+    return next(iter(identities), historical_book_id)
 
 
 def _lib_store_book_id(build_id: str, book_id: str) -> None:
@@ -7621,8 +7721,6 @@ def _lib_import_identity_state(
         return "", ({"ok": False, "error": "item no longer exists"}, 404)
     capture_id = _capture_archive_id(build.get("capture_id"))
     linked_book_id = str(build.get("capture_book_id") or "")
-    if capture_id and not linked_book_id:
-        linked_book_id = capture_book_id(capture_id)
     if linked_book_id and not re.fullmatch(
         r"b-[0-9a-f]{32}", linked_book_id
     ):
@@ -7632,17 +7730,45 @@ def _lib_import_identity_state(
             "conflict": "book_identity_mismatch",
         }, 409)
     stored_book_id = _lib_stored_book_id(build_id)
-    if (
-        linked_book_id
-        and stored_book_id
-        and linked_book_id != stored_book_id
-    ):
+    association = (
+        FilesystemCaptureArchiveRepository.inspect_association(
+            _ensure_engine_session().write_set.root,
+            capture_id,
+        )
+        if capture_id
+        else None
+    )
+    identities = {
+        value
+        for value in (
+            linked_book_id,
+            stored_book_id,
+            association.book_id if association is not None else "",
+        )
+        if value
+    }
+    if len(identities) > 1:
         return "", ({
             "ok": False,
             "error": "the item carries conflicting stable book identities",
             "conflict": "book_identity_mismatch",
         }, 409)
-    local_book_id = linked_book_id or stored_book_id
+    identity_document = lib.load_json(_lib_id_path(build_id), None)
+    historical_book_id = capture_lib_compat.historical_build_book_id(
+        build_id,
+        (
+            identity_document
+            if isinstance(identity_document, Mapping)
+            else None
+        ),
+    )
+    # A capture-linked legacy build already has a stable historical identity,
+    # even if it predates the association sidecar. A fresh unlinked build does
+    # not: its first import is allowed to adopt the archive's identity.
+    local_book_id = next(
+        iter(identities),
+        historical_book_id if capture_id else "",
+    )
     if (
         incoming_book_id
         and local_book_id
@@ -13210,7 +13336,7 @@ def api_manual_update(entry_id: str):
             candidate.get(field) != snapshot.get(field)
             for field in archive_fields
         ):
-            stale_capture_id = _clean_capture_id(
+            stale_capture_id = _capture_archive_id(
                 candidate.get("capture_id")
             )
 
@@ -19942,6 +20068,17 @@ def _capture_archive_id(value) -> str:
     return _clean_capture_id(value)
 
 
+def _capture_build_book_identities(capture_id: str) -> dict[str, str]:
+    """Find identities used by builds that already represent this capture."""
+
+    builds = lib.load_json(BUILDS_PATH, {}) or {}
+    return capture_lib_compat.discover_capture_build_identities(
+        builds,
+        ENTRIES_DIR,
+        capture_id,
+    )
+
+
 def _capture_ingest_lock(capture_id: str) -> threading.Lock:
     """Stable bounded lock stripe for one capture's local asset publication."""
 
@@ -20246,13 +20383,21 @@ def _capture_archive_association(
 
 def _mark_capture_archive_stale(
         capture_id: str) -> CaptureArchiveAssociation | None:
-    """Invalidate the sealed snapshot without treating it as the live store."""
+    """Invalidate locally and queue a previously acknowledged cloud snapshot.
+
+    Catalogue edits remain entirely local: this function never leases
+    credentials or performs network I/O.  A later credentialed cloud-sync pass
+    publishes only a verified current-to-stale transition.
+    """
 
     normalized = _capture_archive_id(capture_id)
     if not normalized:
         return None
     with _capture_ingest_lock(normalized):
-        return _capture_archive_service().mark_stale(normalized)
+        association = _capture_archive_service().mark_stale(normalized)
+    if association is not None:
+        _queue_cloud_capture_stale_association(association)
+    return association
 
 
 def _invalidate_capture_archive_before_item_update(
@@ -20329,10 +20474,22 @@ def _ensure_capture_archive(
             # Later catalogue or sidecar edits are exactly why it is stale and
             # must not prevent a lost delivery acknowledgement from converging.
             return existing
+        book_id = (
+            existing.book_id
+            if existing is not None
+            else capture_lib_compat.resolve_legacy_capture_book_id(
+                authoritative_entry,
+                capture_id,
+                discovered_identities=(
+                    _capture_build_book_identities(capture_id)
+                ),
+            )
+        )
         command = capture_lib_compat.build_capture_archive_command(
             capture_id,
             authoritative_entry,
             CAPTURES_DIR / capture_id,
+            book_id=book_id,
         )
         return service.associate(command).receipt.association
 
@@ -20575,7 +20732,7 @@ def _cloud_capture_title(cap: dict) -> str:
         title = str(source.get("title") or "").strip()
         if title:
             return title[:240]
-    capture_id = _clean_capture_id(cap.get("id"))
+    capture_id = _capture_archive_id(cap.get("id"))
     return f"Capture {capture_id[:8]}" if capture_id else "Phone capture"
 
 
@@ -20605,7 +20762,925 @@ def _manual_capture_identity(capture_id: str) -> tuple[str, str]:
     return entry_id, title
 
 
-def _import_capture(cfg: dict, cap: dict, mistral_key: str,
+def _cloud_capture_association_revision(cap: dict) -> int:
+    """Return the server-owned CAS revision observed in one pending row."""
+
+    value = cap.get("lib_association_revision", 0)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value >= 9223372036854775807
+    ):
+        raise sbase.SyncError("capture archive revision is invalid")
+    return value
+
+
+def _capture_association_is_exact_stale_transition(
+        current: CaptureArchiveAssociation,
+        stale: CaptureArchiveAssociation) -> bool:
+    """Whether ``stale`` changes only the frozen association state."""
+
+    if (
+        current.state is not CaptureArchiveState.CURRENT
+        or stale.state is not CaptureArchiveState.STALE
+    ):
+        return False
+    current_document = current.as_dict()
+    stale_document = stale.as_dict()
+    current_document.pop("state")
+    stale_document.pop("state")
+    return current_document == stale_document
+
+
+def _cloud_capture_association_shadow(
+        raw: object,
+        capture_id: str,
+) -> tuple[CaptureArchiveAssociation, int] | None:
+    """Parse one exact accepted cloud document/revision cursor."""
+
+    if not isinstance(raw, dict):
+        return None
+    revision = raw.get("revision")
+    try:
+        association = CaptureArchiveAssociation.from_dict(
+            raw.get("association")
+        )
+    except (EngineValidationError, TypeError, ValueError):
+        return None
+    if (
+        association.capture_id != capture_id
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision >= 9223372036854775807
+    ):
+        return None
+    return association, revision
+
+
+def _queue_cloud_capture_stale_association(
+        association: CaptureArchiveAssociation,
+) -> bool:
+    """Durably queue an exact acknowledged current-to-stale transition.
+
+    LAN-only and otherwise local captures have no accepted cloud shadow and
+    are deliberately ignored.  That keeps ordinary edits credential-free and
+    prevents a local capture id from becoming authority to write a cloud row.
+    """
+
+    if (
+        not isinstance(association, CaptureArchiveAssociation)
+        or association.state is not CaptureArchiveState.STALE
+    ):
+        return False
+    queued = False
+
+    def update(state: dict) -> None:
+        nonlocal queued
+        capture_id = association.capture_id
+        shadow = _cloud_capture_association_shadow(
+            state["shadows"].get(capture_id),
+            capture_id,
+        )
+        if (
+            shadow is None
+            or not _capture_association_is_exact_stale_transition(
+                shadow[0], association
+            )
+        ):
+            return
+        state["pending"][capture_id] = {
+            "association": association.as_dict(),
+            "expected_revision": shadow[1],
+        }
+        queued = True
+
+    _update_capture_cloud_association_state(update)
+    return queued
+
+
+def _remember_cloud_capture_association(
+        association: CaptureArchiveAssociation,
+        accepted: dict,
+) -> None:
+    """Persist the exact RPC receipt needed for a later offline stale edit."""
+
+    revision = accepted.get("lib_association_revision")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision >= 9223372036854775807
+    ):
+        raise sbase.SyncError(
+            "capture archive publication returned an invalid revision"
+        )
+    accepted_id = accepted.get("id")
+    if accepted_id is not None and accepted_id != association.capture_id:
+        raise sbase.SyncError(
+            "capture archive publication returned another capture"
+        )
+    accepted_document = accepted.get("lib_association")
+    if accepted_document is not None:
+        try:
+            parsed = CaptureArchiveAssociation.from_dict(accepted_document)
+        except (EngineValidationError, TypeError, ValueError) as exc:
+            raise sbase.SyncError(
+                "capture archive publication returned an invalid association"
+            ) from exc
+        if parsed != association:
+            raise sbase.SyncError(
+                "capture archive publication returned another association"
+            )
+
+    def update(state: dict) -> None:
+        capture_id = association.capture_id
+        state["shadows"][capture_id] = {
+            "association": association.as_dict(),
+            "revision": revision,
+        }
+        pending = state["pending"].get(capture_id)
+        if (
+            isinstance(pending, dict)
+            and pending.get("association") == association.as_dict()
+        ):
+            state["pending"].pop(capture_id, None)
+        elif association.state is CaptureArchiveState.CURRENT:
+            # A newly accepted current snapshot supersedes any stale intent
+            # tied to an older accepted document.
+            state["pending"].pop(capture_id, None)
+
+    _update_capture_cloud_association_state(update)
+
+    # Close the race where a catalogue edit became durable after the RPC
+    # committed but before its current receipt reached the local cursor file.
+    if association.state is CaptureArchiveState.CURRENT:
+        try:
+            local = _capture_archive_association(association.capture_id)
+        except EngineError as exc:
+            # The accepted receipt is already durable. A later ordinary edit
+            # (or duplicate-import repair) will retry stale discovery.
+            log.warning(
+                "could not inspect capture archive after cloud receipt: %s",
+                exc,
+            )
+            return
+        if (
+            local is not None
+            and _capture_association_is_exact_stale_transition(
+                association, local
+            )
+        ):
+            _queue_cloud_capture_stale_association(local)
+
+
+def _publish_cloud_capture_state(
+        owner_cfg: dict | None,
+        capture_cfg: dict,
+        cap: dict,
+        association: CaptureArchiveAssociation,
+        *,
+        mark_imported: bool) -> dict:
+    """Publish one exact association through the two-party scoped CAS.
+
+    A second immediate attempt closes the common lost-response window. The
+    locked RPC accepts only the immediately preceding exact attempt as replay;
+    another document or revision remains a conflict.
+    """
+
+    if owner_cfg is None:
+        raise sbase.SyncError(
+            "owner service credential is required for capture acknowledgement"
+        )
+    capture_id = _capture_archive_id(cap.get("id"))
+    if (
+        not capture_id
+        or not isinstance(association, CaptureArchiveAssociation)
+        or association.capture_id != capture_id
+        or association.state not in (
+            CaptureArchiveState.CURRENT,
+            CaptureArchiveState.STALE,
+        )
+    ):
+        raise sbase.SyncError(
+            "capture archive publication state is invalid"
+        )
+    expected_revision = _cloud_capture_association_revision(cap)
+    last_error = None
+    for attempt in range(2):
+        try:
+            accepted = sbase.publish_capture_lib_association(
+                owner_cfg,
+                capture_cfg,
+                capture_id,
+                association.as_dict(),
+                expected_revision=expected_revision,
+                mark_imported=mark_imported,
+            )
+            try:
+                _remember_cloud_capture_association(association, accepted)
+            except sbase.SyncError:
+                raise
+            except Exception as exc:
+                # The remote RPC is exact-replay safe at expected_revision or
+                # expected_revision + 1. Treat a failed local receipt save as
+                # an ambiguous delivery so the bounded retry records the
+                # shadow before an imported row disappears from discovery.
+                raise sbase.SyncError(
+                    "capture archive cloud receipt could not be saved locally"
+                ) from exc
+            return accepted
+        except sbase.SyncError as exc:
+            last_error = exc
+            if attempt:
+                raise
+    raise last_error  # pragma: no cover - the bounded loop always raises/returns
+
+
+def _publish_cloud_capture_acknowledgement(
+        owner_cfg: dict | None,
+        capture_cfg: dict,
+        cap: dict,
+        association: CaptureArchiveAssociation | None) -> dict:
+    """Publish the first verified archive state and atomically mark imported."""
+
+    if not isinstance(association, CaptureArchiveAssociation):
+        raise sbase.SyncError(
+            "a verified library archive is required for acknowledgement"
+        )
+    return _publish_cloud_capture_state(
+        owner_cfg,
+        capture_cfg,
+        cap,
+        association,
+        mark_imported=True,
+    )
+
+
+def _publish_cloud_capture_association_only(
+        owner_cfg: dict | None,
+        capture_cfg: dict,
+        cap: dict,
+        association: CaptureArchiveAssociation | None) -> dict:
+    """Publish only an exact stale document, preserving remote status."""
+
+    if (
+        not isinstance(association, CaptureArchiveAssociation)
+        or association.state is not CaptureArchiveState.STALE
+    ):
+        raise sbase.SyncError(
+            "a verified stale library archive is required for association update"
+        )
+    return _publish_cloud_capture_state(
+        owner_cfg,
+        capture_cfg,
+        cap,
+        association,
+        mark_imported=False,
+    )
+
+
+def _pending_cloud_capture_associations(
+) -> list[tuple[CaptureArchiveAssociation, int]]:
+    """Return only still-authoritative exact stale publication intents."""
+
+    state = _capture_cloud_association_state()
+    shadows = state["shadows"]
+    pending = state["pending"]
+    publications: list[tuple[CaptureArchiveAssociation, int]] = []
+    for capture_id in sorted(pending):
+        normalized = _capture_archive_id(capture_id)
+        raw = pending.get(capture_id)
+        if not normalized or normalized != capture_id or not isinstance(raw, dict):
+            continue
+        expected_revision = raw.get("expected_revision")
+        try:
+            association = CaptureArchiveAssociation.from_dict(
+                raw.get("association")
+            )
+        except (EngineValidationError, TypeError, ValueError):
+            continue
+        shadow = _cloud_capture_association_shadow(
+            shadows.get(capture_id),
+            capture_id,
+        )
+        if (
+            shadow is None
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision != shadow[1]
+            or association.capture_id != capture_id
+            or not _capture_association_is_exact_stale_transition(
+                shadow[0], association
+            )
+        ):
+            continue
+        publications.append((association, expected_revision))
+    return publications
+
+
+def _capture_cloud_quarantine_intent(
+        capture_id: str,
+        reason: str,
+        *,
+        local: dict | None = None,
+        remote: dict | None = None,
+        drop_shadow: bool = False,
+) -> None:
+    """Remove one terminal intent while retaining bounded local evidence."""
+
+    reason = str(reason or "association intent quarantined")[:240]
+
+    def update(state: dict) -> None:
+        evidence = {
+            "capture_id": capture_id,
+            "reason": reason,
+            "intent": copy.deepcopy(state["pending"].get(capture_id)),
+            "shadow": copy.deepcopy(state["shadows"].get(capture_id)),
+            "local": copy.deepcopy(local),
+            "remote": copy.deepcopy(remote),
+        }
+        state["pending"].pop(capture_id, None)
+        if drop_shadow:
+            state["shadows"].pop(capture_id, None)
+        marker = json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if not any(
+            json.dumps(
+                {
+                    key: candidate.get(key)
+                    for key in (
+                        "capture_id",
+                        "reason",
+                        "intent",
+                        "shadow",
+                        "local",
+                        "remote",
+                    )
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) == marker
+            for candidate in state["quarantine"]
+            if isinstance(candidate, dict)
+        ):
+            state["quarantine"].append({
+                **evidence,
+                "quarantined_at": datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+            })
+
+    _update_capture_cloud_association_state(update)
+
+
+def _capture_cloud_quarantine_matches(
+        capture_id: str,
+        local: CaptureArchiveAssociation,
+        remote: dict,
+) -> bool:
+    local_document = local.as_dict()
+    state = _capture_cloud_association_state()
+    return any(
+        isinstance(candidate, dict)
+        and candidate.get("capture_id") == capture_id
+        and candidate.get("local") == local_document
+        and candidate.get("remote") == remote
+        for candidate in reversed(state["quarantine"])
+    )
+
+
+def _cloud_capture_remote_state(raw: object, capture_id: str) -> dict:
+    """Validate one exact user-scoped capture association state row."""
+
+    fields = {
+        "id",
+        "status",
+        "lib_association",
+        "lib_association_revision",
+        "lib_association_updated_at",
+    }
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise sbase.SyncError(
+            "capture archive scoped state returned invalid fields"
+        )
+    normalized = _canonical_capture_id(raw.get("id"))
+    status = raw.get("status")
+    revision = raw.get("lib_association_revision")
+    association_raw = raw.get("lib_association")
+    updated_at = raw.get("lib_association_updated_at")
+    if (
+        not normalized
+        or normalized != capture_id
+        or not isinstance(status, str)
+        or not status
+        or len(status) > 40
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+        or revision >= 9223372036854775807
+    ):
+        raise sbase.SyncError(
+            "capture archive scoped state is invalid"
+        )
+    association = None
+    if association_raw is None:
+        if revision != 0 or updated_at is not None:
+            raise sbase.SyncError(
+                "capture archive null scoped state has transport metadata"
+            )
+    else:
+        try:
+            association = CaptureArchiveAssociation.from_dict(
+                association_raw
+            )
+        except (EngineValidationError, TypeError, ValueError) as exc:
+            raise sbase.SyncError(
+                "capture archive scoped association is invalid"
+            ) from exc
+        if (
+            association.capture_id != capture_id
+            or revision <= 0
+            or not isinstance(updated_at, str)
+            or not updated_at
+            or len(updated_at) > 80
+        ):
+            raise sbase.SyncError(
+                "capture archive scoped association metadata is invalid"
+            )
+    return {
+        "id": capture_id,
+        "status": status,
+        "lib_association": (
+            association.as_dict() if association is not None else None
+        ),
+        "lib_association_revision": revision,
+        "lib_association_updated_at": updated_at,
+        "association": association,
+    }
+
+
+def _capture_cloud_reconciliation_ids() -> list[str]:
+    """Return local/saved UUID identities eligible for user-scoped reads."""
+
+    state = _capture_cloud_association_state()
+    values = (
+        set(_current_capture_targets())
+        | set(state["shadows"])
+        | set(state["pending"])
+    )
+    return sorted({
+        capture_id
+        for value in values
+        if (capture_id := _canonical_capture_id(value))
+    })
+
+
+def _local_capture_association_for_reconciliation(
+        capture_id: str,
+) -> CaptureArchiveAssociation | None:
+    with _capture_ingest_lock(capture_id):
+        return _capture_archive_association(capture_id)
+
+
+def _remember_scoped_cloud_capture_state(remote: dict) -> None:
+    association = remote.get("association")
+    if not isinstance(association, CaptureArchiveAssociation):
+        raise sbase.SyncError(
+            "capture archive scoped state has no association"
+        )
+    _remember_cloud_capture_association(association, remote)
+
+
+def _store_scoped_cloud_capture_shadow(remote: dict) -> None:
+    """Adopt an observed remote cursor without deriving a local transition."""
+
+    association = remote.get("association")
+    revision = remote.get("lib_association_revision")
+    if (
+        not isinstance(association, CaptureArchiveAssociation)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+    ):
+        raise sbase.SyncError(
+            "capture archive scoped state has no valid association"
+        )
+
+    def update(state: dict) -> None:
+        state["shadows"][association.capture_id] = {
+            "association": association.as_dict(),
+            "revision": revision,
+        }
+        state["pending"].pop(association.capture_id, None)
+
+    _update_capture_cloud_association_state(update)
+
+
+def _reconcile_cloud_capture_associations(
+        owner_cfg: dict | None,
+        capture_cfg: dict | None,
+        *,
+        capture_ids: list[str] | None = None,
+) -> dict:
+    """Bootstrap and reconcile local associations from user-scoped rows."""
+
+    if not owner_cfg or not capture_cfg:
+        return {
+            "observed": 0,
+            "bootstrapped": 0,
+            "published": 0,
+            "queued": 0,
+            "quarantined": 0,
+            "errors": [],
+            "skipped": "capture publication credentials unavailable",
+        }
+    ids = (
+        sorted({_canonical_capture_id(value) for value in capture_ids})
+        if capture_ids is not None
+        else _capture_cloud_reconciliation_ids()
+    )
+    ids = [value for value in ids if value]
+    if not ids:
+        return {
+            "observed": 0,
+            "bootstrapped": 0,
+            "published": 0,
+            "queued": 0,
+            "quarantined": 0,
+            "errors": [],
+        }
+    try:
+        rows = sbase.list_capture_association_states(capture_cfg, ids)
+    except Exception as exc:
+        return {
+            "observed": 0,
+            "bootstrapped": 0,
+            "published": 0,
+            "queued": 0,
+            "quarantined": 0,
+            "errors": [
+                f"scoped association discovery failed: "
+                f"{type(exc).__name__}: {exc}"
+            ],
+        }
+    raw_by_id: dict[str, dict] = {}
+    errors: list[str] = []
+    for raw in rows if isinstance(rows, list) else []:
+        raw_id = _canonical_capture_id(
+            raw.get("id") if isinstance(raw, dict) else ""
+        )
+        if not raw_id or raw_id not in ids or raw_id in raw_by_id:
+            errors.append("scoped association discovery returned invalid rows")
+            continue
+        raw_by_id[raw_id] = raw
+    bootstrapped = published = queued = quarantined = 0
+    for capture_id in ids:
+        raw = raw_by_id.get(capture_id)
+        if raw is None:
+            state = _capture_cloud_association_state()
+            if (
+                capture_id in state["pending"]
+                or capture_id in state["shadows"]
+            ):
+                _capture_cloud_quarantine_intent(
+                    capture_id,
+                    "capture is deleted or no longer authorized",
+                    remote=None,
+                    drop_shadow=True,
+                )
+                quarantined += 1
+            continue
+        try:
+            remote = _cloud_capture_remote_state(raw, capture_id)
+        except sbase.SyncError as exc:
+            errors.append(f"capture {capture_id[:8]}: {exc}")
+            continue
+        try:
+            local = _local_capture_association_for_reconciliation(
+                capture_id
+            )
+        except Exception as exc:
+            errors.append(
+                f"capture {capture_id[:8]}: local inspection failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+        remote_association = remote["association"]
+        if local is None:
+            state = _capture_cloud_association_state()
+            if (
+                capture_id in state["pending"]
+                or capture_id in state["shadows"]
+            ):
+                _capture_cloud_quarantine_intent(
+                    capture_id,
+                    "local capture archive no longer exists",
+                    remote=raw,
+                    drop_shadow=True,
+                )
+                quarantined += 1
+            continue
+        if (
+            remote_association is not None
+            and _capture_cloud_quarantine_matches(
+                capture_id,
+                local,
+                raw,
+            )
+        ):
+            _store_scoped_cloud_capture_shadow(remote)
+            continue
+        if remote_association is None:
+            try:
+                _publish_cloud_capture_state(
+                    owner_cfg,
+                    capture_cfg,
+                    remote,
+                    local,
+                    mark_imported=remote["status"] == "pending",
+                )
+                published += 1
+            except Exception as exc:
+                errors.append(
+                    f"capture {capture_id[:8]} bootstrap failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            continue
+        if remote_association == local:
+            _remember_scoped_cloud_capture_state(remote)
+            bootstrapped += 1
+            continue
+        if _capture_association_is_exact_stale_transition(
+            remote_association,
+            local,
+        ):
+            _remember_scoped_cloud_capture_state(remote)
+            if any(
+                candidate.capture_id == capture_id
+                for candidate, _revision
+                in _pending_cloud_capture_associations()
+            ):
+                queued += 1
+            bootstrapped += 1
+            continue
+        reason = (
+            "remote stale association cannot be regressed to current"
+            if _capture_association_is_exact_stale_transition(
+                local,
+                remote_association,
+            )
+            else "local and remote capture associations conflict"
+        )
+        _capture_cloud_quarantine_intent(
+            capture_id,
+            reason,
+            local=local.as_dict(),
+            remote=raw,
+        )
+        _store_scoped_cloud_capture_shadow(remote)
+        quarantined += 1
+    return {
+        "observed": len(raw_by_id),
+        "bootstrapped": bootstrapped,
+        "published": published,
+        "queued": queued,
+        "quarantined": quarantined,
+        "errors": errors,
+    }
+
+
+def _capture_cloud_http_status(exc: Exception) -> int | None:
+    match = re.match(r"HTTP ([0-9]{3})\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _reconcile_failed_cloud_capture_publication(
+        capture_cfg: dict,
+        association: CaptureArchiveAssociation,
+        expected_revision: int,
+        exc: Exception,
+        *,
+        allow_rebase: bool,
+) -> tuple[str, int | None]:
+    """Resolve one terminal RPC failure from the exact scoped remote row."""
+
+    status = _capture_cloud_http_status(exc)
+    if status not in {401, 403, 404, 409, 410}:
+        return "retry", None
+    try:
+        rows = sbase.list_capture_association_states(
+            capture_cfg,
+            [association.capture_id],
+        )
+    except Exception as scoped_exc:
+        if _capture_cloud_http_status(scoped_exc) in {401, 403}:
+            _capture_cloud_quarantine_intent(
+                association.capture_id,
+                "capture association publication is no longer authorized",
+                local=association.as_dict(),
+                drop_shadow=True,
+            )
+            return "quarantined", None
+        return "retry", None
+    if not isinstance(rows, list) or not rows:
+        _capture_cloud_quarantine_intent(
+            association.capture_id,
+            "capture is deleted or no longer authorized",
+            local=association.as_dict(),
+            drop_shadow=True,
+        )
+        return "quarantined", None
+    try:
+        remote = _cloud_capture_remote_state(rows[0], association.capture_id)
+    except sbase.SyncError:
+        return "retry", None
+    remote_association = remote["association"]
+    if remote_association == association:
+        _remember_scoped_cloud_capture_state(remote)
+        return "applied", None
+    exact_predecessor = (
+        isinstance(remote_association, CaptureArchiveAssociation)
+        and _capture_association_is_exact_stale_transition(
+            remote_association,
+            association,
+        )
+    )
+    if exact_predecessor and status in {404, 410}:
+        # During a capability migration the capture row remains authoritative
+        # even while the prepare/publish RPC endpoint is temporarily absent.
+        # Adopt its latest cursor and preserve the exact stale intent so a
+        # later sync retries after the endpoint becomes available.
+        _remember_scoped_cloud_capture_state(remote)
+        _queue_cloud_capture_stale_association(association)
+        if (
+            allow_rebase
+            and remote["lib_association_revision"] != expected_revision
+        ):
+            return "rebase", remote["lib_association_revision"]
+        return "deferred", None
+    if status in {404, 410}:
+        # A visible scoped row proves this is endpoint/capability rollout, not
+        # capture deletion. Keep the old intent for a later exact reconcile.
+        return "deferred", None
+    if (
+        allow_rebase
+        and status == 409
+        and exact_predecessor
+        and remote["lib_association_revision"] != expected_revision
+    ):
+        _remember_scoped_cloud_capture_state(remote)
+        _queue_cloud_capture_stale_association(association)
+        return "rebase", remote["lib_association_revision"]
+    _capture_cloud_quarantine_intent(
+        association.capture_id,
+        (
+            "capture association authorization conflict"
+            if status in {401, 403}
+            else "capture association CAS target is obsolete"
+        ),
+        local=association.as_dict(),
+        remote=rows[0],
+        drop_shadow=remote_association is None,
+    )
+    return "quarantined", None
+
+
+def _publish_pending_cloud_capture_associations(
+        owner_cfg: dict | None,
+        capture_cfg: dict | None,
+) -> dict:
+    """Flush the offline stale outbox only during a credentialed sync pass."""
+
+    publications = _pending_cloud_capture_associations()
+    if not owner_cfg or not capture_cfg:
+        return {
+            "pushed": 0,
+            "pending": len(publications),
+            "errors": [],
+            "skipped": "capture publication credentials unavailable",
+        }
+    pushed = 0
+    errors: list[str] = []
+    for association, expected_revision in publications:
+        cancelled = False
+        try:
+            # Serialize only the local reversion decision with stale marking.
+            # The lock is deliberately released before the network call below.
+            with _capture_ingest_lock(association.capture_id):
+                local = _capture_archive_association(
+                    association.capture_id
+                )
+                state = _capture_cloud_association_state()
+                shadow = _cloud_capture_association_shadow(
+                    state["shadows"].get(
+                        association.capture_id
+                    ),
+                    association.capture_id,
+                )
+                if shadow is not None and local == shadow[0]:
+                    # The catalogue truly returned to the exact
+                    # remotely-current snapshot. A stale transition waiting on
+                    # this same stripe runs after cancellation and requeues it.
+                    def cancel(candidate: dict) -> None:
+                        pending = candidate["pending"].get(
+                            association.capture_id
+                        )
+                        if pending == {
+                            "association": association.as_dict(),
+                            "expected_revision": expected_revision,
+                        }:
+                            candidate["pending"].pop(
+                                association.capture_id, None
+                            )
+
+                    _update_capture_cloud_association_state(cancel)
+                    cancelled = True
+        except Exception as exc:
+            errors.append(
+                f"capture {association.capture_id[:8]}: local inspection "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            continue
+        if cancelled:
+            continue
+        try:
+            # A reseal or later local change cannot make the old accepted cloud
+            # snapshot current again. The queued document remains the exact
+            # cryptographic invalidation of that shadow and must still publish.
+            _publish_cloud_capture_association_only(
+                owner_cfg,
+                capture_cfg,
+                {
+                    "id": association.capture_id,
+                    "lib_association_revision": expected_revision,
+                },
+                association,
+            )
+            pushed += 1
+        except Exception as exc:
+            action, rebased_revision = (
+                _reconcile_failed_cloud_capture_publication(
+                    capture_cfg,
+                    association,
+                    expected_revision,
+                    exc,
+                    allow_rebase=True,
+                )
+            )
+            if action == "applied":
+                pushed += 1
+                continue
+            if action == "quarantined":
+                continue
+            if action == "rebase" and rebased_revision is not None:
+                try:
+                    _publish_cloud_capture_association_only(
+                        owner_cfg,
+                        capture_cfg,
+                        {
+                            "id": association.capture_id,
+                            "lib_association_revision": rebased_revision,
+                        },
+                        association,
+                    )
+                    pushed += 1
+                    continue
+                except Exception as rebased_exc:
+                    final_action, _unused = (
+                        _reconcile_failed_cloud_capture_publication(
+                            capture_cfg,
+                            association,
+                            rebased_revision,
+                            rebased_exc,
+                            allow_rebase=False,
+                        )
+                    )
+                    if final_action == "applied":
+                        pushed += 1
+                        continue
+                    if final_action == "quarantined":
+                        continue
+                    exc = rebased_exc
+            errors.append(
+                f"capture {association.capture_id[:8]}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return {
+        "pushed": pushed,
+        "pending": len(_pending_cloud_capture_associations()),
+        "errors": errors,
+    }
+
+
+def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
+                    cap: dict, mistral_key: str,
                     delete_remote: bool, on_persisted=None) -> dict:
     """Import one pending cloud capture and return its detailed outcome.
 
@@ -20632,24 +21707,31 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
         }
         try:
             # Idempotently repair a lost acknowledgement from an earlier run.
-            sbase.mark_capture(cfg, cap["id"], "imported")
+            _publish_cloud_capture_acknowledgement(
+                owner_cfg, capture_cfg, cap, association)
         except Exception as exc:
             result["sync_error"] = (
                 f"cloud acknowledgement failed: {type(exc).__name__}: {exc}"
             )[:500]
             return result
-        if delete_remote:                                # a lost mark left these behind
+        if (
+            delete_remote
+            and association.state is CaptureArchiveState.CURRENT
+        ):                                              # a lost mark left these behind
             try:
-                sbase.delete_photos(cfg, photo_paths)
+                sbase.delete_photos(capture_cfg, photo_paths)
             except sbase.SyncError:
                 pass
         return result
     try:
-        raw_photos = _download_cloud_capture_photos(cfg, photo_paths)
+        raw_photos = _download_cloud_capture_photos(
+            capture_cfg,
+            photo_paths,
+        )
     except sbase.SyncError as exc:
         if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
             # the photos are gone — this row can never import; stop retrying it
-            sbase.mark_capture(cfg, cap["id"], "error")
+            sbase.mark_capture(capture_cfg, cap["id"], "error")
         raise
     new_id, errors = ingest_capture(
         cap, raw_photos, mistral_key, photo_paths, transport="cloud")
@@ -20677,7 +21759,8 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     if new_id and on_persisted is not None:
         on_persisted(dict(result))
     try:
-        sbase.mark_capture(cfg, cap["id"], "imported")
+        _publish_cloud_capture_acknowledgement(
+            owner_cfg, capture_cfg, cap, association)
     except Exception as exc:
         # The local book is already durable and must remain visible. Leave the
         # remote row pending for a later idempotent acknowledgement repair.
@@ -20687,9 +21770,14 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
         return result
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
-    if delete_remote and not errors:
+    if (
+        delete_remote
+        and not errors
+        and isinstance(association, CaptureArchiveAssociation)
+        and association.state is CaptureArchiveState.CURRENT
+    ):
         try:
-            sbase.delete_photos(cfg, photo_paths)
+            sbase.delete_photos(capture_cfg, photo_paths)
         except sbase.SyncError as exc:
             result["warnings"].append(
                 f"remote photo cleanup deferred: {type(exc).__name__}: {exc}"
@@ -21937,7 +23025,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                 indeterminate=False,
             )
             for index, cap in enumerate(pending_captures, 1):
-                capture_id = _clean_capture_id(cap.get("id"))
+                capture_id = _capture_archive_id(cap.get("id"))
                 title_hint = _cloud_capture_title(cap)
                 _cloudsync_set_stage(
                     "capture_import",
@@ -21954,7 +23042,8 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                              else contextlib.nullcontext(""))
                     with lease as mistral_key:
                         outcome = _import_capture(
-                            capture_cfg, cap, mistral_key, delete_remote,
+                            owner_cfg, capture_cfg, cap, mistral_key,
+                            delete_remote,
                             on_persisted=_cloudsync_book_ready,
                         )
                     status = str(outcome.get("status") or "skipped")
@@ -22012,6 +23101,75 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                         failed=failed,
                         event=item_event,
                     )
+        association_sync: dict = {}
+        if owner_cfg and capture_cfg:
+            _cloudsync_set_stage(
+                "capture_associations",
+                "Publishing capture archive state",
+                total=0,
+                completed=0,
+                unit="operations",
+                indeterminate=True,
+            )
+            try:
+                reconciliation = _reconcile_cloud_capture_associations(
+                    owner_cfg,
+                    capture_cfg,
+                )
+                publication = (
+                    _publish_pending_cloud_capture_associations(
+                        owner_cfg,
+                        capture_cfg,
+                    )
+                )
+                association_sync = {
+                    "observed": reconciliation.get("observed", 0),
+                    "bootstrapped": reconciliation.get(
+                        "bootstrapped", 0
+                    ),
+                    "published": reconciliation.get("published", 0),
+                    "queued": reconciliation.get("queued", 0),
+                    "quarantined": reconciliation.get(
+                        "quarantined", 0
+                    ),
+                    "pushed": publication.get("pushed", 0),
+                    "pending": publication.get("pending", 0),
+                    "errors": [
+                        *(reconciliation.get("errors") or []),
+                        *(publication.get("errors") or []),
+                    ],
+                }
+                errors.extend(
+                    f"capture associations: {error}"
+                    for error in association_sync.get("errors", [])
+                )
+            except Exception as exc:
+                association_sync = {
+                    "pushed": 0,
+                    "pending": len(
+                        _pending_cloud_capture_associations()
+                    ),
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+                errors.append(f"capture associations: {exc}")
+        else:
+            reconciliation = _reconcile_cloud_capture_associations(
+                owner_cfg,
+                capture_cfg,
+            )
+            publication = _publish_pending_cloud_capture_associations(
+                owner_cfg,
+                capture_cfg,
+            )
+            association_sync = {
+                **reconciliation,
+                "pushed": publication.get("pushed", 0),
+                "pending": publication.get("pending", 0),
+                "errors": [
+                    *(reconciliation.get("errors") or []),
+                    *(publication.get("errors") or []),
+                ],
+            }
         pushed = metadata_pushed = 0
         review_sync: dict = {}
         stores: dict = {}
@@ -22101,6 +23259,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
                   "failed": failed, "captures_total": completed,
                   "books_pushed": pushed,
+                  "capture_associations": association_sync,
                   "capture_metadata_pushed": metadata_pushed,
                   "capture_reviews": review_sync,
                   "stores": stores,
@@ -22304,6 +23463,25 @@ LAN_CAPTURE_MAX_REQUEST_BYTES = CAPTURE_MAX_TOTAL_PHOTO_BYTES
 LAN_CAPTURE_MAX_PHOTOS = CAPTURE_MAX_PHOTOS
 LAN_CAPTURE_MAX_PHOTO_BYTES = CAPTURE_MAX_PHOTO_BYTES
 LAN_SNAPSHOT_MAX_ENTRIES = 2_000
+LAN_CAPTURE_LIB_CONFIRMATION_SCHEMA = "org.whl.capture-lib-confirmation"
+LAN_CAPTURE_LIB_CONFIRMATION_VERSION = 1
+LAN_CAPTURE_LIB_CONFIRMATION_MAX_BYTES = 16 * 1024
+LAN_CAPTURE_LIB_CONFIRMATION_MAX_ENTRIES = 2_000
+_LAN_CAPTURE_LIB_CONFIRMATION_FIELDS = frozenset({
+    "schema",
+    "version",
+    "capture_id",
+    "stream_id",
+    "revision",
+    "updated_at",
+    "association",
+})
+_LAN_CAPTURE_LIB_SNAPSHOT_FIELDS = frozenset({
+    "fingerprint",
+    "revision",
+    "updated_at",
+    "last_seen_at",
+})
 
 
 def _lan_token() -> str:
@@ -22408,6 +23586,248 @@ def _lan_snapshot_owner_id() -> str:
 
         _update_capture_phone_sync_state(reset)
         return owner_id
+
+
+def _lan_capture_lib_timestamp(value) -> datetime:
+    if (
+        not isinstance(value, str)
+        or not 0 < len(value) <= 80
+        or value != value.strip()
+        or not sbase._CAPTURE_LIB_OFFSET_TIMESTAMP.fullmatch(value)
+    ):
+        raise ValueError("LAN archive confirmation timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            "LAN archive confirmation timestamp is invalid"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("LAN archive confirmation timestamp needs an offset")
+    return parsed
+
+
+def _lan_capture_lib_confirmation_write(
+        raw: dict,
+        expected_capture_id: str,
+        expected_stream_id: str) -> dict:
+    """Validate and detach one exact Android-compatible LAN confirmation."""
+
+    if not isinstance(raw, dict) or set(raw) != \
+            _LAN_CAPTURE_LIB_CONFIRMATION_FIELDS:
+        raise ValueError("LAN archive confirmation fields are invalid")
+    try:
+        payload = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        value = json.loads(payload.decode("utf-8"))
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise ValueError("LAN archive confirmation is not strict JSON") from exc
+    if len(payload) > LAN_CAPTURE_LIB_CONFIRMATION_MAX_BYTES:
+        raise ValueError("LAN archive confirmation is too large")
+    capture_id = _canonical_capture_id(value.get("capture_id"))
+    stream_id = _canonical_capture_id(value.get("stream_id"))
+    revision = value.get("revision")
+    if (
+        value.get("schema") != LAN_CAPTURE_LIB_CONFIRMATION_SCHEMA
+        or type(value.get("version")) is not int
+        or value.get("version") != LAN_CAPTURE_LIB_CONFIRMATION_VERSION
+        or not capture_id
+        or capture_id != expected_capture_id
+        or value.get("capture_id") != capture_id
+        or not stream_id
+        or stream_id != expected_stream_id
+        or value.get("stream_id") != stream_id
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision > 9223372036854775807
+    ):
+        raise ValueError("LAN archive confirmation is invalid")
+    _lan_capture_lib_timestamp(value.get("updated_at"))
+    try:
+        value["association"] = sbase._capture_lib_association_write(
+            value.get("association"),
+            capture_id,
+        )
+    except sbase.SyncError as exc:
+        raise ValueError("LAN archive confirmation association is invalid") from exc
+    return value
+
+
+def _lan_capture_lib_snapshot(raw) -> dict:
+    if not isinstance(raw, dict) or set(raw) != \
+            _LAN_CAPTURE_LIB_SNAPSHOT_FIELDS:
+        raise ValueError("LAN archive confirmation snapshot is invalid")
+    fingerprint = raw.get("fingerprint")
+    revision = raw.get("revision")
+    if (
+        not isinstance(fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision > 9223372036854775807
+    ):
+        raise ValueError("LAN archive confirmation snapshot is invalid")
+    _lan_capture_lib_timestamp(raw.get("updated_at"))
+    _lan_capture_lib_timestamp(raw.get("last_seen_at"))
+    return dict(raw)
+
+
+def _lan_capture_lib_map_fingerprint(confirmations: dict) -> str:
+    try:
+        payload = json.dumps(
+            confirmations,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise ValueError("LAN archive confirmation ledger is invalid") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _lan_capture_lib_confirmation(capture_id: str) -> dict | None:
+    """Return one durable monotonic confirmation for a verified association."""
+
+    capture_id = _canonical_capture_id(capture_id)
+    if not capture_id:
+        return None
+    accepted: dict = {}
+    write_set = _ensure_engine_session().write_set
+    # Keep the archive read ordered with its confirmation commit. A concurrent
+    # current -> stale transition cannot publish an older state at a newer
+    # confirmation revision.
+    with write_set.workspace_lease():
+        association = _capture_archive_association(capture_id)
+        if association is None:
+            return None
+        desired = sbase._capture_lib_association_write(
+            association.as_dict(),
+            capture_id,
+        )
+        desired_payload = json.dumps(
+            desired,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        desired_fingerprint = hashlib.sha256(desired_payload).hexdigest()
+
+        def update(state):
+            raw_stream = state.get("lan_confirmation_stream_id")
+            raw_fingerprint = state.get("lan_confirmation_fingerprint")
+            raw_confirmations = state.get("lan_confirmations")
+            stream_id = _canonical_capture_id(raw_stream)
+            confirmations = raw_confirmations
+            reset = (
+                not stream_id
+                or raw_stream != stream_id
+                or not isinstance(raw_fingerprint, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", raw_fingerprint)
+                or not isinstance(confirmations, dict)
+            )
+            if not reset:
+                try:
+                    if _lan_capture_lib_map_fingerprint(confirmations) != \
+                            raw_fingerprint:
+                        raise ValueError(
+                            "LAN archive confirmation ledger changed"
+                        )
+                    for key, snapshot in confirmations.items():
+                        if _canonical_capture_id(key) != key:
+                            raise ValueError(
+                                "LAN archive confirmation id is invalid"
+                            )
+                        _lan_capture_lib_snapshot(snapshot)
+                except ValueError:
+                    reset = True
+            if (
+                not reset
+                and capture_id not in confirmations
+                and len(confirmations) >=
+                LAN_CAPTURE_LIB_CONFIRMATION_MAX_ENTRIES
+            ):
+                reset = True
+            if reset:
+                stream_id = str(uuid.uuid4())
+                confirmations = {}
+
+            previous = None
+            if capture_id in confirmations:
+                previous = _lan_capture_lib_snapshot(
+                    confirmations[capture_id]
+                )
+            previous_revision = (
+                previous["revision"] if previous is not None else 0
+            )
+            if (
+                previous is not None
+                and previous["fingerprint"] != desired_fingerprint
+                and previous_revision == 9223372036854775807
+            ):
+                # A new stream is the only non-wrapping continuation.
+                stream_id = str(uuid.uuid4())
+                confirmations = {}
+                previous = None
+                previous_revision = 0
+
+            now = datetime.now(timezone.utc)
+            now_text = now.isoformat(timespec="microseconds")
+            if (
+                previous is not None
+                and previous["fingerprint"] == desired_fingerprint
+            ):
+                revision = previous_revision
+                updated_at = previous["updated_at"]
+                last_seen_at = max(
+                    now,
+                    _lan_capture_lib_timestamp(previous["last_seen_at"]),
+                ).isoformat(timespec="microseconds")
+            else:
+                revision = previous_revision + 1
+                if previous is not None:
+                    prior_time = _lan_capture_lib_timestamp(
+                        previous["updated_at"]
+                    )
+                    now = max(now, prior_time + timedelta(microseconds=1))
+                    now_text = now.isoformat(timespec="microseconds")
+                updated_at = now_text
+                last_seen_at = now_text
+            candidate = {
+                "schema": LAN_CAPTURE_LIB_CONFIRMATION_SCHEMA,
+                "version": LAN_CAPTURE_LIB_CONFIRMATION_VERSION,
+                "capture_id": capture_id,
+                "stream_id": stream_id,
+                "revision": revision,
+                "updated_at": updated_at,
+                "association": desired,
+            }
+            accepted.update(_lan_capture_lib_confirmation_write(
+                candidate,
+                capture_id,
+                stream_id,
+            ))
+            confirmations[capture_id] = {
+                "fingerprint": desired_fingerprint,
+                "revision": revision,
+                "updated_at": updated_at,
+                "last_seen_at": last_seen_at,
+            }
+            state["lan_confirmation_stream_id"] = stream_id
+            state["lan_confirmation_fingerprint"] = \
+                _lan_capture_lib_map_fingerprint(confirmations)
+            state["lan_confirmations"] = confirmations
+
+        _update_capture_phone_sync_state(update)
+    return accepted
 
 
 def _lan_versioned_capture_rows(capture_ids: list[str]) -> tuple[list[dict],
@@ -22578,10 +23998,22 @@ def _lan_metadata_exchange(payload: dict) -> dict:
             errors.append({"capture_id": capture_id, "error": str(exc)[:200]})
     books, reviews, projection_errors = _lan_versioned_capture_rows(capture_ids)
     errors.extend(projection_errors)
+    associations = []
+    for capture_id in capture_ids:
+        try:
+            confirmation = _lan_capture_lib_confirmation(capture_id)
+            if confirmation is not None:
+                associations.append(confirmation)
+        except Exception as exc:
+            errors.append({
+                "capture_id": capture_id,
+                "error": str(exc)[:200],
+            })
     return {
         "app": "whl-capture",
         "books": books,
         "reviews": reviews,
+        "associations": associations,
         "errors": errors,
     }
 
@@ -22692,14 +24124,31 @@ def _lan_capture():
     except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500
-    association = _capture_archive_association(capture_id)
-    if association is None:
-        log.error(
-            "LAN capture returned without a durable archive: capture=%s",
-            capture_id,
-        )
-        return jsonify(error="capture archive association is unavailable"), 500
-    portable = {"lib_association": association.as_dict()}
+    canonical_capture_id = _canonical_capture_id(capture_id)
+    try:
+        if canonical_capture_id:
+            confirmation = _lan_capture_lib_confirmation(
+                canonical_capture_id
+            )
+            if confirmation is None:
+                raise RuntimeError(
+                    "verified capture archive confirmation is unavailable"
+                )
+            portable = {
+                # Retain the prerelease field for older paired clients.
+                "lib_association": confirmation["association"],
+                "lib_confirmation": confirmation,
+            }
+        else:
+            association = _capture_archive_association(capture_id)
+            portable = (
+                {"lib_association": association.as_dict()}
+                if association is not None
+                else {}
+            )
+    except Exception as exc:
+        log.exception("LAN capture confirmation failed")
+        return jsonify(error=str(exc)[:200]), 500
     if entry_id is None:
         # Idempotent retry. Echo the submitted capture id so Android can prove
         # that this receipt belongs to the entry it is about to move to sent/.

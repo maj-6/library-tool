@@ -187,6 +187,24 @@ internal data class HomeStatusPresentation(
     val accessibilityLabel: String = "",
 )
 
+internal data class CaptureLibMarkerPresentation(
+    val visible: Boolean,
+    val accessibilityLabel: String = "",
+)
+
+/** The archive check is independent of upload/cloud status. Only the frozen
+ * #239 `current` state confirms a usable sealed snapshot; stale, null, and
+ * corrupt sidecars intentionally render nothing. */
+internal fun captureLibMarkerPresentation(
+    confirmation: CaptureLibConfirmation?,
+    accessibilityLabel: String,
+): CaptureLibMarkerPresentation =
+    if (confirmation?.confirmed == true) {
+        CaptureLibMarkerPresentation(true, accessibilityLabel)
+    } else {
+        CaptureLibMarkerPresentation(false)
+    }
+
 internal fun homeStatusPresentation(rawStatus: String): HomeStatusPresentation {
     val status = rawStatus.trim().lowercase()
     val withoutComplete = status.removePrefix("complete · ").trim()

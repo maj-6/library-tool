@@ -40,7 +40,12 @@ WHL corrections / category taxonomy merge through these; see
 `tools/store_sync.py`). Migration 015 adds the owner-readable
 `photo_processing_jobs` queue used by the optional image processor. Migration
 017 adds `capture_book_metadata` (desktop-authored registered-book snapshots)
-and `capture_reviews` (small, shared attention/review state).
+and `capture_reviews` (small, shared attention/review state). Migration 020
+adds the nullable, revisioned `.lib/3` association acknowledgement directly to
+`captures`, so status and association can be published in one transaction.
+Migration 021 introduced the first exact-scope publication RPC; append-only
+migration 022 replaces it with the two-party capability protocol described
+below. The archive itself never leaves the importing desktop.
 
 On an existing project, don't re-paste everything: `python3
 tools/cloud_setup.py check` diffs the `schema_migrations` table against the
@@ -75,16 +80,31 @@ any failure.
 ## 4. Wire up both ends
 
 - **Desktop**: sign in to a Library Tool account, then choose the auto-sync
-  interval under Settings → Integrations → *Phone capture (Supabase)*. No
-  Supabase key is needed to import captures. Returning registered-book fields
-  to phones and consuming phone review changes are trusted curator operations;
+  interval under Settings → Integrations → *Phone capture (Supabase)*.
+  Downloading and locally importing a capture uses the signed-in account.
+  Confirming its trusted `.lib/3` association, returning registered-book fields
+  to phones, and consuming phone review changes are trusted curator operations;
   the library owner must add the project service key under Settings →
   Credentials → *Owner service key*. It is held only in the desktop engine's
   protected secret store. Both that key and a signed-in user session are
   required, and they must name the same Supabase project: the user session
-  first limits the operation to capture IDs that account may ingest, then the
-  service credential reads/writes only that exact set. A service key by itself
-  never enables phone round-trip publication. A Mistral API key (Settings → Credentials) is
+  first prepares a five-minute, exact-scope capability bound by `auth.uid()` to
+  the capture, association, observed revision, and requested status change.
+  The service credential can consume only that unguessable capability; it
+  cannot supply or impersonate an actor. The consuming transaction locks the
+  capture and capability, rechecks current ownership or the locked ingest
+  grant, and compare-and-sets the association plus imported status. Only the
+  capability's SHA-256 is stored, and an exact consumed receipt remains
+  replayable for seven days so a lost HTTP response cannot advance the
+  revision twice. Direct service-role table updates cannot write the trusted
+  association columns, and a service key by itself never enables phone
+  round-trip publication. A private, bounded cleanup runs hourly through
+  Supabase Cron, in a transaction separate from publication locks, and keeps
+  30 days of this job's run history. Without
+  the protected owner
+  credential, a locally sealed capture must remain remotely `pending` until a
+  later retry can atomically publish `status=imported` plus the association.
+  A Mistral API key (Settings → Credentials) is
   needed only for captures the phone didn't pre-OCR; it syncs through
   `profile_secrets`, so a key entered on either device follows the
   signed-in account to the other. **Test connection** in the same panel
@@ -141,6 +161,50 @@ Desktop projection publication uses per-row revision compare-and-set plus a
 small source vector (build, manual source, and tombstone timestamps), so a
 second desktop without the source-only fields cannot erase richer phone data
 or resurrect a newer tombstone.
+
+### Capture archive confirmation
+
+The portable association is the exact `org.whl.capture-lib-association`
+version-1 document produced by capture import. Its state is `current` or
+`stale`; only `current` produces the confirmed marker. Transport ordering is
+kept outside that frozen document as a server-owned revision and timestamp.
+The phone persists the resulting confirmation in `lib_association.json`, so
+the marker survives offline use and process restarts. Null legacy rows, stale
+documents, malformed documents, and out-of-order revisions remain unconfirmed.
+No local archive path, token, or owner credential is part of either document.
+
+Migration 020 deliberately replaces the historical table-wide authenticated
+`INSERT` grant on `captures` with a column list. PostgreSQL table privileges
+otherwise include columns added later, which would let a phone forge the new
+association during its initial insert. Authenticated users may read the
+association only through the existing owner-or-assigned-ingester capture RLS;
+association writes are service-only and also guarded by a trigger. These
+explicit grants are required on Supabase projects that no longer add Data API
+privileges for new schema objects automatically.
+
+Migration 022 has the desktop pass its exact verified association to
+`publish_capture_lib_association` with separate owner-service and signed-in-user
+configs. An authenticated RPC binds `auth.uid()` to an exact capture,
+association, expected revision, and status intent under a freshly generated
+256-bit capability. A service-role-only RPC receives only that capability,
+then locks the capture and hashed capability, rechecks the bound actor against
+the current owner or locked ingest grant, and applies the association/status
+CAS in the same transaction. A grant, ownership, revision, status, or document
+change therefore conflicts. Expired capabilities return 410; concurrency
+conflicts return 409. Direct service-role association column updates are not
+granted. Remote photos are deleted only after the RPC returns the exact
+accepted association. If a catalogue edit makes the local association stale
+after durable ingest but before that first receipt, the same exact stale
+document can still mark the capture imported; it remains unconfirmed on the
+phone and its remote photos are retained until a current archive is resealed.
+
+LAN `/lan/capture` receipts and `/lan/metadata` projections expose
+`org.whl.capture-lib-confirmation` envelopes. Their independent durable stream
+ledger keeps exact replays stable across restarts, advances revision and
+timestamp when the current/stale association changes, and rotates the stream
+before any safe revision reset after ledger loss or corruption. The raw
+`lib_association` receipt field remains for older paired clients; older
+cloud/LAN responses without a confirmation also remain valid but unconfirmed.
 
 When migration 015 finds a valid processing request in an uploaded capture,
 it atomically changes that row from `pending` to `processing`. The desktop

@@ -138,6 +138,13 @@ class EntryDetailActivity : AppCompatActivity() {
         diagnosticsEntry = entry
         val details = BookDetailPresenter.from(entry.meta)
 
+        val libMarker = captureLibMarkerPresentation(
+            entry.captureLibConfirmation,
+            getString(R.string.capture_lib_confirmed),
+        )
+        binding.captureLibConfirmed.visibility =
+            if (libMarker.visible) View.VISIBLE else View.GONE
+        binding.captureLibConfirmed.contentDescription = libMarker.accessibilityLabel
         binding.title.text = details.title.ifEmpty { getString(R.string.detail_untitled) }
         binding.author.text = details.author
         binding.author.visibility = details.author.visibleOrGone()

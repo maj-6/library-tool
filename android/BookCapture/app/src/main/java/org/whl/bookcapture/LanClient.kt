@@ -87,7 +87,7 @@ class LanClient(ctx: Context, frozenHost: String? = null) {
     fun uploadCapture(id: String, device: String, note: String, createdAt: String,
                       ocr: JSONObject, meta: JSONObject, photoAssets: JSONObject,
                       captureReview: JSONObject?,
-                      photos: List<Pair<String, File>>) {
+                      photos: List<Pair<String, File>>): CaptureLibConfirmation? {
         val metaJson = JSONObject()
             .put("id", id).put("device", device).put("note", note)
             .put("created_at", createdAt).put("ocr", ocr).put("meta", meta)
@@ -142,6 +142,12 @@ class LanClient(ctx: Context, frozenHost: String? = null) {
                 returnedId = response.optString("id"),
             )
         ) throw IOException("desktop did not confirm capture $id")
+        return when (val raw = response.opt("lib_confirmation")) {
+            null, JSONObject.NULL -> null // pre-#240 desktop: valid legacy receipt, no marker
+            is JSONObject -> captureLibConfirmationFromJson(raw, id)
+                ?: throw IOException("desktop returned an invalid archive confirmation")
+            else -> throw IOException("desktop returned an invalid archive confirmation")
+        }
     }
 
     /** Pull desktop projections and, only for an explicit Sync, send the dirty
@@ -201,6 +207,24 @@ class LanClient(ctx: Context, frozenHost: String? = null) {
                 throw IOException("desktop returned duplicate or out-of-scope review metadata")
             }
         }
+        val associations = linkedMapOf<String, CaptureLibConfirmation>()
+        val associationRows = when (val raw = response.opt("associations")) {
+            null, JSONObject.NULL -> JSONArray() // pre-#240 desktop
+            is JSONArray -> raw
+            else -> throw IOException("desktop returned invalid archive confirmations")
+        }
+        for (index in 0 until associationRows.length()) {
+            val parsed = associationRows.optJSONObject(index)
+                ?.let(::captureLibConfirmationFromJson)
+                ?: throw IOException("desktop returned invalid archive confirmation")
+            if (parsed.captureId !in allowed ||
+                associations.put(parsed.captureId, parsed) != null
+            ) {
+                throw IOException(
+                    "desktop returned duplicate or out-of-scope archive confirmation",
+                )
+            }
+        }
         val rejected = mutableSetOf<String>()
         val errors = response.optJSONArray("errors") ?: JSONArray()
         for (index in 0 until errors.length()) {
@@ -208,7 +232,7 @@ class LanClient(ctx: Context, frozenHost: String? = null) {
                 ?.takeIf { it in allowed }
                 ?.let(rejected::add)
         }
-        return LanMetadataExchange(books, reviewRows, rejected)
+        return LanMetadataExchange(books, reviewRows, associations, rejected)
     }
 }
 
@@ -234,6 +258,7 @@ internal fun readBounded(input: InputStream, maximum: Int): ByteArray {
 internal data class LanMetadataExchange(
     val books: Map<String, DesktopBookMetadata>,
     val reviews: Map<String, CaptureReviewMetadata>,
+    val associations: Map<String, CaptureLibConfirmation>,
     val rejectedReviewIds: Set<String>,
 )
 

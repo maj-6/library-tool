@@ -19,7 +19,9 @@ from librarytool.adapters.filesystem import (
     RecoverableWriteSet,
 )
 from librarytool.engine import (
+    CAPTURE_LIB_MAX_ARCHIVE_BYTES,
     AssociateCaptureArchiveCommand,
+    CaptureArchiveAssociation,
     CaptureArchiveDisposition,
     CaptureArchiveService,
     CaptureArchiveSource,
@@ -312,6 +314,62 @@ def test_source_and_materializer_are_canonical_and_deterministic():
         assert all(
             info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist()
         )
+
+
+@pytest.mark.parametrize(
+    "generated_at",
+    [
+        "2026-07-23T12:34:56",
+        "2026-07-23T12:34:56+0000",
+        "2026-W30-4T12:34:56+00:00",
+        "2026-07-23 12:34:56+00:00",
+        "2026-07-23T12:34:60+00:00",
+        "2026-07-23T12:34:56+14:01",
+    ],
+)
+def test_association_rejects_timestamps_cloud_and_android_cannot_parse(
+        generated_at):
+    with pytest.raises(ValidationError):
+        CaptureArchiveAssociation(
+            capture_id="11111111-2222-4333-8444-555555555555",
+            book_id="b-" + "a" * 32,
+            archive_sha256="b" * 64,
+            archive_bytes=1,
+            format_version="3.0",
+            state="current",
+            generated_at=generated_at,
+            source_revision="sha256:" + "c" * 64,
+            source_fingerprint="d" * 64,
+        )
+
+
+def test_association_enforces_portable_source_and_archive_bounds():
+    values = {
+        "capture_id": "11111111-2222-4333-8444-555555555555",
+        "book_id": "b-" + "a" * 32,
+        "archive_sha256": "b" * 64,
+        "archive_bytes": CAPTURE_LIB_MAX_ARCHIVE_BYTES,
+        "format_version": "3.0",
+        "state": "current",
+        "generated_at": "2026-07-23T12:34:56+00:00",
+        "source_revision": "sha256:" + "c" * 64,
+        "source_fingerprint": "d" * 64,
+    }
+    assert CaptureArchiveAssociation(**values).archive_bytes == \
+        CAPTURE_LIB_MAX_ARCHIVE_BYTES
+    with pytest.raises(ValidationError):
+        CaptureArchiveAssociation(
+            **{
+                **values,
+                "archive_bytes": CAPTURE_LIB_MAX_ARCHIVE_BYTES + 1,
+            }
+        )
+    with pytest.raises(ValidationError):
+        CaptureArchiveAssociation(
+            **{**values, "source_revision": "/private/capture"}
+        )
+    with pytest.raises(ValidationError):
+        _source(source_revision="capture/revision")
 
 
 def test_source_requires_original_to_rendition_lineage():
@@ -708,6 +766,39 @@ def test_operation_and_source_revision_conflicts_fail_closed(tmp_path):
             AssociateCaptureArchiveCommand(advanced, "operation-import-3")
         )
     assert reseal_error.value.code == "capture_archive_reseal_required"
+
+
+def test_legacy_book_identity_override_is_fingerprint_bound_and_preserved(
+    tmp_path,
+):
+    service, _repository, _materializer = _service(tmp_path)
+    source = _source()
+    canonical = AssociateCaptureArchiveCommand(
+        source,
+        "operation-canonical",
+    )
+    explicit_canonical = AssociateCaptureArchiveCommand(
+        source,
+        "operation-explicit-canonical",
+        book_id=capture_book_id(source.capture_id),
+    )
+    legacy_book_id = "b-fedcba0987654321fedcba0987654321"
+    legacy = AssociateCaptureArchiveCommand(
+        source,
+        "operation-legacy",
+        book_id=legacy_book_id,
+    )
+
+    assert explicit_canonical.fingerprint == canonical.fingerprint
+    assert legacy.fingerprint != canonical.fingerprint
+
+    created = service.associate(legacy)
+    assert created.receipt.association.book_id == legacy_book_id
+    assert service.get(source.capture_id).book_id == legacy_book_id
+
+    with pytest.raises(ConflictError) as conflict:
+        service.associate(canonical)
+    assert conflict.value.code == "capture_book_identity_conflict"
 
 
 def test_stale_transition_is_idempotent_and_preserves_historical_replay(

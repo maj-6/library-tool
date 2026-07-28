@@ -72,7 +72,15 @@ Two ways a row gets there:
 pushed. An `android-v*` tag follows the same signed Android path but skips the
 desktop job, which lets the two applications ship on independent schedules:
 
-1. **android** compares its `versionCode` and `versionName` with the newest
+1. **validation** installs the committed runtime/development dependencies and
+   runs Ruff, the complete Python suite, JavaScript syntax checks, and the
+   complete JavaScript behavior suite. A separate, always-run
+   **android_validation** job runs Android unit tests, debug and release lint,
+   and a debug assembly. Both application builds wait for both validation jobs,
+   so no installer or APK is packaged from a tag that fails a repository or
+   Android gate. This includes the executable Corrections recovery,
+   concurrency, accessibility-contract, and performance fixtures.
+2. **android** compares its `versionCode` and `versionName` with the newest
    previous, non-draft GitHub Release that actually contains a non-empty,
    uploaded `BookCapture-*.apk`. Releases where Android failed are not a
    baseline, so a partial desktop release cannot make the next run skip an APK
@@ -81,19 +89,20 @@ desktop job, which lets the two applications ship on independent schedules:
    has ever shipped, Android is included as a first release. If both values are
    unchanged, Android is deliberately skipped. Otherwise, `versionCode` must
    increase and `versionName` must also change; a name-only, code-only, equal-code,
-   or decreasing-code change is rejected. The job then runs the Android unit
-   tests and release lint, builds `android/BookCapture` (`assembleRelease`), and
-   names the APK after its Gradle `versionName`. A tag push that includes
+   or decreasing-code change is rejected. The packaging job builds
+   `android/BookCapture` (`assembleRelease`) and names the APK after its Gradle
+   `versionName`. A tag push that includes
    Android **requires** the release keystore secret: without it the Android job
    fails before the APK is uploaded, because a debug-signed build cannot update
-   an existing install. The desktop release is independent and still ships.
+   an existing install. When preflight selected Android, that failure prevents
+   the entire tagged release from becoming public.
    The job then verifies the APK's signer (via
    `apksigner`) and requires its normalized certificate SHA-256 to match
    `android/BookCapture/release-signing-cert.sha256`. This also protects a
    release-signed `workflow_dispatch` build. A dispatch without the secret still
    builds with the debug key and is suffixed `-debug-DONOTPUBLISH.apk`; that is
    the only signer-mismatch path the workflow permits.
-2. **desktop** freezes the Flask sidecar with PyInstaller and runs
+3. **desktop** freezes the Flask sidecar with PyInstaller and runs
    an isolated transport smoke against that frozen executable before running
    electron-builder on a Windows runner, producing the NSIS installer
    `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
@@ -101,15 +110,17 @@ desktop job, which lets the two applications ship on independent schedules:
    the newest GitHub Release at startup and read them to fetch the update. The
    job requires all three files and verifies that `latest.yml` names the expected
    version and installer before uploading any of them.
-3. **publish** attaches the builds to a GitHub Release named after the tag,
+4. **publish** attaches the builds to a GitHub Release named after the tag,
    using `docs/releases/<tag>.md` as its release notes when that file exists,
    then registers them in the `releases` table via `tools/release_publish.py`
-   (URL → the GitHub Release asset). The two apps release independently: the
-   job runs when either build succeeded and registers only the artifact(s)
-   present, so a broken Android build never blocks a desktop release (or vice
-   versa). When only one app builds, the GitHub Release title and a prominent
-   notes preamble identify the release as partial and distinguish a deliberate
-   unchanged-version Android skip from a build failure. Reruns also account for
+   (URL → the GitHub Release asset). The two apps keep independent version
+   schedules, but publication requires every product selected by preflight to
+   succeed. A desktop tag may omit Android only when its version identity did
+   not advance; an `android-v*` tag deliberately omits desktop. In either
+   deliberate one-product case, the GitHub Release title and a prominent notes
+   preamble identify the release as partial. A selected product's build or
+   signing failure cannot be converted into a partial public release. Reruns
+   also account for
    allowed assets already attached to the same release so they do not rewrite a
    full release as partial. Only the named `desktop` and `android` workflow
    artifacts are downloaded, and an explicit installer/manifest/blockmap/APK

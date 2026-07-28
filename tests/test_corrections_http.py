@@ -69,6 +69,7 @@ def _raster(
     content: bytes = b"png",
     canvas_id: str = "page-1",
     kind: str = "capture",
+    extensions=None,
 ) -> RasterArtifactView:
     revision = f"artifact-{artifact_id}-r1"
     digest = hashlib.sha256(content).hexdigest()
@@ -93,6 +94,7 @@ def _raster(
         label=f"Capture {artifact_id}",
         freshness=ArtifactFreshness.CURRENT,
         provenance=ArtifactProvenance(origin="capture"),
+        extensions=extensions or {},
     )
 
 
@@ -163,6 +165,32 @@ class _SpatialProjector:
 
     def get_spatial_annotation(self, key):
         return next((row for row in self.rows if row.key == key), None)
+
+
+class _Items:
+    def __init__(self, rows):
+        self.rows = tuple(rows)
+
+    def list_items(self):
+        return self.rows
+
+
+def _item(item_id="book-1", title="A Herbal"):
+    return ItemView(
+        item_id=item_id,
+        revision=f"{item_id}-r1",
+        record_revision=f"{item_id}-record-r1",
+        kind="book",
+        title=title,
+        metadata={},
+        representations=(),
+        artifacts=(),
+        workbench_state=WorkbenchState(
+            item_id,
+            f"{item_id}-workbench-r1",
+            {},
+        ),
+    )
 
 
 class _Engine:
@@ -286,6 +314,7 @@ def _projected_harness(
     raster_rows,
     spatial_rows,
     *,
+    items=None,
     actor_id_for_request=None,
 ):
     rasters = _RasterProjector(raster_rows)
@@ -304,13 +333,15 @@ def _projected_harness(
         repository,
     )
     corrections = CorrectionService(repository)
-    return (
-        _app(
-            _Engine(projected, projected, corrections),
-            actor_id_for_request=actor_id_for_request,
+    return _app(
+        _Engine(
+            projected,
+            projected,
+            corrections,
+            items=items,
         ),
-        repository,
-    )
+        actor_id_for_request=actor_id_for_request,
+    ), repository
 
 
 class _ReviewService:
@@ -1173,6 +1204,81 @@ def test_review_transitions_pin_replay_and_retain_audit_history(tmp_path):
     assert stale.status_code == 409
     assert stale.get_json()["code"] == "review_revision_conflict"
 
+
+def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
+    rows = (
+        _raster(
+            "capture:asset-1:original",
+            extensions={"capture_order": 1},
+        ),
+        _raster(
+            "capture:asset-1:display",
+            extensions={"capture_order": 1},
+        ),
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        rows,
+        (),
+        items=_Items((_item(title="Captured Herbal"),)),
+        actor_id_for_request=lambda: "account-42",
+    )
+    client = app.test_client()
+
+    initial = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert initial.status_code == 200
+    body = initial.get_json()
+    assert body["schema"] == "librarytool.corrections-index/1"
+    assert body["attention"] == []
+    assert len(body["books"]) == 1
+    book = body["books"][0]
+    assert book["title"] == "Captured Herbal"
+    assert [
+        capture["artifact_id"] for capture in book["captures"]
+    ] == ["capture:asset-1:display"]
+    capture = book["captures"][0]
+    assert capture["capture_order"] == 1
+    assert capture["thumbnail"]["url"].startswith(
+        "/api/v1/items/book-1/raster-artifacts/"
+    )
+    assert "workspace" not in initial.get_data(as_text=True).casefold()
+
+    detail = client.get("/api/v1/items/book-1/corrections/review")
+    assert detail.status_code == 200
+    review = detail.get_json()["review"]
+    assert review["state"] == "clear"
+    assert review["history_count"] == 0
+    assert review["history_tail"] == []
+    cached = client.get(
+        "/api/v1/items/book-1/corrections/review",
+        headers={"If-None-Match": detail.headers["ETag"]},
+    )
+    assert cached.status_code == 304
+
+    marked = client.put(
+        "/api/v1/items/book-1/corrections/review/attention",
+        json={"reason": "Check the title leaf", "comment": ""},
+        headers={
+            "Idempotency-Key": "index-review-mark",
+            "If-Review-Match": f'"{review["revision"]}"',
+        },
+    )
+    assert marked.status_code == 200
+    updated = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    ).get_json()
+    assert updated["revision"] != body["revision"]
+    assert updated["books"][0]["revision"] != book["revision"]
+    assert updated["books"][0]["review"]["state"] == "needs_attention"
+    assert updated["attention"][0]["target"] == {
+        "kind": "book",
+        "item_id": "book-1",
+    }
+    assert updated["attention"][0]["review"]["latest_event"][
+        "actor_id"
+    ] == "account-42"
 
 def test_review_actor_is_server_owned_and_client_spoofing_is_rejected(
     tmp_path,

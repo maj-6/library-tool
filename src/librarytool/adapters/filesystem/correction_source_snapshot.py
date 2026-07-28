@@ -233,7 +233,18 @@ class FilesystemCorrectionSourceSnapshotReader:
                 code="invalid_correction_transform_authority_snapshot",
                 details=artifact.key.as_dict(),
             )
-        return annotations
+        return tuple(
+            value
+            for value in annotations
+            if (
+                value.source.representation_revision
+                == artifact.source.representation_revision
+                and value.source.canvas_revision
+                == artifact.source.canvas_revision
+                and value.selector.coordinate_space_revision
+                == artifact.source.canvas_revision
+            )
+        )
 
 
 __all__ = ["FilesystemCorrectionSourceSnapshotReader"]

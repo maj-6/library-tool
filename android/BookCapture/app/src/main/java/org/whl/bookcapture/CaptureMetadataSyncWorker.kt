@@ -137,6 +137,7 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                 val ids = entries.map { it.id }
                 val desktopRows = client.desktopBookMetadata(ids)
                 val reviewRows = client.captureReviews(ids)
+                val importRows = client.captureImportStates(ids)
 
                 for ((captureId, metadata) in desktopRows) {
                     if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
@@ -153,6 +154,20 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                     if (result == DesktopMetadataApplyResult.CONFLICT) {
                         throw CaptureMetadataStateException(
                             "conflicting desktop metadata revision for $captureId",
+                        )
+                    }
+                }
+                for ((captureId, importState) in importRows) {
+                    val confirmation = importState.confirmation ?: continue
+                    if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
+                    val applied = EntryOperationLocks.withLock(captureId) {
+                        val entry = Entries.find(ctx, captureId)
+                            ?: return@withLock CaptureLibApplyResult.STALE
+                        CaptureLibAssociationStore.apply(entry.dir, confirmation)
+                    }
+                    if (applied == CaptureLibApplyResult.CONFLICT) {
+                        throw CaptureMetadataStateException(
+                            "conflicting archive confirmation revision for $captureId",
                         )
                     }
                 }
@@ -262,6 +277,18 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                         if (applied == DesktopMetadataApplyResult.CONFLICT) {
                             throw CaptureMetadataStateException(
                                 "conflicting LAN desktop metadata revision for $captureId",
+                            )
+                        }
+                    }
+                    for ((captureId, confirmation) in exchange.associations) {
+                        val applied = EntryOperationLocks.withLock(captureId) {
+                            val entry = Entries.find(ctx, captureId)
+                                ?: return@withLock CaptureLibApplyResult.STALE
+                            CaptureLibAssociationStore.apply(entry.dir, confirmation)
+                        }
+                        if (applied == CaptureLibApplyResult.CONFLICT) {
+                            throw CaptureMetadataStateException(
+                                "conflicting LAN archive confirmation revision for $captureId",
                             )
                         }
                     }

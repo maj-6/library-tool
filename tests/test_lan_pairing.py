@@ -173,6 +173,7 @@ def test_lan_metadata_roundtrip_applies_and_acknowledges_phone_review(
     assert book_data["projection_source"]["manual_updated_at"] != ""
     assert body["reviews"][0]["needs_review"] is True
     assert body["reviews"][0]["attention_reason"] == "Check edition"
+    assert body["associations"] == []
     assert second.get_json()["books"][0]["revision"] == \
         body["books"][0]["revision"]
     assert second.get_json()["reviews"][0]["revision"] == \

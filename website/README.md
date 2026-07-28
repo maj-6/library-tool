@@ -50,6 +50,14 @@ local builds with:
 python3 tools/cloud_setup.py fixture
 ```
 
+That fallback is for local development only. The production Pages workflow
+runs `.github/scripts/write_config.py --mode production`, which stops before
+artifact upload unless both public cloud variables are present and safe, the
+live API is reachable, and its anon key can read every website resource listed
+below. A manual `fixture-preview` dispatch produces a short-lived artifact named
+`fixture-preview-NOT-FOR-PRODUCTION-…`; it never enters the `github-pages`
+environment or the Pages deployment action.
+
 ## The library pages
 
 - **`browse.html`** — the faceted catalogue. A search box (with title and
@@ -123,11 +131,13 @@ python3 tools/cloud_setup.py anon-key      # prints the snippet
 ```
 
 Write it to `assets/config.js` — gitignored, because the project reference is
-yours. The **anon** key belongs here, never the service_role key. Row-level
-security is what protects the project: `docs/cloud/migrations/` grant anon
-seven published-library reads — `volumes`, `volume_texts`, `volume_pages`,
-`volume_notes`, `author_pages`, the `author_index` view, and `releases` —
-plus the `schema_migrations` ledger, and nothing else.
+yours. A modern **publishable** key or legacy **anon** JWT belongs here, never
+an `sb_secret_…` or `service_role` key. Production validation also rejects an
+expired legacy JWT. Row-level security is what protects the project:
+`docs/cloud/migrations/` grant anon seven published-library reads — `volumes`,
+`volume_texts`, `volume_pages`, `volume_notes`, `author_pages`, the
+`author_index` view, and `releases` — plus the `schema_migrations` ledger, and
+nothing else.
 
 ## Downloads and release notes
 
