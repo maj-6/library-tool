@@ -3,6 +3,41 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.1 — 2026-07-28
+
+Android version code: `31`.
+
+### Additions
+
+- Collections now record where a batch came from, use stable printable tag IDs, synchronize between devices, and can be opened from a QR code in the Inspect tab.
+- Inspect offers Tiles, Content, and Icons views and can list every account-owned book recorded in a box, including cloud-only books and books filed under a tag absorbed by a merge.
+- Capture adds tap-to-focus, autofocus lock, zoom, exposure, continuous light, Fast and More Detail profiles, preview sharpening, page-margin guidance, and a fixed portrait or landscape orientation.
+- Realtime voice notes recognize Price, Pages, Condition, Illustrations, and Remark, with commands to start or end notes, restart, undo, and edit the latest unsent scan.
+- An explicit Sync captures action freezes a recoverable upload batch and exchanges desktop catalogue status, rights records, remarks, attention reasons, and review requests.
+- Book details add photo roles, OCR-region overlays, a carousel, corrected-display and retained-original views, and collapsible extraction diagnostics.
+- An elapsed timer now shows how long the current book capture has been open and resumes accurately after an activity or process restart.
+- About includes the app changelog and documentation, while update checks can refresh validated Android text and icon resources without offering an uncertified APK.
+
+### Other Changes
+
+- Home groups scans by collection, keeps one section expanded, pages long histories, offers a compact list, and distinguishes waiting, uploaded, cloud-only, locally cleared, and desktop-archive-confirmed books.
+- A lightweight, photo-free inventory keeps delivered books browsable after local media is cleared, and a fetched box listing stays available offline until the signed-in account changes.
+- Captures keep their creator, collection, origin, start time, and destination fixed when the scan begins, and local captures remain local until the user explicitly claims or sends them.
+- Cloud image cleanup installs validated corrected display photos atomically, keeps camera originals safe, and realigns OCR regions after perspective or page-curvature correction.
+- Collection tags remain reserved after rename, deletion, or merge, and retired tags resolve only through an authoritative merge to the surviving collection.
+- A capture's own title remains authoritative when present; otherwise the phone uses the desktop title, author, and year without treating a generated untitled placeholder as real metadata.
+
+### Bugfixes
+
+- Prevented app lifecycle or background processing from starting an upload batch, adding later captures to a batch, or silently changing its selected destination.
+- Preserved photos, notes, originals, and durable voice drafts through restart, undo, edit, cancellation, backgrounding, and in-flight photo commits.
+- Prevented stale collection editors, duplicate or malformed tags, alias cycles, and damaged inventory files from overwriting newer or recoverable collection data.
+- Prevented large scan histories from blocking Home and fixed doubled separators, clipped controls, light-background icons, and ambiguous capture status text.
+- Kept concurrent phone and desktop review reasons, rejected malformed or oversized sync rows independently, and recovered safely after a paired desktop revision-ledger reset.
+- Fixed corrected images displaying OCR regions from the uncorrected geometry and prevented cloud cleanup from removing an original before its replacement was ready.
+- Box inspection no longer reports an unreachable box as empty, loses books filed under merged tags, or drops its offline listing before an account change.
+- Delayed, stale, malformed, or conflicting desktop archive confirmations no longer replace a newer confirmation or show an unconfirmed capture as safely archived.
+
 ## 0.5.1-alpha.11 — 2026-07-25
 
 Android version code: `30`.

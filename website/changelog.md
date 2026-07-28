@@ -4,25 +4,44 @@ Stable releases are listed newest first. Prerelease changes are included in the
 next stable release. These notes are also available in the desktop app under
 Help → View changelog.
 
-## Next prerelease — 2026-07-25
+## 0.8.0 — 2026-07-28
 
 ### Additions
 
-- Desktop capture sync now publishes registered-book copyright records and status, WHL and Internet Archive availability, scan status, remarks, and review state back to the originating Android capture.
-- Phone Needs attention reasons and Needs review requests now join the desktop attention and review workflow through either account cloud sync or a paired LAN connection.
-- The desktop now publishes the title, author and year it holds for a capture back to the phone, so scanning a box QR lists its books with real names.
-- Captures that have been imported but not yet registered as catalogue entries are published too, so a freshly scanned crate lists with the titles typed on the desktop.
+- The book-centered Workbench now brings catalogue editing, attached PDFs, OCR, staged processing, verification, readiness checks, and publishing into one workspace, with Smart Scan and per-tab undo and redo.
+- Replica adds proposed page regions, facsimile layouts, templates, selectable text layers, a style board, re-typeset previews, print-ready PDF output, and versioned `.lib` import and export.
+- Corrections opens in its own desktop window for perspective cleanup, image adjustments, figure classification, region-role and caption review, and optional OCR follow-up.
+- Knowledge Test and Ask views use structure-aware passages, and the public reader can search within a book.
+- A shared Remarks and review workflow now covers catalogue records, sources, entries, Replica pages, published volumes, and phone review requests, with replies, resolution, and navigation back to the item.
+- Deleting a page, entry, manual record, or translation now sends it to a bounded, recoverable Trash.
+- Porcelain and Slate themes, a custom theme editor, theme-specific fonts and icons, tinted tabs, and clearer high-contrast controls expand the desktop appearance options.
+- Captures imported from Library Tool Capture are sealed as recoverable `.lib/3` archives with stable identities, and older capture archives can be resumed and associated through a safe backfill.
+- Desktop capture sync now returns registered-book rights records and status, WHL and Internet Archive availability, scan status, remarks, review state, title, author, and year to the originating phone.
+- Info → Resources reports the availability, source, location, size, update time, and record count of local search databases.
 
 ### Other Changes
 
-- Phone round-trip state uses owner-scoped, revisioned projections and preserves unregister/delete tombstones so stale catalog badges are removed safely.
-- A capture's own recorded title is preferred over the desktop's, and the placeholder given to an untitled capture is never published as if it were a title.
+- A framework-neutral Library Engine now owns catalogue, canvas, Replica, translation, corrections, provider, background-job, lifecycle, and interchange contracts, while capability discovery hides workbenches that an installation cannot support.
+- Corrections reads and writes revisioned artifacts through the engine; queued transforms are replay-safe, keep the original image immutable, commit corrected output atomically, and continue after the Corrections window closes.
+- Provider keys moved out of ordinary settings and browser state into a protected engine vault with account-scoped synchronization and recovery of earlier saved values.
+- Capture intake serializes cloud and paired-LAN delivery of the same capture, preserves one book identity across retries, and tracks whether its sealed archive is current or needs resealing after a catalogue edit.
+- Phone round-trip state is owner-scoped and revisioned, preserves unregister and delete tombstones, and publishes imported-but-unregistered captures so newly scanned boxes receive useful names.
+- Publishing now saves the metadata on screen before checking readiness, public text waits for an explicit rights decision, and facsimile pages can use a paper tint sampled from the source PDF.
+- Home, activity, contributor profiles, narrow toolbars, icon controls, keyboard navigation, focus restoration, and accessible status text were revised across the desktop.
+- The desktop shell now uses Electron 43, and release publication validates the full repository and Android gates, supported update channels, exact artifact sets, and packaged-sidecar startup before a release becomes public.
 
 ### Bugfixes
 
-- Kept cloud and paired-LAN capture identities separate during metadata sync and preserved concurrent phone and desktop review edits.
-- Editing a Catalogs entry now advances its revision, so corrected titles, copyright, scan status and remarks reach the phone instead of being silently rejected as unchanged.
-- Unregistering a capture again, and re-registering one from a second desktop, no longer lose the title and author already recorded for it.
+- Prevented delayed Workbench saves, verification callbacks, publish completion, and network responses for one book from changing or publishing another selected book.
+- Replica proposals no longer overwrite verified or human-edited pages, and retries reuse their durable operation instead of starting duplicate work.
+- Corrections now rejects stale or mismatched commands, concurrent authority changes, unsafe source ancestry, linked or self-aliasing output, and incomplete transform receipts; reopened windows converge on the committed classifications, reviews, and image result.
+- Concurrent cloud and paired-LAN delivery can no longer create duplicate books or competing asset writers, and a lost acknowledgement is repaired without hiding or re-importing the durable book.
+- Archive confirmation state now survives restarts, rejects delayed streams, preserves a pending stale transition during rollout or conflict repair, and never shows a stale archive as confirmed.
+- Editing a Catalogs entry now advances its revision, so corrected titles, rights, scan status, and remarks reach the phone instead of being rejected as unchanged.
+- Unregistering and re-registering a capture no longer discards its recorded title or author, and a generated untitled placeholder is never published as real metadata.
+- Page deletion, renumbering, restore, and discussion revival keep attention marks, figures, and threads attached to the correct physical page.
+- Fixed protected-key migration and account-switch races, textless PDFs resetting the selected comparison view, zoomed popup menus leaving the screen, and several narrow-layout, contrast, and control-state defects.
+- Production website configuration, desktop engine startup, capture photo downloads, and `.lib/3` parsing now fail closed on missing trust data, oversized input, excessive nesting, invalid page sets, or nonportable identities.
 
 ## 0.7.0 — 2026-07-15
 
