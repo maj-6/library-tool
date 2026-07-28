@@ -81,6 +81,17 @@ private val CAPTURE_COMMIT_EXECUTOR = Executors.newSingleThreadExecutor { task -
     Thread(task, "whl-capture-commit")
 }
 
+internal fun formatCaptureElapsed(elapsedMillis: Long): String {
+    val totalSeconds = elapsedMillis.coerceAtLeast(0L) / 1000L
+    val seconds = totalSeconds % 60
+    val totalMinutes = totalSeconds / 60
+    return if (totalMinutes < 60) {
+        "%02d:%02d".format(totalMinutes, seconds)
+    } else {
+        "%d:%02d:%02d".format(totalMinutes / 60, totalMinutes % 60, seconds)
+    }
+}
+
 /**
  * Hands-free book capture:
  *
@@ -114,6 +125,7 @@ class MainActivity : AppCompatActivity() {
     private var lastBookPreviewFingerprint: String? = null
     private var lastBookPreviewBitmap: android.graphics.Bitmap? = null
     private var backgroundRefreshJob: Job? = null
+    private var captureTimerJob: Job? = null
     private val thumbnailDecodeGate = Semaphore(permits = 2)
     private val thumbnailBitmaps = linkedMapOf<ImageView, android.graphics.Bitmap>()
     private val captureQueue = ShallowCaptureQueue()
@@ -282,6 +294,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        captureTimerJob?.cancel()
+        captureTimerJob = null
         if (voiceNoteDraft != null) {
             finishVoiceNote(
                 save = true,
@@ -2440,6 +2454,7 @@ class MainActivity : AppCompatActivity() {
             else getString(R.string.entry_idle)
         binding.entryState.setTextColor(
             getColor(if (active) R.color.whl_green else R.color.whl_ink_dim))
+        syncCaptureTimer()
         binding.btnStart.isEnabled = !active && captureAvailable && !noteActive
         binding.btnPhoto.isEnabled = active && captureAvailable && !noteActive && !captureQueue.full
         binding.btnDone.isEnabled = active && captureAvailable && !noteActive
@@ -2464,6 +2479,34 @@ class MainActivity : AppCompatActivity() {
             setStatus(resources.getQuantityString(
                 R.plurals.uploads_stuck, pending, pending, err))
         finishAfterAcceptedCapturesIfReady()
+    }
+
+    private fun syncCaptureTimer() {
+        val startedAt = session.startedAtMillis
+        if (!session.active || startedAt == null) {
+            captureTimerJob?.cancel()
+            captureTimerJob = null
+            binding.captureElapsed.visibility = View.GONE
+            return
+        }
+
+        binding.captureElapsed.visibility = View.VISIBLE
+        renderCaptureElapsed(startedAt)
+        if (captureTimerJob?.isActive == true) return
+        captureTimerJob = lifecycleScope.launch {
+            while (isActive && session.active && session.startedAtMillis == startedAt) {
+                renderCaptureElapsed(startedAt)
+                val elapsed = (System.currentTimeMillis() - startedAt).coerceAtLeast(0L)
+                delay(1000L - elapsed % 1000L)
+            }
+        }
+    }
+
+    private fun renderCaptureElapsed(startedAt: Long) {
+        val elapsed = formatCaptureElapsed(System.currentTimeMillis() - startedAt)
+        binding.captureElapsed.text = elapsed
+        binding.captureElapsed.contentDescription =
+            getString(R.string.capture_elapsed_description, elapsed)
     }
 
     /** An open capture is intentionally excluded. The prior submitted book

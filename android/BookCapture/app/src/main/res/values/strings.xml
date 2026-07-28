@@ -229,6 +229,8 @@
 
     <string name="entry_idle">Idle</string>
     <string name="entry_active">Open (%1$d)</string>
+    <string name="capture_elapsed_zero">00:00</string>
+    <string name="capture_elapsed_description">Book in progress for %1$s</string>
     <string name="capture_last_book_label">Last captured book</string>
     <string name="capture_last_book_empty">No recent scan</string>
     <string name="capture_last_book_title_missing">Title not detected</string>
