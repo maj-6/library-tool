@@ -54,7 +54,10 @@ COLLECTION_TAG_RESERVATION_HARDENING_FLAT = " ".join(
 )
 CAPTURE_LIB_ASSOCIATION = SQL["020_capture_lib_association"]
 CAPTURE_LIB_ASSOCIATION_FLAT = " ".join(CAPTURE_LIB_ASSOCIATION.split())
-CAPTURE_LIB_ASSOCIATION_RPC = SQL["021_capture_lib_association_rpc"]
+LEGACY_CAPTURE_LIB_ASSOCIATION_RPC = SQL["021_capture_lib_association_rpc"]
+CAPTURE_LIB_ASSOCIATION_RPC = SQL[
+    "022_capture_lib_association_capability"
+]
 CAPTURE_LIB_ASSOCIATION_RPC_FLAT = " ".join(
     CAPTURE_LIB_ASSOCIATION_RPC.split()
 )
@@ -510,37 +513,177 @@ def test_capture_lib_association_revision_is_server_owned_and_replay_safe():
     assert "before insert or update of id, lib_association," in trigger
 
 
-def test_capture_lib_rpc_rechecks_current_authority_under_transaction_locks():
+def test_capture_lib_capabilities_store_only_hashed_tokens_and_bounded_receipts():
+    migration = CAPTURE_LIB_ASSOCIATION_RPC_FLAT
+    assert "pg_catalog.sha256(" in migration
+    assert "pgcrypto" not in migration
+    assert "extensions.digest" not in migration
+    assert "create extension if not exists pg_cron;" in migration
+    table = migration.split(
+        "create table if not exists "
+        "private.capture_lib_publication_capabilities (",
+        1,
+    )[1].split("); create unique index", 1)[0]
+    assert "token_hash bytea primary key" in table
+    assert "p_capability" not in table
+    assert "octet_length(token_hash) = 32" in table
+    assert "actor_id uuid not null references auth.users" not in table
+    assert "association_digest bytea not null" in table
+    assert "authorization_expires_at <= created_at + interval '5 minutes'" in \
+        table
+    assert "replay_expires_at > consumed_at" in table
+    assert "accepted_revision in ( expected_revision, expected_revision + 1 )" \
+        in table
+    assert (
+        "alter table private.capture_lib_publication_capabilities "
+        "enable row level security;"
+    ) in migration
+    assert (
+        "revoke all on private.capture_lib_publication_capabilities "
+        "from public, anon, authenticated, service_role;"
+    ) in migration
+    assert (
+        "capture_lib_publication_capabilities_capture_idx "
+        "on private.capture_lib_publication_capabilities (capture_id);"
+    ) in migration
+    assert (
+        "capture_lib_publication_capabilities_actor_idx "
+        "on private.capture_lib_publication_capabilities (actor_id);"
+    ) in migration
+    assert "limit p_limit for update skip locked" in migration
+    assert "p_limit < 1 or p_limit > 1000" in migration
+    assert (
+        "select cron.schedule( 'whl-capture-lib-capability-purge', "
+        "'17 * * * *', $cron$ select "
+        "private.maintain_capture_lib_publication_capabilities() $cron$ );"
+    ) in migration
+    assert (
+        "delete from cron.job_run_details as run "
+        "where run.jobid in ( select job.jobid from cron.job as job "
+        "where job.jobname = 'whl-capture-lib-capability-purge' ) "
+        "and run.end_time < clock_timestamp() - interval '30 days';"
+    ) in migration
+
+
+def test_capture_lib_prepare_binds_auth_uid_to_exact_scope_and_lock_order():
     function = CAPTURE_LIB_ASSOCIATION_RPC_FLAT.split(
-        "create or replace function public.publish_capture_lib_association(",
+        "create or replace function public.prepare_capture_lib_association(",
         1,
     )[1].split(
-        "revoke all on function public.publish_capture_lib_association(",
+        "alter function public.prepare_capture_lib_association(",
         1,
     )[0]
     assert "security definer" in function
     assert "set search_path = ''" in function
-    assert "auth.role()" not in function
+    assert "caller_id uuid := auth.uid();" in function
+    assert "p_capability !~ '^whlcap1_[0-9a-f]{64}$'" in function
     assert "p_expected_revision is null" in function
-    assert "where capture_row.id = p_capture_id for update;" in function
-    assert "locked_owner is distinct from p_actor_id" in function
-    assert "grant_row.ingester_id = p_actor_id" in function
-    assert "grant_row.contributor_id = locked_owner for key share;" in function
-    assert "locked_revision <> p_expected_revision" in function
+    assert "p_mark_imported is null" in function
+    assert "p_association ->> 'state' <> 'current'" not in function
+    capture_lock = function.index(
+        "where capture_row.id = p_capture_id for update;",
+    )
+    capability_lock = function.index(
+        "order by capability.token_hash for update",
+    )
+    grant_lock = function.index(
+        "grant_row.contributor_id = locked_owner for key share;",
+    )
+    assert capture_lock < capability_lock < grant_lock
+    assert (
+        "where capability.token_hash = desired_token_hash or ( "
+        "capability.actor_id = caller_id and "
+        "capability.capture_id = p_capture_id and "
+        "capability.consumed_at is null ) "
+        "order by capability.token_hash for update"
+    ) in function
+    assert "locked_owner is distinct from caller_id" in function
+    assert "grant_row.ingester_id = caller_id" in function
+    assert "locked_revision = p_expected_revision" in function
+    assert "locked_status = 'pending'" in function
+    assert "token_capability.association is distinct from p_association" in \
+        function
+    assert "association := token_capability.association;" in function
+    assert "association := p_association;" in function
+    assert "capability_state := 'consumed';" in function
+    assert (
+        "grant execute on function public.prepare_capture_lib_association( "
+        "text, uuid, jsonb, bigint, boolean ) to authenticated;"
+    ) in CAPTURE_LIB_ASSOCIATION_RPC_FLAT
+
+
+def test_capture_lib_consumer_accepts_only_token_and_rechecks_locked_state():
+    function = CAPTURE_LIB_ASSOCIATION_RPC_FLAT.split(
+        "create or replace function public.publish_capture_lib_association(",
+        1,
+    )[1].split(
+        "alter function public.publish_capture_lib_association(text)",
+        1,
+    )[0]
+    assert "p_capability text" in function
+    assert "p_actor_id" not in function
+    assert "p_capture_id" not in function
+    assert "p_association jsonb" not in function
+    assert "security definer" in function
+    assert "set search_path = ''" in function
+    hint = function.index(
+        "select publication.capture_id into hinted_capture_id",
+    )
+    capture_lock = function.index(
+        "where capture_row.id = hinted_capture_id for update;",
+    )
+    capability_lock = function.index(
+        "and publication.capture_id = hinted_capture_id for update;",
+    )
+    grant_lock = function.index(
+        "grant_row.contributor_id = locked_owner for key share;",
+    )
+    assert hint < capture_lock < capability_lock < grant_lock
+    assert "capability.authorization_expires_at <= clock_timestamp()" in \
+        function
+    assert "capability.replay_expires_at <= clock_timestamp()" in function
+    assert "capture archive changed after capability consumption" in function
+    assert "locked_revision <> capability.expected_revision" in function
     assert "locked_status <> 'pending'" in function
-    assert "locked_association is not distinct from p_association" in function
-    assert "p_expected_revision + 1" in function
-    assert "set lib_association = p_association" in function
-    assert "when p_mark_imported then 'imported'" in function
+    assert "set lib_association = capability.association" in function
+    assert "when capability.mark_imported then 'imported'" in function
+    assert "capability.association ->> 'state' <> 'current'" not in function
+    assert "replay_expires_at = consumed_at_value + interval '7 days'" in \
+        function
     assert (
-        "revoke all on function public.publish_capture_lib_association( "
-        "uuid, uuid, jsonb, bigint, boolean ) from public, anon, "
-        "authenticated, service_role;"
+        "grant execute on function public.publish_capture_lib_association(text) "
+        "to service_role;"
     ) in CAPTURE_LIB_ASSOCIATION_RPC_FLAT
+
+
+def test_capture_lib_rpc_removes_actor_endpoint_and_uses_explicit_http_errors():
+    migration = CAPTURE_LIB_ASSOCIATION_RPC_FLAT
     assert (
-        "grant execute on function public.publish_capture_lib_association( "
-        "uuid, uuid, jsonb, bigint, boolean ) to service_role;"
-    ) in CAPTURE_LIB_ASSOCIATION_RPC_FLAT
+        "drop function if exists public.publish_capture_lib_association( "
+        "uuid, uuid, jsonb, bigint, boolean );"
+    ) in migration
+    assert "raise sqlstate 'PGRST'" in migration
+    assert "'status', p_status" in migration
+    assert "perform private.raise_capture_lib_publication_error( 409," in \
+        migration
+    assert "perform private.raise_capture_lib_publication_error( 410," in \
+        migration
+    assert "errcode = '40001'" not in migration
+    assert (
+        "revoke all on function public.publish_capture_lib_association(text) "
+        "from public, anon, authenticated, service_role;"
+    ) in migration
+
+
+def test_capture_lib_capability_is_an_append_only_upgrade():
+    legacy = " ".join(LEGACY_CAPTURE_LIB_ASSOCIATION_RPC.split())
+    assert (
+        "public.publish_capture_lib_association( "
+        "uuid, uuid, jsonb, bigint, boolean )"
+    ) in legacy
+    assert "prepare_capture_lib_association" not in legacy
+    assert "022_capture_lib_association_capability" in \
+        CAPTURE_LIB_ASSOCIATION_RPC
 
 
 def test_capture_lib_association_retrofits_partial_transport_metadata_before_check():

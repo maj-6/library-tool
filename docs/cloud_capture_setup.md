@@ -43,7 +43,9 @@ WHL corrections / category taxonomy merge through these; see
 and `capture_reviews` (small, shared attention/review state). Migration 020
 adds the nullable, revisioned `.lib/3` association acknowledgement directly to
 `captures`, so status and association can be published in one transaction.
-The archive itself never leaves the importing desktop.
+Migration 021 introduced the first exact-scope publication RPC; append-only
+migration 022 replaces it with the two-party capability protocol described
+below. The archive itself never leaves the importing desktop.
 
 On an existing project, don't re-paste everything: `python3
 tools/cloud_setup.py check` diffs the `schema_migrations` table against the
@@ -86,12 +88,19 @@ any failure.
   Credentials → *Owner service key*. It is held only in the desktop engine's
   protected secret store. Both that key and a signed-in user session are
   required, and they must name the same Supabase project: the user session
-  first limits the operation to capture IDs that account may ingest, then the
-  service credential invokes migration 021's exact-ID RPC. That transaction
-  locks the capture, rechecks the signed-in user's current ownership or ingest
-  grant, and compare-and-sets the association plus imported status. Direct
-  service-role table updates cannot write the trusted association columns, and
-  a service key by itself never enables phone round-trip publication. Without
+  first prepares a five-minute, exact-scope capability bound by `auth.uid()` to
+  the capture, association, observed revision, and requested status change.
+  The service credential can consume only that unguessable capability; it
+  cannot supply or impersonate an actor. The consuming transaction locks the
+  capture and capability, rechecks current ownership or the locked ingest
+  grant, and compare-and-sets the association plus imported status. Only the
+  capability's SHA-256 is stored, and an exact consumed receipt remains
+  replayable for seven days so a lost HTTP response cannot advance the
+  revision twice. Direct service-role table updates cannot write the trusted
+  association columns, and a service key by itself never enables phone
+  round-trip publication. A private, bounded cleanup runs hourly through
+  Supabase Cron, in a transaction separate from publication locks, and keeps
+  30 days of this job's run history. Without
   the protected owner
   credential, a locally sealed capture must remain remotely `pending` until a
   later retry can atomically publish `status=imported` plus the association.
@@ -173,15 +182,21 @@ association writes are service-only and also guarded by a trigger. These
 explicit grants are required on Supabase projects that no longer add Data API
 privileges for new schema objects automatically.
 
-The desktop passes its exact verified association to
+Migration 022 has the desktop pass its exact verified association to
 `publish_capture_lib_association` with separate owner-service and signed-in-user
-configs. The helper proves that exact capture through user-JWT RLS and extracts
-the verified subject. A service-role-only RPC then locks the capture, rechecks
-that subject against the current owner or locked ingest grant, and applies the
-association/status CAS in the same transaction. A grant or ownership change
-between proof and write therefore conflicts. Direct service-role association
-column updates are not granted. Remote photos are deleted only after the RPC
-returns the exact accepted association.
+configs. An authenticated RPC binds `auth.uid()` to an exact capture,
+association, expected revision, and status intent under a freshly generated
+256-bit capability. A service-role-only RPC receives only that capability,
+then locks the capture and hashed capability, rechecks the bound actor against
+the current owner or locked ingest grant, and applies the association/status
+CAS in the same transaction. A grant, ownership, revision, status, or document
+change therefore conflicts. Expired capabilities return 410; concurrency
+conflicts return 409. Direct service-role association column updates are not
+granted. Remote photos are deleted only after the RPC returns the exact
+accepted association. If a catalogue edit makes the local association stale
+after durable ingest but before that first receipt, the same exact stale
+document can still mark the capture imported; it remains unconfirmed on the
+phone and its remote photos are retained until a current archive is resealed.
 
 LAN `/lan/capture` receipts and `/lan/metadata` projections expose
 `org.whl.capture-lib-confirmation` envelopes. Their independent durable stream

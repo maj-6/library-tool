@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import secrets
 import uuid
 import urllib.error
 import urllib.parse
@@ -40,6 +41,8 @@ _CAPTURE_LIB_OFFSET_TIMESTAMP = re.compile(
     r"(?:\.[0-9]{1,9})?"
     r"(?:Z|[+-](?:(?:0[0-9]|1[0-3]):[0-5][0-9]|14:00))"
 )
+_CAPTURE_LIB_CAPABILITY = re.compile(r"whlcap1_[0-9a-f]{64}")
+_CAPTURE_LIB_DIGEST = re.compile(r"[0-9a-f]{64}")
 _CAPTURE_LIB_ASSOCIATION_FIELDS = frozenset({
     "schema",
     "version",
@@ -259,7 +262,7 @@ def _service_write_config(cfg: dict) -> None:
 
 def _capture_lib_publish_configs(service_cfg: dict,
                                  scope_cfg: dict) -> tuple[dict, dict]:
-    """Require separate service-write and authenticated RLS-read configs."""
+    """Require separate service-consume and authenticated-prepare configs."""
     _service_write_config(service_cfg)
     if not isinstance(scope_cfg, dict) or service_cfg is scope_cfg:
         raise SyncError("capture archive publication requires separate user scope")
@@ -291,6 +294,40 @@ def _capture_lib_publish_configs(service_cfg: dict,
     return service_cfg, scope_cfg
 
 
+def _new_capture_lib_capability() -> str:
+    """Return an unguessable token retained only for this publication."""
+    return f"whlcap1_{secrets.token_hex(32)}"
+
+
+def _capture_lib_rpc_row(
+    cfg: dict,
+    path: str,
+    payload: dict,
+    *,
+    invalid_message: str,
+) -> dict:
+    """POST one idempotent RPC, retrying one ambiguous response with its token."""
+    last_error: SyncError | None = None
+    for attempt in range(2):
+        try:
+            response = _rest(cfg, "POST", path, payload)
+        except SyncError as exc:
+            status = re.match(r"HTTP ([0-9]{3})\b", str(exc))
+            if attempt or (status and int(status.group(1)) < 500):
+                raise
+            last_error = exc
+            continue
+        if (
+            isinstance(response, list)
+            and len(response) == 1
+            and isinstance(response[0], dict)
+        ):
+            return response[0]
+        if attempt:
+            break
+    raise SyncError(invalid_message) from last_error
+
+
 def publish_capture_lib_association(
     service_cfg: dict,
     scope_cfg: dict,
@@ -303,10 +340,10 @@ def publish_capture_lib_association(
     """CAS-publish one trusted association, optionally with imported status.
 
     ``service_cfg`` is the protected owner credential and ``scope_cfg`` carries
-    a distinct signed-in user's JWT. The exact capture id is first proven
-    through user RLS. A narrowly granted service RPC then locks that row and
-    transactionally rechecks the proven subject against its current owner or
-    ingest grant before applying the association/status compare-and-set.
+    a distinct signed-in user's JWT. The authenticated RPC binds ``auth.uid()``
+    to the exact document/CAS scope and a short-lived one-time capability. The
+    service RPC receives only that capability, then transactionally rechecks
+    current authority and applies or replays the accepted result.
     """
     service_cfg, scope_cfg = _capture_lib_publish_configs(service_cfg, scope_cfg)
     ids = _capture_sync_ids((capture_id,))
@@ -326,26 +363,83 @@ def publish_capture_lib_association(
         raise SyncError("capture archive expected revision is invalid")
     capture_id = ids[0]
     desired = _capture_lib_association_write(association, capture_id)
-    if list_capture_ids(scope_cfg, (capture_id,), chunk=1) != [capture_id]:
-        raise SyncError("capture archive publication is outside the signed-in user scope")
-    actor_id = _jwt_subject(str(scope_cfg.get("access_token") or ""))
-    response = _rest(
-        service_cfg,
-        "POST",
-        "rpc/publish_capture_lib_association",
+    capability = _new_capture_lib_capability()
+    if not _CAPTURE_LIB_CAPABILITY.fullmatch(capability):
+        raise SyncError("capture archive capability generation failed")
+
+    prepared = _capture_lib_rpc_row(
+        scope_cfg,
+        "rpc/prepare_capture_lib_association",
         {
+            "p_capability": capability,
             "p_capture_id": capture_id,
-            "p_actor_id": actor_id,
             "p_association": desired,
             "p_expected_revision": expected_revision,
             "p_mark_imported": mark_imported,
         },
+        invalid_message="capture archive capability preparation returned an invalid row",
     )
+    prepared_fields = {
+        "capture_id",
+        "actor_id",
+        "association",
+        "association_digest",
+        "expected_revision",
+        "mark_imported",
+        "authorization_expires_at",
+        "capability_state",
+    }
+    prepared_expiry = prepared.get("authorization_expires_at")
+    try:
+        prepared_association = _capture_lib_association_write(
+            prepared.get("association"),
+            capture_id,
+        )
+    except SyncError as exc:
+        raise SyncError(
+            "capture archive capability preparation returned an invalid row"
+        ) from exc
+    if (
+        set(prepared) != prepared_fields
+        or prepared.get("capture_id") != capture_id
+        or prepared.get("actor_id") != _jwt_subject(
+            str(scope_cfg.get("access_token") or "")
+        )
+        or prepared_association != desired
+        or not isinstance(prepared.get("association_digest"), str)
+        or not _CAPTURE_LIB_DIGEST.fullmatch(prepared["association_digest"])
+        or type(prepared.get("expected_revision")) is not int
+        or prepared["expected_revision"] != expected_revision
+        or type(prepared.get("mark_imported")) is not bool
+        or prepared["mark_imported"] is not mark_imported
+        or not isinstance(prepared_expiry, str)
+        or not prepared_expiry
+        or len(prepared_expiry) > 80
+        or not _CAPTURE_LIB_OFFSET_TIMESTAMP.fullmatch(prepared_expiry)
+        or prepared.get("capability_state") not in {"prepared", "consumed"}
+    ):
+        raise SyncError(
+            "capture archive capability preparation returned an invalid row"
+        )
+    try:
+        parsed_expiry = datetime.fromisoformat(
+            prepared_expiry.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise SyncError(
+            "capture archive capability preparation returned an invalid expiry"
+        ) from exc
+    if parsed_expiry.tzinfo is None or parsed_expiry.utcoffset() is None:
+        raise SyncError(
+            "capture archive capability preparation returned an invalid expiry"
+        )
 
-    if isinstance(response, list) and len(response) == 1:
-        accepted = response[0]
-    else:
-        raise SyncError("capture archive publication returned an invalid row")
+    accepted = _capture_lib_rpc_row(
+        service_cfg,
+        "rpc/publish_capture_lib_association",
+        {"p_capability": capability},
+        invalid_message="capture archive publication returned an invalid row",
+    )
     accepted_fields = {
         "id",
         "status",
@@ -354,8 +448,7 @@ def publish_capture_lib_association(
         "lib_association_updated_at",
     }
     if (
-        not isinstance(accepted, dict)
-        or set(accepted) != accepted_fields
+        set(accepted) != accepted_fields
         or accepted.get("id") != capture_id
     ):
         raise SyncError("capture archive publication returned an invalid row")
@@ -405,6 +498,51 @@ def list_capture_ids(cfg: dict, capture_ids, chunk: int = 40) -> list[str]:
             out.extend(str(row.get("id")) for row in rows
                        if isinstance(row, dict) and row.get("id") in batch)
     return _capture_sync_ids(out)
+
+
+def list_capture_association_states(
+    cfg: dict,
+    capture_ids,
+    chunk: int = 40,
+) -> list[dict]:
+    """Read exact association/CAS state for named captures visible through RLS."""
+    if (
+        isinstance(chunk, bool)
+        or not isinstance(chunk, int)
+        or not 1 <= chunk <= 100
+    ):
+        raise SyncError("capture association state chunk is invalid")
+    ids = _capture_sync_ids(capture_ids)
+    table = cfg.get("table") or "captures"
+    fields = {
+        "id",
+        "status",
+        "lib_association",
+        "lib_association_revision",
+        "lib_association_updated_at",
+    }
+    out: list[dict] = []
+    for i in range(0, len(ids), chunk):
+        batch = ids[i:i + chunk]
+        encoded = ",".join(urllib.parse.quote(value, safe="") for value in batch)
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?id=in.({encoded})"
+            "&select=id,status,lib_association,lib_association_revision,"
+            "lib_association_updated_at&order=id.asc",
+        )
+        if not isinstance(rows, list):
+            raise SyncError("capture association state returned an invalid collection")
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or set(row) != fields
+                or row.get("id") not in batch
+            ):
+                raise SyncError("capture association state returned an invalid row")
+            out.append(dict(row))
+    return out
 
 
 # --- storage --------------------------------------------------------------------
