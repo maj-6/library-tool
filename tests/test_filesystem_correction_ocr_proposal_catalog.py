@@ -40,12 +40,12 @@ def _request(
     return OcrFollowupRequest(operation_id, item_id, _source(suffix))
 
 
-def _recognition() -> CorrectionOcrRecognition:
+def _recognition(text: str = "Machine proposal") -> CorrectionOcrRecognition:
     return CorrectionOcrRecognition(
         "tesseract",
         "local",
         {
-            "text": "Machine proposal",
+            "text": text,
             "regions": [{"role": "illustration", "box": [0, 0, 1, 1]}],
         },
         {
@@ -211,6 +211,32 @@ def test_catalog_fails_closed_for_a_tampered_candidate_from_another_item(
     assert "book-private" not in json.dumps(dict(raised.value.details))
 
 
+def test_catalog_does_not_silently_prefilter_a_corrupt_cross_item_receipt(
+    tmp_path,
+) -> None:
+    repository = _repository(tmp_path)
+    repository.commit_proposal(
+        _request("book-2", "operation-other", "a"),
+        _recognition(),
+    )
+    receipt_path = next(
+        (
+            tmp_path
+            / ".engine"
+            / "receipts"
+            / "correction-ocr-proposals"
+        ).glob("*.json")
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["source_sha256"] = "not-a-valid-digest"
+    receipt_path.write_bytes(_canonical(receipt))
+
+    with pytest.raises(RepositoryError) as raised:
+        repository.list_proposals("book-1")
+
+    assert raised.value.code == "invalid_correction_ocr_proposal"
+
+
 def test_catalog_fails_closed_for_incomplete_or_untrusted_entries(tmp_path) -> None:
     repository = _repository(tmp_path)
     repository.commit_proposal(
@@ -241,10 +267,106 @@ def test_catalog_fails_closed_for_incomplete_or_untrusted_entries(tmp_path) -> N
     assert str(private_candidate) not in json.dumps(dict(untrusted.value.details))
 
 
+def test_unrelated_volume_does_not_consume_requested_item_budgets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repository = _repository(tmp_path)
+    requested = repository.commit_proposal(
+        _request("book-1", "operation-requested", "a"),
+        _recognition(),
+    )
+    for index, suffix in enumerate(("b", "c", "d"), start=1):
+        repository.commit_proposal(
+            _request(
+                f"unrelated-{index}",
+                f"operation-unrelated-{index}",
+                suffix,
+            ),
+            _recognition(),
+        )
+    monkeypatch.setattr(
+        catalog_repository,
+        "CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT",
+        1,
+    )
+    monkeypatch.setattr(catalog_repository, "_MAX_CATALOG_JSON_DOCUMENTS", 3)
+
+    snapshot = repository.list_proposals("book-1")
+
+    assert tuple(value.proposal_ref for value in snapshot.proposals) == (
+        requested.proposal_ref,
+    )
+
+
+def test_unrelated_recognition_bytes_do_not_consume_requested_item_budget(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repository = _repository(tmp_path)
+    requested = repository.commit_proposal(
+        _request("book-1", "operation-requested", "a"),
+        _recognition("small requested proposal"),
+    )
+    unrelated = repository.commit_proposal(
+        _request("book-2", "operation-unrelated", "b"),
+        _recognition("x" * (2 * 1024 * 1024)),
+    )
+    proposal_root = (
+        tmp_path
+        / ".engine"
+        / "correction-transforms"
+        / "ocr-proposals"
+    )
+    receipt_root = (
+        tmp_path
+        / ".engine"
+        / "receipts"
+        / "correction-ocr-proposals"
+    )
+    operation_root = (
+        tmp_path
+        / ".engine"
+        / "receipts"
+        / "correction-ocr-proposal-operations"
+    )
+    requested_operation = next(
+        path
+        for path in operation_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8"))["operation_id"]
+        == "operation-requested"
+    )
+    requested_bytes = sum(
+        path.stat().st_size
+        for path in (
+            proposal_root / f"{requested.proposal_ref}.json",
+            receipt_root / f"{requested.proposal_ref}.json",
+            requested_operation,
+        )
+    )
+    assert (
+        proposal_root / f"{unrelated.proposal_ref}.json"
+    ).stat().st_size > requested_bytes
+    monkeypatch.setattr(
+        catalog_repository,
+        "_MAX_CATALOG_JSON_BYTES",
+        requested_bytes,
+    )
+
+    snapshot = repository.list_proposals("book-1")
+
+    assert tuple(value.proposal_ref for value in snapshot.proposals) == (
+        requested.proposal_ref,
+    )
+
+
 @pytest.mark.parametrize(
     ("budget_name", "maximum"),
     (
         ("_MAX_CATALOG_DIRECTORY_ENTRIES", 1),
+        ("_MAX_CATALOG_WORKSPACE_PROPOSALS", 0),
+        ("_MAX_CATALOG_CLAIM_JSON_DOCUMENTS", 1),
+        ("_MAX_CATALOG_CLAIM_JSON_BYTES", 1),
         ("CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT", 0),
         ("_MAX_CATALOG_JSON_DOCUMENTS", 2),
         ("_MAX_CATALOG_JSON_BYTES", 1),
