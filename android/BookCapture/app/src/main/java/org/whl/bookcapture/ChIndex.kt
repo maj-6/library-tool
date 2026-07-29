@@ -3,7 +3,6 @@ package org.whl.bookcapture
 import android.content.Context
 import android.util.Log
 import org.json.JSONObject
-import java.util.zip.GZIPInputStream
 
 /**
  * The CH master list, bundled in the APK and searched on-device.
@@ -101,7 +100,17 @@ class ChIndex private constructor(
     }
 
     companion object {
-        private const val ASSET = "ch_index.json.gz"
+        /**
+         * Plain JSON, deliberately NOT ch_index.json.gz.
+         *
+         * The Android build un-gzips a `.gz` asset and packages it under the
+         * stripped name, so shipping the gzip would put `ch_index.json` in the
+         * APK and this open() would throw FileNotFoundException on device —
+         * while every host-side test still passed, because they read the source
+         * tree. The APK's own zip deflates this to ~640 KB, the same size the
+         * gzip was, so there is nothing to win by pre-compressing it.
+         */
+        private const val ASSET = "ch_index.json"
         private const val TAG = "ChIndex"
 
         @Volatile private var cached: ChIndex? = null
@@ -132,9 +141,7 @@ class ChIndex private constructor(
 
         private fun load(context: Context): ChIndex =
             parse(
-                context.assets.open(ASSET).use { raw ->
-                    GZIPInputStream(raw).bufferedReader().readText()
-                },
+                context.assets.open(ASSET).bufferedReader().use { it.readText() },
             )
 
         /** Visible for tests, so the actually-shipped asset can be parsed and

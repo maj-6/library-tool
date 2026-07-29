@@ -6,7 +6,6 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
-import java.util.zip.GZIPInputStream
 
 /**
  * Exercises the index that actually ships in the APK.
@@ -19,14 +18,34 @@ import java.util.zip.GZIPInputStream
 class ChIndexTest {
 
     private val index: ChIndex by lazy {
-        val asset = File("src/main/assets/ch_index.json.gz")
+        val asset = File("src/main/assets/ch_index.json")
         assertTrue(
-            "ch_index.json.gz missing — regenerate with tools/build_ch_index.py",
+            "ch_index.json missing — regenerate with tools/build_ch_index.py",
             asset.isFile,
         )
-        ChIndex.parse(
-            GZIPInputStream(asset.inputStream()).bufferedReader().use { it.readText() },
+        ChIndex.parse(asset.readText())
+    }
+
+    /**
+     * The asset must be plain JSON, not gzipped.
+     *
+     * The Android build un-gzips a `.gz` asset and packages it under the
+     * stripped name, so a `ch_index.json.gz` in the source tree becomes
+     * `assets/ch_index.json` in the APK — and the app's open() of the `.gz`
+     * name throws FileNotFoundException on device while every host-side test
+     * still passes, because they read the source tree rather than the APK.
+     * That is exactly how this shipped broken once.
+     */
+    @Test
+    fun assetIsPlainJsonSoTheApkEntryNameMatchesWhatTheAppOpens() {
+        val assets = File("src/main/assets")
+        val gz = assets.listFiles { f: File -> f.name.startsWith("ch_index") && f.name.endsWith(".gz") }
+        assertTrue(
+            "ch_index must ship uncompressed: the build would rename ${gz?.firstOrNull()?.name} " +
+                "to ch_index.json in the APK and ChIndex.open() would miss it",
+            gz.isNullOrEmpty(),
         )
+        assertTrue(File(assets, "ch_index.json").isFile)
     }
 
     @Test
@@ -89,10 +108,8 @@ class ChIndexTest {
     @Test
     fun keysAreStableAcrossParsesAndDistinctBetweenRows() {
         val a = index.bestMatch("Dr Kings Domestic Medicines and Hydropathy", "Anonymous")
-        val again = ChIndex.parse(
-            GZIPInputStream(File("src/main/assets/ch_index.json.gz").inputStream())
-                .bufferedReader().use { it.readText() },
-        ).bestMatch("Dr Kings Domestic Medicines and Hydropathy", "Anonymous")
+        val again = ChIndex.parse(File("src/main/assets/ch_index.json").readText())
+            .bestMatch("Dr Kings Domestic Medicines and Hydropathy", "Anonymous")
         // The key is what a stored decision is matched against later, so it has
         // to survive a reload of the same data.
         assertEquals(requireNotNull(a).key, requireNotNull(again).key)
