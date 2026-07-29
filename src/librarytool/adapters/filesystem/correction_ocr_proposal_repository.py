@@ -18,8 +18,11 @@ from typing import Any, ContextManager, TypeAlias
 
 from ...engine.correction_ocr import (
     CORRECTION_OCR_MAX_SOURCE_BYTES,
+    CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT,
     CORRECTION_OCR_PROPOSAL_POLICY,
+    CorrectionOcrProposalCatalogSnapshot,
     CorrectionOcrProposalProviderView,
+    CorrectionOcrProposalSummaryView,
     CorrectionOcrProposalView,
     CorrectionOcrProviderSelection,
     CorrectionOcrRecognition,
@@ -35,6 +38,7 @@ from .corrections_artifact_repository import (
     _AuthoritySnapshot,
     _finish_verified_regular,
     _open_verified_regular,
+    _stable_stat_identity,
 )
 from .recoverable_write_set import (
     RecoverableWriteSet,
@@ -65,6 +69,13 @@ _OPERATION_ROOT = PurePosixPath(
 )
 _MAX_PROPOSAL_BYTES = 128 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 64 * 1024
+_MAX_CATALOG_DIRECTORY_ENTRIES = (
+    CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT * 2
+)
+_MAX_CATALOG_JSON_DOCUMENTS = (
+    CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT * 3
+)
+_MAX_CATALOG_JSON_BYTES = 256 * 1024 * 1024
 _DOCUMENT_FIELDS = frozenset(
     {
         "schema",
@@ -113,6 +124,58 @@ _OPERATION_FIELDS = frozenset(
 class _LoadedCorrectionOcrProposal:
     stored: StoredCorrectionOcrProposal
     view: CorrectionOcrProposalView
+
+
+@dataclass(slots=True)
+class _CatalogScanBudget:
+    directory_entries: int = 0
+    proposal_count: int = 0
+    json_documents: int = 0
+    json_bytes: int = 0
+
+    @staticmethod
+    def _exceeded(name: str, maximum: int) -> RepositoryError:
+        return RepositoryError(
+            "the OCR proposal catalog exceeds its read budget",
+            code="correction_ocr_proposal_catalog_budget_exceeded",
+            details={
+                "artifact": "correction_ocr_proposal",
+                "budget": name,
+                "maximum": maximum,
+            },
+        )
+
+    def consume_directory_entry(self) -> None:
+        self.directory_entries += 1
+        if self.directory_entries > _MAX_CATALOG_DIRECTORY_ENTRIES:
+            raise self._exceeded(
+                "directory_entries",
+                _MAX_CATALOG_DIRECTORY_ENTRIES,
+            )
+
+    def set_proposal_count(self, count: int) -> None:
+        self.proposal_count = count
+        if count > CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT:
+            raise self._exceeded(
+                "proposal_count",
+                CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT,
+            )
+
+    def start_json_document(self) -> None:
+        self.json_documents += 1
+        if self.json_documents > _MAX_CATALOG_JSON_DOCUMENTS:
+            raise self._exceeded(
+                "json_documents",
+                _MAX_CATALOG_JSON_DOCUMENTS,
+            )
+
+    def consume_json_bytes(self, count: int) -> None:
+        self.json_bytes += count
+        if self.json_bytes > _MAX_CATALOG_JSON_BYTES:
+            raise self._exceeded(
+                "json_bytes",
+                _MAX_CATALOG_JSON_BYTES,
+            )
 
 
 def _repository_error(
@@ -352,6 +415,40 @@ class FilesystemCorrectionOcrProposalRepository:
                 cause=exc,
             ) from exc
 
+    def list_proposals(
+        self,
+        item_id: str,
+    ) -> CorrectionOcrProposalCatalogSnapshot:
+        """Enumerate one verified item snapshot without creating identifiers."""
+
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or len(item_id) > 256
+        ):
+            raise ValueError("item_id must be a bounded identifier")
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    return self._list_proposals_locked(item_id)
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the OCR proposal workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except RepositoryError:
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the OCR proposal catalog cannot be read",
+                code="invalid_correction_ocr_proposal_catalog",
+                cause=exc,
+            ) from exc
+
     def commit_proposal(
         self,
         request: OcrFollowupRequest,
@@ -499,6 +596,160 @@ class FilesystemCorrectionOcrProposalRepository:
         payload = _canonical_json(request.as_dict())
         return "cop-" + hashlib.sha256(payload).hexdigest()[:40]
 
+    def _list_proposals_locked(
+        self,
+        item_id: str,
+    ) -> CorrectionOcrProposalCatalogSnapshot:
+        budget = _CatalogScanBudget()
+        proposal_root = self._target(_PROPOSAL_ROOT)
+        receipt_root = self._target(_RECEIPT_ROOT)
+        proposal_state = self._catalog_directory_state(proposal_root)
+        receipt_state = self._catalog_directory_state(receipt_root)
+        proposal_refs = self._scan_catalog_directory(
+            proposal_root,
+            expected_state=proposal_state,
+            budget=budget,
+        )
+        receipt_refs = self._scan_catalog_directory(
+            receipt_root,
+            expected_state=receipt_state,
+            budget=budget,
+        )
+        self._require_catalog_directory_state(
+            proposal_root,
+            proposal_state,
+        )
+        self._require_catalog_directory_state(
+            receipt_root,
+            receipt_state,
+        )
+        if proposal_refs != receipt_refs:
+            raise _repository_error(
+                "the OCR proposal catalog contains an incomplete publication",
+                code="invalid_correction_ocr_proposal_catalog",
+            )
+        budget.set_proposal_count(len(receipt_refs))
+
+        proposals: list[CorrectionOcrProposalSummaryView] = []
+        for proposal_ref in sorted(receipt_refs):
+            loaded = self._load_locked(
+                proposal_ref,
+                catalog_budget=budget,
+            )
+            if loaded is None:
+                raise _repository_error(
+                    "the OCR proposal catalog changed while it was read",
+                    code="invalid_correction_ocr_proposal_catalog",
+                )
+            if loaded.view.item_id == item_id:
+                proposals.append(
+                    CorrectionOcrProposalSummaryView.from_proposal(loaded.view)
+                )
+
+        self._require_catalog_directory_state(
+            proposal_root,
+            proposal_state,
+        )
+        self._require_catalog_directory_state(
+            receipt_root,
+            receipt_state,
+        )
+        return CorrectionOcrProposalCatalogSnapshot(
+            item_id=item_id,
+            proposals=tuple(proposals),
+        )
+
+    def _scan_catalog_directory(
+        self,
+        path: Path,
+        *,
+        expected_state: tuple[int, ...] | None,
+        budget: _CatalogScanBudget,
+    ) -> set[str]:
+        if expected_state is None:
+            return set()
+        self._require_catalog_directory_state(path, expected_state)
+        references: set[str] = set()
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    budget.consume_directory_entry()
+                    if not entry.name.endswith(".json"):
+                        raise ValueError(
+                            "OCR proposal catalog entry has an invalid name"
+                        )
+                    proposal_ref = entry.name.removesuffix(".json")
+                    self._require_proposal_ref(proposal_ref)
+                    if entry.name != f"{proposal_ref}.json":
+                        raise ValueError(
+                            "OCR proposal catalog entry has an invalid name"
+                        )
+                    entry_path = self._safe_target(Path(entry.path))
+                    # ``DirEntry.stat`` reports ``st_nlink == 0`` on some
+                    # Windows/Python combinations.  The named-path snapshot is
+                    # the same primitive used by the verified file reader.
+                    info = entry_path.lstat()
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_nlink != 1
+                        or _is_redirecting_path(entry_path)
+                    ):
+                        raise ValueError(
+                            "OCR proposal catalog entry is not a private file"
+                        )
+                    if proposal_ref in references:
+                        raise ValueError(
+                            "OCR proposal catalog contains a duplicate reference"
+                        )
+                    references.add(proposal_ref)
+            self._require_catalog_directory_state(path, expected_state)
+            return references
+        except RepositoryError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _repository_error(
+                "the OCR proposal catalog cannot be enumerated safely",
+                code="invalid_correction_ocr_proposal_catalog",
+                cause=exc,
+            ) from exc
+
+    def _catalog_directory_state(
+        self,
+        path: Path,
+    ) -> tuple[int, ...] | None:
+        try:
+            self._authority_snapshot(path / ".catalog-snapshot")
+            if not os.path.lexists(path):
+                return None
+            info = path.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or _is_redirecting_path(path)
+            ):
+                raise ValueError(
+                    "OCR proposal catalog authority is not a private directory"
+                )
+            return _stable_stat_identity(info)
+        except RepositoryError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _repository_error(
+                "the OCR proposal catalog authority is unsafe",
+                code="invalid_correction_ocr_proposal_catalog",
+                cause=exc,
+            ) from exc
+
+    def _require_catalog_directory_state(
+        self,
+        path: Path,
+        expected: tuple[int, ...] | None,
+    ) -> None:
+        if self._catalog_directory_state(path) != expected:
+            raise _repository_error(
+                "the OCR proposal catalog changed while it was read",
+                code="invalid_correction_ocr_proposal_catalog",
+            )
+
     def _find_locked(
         self,
         request: OcrFollowupRequest,
@@ -547,6 +798,8 @@ class FilesystemCorrectionOcrProposalRepository:
     def _load_locked(
         self,
         proposal_ref: str,
+        *,
+        catalog_budget: _CatalogScanBudget | None = None,
     ) -> _LoadedCorrectionOcrProposal | None:
         self._require_proposal_ref(proposal_ref)
         proposal_path = self._proposal_path(proposal_ref)
@@ -563,10 +816,12 @@ class FilesystemCorrectionOcrProposalRepository:
         payload = self._read_regular(
             proposal_path,
             maximum=_MAX_PROPOSAL_BYTES,
+            catalog_budget=catalog_budget,
         )
         receipt_payload = self._read_regular(
             receipt_path,
             maximum=_MAX_RECEIPT_BYTES,
+            catalog_budget=catalog_budget,
         )
         try:
             raw_receipt = json.loads(
@@ -621,7 +876,10 @@ class FilesystemCorrectionOcrProposalRepository:
             )
             if not self._path_exists(operation_path):
                 raise ValueError("OCR proposal operation claim is missing")
-            operation = self._read_operation(operation_path)
+            operation = self._read_operation(
+                operation_path,
+                catalog_budget=catalog_budget,
+            )
             proposal_sha256 = hashlib.sha256(payload).hexdigest()
             if (
                 document["schema"] != CORRECTION_OCR_PROPOSAL_SCHEMA
@@ -675,8 +933,17 @@ class FilesystemCorrectionOcrProposalRepository:
                 cause=exc,
             ) from exc
 
-    def _read_operation(self, path: Path) -> Mapping[str, Any]:
-        payload = self._read_regular(path, maximum=_MAX_RECEIPT_BYTES)
+    def _read_operation(
+        self,
+        path: Path,
+        *,
+        catalog_budget: _CatalogScanBudget | None = None,
+    ) -> Mapping[str, Any]:
+        payload = self._read_regular(
+            path,
+            maximum=_MAX_RECEIPT_BYTES,
+            catalog_budget=catalog_budget,
+        )
         try:
             raw = json.loads(
                 payload.decode("utf-8"),
@@ -723,9 +990,17 @@ class FilesystemCorrectionOcrProposalRepository:
                 "proposal_ref must be an opaque OCR proposal reference"
             )
 
-    def _read_regular(self, path: Path, *, maximum: int) -> bytes:
+    def _read_regular(
+        self,
+        path: Path,
+        *,
+        maximum: int,
+        catalog_budget: _CatalogScanBudget | None = None,
+    ) -> bytes:
         descriptor = -1
         try:
+            if catalog_budget is not None:
+                catalog_budget.start_json_document()
             authority = self._authority_snapshot(path)
             before = path.lstat()
             if (
@@ -750,6 +1025,8 @@ class FilesystemCorrectionOcrProposalRepository:
                     raise ValueError(
                         "OCR proposal document exceeds its size budget"
                     )
+                if catalog_budget is not None:
+                    catalog_budget.consume_json_bytes(len(block))
                 chunks.append(block)
             _finish_verified_regular(
                 path,
