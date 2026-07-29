@@ -25,7 +25,12 @@ from types import MappingProxyType
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 from .capabilities import CapabilityRef
-from .errors import ValidationError
+from .errors import (
+    ConflictError,
+    EngineError,
+    RepositoryError,
+    ValidationError,
+)
 
 
 JsonMapping: TypeAlias = Mapping[str, Any]
@@ -33,6 +38,10 @@ JsonMapping: TypeAlias = Mapping[str, Any]
 DOCUMENT_ARTIFACT_CONTRACT_VERSION = 1
 DOCUMENT_ARTIFACT_SCHEMA = (
     f"librarytool.document-artifact/{DOCUMENT_ARTIFACT_CONTRACT_VERSION}"
+)
+DOCUMENT_ARTIFACT_CATALOG_PAGE_SCHEMA = (
+    f"librarytool.document-artifact-catalog-page/"
+    f"{DOCUMENT_ARTIFACT_CONTRACT_VERSION}"
 )
 DOCUMENT_RESOURCE_PAGE_REQUEST_SCHEMA = (
     f"librarytool.document-resource-page-request/{DOCUMENT_ARTIFACT_CONTRACT_VERSION}"
@@ -62,6 +71,9 @@ MAX_DOCUMENT_EXTENSION_NODES = 256
 MAX_DOCUMENT_EXTENSION_ENCODED_BYTES = 16 * 1024
 MAX_DOCUMENT_EXTENSION_STRING_CHARACTERS = 4 * 1024
 MAX_DOCUMENT_LINEAGE_REFS = 64
+MAX_DOCUMENT_ARTIFACT_CATALOG_COUNT = 10_000
+MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT = 256
+MAX_DOCUMENT_ARTIFACT_CATALOG_ENCODED_BYTES = 32 * 1024 * 1024
 # 48 KiB of raw bytes has a base64 representation no larger than 64 KiB.
 MAX_DOCUMENT_RESOURCE_PAGE_BYTES = 48 * 1024
 MAX_PORTABLE_INTEGER = (1 << 53) - 1
@@ -77,6 +89,16 @@ _MEDIA_TYPE_RE = re.compile(
 )
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+_CATALOG_REVISION_RE = re.compile(r"^docs-[0-9a-f]{64}$")
+_CATALOG_CURSOR_RE = re.compile(r"^docc-[A-Za-z0-9_-]{1,2043}$")
+_CATALOG_CURSOR_SCHEMA = (
+    f"librarytool.document-artifact-catalog-cursor/"
+    f"{DOCUMENT_ARTIFACT_CONTRACT_VERSION}"
+)
+_CATALOG_SNAPSHOT_SCHEMA = (
+    f"librarytool.document-artifact-catalog-snapshot/"
+    f"{DOCUMENT_ARTIFACT_CONTRACT_VERSION}"
+)
 _RFC3339_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$"
@@ -663,16 +685,17 @@ class DocumentSourceRef:
 
 @dataclass(frozen=True, slots=True)
 class DocumentLineageRef:
-    artifact_id: str
+    key: DocumentArtifactKey
     artifact_revision: str
     relation: str = "derived_from"
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "artifact_id",
-            _opaque_identifier(self.artifact_id, "lineage.artifact_id"),
-        )
+        if not isinstance(self.key, DocumentArtifactKey):
+            raise _validation(
+                "lineage key must be a DocumentArtifactKey",
+                code="invalid_document_artifact_lineage",
+                field_name="lineage.key",
+            )
         object.__setattr__(
             self,
             "artifact_revision",
@@ -684,9 +707,17 @@ class DocumentLineageRef:
             _kind(self.relation, "lineage.relation"),
         )
 
-    def as_dict(self) -> dict[str, str]:
+    @property
+    def item_id(self) -> str:
+        return self.key.item_id
+
+    @property
+    def artifact_id(self) -> str:
+        return self.key.artifact_id
+
+    def as_dict(self) -> dict[str, Any]:
         return {
-            "artifact_id": self.artifact_id,
+            "key": self.key.as_dict(),
             "artifact_revision": self.artifact_revision,
             "relation": self.relation,
         }
@@ -922,9 +953,9 @@ class DocumentArtifactView:
                 code="invalid_document_artifact_lineage",
                 field_name="lineage",
             )
-        identities = [(value.relation, value.artifact_id) for value in lineage]
+        identities = [(value.relation, value.key) for value in lineage]
         if len(identities) != len(set(identities)) or any(
-            value.artifact_id == self.key.artifact_id for value in lineage
+            value.key == self.key for value in lineage
         ):
             raise _validation(
                 "lineage must contain unique external artifact references",
@@ -956,6 +987,266 @@ class DocumentArtifactView:
             "provenance": self.provenance.as_dict(),
             "extensions": _thaw(self.extensions),
         }
+
+
+def _catalog_revision(
+    item_id: str,
+    artifacts: tuple[DocumentArtifactView, ...],
+) -> str:
+    """Hash a bounded catalog without first building one large JSON value."""
+
+    digest = hashlib.sha256()
+    header = json.dumps(
+        {
+            "item_id": item_id,
+            "schema": _CATALOG_SNAPSHOT_SCHEMA,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded_bytes = len(header)
+    if encoded_bytes > MAX_DOCUMENT_ARTIFACT_CATALOG_ENCODED_BYTES:
+        raise _validation(
+            "document artifact catalog exceeds its encoded-size budget",
+            code="document_artifact_catalog_budget_exceeded",
+            field_name="artifacts",
+        )
+    digest.update(header)
+    for artifact in artifacts:
+        encoded = json.dumps(
+            artifact.as_dict(),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        # Count the length prefix used by the digest as well as the payload.
+        encoded_bytes += 8 + len(encoded)
+        if encoded_bytes > MAX_DOCUMENT_ARTIFACT_CATALOG_ENCODED_BYTES:
+            raise _validation(
+                "document artifact catalog exceeds its encoded-size budget",
+                code="document_artifact_catalog_budget_exceeded",
+                field_name="artifacts",
+            )
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return "docs-" + digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentArtifactCatalogSnapshot:
+    """One deterministic item-scoped artifact snapshot."""
+
+    item_id: str
+    artifacts: tuple[DocumentArtifactView, ...] = ()
+    snapshot_revision: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "item_id",
+            _opaque_identifier(self.item_id, "item_id"),
+        )
+        if not isinstance(self.artifacts, tuple):
+            raise _validation(
+                "artifacts must be a tuple",
+                code="invalid_document_artifact_catalog",
+                field_name="artifacts",
+            )
+        if len(self.artifacts) > MAX_DOCUMENT_ARTIFACT_CATALOG_COUNT:
+            raise _validation(
+                "document artifact catalog exceeds its count budget",
+                code="document_artifact_catalog_budget_exceeded",
+                field_name="artifacts",
+            )
+        if any(
+            not isinstance(artifact, DocumentArtifactView)
+            for artifact in self.artifacts
+        ):
+            raise _validation(
+                "artifacts must contain DocumentArtifactView values",
+                code="invalid_document_artifact_catalog",
+                field_name="artifacts",
+            )
+        if any(
+            artifact.key.item_id != self.item_id for artifact in self.artifacts
+        ):
+            raise _validation(
+                "document artifact catalog contains another item",
+                code="invalid_document_artifact_catalog",
+                field_name="artifacts",
+            )
+        artifact_ids = tuple(
+            artifact.key.artifact_id for artifact in self.artifacts
+        )
+        if (
+            artifact_ids != tuple(sorted(artifact_ids))
+            or len(artifact_ids) != len(set(artifact_ids))
+        ):
+            raise _validation(
+                "document artifact catalog must use unique deterministic ordering",
+                code="invalid_document_artifact_catalog",
+                field_name="artifacts",
+            )
+        object.__setattr__(
+            self,
+            "snapshot_revision",
+            _catalog_revision(self.item_id, self.artifacts),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentArtifactCatalogPageView:
+    """One bounded page pinned to a complete artifact snapshot."""
+
+    item_id: str
+    snapshot_revision: str
+    artifacts: tuple[DocumentArtifactView, ...]
+    next_cursor: str | None
+    total: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "item_id",
+            _opaque_identifier(self.item_id, "item_id"),
+        )
+        if (
+            not isinstance(self.snapshot_revision, str)
+            or _CATALOG_REVISION_RE.fullmatch(self.snapshot_revision) is None
+        ):
+            raise _validation(
+                "snapshot_revision must be a document artifact catalog revision",
+                code="invalid_document_artifact_catalog",
+                field_name="snapshot_revision",
+            )
+        if (
+            not isinstance(self.artifacts, tuple)
+            or len(self.artifacts) > MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT
+            or any(
+                not isinstance(artifact, DocumentArtifactView)
+                or artifact.key.item_id != self.item_id
+                for artifact in self.artifacts
+            )
+        ):
+            raise _validation(
+                "artifacts must be a bounded item-scoped tuple",
+                code="invalid_document_artifact_catalog",
+                field_name="artifacts",
+            )
+        artifact_ids = tuple(
+            artifact.key.artifact_id for artifact in self.artifacts
+        )
+        if (
+            artifact_ids != tuple(sorted(artifact_ids))
+            or len(artifact_ids) != len(set(artifact_ids))
+        ):
+            raise _validation(
+                "document artifact page ordering is invalid",
+                code="invalid_document_artifact_catalog",
+                field_name="artifacts",
+            )
+        if self.next_cursor is not None and (
+            not isinstance(self.next_cursor, str)
+            or len(self.next_cursor) > 2048
+            or _CATALOG_CURSOR_RE.fullmatch(self.next_cursor) is None
+        ):
+            raise _validation(
+                "next_cursor must be an opaque document artifact cursor or null",
+                code="invalid_document_artifact_catalog",
+                field_name="next_cursor",
+            )
+        if (
+            isinstance(self.total, bool)
+            or not isinstance(self.total, int)
+            or self.total < len(self.artifacts)
+            or self.total > MAX_DOCUMENT_ARTIFACT_CATALOG_COUNT
+        ):
+            raise _validation(
+                "total is outside the document artifact catalog budget",
+                code="invalid_document_artifact_catalog",
+                field_name="total",
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": DOCUMENT_ARTIFACT_CATALOG_PAGE_SCHEMA,
+            "item_id": self.item_id,
+            "snapshot_revision": self.snapshot_revision,
+            "artifacts": [artifact.as_dict() for artifact in self.artifacts],
+            "next_cursor": self.next_cursor,
+            "total": self.total,
+        }
+
+
+def _encode_catalog_cursor(
+    *,
+    item_id: str,
+    snapshot_revision: str,
+    after_artifact_id: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "after_artifact_id": after_artifact_id,
+            "item_sha256": hashlib.sha256(item_id.encode("utf-8")).hexdigest(),
+            "schema": _CATALOG_CURSOR_SCHEMA,
+            "snapshot_revision": snapshot_revision,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return "docc-" + base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_catalog_cursor(
+    token: str,
+    *,
+    item_id: str,
+) -> tuple[str, str]:
+    if len(token) > 2048 or _CATALOG_CURSOR_RE.fullmatch(token) is None:
+        raise ValueError("cursor must be an opaque document artifact cursor")
+    encoded = token.removeprefix("docc-")
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        decoded = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        value = json.loads(decoded.decode("ascii"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "cursor must be an opaque document artifact cursor"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "after_artifact_id",
+            "item_sha256",
+            "schema",
+            "snapshot_revision",
+        }
+        or value.get("schema") != _CATALOG_CURSOR_SCHEMA
+        or value.get("item_sha256")
+        != hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+        or not isinstance(value.get("snapshot_revision"), str)
+        or _CATALOG_REVISION_RE.fullmatch(value["snapshot_revision"]) is None
+        or not isinstance(value.get("after_artifact_id"), str)
+        or _OPAQUE_ID_RE.fullmatch(value["after_artifact_id"]) is None
+        or token
+        != _encode_catalog_cursor(
+            item_id=item_id,
+            snapshot_revision=value["snapshot_revision"],
+            after_artifact_id=value["after_artifact_id"],
+        )
+    ):
+        raise ValueError("cursor must be an opaque document artifact cursor")
+    return value["snapshot_revision"], value["after_artifact_id"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1260,6 +1551,247 @@ class DocumentArtifactProjectorPort(Protocol):
     ) -> DocumentArtifactView | None: ...
 
 
+class DocumentArtifactCatalogService:
+    """Validate and page deterministic item-scoped artifact snapshots."""
+
+    def __init__(self, projector: DocumentArtifactProjectorPort) -> None:
+        if not isinstance(projector, DocumentArtifactProjectorPort):
+            raise TypeError(
+                "projector must implement DocumentArtifactProjectorPort"
+            )
+        self._projector = projector
+
+    def list_document_artifacts(
+        self,
+        item_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        snapshot_revision: str | None = None,
+    ) -> DocumentArtifactCatalogPageView:
+        try:
+            item = _opaque_identifier(item_id, "item_id")
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+                or limit > MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT
+            ):
+                raise ValueError("limit is outside the artifact page budget")
+            if snapshot_revision is not None and (
+                not isinstance(snapshot_revision, str)
+                or _CATALOG_REVISION_RE.fullmatch(snapshot_revision) is None
+            ):
+                raise ValueError("snapshot_revision is invalid")
+            cursor_revision = ""
+            after_artifact_id = ""
+            if cursor is not None:
+                if not isinstance(cursor, str) or not cursor:
+                    raise ValueError("cursor is invalid")
+                cursor_revision, after_artifact_id = _decode_catalog_cursor(
+                    cursor,
+                    item_id=item,
+                )
+                if (
+                    snapshot_revision is not None
+                    and cursor_revision != snapshot_revision
+                ):
+                    raise ValueError(
+                        "cursor and snapshot_revision identify different snapshots"
+                    )
+        except (ValidationError, ValueError) as exc:
+            raise ValidationError(
+                "the document artifact catalog query is invalid",
+                code="invalid_document_artifact_catalog_query",
+            ) from exc
+
+        snapshot = self._snapshot(item)
+        expected_revision = cursor_revision or snapshot_revision
+        if (
+            expected_revision is not None
+            and expected_revision
+            and snapshot.snapshot_revision != expected_revision
+        ):
+            raise ConflictError(
+                "the document artifact catalog changed while it was being paged",
+                code="document_artifact_catalog_changed",
+                details={
+                    "expected_revision": expected_revision,
+                    "actual_revision": snapshot.snapshot_revision,
+                },
+            )
+
+        offset = 0
+        if after_artifact_id:
+            artifact_ids = tuple(
+                artifact.key.artifact_id for artifact in snapshot.artifacts
+            )
+            try:
+                offset = artifact_ids.index(after_artifact_id) + 1
+            except ValueError as exc:
+                raise ValidationError(
+                    "the document artifact catalog query is invalid",
+                    code="invalid_document_artifact_catalog_query",
+                ) from exc
+            if offset >= len(snapshot.artifacts):
+                raise ValidationError(
+                    "the document artifact catalog query is invalid",
+                    code="invalid_document_artifact_catalog_query",
+                )
+
+        artifacts = snapshot.artifacts[offset : offset + limit]
+        next_offset = offset + len(artifacts)
+        next_cursor = (
+            _encode_catalog_cursor(
+                item_id=item,
+                snapshot_revision=snapshot.snapshot_revision,
+                after_artifact_id=artifacts[-1].key.artifact_id,
+            )
+            if artifacts and next_offset < len(snapshot.artifacts)
+            else None
+        )
+        return DocumentArtifactCatalogPageView(
+            item_id=item,
+            snapshot_revision=snapshot.snapshot_revision,
+            artifacts=artifacts,
+            next_cursor=next_cursor,
+            total=len(snapshot.artifacts),
+        )
+
+    def get_document_artifact(
+        self,
+        key: DocumentArtifactKey,
+    ) -> DocumentArtifactView | None:
+        if not isinstance(key, DocumentArtifactKey):
+            raise ValidationError(
+                "key must be a DocumentArtifactKey",
+                code="invalid_document_artifact_identity",
+                details={"field": "key"},
+            )
+        try:
+            artifact = self._projector.get_document_artifact(key)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the document artifact repository is unavailable",
+                code="document_artifact_repository_unavailable",
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+        if artifact is None:
+            return None
+        if not isinstance(artifact, DocumentArtifactView):
+            raise RepositoryError(
+                "the document artifact repository returned an invalid view",
+                code="invalid_document_artifact_snapshot",
+            )
+        if artifact.key != key:
+            raise RepositoryError(
+                "the document artifact repository returned another artifact",
+                code="document_artifact_repository_scope_mismatch",
+                details={"key": key.as_dict()},
+            )
+        return artifact
+
+    def _snapshot(self, item_id: str) -> DocumentArtifactCatalogSnapshot:
+        try:
+            records = self._projector.list_document_artifacts(item_id)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the document artifact repository is unavailable",
+                code="document_artifact_repository_unavailable",
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+        if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+            raise RepositoryError(
+                "the document artifact repository returned an invalid catalog",
+                code="invalid_document_artifact_snapshot",
+            )
+        try:
+            count = len(records)
+        except Exception as exc:
+            raise RepositoryError(
+                "the document artifact repository returned an invalid catalog",
+                code="invalid_document_artifact_snapshot",
+                details={"cause_type": type(exc).__name__},
+            ) from exc
+        if count > MAX_DOCUMENT_ARTIFACT_CATALOG_COUNT:
+            raise RepositoryError(
+                "the document artifact catalog exceeds its count budget",
+                code="document_artifact_catalog_budget_exceeded",
+                details={
+                    "budget": "count",
+                    "maximum": MAX_DOCUMENT_ARTIFACT_CATALOG_COUNT,
+                },
+            )
+        materialized: list[Any] = []
+        try:
+            for index, artifact in enumerate(records):
+                if index >= count:
+                    raise RepositoryError(
+                        "the document artifact repository changed during its read",
+                        code="invalid_document_artifact_snapshot",
+                    )
+                materialized.append(artifact)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the document artifact repository returned an invalid catalog",
+                code="invalid_document_artifact_snapshot",
+                details={"cause_type": type(exc).__name__},
+            ) from exc
+        if len(materialized) != count:
+            raise RepositoryError(
+                "the document artifact repository changed during its read",
+                code="invalid_document_artifact_snapshot",
+            )
+        artifacts = tuple(materialized)
+        if any(
+            not isinstance(artifact, DocumentArtifactView)
+            for artifact in artifacts
+        ):
+            raise RepositoryError(
+                "the document artifact repository returned an invalid catalog",
+                code="invalid_document_artifact_snapshot",
+            )
+        if any(artifact.key.item_id != item_id for artifact in artifacts):
+            raise RepositoryError(
+                "the document artifact repository returned another item",
+                code="document_artifact_repository_scope_mismatch",
+                details={"item_id": item_id},
+            )
+        ordered = tuple(
+            sorted(artifacts, key=lambda artifact: artifact.key.artifact_id)
+        )
+        try:
+            return DocumentArtifactCatalogSnapshot(
+                item_id=item_id,
+                artifacts=ordered,
+            )
+        except ValidationError as exc:
+            code = (
+                exc.code
+                if exc.code == "document_artifact_catalog_budget_exceeded"
+                else "invalid_document_artifact_snapshot"
+            )
+            details: dict[str, Any] = {}
+            if code == "document_artifact_catalog_budget_exceeded":
+                details = {
+                    "budget": "encoded_bytes",
+                    "maximum": MAX_DOCUMENT_ARTIFACT_CATALOG_ENCODED_BYTES,
+                }
+            raise RepositoryError(
+                "the document artifact repository returned an invalid catalog",
+                code=code,
+                details=details,
+            ) from exc
+
+
 @runtime_checkable
 class DocumentResourcePageReaderPort(Protocol):
     """Resolve one revision-pinned, bounded document resource page."""
@@ -1270,7 +1802,68 @@ class DocumentResourcePageReaderPort(Protocol):
     ) -> DocumentResourcePageView: ...
 
 
+class DocumentResourcePageService:
+    """Validate every repository response against the caller's exact pins."""
+
+    def __init__(self, reader: DocumentResourcePageReaderPort) -> None:
+        if not isinstance(reader, DocumentResourcePageReaderPort):
+            raise TypeError(
+                "reader must implement DocumentResourcePageReaderPort"
+            )
+        self._reader = reader
+
+    def read_document_resource_page(
+        self,
+        request: DocumentResourcePageRequest,
+    ) -> DocumentResourcePageView:
+        if not isinstance(request, DocumentResourcePageRequest):
+            raise ValidationError(
+                "request must be a DocumentResourcePageRequest",
+                code="invalid_document_resource_page",
+                details={"field": "request"},
+            )
+        try:
+            page = self._reader.read_document_resource_page(request)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the document resource repository is unavailable",
+                code="document_resource_repository_unavailable",
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+        if not isinstance(page, DocumentResourcePageView):
+            raise RepositoryError(
+                "the document resource repository returned an invalid page",
+                code="invalid_document_resource_page_response",
+            )
+
+        mismatched: list[str] = []
+        if page.key != request.key:
+            mismatched.append("key")
+        if page.artifact_revision != request.artifact_revision:
+            mismatched.append("artifact_revision")
+        if page.resource != request.resource:
+            mismatched.append("resource")
+        if page.mode is not request.mode:
+            mismatched.append("mode")
+        if page.offset != request.offset:
+            mismatched.append("offset")
+        if page.max_bytes != request.max_bytes:
+            mismatched.append("max_bytes")
+        if mismatched:
+            raise RepositoryError(
+                "the document resource repository returned a page outside "
+                "the requested scope",
+                code="document_resource_repository_scope_mismatch",
+                details={"fields": mismatched},
+            )
+        return page
+
+
 __all__ = [
+    "DOCUMENT_ARTIFACT_CATALOG_PAGE_SCHEMA",
     "DOCUMENT_ARTIFACT_CONTRACT_VERSION",
     "DOCUMENT_ARTIFACT_KINDS",
     "DOCUMENT_ARTIFACT_SCHEMA",
@@ -1281,8 +1874,14 @@ __all__ = [
     "MAX_DOCUMENT_EXTENSION_ENCODED_BYTES",
     "MAX_DOCUMENT_EXTENSION_NODES",
     "MAX_DOCUMENT_EXTENSION_STRING_CHARACTERS",
+    "MAX_DOCUMENT_ARTIFACT_CATALOG_COUNT",
+    "MAX_DOCUMENT_ARTIFACT_CATALOG_ENCODED_BYTES",
+    "MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT",
     "MAX_DOCUMENT_LINEAGE_REFS",
     "MAX_DOCUMENT_RESOURCE_PAGE_BYTES",
+    "DocumentArtifactCatalogPageView",
+    "DocumentArtifactCatalogService",
+    "DocumentArtifactCatalogSnapshot",
     "DocumentArtifactFreshness",
     "DocumentArtifactKey",
     "DocumentArtifactProjectorPort",
@@ -1292,6 +1891,7 @@ __all__ = [
     "DocumentPageMode",
     "DocumentResourcePageReaderPort",
     "DocumentResourcePageRequest",
+    "DocumentResourcePageService",
     "DocumentResourcePageView",
     "DocumentResourceRef",
     "DocumentResourceState",
