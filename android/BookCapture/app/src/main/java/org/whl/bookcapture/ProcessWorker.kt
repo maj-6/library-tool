@@ -1,6 +1,7 @@
 package org.whl.bookcapture
 
 import android.content.Context
+import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
@@ -351,6 +352,7 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             if (forced && !extraction.complete) Entries.holdForProcessing(dir)
             Entries.atomicWrite(File(dir, "meta.json"), merged.toString())
             PhotoAssetStore.applyBibliographicSuggestions(dir, merged)
+            searchChList(ctx, dir, merged)
             requestPostProcessing(ctx, dir, merged)
             if (extraction.complete) {
                 Entries.markComplete(dir)
@@ -375,6 +377,42 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = true)
             DirectoryOutcome(retry = true, lastError = message)
         }
+    }
+
+    /**
+     * Look the freshly-extracted book up in the bundled CH master list.
+     *
+     * Runs here rather than on the UI thread because the index is ~2.7 MB of
+     * JSON on first touch; this worker is already on Dispatchers.IO.
+     *
+     * A CH lookup must never fail a scan — the photos and metadata are the
+     * irreplaceable part, an indicator is not — so any failure is swallowed and
+     * simply leaves the entry unsearched.
+     *
+     * An existing decision is preserved when the same row comes back, so a
+     * reprocess does not re-prompt for a match the user already ruled on. If a
+     * DIFFERENT row now matches, the old decision is dropped: it was about a
+     * different book and carrying it over would silently approve something the
+     * user never saw.
+     */
+    private fun searchChList(ctx: Context, dir: File, metadata: JSONObject) {
+        runCatching {
+            val title = metadata.optString("title").trim()
+            val author = metadata.optString("author").trim()
+            if (title.isEmpty() && author.isEmpty()) return
+
+            val index = ChIndex.get(ctx) ?: return
+            val candidate = index.bestMatch(title, author)
+            val previous = ChMatchStore.read(dir)
+            val decision =
+                if (candidate != null && candidate.key == previous.candidate?.key) previous.decision
+                else ChDecision.UNREVIEWED
+
+            ChMatchStore.write(
+                dir,
+                ChMatchState(searched = true, candidate = candidate, decision = decision),
+            )
+        }.onFailure { Log.w("ProcessWorker", "CH lookup failed for ${dir.name}", it) }
     }
 
     /** Freeze post-processing preferences only after extraction supplied the

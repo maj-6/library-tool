@@ -3,18 +3,20 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
-## 0.5.2-alpha.2 — 2026-07-28
+## 0.5.2-alpha.3 — 2026-07-28
 
-Android version code: `33`.
+Android version code: `34`.
 
 ### Additions
 
+- After a scan the phone checks the book against the CH master list on its own, with no network and no desktop, and shows the result on the book's row.
 - Book rows carry a compact row of catalogue indicators for the CH list, the World Herb Library, and the Internet Archive, in a fixed order and readable without relying on colour.
 - Tapping the CH indicator accepts a proposed match and opens a preview of the merge, marking which values came from the CH list; a long press rejects the match. Values you captured are never overwritten, and where the two disagree the CH reading is shown beside yours rather than replacing it.
+- An accepted match contributes the publisher, city, edition, page count, condition, illustrations, price and subject keys the CH list holds for that book.
 
 ### Other Changes
 
-- Matching a scanned book against the CH list does not run on the phone yet, so the CH indicator stays hidden in this build.
+- A rescan keeps a decision you already made when it finds the same book again, and asks afresh when it finds a different one.
 
 ## 0.5.2-alpha.1 — 2026-07-28
 

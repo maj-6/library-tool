@@ -56,6 +56,39 @@ def display_title(row: dict) -> str:
     return str(row.get("publication") or "").replace("_", " ").strip()
 
 
+def merge_fields(row: dict, title: str, author: str) -> dict:
+    """CH's row, keyed by the field names the phone's records use.
+
+    Only fields an approved match should be able to contribute are included —
+    CH's acquisition DATE, for instance, is about CH's purchase and says nothing
+    about the book, so it is deliberately absent.
+
+    Empty values are dropped rather than emitted as "": the merge rule is that a
+    blank never overwrites, and shipping thousands of empty strings would bloat
+    the index for no effect.
+    """
+    keys = [
+        str(row.get("key") or ""),
+        str(row.get("key_2") or ""),
+        str(row.get("key_3") or ""),
+    ]
+    fields = {
+        "title": title,
+        "author": author,
+        "year": str(row.get("year_of_publication") or ""),
+        "edition": str(row.get("edition") or ""),
+        "publisher": str(row.get("publisher") or ""),
+        "city": str(row.get("city_published") or ""),
+        "pages": str(row.get("page_reference") or ""),
+        "condition": str(row.get("condition") or ""),
+        "illustrations": str(row.get("illustrations") or ""),
+        "price": str(row.get("price") or ""),
+        "notes": str(row.get("notes") or ""),
+        "categories": ", ".join(k for k in keys if k.strip()),
+    }
+    return {k: v.strip() for k, v in fields.items() if v and v.strip()}
+
+
 def build_index(rows: list[dict]) -> dict:
     entries: list[dict] = []
     by_author: dict[str, list[int]] = defaultdict(list)
@@ -79,6 +112,10 @@ def build_index(rows: list[dict]) -> dict:
             # 5k rows at query time — only on the one query string.
             "nt": whl._normalize(title),
             "na": whl._normalize(whl.flip_author(author)),
+            # Everything an approved match can contribute, already keyed by the
+            # APP's field names. Mapping CH's column names lives here rather
+            # than in Kotlin so the two never disagree about what "pages" is.
+            "f": merge_fields(row, title, author),
         })
 
         for token in checks.author_tokens(author):
@@ -189,6 +226,18 @@ def build_fixtures(rows: list[dict]) -> dict:
 
     return {
         "version": INDEX_VERSION,
+        # Carried so the Kotlin conformance test asserts against the tuning the
+        # fixtures were actually generated with, instead of a copy that can
+        # drift once someone retunes a threshold here.
+        "bucket_chars": BUCKET_CHARS,
+        "title_prefix": whl.TITLE_PREFIX,
+        "thresholds": {
+            "prefix_min": checks.TITLE_PREFIX_MIN,
+            "full_min": checks.TITLE_FULL_MIN,
+            "full_missing": checks.TITLE_FULL_MISSING,
+            "full_strict": checks.TITLE_FULL_STRICT,
+        },
+        "author_stop": sorted(checks._AUTHOR_STOP),
         "similarity": cases,
         "authors": author_cases,
         "matches": match_cases,
