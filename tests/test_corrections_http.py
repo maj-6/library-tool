@@ -267,6 +267,7 @@ def _app(
     transform_submitter=None,
     actor_id_for_request=None,
     workspace_id_for_request=None,
+    item_service_for_request=None,
 ):
     app = Flask(__name__)
     app.register_blueprint(
@@ -275,6 +276,7 @@ def _app(
             raster_resource_resolver_for_request=(
                 None if resolver is None else lambda: resolver
             ),
+            correction_item_service_for_request=item_service_for_request,
             correction_actor_id_for_request=actor_id_for_request,
             correction_workspace_id_for_request=workspace_id_for_request,
             correction_transform_submitter=transform_submitter,
@@ -328,6 +330,7 @@ def _projected_harness(
     *,
     items=None,
     actor_id_for_request=None,
+    item_service_for_request=None,
 ):
     rasters = _RasterProjector(raster_rows)
     spatial = _SpatialProjector(spatial_rows)
@@ -353,6 +356,7 @@ def _projected_harness(
             items=items,
         ),
         actor_id_for_request=actor_id_for_request,
+        item_service_for_request=item_service_for_request,
     ), repository
 
 
@@ -1310,6 +1314,40 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
     assert updated["attention"][0]["review"]["latest_event"][
         "actor_id"
     ] == "account-42"
+
+
+def test_corrections_index_can_use_a_dedicated_item_projection(tmp_path):
+    raster = replace(
+        _raster("capture-only"),
+        key=RasterArtifactKey("capture-stable-id", "capture-only"),
+        extensions={"capture_order": 0},
+    )
+    engine_items = _Items((_item("book-global", "Global catalogue"),))
+    corrections_items = _Items(
+        (
+            replace(
+                _item("capture-stable-id", "Phone capture"),
+                kind="capture",
+            ),
+        )
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (raster,),
+        (),
+        items=engine_items,
+        item_service_for_request=lambda: corrections_items,
+    )
+
+    response = app.test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    assert [
+        (item["id"], item["kind"])
+        for item in response.get_json()["books"]
+    ] == [("capture-stable-id", "capture")]
 
 
 def test_corrections_index_includes_books_and_capture_entries_only():

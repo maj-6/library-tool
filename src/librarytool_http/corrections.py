@@ -1313,6 +1313,7 @@ def _validated_items(value: Any) -> list[ItemView]:
 def _corrections_index(
     engine_for_request: Callable[[], LibraryEngine],
     workspace_id_for_request: Callable[[], str],
+    item_service_for_request: Callable[[], ItemQueryService] | None = None,
 ) -> Response:
     workspace_ids = request.args.getlist("workspace_id")
     workspace_id = workspace_ids[0] if len(workspace_ids) == 1 else ""
@@ -1348,7 +1349,18 @@ def _corrections_index(
     attention: list[dict[str, Any]] = []
     capture_count = 0
     projected_bytes = 64
-    items = _validated_items(_item_service(engine_for_request).list_items())
+    item_service = (
+        _item_service(engine_for_request)
+        if item_service_for_request is None
+        else item_service_for_request()
+    )
+    if not callable(getattr(item_service, "list_items", None)):
+        raise RepositoryError(
+            "the Corrections item query is unavailable",
+            code="corrections_item_query_unavailable",
+            retryable=True,
+        )
+    items = _validated_items(item_service.list_items())
     for item in items:
         item_kind = item.kind.casefold()
         if item_kind not in {"book", "capture"}:
@@ -1814,6 +1826,9 @@ def create_corrections_blueprint(
     engine_for_request: Callable[[], LibraryEngine],
     *,
     raster_resource_resolver_for_request: Callable[[], Any] | None = None,
+    correction_item_service_for_request: (
+        Callable[[], ItemQueryService] | None
+    ) = None,
     correction_actor_id_for_request: Callable[[], str] | None = None,
     correction_workspace_id_for_request: Callable[[], str] | None = None,
     correction_transform_submitter: Callable[
@@ -1836,6 +1851,13 @@ def create_corrections_blueprint(
     ):
         raise TypeError(
             "raster_resource_resolver_for_request must be callable or None"
+        )
+    if (
+        correction_item_service_for_request is not None
+        and not callable(correction_item_service_for_request)
+    ):
+        raise TypeError(
+            "correction_item_service_for_request must be callable or None"
         )
     if (
         correction_actor_id_for_request is not None
@@ -1877,6 +1899,7 @@ def create_corrections_blueprint(
             return _corrections_index(
                 engine_for_request,
                 workspace_id_for_request,
+                correction_item_service_for_request,
             )
         except EngineError as error:
             return _error_response(error)
