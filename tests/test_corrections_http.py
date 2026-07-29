@@ -393,12 +393,14 @@ class _ItemService:
 def _book_item(
     item_id: str = "book-1",
     title: str = "Book One",
+    *,
+    kind: str = "book",
 ) -> ItemView:
     return ItemView(
         item_id=item_id,
         revision=f"{item_id}-r1",
         record_revision=f"{item_id}-record-r1",
-        kind="book",
+        kind=kind,
         title=title,
         metadata={},
         representations=(),
@@ -1258,10 +1260,11 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
     )
     assert initial.status_code == 200
     body = initial.get_json()
-    assert body["schema"] == "librarytool.corrections-index/1"
+    assert body["schema"] == "librarytool.corrections-index/2"
     assert body["attention"] == []
     assert len(body["books"]) == 1
     book = body["books"][0]
+    assert book["kind"] == "book"
     assert book["title"] == "Captured Herbal"
     assert [
         capture["artifact_id"] for capture in book["captures"]
@@ -1307,6 +1310,53 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
     assert updated["attention"][0]["review"]["latest_event"][
         "actor_id"
     ] == "account-42"
+
+
+def test_corrections_index_includes_books_and_capture_entries_only():
+    review = _review_with_history(1, "review-attention-r1")
+    reviews = _ReviewService(review)
+    engine = _Engine(
+        _RasterProjector(()),
+        _SpatialProjector(()),
+        reviews,
+        items=_ItemService(
+            (
+                _book_item("book-1", "Built Book"),
+                _book_item(
+                    "capture-1",
+                    "Captured Entry",
+                    kind="capture",
+                ),
+                _book_item(
+                    "collection-1",
+                    "Collection",
+                    kind="collection",
+                ),
+            )
+        ),
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert [
+        (item["id"], item["kind"]) for item in body["books"]
+    ] == [
+        ("book-1", "book"),
+        ("capture-1", "capture"),
+    ]
+    assert reviews.calls == ["book-1", "capture-1"]
+    assert {
+        entry["target"]["item_id"]: entry["target"]["kind"]
+        for entry in body["attention"]
+    } == {
+        "book-1": "book",
+        "capture-1": "book",
+    }
+
 
 def test_review_actor_is_server_owned_and_client_spoofing_is_rejected(
     tmp_path,

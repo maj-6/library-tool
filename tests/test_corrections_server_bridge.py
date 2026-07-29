@@ -310,7 +310,7 @@ def test_production_review_bridge_owns_actor_and_reconciles_cas(
     )
     initial_review = initial_detail.get_json()["review"]
     index_body = initial_index.get_json()
-    assert index_body["schema"] == "librarytool.corrections-index/1"
+    assert index_body["schema"] == "librarytool.corrections-index/2"
     assert [book["id"] for book in index_body["books"]] == [BOOK_ID]
     assert [
         capture["artifact_id"].endswith(":display")

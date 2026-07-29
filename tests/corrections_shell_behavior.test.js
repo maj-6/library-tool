@@ -964,11 +964,12 @@ test("standalone shell resolves reviews through the real engine client adapter",
     });
     const indexBody = () => ({
       ok: true,
-      schema: "librarytool.corrections-index/1",
+      schema: "librarytool.corrections-index/2",
       revision: `index-r${indexRevision}`,
       books: [{
         id: "book-1",
         revision: `book-r${indexRevision}`,
+        kind: "book",
         title: "A Herbal",
         import_state: "ready",
         issues: [],

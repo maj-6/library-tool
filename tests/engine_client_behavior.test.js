@@ -428,11 +428,12 @@ function correctionsIndex(overrides = {}) {
   };
   return {
     ok: true,
-    schema: "librarytool.corrections-index/1",
+    schema: "librarytool.corrections-index/2",
     revision: "index-r2",
     books: [{
       id: "book:one",
       revision: "book-r2",
+      kind: "book",
       title: "A Herbal",
       import_state: "ready",
       issues: [],
@@ -841,7 +842,8 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
     workspaceId: "workspace:one",
   });
 
-  assert.equal(index.schema, "librarytool.corrections-index/1");
+  assert.equal(index.schema, "librarytool.corrections-index/2");
+  assert.equal(index.books[0].kind, "book");
   assert.equal(index.ok, undefined);
   assert.equal(
     index.attention[0].review.latest_event.actor_id,
@@ -858,6 +860,18 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
   assert.throws(() => client.corrections.index({
     workspaceId: "bad workspace",
   }), TypeError);
+
+  const captured = correctionsIndex();
+  captured.books[0].kind = "capture";
+  const capturedClient = new EngineClient({
+    transport: async () => response(200, captured),
+  });
+  assert.equal(
+    (await capturedClient.corrections.index({
+      workspaceId: "workspace:one",
+    })).books[0].kind,
+    "capture",
+  );
 
   const malformed = correctionsIndex();
   malformed.attention[0].target.item_id = "missing:book";
@@ -885,6 +899,12 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
         history_count: 0,
         latest_event: null,
       };
+    },
+    (body) => {
+      body.books[0].kind = "periodical";
+    },
+    (body) => {
+      body.schema = "librarytool.corrections-index/1";
     },
   ]) {
     const contradictory = correctionsIndex();

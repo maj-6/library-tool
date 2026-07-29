@@ -81,7 +81,7 @@ CORRECTION_MUTATION_MAX_BYTES = 64 * 1024
 CORRECTION_TRANSFORM_QUEUE_SCHEMA = (
     "librarytool.correction-transform-queue-receipt/1"
 )
-CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/1"
+CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/2"
 CORRECTIONS_INDEX_BOOK_LIMIT = 100_000
 CORRECTIONS_INDEX_CAPTURE_LIMIT = 100_000
 CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT = 250_000
@@ -1350,7 +1350,8 @@ def _corrections_index(
     projected_bytes = 64
     items = _validated_items(_item_service(engine_for_request).list_items())
     for item in items:
-        if item.kind.casefold() != "book":
+        item_kind = item.kind.casefold()
+        if item_kind not in {"book", "capture"}:
             continue
         review = reviews.get_review(item.item_id)
         if not isinstance(review, CorrectionReviewSnapshot):
@@ -1380,6 +1381,7 @@ def _corrections_index(
         review_summary = _index_review_summary(review)
         without_revision = {
             "id": item.item_id,
+            "kind": item_kind,
             "title": item.title,
             "import_state": _book_import_state(captures),
             "issues": _book_issues(item, captures),

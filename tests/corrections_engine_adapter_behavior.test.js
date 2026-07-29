@@ -1127,11 +1127,12 @@ test("production books port pins audit paging and trusts the server actor",
         latest_event: event,
       };
       return {
-        schema: "librarytool.corrections-index/1",
+        schema: "librarytool.corrections-index/2",
         revision: `index-r${indexRevision}`,
         books: [{
           id: "book-1",
           revision: "book-r1",
+          kind: "book",
           title: "A Herbal",
           import_state: "ready",
           issues: [],
@@ -1140,6 +1141,7 @@ test("production books port pins audit paging and trusts the server actor",
         }, {
           id: "book-2",
           revision: `book-r${indexRevision}`,
+          kind: "book",
           title: indexRevision === 1 ? "Second book" : "Second book updated",
           import_state: "ready",
           issues: [],
@@ -1281,11 +1283,12 @@ test("production books port ignores a late aborted workspace load", async () => 
     },
   };
   const converged = {
-    schema: "librarytool.corrections-index/1",
+    schema: "librarytool.corrections-index/2",
     revision: "index-r2",
     books: [{
       id: "book-1",
       revision: "book-r1",
+      kind: "book",
       title: "A Herbal",
       import_state: "ready",
       issues: [],
@@ -1372,11 +1375,12 @@ test("same-workspace refresh does not invalidate mutation convergence",
       },
     };
     const converged = {
-      schema: "librarytool.corrections-index/1",
+      schema: "librarytool.corrections-index/2",
       revision: "index-r2",
       books: [{
         id: "book-1",
         revision: "book-r1",
+        kind: "book",
         title: "A Herbal",
         import_state: "ready",
         issues: [],
@@ -1501,11 +1505,12 @@ test("production books port surfaces post-receipt review drift", async () => {
     },
   });
   const index = (summary) => ({
-    schema: "librarytool.corrections-index/1",
+    schema: "librarytool.corrections-index/2",
     revision: `index-${summary.revision}`,
     books: [{
       id: "book-1",
       revision: "book-r1",
+      kind: "book",
       title: "A Herbal",
       import_state: "ready",
       issues: [],

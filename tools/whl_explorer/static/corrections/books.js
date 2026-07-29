@@ -5,7 +5,7 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function booksFactory() {
   "use strict";
 
-  const CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/1";
+  const CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/2";
   const CORRECTIONS_REVIEW_SCHEMA = "librarytool.corrections-review/1";
   const CORRECTIONS_REVIEW_RESULT_SCHEMA =
     "librarytool.corrections-review-result/1";
@@ -18,6 +18,7 @@
   ]);
   const MAX_CORRECTION_AUDIT_EVENTS = 100_000;
   const TARGET_KINDS = new Set(["book", "image", "region"]);
+  const ITEM_KINDS = new Set(["book", "capture"]);
   const IMAGE_CATEGORIES = new Set([
     "title_page", "cover", "spine", "content_specimen", "other",
   ]);
@@ -359,7 +360,8 @@
 
   function normalizeBook(value, path) {
     exactObject(value, path, [
-      "id", "revision", "title", "import_state", "issues", "review", "captures",
+      "id", "revision", "kind", "title", "import_state", "issues", "review",
+      "captures",
     ]);
     const captures = boundedArray(value.captures, `${path}.captures`, 100_000)
       .map((capture, index) => normalizeCapture(capture, `${path}.captures[${index}]`))
@@ -377,6 +379,7 @@
     return freezeDeep({
       id: identifier(value.id, `${path}.id`),
       revision: revision(value.revision, `${path}.revision`),
+      kind: enumValue(value.kind, `${path}.kind`, ITEM_KINDS),
       title: safeText(value.title, `${path}.title`, 2048),
       import_state: enumValue(
         value.import_state, `${path}.import_state`, IMPORT_STATES),
@@ -1260,8 +1263,17 @@
         !snapshot.selection.annotationId;
       setAttribute(select, "aria-pressed", selected ? "true" : "false");
       setAttribute(select, "aria-label",
-        `${title}${needsAttention ? ", needs attention" : ""}`);
+        `${title}${book.kind === "capture" ? ", captured entry" : ""}` +
+        `${needsAttention ? ", needs attention" : ""}`);
       select.append(element(this.documentRef, "span", "book-title", title));
+      if (book.kind === "capture") {
+        select.append(element(
+          this.documentRef,
+          "span",
+          "book-kind",
+          "Captured entry",
+        ));
+      }
       if (needsAttention) {
         const attention = element(this.documentRef, "span", "book-attention");
         const icon = element(this.documentRef, "span", "book-attention-icon", "!");

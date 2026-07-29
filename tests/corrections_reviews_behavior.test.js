@@ -22,7 +22,7 @@ const {
 
 
 const fixturePath = path.join(
-  __dirname, "fixtures", "corrections_books_index_v1.json");
+  __dirname, "fixtures", "corrections_books_index_v2.json");
 
 
 function fixture() {

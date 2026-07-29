@@ -81,6 +81,7 @@
 }
 
 [data-corrections-root] .book-attention,
+[data-corrections-root] .book-kind,
 [data-corrections-root] .book-import-state,
 [data-corrections-root] .capture-category,
 [data-corrections-root] .capture-state,
@@ -102,6 +103,11 @@
 
 [data-corrections-root] .book-attention-icon {
   font-weight: 800;
+}
+
+[data-corrections-root] .book-kind {
+  background: var(--chip-subtle, #343943);
+  color: var(--text-muted, #bbc1ca);
 }
 
 [data-corrections-root] .book-import-state,

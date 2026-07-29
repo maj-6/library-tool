@@ -1202,10 +1202,11 @@
 
   function isCorrectionsBook(value) {
     if (!hasExactKeys(value, [
-      "id", "revision", "title", "import_state", "issues", "review",
+      "id", "revision", "kind", "title", "import_state", "issues", "review",
       "captures",
     ]) || !isPortableIdentifier(value.id) ||
         !isArtifactRevision(value.revision) ||
+        !["book", "capture"].includes(value.kind) ||
         !isCorrectionsText(value.title, 2048) ||
         !CORRECTIONS_IMPORT_STATES.has(value.import_state) ||
         !Array.isArray(value.issues) || value.issues.length > 1024 ||
@@ -1234,7 +1235,7 @@
   function isCorrectionsIndex(value) {
     if (!hasExactKeys(value, [
       "schema", "revision", "books", "attention",
-    ]) || value.schema !== "librarytool.corrections-index/1" ||
+    ]) || value.schema !== "librarytool.corrections-index/2" ||
         !isArtifactRevision(value.revision) ||
         !Array.isArray(value.books) || value.books.length > 100000 ||
         !value.books.every(isCorrectionsBook) ||
