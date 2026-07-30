@@ -495,7 +495,12 @@ def _capture_archive() -> bytes:
     return output.getvalue()
 
 
-def _publish_capture(workspace: Path, archive: bytes) -> None:
+def _publish_capture(
+    workspace: Path,
+    archive: bytes,
+    *,
+    state: str = "current",
+) -> None:
     digest = hashlib.sha256(archive).hexdigest()
     association = CaptureArchiveAssociation(
         capture_id=CAPTURE_ID,
@@ -503,15 +508,15 @@ def _publish_capture(workspace: Path, archive: bytes) -> None:
         archive_sha256=digest,
         archive_bytes=len(archive),
         format_version="3.0",
-        state="current",
+        state=state,
         generated_at="2026-07-29T12:00:00+00:00",
         source_revision="sha256:" + "a" * 64,
         source_fingerprint="b" * 64,
     )
     objects = workspace / ".engine" / "capture-lib" / "objects"
     associations = workspace / ".engine" / "capture-lib" / "associations"
-    objects.mkdir(parents=True)
-    associations.mkdir(parents=True)
+    objects.mkdir(parents=True, exist_ok=True)
+    associations.mkdir(parents=True, exist_ok=True)
     (objects / f"{digest}.lib").write_bytes(archive)
     association_name = hashlib.sha256(CAPTURE_ID.encode()).hexdigest()
     (associations / f"{association_name}.json").write_bytes(
@@ -580,3 +585,63 @@ def test_production_filesystem_bridge_reads_sealed_capture_documents(
         DOCUMENT_ARTIFACT_CATALOG_SERVICE,
         DOCUMENT_RESOURCE_PAGE_SERVICE,
     } <= set(engine.lookups)
+
+
+def test_production_document_detail_etag_advances_with_association_state(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "private-workspace"
+    workspace.mkdir()
+    archive = _capture_archive()
+    _publish_capture(workspace, archive)
+    repository = FilesystemCaptureDocumentArtifactRepository(
+        RecoverableWriteSet(workspace),
+        item_exists_for=lambda item_id: item_id == CAPTURE_BOOK_ID,
+        capture_id_for=lambda item_id: (
+            CAPTURE_ID if item_id == CAPTURE_BOOK_ID else None
+        ),
+        lock_context_for=nullcontext,
+    )
+    app, _engine = _app(
+        DocumentArtifactCatalogService(repository),
+        DocumentResourcePageService(repository),
+    )
+    path = (
+        f"/api/v1/items/{CAPTURE_BOOK_ID}/document-artifacts/"
+        "capture-ocr"
+    )
+
+    with app.test_client() as client:
+        current = client.get(path)
+        assert current.status_code == 200
+        current_artifact = current.get_json()["artifact"]
+        assert current_artifact["freshness"] == "current"
+
+        _publish_capture(workspace, archive, state="stale")
+        stale = client.get(
+            path,
+            headers={"If-None-Match": current.headers["ETag"]},
+        )
+        old_resource = current_artifact["resource"]["resource"]
+        rejected_page = client.get(
+            f"{path}/resource",
+            query_string={
+                "artifact_revision": current_artifact["revision"],
+                "resource_id": old_resource["id"],
+                "resource_revision": old_resource["revision"],
+                "mode": "text",
+                "offset": 0,
+                "max_bytes": 48 * 1024,
+            },
+        )
+
+    assert stale.status_code == 200
+    assert stale.headers["ETag"] != current.headers["ETag"]
+    assert stale.get_json()["artifact"]["freshness"] == "stale"
+    assert stale.get_json()["artifact"]["extensions"][
+        "capture_document"
+    ]["association_state"] == "stale"
+    assert rejected_page.status_code == 409
+    assert rejected_page.get_json()["code"] == (
+        "document_resource_revision_conflict"
+    )

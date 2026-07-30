@@ -173,6 +173,29 @@ def _fallback_revision(
     return f"fallback-{digest}"
 
 
+def _association_view_revision(
+    artifact_revision: str,
+    association: CaptureArchiveAssociation,
+) -> str:
+    """Bind a public artifact revision to its association-aware projection."""
+
+    digest = hashlib.sha256(
+        "\0".join(
+            (
+                "librarytool.capture-document-view/1",
+                artifact_revision,
+                association.capture_id,
+                association.book_id,
+                association.archive_sha256,
+                association.state.value,
+                association.source_revision,
+                association.generated_at,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"capture-doc-{digest}"
+
+
 def _safe_member(value: Any) -> str | None:
     if (
         not isinstance(value, str)
@@ -240,17 +263,30 @@ def _provenance_from_record(
     record: Mapping[str, Any],
 ) -> DocumentArtifactProvenance:
     raw = record.get("provenance")
-    if not isinstance(raw, Mapping):
+    if raw is None:
         raw = {}
-    extensions = raw.get("ext")
+    elif not isinstance(raw, Mapping):
+        raise ValueError("artifact provenance is not an object")
+
+    def text(field: str, default: str = "") -> str:
+        if field not in raw:
+            return default
+        value = raw[field]
+        if not isinstance(value, str):
+            raise ValueError(f"artifact provenance {field} is not text")
+        return value
+
+    extensions = raw.get("ext", {})
+    if not isinstance(extensions, Mapping):
+        raise ValueError("artifact provenance extensions are not an object")
     return DocumentArtifactProvenance(
-        origin=str(raw.get("origin") or "capture"),
-        provider_id=str(raw.get("provider_id") or ""),
-        model=str(raw.get("model") or ""),
-        recipe_revision=str(raw.get("recipe_revision") or ""),
-        operation_id=str(raw.get("operation_id") or ""),
-        generated_at=str(raw.get("generated_at") or ""),
-        extensions=extensions if isinstance(extensions, Mapping) else {},
+        origin=text("origin", "capture") or "capture",
+        provider_id=text("provider_id"),
+        model=text("model"),
+        recipe_revision=text("recipe_revision"),
+        operation_id=text("operation_id"),
+        generated_at=text("generated_at"),
+        extensions=extensions,
     )
 
 
@@ -570,10 +606,10 @@ class FilesystemCaptureDocumentArtifactRepository(
             member = _safe_member(record.get("member"))
             if member is None:
                 raise ValueError("capture document member is unsafe")
-            revision = record.get("revision")
+            sealed_revision = record.get("revision")
             content_sha256 = record.get("content_sha256")
             if (
-                not isinstance(revision, str)
+                not isinstance(sealed_revision, str)
                 or not isinstance(content_sha256, str)
                 or len(content_sha256) != 64
                 or any(
@@ -629,6 +665,10 @@ class FilesystemCaptureDocumentArtifactRepository(
                 record,
                 capture_id=capture_id,
                 association=association,
+            )
+            revision = _association_view_revision(
+                sealed_revision,
+                association,
             )
             resource = DocumentResourceRef(
                 _resource_id(
@@ -728,15 +768,21 @@ class FilesystemCaptureDocumentArtifactRepository(
             and association.state is CaptureArchiveState.STALE
             else DocumentArtifactFreshness.UNTRACKED
         )
+        revision = _fallback_revision(
+            item_id=item_id,
+            capture_id=capture_id,
+            artifact_id=expected.artifact_id,
+            state=state,
+            source_revision=source_revision,
+        )
+        if association is not None:
+            revision = _association_view_revision(
+                revision,
+                association,
+            )
         return DocumentArtifactView(
             key=DocumentArtifactKey(item_id, expected.artifact_id),
-            revision=_fallback_revision(
-                item_id=item_id,
-                capture_id=capture_id,
-                artifact_id=expected.artifact_id,
-                state=state,
-                source_revision=source_revision,
-            ),
+            revision=revision,
             kind=expected.kind,
             label=expected.label,
             resource=DocumentResourceSummary(
