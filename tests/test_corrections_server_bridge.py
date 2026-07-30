@@ -1843,6 +1843,185 @@ def test_capture_only_mistral_region_role_assignment_and_clear(
     assert refreshed_link["effective_role"] == ""
 
 
+def test_capture_promotion_preserves_human_corrections_and_one_identity(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    _use_capture_only_target(
+        server,
+        title="Capture With Human Corrections",
+    )
+    monkeypatch.setattr(
+        server,
+        "_auth_doc",
+        lambda: {"session": {"user_id": "promotion-reviewer"}},
+    )
+    review_path = f"/api/v1/items/{BOOK_ID}/corrections/review"
+    initial_review = client.get(review_path).get_json()["review"]
+    marked = client.put(
+        f"{review_path}/attention",
+        json={
+            "reason": "Preserve this review during promotion",
+            "comment": "Human review before build creation",
+        },
+        headers={
+            "Idempotency-Key": "promotion-preserve-review",
+            "If-Review-Match": f'"{initial_review["revision"]}"',
+        },
+    )
+    assert marked.status_code == 200, marked.get_json()
+
+    display = next(
+        artifact
+        for artifact in client.get(
+            f"/api/v1/items/{BOOK_ID}/raster-artifacts"
+            "?representation_id=capture"
+        ).get_json()["artifacts"]
+        if artifact["key"]["artifact_id"].endswith(":display")
+    )
+    artifact_id = display["key"]["artifact_id"]
+    detail_path = f"/api/v1/items/{BOOK_ID}/raster-artifacts/{artifact_id}"
+    categorized = client.put(
+        f"{detail_path}/category",
+        json={"category": "title_page"},
+        headers={
+            "Idempotency-Key": "promotion-preserve-category",
+            "If-Artifact-Match": f'"{display["revision"]}"',
+        },
+    )
+    assert categorized.status_code == 200, categorized.get_json()
+    category_detail = client.get(detail_path).get_json()["artifact"]
+    captioned = client.put(
+        f"{detail_path}/caption",
+        json={
+            "text": "Human caption preserved through promotion",
+            "language": "en",
+        },
+        headers={
+            "Idempotency-Key": "promotion-preserve-caption",
+            "If-Artifact-Match": f'"{category_detail["revision"]}"',
+        },
+    )
+    assert captioned.status_code == 200, captioned.get_json()
+
+    annotation = next(
+        row
+        for row in client.get(
+            f"/api/v1/items/{BOOK_ID}/spatial-annotations"
+            "?representation_id=capture"
+        ).get_json()["annotations"]
+        if row["label"] == "Materia medica"
+    )
+    annotation_id = annotation["key"]["annotation_id"]
+    linked_id = annotation["linked_artifact_ids"][0]
+    linked = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/{linked_id}"
+    ).get_json()["artifact"]
+    assigned = client.put(
+        (
+            f"/api/v1/items/{BOOK_ID}/spatial-annotations/"
+            f"{annotation_id}/role"
+        ),
+        json={
+            "role": "MAR",
+            "linked_artifact_id": linked_id,
+        },
+        headers={
+            "Idempotency-Key": "promotion-preserve-role",
+            "If-Annotation-Match": f'"{annotation["revision"]}"',
+            "If-Linked-Artifact-Match": f'"{linked["revision"]}"',
+        },
+    )
+    assert assigned.status_code == 200, assigned.get_json()
+
+    engine = server._library_engine()
+    rasters = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    transform_source = next(
+        value
+        for value in rasters.list_raster_artifacts(BOOK_ID)
+        if value.key.artifact_id == artifact_id
+    )
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    transform_command = _transform_command(
+        transform_source,
+        "promotion-preserve-transform",
+    )
+    assert transforms.queue(transform_command).created is True
+    transform_result = transforms.execute_queued(transform_command)
+    assert transform_result.image_commit is not None
+
+    source_item = client.get(
+        f"/api/v1/corrections/items/{BOOK_ID}"
+    ).get_json()["item"]
+    promoted = client.post(
+        "/api/v1/capture-promotions",
+        json={
+            "promotion": {
+                "capture_id": CAPTURE_ID,
+                "source_revision": source_item["record_revision"],
+                "item": {
+                    "kind": "book",
+                    "title": "",
+                    "metadata": {},
+                    "representations": [],
+                },
+                "primary_source": "",
+            }
+        },
+        headers={
+            "Idempotency-Key": "promotion-preserve-human-corrections",
+        },
+    )
+    assert promoted.status_code == 201, promoted.get_json()
+    assert promoted.get_json()["capture_id"] == CAPTURE_ID
+    assert promoted.get_json()["build"]["capture_book_id"] == BOOK_ID
+
+    index = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    ).get_json()
+    assert [(row["id"], row["kind"]) for row in index["books"]] == [
+        (BOOK_ID, "book"),
+    ]
+    review = client.get(review_path).get_json()["review"]
+    assert review["state"] == "needs_attention"
+    assert len(review["history_tail"]) == 1
+    assert review["history_tail"][-1]["actor_id"] == "promotion-reviewer"
+
+    artifact = client.get(detail_path).get_json()["artifact"]
+    assert artifact["effective_category"] == "title_page"
+    assert artifact["effective_role"] == "marginalia"
+    assert artifact["effective_caption"]["origin"] == "manual"
+    assert artifact["effective_caption"]["text"] == (
+        "Human caption preserved through promotion"
+    )
+    assert artifact["effective_caption"]["language"] == "en"
+    region = client.get(
+        (
+            f"/api/v1/items/{BOOK_ID}/spatial-annotations/"
+            f"{annotation_id}"
+        )
+    ).get_json()["annotation"]
+    assert region["effective_role"] == "marginalia"
+    correction_outputs = [
+        value
+        for value in rasters.list_raster_artifacts(BOOK_ID)
+        if value.extensions.get("correction_transform", {}).get(
+            "operation_id"
+        ) == transform_command.operation_id
+    ]
+    assert {
+        value.kind for value in correction_outputs
+    } == {
+        "corrected-image",
+        "processed-image",
+        "processed-source",
+    }
+
+
 def test_capture_only_index_isolates_partial_missing_and_corrupt_assets(
     client,
     corrections_workspace,
