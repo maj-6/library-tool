@@ -631,6 +631,31 @@ def _capture_lib_exact_stale_transition(before: dict, after: dict) -> bool:
     }
 
 
+def _capture_lib_publisher_error(
+    message: str,
+    *,
+    code: str,
+    retryable: bool,
+):
+    """Return a privacy-safe engine error for the structural publisher port.
+
+    ``SyncError`` is intentionally useful to interactive Supabase callers and
+    can contain a project URL or a bounded PostgREST response.  The capture
+    backfill engine must never serialize those adapter details, and it can
+    preserve a machine code/retryability flag only for ``EngineError`` values.
+    Import lazily so unrelated standalone Supabase helpers keep their existing
+    dependency boundary.
+    """
+
+    from librarytool.engine.errors import RepositoryError
+
+    return RepositoryError(
+        message,
+        code=code,
+        retryable=retryable,
+    )
+
+
 class ScopedCaptureLibAssociationPublisher:
     """Structural engine publisher backed by the scoped capability RPC.
 
@@ -652,46 +677,89 @@ class ScopedCaptureLibAssociationPublisher:
         try:
             raw = association.as_dict()
         except (AttributeError, TypeError, ValueError) as exc:
-            raise SyncError(
-                "capture association publisher requires a verified association"
+            raise _capture_lib_publisher_error(
+                "capture cloud publisher requires a verified association",
+                code="capture_cloud_association_invalid",
+                retryable=False,
             ) from exc
-        desired = _capture_lib_association_write(raw)
+        try:
+            desired = _capture_lib_association_write(raw)
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud publisher requires a verified association",
+                code="capture_cloud_association_invalid",
+                retryable=False,
+            ) from exc
         capture_id = desired["capture_id"]
         # Revalidate borrowed credentials for every operation. A publisher that
         # escapes its server-side credential lease fails before any REST call.
-        _capture_lib_publish_configs(self._service_cfg, self._scope_cfg)
-        rows = list_capture_association_states(
-            self._scope_cfg,
-            [capture_id],
-        )
-        if len(rows) != 1:
-            raise SyncError(
-                "capture association publisher target is missing or unauthorized"
+        try:
+            _capture_lib_publish_configs(self._service_cfg, self._scope_cfg)
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud publication authority is unavailable",
+                code="capture_cloud_publication_authority_unavailable",
+                retryable=False,
+            ) from exc
+        try:
+            rows = list_capture_association_states(
+                self._scope_cfg,
+                [capture_id],
             )
-        remote = _capture_lib_remote_state(rows[0], capture_id)
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud association state is unavailable",
+                code="capture_cloud_state_unavailable",
+                retryable=True,
+            ) from exc
+        if len(rows) != 1:
+            raise _capture_lib_publisher_error(
+                "capture cloud publication target is missing or unauthorized",
+                code="capture_cloud_target_unavailable",
+                retryable=False,
+            )
+        try:
+            remote = _capture_lib_remote_state(rows[0], capture_id)
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud association state is invalid",
+                code="capture_cloud_state_invalid",
+                retryable=False,
+            ) from exc
         current = remote["association"]
         status = remote["status"]
         if current == desired and status == "imported":
             return
         if current is not None and current != desired:
             if not _capture_lib_exact_stale_transition(current, desired):
-                raise SyncError(
-                    "capture association publisher found conflicting remote state"
+                raise _capture_lib_publisher_error(
+                    "capture cloud association conflicts with remote state",
+                    code="capture_cloud_association_conflict",
+                    retryable=False,
                 )
         if status not in {"pending", "imported"}:
-            raise SyncError(
-                "capture association publisher target is not importable"
+            raise _capture_lib_publisher_error(
+                "capture cloud publication target is not importable",
+                code="capture_cloud_target_not_importable",
+                retryable=False,
             )
-        publish_capture_lib_association(
-            self._service_cfg,
-            self._scope_cfg,
-            capture_id,
-            desired,
-            expected_revision=remote["revision"],
-            # A legacy imported/null row keeps its terminal status while the
-            # association is filled in. Pending rows transition atomically.
-            mark_imported=status == "pending",
-        )
+        try:
+            publish_capture_lib_association(
+                self._service_cfg,
+                self._scope_cfg,
+                capture_id,
+                desired,
+                expected_revision=remote["revision"],
+                # A legacy imported/null row keeps its terminal status while the
+                # association is filled in. Pending rows transition atomically.
+                mark_imported=status == "pending",
+            )
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud association publication is unavailable",
+                code="capture_cloud_publication_unavailable",
+                retryable=True,
+            ) from exc
 
 
 # --- storage --------------------------------------------------------------------

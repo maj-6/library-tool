@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 import supabase_sync
 
+from librarytool.engine.errors import RepositoryError
+
 
 CAPTURE_ID = "11111111-2222-4333-8444-555555555555"
 OTHER_CAPTURE_ID = "66666666-7777-4888-8999-aaaaaaaaaaaa"
@@ -699,11 +701,53 @@ def test_scoped_publisher_replays_exact_state_and_rejects_drift_or_expired_lease
     assert len(calls) == 1
 
     row["lib_association"] = association(book_id="b-" + "e" * 32)
-    with pytest.raises(supabase_sync.SyncError, match="conflicting remote"):
+    with pytest.raises(RepositoryError) as conflict:
         publisher.publish(value)
+    assert conflict.value.code == "capture_cloud_association_conflict"
+    assert conflict.value.retryable is False
+    assert str(conflict.value) == (
+        "capture cloud association conflicts with remote state"
+    )
     assert len(calls) == 2
 
     service_cfg.pop("key")
-    with pytest.raises(supabase_sync.SyncError, match="service credential"):
+    with pytest.raises(RepositoryError) as expired:
         publisher.publish(value)
+    assert expired.value.code == (
+        "capture_cloud_publication_authority_unavailable"
+    )
+    assert expired.value.retryable is False
+    assert str(expired.value) == (
+        "capture cloud publication authority is unavailable"
+    )
     assert len(calls) == 2
+
+
+def test_scoped_publisher_normalizes_private_transport_failure_for_engine_port(
+    monkeypatch,
+):
+    service_cfg, scope_cfg = publish_configs()
+    private_detail = (
+        "HTTP 503 on GET https://private-project.supabase.co/rest/v1/captures: "
+        '{"service_role":"must-not-leak"}'
+    )
+
+    def rest(*_args, **_kwargs):
+        raise supabase_sync.SyncError(private_detail)
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+    publisher = supabase_sync.ScopedCaptureLibAssociationPublisher(
+        service_cfg,
+        scope_cfg,
+    )
+
+    with pytest.raises(RepositoryError) as failure:
+        publisher.publish(SimpleNamespace(as_dict=lambda: association()))
+
+    assert failure.value.code == "capture_cloud_state_unavailable"
+    assert failure.value.retryable is True
+    assert str(failure.value) == (
+        "capture cloud association state is unavailable"
+    )
+    assert "private-project" not in str(failure.value)
+    assert "service_role" not in str(failure.value)
