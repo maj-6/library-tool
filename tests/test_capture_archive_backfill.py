@@ -107,6 +107,23 @@ def _durable_snapshot(workspace: Path) -> dict[str, tuple[bytes, int]]:
     }
 
 
+class _ResumableAssociationPublisher:
+    def __init__(self, *, failures: int = 0, verify=None) -> None:
+        self.failures = failures
+        self.verify = verify
+        self.calls = []
+        self.remote = {}
+
+    def publish(self, association) -> None:
+        if self.verify is not None:
+            self.verify(association)
+        self.calls.append(association.as_dict())
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("injected cloud update failure")
+        self.remote.setdefault(association.capture_id, association.as_dict())
+
+
 def test_dry_run_validates_without_writing_or_replacing_originals(tmp_path):
     capture_id = "capture-dry-run"
     legacy_book_id = "b-1234567890abcdef1234567890abcdef"
@@ -151,6 +168,135 @@ def test_dry_run_validates_without_writing_or_replacing_originals(tmp_path):
     )
     assert entries == entries_before
     assert (directory / "orig_1.jpg").read_bytes() == original_before
+
+
+def test_cloud_update_runs_after_archive_and_resumes_without_resealing(
+    tmp_path,
+):
+    capture_id = "capture-cloud-resume"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    entries = {"manual-cloud": _entry(capture_id)}
+    workspace = tmp_path / "workspace"
+    service, materializer, _write_set = _runtime(workspace)
+
+    def verify_durable_archive(association) -> None:
+        assert service.get(capture_id) == association
+        archive_path = (
+            workspace
+            / ".engine"
+            / "capture-lib"
+            / "objects"
+            / f"{association.archive_sha256}.lib"
+        )
+        assert archive_path.read_bytes()
+
+    publisher = _ResumableAssociationPublisher(
+        failures=1,
+        verify=verify_durable_archive,
+    )
+    first = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=service,
+        materializer=materializer,
+        association_publisher=publisher,
+        apply=True,
+    )
+    durable_after_archive = _durable_snapshot(workspace)
+
+    assert first["ok"] is False
+    assert first["summary"]["created"] == 1
+    assert first["summary"]["failed"] == 0
+    assert first["summary"]["cloud_succeeded"] == 0
+    assert first["summary"]["cloud_failed"] == 1
+    assert first["diagnostics"][0]["status"] == "created"
+    assert first["diagnostics"][0]["changed"] is True
+    assert first["diagnostics"][0]["cloud_update"] == {
+        "status": "failed",
+        "code": "capture_cloud_update_failed",
+        "message": "RuntimeError",
+    }
+    assert service.get(capture_id) is not None
+    assert publisher.remote == {}
+
+    resumed = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=service,
+        materializer=materializer,
+        association_publisher=publisher,
+        apply=True,
+    )
+    remote_after_resume = copy.deepcopy(publisher.remote)
+    converged = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=service,
+        materializer=materializer,
+        association_publisher=publisher,
+        apply=True,
+    )
+
+    assert resumed["ok"] is True
+    assert resumed["summary"]["created"] == 0
+    assert resumed["summary"]["unchanged"] == 1
+    assert resumed["summary"]["cloud_succeeded"] == 1
+    assert resumed["summary"]["cloud_failed"] == 0
+    assert resumed["diagnostics"][0]["cloud_update"]["status"] == "succeeded"
+    assert converged["ok"] is True
+    assert converged["summary"]["unchanged"] == 1
+    assert publisher.remote == remote_after_resume
+    assert len(publisher.calls) == 3
+    assert _durable_snapshot(workspace) == durable_after_archive
+
+
+def test_cloud_update_is_not_called_for_dry_run_or_archive_failure(tmp_path):
+    capture_id = "capture-cloud-ordering"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    entries = {"manual-cloud": _entry(capture_id)}
+    workspace = tmp_path / "workspace"
+    publisher = _ResumableAssociationPublisher()
+
+    dry_service, dry_materializer, _write_set = _runtime(workspace)
+    dry_run = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=dry_service,
+        materializer=dry_materializer,
+        association_publisher=publisher,
+        apply=False,
+    )
+
+    assert dry_run["ok"] is True
+    assert dry_run["summary"]["would_create"] == 1
+    assert "cloud_succeeded" not in dry_run["summary"]
+    assert publisher.calls == []
+    assert dry_service.get(capture_id) is None
+
+    def fail_archive_publication(_index: int, _path: Path) -> None:
+        raise RuntimeError("injected archive publication failure")
+
+    service, materializer, _write_set = _runtime(
+        workspace,
+        publish_hook=fail_archive_publication,
+    )
+    failed = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=service,
+        materializer=materializer,
+        association_publisher=publisher,
+        apply=True,
+    )
+
+    assert failed["ok"] is False
+    assert failed["summary"]["failed"] == 1
+    assert failed["summary"]["cloud_succeeded"] == 0
+    assert failed["summary"]["cloud_failed"] == 0
+    assert publisher.calls == []
+    assert service.get(capture_id) is None
 
 
 def test_apply_preserves_legacy_identity_and_second_run_is_noop(tmp_path):

@@ -559,6 +559,14 @@ missing or corrupt assets produce a bounded diagnostic and processing
 continues, so a later apply resumes failed rows while already-associated rows
 remain unchanged.
 
+An embedding host may provide an idempotent association publisher for the
+cloud association/status acknowledgement. The backfill calls it only after the
+local archive object and association have been committed and verified. A
+publisher failure is reported separately from the successful local archive;
+the next apply detects the existing association and retries that remote phase
+without resealing or replacing originals. Dry-run and failed archive
+transactions never invoke the publisher.
+
 Normal intake derives `book_id` from the capture identity only when no prior
 identity exists. Intake and backfill first inspect any build already linked to
 the exact capture id: a persisted `entries/<build>/ocr/lib-id.json` wins, and a
