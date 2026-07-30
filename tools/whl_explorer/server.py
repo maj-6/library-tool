@@ -6297,6 +6297,15 @@ def _corrections_entry_directory(item_id: str) -> Path:
     return target.entry_directory
 
 
+def _corrections_text_layer_item_id(item_id: str) -> str | None:
+    """Map a stable Corrections identity to its active native text store."""
+
+    target = _corrections_target_for(item_id)
+    if target is None or target.storage_kind != "build":
+        return None
+    return target.storage_id
+
+
 def _corrections_representation_revision(
     item_id: str,
     representation_id: str,
@@ -6562,6 +6571,7 @@ def _engine_host_bindings() -> FilesystemHostBindings:
                 CAPTURES_DIR / capture_id
             ),
             entry_directory_for=_corrections_entry_directory,
+            text_layer_item_id_for=_corrections_text_layer_item_id,
             representation_revision_for=(
                 _corrections_representation_revision
             ),

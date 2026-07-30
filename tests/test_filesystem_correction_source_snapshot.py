@@ -45,11 +45,12 @@ from librarytool.engine.text_layer_aggregate import (
 def _artifact(
     content: bytes,
     *,
+    item_id: str = "book-1",
     annotation_frame: str = "canvas",
     content_sha256: str = "",
 ) -> RasterArtifactView:
     return RasterArtifactView(
-        key=RasterArtifactKey("book-1", "capture-1"),
+        key=RasterArtifactKey(item_id, "capture-1"),
         revision="artifact-r1",
         kind="captured-image",
         media_type="image/png",
@@ -153,12 +154,13 @@ def _text_layer_view(
     layer_id,
     units,
     *,
+    item_id="book-1",
     representation_id="capture",
     source_revision="capture-r1",
     language="en",
 ):
     document = TextLayerDocumentSnapshot.build(
-        "book-1",
+        item_id,
         layer_id,
         TextLayerDraft(
             source=TextLayerSourcePin(
@@ -376,6 +378,62 @@ def test_reader_projects_only_human_owned_text_for_exact_source_revision() -> No
         ("list", "book-1"),
         ("get", "book-1", "layer-protected"),
     ]
+
+
+def test_human_text_reader_maps_canonical_item_to_active_native_store() -> None:
+    artifact = _artifact(b"source")
+    protected = _text_layer_view(
+        "layer-1",
+        (
+            TextLayerUnitDraft(
+                "unit-1",
+                0,
+                "Promoted human text",
+                provenance=TextLayerProvenance(origin="human"),
+            ),
+        ),
+        item_id="active-build",
+    )
+    text_layers = _TextLayers((protected,))
+    mapped_ids = []
+
+    assertions = CanonicalTextLayerHumanAssertionReader(
+        text_layers,
+        text_layer_item_id_for=lambda item_id: (
+            mapped_ids.append(item_id) or "active-build"
+        ),
+    )(artifact)
+
+    assert mapped_ids == ["book-1"]
+    assert [value.text for value in assertions] == [
+        "Promoted human text"
+    ]
+    assert text_layers.calls == [
+        ("list", "active-build"),
+        ("get", "active-build", "layer-1"),
+    ]
+    # The assertion belongs to the stable Corrections identity, not the
+    # compatibility build id that happens to own the native layer today.
+    native_assertion = CanonicalTextLayerHumanAssertionReader(
+        text_layers
+    )(_artifact(b"source", item_id="active-build"))[0]
+    assert assertions[0].assertion_id != native_assertion.assertion_id
+
+
+def test_human_text_reader_projects_no_layers_without_an_active_store() -> None:
+    artifact = _artifact(b"source")
+
+    class UnusedTextLayers:
+        def list(self, _item_id):
+            raise AssertionError("capture-only sources have no native store")
+
+        def get(self, _item_id, _layer_id):
+            raise AssertionError("capture-only sources have no native store")
+
+    assert CanonicalTextLayerHumanAssertionReader(
+        UnusedTextLayers(),
+        text_layer_item_id_for=lambda _item_id: None,
+    )(artifact) == ()
 
 
 def test_human_text_identity_is_stable_while_unit_revision_tracks_edits() -> None:

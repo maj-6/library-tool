@@ -21,12 +21,24 @@ from librarytool.adapters.filesystem import (
     FilesystemCorrectionTransformStore,
     FilesystemItemQueryRepository,
 )
-from librarytool.engine import CORRECTION_TRANSFORM_SERVICE
+from librarytool.engine import (
+    CORRECTION_TRANSFORM_SERVICE,
+    RASTER_ARTIFACT_QUERY_SERVICE,
+    TEXT_LAYER_AGGREGATE_SERVICE,
+)
 from librarytool.engine.correction_transforms import (
+    CorrectionTransformCommand,
     OcrFollowupOutcome,
     OcrFollowupState,
 )
 from librarytool.engine.items import ItemQueryService
+from librarytool.engine.text_layer_aggregate import (
+    CreateTextLayerCommand,
+    TextLayerDraft,
+    TextLayerProvenance,
+    TextLayerSourcePin,
+    TextLayerUnitDraft,
+)
 
 
 BOOK_ID = "b-11111111111111111111111111111111"
@@ -48,6 +60,21 @@ def _opaque_identity(namespace: str, *parts) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return f"{namespace}:{hashlib.sha256(encoded).hexdigest()[:40]}"
+
+
+def _transform_command(source, operation_id: str) -> CorrectionTransformCommand:
+    assert source.resource is not None
+    return CorrectionTransformCommand(
+        item_id=source.key.item_id,
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=None,
+        rerun_ocr=False,
+        operation_id=operation_id,
+    )
 
 
 def _bind_engine_session(monkeypatch, server, session) -> None:
@@ -413,6 +440,158 @@ def test_capture_only_target_is_visible_and_stays_canonical_after_promotion(
     assert boxes.get_json()["annotations"][0]["effective_role"] == (
         "marginalia"
     )
+
+
+def test_capture_only_transform_loads_and_queues_without_native_text_layers(
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                "manual-capture": {
+                    "id": "manual-capture",
+                    "title": "Capture Awaiting Promotion",
+                    "capture_id": CAPTURE_ID,
+                }
+            },
+        )
+
+    engine = server._library_engine()
+    raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts(BOOK_ID)
+        if value.key.artifact_id.endswith(":display")
+    )
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    worker = transforms._executor.__self__
+
+    loaded = worker._store.load_source(source.key)
+    command = _transform_command(
+        source,
+        "capture-only-canonical-transform",
+    )
+    queued = transforms.queue(command)
+    result = transforms.execute_queued(command)
+
+    assert server._corrections_text_layer_item_id(BOOK_ID) is None
+    assert loaded.human_text_assertions == ()
+    assert queued.created is True
+    assert result.image_commit is not None
+
+
+def test_promoted_transform_uses_active_build_text_layers_under_canonical_id(
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    entry = server.ENTRIES_DIR / "promoted-local"
+    images = entry / "ocr" / "images"
+    images.mkdir(parents=True)
+    (images / "figure.jpg").write_bytes(_jpeg_bytes())
+    (entry / "ocr" / "layout.json").write_text(
+        json.dumps(
+            {
+                "regions": {
+                    "primary": {
+                        "1": {
+                            "doc": "compiled.txt",
+                            "dims": {"w": 7, "h": 11},
+                            "origin": "machine",
+                            "items": [],
+                        }
+                    }
+                },
+                "images": {
+                    "figure.jpg": {
+                        "src_key": "primary",
+                        "page": 1,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with server._manual_lock:
+        server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH, {})
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "promoted-local": {
+                    "id": "promoted-local",
+                    "title": "Promoted Capture",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                    "pdf_file": "missing-source.pdf",
+                }
+            },
+        )
+
+    representation_revision = server._engine_representation_revision(
+        "promoted-local",
+        "primary",
+    )
+    assert representation_revision is not None
+    engine = server._library_engine()
+    text_layers = engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE)
+    text_layers.create(
+        CreateTextLayerCommand(
+            "promoted-local",
+            TextLayerDraft(
+                source=TextLayerSourcePin(
+                    "primary",
+                    representation_revision,
+                ),
+                units=(
+                    TextLayerUnitDraft(
+                        "verified-caption",
+                        0,
+                        "Human verified plate",
+                        provenance=TextLayerProvenance(
+                            origin="human",
+                            review_state="approved",
+                        ),
+                    ),
+                ),
+                label="Verified",
+                language="en",
+            ),
+            "promoted-native-text-layer",
+        )
+    )
+    raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts(BOOK_ID)
+        if value.kind == "extracted-figure"
+    )
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    worker = transforms._executor.__self__
+
+    loaded = worker._store.load_source(source.key)
+    command = _transform_command(
+        source,
+        "promoted-canonical-transform",
+    )
+    queued = transforms.queue(command)
+    result = transforms.execute_queued(command)
+
+    assert server._corrections_text_layer_item_id(BOOK_ID) == (
+        "promoted-local"
+    )
+    assert [value.text for value in loaded.human_text_assertions] == [
+        "Human verified plate"
+    ]
+    assert queued.created is True
+    assert result.image_commit is not None
 
 
 def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(

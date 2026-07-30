@@ -45,6 +45,7 @@ from ...engine.text_layer_aggregate import (
 HumanTextAssertionLookup = Callable[
     [RasterArtifactView], Sequence[HumanTextAssertion]
 ]
+TextLayerItemIdentityLookup = Callable[[str], str | None]
 
 
 def _close_stream(stream: Any) -> None:
@@ -94,13 +95,30 @@ class CanonicalTextLayerHumanAssertionReader:
     selector names its canvas. A list/get convergence check makes a changing
     layer fail closed; the correction store's later source reload then uses
     each unit revision as an ordinary dependent CAS pin.
+
+    Corrections identities may remain stable while a capture is promoted to a
+    build whose native text layers use a different item identity. The optional
+    lookup maps the stable Corrections identity to that active native identity.
+    Returning ``None`` deliberately projects no human layers, as for a
+    capture-only entry that has no native text-layer store yet.
     """
 
-    def __init__(self, text_layers: Any) -> None:
+    def __init__(
+        self,
+        text_layers: Any,
+        *,
+        text_layer_item_id_for: TextLayerItemIdentityLookup | None = None,
+    ) -> None:
         for method in ("list", "get"):
             if not callable(getattr(text_layers, method, None)):
                 raise TypeError(f"text_layers must expose {method}()")
+        if (
+            text_layer_item_id_for is not None
+            and not callable(text_layer_item_id_for)
+        ):
+            raise TypeError("text_layer_item_id_for must be callable or None")
         self._text_layers = text_layers
+        self._text_layer_item_id_for = text_layer_item_id_for
 
     def __call__(
         self,
@@ -109,9 +127,16 @@ class CanonicalTextLayerHumanAssertionReader:
         if not isinstance(artifact, RasterArtifactView):
             raise TypeError("artifact must be RasterArtifactView")
         item_id = artifact.key.item_id
+        text_layer_item_id = (
+            item_id
+            if self._text_layer_item_id_for is None
+            else self._text_layer_item_id_for(item_id)
+        )
+        if text_layer_item_id is None:
+            return ()
         representation_id = artifact.source.representation_id
         representation_revision = artifact.source.representation_revision
-        summaries = self._text_layers.list(item_id)
+        summaries = self._text_layers.list(text_layer_item_id)
         if isinstance(summaries, (str, bytes)) or not isinstance(
             summaries,
             Sequence,
@@ -130,7 +155,7 @@ class CanonicalTextLayerHumanAssertionReader:
             )
         layer_ids = tuple(value.layer_id for value in values)
         if (
-            any(value.item_id != item_id for value in values)
+            any(value.item_id != text_layer_item_id for value in values)
             or len(layer_ids) != len(set(layer_ids))
         ):
             raise RepositoryError(
@@ -147,7 +172,10 @@ class CanonicalTextLayerHumanAssertionReader:
             ):
                 continue
             try:
-                view = self._text_layers.get(item_id, summary.layer_id)
+                view = self._text_layers.get(
+                    text_layer_item_id,
+                    summary.layer_id,
+                )
             except NotFoundError as exc:
                 raise ConflictError(
                     "a protected text layer changed while it was read",

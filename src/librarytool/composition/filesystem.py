@@ -209,6 +209,7 @@ CorrectionsCaptureIdentity = Callable[[str], str | None]
 CorrectionsCaptureDirectory = Callable[[str], Path]
 CorrectionsEntryDirectory = Callable[[str], Path]
 CorrectionsRepresentationRevision = Callable[[str, str], str | None]
+CorrectionsTextLayerItemIdentity = Callable[[str], str | None]
 TextLayerItemMembership = Callable[[str], bool]
 TextLayerSourceSnapshotLoader = Callable[
     [str, str], TextLayerSourceSnapshot | None
@@ -437,8 +438,10 @@ class CorrectionsBindings:
     that borrowed read authority without moving the write-set or its recovery
     journals. ``entry_directory_for`` may map a canonical Corrections identity
     to an active compatibility entry; the artifact adapter still confines the
-    result to the engine workspace. Omitting it uses the common entries
-    resolver.
+    result to the engine workspace. ``text_layer_item_id_for`` may likewise
+    map that identity to the active native text-layer owner, or return ``None``
+    when a capture-only item has no native text store. Omitting either mapping
+    uses the common entry resolver and the canonical identity, respectively.
     """
 
     item_exists_for: CorrectionsItemMembership
@@ -450,6 +453,7 @@ class CorrectionsBindings:
     entry_directory_for: CorrectionsEntryDirectory | None = None
     job_start_context_for: ItemLockFactory | None = None
     ocr_provider: CorrectionOcrProviderPort | None = None
+    text_layer_item_id_for: CorrectionsTextLayerItemIdentity | None = None
 
     def __post_init__(self) -> None:
         capture_authority_root = Path(self.capture_authority_root)
@@ -477,6 +481,13 @@ class CorrectionsBindings:
             and not callable(self.entry_directory_for)
         ):
             raise TypeError("entry_directory_for must be callable or None")
+        if (
+            self.text_layer_item_id_for is not None
+            and not callable(self.text_layer_item_id_for)
+        ):
+            raise TypeError(
+                "text_layer_item_id_for must be callable or None"
+            )
         if (
             self.job_start_context_for is not None
             and not callable(self.job_start_context_for)
@@ -1159,7 +1170,12 @@ def compose_filesystem_engine(
             corrections_artifacts,
             corrections_artifacts,
             human_text_assertions_for=(
-                CanonicalTextLayerHumanAssertionReader(native_text_layers)
+                CanonicalTextLayerHumanAssertionReader(
+                    native_text_layers,
+                    text_layer_item_id_for=(
+                        corrections.text_layer_item_id_for
+                    ),
+                )
                 if native_text_layers is not None
                 else None
             ),
