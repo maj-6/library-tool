@@ -345,12 +345,14 @@ class HomeActivity : AppCompatActivity() {
         menu.menuInflater.inflate(R.menu.home_app_menu, menu.menu)
         RemoteUiCatalog.apply(this, menu.menu)
         menu.menu.findItem(R.id.menuSignOut).isVisible = Auth.signedIn(this)
+        menu.menu.findItem(R.id.menuRetryProcessing).isVisible = retryableProcessingIds().isNotEmpty()
         MenuCompat.setGroupDividerEnabled(menu.menu, true)
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 R.id.menuSettings -> {
                     startActivity(Intent(this, SettingsActivity::class.java)); true
                 }
+                R.id.menuRetryProcessing -> { retryFailedProcessing(); true }
                 R.id.menuAbout -> { showAbout(); true }
                 R.id.menuCheckUpdates -> { checkForUpdates(); true }
                 R.id.menuSignOut -> { signOut(); true }
@@ -358,6 +360,56 @@ class HomeActivity : AppCompatActivity() {
             }
         }
         menu.show()
+    }
+
+    /** Captures whose pipeline outcome is worth another attempt. Reads the
+     * browsing list only: an archived capture is deliberately out of scope for
+     * a bulk action, and the archive is not scanned by any worker. */
+    private fun retryableProcessingIds(): List<String> = runCatching {
+        Entries.recent(this)
+            .filter {
+                it.processing.status == Entries.ProcessingStatus.FAILED ||
+                    it.processing.status == Entries.ProcessingStatus.PARTIAL
+            }
+            .filterNot { it.reprocessPending() }
+            .map { it.id }
+    }.getOrDefault(emptyList())
+
+    /**
+     * Re-run OCR and extraction over everything that failed or came back
+     * partial. The common cause is one shared condition — a rejected or
+     * missing API key, an outage — so the useful unit of recovery is "all of
+     * them", not one capture at a time.
+     */
+    private fun retryFailedProcessing() {
+        lifecycleScope.launch {
+            val requested = withContext(Dispatchers.IO) {
+                retryableProcessingIds().filter { entryId ->
+                    EntryOperationLocks.withLock(entryId) {
+                        Entries.find(this@HomeActivity, entryId)?.requestReprocess() == true
+                    }
+                }
+            }
+            if (requested.isEmpty()) {
+                Toast.makeText(
+                    this@HomeActivity,
+                    RemoteUiCatalog.text(this@HomeActivity, R.string.home_retry_none),
+                    Toast.LENGTH_SHORT,
+                ).show()
+                return@launch
+            }
+            ProcessWorker.enqueueForcedRetry(this@HomeActivity, requested)
+            Toast.makeText(
+                this@HomeActivity,
+                RemoteUiCatalog.text(
+                    this@HomeActivity,
+                    R.string.home_retry_queued,
+                    requested.size,
+                ),
+                Toast.LENGTH_LONG,
+            ).show()
+            refreshContentTab()
+        }
     }
 
     private fun showAbout() {
@@ -508,8 +560,14 @@ class HomeActivity : AppCompatActivity() {
             ).show()
             return
         }
-        val pendingReviewChanges = Entries.recent(this).any {
+        val known = Entries.recent(this)
+        val pendingReviewChanges = known.any {
             CaptureMetadataStore.hasPendingReviewSync(it.dir)
+        }
+        val delivered = known.filter { it.uploaded }
+        val deliveredNeedingAttention = delivered.count {
+            it.processing.status == Entries.ProcessingStatus.FAILED ||
+                it.processing.status == Entries.ProcessingStatus.PARTIAL
         }
         val owner = Prefs.userId(this)
         if (owner.isNotEmpty()) {
@@ -525,16 +583,37 @@ class HomeActivity : AppCompatActivity() {
             syncFeedbackPhase = state.phase
         }
         refreshSyncButton(state)
-        if (state.requestedCount == 0)
-            Toast.makeText(
-                this,
-                RemoteUiCatalog.text(
-                    this,
-                    if (pendingReviewChanges) R.string.home_sync_review_queued
-                    else R.string.home_sync_none,
-                ),
-                Toast.LENGTH_SHORT,
-            ).show()
+        if (state.requestedCount == 0) {
+            val message = when (
+                captureSyncEmptyReason(
+                    requestedCount = state.requestedCount,
+                    pendingReviewChanges = pendingReviewChanges,
+                    liveCaptureOpen = Prefs.currentEntryId(this) != null,
+                    deliveredCount = delivered.size,
+                    deliveredNeedingAttention = deliveredNeedingAttention,
+                )
+            ) {
+                CaptureSyncEmptyReason.REVIEW_QUEUED ->
+                    RemoteUiCatalog.text(this, R.string.home_sync_review_queued)
+                CaptureSyncEmptyReason.LIVE_CAPTURE_ONLY ->
+                    RemoteUiCatalog.text(this, R.string.home_sync_live_capture_only)
+                CaptureSyncEmptyReason.DELIVERED_WITH_PROCESSING_ISSUES ->
+                    RemoteUiCatalog.text(
+                        this,
+                        R.string.home_sync_delivered_needs_processing,
+                        deliveredNeedingAttention,
+                    )
+                CaptureSyncEmptyReason.ALL_DELIVERED ->
+                    RemoteUiCatalog.text(
+                        this,
+                        R.string.home_sync_all_delivered,
+                        delivered.size,
+                    )
+                CaptureSyncEmptyReason.NOTHING ->
+                    RemoteUiCatalog.text(this, R.string.home_sync_none)
+            }
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun refreshSyncButton(

@@ -272,22 +272,38 @@ OCR TEXT:
             throw InvalidExtractionError("Extraction returned invalid JSON")
         }
         val out = JSONObject()
-        val problems = mutableListOf<String>()
+        // Two grades of deviation. A DEFECT means a field's value was not
+        // recovered. An ADVISORY means the shape was not what was asked for but
+        // the value came through intact — a year emitted as the JSON number
+        // 1897 rather than "1897" is the common one. Only defects make the
+        // record partial: marking a complete book partial over a scalar year
+        // is a permanent verdict (extraction runs at temperature 0, so the same
+        // book reproduces the same shape forever) on a record that is fine.
+        val defects = mutableListOf<String>()
+        val advisories = mutableListOf<String>()
         var populated = false
         for (k in FIELDS) {
             val value = when {
                 !obj.has(k) -> {
-                    problems += "$k is missing"
+                    defects += "$k is missing"
                     ""
                 }
                 obj.opt(k) == JSONObject.NULL -> {
-                    problems += "$k is not a string"
+                    defects += "$k is null"
                     ""
                 }
                 obj.opt(k) is String -> obj.optString(k).trim()
                 else -> {
-                    problems += "$k is not a string"
-                    obj.opt(k)?.toString()?.trim().orEmpty()
+                    val coerced = obj.opt(k)?.takeIf { it is Number || it is Boolean }
+                        ?.toString()?.trim().orEmpty()
+                    if (coerced.isEmpty()) {
+                        // A JSONObject or JSONArray where a string belongs is
+                        // a real loss: there is no honest scalar to keep.
+                        defects += "$k is not a string"
+                    } else {
+                        advisories += "$k was not quoted"
+                    }
+                    coerced
                 }
             }
             if (value.isNotEmpty()) populated = true
@@ -303,8 +319,11 @@ OCR TEXT:
                     rawValue == null || rawValue == JSONObject.NULL -> ""
                     rawValue is String -> rawValue.trim()
                     else -> {
-                        problems += "extra.$key is not a string"
-                        rawValue.toString().trim()
+                        val coerced = rawValue.takeIf { it is Number || it is Boolean }
+                            ?.toString()?.trim().orEmpty()
+                        if (coerced.isEmpty()) defects += "extra.$key is not a string"
+                        else advisories += "extra.$key was not quoted"
+                        coerced
                     }
                 }
                 if (value.isNotEmpty()) {
@@ -312,19 +331,25 @@ OCR TEXT:
                     populated = true
                 }
             }
+        } else if (extra != null && extra != JSONObject.NULL) {
+            // Present but the wrong type — the model had something to say and
+            // it was lost.
+            defects += "extra is not an object"
         } else {
-            problems += "extra is missing or is not an object"
+            // Simply absent. "extra" is a catch-all for fields outside the
+            // fixed schema; a book with none is complete, not partial.
+            advisories += "extra was omitted"
         }
         out.put("extra", extraOut)
 
         if (!populated)
             throw InvalidExtractionError("Extraction returned no bibliographic fields")
-        val warning = problems.distinct().takeIf { it.isNotEmpty() }?.let {
+        val warning = (defects + advisories).distinct().takeIf { it.isNotEmpty() }?.let {
             val shown = it.take(3).joinToString(", ")
             if (it.size > 3) "Partial extraction response: $shown (+${it.size - 3} more)"
             else "Partial extraction response: $shown"
         }
-        return ExtractionResult(out, complete = warning == null, warning = warning)
+        return ExtractionResult(out, complete = defects.isEmpty(), warning = warning)
     }
 
     /** Merge an accepted response over the prior record without ever erasing a

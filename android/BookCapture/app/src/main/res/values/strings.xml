@@ -13,8 +13,37 @@
     <string name="home_sync_partial">Synced %1$d; %2$d need attention</string>
     <string name="home_sync_failed">Sync failed; captures remain on this device</string>
     <string name="home_sync_none">No captures ready to sync</string>
+    <!-- "Nothing to send" and "nothing here" are different answers. A row
+         reading "failed" is about this phone's OCR, not about delivery, so the
+         empty-sync message says which of the two the user is looking at. -->
+    <string name="home_sync_all_delivered">All %1$d captures are already delivered</string>
+    <string name="home_sync_delivered_needs_processing">All captures delivered; %1$d still need details read on this phone</string>
+    <string name="home_sync_live_capture_only">Finish the open capture before syncing</string>
     <string name="home_sync_review_queued">Review changes queued for sync</string>
     <string name="home_sync_sign_in">Sign in before syncing captures</string>
+
+    <!-- The archive is what retention displaced out of the recent list. It is
+         read-only: no worker enumerates it, so an edit made here would never
+         reach the cloud. -->
+    <string name="archive_title">Archived captures</string>
+    <string name="archive_summary">%1$d archived · %2$s</string>
+    <string name="archive_empty">Nothing archived yet. Captures move here once they leave the recent list.</string>
+    <string name="set_archive_browse">Browse archive</string>
+
+    <string name="set_captures_section">Captures on this phone</string>
+    <string name="set_export_choose">Choose folder…</string>
+    <string name="set_export_now">Export now</string>
+    <string name="set_export_no_folder">No export folder chosen. Captures exist only on this phone.</string>
+    <string name="set_export_folder">Export folder: %1$s</string>
+    <string name="set_export_permission_lost">Export folder is no longer available; choose it again.</string>
+    <string name="set_export_started">Exporting %1$d capture(s)…</string>
+    <string name="set_export_nothing">Everything is already exported</string>
+    <string name="set_export_last">Last export: %1$d copied, %2$d unchanged, %3$d failed</string>
+    <string name="set_archive_summary">%1$d in the list, %2$d archived · %3$s</string>
+
+    <string name="menu_retry_processing">Retry reading details</string>
+    <string name="home_retry_none">Nothing needs another attempt</string>
+    <string name="home_retry_queued">Re-reading %1$d capture(s)</string>
 
     <!-- The app mark at the head of the toolbar is the menu; there is no gear. -->
     <string name="app_menu">Library Tool Capture menu</string>

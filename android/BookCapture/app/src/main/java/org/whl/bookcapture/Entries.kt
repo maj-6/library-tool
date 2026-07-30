@@ -24,7 +24,8 @@ import java.util.UUID
  */
 object Entries {
 
-    const val KEEP_SENT = 15    // uploaded entries kept for the recent list
+    const val KEEP_SENT = 15    // uploaded entries kept in the recent list;
+                                // the rest move to archive/, never deleted
     const val REPROCESS_PENDING = "reprocess.pending"
     const val PROCESSING_STATE = "processing.json"
     const val MISTRAL_RESPONSE_SUFFIX = ".mistral.json"
@@ -108,6 +109,9 @@ object Entries {
         val dir: File,
         val sealed: Boolean,
         val uploaded: Boolean,
+        /** Moved aside by retention. Still uploaded — the archive is only ever
+         * reached from sent/ — but no longer part of the browsing list. */
+        val archived: Boolean = false,
         val createdAt: Long,
         val photoCount: Int,
         val meta: JSONObject?,          // null until extraction lands
@@ -198,6 +202,15 @@ object Entries {
 
         fun requestReprocess(): Boolean {
             File(dir, REPROCESS_ERROR).delete()
+            // An empty sidecar is still the per-photo commit marker, so a page
+            // that OCR'd to nothing is skipped forever and the entry re-fails
+            // on the same "no text" verdict. An explicit retry means the user
+            // wants those pages attempted again, not the old verdict repeated.
+            photos().forEach { photo ->
+                File(dir, photo.name + ".txt")
+                    .takeIf { it.isFile && it.length() == 0L }
+                    ?.delete()
+            }
             if (!holdForProcessing(dir)) return false
             if (!markWaiting(dir, ProcessingStage.EXTRACTION)) {
                 File(dir, REPROCESS_PENDING).delete()
@@ -327,18 +340,37 @@ object Entries {
     fun queueRoot(ctx: Context): File = File(ctx.filesDir, "queue").apply { mkdirs() }
     fun sentRoot(ctx: Context): File = File(ctx.filesDir, "sent").apply { mkdirs() }
 
-    /** Everything worth showing, newest first: the queue plus what was sent. */
+    /** Everything worth showing, newest first: the queue plus what was sent.
+     *
+     * Deliberately excludes archive/. This list is the boundary the upload,
+     * import-poll and inventory paths iterate; an archived capture is finished
+     * business and must not re-enter any of them. Use [archived] to read the
+     * archive, and note that neither [find] nor this function will return an
+     * archived entry to a caller that did not ask for one. */
     fun recent(ctx: Context): List<Entry> {
         val dirs = (queueRoot(ctx).listFiles { f: File -> f.isDirectory } ?: emptyArray()) +
                    (sentRoot(ctx).listFiles { f: File -> f.isDirectory } ?: emptyArray())
         return dirs.mapNotNull(::load).sortedByDescending { it.createdAt }
     }
 
+    /** The retention archive, newest first. Separate from [recent] on purpose;
+     * see its comment. Record-only entries still load: the manifest survives
+     * the photo budget, and an entry with a manifest is never an empty husk. */
+    fun archived(ctx: Context): List<Entry> =
+        (CaptureArchive.archiveRoot(ctx).listFiles { f: File -> f.isDirectory } ?: emptyArray())
+            .mapNotNull(::load)
+            .sortedByDescending { it.createdAt }
+
     fun find(ctx: Context, id: String): Entry? {
         val q = File(queueRoot(ctx), id)
         val s = File(sentRoot(ctx), id)
         return load(if (q.isDirectory) q else s)
     }
+
+    /** Explicitly opt in to the archive. Kept apart from [find] so no existing
+     * caller can start operating on archived captures by accident. */
+    fun findIncludingArchive(ctx: Context, id: String): Entry? =
+        find(ctx, id) ?: load(File(CaptureArchive.archiveRoot(ctx), id))
 
     /** Persist a phone review immediately and offline. Cloud work is
      * deliberately not enqueued here: only the explicit Sync action may push
@@ -388,7 +420,11 @@ object Entries {
         val manifest = manifestFile.takeIf { it.isFile }?.let {
             try { JSONObject(it.readText()) } catch (_: Exception) { null }
         }
-        val uploaded = dir.parentFile?.name == "sent"
+        // Everything in the archive got there from sent/, so it is delivered by
+        // construction. Reporting it as un-uploaded would make a finished
+        // capture read as "pending upload" forever.
+        val archived = dir.parentFile?.name == "archive"
+        val uploaded = dir.parentFile?.name == "sent" || archived
         val photos = dir.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) } ?: emptyArray()
         if (photos.isEmpty() && manifest == null) return null       // empty husk
         val meta = readMetadata(dir)
@@ -406,6 +442,7 @@ object Entries {
             dir = dir,
             sealed = manifestFile.isFile,
             uploaded = uploaded,
+            archived = archived,
             createdAt = manifest?.optLong("created_at", 0L)?.takeIf { it > 0 }
                 ?: (photos.maxOfOrNull { it.lastModified() } ?: dir.lastModified()),
             photoCount = photos.size,
@@ -429,25 +466,16 @@ object Entries {
         }?.takeIf { Pipeline.hasPopulatedMetadata(it) }
 
     /** The line the recent list prints under a title. */
-    fun statusLabel(ctx: Context, e: Entry): String {
-        val importOutcome = remoteImportTerminalLabel(e.cloudStatus)
-        return when {
-            // A cloud-side failure/void is final and must not masquerade as a
-            // generic successful upload, even when local processing succeeded.
-            e.uploaded && importOutcome != null && importOutcome != "imported" -> importOutcome
-            // Preserve the compact label for legacy sent entries that predate
-            // per-entry processing state and never had extraction metadata.
-            e.uploaded && !e.processingRecorded && e.meta == null && importOutcome == "imported" -> "imported"
-            e.uploaded && !e.processingRecorded && e.meta == null -> "uploaded"
-            !e.sealed && e.processing.status == ProcessingStatus.WAITING -> "capturing \u00b7 waiting"
-            !e.sealed && e.processing.status == ProcessingStatus.PROCESSING -> "capturing \u00b7 processing"
-            e.processing.status == ProcessingStatus.WAITING -> "waiting"
-            e.processing.status == ProcessingStatus.PROCESSING -> "processing"
-            e.processing.status == ProcessingStatus.FAILED -> "failed"
-            e.processing.status == ProcessingStatus.PARTIAL -> "partial"
-            e.uploaded && importOutcome == "imported" -> "complete \u00b7 imported"
-            e.uploaded -> "complete \u00b7 uploaded"
-            else -> when {
+    fun statusLabel(ctx: Context, e: Entry): String = captureStatusLabel(
+        uploaded = e.uploaded,
+        sealed = e.sealed,
+        processingRecorded = e.processingRecorded,
+        hasMeta = e.meta != null,
+        status = e.processing.status,
+        bestStatus = e.processing.bestStatus,
+        importOutcome = remoteImportTerminalLabel(e.cloudStatus),
+        pendingLabel = {
+            when {
                 Prefs.transport(ctx) != "cloud" -> "complete \u00b7 pending delivery"
                 cloudUploadOwnership(readCaptureCreator(ctx, e.dir), Prefs.userId(ctx)) ==
                     CloudUploadOwnership.NEEDS_CLAIM -> "complete \u00b7 claim for cloud"
@@ -455,7 +483,86 @@ object Entries {
                     CloudUploadOwnership.DIFFERENT_ACCOUNT -> "complete \u00b7 different account"
                 else -> "complete \u00b7 pending upload"
             }
+        },
+    )
+
+    /**
+     * Delivery outranks the pipeline. Photos are the cargo and they ship
+     * regardless of how OCR went, so once a capture is uploaded the row leads
+     * with that and carries the processing outcome as a qualifier. The old
+     * order printed a bare "failed" over a capture whose pages were already
+     * safely in the cloud, which reads as "sync failed" \u2014 and then Sync
+     * truthfully reported nothing left to send, because there wasn't.
+     *
+     * [bestStatus] is the high-water mark [writeTransition] keeps: a capture
+     * that once extracted cleanly and then failed a retry says so, instead of
+     * throwing away the evidence that the metadata on disk is good.
+     */
+    internal fun captureStatusLabel(
+        uploaded: Boolean,
+        sealed: Boolean,
+        processingRecorded: Boolean,
+        hasMeta: Boolean,
+        status: ProcessingStatus,
+        bestStatus: ProcessingStatus?,
+        importOutcome: String?,
+        pendingLabel: () -> String,
+    ): String {
+        // A cloud-side failure/void is final and must not masquerade as a
+        // generic successful upload, even when local processing succeeded.
+        if (uploaded && importOutcome != null && importOutcome != "imported") return importOutcome
+        // Preserve the compact label for legacy sent entries that predate
+        // per-entry processing state and never had extraction metadata.
+        if (uploaded && !processingRecorded && !hasMeta) {
+            return if (importOutcome == "imported") "imported" else "uploaded"
         }
+        if (!sealed) {
+            when (status) {
+                ProcessingStatus.WAITING -> return "capturing \u00b7 waiting"
+                ProcessingStatus.PROCESSING -> return "capturing \u00b7 processing"
+                else -> Unit
+            }
+        }
+        if (uploaded) {
+            val delivered = if (importOutcome == "imported") "complete \u00b7 imported"
+            else "complete \u00b7 uploaded"
+            return when (val qualifier = processingQualifier(status, bestStatus, hasMeta)) {
+                null -> delivered
+                else -> "$delivered \u00b7 $qualifier"
+            }
+        }
+        return when (status) {
+            ProcessingStatus.WAITING -> "waiting"
+            ProcessingStatus.PROCESSING -> "processing"
+            // Not yet delivered, so the pipeline outcome is the whole story.
+            ProcessingStatus.FAILED -> when (bestStatus) {
+                ProcessingStatus.COMPLETE -> "complete \u00b7 retry failed"
+                ProcessingStatus.PARTIAL -> "partial \u00b7 retry failed"
+                else -> "failed"
+            }
+            ProcessingStatus.PARTIAL -> "partial"
+            ProcessingStatus.COMPLETE -> pendingLabel()
+        }
+    }
+
+    /** What to append after a delivered capture's label, or null when the
+     * pipeline has nothing to add. A delivered capture that extracted cleanly
+     * says nothing extra; anything else names the shortfall without implying
+     * the pages are at risk. */
+    private fun processingQualifier(
+        status: ProcessingStatus,
+        bestStatus: ProcessingStatus?,
+        hasMeta: Boolean,
+    ): String? = when {
+        status == ProcessingStatus.COMPLETE -> null
+        status == ProcessingStatus.WAITING || status == ProcessingStatus.PROCESSING ->
+            "reading pages"
+        // The retry failed but an earlier attempt already produced the record.
+        bestStatus == ProcessingStatus.COMPLETE -> null
+        status == ProcessingStatus.PARTIAL || bestStatus == ProcessingStatus.PARTIAL ->
+            "some details missing"
+        hasMeta -> "some details missing"
+        else -> "no details read"
     }
 
     /** Title cell: the book record once extraction lands, progress before. */
@@ -483,11 +590,16 @@ object Entries {
         return "(no title found)"
     }
 
-    /** Drop the oldest eligible sent entries beyond KEEP_SENT. Entries still
-     * needed for import, photo processing, or an offline review remain local,
-     * but do not prevent completed browsing copies from being capped. A
-     * photo-free Inspect summary must be durable before any browsing media is
-     * removed. */
+    /** Move the oldest eligible sent entries beyond KEEP_SENT into the archive.
+     * Entries still needed for import, photo processing, or an offline review
+     * remain local, but do not prevent completed browsing copies from being
+     * capped. A photo-free Inspect summary must be durable before any browsing
+     * media leaves the list.
+     *
+     * KEEP_SENT caps the *browsing* list, not the device's memory of a capture:
+     * everything it displaces is still on disk under archive/, which is what
+     * makes a delivery or processing failure investigable weeks later. See
+     * [CaptureArchive]. */
     suspend fun pruneSent(
         ctx: Context,
         retainLocally: (Entry) -> Boolean,
@@ -516,10 +628,22 @@ object Entries {
                 val latest = runCatching { load(dir) }.getOrNull() ?: return@withLock
                 if (runCatching { retainLocally(latest) }.getOrDefault(true)) return@withLock
                 if (CollectionInventory.recordFinalized(ctx, listOf(latest))) {
-                    CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation(dir)
+                    CaptureMetadataStore.archiveIfNoUnsyncedLocalMutation(
+                        dir,
+                        File(CaptureArchive.archiveRoot(ctx), entryId),
+                        CaptureArchive.REASON_RETENTION,
+                        System.currentTimeMillis(),
+                    )
                 }
             }
         }
+        // Measured after the move so a capture archived in this pass counts
+        // against the budget along with everything already there.
+        CaptureArchive.enforcePhotoBudget(
+            ctx,
+            Prefs.archivedPhotoBudget(ctx),
+            System.currentTimeMillis(),
+        )
     }
 
     fun atomicWrite(target: File, text: String) {

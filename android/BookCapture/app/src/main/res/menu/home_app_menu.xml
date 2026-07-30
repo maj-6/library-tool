@@ -2,6 +2,11 @@
 <!-- Hangs off the app mark at the head of the toolbar; there is no gear. -->
 <menu xmlns:android="http://schemas.android.com/apk/res/android">
     <group android:id="@+id/menuMainActions">
+        <!-- Shown only when something actually needs it; a permanent "retry"
+             would imply the archive is unhealthy by default. -->
+        <item
+            android:id="@+id/menuRetryProcessing"
+            android:title="@string/menu_retry_processing" />
         <item
             android:id="@+id/menuSettings"
             android:title="@string/menu_settings" />

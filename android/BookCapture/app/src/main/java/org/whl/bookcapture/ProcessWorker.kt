@@ -118,6 +118,39 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)
                 .build()
 
+        const val RETRY_WORK_NAME = "capture-process-retry"
+
+        /**
+         * Re-run the pipeline over captures the user picked out of the
+         * attention list, one serial chain so a long backlog cannot open a
+         * request per book at once.
+         *
+         * Forced, for two reasons the automatic paths cannot supply: it
+         * bypasses the terminal-failure gate in [processDirectory], which is
+         * what pins a capture to "failed" after a permanent error like a
+         * rejected API key; and it is the only route that reaches sent/ at all,
+         * since [enqueueBacklog] enumerates queue/ alone. Callers must have
+         * called [Entries.Entry.requestReprocess] first — that is what clears
+         * the stale error and holds the directory against retention.
+         */
+        fun enqueueForcedRetry(ctx: Context, entryIds: List<String>) {
+            val requests = entryIds.asSequence()
+                .map(String::trim)
+                .filter { it.isNotEmpty() }
+                .distinct()
+                .sorted()
+                .map { processingRequest(it, forceReprocess = true) }
+                .toList()
+            if (requests.isEmpty()) return
+            var continuation = WorkManager.getInstance(ctx).beginUniqueWork(
+                RETRY_WORK_NAME,
+                ExistingWorkPolicy.APPEND_OR_REPLACE,
+                requests.first(),
+            )
+            for (request in requests.drop(1)) continuation = continuation.then(request)
+            continuation.enqueue()
+        }
+
         private fun enqueueBacklog(ctx: Context, entryIds: List<String>) {
             val requests = entryIds.distinct().sorted().map { entryId ->
                 processingRequest(entryId, forceReprocess = false)
@@ -250,6 +283,12 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         val photos =
             if (!entry.sealed && targetAtStart != null) listOf(targetAtStart)
             else allPhotos
+        // Read before the transition below overwrites it. The re-extraction
+        // gate further down asks whether this entry was ALREADY complete on
+        // entry to the worker; asking after markProcessing always answered
+        // PROCESSING, so the gate never fired and every queued capture
+        // re-extracted over the network on every Home resume.
+        val statusAtStart = entry.processing.status
         Entries.markProcessing(dir, Entries.ProcessingStage.STANDARDIZING)
 
         var waitingForJpeg = false
@@ -378,7 +417,7 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         }
         val existingMetadata = entry.meta
         if (!forced && existingMetadata != null &&
-            entry.processing.status == Entries.ProcessingStatus.COMPLETE) {
+            statusAtStart == Entries.ProcessingStatus.COMPLETE) {
             completePendingCatalogCheck(
                 ctx = ctx,
                 dir = dir,

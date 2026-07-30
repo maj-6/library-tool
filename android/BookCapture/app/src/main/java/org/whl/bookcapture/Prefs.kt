@@ -248,6 +248,71 @@ object Prefs {
     fun setShowOcrRegionLabels(ctx: Context, show: Boolean) =
         sp(ctx).edit().putBoolean("show_ocr_region_labels", show).apply()
 
+    // --- export --------------------------------------------------------------
+
+    /** The Storage Access Framework tree the user picked for exports, or "".
+     * Stored as the raw Uri string; the grant itself lives in the system's
+     * persisted-permission table, which is why [exportGrantHeld] and not this
+     * value decides whether an export can actually run. */
+    fun exportTreeUri(ctx: Context): String = str(ctx, "export_tree_uri")
+
+    fun setExportTreeUri(ctx: Context, uri: String) =
+        put(ctx, "export_tree_uri" to uri.trim())
+
+    /** A persisted grant can be revoked from system settings, or die with the
+     * removable card it pointed at. Confirm it before every export rather than
+     * trusting the saved string. */
+    fun exportGrantHeld(ctx: Context, uri: String = exportTreeUri(ctx)): Boolean {
+        if (uri.isBlank()) return false
+        return ctx.contentResolver.persistedUriPermissions.any {
+            it.isWritePermission && it.uri.toString() == uri
+        }
+    }
+
+    fun setLastExportSummary(
+        ctx: Context,
+        exported: Int,
+        failed: Int,
+        unchanged: Int,
+        at: Long,
+    ) = sp(ctx).edit()
+        .putInt("export_last_exported", exported)
+        .putInt("export_last_failed", failed)
+        .putInt("export_last_unchanged", unchanged)
+        .putLong("export_last_at", at)
+        .apply()
+
+    data class ExportSummary(
+        val exported: Int,
+        val failed: Int,
+        val unchanged: Int,
+        val at: Long,
+    )
+
+    fun lastExportSummary(ctx: Context): ExportSummary? {
+        val at = sp(ctx).getLong("export_last_at", 0L).takeIf { it > 0 } ?: return null
+        return ExportSummary(
+            exported = sp(ctx).getInt("export_last_exported", 0),
+            failed = sp(ctx).getInt("export_last_failed", 0),
+            unchanged = sp(ctx).getInt("export_last_unchanged", 0),
+            at = at,
+        )
+    }
+
+    /** How many archived captures keep their photos. Unlimited by default: an
+     * archive that quietly discarded the pages would be no better than the
+     * deletion it replaced, so shedding photos stays an explicit choice made
+     * against a visible archive size. Textual sidecars are never budgeted. */
+    fun archivedPhotoBudget(ctx: Context): Int =
+        sp(ctx).getInt("archived_photo_budget", CaptureArchive.UNLIMITED_ARCHIVED_PHOTOS)
+            .coerceAtLeast(CaptureArchive.UNLIMITED_ARCHIVED_PHOTOS)
+
+    fun setArchivedPhotoBudget(ctx: Context, keepCount: Int) =
+        sp(ctx).edit().putInt(
+            "archived_photo_budget",
+            keepCount.coerceAtLeast(CaptureArchive.UNLIMITED_ARCHIVED_PHOTOS),
+        ).apply()
+
     /** Shared extraction guidance replaces the removed per-book DeepSeek
      * action. Individual legacy instructions still take precedence. */
     fun extractionInstructions(ctx: Context): String = str(ctx, "extraction_instructions")

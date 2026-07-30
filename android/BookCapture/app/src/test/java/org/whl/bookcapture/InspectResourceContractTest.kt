@@ -211,10 +211,14 @@ class InspectResourceContractTest {
         val pruning = entries.substringAfter("suspend fun pruneSent")
             .substringBefore("fun atomicWrite")
         assertTrue(pruning.contains("CollectionInventory.recordFinalized"))
+        // Retention now archives rather than deletes, but the ordering
+        // invariant is unchanged: the photo-free Inspect summary must be
+        // durable before any browsing media leaves sent/.
         assertTrue(
             pruning.indexOf("CollectionInventory.recordFinalized") <
-                pruning.indexOf("CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation"),
+                pruning.indexOf("CaptureMetadataStore.archiveIfNoUnsyncedLocalMutation"),
         )
+        assertFalse(pruning.contains("deleteIfNoUnsyncedLocalMutation"))
     }
 
     private fun source(name: String): String =
