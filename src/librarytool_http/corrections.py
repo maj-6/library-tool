@@ -869,7 +869,16 @@ def _correction_item_response(
     if replayed is not None:
         body["replayed"] = replayed
     response = jsonify(body)
-    response.set_etag(item["record_revision"], weak=False)
+    projection_revision = "cid-" + hashlib.sha256(
+        json.dumps(
+            dict(item),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    response.set_etag(projection_revision, weak=False)
     response.headers["X-Record-Revision"] = item["record_revision"]
     response.cache_control.private = True
     response.cache_control.no_store = True

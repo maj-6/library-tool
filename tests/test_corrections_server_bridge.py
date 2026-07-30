@@ -1354,6 +1354,33 @@ def test_capture_fallback_is_deterministic_and_uncaptured_manual_is_omitted(
         "association_state"
     ] == "current"
 
+    monkeypatch.setattr(
+        server,
+        "_corrections_association",
+        lambda _value: None,
+    )
+    with server._manual_lock:
+        server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH, {})
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "promoted-local": {
+                    "id": "promoted-local",
+                    "title": "Promoted legacy identity",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                }
+            },
+        )
+    promoted_snapshot = server._corrections_item_snapshot()
+    assert list(promoted_snapshot) == [BOOK_ID]
+    assert promoted_snapshot[BOOK_ID]["metadata"][
+        "association_state"
+    ] == "missing"
+
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
     with server._manual_lock:
         server.lib.save_json(
             server.lib.MANUAL_ENTRIES_PATH,
@@ -1374,6 +1401,7 @@ def test_capture_fallback_is_deterministic_and_uncaptured_manual_is_omitted(
 
 
 def test_manual_storage_alias_is_private_and_invalid_unicode_fails_closed(
+    client,
     corrections_workspace,
     monkeypatch,
 ):
@@ -1401,6 +1429,49 @@ def test_manual_storage_alias_is_private_and_invalid_unicode_fails_closed(
     assert snapshot[BOOK_ID]["metadata"]["active_storage_id"].startswith(
         "manual:"
     )
+    endpoint = f"/api/v1/corrections/items/{BOOK_ID}"
+    before = client.get(endpoint).get_json()["item"]
+    document = {
+        "patch": {
+            "title": "Corrected legacy capture",
+            "metadata_set": {},
+            "metadata_remove": [],
+        }
+    }
+    headers = {
+        "Idempotency-Key": "legacy-storage-alias-edit",
+        "If-Record-Match": f'"{before["record_revision"]}"',
+    }
+    edited = client.patch(endpoint, json=document, headers=headers)
+    assert edited.status_code == 200, edited.get_json()
+    assert edited.get_json()["item"]["title"] == (
+        "Corrected legacy capture"
+    )
+    with server._manual_lock:
+        stored = server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )
+    assert list(stored) == [raw_manual_id]
+    assert stored[raw_manual_id]["title"] == "Corrected legacy capture"
+
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "promoted-local": {
+                    "id": "promoted-local",
+                    "title": "Corrected legacy capture",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                }
+            },
+        )
+    replay = client.patch(endpoint, json=document, headers=headers)
+    assert replay.status_code == 200, replay.get_json()
+    assert replay.get_json()["replayed"] is True
+    assert raw_manual_id not in replay.get_data(as_text=True)
+
     real_load_json = server.lib.load_json
 
     def invalid_unicode_snapshot(path, default):

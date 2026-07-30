@@ -6952,9 +6952,6 @@ def _corrections_item_engine() -> ItemQueryService:
     )
 
 
-_CORRECTIONS_STORAGE_ITEM_ID_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
-)
 _CORRECTIONS_DERIVED_METADATA_FIELDS = frozenset({
     "active_storage_id",
     "active_storage_kind",
@@ -7204,21 +7201,49 @@ def _corrections_manual_item_repository(
         canonical_id: str,
         storage_id: str,
 ) -> FilesystemItemCommandRepository:
-    if not _CORRECTIONS_STORAGE_ITEM_ID_RE.fullmatch(storage_id):
-        raise EngineRepositoryError(
-            "the captured entry uses an unsupported legacy storage identity",
-            code="correction_item_update_unavailable",
-            details={"item_id": canonical_id},
+    def decode_record(
+            item_id: str,
+            raw: Mapping,
+    ) -> ItemRecordSnapshot:
+        _MANUAL_ENTRY_ITEM_CODEC.validate_record(storage_id, raw)
+        metadata = {
+            key: value
+            for key, value in _MANUAL_ENTRY_ITEM_CODEC.metadata(raw).items()
+            if key not in {"image_count", "capture_transport"}
+        }
+        return ItemRecordSnapshot(
+            item_id=item_id,
+            revision=_MANUAL_ENTRY_ITEM_CODEC.record_revision(
+                storage_id,
+                raw,
+            ),
+            kind="capture" if raw.get("capture_id") else "book",
+            title=str(raw.get("title") or ""),
+            metadata=metadata,
+            representations=(),
         )
+
+    def encode_record(
+            _item_id: str,
+            draft: ItemDraft,
+            previous: Mapping | None,
+    ) -> Mapping:
+        return _MANUAL_ENTRY_ITEM_CODEC.encode(
+            storage_id,
+            draft,
+            previous,
+        )
+
     session = _ensure_engine_session()
     repository = FilesystemItemCommandRepository(
         session.write_set,
         catalogue_path=lib.MANUAL_ENTRIES_PATH,
-        decode_record=_MANUAL_ENTRY_ITEM_CODEC.decode,
-        encode_record=_MANUAL_ENTRY_ITEM_CODEC.encode,
+        decode_record=decode_record,
+        encode_record=encode_record,
         allocate_item_id=lambda existing: lib.gen_id(set(existing)),
         lock_context_for=_corrections_workspace_locks,
         record_scope_for=lambda item_id: item_id == storage_id,
+        record_item_id_for=lambda _storage_key: canonical_id,
         recover=False,
     )
     return repository
@@ -7266,9 +7291,6 @@ def _corrections_promoted_manual_replay(
     if (
         target.storage_kind != "build"
         or not manual_storage_id
-        or not _CORRECTIONS_STORAGE_ITEM_ID_RE.fullmatch(
-            manual_storage_id
-        )
     ):
         return None
     repository = _corrections_manual_item_repository(
@@ -7279,10 +7301,10 @@ def _corrections_promoted_manual_replay(
         operation_id=command.operation_id
     ) as unit:
         prior = unit.receipt(command.operation_id)
-    if prior is None or prior.item_id != manual_storage_id:
+    if prior is None or prior.item_id != command.item_id:
         return None
     expected_hash = update_item_command_sha256(
-        manual_storage_id,
+        command.item_id,
         command.expected_revision,
         command.patch,
     )
@@ -7324,7 +7346,11 @@ class _CorrectionsItemUpdateService:
         )
         _corrections_item_invalidate_capture(command)
         delegated = UpdateItemCommand(
-            item_id=storage_id,
+            item_id=(
+                command.item_id
+                if storage_kind == "manual"
+                else storage_id
+            ),
             expected_revision=command.expected_revision,
             patch=command.patch,
             operation_id=command.operation_id,

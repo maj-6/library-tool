@@ -238,13 +238,14 @@ def test_canonical_item_detail_and_metadata_patch_never_expose_storage_id():
             "record_revision": "manual-r1",
         },
     }
-    assert detail.headers["ETag"] == '"manual-r1"'
+    assert detail.headers["ETag"].startswith('"cid-')
+    assert detail.headers["ETag"] != '"manual-r1"'
     assert detail.headers["X-Record-Revision"] == "manual-r1"
     assert detail.headers["Cache-Control"] == "private, no-store"
     assert RAW_MANUAL_ID not in detail.get_data(as_text=True)
     conditional = client.get(
         endpoint,
-        headers={"If-None-Match": '"manual-r1"'},
+        headers={"If-None-Match": detail.headers["ETag"]},
     )
     assert conditional.status_code == 304
 
@@ -280,7 +281,8 @@ def test_canonical_item_detail_and_metadata_patch_never_expose_storage_id():
             "record_revision": "manual-r2",
         },
     }
-    assert updated.headers["ETag"] == '"manual-r2"'
+    assert updated.headers["ETag"].startswith('"cid-')
+    assert updated.headers["ETag"] != '"manual-r2"'
     assert updated.headers["X-Record-Revision"] == "manual-r2"
     assert updated.headers["Cache-Control"] == "private, no-store"
     assert RAW_MANUAL_ID not in updated.get_data(as_text=True)
@@ -316,6 +318,33 @@ def test_canonical_item_detail_and_metadata_patch_never_expose_storage_id():
         CANONICAL_ID,
         CANONICAL_ID,
     ]
+
+
+def test_item_detail_etag_changes_when_projection_authority_changes():
+    app, repository, _query, _updater = _app()
+    client = app.test_client()
+    endpoint = f"/api/v1/corrections/items/{CANONICAL_ID}"
+    first = client.get(endpoint)
+    assert first.status_code == 200
+
+    repository.records[RAW_MANUAL_ID] = _snapshot(
+        revision="manual-r1",
+        metadata={
+            "authors": "Ada Curator",
+            "association_state": "stale",
+        },
+    )
+    changed = client.get(
+        endpoint,
+        headers={"If-None-Match": first.headers["ETag"]},
+    )
+
+    assert changed.status_code == 200
+    assert changed.headers["ETag"] != first.headers["ETag"]
+    assert changed.headers["X-Record-Revision"] == "manual-r1"
+    assert changed.get_json()["item"]["metadata"][
+        "association_state"
+    ] == "stale"
 
 
 def test_patch_distinguishes_operation_conflict_and_record_conflict_safely():

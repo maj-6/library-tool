@@ -1731,10 +1731,41 @@ def discover_capture_build_identities(
                 payload,
                 artifact=f"build {raw_build_id} lib identity",
             )
-        identities[f"build:{raw_build_id}"] = historical_build_book_id(
-            raw_build_id,
-            identity_document,
-        )
+        linked_book_id = build.get("capture_book_id")
+        if linked_book_id not in (None, ""):
+            if (
+                not isinstance(linked_book_id, str)
+                or not _BOOK_ID_RE.fullmatch(linked_book_id)
+            ):
+                raise ValueError(
+                    f"build {raw_build_id} capture book identity is invalid"
+                )
+            identities[
+                f"build:{raw_build_id}:capture_book_id"
+            ] = linked_book_id
+            persisted_book_id = (
+                identity_document.get("book_id")
+                if isinstance(identity_document, Mapping)
+                else None
+            )
+            if persisted_book_id not in (None, ""):
+                if (
+                    not isinstance(persisted_book_id, str)
+                    or not _BOOK_ID_RE.fullmatch(persisted_book_id)
+                ):
+                    raise ValueError(
+                        f"build {raw_build_id} lib identity is invalid"
+                    )
+                identities[
+                    f"build:{raw_build_id}:lib-id"
+                ] = persisted_book_id
+        else:
+            identities[f"build:{raw_build_id}"] = (
+                historical_build_book_id(
+                    raw_build_id,
+                    identity_document,
+                )
+            )
     return identities
 
 

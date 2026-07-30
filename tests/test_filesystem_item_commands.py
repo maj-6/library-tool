@@ -131,6 +131,7 @@ def _repository(
     load_identity_reservations=None,
     lock_context_for=None,
     record_scope_for=None,
+    record_item_id_for=None,
     recover: bool = True,
 ):
     store = write_set or RecoverableWriteSet(root, publish_hook=hook)
@@ -144,6 +145,7 @@ def _repository(
         load_identity_reservations=load_identity_reservations,
         lock_context_for=lock_context_for,
         record_scope_for=record_scope_for,
+        record_item_id_for=record_item_id_for,
         recover=recover,
     )
     return store, repository
@@ -308,6 +310,42 @@ def test_scoped_repository_preserves_unselected_legacy_rows(tmp_path):
     assert rows["legacy-valid"] == unsupported
     assert rows["legacy row / invalid identity"] == invalid_identity
     assert set(decoded) == {"book"}
+
+
+def test_scoped_repository_keeps_legacy_storage_key_private(tmp_path):
+    root = tmp_path / "legacy-storage-key"
+    storage_key = "../legacy row/private alias"
+    _write_catalogue(
+        root,
+        {
+            storage_key: _raw_record(),
+            "unselected": {"title": ["unsupported"]},
+        },
+    )
+    _, repository = _repository(
+        root,
+        record_scope_for=lambda key: key == storage_key,
+        record_item_id_for=lambda _key: "capture-stable",
+    )
+
+    updated = ItemCommandService(repository).update(
+        UpdateItemCommand(
+            item_id="capture-stable",
+            expected_revision="rev-1",
+            patch=ItemPatch(title="Corrected capture"),
+            operation_id="legacy-storage-update",
+        )
+    )
+
+    assert updated.receipt.item_id == "capture-stable"
+    rows = _catalogue(root)
+    assert set(rows) == {storage_key, "unselected"}
+    assert rows[storage_key]["title"] == "Corrected capture"
+    assert rows["unselected"] == {"title": ["unsupported"]}
+    assert storage_key.encode("utf-8") not in _receipt_path(
+        root,
+        "legacy-storage-update",
+    ).read_bytes()
 
 
 def test_staging_does_not_publish_without_commit(tmp_path):
