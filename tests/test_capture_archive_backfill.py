@@ -22,6 +22,7 @@ from librarytool.engine.capture_archives import (
     CaptureArchiveService,
     capture_book_id,
 )
+from librarytool.engine.errors import RepositoryError
 
 
 def _entry(capture_id: str, *, book_id: str = "") -> dict:
@@ -207,14 +208,18 @@ def test_cloud_update_runs_after_archive_and_resumes_without_resealing(
 
     assert first["ok"] is False
     assert first["summary"]["created"] == 1
-    assert first["summary"]["failed"] == 0
+    assert first["summary"]["failed"] == 1
+    assert first["summary"]["local_failed"] == 0
     assert first["summary"]["cloud_succeeded"] == 0
     assert first["summary"]["cloud_failed"] == 1
     assert first["diagnostics"][0]["status"] == "created"
+    assert first["diagnostics"][0]["local_status"] == "created"
+    assert first["diagnostics"][0]["overall_status"] == "failed"
     assert first["diagnostics"][0]["changed"] is True
     assert first["diagnostics"][0]["cloud_update"] == {
         "status": "failed",
         "code": "capture_cloud_update_failed",
+        "cause_code": "unexpected_publisher_error",
         "message": "RuntimeError",
     }
     assert service.get(capture_id) is not None
@@ -243,6 +248,8 @@ def test_cloud_update_runs_after_archive_and_resumes_without_resealing(
     assert resumed["summary"]["unchanged"] == 1
     assert resumed["summary"]["cloud_succeeded"] == 1
     assert resumed["summary"]["cloud_failed"] == 0
+    assert resumed["diagnostics"][0]["local_status"] == "unchanged"
+    assert resumed["diagnostics"][0]["overall_status"] == "unchanged"
     assert resumed["diagnostics"][0]["cloud_update"]["status"] == "succeeded"
     assert converged["ok"] is True
     assert converged["summary"]["unchanged"] == 1
@@ -297,6 +304,77 @@ def test_cloud_update_is_not_called_for_dry_run_or_archive_failure(tmp_path):
     assert failed["summary"]["cloud_failed"] == 0
     assert publisher.calls == []
     assert service.get(capture_id) is None
+
+
+def test_cloud_engine_failure_retains_safe_code_and_retryability(tmp_path):
+    capture_id = "capture-cloud-engine-error"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    entries = {"manual-cloud": _entry(capture_id)}
+    workspace = tmp_path / "workspace"
+    service, materializer, _write_set = _runtime(workspace)
+
+    class FailingPublisher:
+        def publish(self, _association) -> None:
+            raise RepositoryError(
+                "temporary cloud publication unavailable",
+                code="capture_cloud_transport_unavailable",
+                retryable=True,
+            )
+
+    report = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=service,
+        materializer=materializer,
+        association_publisher=FailingPublisher(),
+        apply=True,
+    )
+
+    assert report["ok"] is False
+    assert report["summary"]["created"] == 1
+    assert report["summary"]["failed"] == 1
+    assert report["summary"]["local_failed"] == 0
+    assert report["summary"]["cloud_failed"] == 1
+    assert report["diagnostics"][0]["status"] == "created"
+    assert report["diagnostics"][0]["overall_status"] == "failed"
+    assert report["diagnostics"][0]["cloud_update"] == {
+        "status": "failed",
+        "code": "capture_cloud_update_failed",
+        "cause_code": "capture_cloud_transport_unavailable",
+        "message": "temporary cloud publication unavailable",
+        "retryable": True,
+    }
+
+
+def test_cloud_engine_failure_quarantines_unsafe_diagnostic_values(tmp_path):
+    capture_id = "capture-cloud-private-error"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    entries = {"manual-cloud": _entry(capture_id)}
+    workspace = tmp_path / "workspace"
+    service, materializer, _write_set = _runtime(workspace)
+
+    class UnsafePublisher:
+        def publish(self, _association) -> None:
+            raise RepositoryError(
+                r"failed at C:\private\capture-token.json",
+                code="../private-token",
+            )
+
+    report = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=service,
+        materializer=materializer,
+        association_publisher=UnsafePublisher(),
+        apply=True,
+    )
+
+    cloud_update = report["diagnostics"][0]["cloud_update"]
+    assert cloud_update["cause_code"] == "engine_error"
+    assert cloud_update["message"] == "capture cloud update failed"
+    assert cloud_update["retryable"] is False
 
 
 def test_apply_preserves_legacy_identity_and_second_run_is_noop(tmp_path):

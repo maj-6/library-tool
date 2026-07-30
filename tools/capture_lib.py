@@ -59,6 +59,7 @@ _MAX_DIAGNOSTIC_TEXT = 240
 _NUMBERED_IMAGE_RE = re.compile(r"^(orig|photo)_([1-9][0-9]*)\.jpg$")
 _BOOK_ID_RE = re.compile(r"^b-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _ASSET_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _WINDOWS_PATH_RE = re.compile(r"(?:^|[\s\"'(])[A-Za-z]:[\\/]")
 _ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
@@ -1611,6 +1612,24 @@ def _bounded_diagnostic_text(value: Any) -> str:
     return text[:_MAX_DIAGNOSTIC_TEXT]
 
 
+def _safe_engine_error_diagnostic(
+    error: EngineError,
+) -> dict[str, Any]:
+    cause_code = str(error.code or "")
+    if not _DIAGNOSTIC_CODE_RE.fullmatch(cause_code):
+        cause_code = "engine_error"
+    message = _bounded_diagnostic_text(error)
+    if not message or _looks_like_local_locator(message):
+        message = "capture cloud update failed"
+    return {
+        "status": "failed",
+        "code": "capture_cloud_update_failed",
+        "cause_code": cause_code,
+        "message": message,
+        "retryable": bool(error.retryable),
+    }
+
+
 def _diagnostic(
     *,
     capture_id: str,
@@ -1634,7 +1653,14 @@ def _diagnostic(
         "association": dict(association) if association is not None else None,
     }
     if cloud_update is not None:
-        diagnostic["cloud_update"] = dict(cloud_update)
+        detached_cloud_update = dict(cloud_update)
+        diagnostic["cloud_update"] = detached_cloud_update
+        diagnostic["local_status"] = status
+        diagnostic["overall_status"] = (
+            "failed"
+            if detached_cloud_update.get("status") == "failed"
+            else status
+        )
     return diagnostic
 
 
@@ -2043,16 +2069,13 @@ def backfill_capture_archives(
             association_publisher.publish(association)
         except EngineError as exc:
             cloud_counts["failed"] += 1
-            return {
-                "status": "failed",
-                "code": "capture_cloud_update_failed",
-                "message": _bounded_diagnostic_text(str(exc)),
-            }
+            return _safe_engine_error_diagnostic(exc)
         except Exception as exc:
             cloud_counts["failed"] += 1
             return {
                 "status": "failed",
                 "code": "capture_cloud_update_failed",
+                "cause_code": "unexpected_publisher_error",
                 "message": type(exc).__name__,
             }
         cloud_counts["succeeded"] += 1
@@ -2250,7 +2273,8 @@ def backfill_capture_archives(
             )
         )
 
-    failed = counts.get("failed", 0)
+    local_failed = counts.get("failed", 0)
+    failed = local_failed + cloud_counts["failed"]
     summary = {
         "total": sum(counts.values()),
         "created": counts.get("created", 0),
@@ -2261,6 +2285,7 @@ def backfill_capture_archives(
     }
     if apply and association_publisher is not None:
         summary.update({
+            "local_failed": local_failed,
             "cloud_succeeded": cloud_counts["succeeded"],
             "cloud_failed": cloud_counts["failed"],
         })
@@ -2268,7 +2293,7 @@ def backfill_capture_archives(
         "schema": "org.whl.capture-lib-backfill-report",
         "version": 1,
         "mode": "apply" if apply else "dry-run",
-        "ok": failed == 0 and cloud_counts["failed"] == 0,
+        "ok": failed == 0,
         "summary": summary,
         "diagnostics": diagnostics,
     }
