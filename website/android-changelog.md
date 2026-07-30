@@ -3,6 +3,22 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.5 — 2026-07-30
+
+Android version code: `36`.
+
+### Additions
+
+- Captures that age out of the recent list are archived instead of deleted, and can be read from **Settings › Captures on this phone › Browse archive**.
+- When the photo budget is reached an archived capture keeps its bibliography, notes, and processing history and drops only its photos, so the record survives rather than the whole capture disappearing.
+- Captures can be exported to a folder you choose, including one on an SD card or a cloud provider, so they survive reinstalling the app.
+
+### Bugfixes
+
+- A capture whose text extraction failed no longer looks like a failed upload. Its photos had already been delivered; the row now says which of the two failed.
+- Pressing **Sync** when nothing is outstanding explains why instead of only saying no captures are ready, so a screen of failed rows and an empty sync no longer contradict each other.
+- Books are no longer marked **partial** because the extracted year arrived as a number rather than as text. Only a field whose value was actually lost makes a capture partial, and affected books stop reporting partial once reprocessed.
+
 ## 0.5.2-alpha.4 — 2026-07-29
 
 Android version code: `35`.
