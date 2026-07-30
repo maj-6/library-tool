@@ -7630,7 +7630,7 @@ def _capture_promotion_hash(command: _CapturePromotionCommand) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _capture_promotion_draft(
+def _capture_promotion_hydrated_draft(
         source_snapshot: _CaptureManualSourceSnapshot,
         requested: ItemDraft,
 ) -> tuple[ItemDraft, dict]:
@@ -7654,6 +7654,79 @@ def _capture_promotion_draft(
         _engine_item_category_ids
     ).validate_create(draft)
     return draft, safe_extra
+
+
+def _capture_promotion_draft(
+        source_snapshot: _CaptureManualSourceSnapshot,
+        requested: ItemDraft,
+) -> tuple[ItemDraft, dict]:
+    """Hydrate the draft while preserving the promotion lock test seam."""
+
+    return _capture_promotion_hydrated_draft(
+        source_snapshot,
+        requested,
+    )
+
+
+def _capture_promotion_explicit_fields(requested: ItemDraft) -> set[str]:
+    return (
+        set(requested.metadata)
+        | ({"title"} if requested.title else set())
+    )
+
+
+def _capture_promotion_comparison_source(
+        source_snapshot: _CaptureManualSourceSnapshot,
+        safe_extra: Mapping,
+) -> dict:
+    comparison_source = dict(source_snapshot.record)
+    comparison_source["extra"] = dict(safe_extra)
+    comparison_source["images"] = _clean_images(
+        source_snapshot.record.get("images")
+    )
+    return comparison_source
+
+
+def _capture_promotion_preflight_changes_source(
+        command: _CapturePromotionCommand,
+) -> bool | None:
+    """Compare a source-pinned promotion before any catalogue publication.
+
+    ``None`` means that the source pin could not be established. The command
+    service performs the authoritative locked check; exact receipt replays use
+    their conservative post-result repair path.
+    """
+
+    source_snapshot = _capture_manual_source_snapshot(command.capture_id)
+    if (
+        source_snapshot is None
+        or source_snapshot.record_revision
+        != command.expected_source_revision
+    ):
+        return None
+    draft, safe_extra = _capture_promotion_hydrated_draft(
+        source_snapshot,
+        command.item,
+    )
+    preview = dict(_ENGINE_ITEM_CODEC.encode(
+        "capture-promotion-preview",
+        draft,
+        None,
+    ))
+    preview["images"] = _clean_images(
+        source_snapshot.record.get("images")
+    )
+    preview["extra"] = safe_extra
+    return _capture_promotion_changes_source(
+        preview,
+        _capture_promotion_comparison_source(
+            source_snapshot,
+            safe_extra,
+        ),
+        explicit_fields=_capture_promotion_explicit_fields(
+            command.item
+        ),
+    )
 
 
 def _capture_promotion_replay(
@@ -7686,33 +7759,34 @@ def _capture_promotion_replay(
     source_snapshot = _capture_manual_source_snapshot_locked(
         command.capture_id
     )
-    comparison_source = (
-        dict(source_snapshot.record)
-        if source_snapshot is not None
-        else {}
+    source_matches = (
+        source_snapshot is not None
+        and source_snapshot.record_revision
+        == command.expected_source_revision
     )
-    if isinstance(comparison_source.get("extra"), Mapping):
-        comparison_source["extra"] = (
-            _MANUAL_ENTRY_ITEM_CODEC.public_extra(
-                comparison_source["extra"]
+    comparison_source = {}
+    if source_matches:
+        safe_extra = {}
+        if isinstance(source_snapshot.record.get("extra"), Mapping):
+            safe_extra = _MANUAL_ENTRY_ITEM_CODEC.public_extra(
+                source_snapshot.record["extra"]
             )
+        comparison_source = _capture_promotion_comparison_source(
+            source_snapshot,
+            safe_extra,
         )
-    comparison_source["images"] = _clean_images(
-        comparison_source.get("images")
-    )
     return _CapturePromotionResult(
         receipt=prior,
         build=dict(raw),
         source_revision=command.expected_source_revision,
         replayed=True,
         changes_source=(
-            bool(comparison_source)
-            and _capture_promotion_changes_source(
+            not source_matches
+            or _capture_promotion_changes_source(
                 raw,
                 comparison_source,
-                explicit_fields=(
-                    set(command.item.metadata)
-                    | ({"title"} if command.item.title else set())
+                explicit_fields=_capture_promotion_explicit_fields(
+                    command.item
                 ),
             )
         ),
@@ -7826,17 +7900,14 @@ def _promote_capture(
                     ),
                 ))
 
-            comparison_source = dict(source_snapshot.record)
-            comparison_source["extra"] = safe_extra
-            comparison_source["images"] = _clean_images(
-                source_snapshot.record.get("images")
-            )
             changes_source = _capture_promotion_changes_source(
                 raw,
-                comparison_source,
-                explicit_fields=(
-                    set(command.item.metadata)
-                    | ({"title"} if command.item.title else set())
+                _capture_promotion_comparison_source(
+                    source_snapshot,
+                    safe_extra,
+                ),
+                explicit_fields=_capture_promotion_explicit_fields(
+                    command.item
                 ),
             )
             staged = unit.stage_managed_create(item_id, raw)
@@ -8566,11 +8637,24 @@ def api_v1_capture_promotions_create():
 
     try:
         command = _capture_promotion_command()
+        preflight_changes_source = (
+            _capture_promotion_preflight_changes_source(command)
+        )
+        if preflight_changes_source:
+            # Invalidate outside the promotion lock chain and before catalogue
+            # publication. A later CAS/race failure can leave a conservative
+            # stale snapshot, but a successful promotion can never leave an
+            # outdated archive marked current.
+            _mark_capture_archive_stale(command.capture_id)
         result = _promote_capture(command)
-        if result.changes_source:
-            # A failed invalidation makes the committed response ambiguous,
-            # not successful. The same operation replays the durable build
-            # and retries this gate without allocating another item.
+        if (
+            result.changes_source
+            and not preflight_changes_source
+            and result.replayed
+        ):
+            # A receipt replay can outlive its original source row or pin. It
+            # does not publish new catalogue state, so repair that historical
+            # mismatch after the service has proved the replay identity.
             _mark_capture_archive_stale(command.capture_id)
     except EngineError as exc:
         return _engine_error_response(exc)

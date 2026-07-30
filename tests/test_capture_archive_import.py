@@ -2303,7 +2303,7 @@ def test_capture_promotion_source_failure_leaves_no_orphan(monkeypatch):
     assert lib.load_json(server.BUILDS_PATH, {}) == {}
 
 
-def test_capture_promotion_replay_repairs_post_commit_invalidation(
+def test_capture_promotion_invalidation_failure_leaves_no_build_and_new_operation_retries(
         monkeypatch):
     capture_id = "transactional_promotion_replay_gate.1"
     _entry_id, association = _ingest_associated_capture(
@@ -2319,7 +2319,7 @@ def test_capture_promotion_replay_repairs_post_commit_invalidation(
         calls.append(requested_capture_id)
         if len(calls) == 1:
             raise server.EngineRepositoryError(
-                "injected post-commit invalidation failure",
+                "injected pre-commit invalidation failure",
                 code="capture_archive_stale_unavailable",
                 retryable=True,
             )
@@ -2331,29 +2331,83 @@ def test_capture_promotion_replay_repairs_post_commit_invalidation(
         source.record_revision,
         metadata={"source_url": "https://example.test/new-source"},
     )
-    headers = {"Idempotency-Key": "promotion-replay-gate"}
 
     with server.app.test_client() as client:
         failed = client.post(
             "/api/v1/capture-promotions",
             json=document,
-            headers=headers,
+            headers={"Idempotency-Key": "promotion-failed-gate"},
         )
-        assert len(lib.load_json(server.BUILDS_PATH, {})) == 1
-        replayed = client.post(
+        assert lib.load_json(server.BUILDS_PATH, {}) == {}
+        assert server._capture_archive_association(
+            capture_id
+        ).state.value == "current"
+        retried = client.post(
             "/api/v1/capture-promotions",
             json=document,
-            headers=headers,
+            headers={"Idempotency-Key": "promotion-browser-reload"},
         )
 
     assert failed.status_code == 503
     assert failed.get_json()["code"] == (
         "capture_archive_stale_unavailable"
     )
+    assert retried.status_code == 201, retried.get_json()
+    assert retried.get_json()["replayed"] is False
+    assert len(lib.load_json(server.BUILDS_PATH, {})) == 1
+    assert calls == [capture_id, capture_id]
+    stale = server._capture_archive_association(capture_id)
+    assert stale is not None
+    assert stale.state.value == "stale"
+    assert stale.archive_sha256 == association.archive_sha256
+
+
+@pytest.mark.parametrize("source_change", ["delete", "edit"])
+def test_capture_promotion_replay_marks_archive_stale_when_source_pin_is_lost(
+        monkeypatch, source_change):
+    capture_id = f"promotion_replay_lost_source_pin.{source_change}"
+    entry_id, association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    source = server._capture_manual_source_snapshot(capture_id)
+    assert source is not None
+    document = _capture_promotion_document(
+        capture_id,
+        source.record_revision,
+    )
+    headers = {"Idempotency-Key": f"lost-source-pin-{source_change}"}
+
+    with server.app.test_client() as client:
+        created = client.post(
+            "/api/v1/capture-promotions",
+            json=document,
+            headers=headers,
+        )
+        assert created.status_code == 201, created.get_json()
+        assert server._capture_archive_association(
+            capture_id
+        ).state.value == "current"
+
+        with server._manual_lock:
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+            if source_change == "delete":
+                del entries[entry_id]
+            else:
+                entries[entry_id]["notes"] = (
+                    "Changed after the source-pinned promotion"
+                )
+            server._save_manual_entries(entries)
+
+        replayed = client.post(
+            "/api/v1/capture-promotions",
+            json=document,
+            headers=headers,
+        )
+
     assert replayed.status_code == 200, replayed.get_json()
     assert replayed.get_json()["replayed"] is True
     assert len(lib.load_json(server.BUILDS_PATH, {})) == 1
-    assert calls == [capture_id, capture_id]
     stale = server._capture_archive_association(capture_id)
     assert stale is not None
     assert stale.state.value == "stale"
