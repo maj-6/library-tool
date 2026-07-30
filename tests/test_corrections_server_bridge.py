@@ -298,6 +298,27 @@ def test_production_bridge_lists_and_serves_capture_artifacts(
     assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
+def test_corrections_projection_keeps_runtime_workbench_policies(
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    native = server._item_engine()
+    corrections = server._corrections_item_engine()
+    assert [policy.policy_id for policy in corrections.policies] == [
+        policy.policy_id for policy in native.policies
+    ]
+    assert corrections.policies
+
+    native_state = native.get_item(BOOK_ID).workbench_state
+    corrections_state = corrections.get_item(BOOK_ID).workbench_state
+    assert corrections_state.readiness == native_state.readiness
+    assert corrections_state.available_commands == (
+        native_state.available_commands
+    )
+
+
 def test_capture_only_target_is_visible_and_stays_canonical_after_promotion(
     client,
     corrections_workspace,
@@ -692,6 +713,13 @@ def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
                         f"captures/{CAPTURE_ID}/private-photo.jpg"
                     ],
                     "local_pdf": "C:/private/capture.pdf",
+                    "extra": {
+                        "scan_collection_id": "private-collection",
+                        "generated": {
+                            "caption": "Automatically assigned caption",
+                            "local_path": "C:/private/plate.jpg",
+                        },
+                    },
                 }
             },
         )
@@ -703,8 +731,15 @@ def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
     assert before["kind"] == "capture"
     assert before["metadata"]["authors"] == "A. Botanist"
     assert before["metadata"]["publisher_city"] == "Bath"
+    assert before["metadata"]["extra"] == {
+        "generated": {
+            "caption": "Automatically assigned caption",
+        },
+    }
     assert "local_pdf" not in detail.get_data(as_text=True)
     assert "private-photo.jpg" not in detail.get_data(as_text=True)
+    assert "private-collection" not in detail.get_data(as_text=True)
+    assert "private/plate.jpg" not in detail.get_data(as_text=True)
 
     document = {
         "patch": {
@@ -713,6 +748,11 @@ def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
                 "authors": "B. Botanist",
                 "publisher_city": "Edinburgh",
                 "condition": "Good",
+                "extra": {
+                    "generated": {
+                        "caption": "Corrected botanical caption",
+                    },
+                },
             },
             "metadata_remove": ["year"],
         }
@@ -732,6 +772,11 @@ def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
     assert after["metadata"]["authors"] == "B. Botanist"
     assert after["metadata"]["publisher_city"] == "Edinburgh"
     assert after["metadata"]["condition"] == "Good"
+    assert after["metadata"]["extra"] == {
+        "generated": {
+            "caption": "Corrected botanical caption",
+        },
+    }
     assert "year" not in after["metadata"]
     assert after["record_revision"] != before["record_revision"]
     assert replay.status_code == 200
@@ -754,6 +799,13 @@ def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
         f"captures/{CAPTURE_ID}/private-photo.jpg"
     ]
     assert stored["local_pdf"] == "C:/private/capture.pdf"
+    assert stored["extra"] == {
+        "scan_collection_id": "private-collection",
+        "generated": {
+            "caption": "Corrected botanical caption",
+            "local_path": "C:/private/plate.jpg",
+        },
+    }
 
     second_client = client.application.test_client()
     stale = second_client.patch(

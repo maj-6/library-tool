@@ -205,6 +205,11 @@ test("captured entries and books show canonical identity without storage details
       storage_id: "manual-row-raw-key",
       capture_id: "private-capture-key",
       notes: "Leaf fragment enclosed",
+      extra: {
+        illustration: {
+          caption: "Aloe, supplied by the cataloguer",
+        },
+      },
     },
   });
   const api = {
@@ -223,6 +228,11 @@ test("captured entries and books show canonical identity without storage details
     /storage_id|capture_id|manual-row-raw-key|private-capture-key/);
   assert.deepEqual(editableMetadata(raw.metadata), {
     authors: "Unknown",
+    extra: {
+      illustration: {
+        caption: "Aloe, supplied by the cataloguer",
+      },
+    },
     notes: "Leaf fragment enclosed",
   });
 

@@ -6945,8 +6945,10 @@ def _item_engine() -> ItemQueryService:
 def _corrections_item_engine() -> ItemQueryService:
     """Expose the canonical capture-aware projection only to Corrections."""
 
+    native_items = _item_engine()
     return ItemQueryService(
-        FilesystemItemQueryRepository(_corrections_item_snapshot)
+        FilesystemItemQueryRepository(_corrections_item_snapshot),
+        policies=native_items.policies,
     )
 
 
@@ -7307,10 +7309,6 @@ class _CorrectionsItemUpdateService:
             )
         with _corrections_workspace_locks():
             target = _corrections_item_current_target(command.item_id)
-            _corrections_item_validate_writable_patch(
-                target,
-                command.patch,
-            )
             storage_kind = target.storage_kind
             storage_id = target.storage_id
         replay = _corrections_promoted_manual_replay(
@@ -7320,6 +7318,10 @@ class _CorrectionsItemUpdateService:
         if replay is not None:
             return replay
 
+        _corrections_item_validate_writable_patch(
+            target,
+            command.patch,
+        )
         _corrections_item_invalidate_capture(command)
         delegated = UpdateItemCommand(
             item_id=storage_id,

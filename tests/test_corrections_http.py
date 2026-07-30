@@ -1250,11 +1250,21 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
             extensions={"capture_order": 1},
         ),
     )
+    captured_item = _item(title="Captured Herbal")
+    captured_item = replace(
+        captured_item,
+        workbench_state=WorkbenchState(
+            item_id=captured_item.item_id,
+            revision="book-1-workbench-capture-r1",
+            readiness={"source": "missing", "text": "missing"},
+            issues=("representation.missing", "text.missing"),
+        ),
+    )
     app, _repository = _projected_harness(
         tmp_path,
         rows,
         (),
-        items=_Items((_item(title="Captured Herbal"),)),
+        items=_Items((captured_item,)),
         actor_id_for_request=lambda: "account-42",
     )
     client = app.test_client()
@@ -1270,6 +1280,7 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
     book = body["books"][0]
     assert book["kind"] == "book"
     assert book["title"] == "Captured Herbal"
+    assert book["issues"] == ["text.missing"]
     assert [
         capture["artifact_id"] for capture in book["captures"]
     ] == ["capture:asset-1:display"]

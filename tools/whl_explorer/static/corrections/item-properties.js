@@ -46,7 +46,6 @@
       "pdf_file",
       "pdf_sources",
       "images",
-      "extra",
       "storage_id",
       "active_storage_id",
       "manual_entry_id",

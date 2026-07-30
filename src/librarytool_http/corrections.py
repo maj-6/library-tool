@@ -1784,7 +1784,14 @@ def _book_issues(
     item: ItemView,
     captures: Sequence[Mapping[str, Any]],
 ) -> list[str]:
-    issues = list(item.workbench_state.issues)
+    issues = [
+        value
+        for value in item.workbench_state.issues
+        if not (
+            value == "representation.missing"
+            and captures
+        )
+    ]
     missing = sum(
         value["resource_state"] == "missing" for value in captures
     )
