@@ -120,6 +120,7 @@ class MainActivity : AppCompatActivity() {
     private var voicePermissionRequestedForEnablement = false
     private var extraFieldsDialog: AlertDialog? = null
     private var cameraSettingsDialog: AlertDialog? = null
+    private var catalogCheckDialog: AlertDialog? = null
     private var lastBookPreviewJob: Job? = null
     private var lastBookPreviewRefreshPending = false
     private var lastBookPreviewFingerprint: String? = null
@@ -148,6 +149,8 @@ class MainActivity : AppCompatActivity() {
     private data class AcceptedShot(
         var reservation: CaptureSession.PhotoReservation,
         val acceptedAtNanos: Long,
+        /** Durable request written before this shot is submitted to CameraX. */
+        val catalogCheckRequestId: String?,
         var startedAtNanos: Long? = null,
     )
 
@@ -168,6 +171,11 @@ class MainActivity : AppCompatActivity() {
         val bitmap: android.graphics.Bitmap?,
         val fingerprint: String?,
         val thumbnailChanged: Boolean,
+    )
+
+    private data class CatalogCheckLoad(
+        val record: CatalogCheckRecord,
+        val updatedAt: Long,
     )
 
     private sealed interface CaptureUndoOutcome {
@@ -198,6 +206,7 @@ class MainActivity : AppCompatActivity() {
         })
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         session = CaptureSession(this)
+        reconcileCatalogCheckIntent()
         pendingCommand = Prefs.pendingCaptureCommand(this, session.entryId)
         pendingUndoTargetPage = Prefs.pendingCaptureTargetPage(this, session.entryId)
         cues = AudioCues(this)
@@ -272,6 +281,59 @@ class MainActivity : AppCompatActivity() {
         submitDeferredCaptureIfReady()
         updateUi()
         refreshLastCapturedBook()
+        refreshCatalogCheckResult()
+    }
+
+    /**
+     * Close the process-death window around CameraX publication.
+     *
+     * A request without an asset id was durably accepted but not yet bound to
+     * a registered JPEG. If the final JPEG exists, commit won the race and we
+     * can recover its stable identity. If no callback still owns a temporary,
+     * the capture was interrupted and must become a terminal failure instead
+     * of remaining "processing" forever.
+     */
+    private fun reconcileCatalogCheckIntent() {
+        val entryId = session.entryId ?: return
+        val dir = session.entryDir(entryId)
+        val request = CatalogCheckStore.read(dir)
+            ?.takeIf {
+                it.state == CatalogCheckState.PENDING &&
+                    it.targetAssetId == null
+            } ?: return
+        val photo = File(dir, "photo_${request.targetPage}.jpg")
+        val asset = photo.takeIf { it.isFile }?.let {
+            runCatching { PhotoAssetStore.descriptor(dir, it) }.getOrNull()
+        }
+        if (asset != null) {
+            val recovered = runCatching {
+                CatalogCheckStore.bindOrRetarget(
+                    dir = dir,
+                    requestId = request.requestId,
+                    targetAssetId = asset.assetId,
+                    page = asset.captureOrder,
+                )
+            }.getOrNull()
+            if (recovered == null) {
+                failCatalogCheckRequest(
+                    dir,
+                    request.requestId,
+                    "Catalog check could not recover the captured photo identity",
+                )
+            } else {
+                // Process death may also have won before the original commit
+                // callback reached its enqueue step.
+                ProcessWorker.enqueue(this)
+            }
+            return
+        }
+        if (!session.hasActiveCaptureWrites()) {
+            failCatalogCheckRequest(
+                dir,
+                request.requestId,
+                "Capture was interrupted before the catalog check photo was saved",
+            )
+        }
     }
 
     /** After a config change / process death, CaptureSession re-adopts the open
@@ -326,6 +388,8 @@ class MainActivity : AppCompatActivity() {
         extraFieldsDialog = null
         cameraSettingsDialog?.dismiss()
         cameraSettingsDialog = null
+        catalogCheckDialog?.dismiss()
+        catalogCheckDialog = null
         lastBookPreviewRefreshPending = false
         lastBookPreviewJob?.cancel()
         lastBookPreviewJob = null
@@ -364,9 +428,19 @@ class MainActivity : AppCompatActivity() {
     private fun abortUnsubmittedDeferredCapture() {
         if (!deferredCaptureSubmission) return
         captureQueue.cancelAll().forEach { ticket ->
-            acceptedShots.remove(ticket.id)?.let { session.abortPhoto(it.reservation) }
+            acceptedShots.remove(ticket.id)?.let {
+                abortAcceptedShot(
+                    it,
+                    "Capture stopped before the catalog check photo was submitted",
+                )
+            }
         }
-        acceptedShots.values.forEach { session.abortPhoto(it.reservation) }
+        acceptedShots.values.forEach {
+            abortAcceptedShot(
+                it,
+                "Capture stopped before the catalog check photo was submitted",
+            )
+        }
         acceptedShots.clear()
         deferredCaptureSubmission = false
     }
@@ -1588,6 +1662,10 @@ class MainActivity : AppCompatActivity() {
                 if (!session.active) cues.error("no entry open")
                 else takePhoto()
             }
+            "check" -> {
+                if (!session.active) cues.error("no entry open")
+                else takePhoto(checkCatalogs = true)
+            }
             "done" -> {
                 if (!session.active) cues.error("nothing to save")
                 else {
@@ -1924,14 +2002,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun takePhoto() {
+    private fun takePhoto(checkCatalogs: Boolean = false) {
         if (imageCapture == null) return cues.error("camera not ready")
         if (pendingCommand != null) return cues.error("capture is finishing")
         session.refreshPhotoCount()
 
         when (val acceptance = captureQueue.accept(session.photoCount + 1)) {
             is ShallowCaptureQueue.Acceptance.Started -> {
-                if (!reserveAcceptedShot(acceptance.ticket)) {
+                if (!reserveAcceptedShot(acceptance.ticket, checkCatalogs)) {
                     captureQueue.finishActive(success = false)
                     cues.error("could not reserve capture")
                     setStatus("Capture error: could not reserve a file")
@@ -1943,7 +2021,7 @@ class MainActivity : AppCompatActivity() {
                 submitCapture(acceptance.ticket)
             }
             is ShallowCaptureQueue.Acceptance.Queued -> {
-                if (!reserveAcceptedShot(acceptance.ticket)) {
+                if (!reserveAcceptedShot(acceptance.ticket, checkCatalogs)) {
                     captureQueue.cancelQueued()
                     cues.error("could not queue capture")
                     setStatus("Capture error: could not reserve a queued file")
@@ -1960,11 +2038,31 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun reserveAcceptedShot(ticket: ShallowCaptureQueue.Ticket): Boolean {
+    private fun reserveAcceptedShot(
+        ticket: ShallowCaptureQueue.Ticket,
+        checkCatalogs: Boolean,
+    ): Boolean {
         val reservation = session.reservePhoto(ticket.pageNumber) ?: return false
+        val catalogCheckRequestId = if (checkCatalogs) {
+            try {
+                CatalogCheckStore.request(
+                    dir = checkNotNull(reservation.finalFile.parentFile),
+                    page = reservation.pageNumber,
+                ).requestId
+            } catch (error: Exception) {
+                session.abortPhoto(reservation)
+                Log.e(
+                    CAMERA_LOG_TAG,
+                    "Could not persist catalog check intent for page=${ticket.pageNumber}",
+                    error,
+                )
+                return false
+            }
+        } else null
         acceptedShots[ticket.id] = AcceptedShot(
             reservation = reservation,
             acceptedAtNanos = SystemClock.elapsedRealtimeNanos(),
+            catalogCheckRequestId = catalogCheckRequestId,
         )
         return true
     }
@@ -2035,6 +2133,15 @@ class MainActivity : AppCompatActivity() {
     ) {
         val shot = acceptedShots[ticket.id]
         if (captureQueue.active?.id != ticket.id || shot?.reservation != reservation) {
+            if (shot?.reservation == reservation) {
+                shot.catalogCheckRequestId?.let { requestId ->
+                    failCatalogCheckRequest(
+                        checkNotNull(reservation.finalFile.parentFile),
+                        requestId,
+                        "Capture completed after its catalog check request was cancelled",
+                    )
+                }
+            }
             session.abortPhoto(reservation)
             return
         }
@@ -2051,8 +2158,52 @@ class MainActivity : AppCompatActivity() {
             } catch (error: Exception) {
                 error
             }
+            val checkRequestId = shot.catalogCheckRequestId
+            val checkRequestError =
+                if (commitError == null && checkRequestId != null) {
+                    runCatching {
+                        val dir = checkNotNull(reservation.finalFile.parentFile)
+                        val asset = checkNotNull(
+                            PhotoAssetStore.descriptor(dir, reservation.finalFile),
+                        ) { "captured photo identity is unavailable" }
+                        val bound = CatalogCheckStore.bindOrRetarget(
+                            dir = dir,
+                            requestId = checkRequestId,
+                            page = reservation.pageNumber,
+                            targetAssetId = asset.assetId,
+                        )
+                        // A newer Check may intentionally supersede this one
+                        // while its shot is queued. Otherwise a null binding
+                        // means the durable request was lost or terminalized.
+                        val current = CatalogCheckStore.read(dir)
+                        if (bound == null &&
+                            (current == null || current.requestId == checkRequestId)
+                        ) {
+                            error("catalog check photo identity could not be bound")
+                        }
+                    }.exceptionOrNull()
+                } else null
+            if (commitError != null && checkRequestId != null) {
+                failCatalogCheckRequest(
+                    checkNotNull(reservation.finalFile.parentFile),
+                    checkRequestId,
+                    captureFailureMessage(commitError),
+                )
+            } else if (checkRequestError != null && checkRequestId != null) {
+                failCatalogCheckRequest(
+                    checkNotNull(reservation.finalFile.parentFile),
+                    checkRequestId,
+                    "Catalog check could not bind the captured photo: " +
+                        (checkRequestError.message ?: checkRequestError.javaClass.simpleName),
+                )
+            }
             ContextCompat.getMainExecutor(this).execute {
-                finishCaptureCommit(ticket, reservation, commitError)
+                finishCaptureCommit(
+                    ticket,
+                    reservation,
+                    commitError,
+                    checkRequestError,
+                )
             }
         }
     }
@@ -2061,6 +2212,7 @@ class MainActivity : AppCompatActivity() {
         ticket: ShallowCaptureQueue.Ticket,
         reservation: CaptureSession.PhotoReservation,
         commitError: Exception?,
+        checkRequestError: Throwable?,
     ) {
         val shot = acceptedShots[ticket.id]
         if (captureQueue.active?.id != ticket.id || shot?.reservation != reservation) {
@@ -2078,8 +2230,16 @@ class MainActivity : AppCompatActivity() {
                 nanosToMillis(saved - (shot.startedAtNanos ?: shot.acceptedAtNanos)),
         )
         if (canUpdateCaptureUi()) {
-            setStatus("Capture saved")
+            setStatus(
+                when {
+                    checkRequestError != null -> getString(R.string.catalog_check_request_failed)
+                    shot.catalogCheckRequestId != null ->
+                        getString(R.string.catalog_check_processing)
+                    else -> "Capture saved"
+                },
+            )
             addThumbnail(reservation.finalFile.absolutePath)
+            if (checkRequestError != null) cues.error("catalog check could not start")
         }
         // Standardize + OCR while the user flips to the next page. Thumbnail
         // decoding also remains outside the CameraX callback's synchronous work.
@@ -2092,6 +2252,16 @@ class MainActivity : AppCompatActivity() {
         reservation: CaptureSession.PhotoReservation,
         error: Exception,
     ) {
+        acceptedShots[ticket.id]
+            ?.takeIf { it.reservation == reservation }
+            ?.catalogCheckRequestId
+            ?.let { requestId ->
+                failCatalogCheckRequest(
+                    checkNotNull(reservation.finalFile.parentFile),
+                    requestId,
+                    captureFailureMessage(error),
+                )
+            }
         session.abortPhoto(reservation)
         if (captureQueue.active?.id != ticket.id) return
         Log.e(CAMERA_LOG_TAG, "Capture page=${ticket.pageNumber} failed", error)
@@ -2100,6 +2270,41 @@ class MainActivity : AppCompatActivity() {
             setStatus("Capture error: ${error.message ?: error.javaClass.simpleName}")
         }
         completeCapture(ticket, success = false)
+    }
+
+    private fun captureFailureMessage(error: Throwable): String =
+        "Capture failed before the catalog check photo was saved: " +
+            (error.message ?: error.javaClass.simpleName)
+
+    private fun failCatalogCheckRequest(
+        dir: File,
+        requestId: String,
+        message: String,
+    ) {
+        runCatching {
+            CatalogCheckStore.fail(
+                dir = dir,
+                requestId = requestId,
+                error = message,
+            )
+        }.onFailure { error ->
+            Log.e(
+                CAMERA_LOG_TAG,
+                "Could not persist catalog check failure for ${dir.name}",
+                error,
+            )
+        }
+    }
+
+    private fun abortAcceptedShot(shot: AcceptedShot, message: String) {
+        shot.catalogCheckRequestId?.let { requestId ->
+            failCatalogCheckRequest(
+                checkNotNull(shot.reservation.finalFile.parentFile),
+                requestId,
+                message,
+            )
+        }
+        session.abortPhoto(shot.reservation)
     }
 
     private fun completeCapture(ticket: ShallowCaptureQueue.Ticket, success: Boolean) {
@@ -2128,6 +2333,28 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             waiting.reservation = compacted
+            val requestId = waiting.catalogCheckRequestId
+            if (requestId != null) {
+                val retargeted = runCatching {
+                    CatalogCheckStore.bindOrRetarget(
+                        dir = checkNotNull(compacted.finalFile.parentFile),
+                        requestId = requestId,
+                        page = next.pageNumber,
+                    )
+                }.getOrNull()
+                val current = CatalogCheckStore.read(
+                    checkNotNull(compacted.finalFile.parentFile),
+                )
+                if (retargeted == null &&
+                    (current == null || current.requestId == requestId)
+                ) {
+                    failUnsubmittedCapture(
+                        next,
+                        "could not retarget queued catalog check",
+                    )
+                    return
+                }
+            }
         }
         if (isDestroyed) {
             failUnsubmittedCapture(next, "camera activity was destroyed before queued capture")
@@ -2170,7 +2397,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun failUnsubmittedCapture(ticket: ShallowCaptureQueue.Ticket, message: String) {
         if (captureQueue.active?.id == ticket.id) deferredCaptureSubmission = false
-        acceptedShots.remove(ticket.id)?.let { session.abortPhoto(it.reservation) }
+        acceptedShots.remove(ticket.id)?.let {
+            abortAcceptedShot(
+                it,
+                "Catalog check photo was not submitted: $message",
+            )
+        }
         if (captureQueue.active?.id == ticket.id) captureQueue.finishActive(success = false)
         Log.w(CAMERA_LOG_TAG, "Capture page=${ticket.pageNumber} not submitted: $message")
         if (canUpdateCaptureUi()) {
@@ -2185,15 +2417,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun cancelQueuedCapture() {
         val ticket = captureQueue.cancelQueued() ?: return
-        acceptedShots.remove(ticket.id)?.let { session.abortPhoto(it.reservation) }
+        acceptedShots.remove(ticket.id)?.let {
+            abortAcceptedShot(
+                it,
+                "Queued catalog check photo was cancelled before capture",
+            )
+        }
         Log.i(CAMERA_LOG_TAG, "Cancelled queued capture page=${ticket.pageNumber}")
     }
 
     private fun discardAllCaptureRequests() {
         captureQueue.cancelAll().forEach { ticket ->
-            acceptedShots.remove(ticket.id)?.let { session.abortPhoto(it.reservation) }
+            acceptedShots.remove(ticket.id)?.let {
+                abortAcceptedShot(
+                    it,
+                    "Catalog check photo was cancelled before capture",
+                )
+            }
         }
-        acceptedShots.values.forEach { session.abortPhoto(it.reservation) }
+        acceptedShots.values.forEach {
+            abortAcceptedShot(
+                it,
+                "Catalog check photo was cancelled before capture",
+            )
+        }
         acceptedShots.clear()
         // Pending terminal commands are durable. Activity destruction must not
         // erase an accepted Done/Cancel/Restart/Undo before its replacement can
@@ -2442,8 +2689,139 @@ class MainActivity : AppCompatActivity() {
             delay(200)
             updateUi()
             refreshLastCapturedBook()
+            refreshCatalogCheckResult()
         }
     }
+
+    private fun refreshCatalogCheckResult() {
+        lifecycleScope.launch {
+            val load = withContext(Dispatchers.IO) {
+                val activeDir = session.entryId?.let(session::entryDir)
+                val dirs = buildList {
+                    activeDir?.let(::add)
+                    Entries.recent(this@MainActivity)
+                        .asSequence()
+                        .map { it.dir }
+                        .filterNot { candidate ->
+                            activeDir != null && candidate.absolutePath == activeDir.absolutePath
+                        }
+                        .take(10)
+                        .forEach(::add)
+                }
+                dirs.mapNotNull { dir ->
+                    val file = File(dir, CATALOG_CHECK_FILE)
+                    val record = CatalogCheckStore.read(dir) ?: return@mapNotNull null
+                    CatalogCheckLoad(record, file.lastModified())
+                }.maxByOrNull { it.updatedAt }
+            } ?: return@launch
+
+            val record = load.record
+            if (record.state == CatalogCheckState.PENDING) {
+                if (session.active) setStatus(getString(R.string.catalog_check_processing))
+                return@launch
+            }
+            if (Prefs.presentedCatalogCheckId(this@MainActivity) == record.requestId) return@launch
+            Prefs.setPresentedCatalogCheckId(this@MainActivity, record.requestId)
+            presentCatalogCheck(record)
+        }
+    }
+
+    private fun presentCatalogCheck(record: CatalogCheckRecord) {
+        val succeeded = record.state == CatalogCheckState.SUCCEEDED
+        val message = if (succeeded) catalogCheckResultMessage(record) else {
+            getString(
+                R.string.catalog_check_failed_message,
+                record.error.ifBlank { getString(R.string.catalog_check_failed_unknown) },
+            )
+        }
+        setStatus(
+            if (succeeded) getString(
+                R.string.catalog_check_complete_status,
+                catalogCheckChShort(record.ch),
+                catalogCheckWhlShort(record.whl),
+            ) else getString(R.string.catalog_check_failed_status),
+        )
+        catalogCheckDialog?.dismiss()
+        catalogCheckDialog = MaterialAlertDialogBuilder(this)
+            .setTitle(getString(R.string.catalog_check_title))
+            .setMessage(message)
+            .setPositiveButton(android.R.string.ok, null)
+            .create()
+            .also { dialog ->
+                dialog.setOnDismissListener {
+                    if (catalogCheckDialog === dialog) catalogCheckDialog = null
+                }
+                dialog.show()
+                RemoteUiCatalog.apply(dialog)
+            }
+    }
+
+    private fun catalogCheckResultMessage(record: CatalogCheckRecord): String {
+        val bibliography = record.bibliography
+        val identified = buildList {
+            bibliography.title.takeIf { it.isNotBlank() }?.let(::add)
+            bibliography.author.takeIf { it.isNotBlank() }?.let(::add)
+            bibliography.year.takeIf { it.isNotBlank() }?.let(::add)
+        }.joinToString("\n").ifBlank {
+            getString(R.string.catalog_check_bibliography_unknown)
+        }
+        return listOf(
+            getString(R.string.catalog_check_identified, identified),
+            catalogCheckChLine(record.ch),
+            catalogCheckWhlLine(record.whl),
+        ).joinToString("\n\n")
+    }
+
+    private fun catalogCheckChShort(result: CatalogCheckChResult?): String = when {
+        result?.searched != true -> getString(R.string.catalog_check_short_unavailable)
+        result.candidate != null -> getString(R.string.catalog_check_short_match)
+        else -> getString(R.string.catalog_check_short_no_match)
+    }
+
+    private fun catalogCheckWhlShort(result: CatalogCheckWhlResult?): String = when (result?.status) {
+        CatalogCheckWhlStatus.YES -> getString(R.string.catalog_check_short_match)
+        CatalogCheckWhlStatus.DRAFT -> getString(R.string.catalog_check_short_draft)
+        CatalogCheckWhlStatus.NO -> getString(R.string.catalog_check_short_no_match)
+        CatalogCheckWhlStatus.UNAVAILABLE, null ->
+            getString(R.string.catalog_check_short_unavailable)
+    }
+
+    private fun catalogCheckChLine(result: CatalogCheckChResult?): String = when {
+        result?.searched != true -> getString(R.string.catalog_check_ch_unavailable)
+        result.candidate != null -> getString(
+            R.string.catalog_check_ch_match,
+            catalogCandidateLabel(
+                result.candidate.title,
+                result.candidate.author,
+                result.candidate.year,
+            ),
+        )
+        else -> getString(R.string.catalog_check_ch_none)
+    }
+
+    private fun catalogCheckWhlLine(result: CatalogCheckWhlResult?): String {
+        val candidate = result?.candidate
+        val label = candidate?.let {
+            catalogCandidateLabel(it.title, it.author, it.year)
+        }.orEmpty()
+        return when (result?.status) {
+            CatalogCheckWhlStatus.YES ->
+                getString(R.string.catalog_check_whl_match, label)
+            CatalogCheckWhlStatus.DRAFT ->
+                getString(R.string.catalog_check_whl_draft, label)
+            CatalogCheckWhlStatus.NO ->
+                getString(R.string.catalog_check_whl_none)
+            CatalogCheckWhlStatus.UNAVAILABLE, null ->
+                getString(R.string.catalog_check_whl_unavailable)
+        }
+    }
+
+    private fun catalogCandidateLabel(title: String, author: String, year: String): String =
+        buildString {
+            append(title.ifBlank { getString(R.string.catalog_check_bibliography_unknown) })
+            val details = listOf(author, year).filter { it.isNotBlank() }.joinToString(" · ")
+            if (details.isNotEmpty()) append("\n").append(details)
+        }
 
     private fun updateUi() {
         val active = session.active

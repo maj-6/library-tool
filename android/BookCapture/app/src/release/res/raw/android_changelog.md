@@ -3,6 +3,21 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.4 — 2026-07-29
+
+Android version code: `35`.
+
+### Additions
+
+- Say **check** while a capture is open to photograph a book, extract its bibliography, and immediately search both the CH and World Herb Library catalogues.
+- The World Herb Library snapshot now ships inside the APK for fast on-device matching, including distinct published, draft-only, and no-match results.
+- Catalog-check results show the identified title, author, and year together with the CH and WHL verdicts without requiring the capture to be finished first.
+
+### Other Changes
+
+- CH and WHL catalogue searches run entirely on-device after OCR and extraction; no catalogue query is sent over the network.
+- Check requests survive camera queuing, retries, activity recreation, and process interruption without attaching a result to the wrong photo.
+
 ## 0.5.2-alpha.3 — 2026-07-28
 
 Android version code: `34`.

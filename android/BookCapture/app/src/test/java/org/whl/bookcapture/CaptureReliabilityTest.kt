@@ -127,6 +127,42 @@ class CaptureReliabilityTest {
     }
 
     @Test
+    fun catalogCheckIntentStaysWithItsAcceptedShotAndIsDurableBeforeProcessing() {
+        val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        val acceptedShot = source.substringAfter("private data class AcceptedShot(")
+            .substringBefore("private data class CameraBindingSnapshot(")
+        val reservation = source.substringAfter("private fun reserveAcceptedShot(")
+            .substringBefore("private fun submitCapture(")
+        val savedCallback = source.substringAfter("private fun handleCaptureSaved(")
+            .substringBefore("private fun finishCaptureCommit(")
+        val captureFailure = source.substringAfter("private fun handleCaptureError(")
+            .substringBefore("private fun completeCapture(")
+
+        assertTrue(source.contains("\"check\" ->"))
+        assertTrue(source.contains("takePhoto(checkCatalogs = true)"))
+        assertTrue(acceptedShot.contains("val catalogCheckRequestId: String?"))
+        assertTrue(source.contains("reserveAcceptedShot(acceptance.ticket, checkCatalogs)"))
+        assertTrue(reservation.contains("CatalogCheckStore.request("))
+        assertTrue(reservation.contains("page = reservation.pageNumber"))
+        assertTrue(source.indexOf("CatalogCheckStore.request(") <
+            source.indexOf("capture.takePicture("))
+        assertFalse(savedCallback.contains("CatalogCheckStore.request("))
+        assertTrue(savedCallback.contains("CatalogCheckStore.bindOrRetarget("))
+        assertTrue(savedCallback.contains("targetAssetId = asset.assetId"))
+        assertTrue(savedCallback.indexOf("session.commitPhoto(reservation)") <
+            savedCallback.indexOf("CatalogCheckStore.bindOrRetarget("))
+        assertTrue(captureFailure.contains("failCatalogCheckRequest("))
+        assertTrue(source.contains("private fun reconcileCatalogCheckIntent()"))
+        assertTrue(source.contains("Capture was interrupted before the catalog check photo was saved"))
+        val reconciliation = source.substringAfter("private fun reconcileCatalogCheckIntent()")
+            .substringBefore("/** After a config change / process death")
+        assertTrue(reconciliation.contains("CatalogCheckStore.bindOrRetarget("))
+        assertTrue(reconciliation.contains("ProcessWorker.enqueue(this)"))
+        assertTrue(source.indexOf("CatalogCheckStore.request(") <
+            source.indexOf("ProcessWorker.enqueue(this)", source.indexOf("private fun handleCaptureSaved(")))
+    }
+
+    @Test
     fun captureScreenBoundsThumbnailWorkAndIgnoresTerminalWorkerHistory() {
         val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
         val addThumbnail = source.substringAfter("private fun addThumbnail(")

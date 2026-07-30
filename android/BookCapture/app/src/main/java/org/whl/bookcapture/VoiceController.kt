@@ -25,8 +25,9 @@ import java.util.zip.ZipInputStream
  * row is just as trustworthy under this grammar and arrives while the word is
  * barely off the tongue. The final result still fires (covers a word the
  * partial stream only surfaced once) — the debounce swallows the duplicate.
- * Commands that seal or discard work fire only from a FINAL result, so a
- * mis-heard partial can neither finish nor remove the active capture.
+ * Commands that seal or discard work, plus the API-backed catalog check, fire
+ * only from a FINAL result, so a mis-heard partial can neither finish/remove
+ * the active capture nor spend a check request.
  *
  * Cues are plain tones now, so no suppression window is needed: a beep can't
  * spell "photo".
@@ -49,10 +50,12 @@ class VoiceController(
             "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
         const val MODEL_DIR = "vosk-model-small-en-us-0.15"
         val COMMANDS = listOf(
-            "start", "photo", "done", "cancel", "restart", "undo", "edit", "notes", "end notes",
+            "start", "photo", "check", "done", "cancel", "restart", "undo", "edit", "notes",
+            "end notes",
         )
 
-        /** Final recognition is required for actions that seal or delete work. */
+        /** Final recognition is required for actions that seal/delete work or
+         * launch the OCR-backed catalog check. */
         internal fun commandFromPartial(text: String): String? =
             StateAwareVoiceCommandPolicy.evaluate(
                 transcript = text,
@@ -254,7 +257,8 @@ class VoiceController(
     }
 
     /** Same safe command in two consecutive partials -> fire now. Commands
-     *  that seal or delete work are accepted only from a final result. */
+     *  that seal/delete work or trigger a catalog check are accepted only from
+     *  a final result. */
     private fun handlePartial(generation: Long, hypothesis: String?) {
         if (!accepts(generation)) { pendingPartial = ""; return }
         errorRestarts = 0

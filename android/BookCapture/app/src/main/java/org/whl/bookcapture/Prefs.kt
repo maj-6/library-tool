@@ -397,6 +397,15 @@ object Prefs {
     fun lastProcError(ctx: Context): String? = str(ctx, "last_proc_error").ifEmpty { null }
     fun setLastProcError(ctx: Context, m: String?) = put(ctx, "last_proc_error" to m)
 
+    /** Last terminal one-shot catalog result shown by the capture screen.
+     * Request ids are globally unique, so one value prevents duplicate dialogs
+     * across rotation/process recreation without hiding a newer result. */
+    fun presentedCatalogCheckId(ctx: Context): String =
+        str(ctx, "presented_catalog_check_id")
+
+    fun setPresentedCatalogCheckId(ctx: Context, requestId: String) =
+        put(ctx, "presented_catalog_check_id" to requestId.trim())
+
     // --- explicit capture synchronization ----------------------------------
 
     /**

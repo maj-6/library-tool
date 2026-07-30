@@ -118,12 +118,17 @@ owns the microphone.
 | --- | --- |
 | **start** | Begin a capture in the current collection. |
 | **photo** | Photograph the page shown in the preview. |
+| **check** | Photograph the page, extract its bibliography, and check the bundled CH and WHL lists. |
 | **done** | Seal the capture and submit it for background processing/upload. |
 | **cancel** | Discard the open capture immediately; no confirmation dialog. |
 | **restart** | Discard the open capture and start a fresh one in the same/current collection. |
 | **undo** | Discard the most recent committed photo or saved/in-progress note. |
 | **notes** | Start a Mistral voice note for the open capture. |
 | **end notes** | Finish and save the active note. |
+
+`check` needs the configured OCR/extraction service and a network connection to
+identify the book. The CH and WHL searches themselves run on-device against
+snapshots bundled in the APK, so no catalogue lookup is sent over the network.
 
 The floating note button provides the same start/finish action. While a note is
 active, a compact translucent overlay shows the evolving transcript. The words

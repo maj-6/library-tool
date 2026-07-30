@@ -166,6 +166,7 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                     deepseek,
                     forced = forceReprocess && requestedId == dir.name,
                     workerRetry = runAttemptCount > 0,
+                    workAttempt = runAttemptCount,
                 )
             }
             transient = transient || outcome.retry
@@ -206,6 +207,7 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         deepseek: String,
         forced: Boolean,
         workerRetry: Boolean,
+        workAttempt: Int,
     ): DirectoryOutcome {
         var entry = Entries.find(ctx, dir.name) ?: return DirectoryOutcome()
         if (workerRetry && !forced && entry.processing.status == Entries.ProcessingStatus.FAILED &&
@@ -213,8 +215,41 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             return DirectoryOutcome(permanentError = entry.processing.lastError)
         }
 
-        val photos = entry.photos()
-        if (photos.isEmpty()) return DirectoryOutcome()
+        val pendingAtStart = CatalogCheckStore.read(dir)
+            ?.takeIf { it.state == CatalogCheckState.PENDING }
+        if (pendingAtStart != null && pendingAtStart.targetAssetId == null) {
+            // The command intent is durable before CameraX starts. Its stable
+            // photo identity is bound only after commit; that commit enqueues
+            // fresh work. Do not mistake the reservation window for deletion.
+            if (entry.sealed) {
+                return catalogCheckFailure(
+                    dir,
+                    pendingAtStart,
+                    "Catalog check photo was not finalized",
+                )
+            }
+            Entries.markWaiting(dir, Entries.ProcessingStage.STANDARDIZING)
+            return DirectoryOutcome()
+        }
+        val allPhotos = entry.photos()
+        if (allPhotos.isEmpty()) {
+            failPendingCatalogCheck(dir, "Catalog check photo is no longer available")
+            return DirectoryOutcome()
+        }
+        val targetAtStart = pendingAtStart?.let { catalogCheckPhoto(dir, it) }
+        if (!entry.sealed && pendingAtStart != null && targetAtStart == null) {
+            return catalogCheckFailure(
+                dir,
+                pendingAtStart,
+                "Catalog check photo is no longer available",
+            )
+        }
+        // A check is latency-sensitive and depends on exactly one photographed
+        // page. OCR that stable asset first without letting an unrelated older
+        // page failure block the answer; Done/a later shutter drains the rest.
+        val photos =
+            if (!entry.sealed && targetAtStart != null) listOf(targetAtStart)
+            else allPhotos
         Entries.markProcessing(dir, Entries.ProcessingStage.STANDARDIZING)
 
         var waitingForJpeg = false
@@ -271,11 +306,15 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                 throw e
             } catch (e: Pipeline.PermanentError) {
                 val message = failureMessage("OCR", e)
+                failPendingCatalogCheck(dir, message)
                 entry.finishReprocess(message)
                 Entries.markFailed(dir, Entries.ProcessingStage.OCR, message, retryable = false)
                 return DirectoryOutcome(permanentError = message)
             } catch (e: Exception) {
                 val message = failureMessage("OCR", e)
+                if (!shouldRetryProcessingWork(true, forced, workAttempt)) {
+                    failPendingCatalogCheck(dir, message)
+                }
                 Entries.markFailed(dir, Entries.ProcessingStage.OCR, message, retryable = true)
                 return DirectoryOutcome(retry = true, lastError = message)
             }
@@ -285,33 +324,80 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         val missingOcr = photos.any { !File(dir, it.name + ".txt").isFile }
         if (missingOcr && mistral.isEmpty()) {
             val message = "OCR: Mistral API key is missing"
+            failPendingCatalogCheck(dir, message)
             Entries.markFailed(dir, Entries.ProcessingStage.OCR, message, retryable = false)
             entry.finishReprocess(message)
             return DirectoryOutcome(permanentError = message)
         }
         if (missingOcr || waitingForJpeg) {
             Entries.markWaiting(dir, Entries.ProcessingStage.OCR)
+            if (pendingAtStart != null &&
+                !shouldRetryProcessingWork(
+                    retryRequested = true,
+                    forceReprocess = forced,
+                    runAttemptCount = workAttempt,
+                )
+            ) {
+                return catalogCheckFailure(
+                    dir,
+                    pendingAtStart,
+                    if (waitingForJpeg) {
+                        "Catalog check photo did not finish saving"
+                    } else {
+                        "Catalog check OCR did not become ready"
+                    },
+                )
+            }
             return DirectoryOutcome(retry = true)
         }
 
-        // Extraction waits for Done so it cannot lock in a half-captured title page.
+        val pendingCheck = CatalogCheckStore.read(dir)
+            ?.takeIf { it.state == CatalogCheckState.PENDING }
+
+        // Normal metadata extraction waits for Done so it cannot lock in a
+        // half-captured title page. A requested catalog check is deliberately
+        // different: it extracts only the photographed check page, stores the
+        // result outside meta.json, and leaves the capture open.
         if (!entry.sealed) {
+            if (pendingCheck != null) {
+                Entries.markProcessing(dir, Entries.ProcessingStage.EXTRACTION)
+                val outcome = processOpenCatalogCheck(
+                    ctx = ctx,
+                    dir = dir,
+                    request = pendingCheck,
+                    mistral = mistral,
+                    deepseek = deepseek,
+                    forced = forced,
+                    workAttempt = workAttempt,
+                )
+                Entries.markWaiting(dir, Entries.ProcessingStage.EXTRACTION)
+                return outcome
+            }
             Entries.markWaiting(dir, Entries.ProcessingStage.EXTRACTION)
             return DirectoryOutcome()
         }
-        if (!forced && entry.meta != null &&
+        val existingMetadata = entry.meta
+        if (!forced && existingMetadata != null &&
             entry.processing.status == Entries.ProcessingStatus.COMPLETE) {
+            completePendingCatalogCheck(
+                ctx = ctx,
+                dir = dir,
+                metadata = existingMetadata,
+                ch = searchChList(ctx, dir, existingMetadata),
+            )
             Entries.markComplete(dir)
             return DirectoryOutcome()
         }
         if (forced && deepseek.isEmpty()) {
             val message = "Extraction: DeepSeek API key is missing"
+            failPendingCatalogCheck(dir, message)
             entry.finishReprocess(message)
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = false)
             return DirectoryOutcome(permanentError = message)
         }
         if (deepseek.isEmpty() && mistral.isEmpty()) {
             val message = "Extraction API key is missing"
+            failPendingCatalogCheck(dir, message)
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = false)
             entry.finishReprocess(message)
             return DirectoryOutcome(permanentError = message)
@@ -320,6 +406,7 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         val text = entry.ocrText()
         if (text.isEmpty()) {
             val message = "Extraction: OCR returned no text"
+            failPendingCatalogCheck(dir, message)
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = false)
             entry.finishReprocess(message)
             return DirectoryOutcome(permanentError = message)
@@ -352,7 +439,8 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             if (forced && !extraction.complete) Entries.holdForProcessing(dir)
             Entries.atomicWrite(File(dir, "meta.json"), merged.toString())
             PhotoAssetStore.applyBibliographicSuggestions(dir, merged)
-            searchChList(ctx, dir, merged)
+            val ch = searchChList(ctx, dir, merged)
+            completePendingCatalogCheck(ctx, dir, merged, ch)
             requestPostProcessing(ctx, dir, merged)
             if (extraction.complete) {
                 Entries.markComplete(dir)
@@ -365,54 +453,279 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             }
         } catch (e: Pipeline.PermanentError) {
             val message = failureMessage("Extraction", e)
+            failPendingCatalogCheck(dir, message)
             entry.finishReprocess(message)
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = false)
             DirectoryOutcome(permanentError = message)
         } catch (e: Pipeline.InvalidExtractionError) {
             val message = failureMessage("Extraction", e)
+            if (!shouldRetryProcessingWork(true, forced, workAttempt)) {
+                failPendingCatalogCheck(dir, message)
+            }
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = true)
             DirectoryOutcome(retry = true, lastError = message)
         } catch (e: Exception) {
             val message = failureMessage("Extraction", e)
+            if (!shouldRetryProcessingWork(true, forced, workAttempt)) {
+                failPendingCatalogCheck(dir, message)
+            }
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = true)
             DirectoryOutcome(retry = true, lastError = message)
         }
     }
 
+    private fun catalogCheckPhoto(dir: File, request: CatalogCheckRecord): File? {
+        val assetId = request.targetAssetId ?: return null
+        val descriptors = PhotoAssetStore.descriptors(dir)
+        val descriptor = descriptors.firstOrNull { it.assetId == assetId }
+        return descriptor?.captureFile?.takeIf { it.isFile }
+    }
+
+    private fun processOpenCatalogCheck(
+        ctx: Context,
+        dir: File,
+        request: CatalogCheckRecord,
+        mistral: String,
+        deepseek: String,
+        forced: Boolean,
+        workAttempt: Int,
+    ): DirectoryOutcome {
+        if (request.targetAssetId == null) {
+            // CameraX commit/binding will enqueue the work that can resolve the
+            // stable asset. This is a reservation state, not a missing photo.
+            return DirectoryOutcome()
+        }
+        val target = catalogCheckPhoto(dir, request)
+            ?: return catalogCheckFailure(
+                dir,
+                request,
+                "Catalog check photo is no longer available",
+            )
+        val sidecar = File(dir, target.name + ".txt")
+        if (!sidecar.isFile) {
+            return if (shouldRetryProcessingWork(true, forced, workAttempt)) {
+                DirectoryOutcome(
+                    retry = true,
+                    lastError = "Catalog check is waiting for OCR",
+                )
+            } else {
+                catalogCheckFailure(dir, request, "Catalog check OCR did not complete")
+            }
+        }
+        val text = runCatching {
+            sidecar.readText().trim()
+        }.getOrElse { error ->
+            return catalogCheckFailure(
+                dir,
+                request,
+                "Check OCR could not be read: ${error.message ?: error.javaClass.simpleName}",
+            )
+        }
+        if (text.isEmpty()) {
+            return catalogCheckFailure(
+                dir,
+                request,
+                "Check OCR returned no text",
+            )
+        }
+        if (deepseek.isEmpty() && mistral.isEmpty()) {
+            return catalogCheckFailure(
+                dir,
+                request,
+                "Catalog check extraction API key is missing",
+            )
+        }
+
+        return try {
+            val entry = Entries.find(ctx, dir.name)
+            val instructions = entry?.customInstructions().orEmpty().ifEmpty {
+                Prefs.extractionInstructions(ctx)
+            }
+            val extraction = Pipeline.extract(text, deepseek, mistral, instructions)
+            val metadata = extraction.metadata
+            if (metadata.optString("title").isBlank()) {
+                throw Pipeline.InvalidExtractionError(
+                    "Extraction returned no title for catalog matching",
+                )
+            }
+            val current = CatalogCheckStore.read(dir)
+            if (current?.state != CatalogCheckState.PENDING ||
+                current.requestId != request.requestId
+            ) {
+                // A later photographed check superseded this network result.
+                return DirectoryOutcome()
+            }
+            // A Check is an independent observation of its photographed page.
+            // It must not overwrite the entry-wide CH candidate or a decision
+            // the operator already made for the captured book.
+            val ch = lookupChList(ctx, metadata)
+            if (!completePendingCatalogCheck(
+                    ctx,
+                    dir,
+                    metadata,
+                    ch,
+                    expectedRequestId = request.requestId,
+                )
+            ) {
+                throw IOException("catalog check result could not be persisted")
+            }
+            DirectoryOutcome()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Pipeline.PermanentError) {
+            catalogCheckFailure(dir, request, failureMessage("Check extraction", error))
+        } catch (error: Exception) {
+            val message = failureMessage("Check extraction", error)
+            if (shouldRetryProcessingWork(
+                    retryRequested = true,
+                    forceReprocess = forced,
+                    runAttemptCount = workAttempt,
+                )
+            ) {
+                DirectoryOutcome(retry = true, lastError = message)
+            } else {
+                catalogCheckFailure(dir, request, message)
+            }
+        }
+    }
+
+    private fun catalogCheckFailure(
+        dir: File,
+        request: CatalogCheckRecord,
+        message: String,
+    ): DirectoryOutcome {
+        runCatching {
+            CatalogCheckStore.fail(
+                dir = dir,
+                requestId = request.requestId,
+                error = message,
+            )
+        }.onFailure { error ->
+            Log.w("ProcessWorker", "Catalog check failure could not be persisted for ${dir.name}", error)
+        }
+        return DirectoryOutcome()
+    }
+
+    private fun failPendingCatalogCheck(dir: File, message: String) {
+        CatalogCheckStore.read(dir)
+            ?.takeIf { it.state == CatalogCheckState.PENDING }
+            ?.let { request -> catalogCheckFailure(dir, request, message) }
+    }
+
     /**
-     * Look the freshly-extracted book up in the bundled CH master list.
-     *
-     * Runs here rather than on the UI thread because the index is ~2.7 MB of
-     * JSON on first touch; this worker is already on Dispatchers.IO.
-     *
-     * A CH lookup must never fail a scan — the photos and metadata are the
-     * irreplaceable part, an indicator is not — so any failure is swallowed and
-     * simply leaves the entry unsearched.
-     *
-     * An existing decision is preserved when the same row comes back, so a
-     * reprocess does not re-prompt for a match the user already ruled on. If a
-     * DIFFERENT row now matches, the old decision is dropped: it was about a
-     * different book and carrying it over would silently approve something the
-     * user never saw.
+     * Finish the latest pending request from extracted metadata. WHL index
+     * unavailability is itself a result rather than a capture-processing
+     * failure: the bundled snapshot can be repaired in a later APK.
      */
-    private fun searchChList(ctx: Context, dir: File, metadata: JSONObject) {
+    private fun completePendingCatalogCheck(
+        ctx: Context,
+        dir: File,
+        metadata: JSONObject,
+        ch: ChMatchState?,
+        expectedRequestId: String? = null,
+    ): Boolean {
+        val request = CatalogCheckStore.read(dir)
+            ?.takeIf { it.state == CatalogCheckState.PENDING }
+            ?: return true
+        // A second Check can commit while the first network request is in
+        // flight. The old extraction is then obsolete, not a result for the
+        // newer photographed page.
+        if (expectedRequestId != null && request.requestId != expectedRequestId) return true
+        return runCatching {
+            val title = metadata.optString("title").trim()
+            val author = metadata.optString("author").trim()
+            val year = metadata.optString("year").trim()
+            val whlIndex = WhlIndex.get(ctx)
+            val whlMatch = whlIndex?.match(title, author)
+            CatalogCheckStore.complete(
+                dir = dir,
+                requestId = request.requestId,
+                bibliography = CatalogCheckBibliography(title, author, year),
+                ch = CatalogCheckChResult(
+                    searched = ch?.searched == true,
+                    candidate = ch?.candidate?.let(CatalogCheckChCandidateSummary::from),
+                ),
+                whl = whlMatch?.toCatalogCheckResult()
+                    ?: CatalogCheckWhlResult(CatalogCheckWhlStatus.UNAVAILABLE),
+            ) != null
+        }.onFailure { error ->
+            Log.w("ProcessWorker", "Catalog check completion failed for ${dir.name}", error)
+        }.getOrDefault(false)
+    }
+
+    private fun WhlMatch.toCatalogCheckResult(): CatalogCheckWhlResult =
+        CatalogCheckWhlResult(
+            status = when (flag) {
+                WhlCatalogFlag.YES -> CatalogCheckWhlStatus.YES
+                WhlCatalogFlag.DRAFT -> CatalogCheckWhlStatus.DRAFT
+                WhlCatalogFlag.NO -> CatalogCheckWhlStatus.NO
+            },
+            candidate = candidate?.let { row ->
+                CatalogCheckWhlCandidateSummary(
+                    title = row.title,
+                    author = row.author,
+                    year = row.year,
+                    permalink = row.permalink,
+                    score = row.score,
+                )
+            },
+        )
+
+    /**
+     * Perform the bundled CH lookup without mutating entry state.
+     *
+     * The index is ~2.7 MB of JSON on first touch, so lookup stays on this IO
+     * worker. A CH failure must never fail a scan; it simply leaves the result
+     * unsearched.
+     *
+     * Open catalog checks use this result directly. Normal sealed-entry
+     * processing adds decision preservation and persistence in [searchChList].
+     */
+    private fun lookupChList(
+        ctx: Context,
+        metadata: JSONObject,
+    ): ChMatchState? =
         runCatching {
             val title = metadata.optString("title").trim()
             val author = metadata.optString("author").trim()
-            if (title.isEmpty() && author.isEmpty()) return
+            if (title.isEmpty() && author.isEmpty()) return@runCatching null
 
-            val index = ChIndex.get(ctx) ?: return
-            val candidate = index.bestMatch(title, author)
+            val index = ChIndex.get(ctx) ?: return@runCatching null
+            ChMatchState(
+                searched = true,
+                candidate = index.bestMatch(title, author),
+                decision = ChDecision.UNREVIEWED,
+            )
+        }.onFailure {
+            Log.w("ProcessWorker", "CH lookup failed", it)
+        }.getOrNull()
+
+    /**
+     * Persist the normal entry-wide CH result. A decision is preserved only
+     * when the same candidate returns; a different candidate is unreviewed.
+     */
+    private fun searchChList(
+        ctx: Context,
+        dir: File,
+        metadata: JSONObject,
+    ): ChMatchState? {
+        val lookup = lookupChList(ctx, metadata) ?: return null
+        return runCatching {
             val previous = ChMatchStore.read(dir)
             val decision =
-                if (candidate != null && candidate.key == previous.candidate?.key) previous.decision
+                if (lookup.candidate != null &&
+                    lookup.candidate.key == previous.candidate?.key
+                ) {
+                    previous.decision
+                }
                 else ChDecision.UNREVIEWED
 
-            ChMatchStore.write(
-                dir,
-                ChMatchState(searched = true, candidate = candidate, decision = decision),
-            )
-        }.onFailure { Log.w("ProcessWorker", "CH lookup failed for ${dir.name}", it) }
+            lookup.copy(decision = decision).also { state ->
+                ChMatchStore.write(dir, state)
+            }
+        }.onFailure {
+            Log.w("ProcessWorker", "CH result could not be stored for ${dir.name}", it)
+        }.getOrNull()
     }
 
     /** Freeze post-processing preferences only after extraction supplied the

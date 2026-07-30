@@ -11,6 +11,7 @@ class VoiceCommandPolicyTest {
         assertEquals("start", VoiceController.commandFromPartial("please start"))
         assertEquals("photo", VoiceController.commandFromPartial("photo"))
         assertNull(VoiceController.commandFromPartial("Edit"))
+        assertNull(VoiceController.commandFromPartial("check"))
         assertNull(VoiceController.commandFromPartial("done"))
         assertNull(VoiceController.commandFromPartial("cancel"))
         assertNull(VoiceController.commandFromPartial("restart"))
@@ -22,5 +23,12 @@ class VoiceCommandPolicyTest {
     fun editIsAcceptedFromACompletedRecognitionWithoutMatchingLargerWords() {
         assertEquals("edit", VoiceController.commandFromFinal("edit"))
         assertNull(VoiceController.commandFromFinal("edition"))
+    }
+
+    @Test
+    fun checkIsAcceptedOnlyFromACompletedRecognition() {
+        assertNull(VoiceController.commandFromPartial("please check"))
+        assertEquals("check", VoiceController.commandFromFinal("please check"))
+        assertNull(VoiceController.commandFromFinal("checklist"))
     }
 }
