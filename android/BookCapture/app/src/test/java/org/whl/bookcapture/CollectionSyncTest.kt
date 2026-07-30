@@ -53,6 +53,35 @@ class CollectionSyncTest {
     }
 
     @Test
+    fun editedTagIdIsSelectedForSyncAndIncludedInTheCloudPatch() {
+        val baseline = row("Blue crate", "2026-07-19T12:00:00Z")
+            .copy(tagId = "BLUE_CRATE_1")
+        val edit = updateCollection(
+            listOf(baseline),
+            id = baseline.id,
+            name = baseline.name,
+            from = baseline.from,
+            tagId = "archive box 7",
+        )
+        val local = requireNotNull(edit.collections).single()
+            .copy(updatedAt = "2026-07-19T12:00:01Z")
+
+        val merge = mergeCollections(
+            listOf(local),
+            listOf(baseline),
+            shadowOf(baseline),
+            setOf(local.id),
+        )
+
+        assertEquals("ARCHIVE_BOX_7", local.tagId)
+        assertEquals(local, merge.writes.single().row)
+        assertEquals(
+            "ARCHIVE_BOX_7",
+            collectionCloudBody(merge.writes.single().row).getString("tag_id"),
+        )
+    }
+
+    @Test
     fun successfulPatchDoesNotPublishAFuturePhoneClock() {
         val baseline = "2026-07-19T12:00:00Z"
         assertEquals(
