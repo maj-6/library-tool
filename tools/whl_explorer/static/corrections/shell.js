@@ -1495,6 +1495,12 @@
       }
       const toolUpdates = isPlainObject(options.toolUpdates)
         ? options.toolUpdates : {};
+      if (this.profileStore &&
+          typeof this.profileStore.saveTool === "function") {
+        for (const [toolName, value] of Object.entries(toolUpdates)) {
+          this.profileStore.saveTool(this.profileKey, toolName, value);
+        }
+      }
       this.profileStore.save(this.profileKey, {
         layout: this.layout.getState(),
         editors: this.editorRegistry.serializeChoices(),
@@ -1503,6 +1509,11 @@
         // another Corrections window cannot roll back a successfully committed
         // Image Adjust brightness (or a keymap remap).
         tools: { ...tools, ...toolUpdates },
+      }, {
+        // Explicit tool updates were written to independent per-tool sidecars
+        // above. Presentation-only saves must not rewrite another window's
+        // concurrently committed tool preference.
+        writeTools: false,
       });
       this.updateProfileLabel();
     }

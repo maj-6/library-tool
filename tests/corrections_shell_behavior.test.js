@@ -16,6 +16,7 @@ const {
 const {
   CorrectionsProfileStore,
   PROFILE_SCHEMA,
+  TOOL_PROFILE_SCHEMA,
   validateProfileKey,
 } = require("../tools/whl_explorer/static/corrections/ui-profile");
 const {
@@ -417,6 +418,18 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
   assert.deepEqual(saved.tools, {
     imageAdjust: { lastAppliedBrightness: 24 },
   });
+  assert.deepEqual(
+    store.load("corrections/default").tools.imageAdjust,
+    { lastAppliedBrightness: 24 },
+  );
+  store.save("corrections/default", {
+    tools: { imageAdjust: { lastAppliedBrightness: -12 } },
+  });
+  assert.deepEqual(
+    store.load("corrections/default").tools.imageAdjust,
+    { lastAppliedBrightness: -12 },
+    "the public full-profile save contract also replaces tool sidecars",
+  );
   assert.deepEqual(Object.keys(saved).sort(),
     ["editors", "layout", "profile_key", "schema", "tools"]);
   assert.equal(store.load("corrections/default").found, true);
@@ -433,6 +446,10 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
     storageArea: storage,
   }), true);
   assert.equal(store.matchesStorageEvent("corrections/default", {
+    key: store.toolKey("corrections/default", "imageAdjust"),
+    storageArea: storage,
+  }), true);
+  assert.equal(store.matchesStorageEvent("corrections/default", {
     key: store.key("corrections/alternate"),
     storageArea: storage,
   }), false);
@@ -440,6 +457,15 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
     key: store.key("corrections/default"),
     storageArea: new MemoryStorage(),
   }), false);
+  assert.throws(
+    () => store.toolKey("corrections/default", "__proto__"),
+    TypeError,
+  );
+  const imageAdjustKey = store.toolKey(
+    "corrections/default", "imageAdjust");
+  assert.equal(store.clear("corrections/default"), true);
+  assert.equal(storage.getItem(imageAdjustKey), null);
+  assert.equal(store.load("corrections/default").found, false);
 });
 
 
@@ -555,6 +581,75 @@ test("cross-window layout saves cannot roll back committed Image Adjust brightne
     key: secondStore.key("corrections/alternate"),
     storageArea: storage,
   }), false);
+  firstWindow.imageAdjustTool.destroy();
+  secondWindow.imageAdjustTool.destroy();
+});
+
+
+test("tool sidecars survive an interleaved cross-window profile write", () => {
+  const storage = new MemoryStorage();
+  const createStore = () => new CorrectionsProfileStore({
+    storage,
+    normalizeLayout: normalizeLayoutState,
+    normalizeEditors: (value) => value && typeof value === "object" ? value : {},
+    normalizeTools: (value) => ({
+      imageAdjust: normalizeImageAdjustProfile(value && value.imageAdjust),
+      classification: value && value.classification || { bindings: {} },
+    }),
+  });
+  const firstStore = createStore();
+  const secondStore = createStore();
+  firstStore.save("corrections/default", {
+    tools: {
+      imageAdjust: { lastAppliedBrightness: 0 },
+      classification: { bindings: {} },
+    },
+  });
+
+  function profileShell(store, brightness, navigatorWidth) {
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      profileKey: "corrections/default",
+      profileStore: store,
+      layout: { getState: () => ({ navigatorWidth }) },
+      editorRegistry: { serializeChoices: () => ({}) },
+      classificationController: null,
+      imageAdjustTool: createImageAdjustTool({
+        profile: { lastAppliedBrightness: brightness },
+      }),
+      updateProfileLabel() {},
+    });
+    return shell;
+  }
+
+  const firstWindow = profileShell(firstStore, 0, 320);
+  const secondWindow = profileShell(secondStore, 0, 410);
+  const originalLoad = secondStore.load.bind(secondStore);
+  let interleave = true;
+  secondStore.load = (profileKey) => {
+    const stale = originalLoad(profileKey);
+    if (interleave) {
+      interleave = false;
+      firstWindow.persistProfile({
+        toolUpdates: {
+          imageAdjust: { lastAppliedBrightness: 37 },
+        },
+      });
+    }
+    return stale;
+  };
+
+  secondWindow.persistProfile();
+
+  assert.deepEqual(
+    originalLoad("corrections/default").tools.imageAdjust,
+    { lastAppliedBrightness: 37 },
+  );
+  const sidecar = JSON.parse(storage.getItem(
+    firstStore.toolKey("corrections/default", "imageAdjust"),
+  ));
+  assert.equal(sidecar.schema, TOOL_PROFILE_SCHEMA);
+  assert.equal(sidecar.value.lastAppliedBrightness, 37);
   firstWindow.imageAdjustTool.destroy();
   secondWindow.imageAdjustTool.destroy();
 });
