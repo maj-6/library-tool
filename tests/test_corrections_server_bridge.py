@@ -276,6 +276,9 @@ def test_capture_only_target_is_visible_and_stays_canonical_after_promotion(
         )
 
     first = server._corrections_item_snapshot()
+    index_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
     item = first[BOOK_ID]
     query_item = ItemQueryService(
         FilesystemItemQueryRepository(lambda: first)
@@ -286,6 +289,11 @@ def test_capture_only_target_is_visible_and_stays_canonical_after_promotion(
     )
 
     assert list(first) == [BOOK_ID]
+    assert index_response.status_code == 200
+    assert [
+        (row["id"], row["kind"])
+        for row in index_response.get_json()["books"]
+    ] == [(BOOK_ID, "capture")]
     assert item["kind"] == "capture"
     assert item["title"] == "Manual Capture"
     assert query_item.kind == "capture"

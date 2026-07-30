@@ -93,6 +93,9 @@ from librarytool.adapters.capture_lib import (  # noqa: E402
 from librarytool.adapters.filesystem.capture_archive_repository import (  # noqa: E402
     FilesystemCaptureArchiveRepository,
 )
+from librarytool.adapters.filesystem.item_repository import (  # noqa: E402
+    FilesystemItemQueryRepository,
+)
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
 )
@@ -282,6 +285,9 @@ app.register_blueprint(
         lambda: _library_engine(),
         raster_resource_resolver_for_request=(
             lambda: _ensure_engine_session().raster_resource_resolver
+        ),
+        correction_item_service_for_request=(
+            lambda: _corrections_item_engine()
         ),
         correction_actor_id_for_request=(
             lambda: _local_correction_actor_id()
@@ -6738,6 +6744,14 @@ def _item_engine() -> ItemQueryService:
             code="item_query_unavailable", retryable=True,
         )
     return items
+
+
+def _corrections_item_engine() -> ItemQueryService:
+    """Expose the canonical capture-aware projection only to Corrections."""
+
+    return ItemQueryService(
+        FilesystemItemQueryRepository(_corrections_item_snapshot)
+    )
 
 
 def _item_command_engine() -> ItemCommandService:
