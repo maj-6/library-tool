@@ -21,8 +21,8 @@
     }
 
     function captionDraftKey(detail) {
-      if (!detail || !detail.itemId || !detail.id || !detail.revision) return "";
-      return `caption:${detail.itemId}:${detail.id}:${detail.revision}`;
+      if (!detail || !detail.itemId || !detail.id) return "";
+      return `caption:${detail.itemId}:${detail.id}`;
     }
 
     function assertionByOrigin(detail, origin) {
@@ -44,6 +44,68 @@
         if (assertion) return assertion;
       }
       return null;
+    }
+
+    function manualCaptionValues(detail) {
+      const manual = assertionByOrigin(detail, "manual");
+      return Object.freeze({
+        text: manual ? String(manual.text || "") : "",
+        language: manual ? String(manual.language || "") : "",
+      });
+    }
+
+    function normalizeCaptionDraft(detail, value = null, fallbackDetail = null) {
+      const current = manualCaptionValues(detail);
+      const fallback = manualCaptionValues(fallbackDetail || detail);
+      const saved = value && typeof value === "object" ? value : null;
+      return {
+        text: saved ? String(saved.text || "") : current.text,
+        language: saved ? String(saved.language || "") : current.language,
+        dirty: saved ? saved.dirty !== false : false,
+        baseRevision: saved && saved.baseRevision
+          ? String(saved.baseRevision)
+          : String(fallbackDetail && fallbackDetail.revision ||
+            detail && detail.revision || ""),
+        baseText: saved && Object.hasOwn(saved, "baseText")
+          ? String(saved.baseText || "") : fallback.text,
+        baseLanguage: saved && Object.hasOwn(saved, "baseLanguage")
+          ? String(saved.baseLanguage || "") : fallback.language,
+      };
+    }
+
+    function rebaseCaptionDraft(detail, value, fallbackDetail = null) {
+      const draft = normalizeCaptionDraft(detail, value, fallbackDetail);
+      if (!draft.dirty || draft.baseRevision === detail.revision) {
+        return Object.freeze({
+          draft,
+          rebased: false,
+          conflicts: Object.freeze([]),
+        });
+      }
+      const current = manualCaptionValues(detail);
+      const localTextChanged = draft.text !== draft.baseText;
+      const localLanguageChanged = draft.language !== draft.baseLanguage;
+      const remoteTextChanged = current.text !== draft.baseText;
+      const remoteLanguageChanged = current.language !== draft.baseLanguage;
+      const conflicts = [];
+      if (localTextChanged && remoteTextChanged &&
+          draft.text !== current.text) conflicts.push("caption text");
+      if (localLanguageChanged && remoteLanguageChanged &&
+          draft.language !== current.language) conflicts.push("language");
+      const merged = {
+        text: localTextChanged ? draft.text : current.text,
+        language: localLanguageChanged ? draft.language : current.language,
+        baseRevision: detail.revision,
+        baseText: current.text,
+        baseLanguage: current.language,
+      };
+      merged.dirty = merged.text !== current.text ||
+        merged.language !== current.language;
+      return Object.freeze({
+        draft: merged,
+        rebased: true,
+        conflicts: Object.freeze(conflicts),
+      });
     }
 
     function isRevisionConflict(error) {
@@ -150,6 +212,7 @@
         this.message = "";
         this.messageError = false;
         this.draft = null;
+        this.draftNotice = null;
         this.undoStack = [];
         this.mutationGeneration = 0;
         this.mutationAbort = null;
@@ -162,27 +225,48 @@
       }
 
       setSelection(value, options = {}) {
-        const previousKey = this.detail && this.detail.key;
+        const previousDetail = this.detail;
+        const previousKey = previousDetail && previousDetail.key;
+        const previousDraft = this.draft;
+        const previousDraftNotice = this.draftNotice;
+        const previousMessage = this.message;
         this.detail = normalizedDetail(value);
         this.loading = options.loading === true;
         this.message = options.message || "";
         this.messageError = options.error === true;
+        this.draftNotice = null;
         if (!this.detail) {
           this.draft = null;
         } else {
           const key = captionDraftKey(this.detail);
-          const saved = options.draft || this.drafts.getDraft(key);
-          const manual = assertionByOrigin(this.detail, "manual");
-          this.draft = saved ? {
-            text: String(saved.text || ""),
-            language: String(saved.language || ""),
-            dirty: saved.dirty !== false,
-          } : {
-            text: manual ? manual.text : "",
-            language: manual ? manual.language : "",
-            dirty: false,
-          };
-          if (options.draft) this.drafts.setDraft(key, this.draft);
+          const sameIdentity = key &&
+            key === captionDraftKey(previousDetail);
+          const saved = options.draft || this.drafts.getDraft(key) ||
+            (sameIdentity && previousDraft && previousDraft.dirty
+              ? previousDraft : null);
+          const result = rebaseCaptionDraft(
+            this.detail,
+            saved,
+            sameIdentity ? previousDetail : null,
+          );
+          this.draft = result.draft;
+          if (result.rebased) {
+            this.draftNotice = result;
+            if (!this.message) {
+              this.message = result.conflicts.length
+                ? `A newer artifact revision was loaded. Your caption draft ` +
+                  `was merged; review concurrent changes to ` +
+                  `${result.conflicts.join(" and ")} before saving.`
+                : "A newer artifact revision was loaded. Your caption draft " +
+                  "was rebased without losing local changes.";
+            }
+          } else if (sameIdentity && previousDraftNotice &&
+              this.draft.dirty) {
+            this.draftNotice = previousDraftNotice;
+            if (!this.message) this.message = previousMessage;
+          }
+          if (this.draft.dirty) this.drafts.setDraft(key, { ...this.draft });
+          else this.drafts.clearDraft(key);
         }
         if (previousKey !== (this.detail && this.detail.key)) this.busy = false;
         this.render();
@@ -275,6 +359,11 @@
       saveDraft(value) {
         if (!this.detail || !this.draft) return;
         this.draft = { ...this.draft, ...value, dirty: true };
+        if (this.draftNotice) {
+          this.message = "";
+          this.messageError = false;
+        }
+        this.draftNotice = null;
         const key = captionDraftKey(this.detail);
         if (key) this.drafts.setDraft(key, { ...this.draft });
       }
@@ -562,5 +651,6 @@
       createPropertiesInspector,
       effectiveCaption,
       isRevisionConflict,
+      rebaseCaptionDraft,
     };
   });

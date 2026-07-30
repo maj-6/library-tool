@@ -563,8 +563,21 @@
     if (!options.root) throw new TypeError("Corrections feature root is required");
     const status = typeof options.onStatus === "function"
       ? options.onStatus : () => {};
+    let books = null;
     const store = options.store || new deps.CorrectionsIndexStore({
       api: options.api || null,
+      onExternalChange: (change) => {
+        if (books && typeof books.syncSelectionTarget === "function") {
+          books.syncSelectionTarget(store.snapshot().selection, {
+            focused: false,
+            source: "external",
+          });
+        }
+        if (typeof options.onExternalChange === "function") {
+          return options.onExternalChange(change);
+        }
+        return null;
+      },
       onSelectionInvalidated: (event) => {
         status("The selected item disappeared after the Corrections index refreshed.", true);
         if (typeof options.onSelectionInvalidated === "function") {
@@ -581,7 +594,7 @@
       onSelectionTarget: options.onSelectionTarget,
       onHotTarget: options.onHotTarget,
     };
-    const books = options.booksController || new deps.BooksPanelController(shared);
+    books = options.booksController || new deps.BooksPanelController(shared);
     const reviews = options.reviewsController || new ReviewsPanelController({
       ...shared,
       actorIdProvider: options.actorIdProvider,

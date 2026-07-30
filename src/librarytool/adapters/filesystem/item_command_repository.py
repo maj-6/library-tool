@@ -50,6 +50,8 @@ ItemIdValidator = Callable[[str], Any]
 ItemIdentityReservationLoader = Callable[[], ItemLifecycleDeletionIndex]
 TombstoneIdAllocator = Callable[[frozenset[str]], str]
 LockContextFactory = Callable[[], ContextManager[None]]
+RecordScope = Callable[[str], bool]
+RecordItemIdentity = Callable[[str], str]
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FILE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -212,6 +214,17 @@ class FilesystemItemCommandRepository:
     by the unit of work, after durable receipt lookup and while the workspace
     lease is held.  The callback must only read within that lease; it must not
     acquire a host lock that the unit already holds.
+
+    ``record_scope_for`` supports mixed compatibility catalogues whose
+    unrelated legacy rows are not engine items. Rows outside the scope remain
+    strict JSON passthrough data in every publication, but are not interpreted
+    by the item-id validator or record codec and cannot be addressed through
+    this repository. The default keeps the ordinary whole-catalogue contract.
+
+    ``record_item_id_for`` lets a selected legacy storage key remain private
+    while commands address the row through a portable engine identity. The
+    callback receives the raw JSON object key after scope selection. Existing
+    rows retain that raw key when a mutation republishes the whole catalogue.
     """
 
     def __init__(
@@ -225,6 +238,8 @@ class FilesystemItemCommandRepository:
         validate_item_id: ItemIdValidator | None = None,
         load_identity_reservations: ItemIdentityReservationLoader | None = None,
         lock_context_for: LockContextFactory | None = None,
+        record_scope_for: RecordScope | None = None,
+        record_item_id_for: RecordItemIdentity | None = None,
         allocate_tombstone_id: TombstoneIdAllocator | None = None,
         recover: bool = True,
     ) -> None:
@@ -239,6 +254,12 @@ class FilesystemItemCommandRepository:
                 raise TypeError(f"{name} must be callable")
         if lock_context_for is not None and not callable(lock_context_for):
             raise TypeError("lock_context_for must be callable")
+        if record_scope_for is not None and not callable(record_scope_for):
+            raise TypeError("record_scope_for must be callable")
+        if record_item_id_for is not None and not callable(
+            record_item_id_for
+        ):
+            raise TypeError("record_item_id_for must be callable")
         if validate_item_id is not None and not callable(validate_item_id):
             raise TypeError("validate_item_id must be callable")
         if load_identity_reservations is not None and not callable(
@@ -258,6 +279,8 @@ class FilesystemItemCommandRepository:
         self._load_identity_reservations = load_identity_reservations
         self._allocate_tombstone_id = allocate_tombstone_id
         self._lock_context_for = lock_context_for or (lambda: nullcontext())
+        self._record_scope_for = record_scope_for
+        self._record_item_id_for = record_item_id_for
         self._catalogue_relative = self._catalogue_path(catalogue_path)
         self._safe_target(self._catalogue_relative, artifact="catalogue")
         if recover:
@@ -325,6 +348,8 @@ class FilesystemItemCommandRepository:
             validate_item_id=self._validate_item_id,
             load_identity_reservations=self._load_identity_reservations,
             allocate_tombstone_id=self._allocate_tombstone_id,
+            record_scope_for=self._record_scope_for,
+            record_item_id_for=self._record_item_id_for,
         )
 
     @property
@@ -443,6 +468,8 @@ class FilesystemItemCommandUnitOfWork:
         validate_item_id: ItemIdValidator | None,
         load_identity_reservations: ItemIdentityReservationLoader | None,
         allocate_tombstone_id: TombstoneIdAllocator | None,
+        record_scope_for: RecordScope | None,
+        record_item_id_for: RecordItemIdentity | None,
     ) -> None:
         self._write_set = write_set
         self._operation_id = operation_id
@@ -456,7 +483,13 @@ class FilesystemItemCommandUnitOfWork:
             load_identity_reservations
         )
         self._allocate_tombstone_id_callback = allocate_tombstone_id
-        self._catalogue, self._snapshots = self._load_catalogue()
+        self._record_scope_for = record_scope_for
+        self._record_item_id_for = record_item_id_for
+        (
+            self._catalogue,
+            self._snapshots,
+            self._storage_keys,
+        ) = self._load_catalogue()
         self._identity_reservations_cache: (
             ItemLifecycleDeletionIndex | None
         ) = None
@@ -514,7 +547,9 @@ class FilesystemItemCommandUnitOfWork:
 
         self._ensure_open()
         self._item_id(item_id, field_name="item_id")
-        raw = self._catalogue.get(item_id)
+        if item_id not in self._snapshots:
+            return None
+        raw = self._catalogue.get(self._storage_keys[item_id])
         return None if raw is None else _strict_plain(raw)
 
     def allocate_item_id(self) -> str:
@@ -599,6 +634,11 @@ class FilesystemItemCommandUnitOfWork:
     ) -> ItemRecordSnapshot:
         self._ensure_stageable()
         self._item_id(item_id, field_name="item_id")
+        if not self._record_in_scope(item_id):
+            raise RepositoryError(
+                "the item create identity is outside this repository",
+                code="item_repository_scope_mismatch",
+            )
         if not isinstance(draft, ItemDraft):
             raise RepositoryError(
                 "the item create draft is invalid",
@@ -619,6 +659,73 @@ class FilesystemItemCommandUnitOfWork:
                 details={"item_id": item_id},
             )
         raw, snapshot = self._encode_record(item_id, draft, None)
+        catalogue = _strict_plain(self._catalogue)
+        catalogue[item_id] = raw
+        self._stage(
+            action="create",
+            item_id=item_id,
+            catalogue=catalogue,
+            snapshot=snapshot,
+        )
+        return snapshot
+
+    def stage_managed_create(
+        self,
+        item_id: str,
+        raw_record: Mapping[str, Any],
+    ) -> ItemRecordSnapshot:
+        """Stage a storage-enriched create allocated by this locked unit.
+
+        Composite aggregates sometimes need to publish server-managed fields
+        with the first catalogue row (for example capture identity and an
+        already-validated representation).  Requiring the identity allocated
+        by this unit keeps lifecycle reservations and collision checks in the
+        ordinary item authority while the caller owns validation of those
+        managed fields.
+        """
+
+        self._ensure_stageable()
+        self._item_id(item_id, field_name="item_id")
+        if item_id != self._allocated_item_id:
+            raise RepositoryError(
+                "the managed item create did not use this unit's allocation",
+                code="item_repository_scope_mismatch",
+                details={"item_id": item_id},
+            )
+        if not self._record_in_scope(item_id):
+            raise RepositoryError(
+                "the item create identity is outside this repository",
+                code="item_repository_scope_mismatch",
+            )
+        if not self._identity_reservations().allows(item_id):
+            raise RepositoryError(
+                "the item create identity is reserved by its lifecycle tombstone",
+                code="item_identity_reserved",
+                details={"item_id": item_id},
+            )
+        if item_id.casefold() in {
+            existing.casefold() for existing in self._catalogue
+        }:
+            raise RepositoryError(
+                "the item already exists",
+                code="item_already_exists",
+                details={"item_id": item_id},
+            )
+        try:
+            raw = _strict_plain(raw_record)
+        except (TypeError, ValueError) as exc:
+            raise RepositoryError(
+                "the managed item create record is invalid",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "managed_create_record"},
+            ) from exc
+        if not isinstance(raw, dict):
+            raise RepositoryError(
+                "the managed item create record is not an object",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "managed_create_record"},
+            )
+        snapshot = self._decode_record(item_id, raw)
         catalogue = _strict_plain(self._catalogue)
         catalogue[item_id] = raw
         self._stage(
@@ -650,10 +757,11 @@ class FilesystemItemCommandUnitOfWork:
                 code="item_repository_scope_mismatch",
                 details={"item_id": current.item_id},
             )
-        previous = self._catalogue[current.item_id]
+        storage_key = self._storage_keys[current.item_id]
+        previous = self._catalogue[storage_key]
         raw, snapshot = self._encode_record(current.item_id, draft, previous)
         catalogue = _strict_plain(self._catalogue)
-        catalogue[current.item_id] = raw
+        catalogue[storage_key] = raw
         self._stage(
             action="update",
             item_id=current.item_id,
@@ -700,7 +808,7 @@ class FilesystemItemCommandUnitOfWork:
             )
         snapshot = self._decode_record(item_id, raw)
         catalogue = _strict_plain(self._catalogue)
-        catalogue[item_id] = raw
+        catalogue[self._storage_keys[item_id]] = raw
         self._stage(
             action="managed",
             item_id=item_id,
@@ -726,6 +834,11 @@ class FilesystemItemCommandUnitOfWork:
 
         self._ensure_stageable()
         self._item_id(item_id, field_name="item_id")
+        if not self._record_in_scope(item_id):
+            raise RepositoryError(
+                "the item restore identity is outside this repository",
+                code="item_repository_scope_mismatch",
+            )
         if item_id.casefold() in {
             existing.casefold() for existing in self._catalogue
         }:
@@ -783,7 +896,7 @@ class FilesystemItemCommandUnitOfWork:
             tombstone_id,
         )
         catalogue = _strict_plain(self._catalogue)
-        raw = catalogue.pop(current.item_id)
+        raw = catalogue.pop(self._storage_keys[current.item_id])
         self._stage(
             action="delete",
             item_id=current.item_id,
@@ -940,7 +1053,11 @@ class FilesystemItemCommandUnitOfWork:
 
     def _load_catalogue(
         self,
-    ) -> tuple[dict[str, Any], dict[str, ItemRecordSnapshot]]:
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, ItemRecordSnapshot],
+        dict[str, str],
+    ]:
         path = self._safe_target(
             self._catalogue_relative,
             artifact="catalogue",
@@ -952,8 +1069,12 @@ class FilesystemItemCommandUnitOfWork:
                 code="invalid_item_catalogue",
             )
         snapshots: dict[str, ItemRecordSnapshot] = {}
+        storage_keys: dict[str, str] = {}
         aliases: dict[str, str] = {}
-        for item_id, raw in value.items():
+        for storage_key, raw in value.items():
+            if not self._record_in_scope(storage_key):
+                continue
+            item_id = self._record_item_id(storage_key)
             self._item_id(item_id, field_name="catalogue_item_id")
             alias = item_id.casefold()
             if alias in aliases:
@@ -970,7 +1091,50 @@ class FilesystemItemCommandUnitOfWork:
                     details={"item_id": item_id},
                 )
             snapshots[item_id] = self._decode_record(item_id, raw)
-        return value, snapshots
+            storage_keys[item_id] = storage_key
+        return value, snapshots, storage_keys
+
+    def _record_in_scope(self, item_id: str) -> bool:
+        callback = self._record_scope_for
+        if callback is None:
+            return True
+        try:
+            selected = callback(item_id)
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise _safe_cause(
+                exc,
+                code="item_record_scope_failed",
+                message="the item repository could not select a record",
+            ) from exc
+        if not isinstance(selected, bool):
+            raise RepositoryError(
+                "the item record scope returned an invalid decision",
+                code="invalid_item_record_scope",
+            )
+        return selected
+
+    def _record_item_id(self, storage_key: str) -> str:
+        callback = self._record_item_id_for
+        if callback is None:
+            return storage_key
+        try:
+            item_id = callback(storage_key)
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise _safe_cause(
+                exc,
+                code="item_record_identity_failed",
+                message="the item repository could not map a record identity",
+            ) from exc
+        if not isinstance(item_id, str):
+            raise RepositoryError(
+                "the item record identity callback returned an invalid value",
+                code="invalid_item_record_identity",
+            )
+        return item_id
 
     def _decode_record(
         self,

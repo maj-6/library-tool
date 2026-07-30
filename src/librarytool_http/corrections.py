@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any
 from urllib.parse import quote
 
@@ -47,6 +48,21 @@ from librarytool.engine.correction_transforms import (
     QueuedCorrectionTransform,
 )
 from librarytool.engine.correction_ocr import CorrectionOcrProposalQueryService
+from librarytool.engine.document_artifacts import (
+    MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT,
+    MAX_DOCUMENT_RESOURCE_PAGE_BYTES,
+    DocumentArtifactCatalogService,
+    DocumentArtifactKey,
+    DocumentPageMode,
+    DocumentResourcePageRequest,
+    DocumentResourcePageService,
+    DocumentResourceRef,
+)
+from librarytool.engine.item_commands import (
+    ItemCommandResult,
+    ItemPatch,
+    UpdateItemCommand,
+)
 from librarytool.engine.items import ItemQueryService, ItemView
 from librarytool.engine.raster_artifacts import (
     RasterArtifactKey,
@@ -62,6 +78,8 @@ from librarytool.engine.runtime import (
     CORRECTION_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+    DOCUMENT_RESOURCE_PAGE_SERVICE,
     ITEM_QUERY_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
@@ -78,10 +96,18 @@ ARTIFACT_PAGE_LIMIT = 512
 CORRECTION_REVIEW_HISTORY_PAGE_LIMIT = 100
 CORRECTION_REVIEW_HISTORY_TAIL_LIMIT = 8
 CORRECTION_MUTATION_MAX_BYTES = 64 * 1024
+CORRECTION_ITEM_DETAIL_MAX_BYTES = 1024 * 1024
+CORRECTION_ITEM_METADATA_FIELD_LIMIT = 1_024
+CORRECTION_ITEM_METADATA_NODE_LIMIT = 4_096
+CORRECTION_ITEM_METADATA_DEPTH_LIMIT = 32
+CORRECTION_ITEM_SCHEMA = "librarytool.corrections-item/1"
+CORRECTION_ITEM_MUTATION_SCHEMA = (
+    "librarytool.corrections-item-mutation/1"
+)
 CORRECTION_TRANSFORM_QUEUE_SCHEMA = (
     "librarytool.correction-transform-queue-receipt/1"
 )
-CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/1"
+CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/2"
 CORRECTIONS_INDEX_BOOK_LIMIT = 100_000
 CORRECTIONS_INDEX_CAPTURE_LIMIT = 100_000
 CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT = 250_000
@@ -94,6 +120,9 @@ _REVIEW_HISTORY_CURSOR_SCHEMA = (
 _CORRECTION_ACTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CORRECTIONS_IDENTIFIER_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$"
+)
+_ITEM_OPERATION_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 )
 _OCR_PROPOSAL_REF_RE = re.compile(r"^cop-[0-9a-f]{40}$")
 _UNSAFE_TEXT_RE = re.compile(
@@ -224,6 +253,26 @@ def _spatial_service(
         engine_for_request,
         SPATIAL_ANNOTATION_QUERY_SERVICE,
         "spatial annotation",
+    )
+
+
+def _document_artifact_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> DocumentArtifactCatalogService:
+    return _query_service(
+        engine_for_request,
+        DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+        "document artifact",
+    )
+
+
+def _document_resource_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> DocumentResourcePageService:
+    return _query_service(
+        engine_for_request,
+        DOCUMENT_RESOURCE_PAGE_SERVICE,
+        "document resource",
     )
 
 
@@ -537,6 +586,538 @@ def _string_array_field(
             details={"field": name},
         )
     return tuple(value)
+
+
+def _correction_item_id(item_id: str) -> str:
+    if (
+        not isinstance(item_id, str)
+        or not _CORRECTIONS_IDENTIFIER_RE.fullmatch(item_id)
+    ):
+        raise ValidationError(
+            "the Corrections item id is invalid",
+            code="invalid_correction_item_id",
+            details={"field": "item_id"},
+        )
+    return item_id
+
+
+def _correction_item_operation_id(item_id: str) -> str:
+    value = request.headers.get("Idempotency-Key")
+    if value is None or value == "":
+        raise PreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={
+                "header": "Idempotency-Key",
+                "item_id": item_id,
+            },
+        )
+    if _ITEM_OPERATION_RE.fullmatch(value) is None:
+        raise ValidationError(
+            "Idempotency-Key must contain one portable operation id",
+            code="invalid_operation_id",
+            details={
+                "header": "Idempotency-Key",
+                "item_id": item_id,
+            },
+        )
+    return value
+
+
+def _is_correction_item_revision(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 512
+        and value == value.strip()
+        and all(
+            0x21 <= ord(character) <= 0x7E
+            and character not in {'"', "\\"}
+            for character in value
+        )
+    )
+
+
+def _correction_item_record_match(item_id: str) -> str:
+    raw = request.headers.get("If-Record-Match")
+    if raw is None or raw == "":
+        raise PreconditionRequiredError(
+            "an item revision is required",
+            code="item_revision_required",
+            details={
+                "header": "If-Record-Match",
+                "item_id": item_id,
+            },
+        )
+    value = raw[1:-1] if len(raw) >= 2 else ""
+    if (
+        raw != raw.strip()
+        or raw.startswith("W/")
+        or len(raw) < 3
+        or raw[0] != '"'
+        or raw[-1] != '"'
+        or not _is_correction_item_revision(value)
+    ):
+        raise ValidationError(
+            "If-Record-Match must contain one strong quoted item revision",
+            code="invalid_item_revision",
+            details={
+                "header": "If-Record-Match",
+                "item_id": item_id,
+            },
+        )
+    return value
+
+
+def _correction_item_metadata_budget(value: Mapping[str, Any]) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > CORRECTION_ITEM_METADATA_NODE_LIMIT:
+            raise ValidationError(
+                "the Corrections item metadata patch is too complex",
+                code="correction_item_metadata_too_complex",
+                details={
+                    "maximum_nodes": (
+                        CORRECTION_ITEM_METADATA_NODE_LIMIT
+                    )
+                },
+            )
+        if depth > CORRECTION_ITEM_METADATA_DEPTH_LIMIT:
+            raise ValidationError(
+                "the Corrections item metadata patch is nested too deeply",
+                code="correction_item_metadata_too_complex",
+                details={
+                    "maximum_depth": (
+                        CORRECTION_ITEM_METADATA_DEPTH_LIMIT
+                    )
+                },
+            )
+        if isinstance(current, Mapping):
+            if len(current) > CORRECTION_ITEM_METADATA_FIELD_LIMIT:
+                raise ValidationError(
+                    "the Corrections item metadata patch has too many fields",
+                    code="correction_item_metadata_too_complex",
+                    details={
+                        "maximum_fields": (
+                            CORRECTION_ITEM_METADATA_FIELD_LIMIT
+                        )
+                    },
+                )
+            stack.extend(
+                (item, depth + 1) for item in current.values()
+            )
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+
+
+def _correction_item_patch(item_id: str) -> ItemPatch:
+    document = _mutation_document(frozenset({"patch"}))
+    raw = document["patch"]
+    fields = {"title", "metadata_set", "metadata_remove"}
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != fields
+        or (
+            raw.get("title") is not None
+            and not isinstance(raw.get("title"), str)
+        )
+        or not isinstance(raw.get("metadata_set"), Mapping)
+        or not isinstance(raw.get("metadata_remove"), list)
+        or len(raw["metadata_set"])
+        > CORRECTION_ITEM_METADATA_FIELD_LIMIT
+        or len(raw["metadata_remove"])
+        > CORRECTION_ITEM_METADATA_FIELD_LIMIT
+    ):
+        raise ValidationError(
+            "the Corrections item patch does not match its schema",
+            code="invalid_correction_item_patch",
+        )
+    _correction_item_metadata_budget(raw["metadata_set"])
+    try:
+        patch = ItemPatch(
+            title=raw["title"],
+            metadata_set=raw["metadata_set"],
+            metadata_remove=tuple(raw["metadata_remove"]),
+        )
+    except (RecursionError, TypeError, ValueError) as error:
+        raise ValidationError(
+            "the Corrections item patch is invalid",
+            code="invalid_correction_item_patch",
+            details={"cause_type": type(error).__name__},
+        ) from error
+    if patch.title is not None and patch.title != patch.title.strip():
+        raise ValidationError(
+            "the Corrections item title cannot have outer whitespace",
+            code="invalid_correction_item_patch",
+            details={"field": "title"},
+        )
+    if patch.is_empty:
+        raise ValidationError(
+            "the Corrections item patch has no changes",
+            code="empty_item_patch",
+            details={"item_id": item_id},
+        )
+    return patch
+
+
+def _correction_item_query_service(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_service_for_request: Callable[[], ItemQueryService] | None,
+) -> Any:
+    if item_service_for_request is None:
+        return _item_service(engine_for_request)
+    try:
+        service = item_service_for_request()
+    except EngineError as error:
+        raise RepositoryError(
+            "the Corrections item query is unavailable",
+            code="corrections_item_query_unavailable",
+            retryable=error.retryable,
+        ) from error
+    except Exception as error:
+        raise RepositoryError(
+            "the Corrections item query is unavailable",
+            code="corrections_item_query_unavailable",
+            details={"cause_type": type(error).__name__},
+            retryable=True,
+        ) from error
+    if not callable(getattr(service, "get_item", None)):
+        raise RepositoryError(
+            "the Corrections item query is unavailable",
+            code="corrections_item_query_unavailable",
+            retryable=True,
+        )
+    return service
+
+
+def _correction_item_not_found(item_id: str) -> NotFoundError:
+    return NotFoundError(
+        "the Corrections item does not exist",
+        code="correction_item_not_found",
+        details={"item_id": item_id},
+    )
+
+
+def _correction_item_view(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_service_for_request: Callable[[], ItemQueryService] | None,
+    item_id: str,
+) -> dict[str, Any]:
+    service = _correction_item_query_service(
+        engine_for_request,
+        item_service_for_request,
+    )
+    try:
+        item = service.get_item(item_id)
+    except NotFoundError as error:
+        raise _correction_item_not_found(item_id) from error
+    except EngineError as error:
+        raise RepositoryError(
+            "the Corrections item query failed",
+            code="corrections_item_query_unavailable",
+            retryable=error.retryable,
+        ) from error
+    except Exception as error:
+        raise RepositoryError(
+            "the Corrections item query failed",
+            code="corrections_item_query_unavailable",
+            details={"cause_type": type(error).__name__},
+            retryable=True,
+        ) from error
+
+    if not isinstance(item, ItemView) or item.item_id != item_id:
+        raise RepositoryError(
+            "the Corrections item query returned an invalid view",
+            code="invalid_correction_item_projection",
+            details={"item_id": item_id},
+        )
+    kind = item.kind.casefold() if isinstance(item.kind, str) else ""
+    if kind not in {"book", "capture"}:
+        raise _correction_item_not_found(item_id)
+    if (
+        not _is_correction_item_revision(item.record_revision)
+        or not isinstance(item.title, str)
+        or len(item.title) > 4096
+        or _UNSAFE_TEXT_RE.search(item.title)
+    ):
+        raise RepositoryError(
+            "the Corrections item query returned an invalid view",
+            code="invalid_correction_item_projection",
+            details={"item_id": item_id},
+        )
+    try:
+        serialized = item.as_dict()
+        metadata = serialized["metadata"]
+        if not isinstance(metadata, Mapping):
+            raise TypeError("metadata is not an object")
+        public = {
+            "id": item_id,
+            "kind": kind,
+            "title": item.title,
+            "metadata": dict(metadata),
+            "record_revision": item.record_revision,
+        }
+        encoded = json.dumps(
+            public,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (RecursionError, TypeError, UnicodeError, ValueError) as error:
+        raise RepositoryError(
+            "the Corrections item query returned an invalid view",
+            code="invalid_correction_item_projection",
+            details={"item_id": item_id},
+        ) from error
+    if len(encoded) > CORRECTION_ITEM_DETAIL_MAX_BYTES:
+        raise RepositoryError(
+            "the Corrections item detail exceeds its size budget",
+            code="invalid_correction_item_projection",
+            details={
+                "item_id": item_id,
+                "maximum_bytes": CORRECTION_ITEM_DETAIL_MAX_BYTES,
+            },
+        )
+    return public
+
+
+def _correction_item_response(
+    item: Mapping[str, Any],
+    *,
+    replayed: bool | None = None,
+) -> Response:
+    body: dict[str, Any] = {
+        "ok": True,
+        "schema": (
+            CORRECTION_ITEM_SCHEMA
+            if replayed is None
+            else CORRECTION_ITEM_MUTATION_SCHEMA
+        ),
+        "item": dict(item),
+    }
+    if replayed is not None:
+        body["replayed"] = replayed
+    response = jsonify(body)
+    projection_revision = "cid-" + hashlib.sha256(
+        json.dumps(
+            dict(item),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    response.set_etag(projection_revision, weak=False)
+    response.headers["X-Record-Revision"] = item["record_revision"]
+    response.cache_control.private = True
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response if replayed is not None else response.make_conditional(
+        request
+    )
+
+
+def _get_correction_item(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_service_for_request: Callable[[], ItemQueryService] | None,
+    item_id: str,
+) -> Response:
+    item_id = _correction_item_id(item_id)
+    if request.args:
+        raise ValidationError(
+            "the Corrections item detail does not accept query parameters",
+            code="invalid_correction_item_request",
+        )
+    return _correction_item_response(
+        _correction_item_view(
+            engine_for_request,
+            item_service_for_request,
+            item_id,
+        )
+    )
+
+
+def _correction_item_update_service(
+    service_for_request: Callable[[], Any] | None,
+) -> Any:
+    if service_for_request is None:
+        raise RepositoryError(
+            "the Corrections item update module is unavailable",
+            code="correction_item_update_module_unavailable",
+            retryable=True,
+        )
+    try:
+        service = service_for_request()
+    except EngineError as error:
+        raise RepositoryError(
+            "the Corrections item update module is unavailable",
+            code="correction_item_update_module_unavailable",
+            retryable=error.retryable,
+        ) from error
+    except Exception as error:
+        raise RepositoryError(
+            "the Corrections item update module is unavailable",
+            code="correction_item_update_module_unavailable",
+            details={"cause_type": type(error).__name__},
+            retryable=True,
+        ) from error
+    if not callable(getattr(service, "update", None)):
+        raise RepositoryError(
+            "the Corrections item update module is unavailable",
+            code="correction_item_update_module_unavailable",
+            retryable=True,
+        )
+    return service
+
+
+def _correction_item_update_error(
+    error: EngineError,
+    *,
+    item_id: str,
+    expected_revision: str,
+    operation_id: str,
+) -> EngineError:
+    if isinstance(error, NotFoundError):
+        return _correction_item_not_found(item_id)
+    if isinstance(error, ConflictError):
+        if error.code == "operation_id_conflict":
+            return ConflictError(
+                "the idempotency key was already used for another edit",
+                code="operation_id_conflict",
+                details={"operation_id": operation_id},
+            )
+        if error.code == "item_revision_conflict":
+            details = {
+                "item_id": item_id,
+                "expected_revision": expected_revision,
+            }
+            current_revision = error.details.get("current_revision")
+            if _is_correction_item_revision(current_revision):
+                details["current_revision"] = current_revision
+            return ConflictError(
+                "the Corrections item changed elsewhere",
+                code="item_revision_conflict",
+                details=details,
+            )
+        return ConflictError(
+            "the Corrections item update conflicted",
+            code="correction_item_update_conflict",
+            details={"item_id": item_id},
+        )
+    if isinstance(error, ValidationError):
+        details: dict[str, Any] = {"item_id": item_id}
+        for key in ("field", "reason", "cause_type", "kind"):
+            value = error.details.get(key)
+            if (
+                isinstance(value, str)
+                and len(value) <= 256
+                and not _UNSAFE_TEXT_RE.search(value)
+            ):
+                details[key] = value
+        fields = error.details.get("fields")
+        if (
+            isinstance(fields, (list, tuple))
+            and len(fields) <= CORRECTION_ITEM_METADATA_FIELD_LIMIT
+            and all(
+                isinstance(value, str)
+                and len(value) <= 256
+                and not _UNSAFE_TEXT_RE.search(value)
+                for value in fields
+            )
+        ):
+            details["fields"] = list(fields)
+        safe_codes = {
+            "empty_item_patch",
+            "invalid_item_metadata",
+            "managed_item_fields_not_writable",
+            "unsupported_item_kind",
+        }
+        return ValidationError(
+            "the Corrections item update is invalid",
+            code=(
+                error.code
+                if error.code in safe_codes
+                else "invalid_correction_item_update"
+            ),
+            details=details,
+        )
+    return RepositoryError(
+        "the Corrections item update failed",
+        code="correction_item_update_unavailable",
+        retryable=error.retryable,
+    )
+
+
+def _update_correction_item(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_service_for_request: Callable[[], ItemQueryService] | None,
+    update_service_for_request: Callable[[], Any] | None,
+    item_id: str,
+) -> Response:
+    item_id = _correction_item_id(item_id)
+    if request.args:
+        raise ValidationError(
+            "the Corrections item update does not accept query parameters",
+            code="invalid_correction_item_request",
+        )
+    operation_id = _correction_item_operation_id(item_id)
+    expected_revision = _correction_item_record_match(item_id)
+    patch = _correction_item_patch(item_id)
+    service = _correction_item_update_service(
+        update_service_for_request
+    )
+    command = UpdateItemCommand(
+        item_id=item_id,
+        expected_revision=expected_revision,
+        patch=patch,
+        operation_id=operation_id,
+    )
+    try:
+        result = service.update(command)
+    except EngineError as error:
+        raise _correction_item_update_error(
+            error,
+            item_id=item_id,
+            expected_revision=expected_revision,
+            operation_id=operation_id,
+        ) from error
+    except Exception as error:
+        raise RepositoryError(
+            "the Corrections item update failed",
+            code="correction_item_update_unavailable",
+            details={"cause_type": type(error).__name__},
+            retryable=True,
+        ) from error
+    if (
+        not isinstance(result, ItemCommandResult)
+        or result.receipt.action != "update"
+        or result.receipt.operation_id != operation_id
+        or result.receipt.before_revision != expected_revision
+    ):
+        raise RepositoryError(
+            "the Corrections item update returned an invalid result",
+            code="invalid_correction_item_update_result",
+        )
+    item = _correction_item_view(
+        engine_for_request,
+        item_service_for_request,
+        item_id,
+    )
+    if not result.replayed and item["record_revision"] == expected_revision:
+        raise RepositoryError(
+            "the Corrections item projection did not advance",
+            code="stale_correction_item_projection",
+            details={"item_id": item_id},
+            retryable=True,
+        )
+    return _correction_item_response(
+        item,
+        replayed=result.replayed,
+    )
 
 
 def _mutation_response(result: CorrectionCommandResult) -> Response:
@@ -1150,6 +1731,53 @@ def _capture_import_state(value: RasterArtifactView) -> str:
     return "ready"
 
 
+def _artifact_diagnostic_scopes(
+    value: RasterArtifactView,
+) -> frozenset[str]:
+    diagnostics = value.extensions.get("artifact_diagnostics")
+    if (
+        isinstance(diagnostics, (str, bytes))
+        or not isinstance(diagnostics, Sequence)
+        or len(diagnostics) > 128
+    ):
+        return frozenset()
+    known = {
+        "capture_geometry",
+        "capture_rendition",
+        "mistral_figure",
+        "mistral_layout",
+    }
+    return frozenset(
+        scope
+        for diagnostic in diagnostics
+        if isinstance(diagnostic, Mapping)
+        for scope in (diagnostic.get("scope"),)
+        if (
+            isinstance(scope, str)
+            and scope in known
+            and diagnostic.get("state") in {"missing", "unavailable"}
+        )
+    )
+
+
+def _capture_group_import_state(
+    values: Sequence[RasterArtifactView],
+) -> str:
+    states = [_capture_import_state(value) for value in values]
+    if states and all(state == "missing" for state in states):
+        return "missing"
+    if states and all(state == "unavailable" for state in states):
+        return "unavailable"
+    has_diagnostics = any(
+        _artifact_diagnostic_scopes(value)
+        & {"capture_geometry", "capture_rendition"}
+        for value in values
+    )
+    if has_diagnostics or any(state != "ready" for state in states):
+        return "partial"
+    return "ready"
+
+
 def _capture_rank(value: RasterArtifactView) -> tuple[int, str]:
     variant = value.resource.variant if value.resource is not None else ""
     is_display = (
@@ -1185,7 +1813,7 @@ def _capture_rows(
             "label": value.label,
             "effective_category": value.effective_category,
             "resource_state": value.resource_state.value,
-            "import_state": _capture_import_state(value),
+            "import_state": _capture_group_import_state(by_order[order]),
             "freshness": value.freshness.value,
             "thumbnail": None,
         }
@@ -1240,16 +1868,73 @@ def _book_import_state(captures: Sequence[Mapping[str, Any]]) -> str:
     return "ready"
 
 
+def _item_has_capture_inventory(item: ItemView) -> bool:
+    if item.kind.casefold() == "capture":
+        return True
+    origin = item.metadata.get("origin")
+    return origin in {"captured_entry", "promoted_capture"} or bool(
+        item.metadata.get("capture_id")
+    )
+
+
+def _index_capture_inventory(
+    rasters: Any,
+    item: ItemView,
+) -> tuple[list[dict[str, Any]], str, tuple[str, ...]]:
+    """Project one independently fallible capture inventory for the index."""
+
+    values = _validated_rasters(
+        rasters.list_raster_artifacts(item.item_id),
+        item_id=item.item_id,
+    )
+    captures = _capture_rows(item.item_id, values)
+    diagnostic_scopes = frozenset(
+        scope
+        for value in values
+        for scope in _artifact_diagnostic_scopes(value)
+    )
+    issues: list[str] = []
+    if "capture_geometry" in diagnostic_scopes:
+        issues.append("Captured image geometry is incomplete")
+    if "mistral_layout" in diagnostic_scopes:
+        issues.append("Mistral artifact layout is unavailable")
+    if "mistral_figure" in diagnostic_scopes:
+        issues.append("Mistral image artifacts are incomplete")
+    if _item_has_capture_inventory(item) and not captures:
+        return (
+            [],
+            "missing",
+            ("Captured image manifest is missing", *issues),
+        )
+    import_state = _book_import_state(captures)
+    if diagnostic_scopes & {"mistral_layout", "mistral_figure"}:
+        import_state = "partial" if captures else "unavailable"
+    return captures, import_state, tuple(issues)
+
+
 def _book_issues(
     item: ItemView,
     captures: Sequence[Mapping[str, Any]],
+    *,
+    inventory_issues: Sequence[str] = (),
 ) -> list[str]:
-    issues = list(item.workbench_state.issues)
+    issues = [
+        value
+        for value in item.workbench_state.issues
+        if not (
+            value == "representation.missing"
+            and captures
+        )
+    ]
+    issues.extend(inventory_issues)
     missing = sum(
         value["resource_state"] == "missing" for value in captures
     )
     unavailable = sum(
         value["resource_state"] == "unavailable" for value in captures
+    )
+    incomplete = sum(
+        value["import_state"] == "partial" for value in captures
     )
     if missing:
         issues.append(
@@ -1260,6 +1945,11 @@ def _book_issues(
         issues.append(
             f"{unavailable} captured image"
             f"{' is' if unavailable == 1 else 's are'} unavailable"
+        )
+    if incomplete:
+        issues.append(
+            f"{incomplete} captured image record"
+            f"{' is' if incomplete == 1 else 's are'} incomplete"
         )
     values = list(dict.fromkeys(issues))
     if (
@@ -1310,10 +2000,9 @@ def _validated_items(value: Any) -> list[ItemView]:
     return rows
 
 
-def _corrections_index(
-    engine_for_request: Callable[[], LibraryEngine],
+def _validate_corrections_workspace(
     workspace_id_for_request: Callable[[], str],
-) -> Response:
+) -> None:
     workspace_ids = request.args.getlist("workspace_id")
     workspace_id = workspace_ids[0] if len(workspace_ids) == 1 else ""
     if (
@@ -1342,15 +2031,32 @@ def _corrections_index(
             },
         )
 
+
+def _corrections_index_projection(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_service_for_request: Callable[[], ItemQueryService] | None = None,
+) -> Response:
     reviews = _review_service(engine_for_request)
     rasters = _raster_service(engine_for_request)
     books: list[dict[str, Any]] = []
     attention: list[dict[str, Any]] = []
     capture_count = 0
     projected_bytes = 64
-    items = _validated_items(_item_service(engine_for_request).list_items())
+    item_service = (
+        _item_service(engine_for_request)
+        if item_service_for_request is None
+        else item_service_for_request()
+    )
+    if not callable(getattr(item_service, "list_items", None)):
+        raise RepositoryError(
+            "the Corrections item query is unavailable",
+            code="corrections_item_query_unavailable",
+            retryable=True,
+        )
+    items = _validated_items(item_service.list_items())
     for item in items:
-        if item.kind.casefold() != "book":
+        item_kind = item.kind.casefold()
+        if item_kind not in {"book", "capture"}:
             continue
         review = reviews.get_review(item.item_id)
         if not isinstance(review, CorrectionReviewSnapshot):
@@ -1359,12 +2065,8 @@ def _corrections_index(
                 code="invalid_correction_review",
                 details={"item_id": item.item_id},
             )
-        captures = _capture_rows(
-            item.item_id,
-            _validated_rasters(
-                rasters.list_raster_artifacts(item.item_id),
-                item_id=item.item_id,
-            ),
+        captures, import_state, inventory_issues = (
+            _index_capture_inventory(rasters, item)
         )
         capture_count += len(captures)
         if capture_count > CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT:
@@ -1380,9 +2082,14 @@ def _corrections_index(
         review_summary = _index_review_summary(review)
         without_revision = {
             "id": item.item_id,
+            "kind": item_kind,
             "title": item.title,
-            "import_state": _book_import_state(captures),
-            "issues": _book_issues(item, captures),
+            "import_state": import_state,
+            "issues": _book_issues(
+                item,
+                captures,
+                inventory_issues=inventory_issues,
+            ),
             "review": review_summary,
             "captures": captures,
         }
@@ -1448,6 +2155,200 @@ def _corrections_index(
             details={"maximum_bytes": CORRECTIONS_INDEX_MAX_BYTES},
         )
     return _conditional_json(body, revision)
+
+
+def _corrections_index(
+    engine_for_request: Callable[[], LibraryEngine],
+    workspace_id_for_request: Callable[[], str],
+    item_service_for_request: Callable[[], ItemQueryService] | None = None,
+    index_context_for_request: Callable[[], Any] | None = None,
+) -> Response:
+    _validate_corrections_workspace(workspace_id_for_request)
+    operation_context = (
+        nullcontext()
+        if index_context_for_request is None
+        else index_context_for_request()
+    )
+    with operation_context:
+        return _corrections_index_projection(
+            engine_for_request,
+            item_service_for_request,
+        )
+
+
+def _document_query_value(
+    name: str,
+    *,
+    required: bool = False,
+    default: str = "",
+    error_code: str = "invalid_document_artifact_query",
+    subject: str = "document artifact",
+) -> str:
+    values = request.args.getlist(name)
+    if len(values) > 1:
+        raise ValidationError(
+            f"the {subject} query contains a repeated field",
+            code=error_code,
+            details={"field": name},
+        )
+    value = values[0] if values else default
+    if required and not value:
+        raise ValidationError(
+            f"the {subject} query is incomplete",
+            code=error_code,
+            details={"field": name},
+        )
+    return value
+
+
+def _document_artifact_list(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    allowed = {"cursor", "limit", "snapshot_revision"}
+    unknown = sorted(set(request.args) - allowed)
+    if unknown:
+        raise ValidationError(
+            "the document artifact query contains unknown fields",
+            code="invalid_document_artifact_query",
+            details={"fields": unknown},
+        )
+    cursor = _document_query_value("cursor") or None
+    snapshot_revision = _document_query_value("snapshot_revision") or None
+    # Repeated limits must not silently collapse to their first value.
+    _document_query_value("limit", default="100")
+    page = _document_artifact_service(
+        engine_for_request
+    ).list_document_artifacts(
+        item_id,
+        cursor=cursor,
+        limit=_limit(maximum=MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT),
+        snapshot_revision=snapshot_revision,
+    )
+    return _conditional_json(
+        {"ok": True, **page.as_dict()},
+        page.snapshot_revision,
+    )
+
+
+def _document_artifact_detail(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    if request.args:
+        raise ValidationError(
+            "document artifact detail does not accept query fields",
+            code="invalid_document_artifact_query",
+            details={"fields": sorted(set(request.args))},
+        )
+    key = DocumentArtifactKey(item_id, artifact_id)
+    artifact = _document_artifact_service(
+        engine_for_request
+    ).get_document_artifact(key)
+    if artifact is None:
+        raise NotFoundError(
+            "the document artifact does not exist",
+            code="document_artifact_not_found",
+            details=key.as_dict(),
+        )
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": "librarytool.document-artifact-detail/1",
+            "artifact": artifact.as_dict(),
+        },
+        artifact.revision,
+    )
+
+
+def _document_resource_page(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    allowed = {
+        "artifact_revision",
+        "resource_id",
+        "resource_revision",
+        "mode",
+        "offset",
+        "max_bytes",
+    }
+    unknown = sorted(set(request.args) - allowed)
+    if unknown:
+        raise ValidationError(
+            "the document resource query contains unknown fields",
+            code="invalid_document_resource_page",
+            details={"fields": unknown},
+        )
+    artifact_revision = _document_query_value(
+        "artifact_revision",
+        required=True,
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    resource_id = _document_query_value(
+        "resource_id",
+        required=True,
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    resource_revision = _document_query_value(
+        "resource_revision",
+        required=True,
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    mode = _document_query_value(
+        "mode",
+        default="text",
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    raw_offset = _document_query_value(
+        "offset",
+        default="0",
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    raw_maximum = _document_query_value(
+        "max_bytes",
+        default=str(MAX_DOCUMENT_RESOURCE_PAGE_BYTES),
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    try:
+        offset = int(raw_offset, 10)
+        maximum = int(raw_maximum, 10)
+        page_mode = DocumentPageMode(mode)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(
+            "the document resource query is invalid",
+            code="invalid_document_resource_page",
+        ) from exc
+    page = _document_resource_service(
+        engine_for_request
+    ).read_document_resource_page(
+        DocumentResourcePageRequest(
+            key=DocumentArtifactKey(item_id, artifact_id),
+            artifact_revision=artifact_revision,
+            resource=DocumentResourceRef(
+                resource_id,
+                resource_revision,
+            ),
+            mode=page_mode,
+            offset=offset,
+            max_bytes=maximum,
+        )
+    )
+    response = _conditional_json(
+        {"ok": True, **page.as_dict()},
+        page.page_sha256,
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Resource-Revision"] = page.resource.revision
+    return response
 
 
 def _raster_list(
@@ -1812,6 +2713,13 @@ def create_corrections_blueprint(
     engine_for_request: Callable[[], LibraryEngine],
     *,
     raster_resource_resolver_for_request: Callable[[], Any] | None = None,
+    correction_index_context_for_request: Callable[[], Any] | None = None,
+    correction_item_service_for_request: (
+        Callable[[], ItemQueryService] | None
+    ) = None,
+    correction_item_update_service_for_request: (
+        Callable[[], Any] | None
+    ) = None,
     correction_actor_id_for_request: Callable[[], str] | None = None,
     correction_workspace_id_for_request: Callable[[], str] | None = None,
     correction_transform_submitter: Callable[
@@ -1824,7 +2732,23 @@ def create_corrections_blueprint(
     ]
     | None = None,
 ) -> Blueprint:
-    """Create the optional Corrections read transport."""
+    """Create the optional Corrections transport.
+
+    ``correction_item_update_service_for_request`` returns an adapter with an
+    ``update(UpdateItemCommand) -> ItemCommandResult`` method.  Commands carry
+    the public Corrections item id; the adapter may resolve that id to a
+    capture-only/manual record or a promoted catalogue record before invoking
+    a generic item command service.  The composition must install the policy
+    appropriate to that backing record.  In particular, attempts to write
+    server-managed metadata must raise ``ValidationError`` with code
+    ``managed_item_fields_not_writable``.  Product-specific managed fields do
+    not belong in this transport because book and capture stores can differ.
+
+    ``correction_index_context_for_request`` may pin one composition-owned
+    authority snapshot around the complete index projection.  This lets the
+    item query and its dependent review/raster reads share the same bounded
+    operation state without installing a process-global transport cache.
+    """
 
     if not callable(engine_for_request):
         raise TypeError("engine_for_request must be callable")
@@ -1834,6 +2758,28 @@ def create_corrections_blueprint(
     ):
         raise TypeError(
             "raster_resource_resolver_for_request must be callable or None"
+        )
+    if (
+        correction_index_context_for_request is not None
+        and not callable(correction_index_context_for_request)
+    ):
+        raise TypeError(
+            "correction_index_context_for_request must be callable or None"
+        )
+    if (
+        correction_item_service_for_request is not None
+        and not callable(correction_item_service_for_request)
+    ):
+        raise TypeError(
+            "correction_item_service_for_request must be callable or None"
+        )
+    if (
+        correction_item_update_service_for_request is not None
+        and not callable(correction_item_update_service_for_request)
+    ):
+        raise TypeError(
+            "correction_item_update_service_for_request must be callable "
+            "or None"
         )
     if (
         correction_actor_id_for_request is not None
@@ -1869,12 +2815,37 @@ def create_corrections_blueprint(
 
     blueprint = Blueprint("librarytool_corrections", __name__)
 
+    @blueprint.get("/api/v1/corrections/items/<item_id>")
+    def get_correction_item(item_id: str):
+        try:
+            return _get_correction_item(
+                engine_for_request,
+                correction_item_service_for_request,
+                item_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.patch("/api/v1/corrections/items/<item_id>")
+    def update_correction_item(item_id: str):
+        try:
+            return _update_correction_item(
+                engine_for_request,
+                correction_item_service_for_request,
+                correction_item_update_service_for_request,
+                item_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
     @blueprint.get("/api/v1/corrections/index")
     def get_corrections_index():
         try:
             return _corrections_index(
                 engine_for_request,
                 workspace_id_for_request,
+                correction_item_service_for_request,
+                correction_index_context_for_request,
             )
         except EngineError as error:
             return _error_response(error)
@@ -1883,6 +2854,40 @@ def create_corrections_blueprint(
     def list_raster_artifacts(item_id: str):
         try:
             return _raster_list(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get("/api/v1/items/<item_id>/document-artifacts")
+    def list_document_artifacts(item_id: str):
+        try:
+            return _document_artifact_list(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/document-artifacts/<artifact_id>"
+    )
+    def get_document_artifact(item_id: str, artifact_id: str):
+        try:
+            return _document_artifact_detail(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/document-artifacts/"
+        "<artifact_id>/resource"
+    )
+    def get_document_resource(item_id: str, artifact_id: str):
+        try:
+            return _document_resource_page(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
         except EngineError as error:
             return _error_response(error)
 
@@ -2100,6 +3105,12 @@ __all__ = [
     "CORRECTION_REVIEW_HISTORY_PAGE_LIMIT",
     "CORRECTION_REVIEW_HISTORY_TAIL_LIMIT",
     "CORRECTION_MUTATION_MAX_BYTES",
+    "CORRECTION_ITEM_DETAIL_MAX_BYTES",
+    "CORRECTION_ITEM_METADATA_FIELD_LIMIT",
+    "CORRECTION_ITEM_METADATA_NODE_LIMIT",
+    "CORRECTION_ITEM_METADATA_DEPTH_LIMIT",
+    "CORRECTION_ITEM_SCHEMA",
+    "CORRECTION_ITEM_MUTATION_SCHEMA",
     "CORRECTION_TRANSFORM_QUEUE_SCHEMA",
     "CORRECTIONS_INDEX_SCHEMA",
     "create_corrections_blueprint",

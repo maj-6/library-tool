@@ -474,10 +474,11 @@ def test_manual_entry_get_supports_incremental_merge(client, monkeypatch,
 
     response = client.get("/api/manual/new-book")
     assert response.status_code == 200
-    assert response.get_json() == {
-        "ok": True,
-        "entry": {"id": "new-book", "title": "Just Arrived"},
-    }
+    body = response.get_json()
+    assert body["ok"] is True
+    assert body["entry"]["id"] == "new-book"
+    assert body["entry"]["title"] == "Just Arrived"
+    assert body["entry"]["record_revision"].startswith("mir-")
     assert client.get("/api/manual/missing").status_code == 404
 
 

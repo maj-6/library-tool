@@ -248,11 +248,12 @@ function capture(index) {
 test("large cached thumbnail and artifact browsing stays bounded by release budgets",
   () => {
     const payload = {
-      schema: "librarytool.corrections-index/1",
+      schema: "librarytool.corrections-index/2",
       revision: "large-index-r1",
       books: [{
         id: "gate-book",
         revision: "gate-book-r1",
+        kind: "book",
         title: "Large release-gate book",
         import_state: "ready",
         issues: [],

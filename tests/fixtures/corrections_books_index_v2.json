@@ -1,10 +1,11 @@
 {
-  "schema": "librarytool.corrections-index/1",
+  "schema": "librarytool.corrections-index/2",
   "revision": "index-r7",
   "books": [
     {
       "id": "book-herbarium",
       "revision": "book-herbarium-r3",
+      "kind": "book",
       "title": "An Herbarium",
       "import_state": "partial",
       "issues": [
@@ -63,6 +64,7 @@
     {
       "id": "book-pending",
       "revision": "book-pending-r1",
+      "kind": "capture",
       "title": "Zoological Botany",
       "import_state": "pending",
       "issues": [
@@ -92,6 +94,7 @@
     {
       "id": "book-legacy",
       "revision": "book-legacy-r4",
+      "kind": "book",
       "title": "Materia Medica",
       "import_state": "legacy",
       "issues": [],
@@ -122,6 +125,7 @@
     {
       "id": "book-empty",
       "revision": "book-empty-r1",
+      "kind": "book",
       "title": "Materia Medica",
       "import_state": "ready",
       "issues": [],

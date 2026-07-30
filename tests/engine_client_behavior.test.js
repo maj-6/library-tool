@@ -178,6 +178,70 @@ function rasterArtifact(overrides = {}) {
   };
 }
 
+function documentArtifact(overrides = {}) {
+  return {
+    schema: "librarytool.document-artifact/1",
+    key: {
+      item_id: "book:one",
+      artifact_id: "capture-generated-metadata",
+    },
+    revision: "document-r1",
+    kind: "generated-metadata",
+    label: "Generated metadata",
+    language: "",
+    resource: {
+      state: "available",
+      media_type: "application/json",
+      content_sha256: "c".repeat(64),
+      byte_size: 17,
+      resource: {
+        id: "docres-generated-metadata",
+        revision: "resource-r1",
+      },
+      text_encoding: "utf-8",
+    },
+    source: {
+      kind: "capture",
+      id: "capture:one",
+      revision: "capture-r1",
+    },
+    freshness: "current",
+    lineage: [],
+    provenance: artifactProvenance(),
+    extensions: {},
+    ...overrides,
+  };
+}
+
+function documentResourcePage(overrides = {}) {
+  return {
+    ok: true,
+    schema: "librarytool.document-resource-page/1",
+    key: {
+      item_id: "book:one",
+      artifact_id: "capture-generated-metadata",
+    },
+    artifact_revision: "document-r1",
+    resource: {
+      id: "docres-generated-metadata",
+      revision: "resource-r1",
+    },
+    mode: "text",
+    media_type: "application/json",
+    text_encoding: "utf-8",
+    content_sha256: "c".repeat(64),
+    total_byte_size: 9,
+    offset: 0,
+    max_bytes: 48 * 1024,
+    byte_count: 9,
+    next_offset: null,
+    page_sha256: "d".repeat(64),
+    encoding: "utf-8",
+    data: "sage 🌿",
+    ...overrides,
+  };
+}
+
 function spatialAnnotation(overrides = {}) {
   return {
     key: { item_id: "book:one", annotation_id: "region:one" },
@@ -428,11 +492,12 @@ function correctionsIndex(overrides = {}) {
   };
   return {
     ok: true,
-    schema: "librarytool.corrections-index/1",
+    schema: "librarytool.corrections-index/2",
     revision: "index-r2",
     books: [{
       id: "book:one",
       revision: "book-r2",
+      kind: "book",
       title: "A Herbal",
       import_state: "ready",
       issues: [],
@@ -472,6 +537,9 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.rasterArtifacts.list, "function");
   assert.equal(typeof client.rasterArtifacts.get, "function");
   assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
+  assert.equal(typeof client.documentArtifacts.list, "function");
+  assert.equal(typeof client.documentArtifacts.get, "function");
+  assert.equal(typeof client.documentArtifacts.readPage, "function");
   assert.equal(typeof client.spatialAnnotations.list, "function");
   assert.equal(typeof client.spatialAnnotations.get, "function");
   assert.equal(typeof client.corrections.index, "function");
@@ -633,6 +701,122 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
   }), "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/resource" +
     "?revision=resource-r1");
 });
+
+test("EngineClient owns exact capture document artifact reads", async () => {
+  const artifact = documentArtifact();
+  const bodies = [
+    {
+      ok: true,
+      schema: "librarytool.document-artifact-catalog-page/1",
+      item_id: "book:one",
+      snapshot_revision: `docs-${"a".repeat(64)}`,
+      artifacts: [artifact],
+      next_cursor: "docc-next_page",
+      total: 3,
+    },
+    {
+      ok: true,
+      schema: "librarytool.document-artifact-detail/1",
+      artifact,
+    },
+    documentResourcePage(),
+  ];
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, bodies.shift());
+    },
+  });
+
+  const page = await client.documentArtifacts.list({
+    itemId: "book:one",
+    snapshotRevision: `docs-${"b".repeat(64)}`,
+    limit: 3,
+  });
+  assert.equal(page.artifacts[0].kind, "generated-metadata");
+  assert.equal((await client.documentArtifacts.get({
+    itemId: "book:one",
+    artifactId: "capture-generated-metadata",
+  })).artifact.resource.resource.id, "docres-generated-metadata");
+  const resourcePage = await client.documentArtifacts.readPage({
+    itemId: "book:one",
+    artifactId: "capture-generated-metadata",
+    artifactRevision: "document-r1",
+    resourceId: "docres-generated-metadata",
+    resourceRevision: "resource-r1",
+  });
+  assert.equal(resourcePage.data, "sage 🌿");
+  assert.equal(resourcePage.byte_count, 9,
+    "document paging counts UTF-8 bytes, not JavaScript code units");
+  assert.deepEqual(calls.map(({ url }) => url), [
+    "/api/v1/items/book%3Aone/document-artifacts" +
+      `?snapshot_revision=docs-${"b".repeat(64)}&limit=3`,
+    "/api/v1/items/book%3Aone/document-artifacts/" +
+      "capture-generated-metadata",
+    "/api/v1/items/book%3Aone/document-artifacts/" +
+      "capture-generated-metadata/resource" +
+      "?artifact_revision=document-r1" +
+      "&resource_id=docres-generated-metadata" +
+      "&resource_revision=resource-r1&mode=text&offset=0&max_bytes=49152",
+  ]);
+  assert.ok(calls.every(({ init }) => init.method === "GET"));
+});
+
+test("EngineClient rejects unsafe capture document views and incoherent pages",
+  async () => {
+    const unsafe = documentArtifact({
+      extensions: { local_path: "C:/private/capture.lib" },
+    });
+    const unsafeClient = new EngineClient({
+      transport: async () => response(200, {
+        ok: true,
+        schema: "librarytool.document-artifact-detail/1",
+        artifact: unsafe,
+      }),
+    });
+    await assert.rejects(
+      unsafeClient.documentArtifacts.get({
+        itemId: "book:one",
+        artifactId: "capture-generated-metadata",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+
+    const badPageClient = new EngineClient({
+      transport: async () => response(200, documentResourcePage({
+        byte_count: 8,
+      })),
+    });
+    await assert.rejects(
+      badPageClient.documentArtifacts.readPage({
+        itemId: "book:one",
+        artifactId: "capture-generated-metadata",
+        artifactRevision: "document-r1",
+        resourceId: "docres-generated-metadata",
+        resourceRevision: "resource-r1",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+
+    assert.throws(() => badPageClient.documentArtifacts.readPage({
+      itemId: "book:one",
+      artifactId: "capture-generated-metadata",
+      artifactRevision: "../document-r1",
+      resourceId: "docres-generated-metadata",
+      resourceRevision: "resource-r1",
+    }), TypeError);
+    assert.throws(() => badPageClient.documentArtifacts.readPage({
+      itemId: "book:one",
+      artifactId: "capture-generated-metadata",
+      artifactRevision: "document-r1",
+      resourceId: "docres-generated-metadata",
+      resourceRevision: "resource-r1",
+      maxBytes: 48 * 1024 + 1,
+    }), TypeError);
+  });
 
 test("EngineClient rejects malformed or path-leaking Corrections views", async () => {
   const malformed = rasterArtifact({
@@ -841,7 +1025,8 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
     workspaceId: "workspace:one",
   });
 
-  assert.equal(index.schema, "librarytool.corrections-index/1");
+  assert.equal(index.schema, "librarytool.corrections-index/2");
+  assert.equal(index.books[0].kind, "book");
   assert.equal(index.ok, undefined);
   assert.equal(
     index.attention[0].review.latest_event.actor_id,
@@ -858,6 +1043,18 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
   assert.throws(() => client.corrections.index({
     workspaceId: "bad workspace",
   }), TypeError);
+
+  const captured = correctionsIndex();
+  captured.books[0].kind = "capture";
+  const capturedClient = new EngineClient({
+    transport: async () => response(200, captured),
+  });
+  assert.equal(
+    (await capturedClient.corrections.index({
+      workspaceId: "workspace:one",
+    })).books[0].kind,
+    "capture",
+  );
 
   const malformed = correctionsIndex();
   malformed.attention[0].target.item_id = "missing:book";
@@ -885,6 +1082,12 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
         history_count: 0,
         latest_event: null,
       };
+    },
+    (body) => {
+      body.books[0].kind = "periodical";
+    },
+    (body) => {
+      body.schema = "librarytool.corrections-index/1";
     },
   ]) {
     const contradictory = correctionsIndex();
@@ -2195,6 +2398,56 @@ test("item commands use versioned idempotent JSON contracts", async () => {
     "Content-Type": "application/json",
   });
   assert.deepEqual(JSON.parse(calls[1].init.body), { patch });
+});
+
+test("capture promotion owns one source-pinned create contract", async () => {
+  const item = {
+    kind: "book",
+    title: "",
+    metadata: { pdf_source: "https://example.test/scan.pdf" },
+    representations: [],
+  };
+  const body = {
+    ok: true,
+    schema: "librarytool.capture-promotion/1",
+    replayed: false,
+    capture_id: "capture.1",
+    source_revision: `mir-${"a".repeat(64)}`,
+    item_id: "promoted-book",
+    record_revision: "item-r1",
+    build: {
+      id: "promoted-book",
+      title: "Corrected capture",
+      capture_id: "capture.1",
+      updated_at: "item-r1",
+    },
+  };
+  const { client, calls } = harness(body);
+
+  const result = await client.items.promoteCapture({
+    captureId: "capture.1",
+    sourceRevision: `mir-${"a".repeat(64)}`,
+    item,
+    primarySource: "downloads/capture.pdf",
+    idempotencyKey: "capture-promote-1",
+  });
+
+  assert.equal(result.item_id, "promoted-book");
+  assert.equal(calls[0].url, "/api/v1/capture-promotions");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(calls[0].init.headers, {
+    Accept: "application/json",
+    "Idempotency-Key": "capture-promote-1",
+    "Content-Type": "application/json",
+  });
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    promotion: {
+      capture_id: "capture.1",
+      source_revision: `mir-${"a".repeat(64)}`,
+      item,
+      primary_source: "downloads/capture.pdf",
+    },
+  });
 });
 
 test("compatibility acquisition seeding is isolated behind conditional transport", async () => {
@@ -4841,6 +5094,90 @@ this.createBuild = createBuild;`, context);
     /ATTACH FAILED/.test(event.message)));
   assert.equal(events.some((event) =>
     /ATTACHED|SOURCE ADDED/.test(event.message || "")), false);
+});
+
+test("captured source creation uses one atomic promotion command", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("const ITEM_CREATE_NON_METADATA_FIELDS");
+  const end = app.indexOf("function buildSeedFromSource", start);
+  assert.ok(start >= 0 && end > start);
+  const events = [];
+  const state = { builds: {} };
+  const context = vm.createContext({
+    state,
+    crypto: { randomUUID: () => "promotion-uuid" },
+    engineClient: { items: {
+      create: async () => {
+        throw new Error("generic create must not run");
+      },
+      promoteCapture: async (args) => {
+        events.push({ type: "promotion", args: copyJson(args) });
+        return {
+          ok: true,
+          schema: "librarytool.capture-promotion/1",
+          replayed: false,
+          capture_id: args.captureId,
+          source_revision: args.sourceRevision,
+          item_id: "promoted-book",
+          record_revision: "item-r1",
+          build: {
+            id: "promoted-book",
+            title: "Latest corrected title",
+            authors: "Current Curator",
+            notes: "Corrected capture notes",
+            capture_id: args.captureId,
+            pdf_file: args.primarySource,
+            extra: { generated: { binding: "calf" } },
+            images: ["captures/one.jpg"],
+            updated_at: "item-r1",
+          },
+        };
+      },
+    } },
+    invalidateRepresentationItemIncarnation: (itemId) =>
+      events.push({ type: "incarnation", itemId }),
+    refreshBuildEngineRecord: async () => {
+      throw new Error("optional projection unavailable");
+    },
+    pushOp: () => events.push({ type: "history" }),
+    selectBuild: (id) => events.push({ type: "select", id }),
+    renderUpload: () => events.push({ type: "render" }),
+    statusCrit: (message) => events.push({ type: "critical", message }),
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.promoteCaptureBuild = promoteCaptureBuild;`, context);
+
+  const result = await context.promoteCaptureBuild({
+    title: "Upload-list seed",
+    capture_id: "capture.1",
+    capture_source_revision: `mir-${"a".repeat(64)}`,
+    pdf_file: "downloads/capture.pdf",
+    extra: { private_client_copy: true },
+    images: ["captures/one.jpg"],
+  }, "capture", "workbench");
+
+  const promotion = events.find((event) =>
+    event.type === "promotion").args;
+  assert.equal(promotion.idempotencyKey,
+    "capture-promote-promotion-uuid");
+  assert.equal(promotion.captureId, "capture.1");
+  assert.equal(promotion.sourceRevision, `mir-${"a".repeat(64)}`);
+  assert.equal(promotion.primarySource, "downloads/capture.pdf");
+  assert.deepEqual(promotion.item, {
+    kind: "book",
+    title: "Upload-list seed",
+    metadata: {},
+    representations: [],
+  });
+  assert.equal(events.filter((event) =>
+    event.type === "promotion").length, 1);
+  assert.ok(events.findIndex((event) => event.type === "promotion") <
+    events.findIndex((event) => event.type === "history"));
+  assert.equal(result.title, "Latest corrected title");
+  assert.equal(result.authors, "Current Curator");
+  assert.equal(result.notes, "Corrected capture notes");
+  assert.deepEqual(copyJson(result.extra),
+    { generated: { binding: "calf" } });
 });
 
 test("build creation retains one durable command across ambiguous retries", async () => {

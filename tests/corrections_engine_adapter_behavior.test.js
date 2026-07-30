@@ -4,11 +4,15 @@ const test = require("node:test");
 const {
   correctionTransformJob,
   createCorrectionsEnginePorts,
+  decorateDocumentArtifact,
   decorateRasterArtifact,
   decorateSpatialAnnotation,
 } = require(
   "../tools/whl_explorer/static/corrections/engine-adapter",
 );
+const {
+  CorrectionsIndexStore,
+} = require("../tools/whl_explorer/static/corrections/books");
 
 
 function deferred() {
@@ -82,10 +86,49 @@ function annotation(id, overrides = {}) {
   };
 }
 
+function documentArtifact(
+  id,
+  kind = "generated-metadata",
+  overrides = {},
+) {
+  return {
+    schema: "librarytool.document-artifact/1",
+    key: { item_id: "book-1", artifact_id: id },
+    revision: `${id}-r1`,
+    kind,
+    label: id,
+    language: "",
+    resource: {
+      state: "available",
+      media_type: kind === "ocr-text" ? "text/plain" : "application/json",
+      content_sha256: "c".repeat(64),
+      byte_size: 24,
+      resource: {
+        id: `docres-${id}`,
+        revision: `${id}-resource-r1`,
+      },
+      text_encoding: "utf-8",
+    },
+    source: {
+      kind: "capture",
+      id: "capture-1",
+      revision: "capture-r1",
+    },
+    freshness: "current",
+    lineage: [],
+    provenance: { origin: "capture" },
+    extensions: {},
+    ...overrides,
+  };
+}
+
 
 function engineHarness(overrides = {}) {
   const calls = {
     corrections: [],
+    documentGet: [],
+    documentList: [],
+    documentReadPage: [],
     rasterGet: [],
     rasterList: [],
     resourceUrl: [],
@@ -135,6 +178,28 @@ function engineHarness(overrides = {}) {
   }
   if (overrides.jobs) {
     engineClient.jobs = overrides.jobs;
+  }
+  if (overrides.documentArtifacts) {
+    engineClient.documentArtifacts = {
+      async list(args) {
+        calls.documentList.push(args);
+        return {
+          snapshot_revision: `docs-${"a".repeat(64)}`,
+          artifacts: [],
+          next_cursor: null,
+          total: 0,
+        };
+      },
+      async get(args) {
+        calls.documentGet.push(args);
+        return { artifact: documentArtifact(args.artifactId) };
+      },
+      async readPage(args) {
+        calls.documentReadPage.push(args);
+        return { data: "", next_offset: null };
+      },
+      ...overrides.documentArtifacts,
+    };
   }
   return { calls, engineClient };
 }
@@ -236,13 +301,60 @@ function manualScheduler() {
   };
 }
 
+function nextScheduled(scheduler) {
+  while (scheduler.scheduled.length) {
+    const token = scheduler.scheduled.shift();
+    if (!token.cancelled) return token;
+  }
+  return null;
+}
+
+function correctionsIndex(revision, title = "A Herbal") {
+  const review = {
+    revision: `review-${revision}`,
+    state: "clear",
+    reason: "",
+    history_count: 0,
+    latest_event: null,
+  };
+  return {
+    schema: "librarytool.corrections-index/2",
+    revision,
+    books: [
+      {
+        id: "book-1",
+        revision: `book-1-${revision}`,
+        kind: "book",
+        title,
+        import_state: "ready",
+        issues: [],
+        review: { ...review },
+        captures: [],
+      },
+      {
+        id: "book-2",
+        revision: `book-2-${revision}`,
+        kind: "book",
+        title: "Second Herbal",
+        import_state: "ready",
+        issues: [],
+        review: { ...review },
+        captures: [],
+      },
+    ],
+    attention: [],
+  };
+}
+
 
 test("engine decorations preserve transport values and supply artifact model identity", () => {
   const rawRaster = raster("capture:asset-1:display");
   const rawAnnotation = annotation("region:1");
+  const rawDocument = documentArtifact("capture-notes", "capture-notes");
 
   const decoratedRaster = decorateRasterArtifact(rawRaster);
   const decoratedAnnotation = decorateSpatialAnnotation(rawAnnotation);
+  const decoratedDocument = decorateDocumentArtifact(rawDocument);
 
   assert.equal(decoratedRaster.object_type, "raster-artifact");
   assert.equal(decoratedRaster.artifact_id, "capture:asset-1:display");
@@ -259,8 +371,17 @@ test("engine decorations preserve transport values and supply artifact model ide
   assert.equal(decoratedAnnotation.annotation_id, "region:1");
   assert.equal(decoratedAnnotation.kind, "spatial-annotation");
   assert.equal(decoratedAnnotation.group, "layout-regions");
+  assert.equal(decoratedDocument.object_type, "document-artifact");
+  assert.equal(decoratedDocument.artifact_id, "capture-notes");
+  assert.equal(decoratedDocument.group, "generated-metadata");
+  assert.deepEqual(decoratedDocument.resource, {
+    id: "docres-capture-notes",
+    revision: "capture-notes-resource-r1",
+    variant: "text",
+  });
   assert.equal(Object.hasOwn(rawRaster, "object_type"), false);
   assert.equal(Object.hasOwn(rawAnnotation, "object_type"), false);
+  assert.equal(Object.hasOwn(rawDocument, "object_type"), false);
 });
 
 
@@ -386,6 +507,131 @@ test("spatial catalog and region resources retain engine paging", async () => {
     signal: undefined,
   });
 });
+
+test("capture documents join artifact groups and retain bounded revision pins",
+  async () => {
+    const metadata = documentArtifact("capture-generated-metadata");
+    const ocr = documentArtifact("capture-ocr", "ocr-text");
+    const { calls, engineClient } = engineHarness({
+      documentArtifacts: {
+        async list(args) {
+          calls.documentList.push(args);
+          return {
+            snapshot_revision: `docs-${"a".repeat(64)}`,
+            artifacts: [metadata, ocr],
+            next_cursor: "docc-next",
+            total: 3,
+          };
+        },
+        async get(args) {
+          calls.documentGet.push(args);
+          return { artifact: ocr };
+        },
+        async readPage(args) {
+          calls.documentReadPage.push(args);
+          return {
+            data: args.offset === 0 ? "first " : "second",
+            next_offset: args.offset === 0 ? 6 : null,
+          };
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient);
+    const page = await ports.artifacts.catalog.list({
+      context: { item_id: "book-1" },
+      group: "ocr-text",
+      cursor: null,
+      limit: 20,
+    });
+
+    assert.deepEqual(
+      page.items.map((item) => [item.artifact_id, item.group]),
+      [["capture-ocr", "ocr-text"]],
+    );
+    assert.equal(page.revision, `docs-${"a".repeat(64)}`);
+    assert.equal(page.nextCursor, "docc-next");
+    assert.deepEqual(calls.documentList[0], {
+      itemId: "book-1",
+      cursor: null,
+      limit: 20,
+      signal: undefined,
+    });
+
+    const detail = await ports.artifacts.catalog.get({
+      context: { itemId: "book-1" },
+      key: "document:capture-ocr",
+    });
+    assert.deepEqual(detail.key, {
+      item_id: "book-1",
+      artifact_id: "capture-ocr",
+    });
+    assert.equal(detail.resource.id, "docres-capture-ocr");
+    assert.deepEqual(calls.documentGet[0], {
+      itemId: "book-1",
+      artifactId: "capture-ocr",
+      signal: undefined,
+    });
+
+    const first = await ports.artifacts.resources.readText({
+      itemId: "book-1",
+      artifactId: "capture-ocr",
+      artifactRevision: "capture-ocr-r1",
+      resourceRef: detail.resource,
+      cursor: null,
+      limit: 64 * 1024,
+    });
+    assert.deepEqual(first, { text: "first ", nextCursor: "6" });
+    const second = await ports.artifacts.resources.readText({
+      itemId: "book-1",
+      artifactId: "capture-ocr",
+      artifactRevision: "capture-ocr-r1",
+      resourceRef: detail.resource,
+      cursor: first.nextCursor,
+      limit: 100,
+    });
+    assert.deepEqual(second, { text: "second", nextCursor: null });
+    assert.deepEqual(calls.documentReadPage.map((call) => ({
+      itemId: call.itemId,
+      artifactId: call.artifactId,
+      artifactRevision: call.artifactRevision,
+      resourceId: call.resourceId,
+      resourceRevision: call.resourceRevision,
+      mode: call.mode,
+      offset: call.offset,
+      maxBytes: call.maxBytes,
+    })), [
+      {
+        itemId: "book-1",
+        artifactId: "capture-ocr",
+        artifactRevision: "capture-ocr-r1",
+        resourceId: "docres-capture-ocr",
+        resourceRevision: "capture-ocr-resource-r1",
+        mode: "text",
+        offset: 0,
+        maxBytes: 48 * 1024,
+      },
+      {
+        itemId: "book-1",
+        artifactId: "capture-ocr",
+        artifactRevision: "capture-ocr-r1",
+        resourceId: "docres-capture-ocr",
+        resourceRevision: "capture-ocr-resource-r1",
+        mode: "text",
+        offset: 6,
+        maxBytes: 100,
+      },
+    ]);
+    await assert.rejects(
+      ports.artifacts.resources.readText({
+        itemId: "book-1",
+        artifactId: "capture-ocr",
+        artifactRevision: "capture-ocr-r1",
+        resourceRef: detail.resource,
+        cursor: "../private",
+      }),
+      /cursor is invalid/,
+    );
+  });
 
 
 test("raster details advertise paged regions and pin resource URLs to revisions", async () => {
@@ -1127,11 +1373,12 @@ test("production books port pins audit paging and trusts the server actor",
         latest_event: event,
       };
       return {
-        schema: "librarytool.corrections-index/1",
+        schema: "librarytool.corrections-index/2",
         revision: `index-r${indexRevision}`,
         books: [{
           id: "book-1",
           revision: "book-r1",
+          kind: "book",
           title: "A Herbal",
           import_state: "ready",
           issues: [],
@@ -1140,6 +1387,7 @@ test("production books port pins audit paging and trusts the server actor",
         }, {
           id: "book-2",
           revision: `book-r${indexRevision}`,
+          kind: "book",
           title: indexRevision === 1 ? "Second book" : "Second book updated",
           import_state: "ready",
           issues: [],
@@ -1260,6 +1508,145 @@ test("production books port pins audit paging and trusts the server actor",
     ]);
   });
 
+test("production index polling converges a second visible window without sharing selection",
+  async () => {
+    const listeners = new Set();
+    const lifecycle = {
+      visibilityState: "visible",
+      addEventListener(type, listener) {
+        if (type === "visibilitychange") listeners.add(listener);
+      },
+      removeEventListener(type, listener) {
+        if (type === "visibilitychange") listeners.delete(listener);
+      },
+      emit() {
+        for (const listener of [...listeners]) listener();
+      },
+    };
+    const firstScheduler = manualScheduler();
+    const secondScheduler = manualScheduler();
+    let current = correctionsIndex("index-r1");
+    let activeReads = 0;
+    let maximumActiveReads = 0;
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          activeReads += 1;
+          maximumActiveReads = Math.max(maximumActiveReads, activeReads);
+          await Promise.resolve();
+          activeReads -= 1;
+          return current;
+        },
+        async getReview() {
+          throw new Error("not expected");
+        },
+        async listReviewHistory() {
+          throw new Error("not expected");
+        },
+      },
+    });
+    const firstPorts = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...firstScheduler, lifecycle, intervalMs: 250 },
+    });
+    const secondPorts = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...secondScheduler, lifecycle, intervalMs: 250 },
+    });
+    const first = new CorrectionsIndexStore({ api: firstPorts.books });
+    const second = new CorrectionsIndexStore({ api: secondPorts.books });
+    await first.openWorkspace("workspace-1");
+    await second.openWorkspace("workspace-1");
+    first.setSelection({
+      itemId: "book-1",
+      representationId: null,
+      canvasId: null,
+      artifactId: null,
+      annotationId: null,
+    }, { ownedByFeature: true });
+    second.setSelection({
+      itemId: "book-2",
+      representationId: null,
+      canvasId: null,
+      artifactId: null,
+      annotationId: null,
+    }, { ownedByFeature: true });
+
+    current = correctionsIndex("index-r2", "A Herbal, corrected");
+    const poll = nextScheduled(secondScheduler);
+    assert.ok(poll, "the visible production adapter schedules convergence");
+    poll.callback();
+    for (let attempt = 0;
+      attempt < 10 && second.index.revision !== "index-r2";
+      attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(second.index.revision, "index-r2");
+    assert.equal(second.index.books[0].title, "A Herbal, corrected");
+    assert.equal(second.selection.itemId, "book-2");
+    assert.equal(first.index.revision, "index-r1",
+      "another window receives no selection or snapshot state implicitly");
+    assert.equal(first.selection.itemId, "book-1");
+    assert.equal(maximumActiveReads, 1,
+      "a subscription never overlaps its bounded index reads");
+
+    lifecycle.visibilityState = "hidden";
+    lifecycle.emit();
+    assert.equal(
+      secondScheduler.scheduled.some((token) => !token.cancelled),
+      false,
+      "backgrounding cancels the pending production poll",
+    );
+    lifecycle.visibilityState = "visible";
+    lifecycle.emit();
+    assert.equal(nextScheduled(secondScheduler).delay, 0,
+      "a visible window resumes promptly");
+
+    first.destroy();
+    second.destroy();
+    assert.equal(listeners.size, 0,
+      "destroy releases every lifecycle subscription");
+  });
+
+test("production index polling recovers a window whose initial index load failed",
+  async () => {
+    const scheduler = manualScheduler();
+    let calls = 0;
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          calls += 1;
+          if (calls === 1) throw new Error("temporary index failure");
+          return correctionsIndex("index-recovered");
+        },
+        async getReview() {
+          throw new Error("not expected");
+        },
+        async listReviewHistory() {
+          throw new Error("not expected");
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...scheduler, intervalMs: 250 },
+    });
+    const store = new CorrectionsIndexStore({ api: ports.books });
+
+    await store.openWorkspace("workspace-1");
+    assert.equal(store.status, "error");
+    nextScheduled(scheduler).callback();
+    for (let attempt = 0;
+      attempt < 10 && store.status !== "ready";
+      attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(store.status, "ready");
+    assert.equal(store.index.revision, "index-recovered");
+    assert.equal(calls, 3,
+      "the successful probe is followed by one authoritative store load");
+    store.destroy();
+  });
+
 test("production books port ignores a late aborted workspace load", async () => {
   const workspaceA = deferred();
   const workspaceB = deferred();
@@ -1281,11 +1668,12 @@ test("production books port ignores a late aborted workspace load", async () => 
     },
   };
   const converged = {
-    schema: "librarytool.corrections-index/1",
+    schema: "librarytool.corrections-index/2",
     revision: "index-r2",
     books: [{
       id: "book-1",
       revision: "book-r1",
+      kind: "book",
       title: "A Herbal",
       import_state: "ready",
       issues: [],
@@ -1372,11 +1760,12 @@ test("same-workspace refresh does not invalidate mutation convergence",
       },
     };
     const converged = {
-      schema: "librarytool.corrections-index/1",
+      schema: "librarytool.corrections-index/2",
       revision: "index-r2",
       books: [{
         id: "book-1",
         revision: "book-r1",
+        kind: "book",
         title: "A Herbal",
         import_state: "ready",
         issues: [],
@@ -1501,11 +1890,12 @@ test("production books port surfaces post-receipt review drift", async () => {
     },
   });
   const index = (summary) => ({
-    schema: "librarytool.corrections-index/1",
+    schema: "librarytool.corrections-index/2",
     revision: `index-${summary.revision}`,
     books: [{
       id: "book-1",
       revision: "book-r1",
+      kind: "book",
       title: "A Herbal",
       import_state: "ready",
       issues: [],

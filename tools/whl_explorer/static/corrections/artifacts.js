@@ -12,7 +12,7 @@
     "use strict";
 
     const DEFAULT_PAGE_LIMIT = 100;
-    const TEXT_PAGE_LIMIT = 64 * 1024;
+    const TEXT_PAGE_LIMIT = 48 * 1024;
     const REGION_PAGE_LIMIT = 200;
     const MAX_TEXT_CHUNKS = 4;
     const MAX_REGION_PAGES = 4;
@@ -964,7 +964,7 @@
 
       async routeResource(detail, selectionGeneration) {
         if (detail.resourceState !== "available" &&
-            !["metadata", "regions"].includes(detail.family)) {
+            detail.family !== "regions") {
           this.publishResource(this.unavailableResource(detail));
           return;
         }
@@ -1002,6 +1002,10 @@
           return;
         }
         if (detail.family === "metadata") {
+          if (detail.resourceRef) {
+            await this.openMetadata(detail, selectionGeneration);
+            return;
+          }
           this.publishResource({
             id: detail.id,
             label: resourceLabel(detail),
@@ -1065,6 +1069,9 @@
       async openText(detail, selectionGeneration) {
         if (!detail.resourceRef) throw capabilityError("paged text resource reference");
         const page = textPage(await this.resources.readText({
+          itemId: detail.itemId || this.context && this.context.itemId,
+          artifactId: detail.id,
+          artifactRevision: detail.revision,
           resourceRef: detail.resourceRef,
           cursor: null,
           limit: TEXT_PAGE_LIMIT,
@@ -1094,6 +1101,9 @@
         if (!resource.nextCursor || selectionGeneration !== this.selectionGeneration) return;
         const cursor = resource.nextCursor;
         const page = textPage(await this.resources.readText({
+          itemId: detail.itemId || this.context && this.context.itemId,
+          artifactId: detail.id,
+          artifactRevision: detail.revision,
           resourceRef: detail.resourceRef,
           cursor,
           limit: TEXT_PAGE_LIMIT,
@@ -1108,6 +1118,73 @@
         resource.truncated = resource.chunks.length >= MAX_TEXT_CHUNKS ||
           !!resource.nextCursor;
         this.publishResource(resource);
+      }
+
+      async openMetadata(detail, selectionGeneration) {
+        const page = textPage(await this.resources.readText({
+          itemId: detail.itemId || this.context && this.context.itemId,
+          artifactId: detail.id,
+          artifactRevision: detail.revision,
+          resourceRef: detail.resourceRef,
+          cursor: null,
+          limit: TEXT_PAGE_LIMIT,
+          signal: this.selectionAbort && this.selectionAbort.signal,
+        }));
+        if (selectionGeneration !== this.selectionGeneration || this.destroyed) {
+          return;
+        }
+        if (page.nextCursor) {
+          // Large structured documents stay inspectable through the bounded
+          // paged-text editor; the UI never downloads an unbounded JSON blob.
+          const resource = {
+            id: detail.id,
+            label: resourceLabel(detail),
+            kind: detail.kind,
+            family: "text",
+            media_type: detail.mediaType || "application/json",
+            paged: true,
+            chunks: [page.text],
+            text: page.text,
+            nextCursor: page.nextCursor,
+            truncated: true,
+            summary: detail,
+          };
+          resource.loadNext = () => this.loadMoreText(
+            resource,
+            detail,
+            selectionGeneration,
+          );
+          this.publishResource(resource);
+          return;
+        }
+        let metadata;
+        try {
+          metadata = deps.boundedJson(JSON.parse(page.text));
+        } catch (error) {
+          this.publishResource({
+            id: detail.id,
+            label: resourceLabel(detail),
+            kind: detail.kind,
+            family: "text",
+            media_type: detail.mediaType || "application/json",
+            paged: false,
+            chunks: [page.text],
+            text: page.text,
+            nextCursor: null,
+            truncated: false,
+            summary: detail,
+          });
+          return;
+        }
+        this.publishResource({
+          id: detail.id,
+          label: resourceLabel(detail),
+          kind: "metadata",
+          family: "metadata",
+          media_type: detail.mediaType || "application/json",
+          metadata,
+          detail,
+        });
       }
 
       async openRegions(detail, selectionGeneration) {

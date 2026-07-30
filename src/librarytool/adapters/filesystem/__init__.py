@@ -15,6 +15,9 @@ from .canvas_preparation_repository import (
 )
 from .canvas_query_repository import FilesystemCanvasQueryRepository
 from .capture_archive_repository import FilesystemCaptureArchiveRepository
+from .capture_document_artifact_repository import (
+    FilesystemCaptureDocumentArtifactRepository,
+)
 from .correction_repository import FilesystemCorrectionRepository
 from .correction_ocr_proposal_repository import (
     FilesystemCorrectionOcrProposalRepository,
@@ -42,6 +45,7 @@ from .item_lifecycle_repository import (
 from .item_repository import FilesystemItemQueryRepository
 from .interchange_repository import FilesystemInterchangeRepository
 from .lib_open_repository import FilesystemOpenLibRepository
+from .manual_entry_item_codec import ManualEntryItemCodec
 from .recoverable_write_set import (
     RecoverableWriteSet,
     RecoveryResult,
@@ -81,6 +85,7 @@ __all__ = [
     "FilesystemCanvasPreparationRepository",
     "FilesystemCanvasQueryRepository",
     "FilesystemCaptureArchiveRepository",
+    "FilesystemCaptureDocumentArtifactRepository",
     "FilesystemCorrectionRepository",
     "FilesystemCorrectionOcrProposalRepository",
     "FilesystemCorrectionTransformStore",
@@ -95,6 +100,7 @@ __all__ = [
     "FilesystemInterchangeRepository",
     "FilesystemOpenLibRepository",
     "FilesystemJobHistoryRepository",
+    "ManualEntryItemCodec",
     "FilesystemReplicaRepository",
     "FilesystemRepresentationCommandRepository",
     "FilesystemTranslationRepository",

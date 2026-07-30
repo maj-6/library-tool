@@ -1155,6 +1155,37 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     assert workbench["requires"] == module["provides"]
 
 
+def test_corrections_bindings_can_override_the_active_entry_directory(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    observed: list[str] = []
+
+    def active_entry_directory(item_id: str) -> Path:
+        observed.append(item_id)
+        return tmp_path / "workspace" / "entries" / "active-build"
+
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "canonical-book",
+        capture_id_for=lambda _item_id: None,
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+        entry_directory_for=active_entry_directory,
+    )
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+
+    assert raster.list_raster_artifacts("canonical-book") == ()
+    assert observed
+    assert set(observed) == {"canonical-book"}
+
+
 def test_corrections_source_uses_installed_native_text_layer_service(
     tmp_path,
 ):

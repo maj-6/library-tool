@@ -282,7 +282,7 @@ def test_production_text_layer_source_uses_live_representation_revision(
     )
     monkeypatch.setattr(
         server,
-        "_corrections_representation_revision",
+        "_engine_representation_revision",
         lambda item_id, representation_id: (
             "scan-r7"
             if (item_id, representation_id) == ("book-1", "scan")

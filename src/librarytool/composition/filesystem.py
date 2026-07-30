@@ -31,6 +31,7 @@ from ..adapters.filesystem import (
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
+    FilesystemCaptureDocumentArtifactRepository,
     FilesystemCorrectionOcrProposalRepository,
     FilesystemCorrectionRepository,
     FilesystemCorrectionSourceSnapshotReader,
@@ -69,6 +70,10 @@ from ..engine.corrections import CorrectionService
 from ..engine.correction_transforms import (
     CorrectionTransformService,
     CorrectionTransformWorker,
+)
+from ..engine.document_artifacts import (
+    DocumentArtifactCatalogService,
+    DocumentResourcePageService,
 )
 from ..engine.canvases import CanvasQueryService
 from ..engine.errors import RepositoryError
@@ -118,6 +123,8 @@ from ..engine.runtime import (
     CORRECTION_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+    DOCUMENT_RESOURCE_PAGE_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -207,7 +214,9 @@ CanvasIdAllocator = Callable[[frozenset[str]], str]
 CorrectionsItemMembership = Callable[[str], bool]
 CorrectionsCaptureIdentity = Callable[[str], str | None]
 CorrectionsCaptureDirectory = Callable[[str], Path]
+CorrectionsEntryDirectory = Callable[[str], Path]
 CorrectionsRepresentationRevision = Callable[[str, str], str | None]
+CorrectionsTextLayerItemIdentity = Callable[[str], str | None]
 TextLayerItemMembership = Callable[[str], bool]
 TextLayerSourceSnapshotLoader = Callable[
     [str, str], TextLayerSourceSnapshot | None
@@ -434,7 +443,12 @@ class CorrectionsBindings:
     Capture files may live outside the engine write-set (the desktop stores
     them beside ``output``). ``capture_authority_root`` explicitly confines
     that borrowed read authority without moving the write-set or its recovery
-    journals. Entry artifacts remain confined by the common entries resolver.
+    journals. ``entry_directory_for`` may map a canonical Corrections identity
+    to an active compatibility entry; the artifact adapter still confines the
+    result to the engine workspace. ``text_layer_item_id_for`` may likewise
+    map that identity to the active native text-layer owner, or return ``None``
+    when a capture-only item has no native text store. Omitting either mapping
+    uses the common entry resolver and the canonical identity, respectively.
     """
 
     item_exists_for: CorrectionsItemMembership
@@ -443,8 +457,10 @@ class CorrectionsBindings:
     capture_authority_root: Path
     representation_revision_for: CorrectionsRepresentationRevision
     lock_context_for: CatalogueLockFactory
+    entry_directory_for: CorrectionsEntryDirectory | None = None
     job_start_context_for: ItemLockFactory | None = None
     ocr_provider: CorrectionOcrProviderPort | None = None
+    text_layer_item_id_for: CorrectionsTextLayerItemIdentity | None = None
 
     def __post_init__(self) -> None:
         capture_authority_root = Path(self.capture_authority_root)
@@ -467,6 +483,18 @@ class CorrectionsBindings:
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+        if (
+            self.entry_directory_for is not None
+            and not callable(self.entry_directory_for)
+        ):
+            raise TypeError("entry_directory_for must be callable or None")
+        if (
+            self.text_layer_item_id_for is not None
+            and not callable(self.text_layer_item_id_for)
+        ):
+            raise TypeError(
+                "text_layer_item_id_for must be callable or None"
+            )
         if (
             self.job_start_context_for is not None
             and not callable(self.job_start_context_for)
@@ -861,6 +889,8 @@ class FilesystemServiceGraph:
     correction_commands: CorrectionService | None = None
     correction_transforms: CorrectionTransformService | None = None
     correction_ocr_proposals: CorrectionOcrProposalQueryService | None = None
+    document_artifacts: DocumentArtifactCatalogService | None = None
+    document_resources: DocumentResourcePageService | None = None
     raster_artifacts: RasterArtifactProjectorPort | None = None
     spatial_annotations: SpatialAnnotationProjectorPort | None = None
 
@@ -875,6 +905,13 @@ class FilesystemServiceGraph:
             raise ValueError(
                 "raster artifact and spatial annotation projectors must be "
                 "installed together"
+            )
+        if (self.document_artifacts is None) != (
+            self.document_resources is None
+        ):
+            raise ValueError(
+                "document artifact and resource services must be installed "
+                "together"
             )
         if self.secret_store is not None and not isinstance(
             self.secret_store,
@@ -941,6 +978,14 @@ class FilesystemServiceGraph:
                 self.correction_ocr_proposals,
             ),
             (CORRECTION_TRANSFORM_SERVICE, self.correction_transforms),
+            (
+                DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+                self.document_artifacts,
+            ),
+            (
+                DOCUMENT_RESOURCE_PAGE_SERVICE,
+                self.document_resources,
+            ),
             (RASTER_ARTIFACT_QUERY_SERVICE, self.raster_artifacts),
             (
                 SPATIAL_ANNOTATION_QUERY_SERVICE,
@@ -1078,22 +1123,43 @@ def compose_filesystem_engine(
         )
 
     corrections_artifacts = None
+    capture_document_artifacts = None
+    capture_document_resources = None
     correction_commands = None
     correction_transforms = None
     correction_ocr_proposals = None
     if corrections is not None:
         assert corrections_lock is not None
+        corrections_entry_directory_for = (
+            corrections.entry_directory_for
+            if corrections.entry_directory_for is not None
+            else entry_directory_for
+        )
         corrections_base = FilesystemCorrectionsArtifactRepository(
             resources.write_set,
             item_exists=corrections.item_exists_for,
             capture_id_for=corrections.capture_id_for,
-            entry_directory_for=entry_directory_for,
+            entry_directory_for=corrections_entry_directory_for,
             capture_directory_for=corrections.capture_directory_for,
             capture_authority_root=corrections.capture_authority_root,
             representation_revision_for=(
                 corrections.representation_revision_for
             ),
             lock_context_for=corrections_lock,
+        )
+        capture_document_repository = (
+            FilesystemCaptureDocumentArtifactRepository(
+                resources.write_set,
+                item_exists_for=corrections.item_exists_for,
+                capture_id_for=corrections.capture_id_for,
+                lock_context_for=corrections_lock,
+            )
+        )
+        capture_document_artifacts = DocumentArtifactCatalogService(
+            capture_document_repository
+        )
+        capture_document_resources = DocumentResourcePageService(
+            capture_document_repository
         )
         correction_source_reader: (
             FilesystemCorrectionSourceSnapshotReader | None
@@ -1144,7 +1210,12 @@ def compose_filesystem_engine(
             corrections_artifacts,
             corrections_artifacts,
             human_text_assertions_for=(
-                CanonicalTextLayerHumanAssertionReader(native_text_layers)
+                CanonicalTextLayerHumanAssertionReader(
+                    native_text_layers,
+                    text_layer_item_id_for=(
+                        corrections.text_layer_item_id_for
+                    ),
+                )
                 if native_text_layers is not None
                 else None
             ),
@@ -1385,6 +1456,8 @@ def compose_filesystem_engine(
         correction_commands=correction_commands,
         correction_transforms=correction_transforms,
         correction_ocr_proposals=correction_ocr_proposals,
+        document_artifacts=capture_document_artifacts,
+        document_resources=capture_document_resources,
         raster_artifacts=corrections_artifacts,
         spatial_annotations=corrections_artifacts,
     )

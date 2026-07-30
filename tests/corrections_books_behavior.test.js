@@ -16,7 +16,7 @@ const {
 
 
 const fixturePath = path.join(
-  __dirname, "fixtures", "corrections_books_index_v1.json");
+  __dirname, "fixtures", "corrections_books_index_v2.json");
 
 
 function fixture() {
@@ -228,7 +228,7 @@ test("Corrections index validation is strict and capture order is explicit", () 
   assert.ok(Object.isFrozen(normalized.books[0].captures));
 
   const wrongSchema = fixture();
-  wrongSchema.schema = "librarytool.corrections-index/2";
+  wrongSchema.schema = "librarytool.corrections-index/1";
   assert.throws(() => normalizeCorrectionsIndex(wrongSchema),
     (error) => error instanceof CorrectionsContractError &&
       error.path === "$.schema");
@@ -237,6 +237,16 @@ test("Corrections index validation is strict and capture order is explicit", () 
   unknown.books[0].legacy_path = "C:/private/book";
   assert.throws(() => normalizeCorrectionsIndex(unknown),
     /legacy_path: is not a recognized field/);
+
+  const missingKind = fixture();
+  delete missingKind.books[0].kind;
+  assert.throws(() => normalizeCorrectionsIndex(missingKind),
+    /kind: is required/);
+
+  const unsupportedKind = fixture();
+  unsupportedKind.books[0].kind = "periodical";
+  assert.throws(() => normalizeCorrectionsIndex(unsupportedKind),
+    /kind: has an unsupported value/);
 
   const implicitOrder = fixture();
   delete implicitOrder.books[0].captures[0].capture_order;
@@ -395,7 +405,9 @@ test("external index notices refresh data without importing another window's sel
     let current = fixture();
     let onChange;
     let loads = 0;
+    const externalChanges = [];
     const store = new CorrectionsIndexStore({
+      onExternalChange: (change) => externalChanges.push(change),
       api: {
         async loadIndex() {
           loads += 1;
@@ -424,6 +436,10 @@ test("external index notices refresh data without importing another window's sel
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(loads, 2);
     assert.deepEqual(store.selection, selection);
+    assert.deepEqual(externalChanges, [{
+      workspaceId: "workspace-1",
+      revision: "index-external-r1",
+    }]);
   });
 
 
@@ -454,6 +470,11 @@ test("Books panel renders honest states, accessible chips, and keyboard-focusabl
     assert.match(captureButtons[0].getAttribute("aria-label"),
       /Title page, Image missing/);
     assert.match(textOf(harness.list), /Needs attention/);
+    assert.match(textOf(harness.list), /Captured entry/);
+    const capturedRow = harness.list.children
+      .find((row) => row.dataset.bookId === "book-pending");
+    assert.match(capturedRow.children[0].getAttribute("aria-label"),
+      /captured entry/);
     assert.match(textOf(harness.list), /No captured images/);
     assert.match(textOf(harness.list), /Pending import/);
     assert.match(textOf(harness.list), /Legacy import/);

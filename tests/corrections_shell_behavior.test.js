@@ -775,6 +775,123 @@ test("selection, resources, and drafts remain independent per window instance", 
 });
 
 
+test("window activation refreshes shared corrections state once", async () => {
+  const windowRef = new FakeEventTarget();
+  const documentRef = new FakeEventTarget();
+  documentRef.visibilityState = "visible";
+  let releaseBooks;
+  const calls = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    windowRef,
+    documentRef,
+    listeners: [],
+    destroyed: false,
+    externalRefreshPromise: null,
+    booksFeature: {
+      refresh(reason) {
+        calls.push(["books", reason]);
+        return new Promise((resolve) => { releaseBooks = resolve; });
+      },
+    },
+    artifactsFeature: {
+      refresh(options) {
+        calls.push(["artifacts", options]);
+        return Promise.resolve();
+      },
+    },
+    itemProperties: {
+      refresh(reason) {
+        calls.push(["metadata", reason]);
+        return Promise.resolve();
+      },
+    },
+  });
+  shell.bindExternalRefresh();
+
+  windowRef.emit("focus");
+  documentRef.emit("visibilitychange");
+  await Promise.resolve();
+  assert.deepEqual(calls, [
+    ["books", "window-focus"],
+    ["artifacts", {
+      preserveSelection: true,
+      reason: "window-focus",
+    }],
+    ["metadata", "window-focus"],
+  ], "focus and visibility events share one in-flight refresh");
+  releaseBooks();
+  await shell.externalRefreshPromise;
+
+  documentRef.visibilityState = "hidden";
+  documentRef.emit("visibilitychange");
+  assert.equal(calls.length, 3);
+
+  documentRef.visibilityState = "visible";
+  documentRef.emit("visibilitychange");
+  await Promise.resolve();
+  releaseBooks();
+  await shell.externalRefreshPromise;
+  assert.deepEqual(calls.slice(3), [
+    ["books", "window-visible"],
+    ["artifacts", {
+      preserveSelection: true,
+      reason: "window-visible",
+    }],
+    ["metadata", "window-visible"],
+  ]);
+});
+
+test("external index convergence refreshes selected detail panels without a second Books load",
+  async () => {
+    let releaseArtifacts;
+    const calls = [];
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      destroyed: false,
+      externalRefreshPromise: null,
+      booksFeature: {
+        refresh(reason) {
+          calls.push(["books", reason]);
+          return Promise.resolve();
+        },
+      },
+      artifactsFeature: {
+        refresh(options) {
+          calls.push(["artifacts", options]);
+          return new Promise((resolve) => { releaseArtifacts = resolve; });
+        },
+      },
+      itemProperties: {
+        refresh(reason) {
+          calls.push(["metadata", reason]);
+          return Promise.resolve();
+        },
+      },
+    });
+
+    const first = shell.refreshExternalState("external-change", {
+      includeBooks: false,
+    });
+    const coalesced = shell.refreshExternalState("external-change", {
+      includeBooks: false,
+    });
+    await Promise.resolve();
+
+    assert.strictEqual(coalesced, first);
+    assert.deepEqual(calls, [
+      ["artifacts", {
+        preserveSelection: true,
+        reason: "external-change",
+      }],
+      ["metadata", "external-change"],
+    ]);
+    releaseArtifacts();
+    await first;
+    assert.equal(shell.externalRefreshPromise, null);
+  });
+
+
 test("cross-panel selection addresses retain context without carrying stale object IDs", () => {
   const prior = normalizeSelection({
     itemId: "book-1",
@@ -913,6 +1030,7 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
   assert.equal(typeof standalone.books.getReview, "function");
   assert.equal(typeof standalone.books.resolveReview, "function");
   assert.equal(typeof standalone.books.reopenReview, "function");
+  assert.equal(typeof standalone.books.subscribe, "function");
   assert.equal(typeof standalone.transforms.subscribeResults, "function");
   assert.equal(standalone.books.trustedActor, true);
 
@@ -964,11 +1082,12 @@ test("standalone shell resolves reviews through the real engine client adapter",
     });
     const indexBody = () => ({
       ok: true,
-      schema: "librarytool.corrections-index/1",
+      schema: "librarytool.corrections-index/2",
       revision: `index-r${indexRevision}`,
       books: [{
         id: "book-1",
         revision: `book-r${indexRevision}`,
+        kind: "book",
         title: "A Herbal",
         import_state: "ready",
         issues: [],

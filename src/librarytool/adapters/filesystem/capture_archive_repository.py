@@ -426,6 +426,56 @@ class FilesystemCaptureArchiveRepository:
                 retryable=True,
             ) from exc
 
+    def read_verified_archive(
+        self,
+        capture_id: str,
+    ) -> tuple[CaptureArchiveAssociation, bytes] | None:
+        """Return one association and its exact immutable archive snapshot.
+
+        Document/read adapters need the sealed graph, not a filesystem
+        locator.  Keeping this operation on the association repository makes
+        the association sidecar, object digest, and returned bytes one
+        workspace-leased authority read.  Callers never learn the object path.
+        """
+
+        capture_book_id(capture_id)
+        try:
+            with self._write_set.workspace_lease():
+                association = self._read_association(capture_id)
+                if association is None:
+                    return None
+                if association.archive_bytes > _MAX_ARCHIVE_BYTES:
+                    raise RepositoryError(
+                        "the associated capture archive is too large",
+                        code="invalid_capture_archive_storage",
+                        details={"artifact": "capture_archive"},
+                    )
+                payload = self._read_regular(
+                    self._archive_path(association.archive_sha256),
+                    maximum=_MAX_ARCHIVE_BYTES,
+                    artifact="capture_archive",
+                )
+                self._validate_archive_payload(association, payload)
+                return association, payload
+        except RepositoryError:
+            raise
+        except WriteSetError as exc:
+            raise _repository_failure(
+                "the capture archive workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=exc.retryable,
+            ) from exc
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_failure(
+                "the capture archive snapshot could not be loaded",
+                code="capture_archive_repository_unavailable",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
     def mark_stale(
         self,
         capture_id: str,

@@ -17,6 +17,10 @@ from librarytool.engine.capabilities import CapabilityRef
 from librarytool.engine.correction_ocr import CorrectionOcrProposalQueryService
 from librarytool.engine.correction_transforms import CorrectionTransformService
 from librarytool.engine.corrections import CorrectionService
+from librarytool.engine.document_artifacts import (
+    DocumentArtifactCatalogService,
+    DocumentResourcePageService,
+)
 from librarytool.engine.items import ItemQueryService
 from librarytool.engine.jobs import JobManager
 from librarytool.engine.runtime import (
@@ -26,6 +30,8 @@ from librarytool.engine.runtime import (
     CORRECTION_METADATA_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
+    DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+    DOCUMENT_RESOURCE_PAGE_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -60,6 +66,17 @@ class _EmptyItemRepository:
 class _EmptyCorrectionOcrProposalRepository:
     def get_proposal(self, _item_id, _proposal_ref):
         return None
+
+
+class _EmptyDocumentArtifactRepository:
+    def list_document_artifacts(self, _item_id):
+        return ()
+
+    def get_document_artifact(self, _key):
+        return None
+
+    def read_document_resource_page(self, _request):
+        raise AssertionError("composition must not read a document resource")
 
 
 class _NeverCalledSecretRepository:
@@ -126,6 +143,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.item-lifecycle.commands": "1.0.0",
         "library.canvases": "1.0.0",
         "library.corrections.artifacts": "1.0.0",
+        "library.corrections.documents": "1.0.0",
         "library.corrections.commands": "1.0.0",
         "library.corrections.captions": "1.0.0",
         "library.corrections.metadata": "1.0.0",
@@ -183,6 +201,13 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.spatial-annotations.read", 1),
     }
     assert _capabilities(corrections.requires) == {
+        ("library.items.read", 1),
+    }
+    documents = modules["library.corrections.documents"]
+    assert _capabilities(documents.provides) == {
+        ("library.document-artifacts.read", 1),
+    }
+    assert _capabilities(documents.requires) == {
         ("library.items.read", 1),
     }
     correction_commands = modules["library.corrections.commands"]
@@ -309,6 +334,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.corrections.metadata.edit", 1),
         ("library.corrections.reviews.read", 1),
         ("library.corrections.reviews.edit", 1),
+        ("library.document-artifacts.read", 1),
         ("library.raster-artifacts.classify", 1),
         ("library.spatial-annotations.edit", 1),
     }
@@ -725,3 +751,49 @@ def test_service_graph_allows_independent_correction_command_modules():
         contribution.manifest.id
         for contribution in first_party_module_contributions(transform_only)
     }
+
+
+def test_document_artifact_services_bind_as_one_optional_vertical():
+    graph = _graph()
+    repository = _EmptyDocumentArtifactRepository()
+    catalog = DocumentArtifactCatalogService(repository)
+    resources = DocumentResourcePageService(repository)
+    documents = replace(
+        graph,
+        document_artifacts=catalog,
+        document_resources=resources,
+    )
+
+    contribution = next(
+        value
+        for value in first_party_module_contributions(documents)
+        if value.manifest.id == "library.corrections.documents"
+    )
+    assert tuple(binding.key for binding in contribution.bindings) == (
+        DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+        DOCUMENT_RESOURCE_PAGE_SERVICE,
+    )
+    assert all(
+        _capabilities(binding.capabilities)
+        == {("library.document-artifacts.read", 1)}
+        for binding in contribution.bindings
+    )
+
+    engine = LibraryEngineBuilder(
+        first_party_module_contributions(documents)
+    ).build()
+    assert engine.require_service(DOCUMENT_ARTIFACT_CATALOG_SERVICE) is catalog
+    assert engine.require_service(DOCUMENT_RESOURCE_PAGE_SERVICE) is resources
+    module = next(
+        row
+        for row in engine.discovery_document()["modules"]
+        if row["id"] == "library.corrections.documents"
+    )
+    assert module["status"] == "available"
+
+    with pytest.raises(ValueError, match="must be installed together"):
+        replace(
+            graph,
+            document_artifacts=catalog,
+            document_resources=None,
+        )

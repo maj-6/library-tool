@@ -8,6 +8,7 @@ port for replacing canonical text or human assertions.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ import re
 import threading
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
@@ -33,8 +35,19 @@ from .errors import ConflictError, EngineError, ValidationError
 CORRECTION_OCR_JOB_KIND = "correction.ocr-followup"
 CORRECTION_OCR_PROPOSAL_POLICY = "machine-proposal-only"
 CORRECTION_OCR_MAX_SOURCE_BYTES = 256 * 1024 * 1024
+CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT = 10_000
+CORRECTION_OCR_PROPOSAL_CATALOG_PAGE_LIMIT = 256
 _PORTABLE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _PROPOSAL_REF = re.compile(r"^cop-[0-9a-f]{40}$")
+_PROPOSAL_CATALOG_REVISION = re.compile(r"^cops-[0-9a-f]{64}$")
+_PROPOSAL_CATALOG_CURSOR = re.compile(r"^copc-[A-Za-z0-9_-]{1,2043}$")
+_PROPOSAL_CATALOG_CURSOR_SCHEMA = (
+    "librarytool.correction-ocr-proposal-cursor/1"
+)
+_PROPOSAL_CATALOG_SNAPSHOT_SCHEMA = (
+    "librarytool.correction-ocr-proposal-catalog-snapshot/1"
+)
+_MAX_PROPOSAL_CATALOG_SNAPSHOT_BYTES = 32 * 1024 * 1024
 _MAX_RECOGNITION_BYTES = 64 * 1024 * 1024
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 200_000
@@ -349,6 +362,196 @@ class CorrectionOcrProposalView:
         }
 
 
+class CorrectionOcrProposalAvailability(str, Enum):
+    """Safe public state for one catalogued OCR proposal."""
+
+    AVAILABLE = "available"
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionOcrProposalSummaryView:
+    """Bounded catalog row without recognition data or execution options."""
+
+    proposal_ref: str
+    operation_id: str
+    source: CommittedCorrectionOutput
+    provider: CorrectionOcrProposalProviderView
+    publication_policy: str
+    content_sha256: str
+    availability: CorrectionOcrProposalAvailability = (
+        CorrectionOcrProposalAvailability.AVAILABLE
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "proposal_ref",
+            _portable(self.proposal_ref, "proposal_ref"),
+        )
+        if _PROPOSAL_REF.fullmatch(self.proposal_ref) is None:
+            raise ValueError("proposal_ref must be an opaque OCR proposal reference")
+        object.__setattr__(
+            self,
+            "operation_id",
+            _portable(self.operation_id, "operation_id"),
+        )
+        if not isinstance(self.source, CommittedCorrectionOutput):
+            raise TypeError("source must be a CommittedCorrectionOutput")
+        if self.source.kind != "ocr-ready":
+            raise ValueError("proposal source must be the OCR-ready rendition")
+        if not isinstance(self.provider, CorrectionOcrProposalProviderView):
+            raise TypeError(
+                "provider must be a CorrectionOcrProposalProviderView"
+            )
+        if self.publication_policy != CORRECTION_OCR_PROPOSAL_POLICY:
+            raise ValueError("publication_policy must be machine-proposal-only")
+        if (
+            not isinstance(self.content_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.content_sha256) is None
+        ):
+            raise ValueError("content_sha256 must be a lowercase SHA-256 digest")
+        if not isinstance(self.availability, CorrectionOcrProposalAvailability):
+            raise TypeError(
+                "availability must be a CorrectionOcrProposalAvailability"
+            )
+
+    @classmethod
+    def from_proposal(
+        cls,
+        proposal: CorrectionOcrProposalView,
+    ) -> CorrectionOcrProposalSummaryView:
+        if not isinstance(proposal, CorrectionOcrProposalView):
+            raise TypeError("proposal must be a CorrectionOcrProposalView")
+        return cls(
+            proposal_ref=proposal.proposal_ref,
+            operation_id=proposal.operation_id,
+            source=proposal.source,
+            provider=proposal.provider,
+            publication_policy=proposal.publication_policy,
+            content_sha256=proposal.content_sha256,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "proposal_ref": self.proposal_ref,
+            "operation_id": self.operation_id,
+            "source": self.source.as_dict(),
+            "provider": self.provider.as_dict(),
+            "publication_policy": self.publication_policy,
+            "content_sha256": self.content_sha256,
+            "availability": self.availability.value,
+        }
+
+
+def _proposal_catalog_revision(
+    item_id: str,
+    proposals: tuple[CorrectionOcrProposalSummaryView, ...],
+) -> str:
+    encoded = _canonical_json(
+        {
+            "schema": _PROPOSAL_CATALOG_SNAPSHOT_SCHEMA,
+            "item_id": item_id,
+            "proposals": [proposal.as_dict() for proposal in proposals],
+        }
+    )
+    if len(encoded) > _MAX_PROPOSAL_CATALOG_SNAPSHOT_BYTES:
+        raise ValueError("OCR proposal catalog snapshot exceeds its size budget")
+    return "cops-" + hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionOcrProposalCatalogSnapshot:
+    """One deterministic, verified item-scoped proposal snapshot."""
+
+    item_id: str
+    proposals: tuple[CorrectionOcrProposalSummaryView, ...] = ()
+    snapshot_revision: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "item_id", _portable(self.item_id, "item_id"))
+        if not isinstance(self.proposals, tuple):
+            raise TypeError("proposals must be a tuple")
+        if len(self.proposals) > CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT:
+            raise ValueError("OCR proposal catalog exceeds its count budget")
+        if any(
+            not isinstance(proposal, CorrectionOcrProposalSummaryView)
+            for proposal in self.proposals
+        ):
+            raise TypeError(
+                "proposals must contain CorrectionOcrProposalSummaryView values"
+            )
+        references = tuple(proposal.proposal_ref for proposal in self.proposals)
+        if references != tuple(sorted(references)) or len(references) != len(
+            set(references)
+        ):
+            raise ValueError(
+                "OCR proposal catalog must use unique deterministic ordering"
+            )
+        object.__setattr__(
+            self,
+            "snapshot_revision",
+            _proposal_catalog_revision(self.item_id, self.proposals),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionOcrProposalPageView:
+    """One bounded page pinned to a complete catalog snapshot."""
+
+    item_id: str
+    snapshot_revision: str
+    proposals: tuple[CorrectionOcrProposalSummaryView, ...]
+    next_cursor: str | None
+    total: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "item_id", _portable(self.item_id, "item_id"))
+        if (
+            not isinstance(self.snapshot_revision, str)
+            or _PROPOSAL_CATALOG_REVISION.fullmatch(self.snapshot_revision) is None
+        ):
+            raise ValueError(
+                "snapshot_revision must be an OCR proposal catalog revision"
+            )
+        if not isinstance(self.proposals, tuple):
+            raise TypeError("proposals must be a tuple")
+        if (
+            len(self.proposals) > CORRECTION_OCR_PROPOSAL_CATALOG_PAGE_LIMIT
+            or any(
+                not isinstance(proposal, CorrectionOcrProposalSummaryView)
+                for proposal in self.proposals
+            )
+        ):
+            raise ValueError("proposals must be a bounded tuple of summary views")
+        references = tuple(proposal.proposal_ref for proposal in self.proposals)
+        if references != tuple(sorted(references)) or len(references) != len(
+            set(references)
+        ):
+            raise ValueError("proposal page ordering is invalid")
+        if self.next_cursor is not None and (
+            not isinstance(self.next_cursor, str)
+            or len(self.next_cursor) > 2048
+            or _PROPOSAL_CATALOG_CURSOR.fullmatch(self.next_cursor) is None
+        ):
+            raise ValueError("next_cursor must be an opaque catalog cursor or None")
+        if (
+            isinstance(self.total, bool)
+            or not isinstance(self.total, int)
+            or self.total < len(self.proposals)
+            or self.total > CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT
+        ):
+            raise ValueError("total is outside the OCR proposal catalog budget")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "item_id": self.item_id,
+            "snapshot_revision": self.snapshot_revision,
+            "proposals": [proposal.as_dict() for proposal in self.proposals],
+            "next_cursor": self.next_cursor,
+            "total": self.total,
+        }
+
+
 @runtime_checkable
 class CorrectionOcrProposalQueryRepositoryPort(Protocol):
     """Resolve one immutable proposal without exposing storage addressing."""
@@ -358,6 +561,16 @@ class CorrectionOcrProposalQueryRepositoryPort(Protocol):
         item_id: str,
         proposal_ref: str,
     ) -> CorrectionOcrProposalView | None: ...
+
+
+@runtime_checkable
+class CorrectionOcrProposalCatalogRepositoryPort(Protocol):
+    """Enumerate a verified immutable proposal snapshot for one item."""
+
+    def list_proposals(
+        self,
+        item_id: str,
+    ) -> CorrectionOcrProposalCatalogSnapshot: ...
 
 
 class CorrectionOcrProposalQueryService:
@@ -396,6 +609,184 @@ class CorrectionOcrProposalQueryService:
         ):
             raise TypeError("OCR proposal repository returned an invalid view")
         return proposal
+
+
+def _encode_proposal_catalog_cursor(
+    *,
+    item_id: str,
+    snapshot_revision: str,
+    after_ref: str,
+) -> str:
+    payload = _canonical_json(
+        {
+            "schema": _PROPOSAL_CATALOG_CURSOR_SCHEMA,
+            "item_sha256": hashlib.sha256(item_id.encode("utf-8")).hexdigest(),
+            "snapshot_revision": snapshot_revision,
+            "after_ref": after_ref,
+        }
+    )
+    return "copc-" + base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_proposal_catalog_cursor(
+    token: str,
+    *,
+    item_id: str,
+) -> tuple[str, str]:
+    if len(token) > 2048 or _PROPOSAL_CATALOG_CURSOR.fullmatch(token) is None:
+        raise ValueError("cursor must be an opaque OCR proposal catalog cursor")
+    encoded = token.removeprefix("copc-")
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        decoded = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        value = json.loads(decoded.decode("ascii"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "cursor must be an opaque OCR proposal catalog cursor"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {"schema", "item_sha256", "snapshot_revision", "after_ref"}
+        or value.get("schema") != _PROPOSAL_CATALOG_CURSOR_SCHEMA
+        or value.get("item_sha256")
+        != hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+        or not isinstance(value.get("snapshot_revision"), str)
+        or _PROPOSAL_CATALOG_REVISION.fullmatch(value["snapshot_revision"]) is None
+        or not isinstance(value.get("after_ref"), str)
+        or _PROPOSAL_REF.fullmatch(value["after_ref"]) is None
+        or token
+        != _encode_proposal_catalog_cursor(
+            item_id=item_id,
+            snapshot_revision=value["snapshot_revision"],
+            after_ref=value["after_ref"],
+        )
+    ):
+        raise ValueError("cursor must be an opaque OCR proposal catalog cursor")
+    return value["snapshot_revision"], value["after_ref"]
+
+
+class CorrectionOcrProposalCatalogService:
+    """Page public proposal summaries through revision-pinned cursors."""
+
+    def __init__(
+        self,
+        repository: CorrectionOcrProposalCatalogRepositoryPort,
+    ) -> None:
+        if not isinstance(repository, CorrectionOcrProposalCatalogRepositoryPort):
+            raise TypeError(
+                "repository must implement "
+                "CorrectionOcrProposalCatalogRepositoryPort"
+            )
+        self._repository = repository
+
+    def list_proposals(
+        self,
+        item_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        snapshot_revision: str | None = None,
+    ) -> CorrectionOcrProposalPageView:
+        try:
+            item = _portable(item_id, "item_id")
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+                or limit > CORRECTION_OCR_PROPOSAL_CATALOG_PAGE_LIMIT
+            ):
+                raise ValueError("limit is outside the catalog page budget")
+            if snapshot_revision is not None and (
+                not isinstance(snapshot_revision, str)
+                or _PROPOSAL_CATALOG_REVISION.fullmatch(snapshot_revision) is None
+            ):
+                raise ValueError("snapshot_revision is invalid")
+            cursor_revision = ""
+            after_ref = ""
+            if cursor is not None:
+                if not isinstance(cursor, str) or not cursor:
+                    raise ValueError("cursor is invalid")
+                cursor_revision, after_ref = _decode_proposal_catalog_cursor(
+                    cursor,
+                    item_id=item,
+                )
+                if (
+                    snapshot_revision is not None
+                    and cursor_revision != snapshot_revision
+                ):
+                    raise ValueError(
+                        "cursor and snapshot_revision identify different snapshots"
+                    )
+        except ValueError as exc:
+            raise ValidationError(
+                "the OCR proposal catalog query is invalid",
+                code="invalid_correction_ocr_proposal_catalog_query",
+            ) from exc
+
+        snapshot = self._repository.list_proposals(item)
+        if (
+            not isinstance(snapshot, CorrectionOcrProposalCatalogSnapshot)
+            or snapshot.item_id != item
+        ):
+            raise TypeError(
+                "OCR proposal catalog repository returned an invalid snapshot"
+            )
+        expected_revision = cursor_revision or snapshot_revision
+        if (
+            expected_revision is not None
+            and expected_revision
+            and snapshot.snapshot_revision != expected_revision
+        ):
+            raise ConflictError(
+                "the OCR proposal catalog changed while it was being paged",
+                code="correction_ocr_proposal_catalog_changed",
+                details={
+                    "expected_revision": expected_revision,
+                    "actual_revision": snapshot.snapshot_revision,
+                },
+            )
+
+        offset = 0
+        if after_ref:
+            references = tuple(
+                proposal.proposal_ref for proposal in snapshot.proposals
+            )
+            try:
+                offset = references.index(after_ref) + 1
+            except ValueError as exc:
+                raise ValidationError(
+                    "the OCR proposal catalog query is invalid",
+                    code="invalid_correction_ocr_proposal_catalog_query",
+                ) from exc
+            if offset >= len(snapshot.proposals):
+                raise ValidationError(
+                    "the OCR proposal catalog query is invalid",
+                    code="invalid_correction_ocr_proposal_catalog_query",
+                )
+
+        proposals = snapshot.proposals[offset : offset + limit]
+        next_offset = offset + len(proposals)
+        next_cursor = (
+            _encode_proposal_catalog_cursor(
+                item_id=item,
+                snapshot_revision=snapshot.snapshot_revision,
+                after_ref=proposals[-1].proposal_ref,
+            )
+            if proposals and next_offset < len(snapshot.proposals)
+            else None
+        )
+        return CorrectionOcrProposalPageView(
+            item_id=item,
+            snapshot_revision=snapshot.snapshot_revision,
+            proposals=proposals,
+            next_cursor=next_cursor,
+            total=len(snapshot.proposals),
+        )
 
 
 @runtime_checkable
@@ -1056,11 +1447,19 @@ class CorrectionOcrFollowupService:
 __all__ = [
     "CORRECTION_OCR_JOB_KIND",
     "CORRECTION_OCR_MAX_SOURCE_BYTES",
+    "CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT",
+    "CORRECTION_OCR_PROPOSAL_CATALOG_PAGE_LIMIT",
     "CORRECTION_OCR_PROPOSAL_POLICY",
     "CorrectionOcrFollowupService",
+    "CorrectionOcrProposalAvailability",
+    "CorrectionOcrProposalCatalogRepositoryPort",
+    "CorrectionOcrProposalCatalogService",
+    "CorrectionOcrProposalCatalogSnapshot",
+    "CorrectionOcrProposalPageView",
     "CorrectionOcrProposalQueryRepositoryPort",
     "CorrectionOcrProposalQueryService",
     "CorrectionOcrProposalProviderView",
+    "CorrectionOcrProposalSummaryView",
     "CorrectionOcrProposalView",
     "CorrectionOcrProposalRepositoryPort",
     "CorrectionOcrProviderPort",

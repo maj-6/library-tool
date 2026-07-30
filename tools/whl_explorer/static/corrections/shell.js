@@ -5,6 +5,7 @@
     ...require("./layout-controller"),
     ...require("./reviews"),
     ...require("./artifacts"),
+    ...require("./item-properties"),
     ...require("./engine-adapter"),
     ...require("./commands"),
     ...require("./keymap"),
@@ -340,12 +341,22 @@
     return null;
   }
 
-  function correctionsRuntimePorts(windowRef, desktopCorrections) {
+  function correctionsRuntimePorts(
+    windowRef, desktopCorrections, documentRef = null,
+  ) {
     if (desktopCorrections || !windowRef || !windowRef.engineClient ||
         typeof deps.createCorrectionsEnginePorts !== "function") {
       return null;
     }
-    return deps.createCorrectionsEnginePorts(windowRef.engineClient);
+    return deps.createCorrectionsEnginePorts(windowRef.engineClient, {
+      indexPolling: {
+        lifecycle: documentRef || windowRef.document || null,
+        schedule: typeof windowRef.setTimeout === "function"
+          ? windowRef.setTimeout.bind(windowRef) : undefined,
+        cancelSchedule: typeof windowRef.clearTimeout === "function"
+          ? windowRef.clearTimeout.bind(windowRef) : undefined,
+      },
+    });
   }
 
   class CorrectionsShell {
@@ -367,12 +378,13 @@
       this.unsubscribeContext = null;
       this.unsubscribeTransformResults = null;
       this.unsubscribeClassificationBindings = null;
+      this.externalRefreshPromise = null;
       this.restoringProfile = false;
       this.destroyed = false;
       this.activeTrayTab = "reviews";
       const desktopCorrections = this.desktop && this.desktop.corrections || null;
       this.engineCorrections = correctionsRuntimePorts(
-        this.windowRef, desktopCorrections);
+        this.windowRef, desktopCorrections, this.documentRef);
       this.booksApi = options.booksApi || desktopCorrections ||
         this.engineCorrections && this.engineCorrections.books || null;
       this.artifactPorts = options.artifactPorts ||
@@ -526,6 +538,8 @@
         options.booksFeature || this.createBooksFeature(options);
       this.artifactsFeature = options.artifactsFeature === false ? null :
         options.artifactsFeature || this.createArtifactsFeature(options);
+      this.itemProperties = options.itemProperties === false ? null :
+        options.itemProperties || this.createItemPropertiesFeature(options);
     }
 
     createClassificationFeature(options, profile) {
@@ -703,6 +717,10 @@
           }
         },
         onSelectionInvalidated: () => this.clearSelection(),
+        onExternalChange: () =>
+          this.refreshExternalState("external-change", {
+            includeBooks: false,
+          }),
         onStatus: (message, error) => this.setStatus(message, error),
       });
     }
@@ -754,6 +772,41 @@
               source: "artifacts",
             });
           }
+        },
+        onStatus: (message, error) => this.setStatus(message, error),
+      });
+    }
+
+    createItemPropertiesFeature(options) {
+      if (options.features === false ||
+          typeof deps.createItemMetadataEditor !== "function") return null;
+      const propertiesRoot = this.root.querySelector("[data-item-properties]");
+      if (!propertiesRoot) return null;
+      let api = options.itemMetadataApi || null;
+      if (!api && typeof deps.createCorrectionsItemApi === "function") {
+        const fetchImpl = typeof options.fetchImpl === "function"
+          ? options.fetchImpl
+          : this.windowRef && typeof this.windowRef.fetch === "function"
+            ? this.windowRef.fetch.bind(this.windowRef)
+            : typeof fetch === "function" ? fetch.bind(globalThis) : null;
+        if (fetchImpl) api = deps.createCorrectionsItemApi({ fetchImpl });
+      }
+      if (!api) return null;
+      return deps.createItemMetadataEditor({
+        root: propertiesRoot,
+        documentRef: this.documentRef,
+        api,
+        draftStore: this.state,
+        operationIdFactory: options.itemMetadataOperationIdFactory,
+        onChanged: () => {
+          if (!this.booksFeature ||
+              typeof this.booksFeature.refresh !== "function") return;
+          void Promise.resolve(this.booksFeature.refresh("metadata"))
+            .catch((error) => this.setStatus(
+              error && error.message ||
+                "Metadata saved, but the Books panel could not be refreshed",
+              true,
+            ));
         },
         onStatus: (message, error) => this.setStatus(message, error),
       });
@@ -1010,6 +1063,48 @@
       this.listeners.push(() => target.removeEventListener(type, handler, options));
     }
 
+    refreshExternalState(reason = "window-activation", options = {}) {
+      if (this.destroyed) return Promise.resolve([]);
+      if (this.externalRefreshPromise) return this.externalRefreshPromise;
+      const tasks = [];
+      if (options.includeBooks !== false && this.booksFeature &&
+          typeof this.booksFeature.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.booksFeature.refresh(reason)));
+      }
+      if (this.artifactsFeature &&
+          typeof this.artifactsFeature.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.artifactsFeature.refresh({
+            preserveSelection: true,
+            reason,
+          })));
+      }
+      if (this.itemProperties &&
+          typeof this.itemProperties.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.itemProperties.refresh(reason)));
+      }
+      const refresh = Promise.allSettled(tasks).finally(() => {
+        if (this.externalRefreshPromise === refresh) {
+          this.externalRefreshPromise = null;
+        }
+      });
+      this.externalRefreshPromise = refresh;
+      return refresh;
+    }
+
+    bindExternalRefresh() {
+      this.listen(this.windowRef, "focus", () => {
+        void this.refreshExternalState("window-focus");
+      });
+      this.listen(this.documentRef, "visibilitychange", () => {
+        if (this.documentRef.visibilityState === "visible") {
+          void this.refreshExternalState("window-visible");
+        }
+      });
+    }
+
     mount() {
       this.bindEditorSelector();
       this.bindLayoutReset();
@@ -1028,11 +1123,15 @@
           this.classificationController.setScopeActive(true);
         }
       });
+      this.bindExternalRefresh();
       if (this.booksFeature && typeof this.booksFeature.mount === "function") {
         this.booksFeature.mount();
       }
       if (this.artifactsFeature && typeof this.artifactsFeature.mount === "function") {
         this.artifactsFeature.mount();
+      }
+      if (this.itemProperties && typeof this.itemProperties.mount === "function") {
+        this.itemProperties.mount();
       }
       this.connectTransformResults();
       this.renderEditor();
@@ -1076,6 +1175,12 @@
       const selection = this.state.setSelection(value);
       if (this.booksFeature && typeof this.booksFeature.setSelection === "function") {
         this.booksFeature.setSelection(selection.itemId ? selection : null);
+      }
+      if (this.itemProperties &&
+          typeof this.itemProperties.setSelection === "function") {
+        void Promise.resolve(this.itemProperties.setSelection(selection.itemId))
+          .catch((error) => this.setStatus(
+            error && error.message || "Item metadata could not be loaded", true));
       }
       const changedItem = previous.itemId !== selection.itemId;
       const changedDeepLink = previous.artifactId !== selection.artifactId ||
@@ -1245,6 +1350,13 @@
       const context = normalizeWorkbenchContext(value);
       if (context.ui_profile_key !== this.profileKey) this.applyProfile(context.ui_profile_key);
       this.state.applyContext(context);
+      if (this.itemProperties &&
+          typeof this.itemProperties.setSelection === "function") {
+        void Promise.resolve(
+          this.itemProperties.setSelection(this.state.selection.itemId))
+          .catch((error) => this.setStatus(
+            error && error.message || "Item metadata could not be loaded", true));
+      }
       this.updateContextLabels();
       this.renderContextNavigation();
       this.setResource(null);
@@ -1477,8 +1589,13 @@
       if (this.artifactsFeature && typeof this.artifactsFeature.destroy === "function") {
         this.artifactsFeature.destroy();
       }
+      if (this.itemProperties &&
+          typeof this.itemProperties.destroy === "function") {
+        this.itemProperties.destroy();
+      }
       this.booksFeature = null;
       this.artifactsFeature = null;
+      this.itemProperties = null;
       if (this.selectionListeners) this.selectionListeners.clear();
       if (this.editorRegistry && typeof this.editorRegistry.destroy === "function") {
         this.editorRegistry.destroy();

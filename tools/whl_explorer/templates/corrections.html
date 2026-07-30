@@ -162,6 +162,12 @@
                   aria-label="Collapse Properties panel">›</button>
         </header>
         <div class="pane-body properties-body" id="properties-body">
+          <section class="item-properties-host" data-item-properties
+                   aria-label="Selected item metadata">
+            <p class="empty-row">
+              Select a book or captured entry to edit its metadata.
+            </p>
+          </section>
           <section class="classification-controls-host" data-classification-controls
                    aria-label="Classification commands"></section>
           <dl class="property-list" data-properties-list>
@@ -225,6 +231,7 @@
   <script src="{{ url_for('static', filename='corrections/engine-adapter.js') }}?v={{ corrections_engine_adapter_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/artifact-editors.js') }}?v={{ artifact_editors_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/properties.js') }}?v={{ corrections_properties_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/item-properties.js') }}?v={{ corrections_item_properties_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/artifacts.js') }}?v={{ corrections_artifacts_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/books.js') }}?v={{ corrections_books_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/reviews.js') }}?v={{ corrections_reviews_v }}"></script>

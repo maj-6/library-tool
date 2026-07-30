@@ -267,6 +267,7 @@ def _app(
     transform_submitter=None,
     actor_id_for_request=None,
     workspace_id_for_request=None,
+    item_service_for_request=None,
 ):
     app = Flask(__name__)
     app.register_blueprint(
@@ -275,6 +276,7 @@ def _app(
             raster_resource_resolver_for_request=(
                 None if resolver is None else lambda: resolver
             ),
+            correction_item_service_for_request=item_service_for_request,
             correction_actor_id_for_request=actor_id_for_request,
             correction_workspace_id_for_request=workspace_id_for_request,
             correction_transform_submitter=transform_submitter,
@@ -328,6 +330,7 @@ def _projected_harness(
     *,
     items=None,
     actor_id_for_request=None,
+    item_service_for_request=None,
 ):
     rasters = _RasterProjector(raster_rows)
     spatial = _SpatialProjector(spatial_rows)
@@ -353,6 +356,7 @@ def _projected_harness(
             items=items,
         ),
         actor_id_for_request=actor_id_for_request,
+        item_service_for_request=item_service_for_request,
     ), repository
 
 
@@ -393,12 +397,14 @@ class _ItemService:
 def _book_item(
     item_id: str = "book-1",
     title: str = "Book One",
+    *,
+    kind: str = "book",
 ) -> ItemView:
     return ItemView(
         item_id=item_id,
         revision=f"{item_id}-r1",
         record_revision=f"{item_id}-record-r1",
-        kind="book",
+        kind=kind,
         title=title,
         metadata={},
         representations=(),
@@ -1244,11 +1250,21 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
             extensions={"capture_order": 1},
         ),
     )
+    captured_item = _item(title="Captured Herbal")
+    captured_item = replace(
+        captured_item,
+        workbench_state=WorkbenchState(
+            item_id=captured_item.item_id,
+            revision="book-1-workbench-capture-r1",
+            readiness={"source": "missing", "text": "missing"},
+            issues=("representation.missing", "text.missing"),
+        ),
+    )
     app, _repository = _projected_harness(
         tmp_path,
         rows,
         (),
-        items=_Items((_item(title="Captured Herbal"),)),
+        items=_Items((captured_item,)),
         actor_id_for_request=lambda: "account-42",
     )
     client = app.test_client()
@@ -1258,11 +1274,13 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
     )
     assert initial.status_code == 200
     body = initial.get_json()
-    assert body["schema"] == "librarytool.corrections-index/1"
+    assert body["schema"] == "librarytool.corrections-index/2"
     assert body["attention"] == []
     assert len(body["books"]) == 1
     book = body["books"][0]
+    assert book["kind"] == "book"
     assert book["title"] == "Captured Herbal"
+    assert book["issues"] == ["text.missing"]
     assert [
         capture["artifact_id"] for capture in book["captures"]
     ] == ["capture:asset-1:display"]
@@ -1307,6 +1325,87 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
     assert updated["attention"][0]["review"]["latest_event"][
         "actor_id"
     ] == "account-42"
+
+
+def test_corrections_index_can_use_a_dedicated_item_projection(tmp_path):
+    raster = replace(
+        _raster("capture-only"),
+        key=RasterArtifactKey("capture-stable-id", "capture-only"),
+        extensions={"capture_order": 0},
+    )
+    engine_items = _Items((_item("book-global", "Global catalogue"),))
+    corrections_items = _Items(
+        (
+            replace(
+                _item("capture-stable-id", "Phone capture"),
+                kind="capture",
+            ),
+        )
+    )
+    app, _repository = _projected_harness(
+        tmp_path,
+        (raster,),
+        (),
+        items=engine_items,
+        item_service_for_request=lambda: corrections_items,
+    )
+
+    response = app.test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    assert [
+        (item["id"], item["kind"])
+        for item in response.get_json()["books"]
+    ] == [("capture-stable-id", "capture")]
+
+
+def test_corrections_index_includes_books_and_capture_entries_only():
+    review = _review_with_history(1, "review-attention-r1")
+    reviews = _ReviewService(review)
+    engine = _Engine(
+        _RasterProjector(()),
+        _SpatialProjector(()),
+        reviews,
+        items=_ItemService(
+            (
+                _book_item("book-1", "Built Book"),
+                _book_item(
+                    "capture-1",
+                    "Captured Entry",
+                    kind="capture",
+                ),
+                _book_item(
+                    "collection-1",
+                    "Collection",
+                    kind="collection",
+                ),
+            )
+        ),
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert [
+        (item["id"], item["kind"]) for item in body["books"]
+    ] == [
+        ("book-1", "book"),
+        ("capture-1", "capture"),
+    ]
+    assert reviews.calls == ["book-1", "capture-1"]
+    assert {
+        entry["target"]["item_id"]: entry["target"]["kind"]
+        for entry in body["attention"]
+    } == {
+        "book-1": "book",
+        "capture-1": "book",
+    }
+
 
 def test_review_actor_is_server_owned_and_client_spoofing_is_rejected(
     tmp_path,
