@@ -66,6 +66,66 @@ _CANONICAL_TO_LEGACY = {
     for legacy, canonical in _LEGACY_TO_CANONICAL.items()
 }
 _OPTIONAL_EDITABLE_FIELDS = frozenset({"category_ids", "extra"})
+_WINDOWS_PATH_RE = re.compile(r"(?:^|[\s\"'(])[A-Za-z]:[\\/]")
+_ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+_KEY_SEPARATOR_RE = re.compile(r"[^A-Za-z0-9]+")
+_PRIVATE_EXTRA_LOCATOR_KEYS = frozenset(
+    {
+        "absolute_path",
+        "asset_ref",
+        "capture_file",
+        "display_ref",
+        "file",
+        "file_name",
+        "filename",
+        "filepath",
+        "local_path",
+        "locator",
+        "path",
+        "raw_ref",
+        "reference",
+        "resource_ref",
+        "storage_key",
+        "storage_locator",
+        "storage_path",
+        "uri",
+        "url",
+        "workspace_path",
+    }
+)
+_PRIVATE_EXTRA_LOCATOR_SUFFIXES = frozenset(
+    {
+        "file",
+        "filename",
+        "filepath",
+        "locator",
+        "path",
+        "ref",
+        "reference",
+        "uri",
+        "url",
+    }
+)
+# These values describe storage authority or the immutable phone-ingest
+# envelope. They are useful to the capture/archive adapters, but are not
+# user-authored bibliographic metadata.
+_SERVER_OWNED_EXTRA_KEYS = frozenset(
+    {
+        "_capture_notes",
+        "_capture_photo_assets",
+        "active_storage_id",
+        "book_id",
+        "canonical_book_id",
+        "canonical_item_id",
+        "capture_id",
+        "lib_book_id",
+        "scan_collection",
+        "scan_collection_id",
+        "scan_from",
+        "storage_id",
+    }
+)
 _LOCAL_OR_SERVER_MANAGED_FIELDS = frozenset(
     {
         "capture_id",
@@ -86,6 +146,8 @@ _LOCAL_OR_SERVER_MANAGED_FIELDS = frozenset(
 _ALL_EDITABLE_FIELDS = frozenset(_CANONICAL_EDITABLE_STRING_FIELDS) | (
     _OPTIONAL_EDITABLE_FIELDS
 )
+_DROP = object()
+_MISSING = object()
 
 
 def _json_clone(value: Any, *, label: str) -> Any:
@@ -130,6 +192,195 @@ def _json_clone(value: Any, *, label: str) -> Any:
         return json.loads(encoded)
     except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
         raise ValueError(f"{label} is not strict JSON data") from exc
+
+
+def _normalized_extra_key(key: str) -> str:
+    separated = _ACRONYM_BOUNDARY_RE.sub(r"\1_\2", key)
+    separated = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", separated)
+    return _KEY_SEPARATOR_RE.sub("_", separated).strip("_").casefold()
+
+
+def _private_extra_key(key: str) -> bool:
+    normalized = _normalized_extra_key(key)
+    if key.startswith("_") or normalized in _SERVER_OWNED_EXTRA_KEYS:
+        return True
+    if normalized in _PRIVATE_EXTRA_LOCATOR_KEYS:
+        return True
+    return normalized.rsplit("_", 1)[-1] in (
+        _PRIVATE_EXTRA_LOCATOR_SUFFIXES
+    )
+
+
+def _looks_like_local_locator(value: str) -> bool:
+    stripped = value.strip()
+    normalized = stripped.replace("\\", "/")
+    lowered = normalized.casefold()
+    return bool(
+        _WINDOWS_PATH_RE.search(stripped)
+        or stripped.startswith(("\\\\", "//", "file:"))
+        or "file://" in lowered
+        or normalized.startswith("/")
+        or normalized.startswith("./")
+        or normalized.startswith("../")
+        or "/../" in normalized
+        or (
+            not lowered.startswith(("http://", "https://"))
+            and (
+                "\\" in stripped
+                or (
+                    "/" in normalized
+                    and (
+                        normalized.count("/") > 1
+                        or bool(
+                            re.search(
+                                r"\.[A-Za-z0-9]{1,12}$",
+                                normalized,
+                            )
+                        )
+                    )
+                )
+                or bool(
+                    re.fullmatch(
+                        (
+                            r"[^\s/\\]+\."
+                            r"(?:bmp|gif|jpe?g|json|pdf|png|tiff?|txt|webp)"
+                        ),
+                        stripped,
+                        re.IGNORECASE,
+                    )
+                )
+            )
+        )
+    )
+
+
+def _public_extra_projection(value: Any) -> Any:
+    """Return the user-visible portion of strict capture metadata."""
+
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, item in value.items():
+            if _private_extra_key(key):
+                continue
+            clean = _public_extra_projection(item)
+            if clean is not _DROP:
+                projected[key] = clean
+        return projected
+    if isinstance(value, list):
+        projected_items = []
+        for item in value:
+            clean = _public_extra_projection(item)
+            if clean is not _DROP:
+                projected_items.append(clean)
+        return projected_items
+    if isinstance(value, str) and _looks_like_local_locator(value):
+        return _DROP
+    return value
+
+
+def _contains_protected_extra(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            _private_extra_key(key) or _contains_protected_extra(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_protected_extra(item) for item in value)
+    return isinstance(value, str) and _looks_like_local_locator(value)
+
+
+def _protected_extra_fragment(value: Any) -> Any:
+    """Extract data that must survive removal of the public metadata."""
+
+    if isinstance(value, Mapping):
+        protected: dict[str, Any] = {}
+        for key, item in value.items():
+            if _private_extra_key(key):
+                protected[key] = _json_clone(
+                    item,
+                    label="protected manual entry extra",
+                )
+                continue
+            if _contains_protected_extra(item):
+                protected[key] = _protected_extra_fragment(item)
+        return protected
+    if isinstance(value, list):
+        # A list has no durable member key. Keep its complete shape instead of
+        # risking that a hidden locator is rebound to a different generated
+        # artifact after public members are removed or reordered.
+        return _json_clone(value, label="protected manual entry extra")
+    if isinstance(value, str) and _looks_like_local_locator(value):
+        return value
+    return _MISSING
+
+
+def _merge_protected_extra(previous: Any, edited: Any) -> Any:
+    """Merge an editable projection without losing adapter-private values."""
+
+    if not _contains_protected_extra(previous):
+        return _json_clone(edited, label="manual entry extra")
+
+    if isinstance(previous, Mapping):
+        if not isinstance(edited, Mapping):
+            raise ValueError(
+                "manual entry extra cannot replace server-managed metadata"
+            )
+        merged = _json_clone(edited, label="manual entry extra")
+        for key, prior in previous.items():
+            if _private_extra_key(key):
+                if key in edited:
+                    raise ValueError(
+                        "manual entry extra cannot change "
+                        "server-managed metadata"
+                    )
+                merged[key] = _json_clone(
+                    prior,
+                    label="protected manual entry extra",
+                )
+                continue
+            if not _contains_protected_extra(prior):
+                continue
+            if key not in edited:
+                merged[key] = _protected_extra_fragment(prior)
+                continue
+            merged[key] = _merge_protected_extra(prior, edited[key])
+        return merged
+
+    if isinstance(previous, list):
+        if not isinstance(edited, list):
+            raise ValueError(
+                "manual entry extra cannot replace server-managed metadata"
+            )
+        visible = _public_extra_projection(previous)
+        if not isinstance(visible, list) or len(edited) != len(visible):
+            raise ValueError(
+                "manual entry extra cannot resize a list containing "
+                "server-managed metadata"
+            )
+        merged_items = []
+        edited_index = 0
+        for prior in previous:
+            projected = _public_extra_projection(prior)
+            if projected is _DROP:
+                merged_items.append(
+                    _json_clone(
+                        prior,
+                        label="protected manual entry extra",
+                    )
+                )
+                continue
+            candidate = edited[edited_index]
+            edited_index += 1
+            merged_items.append(
+                _merge_protected_extra(prior, candidate)
+                if _contains_protected_extra(prior)
+                else _json_clone(candidate, label="manual entry extra")
+            )
+        return merged_items
+
+    raise ValueError(
+        "manual entry extra cannot change server-managed metadata"
+    )
 
 
 class ManualEntryItemCodec:
@@ -233,10 +484,11 @@ class ManualEntryItemCodec:
         if "category_ids" in raw:
             result["category_ids"] = list(raw["category_ids"])
         if "extra" in raw:
-            result["extra"] = _json_clone(
+            detached = _json_clone(
                 raw["extra"],
                 label="manual entry extra",
             )
+            result["extra"] = _public_extra_projection(detached)
         images = raw.get("images")
         if isinstance(images, (list, tuple)):
             result["image_count"] = len(images)
@@ -304,9 +556,21 @@ class ManualEntryItemCodec:
             or len(category_ids) != len(set(category_ids))
         ):
             raise TypeError("manual entry category_ids must be unique strings")
+        has_extra = "extra" in draft.metadata
         extra = draft.metadata.get("extra")
-        if extra is not None and not isinstance(extra, Mapping):
+        detached_extra: Mapping[str, Any] | None = None
+        if has_extra and not isinstance(extra, Mapping):
             raise TypeError("manual entry extra must be an object")
+        if has_extra:
+            detached_extra = _json_clone(
+                extra,
+                label="manual entry extra",
+            )
+            if _public_extra_projection(detached_extra) != detached_extra:
+                raise ValueError(
+                    "manual entry extra contains server-managed metadata "
+                    "or a private locator"
+                )
 
         if previous is None:
             if draft.kind != "book":
@@ -342,16 +606,30 @@ class ManualEntryItemCodec:
                 result.pop(legacy_field, None)
             else:
                 result[legacy_field] = draft.metadata[field]
-        for field in _OPTIONAL_EDITABLE_FIELDS:
-            if field not in draft.metadata:
-                result.pop(field, None)
-            elif field == "category_ids":
-                result[field] = list(draft.metadata[field])
+        if "category_ids" not in draft.metadata:
+            result.pop("category_ids", None)
+        else:
+            result["category_ids"] = list(draft.metadata["category_ids"])
+
+        previous_extra = (
+            previous.get("extra")
+            if isinstance(previous, Mapping)
+            and isinstance(previous.get("extra"), Mapping)
+            else {}
+        )
+        if "extra" not in draft.metadata:
+            protected = _protected_extra_fragment(previous_extra)
+            if protected is _MISSING or protected == {}:
+                result.pop("extra", None)
             else:
-                result[field] = _json_clone(
-                    draft.metadata[field],
-                    label="manual entry extra",
-                )
+                result["extra"] = protected
+        else:
+            if detached_extra is None:  # pragma: no cover - guarded above
+                raise TypeError("manual entry extra must be an object")
+            result["extra"] = _merge_protected_extra(
+                previous_extra,
+                detached_extra,
+            )
         self.validate_record(entry_id, result)
         return result
 
