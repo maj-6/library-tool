@@ -457,6 +457,64 @@ def test_capture_only_target_is_visible_and_stays_canonical_after_promotion(
     )
 
 
+def test_corrections_index_resolves_capture_authority_once_per_capture(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    capture_ids = tuple(
+        f"00000000-0000-4000-8000-{index:012d}"
+        for index in range(1, 7)
+    )
+    builds = {
+        f"bulk-capture-{index}": {
+            "id": f"bulk-capture-{index}",
+            "title": f"Bulk capture {index}",
+            "capture_id": capture_id,
+        }
+        for index, capture_id in enumerate(capture_ids, start=1)
+    }
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, builds)
+    with server._manual_lock:
+        server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH, {})
+
+    original = (
+        server.FilesystemCaptureArchiveRepository.inspect_association
+    )
+    inspected: list[str] = []
+
+    def inspect_once(_cls, workspace_root, capture_id):
+        inspected.append(capture_id)
+        return original(workspace_root, capture_id)
+
+    monkeypatch.setattr(
+        server.FilesystemCaptureArchiveRepository,
+        "inspect_association",
+        classmethod(inspect_once),
+    )
+
+    first = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert first.status_code == 200
+    assert len(first.get_json()["books"]) == len(capture_ids)
+    assert inspected == list(capture_ids)
+
+    second = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert second.status_code == 200
+    assert len(second.get_json()["books"]) == len(capture_ids)
+    # A fresh request gets a fresh bulk snapshot; nothing is cached globally.
+    assert inspected == [*capture_ids, *capture_ids]
+
+
 def test_capture_only_transform_loads_and_queues_without_native_text_layers(
     corrections_workspace,
 ):

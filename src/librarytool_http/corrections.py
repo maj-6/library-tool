@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any
 from urllib.parse import quote
 
@@ -1849,11 +1850,9 @@ def _validated_items(value: Any) -> list[ItemView]:
     return rows
 
 
-def _corrections_index(
-    engine_for_request: Callable[[], LibraryEngine],
+def _validate_corrections_workspace(
     workspace_id_for_request: Callable[[], str],
-    item_service_for_request: Callable[[], ItemQueryService] | None = None,
-) -> Response:
+) -> None:
     workspace_ids = request.args.getlist("workspace_id")
     workspace_id = workspace_ids[0] if len(workspace_ids) == 1 else ""
     if (
@@ -1882,6 +1881,11 @@ def _corrections_index(
             },
         )
 
+
+def _corrections_index_projection(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_service_for_request: Callable[[], ItemQueryService] | None = None,
+) -> Response:
     reviews = _review_service(engine_for_request)
     rasters = _raster_service(engine_for_request)
     books: list[dict[str, Any]] = []
@@ -2001,6 +2005,25 @@ def _corrections_index(
             details={"maximum_bytes": CORRECTIONS_INDEX_MAX_BYTES},
         )
     return _conditional_json(body, revision)
+
+
+def _corrections_index(
+    engine_for_request: Callable[[], LibraryEngine],
+    workspace_id_for_request: Callable[[], str],
+    item_service_for_request: Callable[[], ItemQueryService] | None = None,
+    index_context_for_request: Callable[[], Any] | None = None,
+) -> Response:
+    _validate_corrections_workspace(workspace_id_for_request)
+    operation_context = (
+        nullcontext()
+        if index_context_for_request is None
+        else index_context_for_request()
+    )
+    with operation_context:
+        return _corrections_index_projection(
+            engine_for_request,
+            item_service_for_request,
+        )
 
 
 def _raster_list(
@@ -2365,6 +2388,7 @@ def create_corrections_blueprint(
     engine_for_request: Callable[[], LibraryEngine],
     *,
     raster_resource_resolver_for_request: Callable[[], Any] | None = None,
+    correction_index_context_for_request: Callable[[], Any] | None = None,
     correction_item_service_for_request: (
         Callable[[], ItemQueryService] | None
     ) = None,
@@ -2394,6 +2418,11 @@ def create_corrections_blueprint(
     server-managed metadata must raise ``ValidationError`` with code
     ``managed_item_fields_not_writable``.  Product-specific managed fields do
     not belong in this transport because book and capture stores can differ.
+
+    ``correction_index_context_for_request`` may pin one composition-owned
+    authority snapshot around the complete index projection.  This lets the
+    item query and its dependent review/raster reads share the same bounded
+    operation state without installing a process-global transport cache.
     """
 
     if not callable(engine_for_request):
@@ -2404,6 +2433,13 @@ def create_corrections_blueprint(
     ):
         raise TypeError(
             "raster_resource_resolver_for_request must be callable or None"
+        )
+    if (
+        correction_index_context_for_request is not None
+        and not callable(correction_index_context_for_request)
+    ):
+        raise TypeError(
+            "correction_index_context_for_request must be callable or None"
         )
     if (
         correction_item_service_for_request is not None
@@ -2484,6 +2520,7 @@ def create_corrections_blueprint(
                 engine_for_request,
                 workspace_id_for_request,
                 correction_item_service_for_request,
+                correction_index_context_for_request,
             )
         except EngineError as error:
             return _error_response(error)

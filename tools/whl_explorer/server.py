@@ -291,6 +291,9 @@ app.register_blueprint(
         raster_resource_resolver_for_request=(
             lambda: _ensure_engine_session().raster_resource_resolver
         ),
+        correction_index_context_for_request=(
+            lambda: _corrections_index_authority_context()
+        ),
         correction_item_service_for_request=(
             lambda: _corrections_item_engine()
         ),
@@ -6489,6 +6492,15 @@ def _corrections_workspace_locks():
                 yield
             finally:
                 del _corrections_authority_context.targets
+
+
+@contextlib.contextmanager
+def _corrections_index_authority_context():
+    """Share one capture authority snapshot across the whole index read."""
+
+    with _ensure_engine_session().write_set.workspace_lease():
+        with _corrections_workspace_locks():
+            yield
 
 
 @contextlib.contextmanager
