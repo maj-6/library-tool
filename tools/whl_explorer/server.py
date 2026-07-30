@@ -99,6 +99,9 @@ from librarytool.adapters.filesystem.item_repository import (  # noqa: E402
 from librarytool.adapters.filesystem.item_command_repository import (  # noqa: E402
     FilesystemItemCommandRepository,
 )
+from librarytool.adapters.filesystem.item_lifecycle_repository import (  # noqa: E402
+    FilesystemItemLifecycleReservationRepository,
+)
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
 )
@@ -184,6 +187,7 @@ from librarytool.engine.item_commands import (  # noqa: E402
     ItemCommandResult,
     ItemCommandService,
     ItemDraft,
+    ItemMutationReceipt,
     ItemPatch,
     ItemRecordSnapshot,
     UpdateItemCommand,
@@ -6035,6 +6039,12 @@ def _corrections_target_metadata(
             key: value for key, value in raw.items()
             if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
         }
+        if capture_id and isinstance(raw.get("extra"), Mapping):
+            present, extra = _CORRECTIONS_BUILD_ITEM_CODEC._projected_extra(
+                raw
+            )
+            if present:
+                metadata["extra"] = extra
         origin = "promoted_capture" if capture_id else "catalogue"
     active_storage_id = (
         storage_id
@@ -6543,6 +6553,83 @@ _MANUAL_ENTRY_ITEM_CODEC = ManualEntryItemCodec(
 )
 
 
+class _CorrectionsBuildItemCodec:
+    """Expose safe generated capture metadata on promoted build rows."""
+
+    @staticmethod
+    def _projected_extra(raw: Mapping) -> tuple[bool, dict]:
+        value = raw.get("extra")
+        if not isinstance(value, Mapping):
+            return False, {}
+        public = _MANUAL_ENTRY_ITEM_CODEC.public_extra(value)
+        # A protected-only envelope has no editable ``extra`` field. An
+        # explicitly empty public object does, which keeps set/remove command
+        # candidates round-trippable through the generic repository.
+        return bool(public) or dict(value) == public, public
+
+    @classmethod
+    def decode(
+            cls, item_id: str, raw: Mapping) -> ItemRecordSnapshot:
+        base = _ENGINE_ITEM_CODEC.decode(item_id, raw)
+        metadata = dict(base.metadata)
+        if raw.get("capture_id"):
+            present, extra = cls._projected_extra(raw)
+            if present:
+                metadata["extra"] = extra
+        return ItemRecordSnapshot(
+            item_id=base.item_id,
+            revision=base.revision,
+            kind=base.kind,
+            title=base.title,
+            metadata=metadata,
+            representations=base.representations,
+        )
+
+    @classmethod
+    def encode(
+            cls, item_id: str, draft: ItemDraft,
+            previous: Mapping | None) -> Mapping:
+        metadata = dict(draft.metadata)
+        has_extra = "extra" in metadata
+        edited_extra = metadata.pop("extra", None)
+        plain_draft = ItemDraft(
+            kind=draft.kind,
+            title=draft.title,
+            metadata=metadata,
+            representations=draft.representations,
+        )
+        encoded = dict(
+            _ENGINE_ITEM_CODEC.encode(item_id, plain_draft, previous)
+        )
+        prior_extra = (
+            previous.get("extra")
+            if isinstance(previous, Mapping)
+            and isinstance(previous.get("extra"), Mapping)
+            else {}
+        )
+        prior_present = (
+            cls._projected_extra(previous)[0]
+            if isinstance(previous, Mapping)
+            else False
+        )
+        if has_extra:
+            if not isinstance(edited_extra, Mapping):
+                raise TypeError("promoted capture extra must be an object")
+            encoded["extra"] = _MANUAL_ENTRY_ITEM_CODEC.merge_public_extra(
+                prior_extra,
+                edited_extra,
+            )
+        elif prior_present:
+            encoded["extra"] = _MANUAL_ENTRY_ITEM_CODEC.merge_public_extra(
+                prior_extra,
+                {},
+            )
+        return encoded
+
+
+_CORRECTIONS_BUILD_ITEM_CODEC = _CorrectionsBuildItemCodec()
+
+
 def _engine_host_bindings() -> FilesystemHostBindings:
     """Return borrowed production callbacks for the neutral host opener."""
 
@@ -6969,11 +7056,12 @@ def _corrections_item_read_only_fields(
         target: "_CorrectionsTarget",
         patch: ItemPatch,
 ) -> tuple[str, ...]:
-    source_fields = (
-        _MANUAL_ENTRY_ITEM_CODEC.server_managed_fields
-        if target.storage_kind == "manual"
-        else _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
-    )
+    if target.storage_kind == "manual":
+        source_fields = _MANUAL_ENTRY_ITEM_CODEC.server_managed_fields
+    else:
+        source_fields = _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
+        if target.capture_id:
+            source_fields = source_fields - {"extra"}
     fields = (
         _CORRECTIONS_DERIVED_METADATA_FIELDS
         | source_fields
@@ -7194,7 +7282,61 @@ class _CorrectionsBuildItemPolicy:
             current_revision=current.revision,
         )
         _corrections_item_validate_writable_patch(target, patch)
-        self._profile.validate_update(current, patch, candidate)
+        if "extra" in candidate.metadata:
+            extra = candidate.metadata["extra"]
+            if not isinstance(extra, Mapping):
+                raise EngineValidationError(
+                    "the promoted capture extra metadata must be an object",
+                    code="invalid_item_metadata",
+                    details={"field": "extra"},
+                )
+            try:
+                _MANUAL_ENTRY_ITEM_CODEC.merge_public_extra({}, extra)
+            except (RecursionError, TypeError, ValueError) as exc:
+                raise EngineValidationError(
+                    "the promoted capture extra metadata is invalid",
+                    code="invalid_item_metadata",
+                    details={
+                        "field": "extra",
+                        "cause_type": type(exc).__name__,
+                    },
+                ) from exc
+        profile_current = ItemRecordSnapshot(
+            item_id=current.item_id,
+            revision=current.revision,
+            kind=current.kind,
+            title=current.title,
+            metadata={
+                key: value for key, value in current.metadata.items()
+                if key != "extra"
+            },
+            representations=current.representations,
+        )
+        profile_patch = ItemPatch(
+            title=patch.title,
+            metadata_set={
+                key: value for key, value in patch.metadata_set.items()
+                if key != "extra"
+            },
+            metadata_remove=tuple(
+                key for key in patch.metadata_remove if key != "extra"
+            ),
+            representations=patch.representations,
+        )
+        profile_candidate = ItemDraft(
+            kind=candidate.kind,
+            title=candidate.title,
+            metadata={
+                key: value for key, value in candidate.metadata.items()
+                if key != "extra"
+            },
+            representations=candidate.representations,
+        )
+        self._profile.validate_update(
+            profile_current,
+            profile_patch,
+            profile_candidate,
+        )
 
 
 def _corrections_manual_item_repository(
@@ -7270,8 +7412,8 @@ def _corrections_build_item_command_engine(
     repository = FilesystemItemCommandRepository(
         _ensure_engine_session().write_set,
         catalogue_path=BUILDS_PATH,
-        decode_record=_engine_item_command_decode,
-        encode_record=_engine_item_command_encode,
+        decode_record=_CORRECTIONS_BUILD_ITEM_CODEC.decode,
+        encode_record=_CORRECTIONS_BUILD_ITEM_CODEC.encode,
         allocate_item_id=lambda existing: lib.gen_id(set(existing)),
         lock_context_for=_corrections_workspace_locks,
         recover=False,
@@ -7329,6 +7471,29 @@ class _CorrectionsItemUpdateService:
                 "the Corrections item update is invalid",
                 code="invalid_item_command",
             )
+        if command.patch.metadata_set.get("extra") == {}:
+            # The public projection has no observable distinction between a
+            # removed object and an empty object when private provenance must
+            # remain stored. Canonicalize both spellings to removal so the
+            # generic repository can round-trip the exact candidate.
+            command = UpdateItemCommand(
+                item_id=command.item_id,
+                expected_revision=command.expected_revision,
+                patch=ItemPatch(
+                    title=command.patch.title,
+                    metadata_set={
+                        key: value
+                        for key, value
+                        in command.patch.metadata_set.items()
+                        if key != "extra"
+                    },
+                    metadata_remove=tuple(sorted(
+                        set(command.patch.metadata_remove) | {"extra"}
+                    )),
+                    representations=command.patch.representations,
+                ),
+                operation_id=command.operation_id,
+            )
         with _corrections_workspace_locks():
             target = _corrections_item_current_target(command.item_id)
             storage_kind = target.storage_kind
@@ -7380,6 +7545,327 @@ def _item_command_engine() -> ItemCommandService:
             code="item_command_unavailable", retryable=True,
         )
     return commands
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturePromotionCommand:
+    """One capture-to-build intent pinned to an exact manual source row."""
+
+    capture_id: str
+    expected_source_revision: str
+    item: ItemDraft
+    primary_source: str
+    operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturePromotionResult:
+    receipt: ItemMutationReceipt
+    build: Mapping
+    source_revision: str
+    replayed: bool
+    changes_source: bool
+
+
+@contextlib.contextmanager
+def _capture_promotion_locks():
+    """Use the canonical workspace -> build -> manual lock order."""
+
+    with _engine_workspace_locks(""):
+        with _manual_lock:
+            yield
+
+
+def _capture_promotion_repository() -> FilesystemItemCommandRepository:
+    session = _ensure_engine_session()
+    reservations = FilesystemItemLifecycleReservationRepository(
+        session.write_set
+    )
+
+    def validate_item_id(item_id: str) -> None:
+        if not _BUILD_ID_RE.fullmatch(item_id):
+            raise ValueError("item id is not compatible with build storage")
+
+    return FilesystemItemCommandRepository(
+        session.write_set,
+        catalogue_path=BUILDS_PATH,
+        decode_record=_engine_item_command_decode,
+        encode_record=_engine_item_command_encode,
+        allocate_item_id=lambda existing: lib.gen_id(set(existing)),
+        validate_item_id=validate_item_id,
+        load_identity_reservations=reservations.load,
+        lock_context_for=_capture_promotion_locks,
+        recover=False,
+    )
+
+
+def _capture_promotion_hash(command: _CapturePromotionCommand) -> str:
+    try:
+        encoded = json.dumps(
+            {
+                "action": "capture.promote",
+                "capture_id": command.capture_id,
+                "expected_source_revision": (
+                    command.expected_source_revision
+                ),
+                "item": command.item.as_dict(),
+                "primary_source": command.primary_source,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        raise EngineValidationError(
+            "the capture promotion command is invalid",
+            code="invalid_capture_promotion",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _capture_promotion_draft(
+        source_snapshot: _CaptureManualSourceSnapshot,
+        requested: ItemDraft,
+) -> tuple[ItemDraft, dict]:
+    """Hydrate omitted catalogue fields from the locked capture source."""
+
+    source_item = _MANUAL_ENTRY_ITEM_CODEC.decode(
+        source_snapshot.storage_id,
+        source_snapshot.record,
+    )
+    metadata = source_item.as_draft().as_dict()["metadata"]
+    safe_extra = metadata.pop("extra", {})
+    metadata.update(dict(requested.metadata))
+    title = requested.title or source_item.title
+    draft = ItemDraft(
+        kind="book",
+        title=title,
+        metadata=metadata,
+        representations=(),
+    )
+    WhlBookItemCommandPolicy(
+        _engine_item_category_ids
+    ).validate_create(draft)
+    return draft, safe_extra
+
+
+def _capture_promotion_replay(
+        unit,
+        command: _CapturePromotionCommand,
+        command_sha256: str,
+) -> _CapturePromotionResult | None:
+    prior = unit.receipt(command.operation_id)
+    if prior is None:
+        return None
+    if (
+        prior.action != "create"
+        or prior.command_sha256 != command_sha256
+    ):
+        raise EngineConflictError(
+            "the operation id was already used for another item command",
+            code="operation_id_conflict",
+            details={"operation_id": command.operation_id},
+        )
+    raw = unit.raw_record(prior.item_id)
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("capture_id") != command.capture_id
+    ):
+        raise EngineRepositoryError(
+            "the stored capture promotion receipt has no matching build",
+            code="invalid_item_mutation_receipt",
+            details={"item_id": prior.item_id},
+        )
+    source_snapshot = _capture_manual_source_snapshot_locked(
+        command.capture_id
+    )
+    comparison_source = (
+        dict(source_snapshot.record)
+        if source_snapshot is not None
+        else {}
+    )
+    if isinstance(comparison_source.get("extra"), Mapping):
+        comparison_source["extra"] = (
+            _MANUAL_ENTRY_ITEM_CODEC.public_extra(
+                comparison_source["extra"]
+            )
+        )
+    comparison_source["images"] = _clean_images(
+        comparison_source.get("images")
+    )
+    return _CapturePromotionResult(
+        receipt=prior,
+        build=dict(raw),
+        source_revision=command.expected_source_revision,
+        replayed=True,
+        changes_source=(
+            bool(comparison_source)
+            and _capture_promotion_changes_source(
+                raw,
+                comparison_source,
+                explicit_fields=(
+                    set(command.item.metadata)
+                    | ({"title"} if command.item.title else set())
+                ),
+            )
+        ),
+    )
+
+
+def _promote_capture(
+        command: _CapturePromotionCommand,
+) -> _CapturePromotionResult:
+    if not isinstance(command, _CapturePromotionCommand):
+        raise EngineValidationError(
+            "the capture promotion command is invalid",
+            code="invalid_capture_promotion",
+        )
+    command_sha256 = _capture_promotion_hash(command)
+    repository = _capture_promotion_repository()
+    try:
+        with repository.unit_of_work(
+            operation_id=command.operation_id
+        ) as unit:
+            replay = _capture_promotion_replay(
+                unit,
+                command,
+                command_sha256,
+            )
+            if replay is not None:
+                return replay
+
+            source_snapshot = _capture_manual_source_snapshot_locked(
+                command.capture_id
+            )
+            if source_snapshot is None:
+                raise EngineNotFoundError(
+                    "the capture has no committed source row",
+                    code="capture_source_required",
+                    details={"capture_id": command.capture_id},
+                )
+            if (
+                source_snapshot.record_revision
+                != command.expected_source_revision
+            ):
+                raise EngineConflictError(
+                    "the capture source changed before promotion",
+                    code="capture_source_revision_conflict",
+                    details={
+                        "capture_id": command.capture_id,
+                        "expected_revision": (
+                            command.expected_source_revision
+                        ),
+                        "current_revision": (
+                            source_snapshot.record_revision
+                        ),
+                    },
+                )
+            association = _capture_archive_association(
+                command.capture_id
+            )
+            if association is None:
+                raise EngineConflictError(
+                    "the capture has no verified archive association",
+                    code="capture_archive_association_required",
+                    details={"capture_id": command.capture_id},
+                )
+            builds = lib.load_json(BUILDS_PATH, {}) or {}
+            if not isinstance(builds, Mapping):
+                raise EngineRepositoryError(
+                    "the item catalogue is unavailable",
+                    code="invalid_item_catalogue",
+                )
+            if _capture_has_competing_build_locked(
+                builds,
+                command.capture_id,
+            ):
+                raise EngineConflictError(
+                    "the capture already has an active build",
+                    code="capture_build_conflict",
+                    details={"capture_id": command.capture_id},
+                )
+
+            draft, safe_extra = _capture_promotion_draft(
+                source_snapshot,
+                command.item,
+            )
+            item_id = unit.allocate_item_id()
+            raw = dict(_ENGINE_ITEM_CODEC.encode(item_id, draft, None))
+            raw["capture_id"] = command.capture_id
+            raw["capture_book_id"] = association.book_id
+            raw["images"] = _clean_images(
+                source_snapshot.record.get("images")
+            )
+            raw["extra"] = safe_extra
+
+            primary_source = (
+                command.primary_source
+                or str(
+                    source_snapshot.record.get("local_pdf") or ""
+                ).strip()
+            )
+            if primary_source:
+                raw = dict(_engine_representation_put_record(
+                    item_id,
+                    raw,
+                    RepresentationAttachmentDraft(
+                        representation_id="primary",
+                        source_token=primary_source,
+                        acquisition="reference",
+                        role="primary",
+                        media_type="application/pdf",
+                        label="Primary source",
+                        metadata={},
+                    ),
+                ))
+
+            comparison_source = dict(source_snapshot.record)
+            comparison_source["extra"] = safe_extra
+            comparison_source["images"] = _clean_images(
+                source_snapshot.record.get("images")
+            )
+            changes_source = _capture_promotion_changes_source(
+                raw,
+                comparison_source,
+                explicit_fields=(
+                    set(command.item.metadata)
+                    | ({"title"} if command.item.title else set())
+                ),
+            )
+            staged = unit.stage_managed_create(item_id, raw)
+            if staged.as_draft() != draft:
+                raise EngineRepositoryError(
+                    "the capture promotion changed canonical item content",
+                    code="item_repository_content_mismatch",
+                    details={"item_id": item_id},
+                )
+            receipt = ItemMutationReceipt(
+                action="create",
+                operation_id=command.operation_id,
+                command_sha256=command_sha256,
+                item_id=item_id,
+                after_revision=staged.revision,
+                item=staged,
+            )
+            unit.commit(receipt)
+    except EngineError:
+        raise
+    except Exception as exc:
+        raise EngineRepositoryError(
+            "the capture promotion repository failed",
+            code="capture_promotion_unavailable",
+            details={"cause_type": type(exc).__name__},
+            retryable=True,
+        ) from exc
+    return _CapturePromotionResult(
+        receipt=receipt,
+        build=raw,
+        source_revision=source_snapshot.record_revision,
+        replayed=False,
+        changes_source=changes_source,
+    )
 
 
 def _item_lifecycle_engine() -> ItemLifecycleService:
@@ -7471,6 +7957,91 @@ def _item_command_operation_id(*, item_id: str = "") -> str:
             details=details,
         )
     return operation_id
+
+
+def _capture_promotion_command() -> _CapturePromotionCommand:
+    raw = _item_command_json("promotion")
+    fields = {
+        "capture_id",
+        "source_revision",
+        "item",
+        "primary_source",
+    }
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != fields
+        or not isinstance(raw.get("capture_id"), str)
+        or not isinstance(raw.get("source_revision"), str)
+        or not isinstance(raw.get("primary_source"), str)
+        or not isinstance(raw.get("item"), Mapping)
+    ):
+        raise EngineValidationError(
+            "the capture promotion does not match its schema",
+            code="invalid_capture_promotion",
+        )
+    capture_id = _capture_archive_id(raw["capture_id"])
+    if not capture_id or capture_id != raw["capture_id"]:
+        raise EngineValidationError(
+            "the capture id is not a portable identity",
+            code="invalid_capture_identity",
+        )
+    source_revision = raw["source_revision"]
+    if (
+        not source_revision.startswith("mir-")
+        or not _MANUAL_ENTRY_ITEM_CODEC.valid_record_revision(
+            source_revision
+        )
+    ):
+        raise EngineValidationError(
+            "the capture source revision is invalid",
+            code="invalid_capture_source_revision",
+        )
+    primary_source = raw["primary_source"]
+    if (
+        primary_source != primary_source.strip()
+        or len(primary_source) > 8192
+        or any(
+            ord(character) == 127
+            or (
+                ord(character) < 32
+                and character not in "\n\r\t"
+            )
+            for character in primary_source
+        )
+    ):
+        raise EngineValidationError(
+            "the capture primary source is invalid",
+            code="invalid_capture_promotion",
+            details={"field": "primary_source"},
+        )
+    try:
+        item = ItemDraft.from_dict(raw["item"])
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the capture promotion item is invalid",
+            code="invalid_capture_promotion",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    if item.kind != "book" or item.representations:
+        raise EngineValidationError(
+            "capture promotion accepts catalogue metadata only",
+            code="invalid_capture_promotion",
+            details={"field": "item"},
+        )
+    operation_id = _item_command_operation_id()
+    if not _CORRECTIONS_STORAGE_ITEM_ID_RE.fullmatch(operation_id):
+        raise EngineValidationError(
+            "the idempotency key is not a portable operation identity",
+            code="invalid_operation_id",
+            details={"header": "Idempotency-Key"},
+        )
+    return _CapturePromotionCommand(
+        capture_id=capture_id,
+        expected_source_revision=source_revision,
+        item=item,
+        primary_source=primary_source,
+        operation_id=operation_id,
+    )
 
 
 def _item_command_record_match(item_id: str) -> str:
@@ -7982,6 +8553,64 @@ def api_v1_items_create():
     except EngineError as exc:
         return _engine_error_response(exc)
     return _item_command_response(result, created=True)
+
+
+@app.route("/api/v1/capture-promotions", methods=["POST"])
+def api_v1_capture_promotions_create():
+    """Atomically promote one source-revision-pinned captured entry."""
+
+    try:
+        command = _capture_promotion_command()
+        result = _promote_capture(command)
+        if result.changes_source:
+            # A failed invalidation makes the committed response ambiguous,
+            # not successful. The same operation replays the durable build
+            # and retries this gate without allocating another item.
+            _mark_capture_archive_stale(command.capture_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    build = dict(result.build)
+    if not result.replayed:
+        try:
+            _apply_pending_capture_review(build)
+        except Exception as exc:
+            log.warning(
+                "could not carry phone review into promoted build %s: %s",
+                result.receipt.item_id,
+                exc,
+            )
+        activity(
+            "created",
+            "captured draft entry",
+            detail=build.get("title", ""),
+        )
+    current_builds = lib.load_json(BUILDS_PATH, {}) or {}
+    current = (
+        current_builds.get(result.receipt.item_id)
+        if isinstance(current_builds, Mapping)
+        else None
+    )
+    if isinstance(current, Mapping):
+        build = dict(current)
+    record_revision = _engine_build_record_revision(
+        result.receipt.item_id,
+        build,
+    )
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.capture-promotion/1",
+        "replayed": result.replayed,
+        "capture_id": command.capture_id,
+        "source_revision": result.source_revision,
+        "item_id": result.receipt.item_id,
+        "record_revision": record_revision,
+        "build": build,
+    })
+    response.cache_control.no_store = True
+    response.headers["X-Record-Revision"] = (
+        record_revision
+    )
+    return response, 200 if result.replayed else 201
 
 
 @app.route("/api/v1/items/<item_id>")
@@ -14929,8 +15558,28 @@ def api_manual_list():
     # named by the event immediately and always see a coherent durable row.
     with _manual_lock:
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    out = sorted(entries.values(), key=lambda e: e.get("created_at", ""), reverse=True)
+    out = sorted(
+        (
+            _manual_entry_api_projection(entry_id, entry)
+            for entry_id, entry in entries.items()
+            if isinstance(entry_id, str) and isinstance(entry, Mapping)
+        ),
+        key=lambda e: e.get("created_at", ""),
+        reverse=True,
+    )
     return jsonify(out)
+
+
+def _manual_entry_api_projection(
+        entry_id: str, entry: Mapping) -> dict:
+    """Add a full-row CAS token without persisting transport metadata."""
+
+    out = copy.deepcopy(dict(entry))
+    out["record_revision"] = _MANUAL_ENTRY_ITEM_CODEC.record_revision(
+        entry_id,
+        entry,
+    )
+    return out
 
 
 def _clean_extra(v) -> dict:
@@ -15039,7 +15688,10 @@ def api_manual_add():
         entries[entry["id"]] = entry
         _save_manual_entries(entries)
     activity("added", "manual entry", detail=entry.get("title", ""))
-    return jsonify({"ok": True, "entry": entry})
+    return jsonify({
+        "ok": True,
+        "entry": _manual_entry_api_projection(entry["id"], entry),
+    })
 
 
 @app.route("/api/manual/<entry_id>")
@@ -15051,7 +15703,7 @@ def api_manual_get(entry_id: str):
         entry = entries.get(entry_id)
         if not isinstance(entry, dict):
             abort(404)
-        out = copy.deepcopy(entry)
+        out = _manual_entry_api_projection(entry_id, entry)
     return jsonify({"ok": True, "entry": out})
 
 
@@ -15121,12 +15773,19 @@ def api_manual_update(entry_id: str):
             return jsonify({
                 "ok": False,
                 "error": "changed elsewhere",
-                "entry": current,
+                "entry": (
+                    _manual_entry_api_projection(entry_id, current)
+                    if isinstance(current, Mapping)
+                    else current
+                ),
             }), 409
         assert candidate is not None
         entries[entry_id] = candidate
         _save_manual_entries(entries)
-    return jsonify({"ok": True, "entry": candidate})
+    return jsonify({
+        "ok": True,
+        "entry": _manual_entry_api_projection(entry_id, candidate),
+    })
 
 
 @app.route("/api/manual/restore", methods=["POST"])
@@ -15137,7 +15796,9 @@ def api_manual_restore():
     before the deletion, so checks/scans/verifications survive the round trip.
     """
     payload = request.get_json(silent=True) or {}
-    entry = payload.get("entry") or {}
+    entry = copy.deepcopy(payload.get("entry") or {})
+    if isinstance(entry, dict):
+        entry.pop("record_revision", None)
     eid = str(entry.get("id") or "")
     if not eid or not str(entry.get("title", "") or "").strip():
         abort(400)
@@ -15146,7 +15807,10 @@ def api_manual_restore():
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         entries[eid] = entry
         _save_manual_entries(entries)
-    return jsonify({"ok": True, "entry": entry})
+    return jsonify({
+        "ok": True,
+        "entry": _manual_entry_api_projection(eid, entry),
+    })
 
 
 @app.route("/api/manual/<entry_id>", methods=["DELETE"])
@@ -15186,7 +15850,10 @@ def api_manual_scans(entry_id: str):
         e = entries[entry_id]
         e["scans"] = scans
         _save_manual_entries(entries)
-    return jsonify({"ok": True, "entry": e})
+    return jsonify({
+        "ok": True,
+        "entry": _manual_entry_api_projection(entry_id, e),
+    })
 
 
 @app.route("/api/manual/<entry_id>/verify", methods=["POST"])
@@ -15218,7 +15885,10 @@ def api_manual_verify(entry_id: str):
             # A manually located source only exists alongside a rejected match.
             (e.get("manual_urls") or {}).pop(source, None)
         _save_manual_entries(entries)
-    return jsonify({"ok": True, "entry": e})
+    return jsonify({
+        "ok": True,
+        "entry": _manual_entry_api_projection(entry_id, e),
+    })
 
 
 @app.route("/api/manual/<entry_id>/source", methods=["POST"])
@@ -15244,7 +15914,10 @@ def api_manual_source(entry_id: str):
         else:
             urls.pop(source, None)
         _save_manual_entries(entries)
-    return jsonify({"ok": True, "entry": e})
+    return jsonify({
+        "ok": True,
+        "entry": _manual_entry_api_projection(entry_id, e),
+    })
 
 
 # --- Internet Archive PDF downloads --------------------------------------------

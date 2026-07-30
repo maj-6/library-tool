@@ -6036,6 +6036,8 @@ function manualToBook(e) {
   if (e.extra && Object.keys(e.extra).length) book.extra = e.extra;
   if (e.images && e.images.length) book.images = e.images;
   if (e.capture_id) book.capture_id = e.capture_id;
+  if (e.capture_id && e.record_revision)
+    book.capture_source_revision = e.record_revision;
   return applyScanProvenance(book);
 }
 
@@ -17806,6 +17808,8 @@ function capturedSourceMeta(row) {
     extra: book.extra && typeof book.extra === "object" ? book.extra : {},
     images: Array.isArray(book.images) ? book.images.slice() : [],
     capture_id: String(book.capture_id || ""),
+    capture_source_revision: String(
+      book.capture_source_revision || ""),
   };
 }
 
@@ -18403,6 +18407,7 @@ function selectBuild(id) {
 const ITEM_CREATE_NON_METADATA_FIELDS = Object.freeze(new Set([
   "id", "item_id", "kind", "title", "created_at", "updated_at", "revision",
   "representations", "artifacts", "relevance", "capture_id",
+  "capture_source_revision",
   "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
   "title_pages", "thumbnail_source", "status", "pdf_file", "pdf_sources",
   "images", "extra", "representation_manifest",
@@ -18413,6 +18418,7 @@ const ITEM_CREATE_STRING_METADATA_FIELDS = Object.freeze(new Set([
   "pdf_source", "source_url", "notes", "rights", "attention",
 ]));
 const pendingBuildCreates = new Map();
+const pendingCapturePromotions = new Map();
 
 function itemCreateDraft(seed) {
   const requested = seed && typeof seed === "object" && !Array.isArray(seed)
@@ -18747,6 +18753,88 @@ async function createBuild(seed, label, originTab = activeHistoryTab()) {
   return built;
 }
 
+async function promoteCaptureBuild(
+    seed, label, originTab = activeHistoryTab()) {
+  const requested = seed && typeof seed === "object" && !Array.isArray(seed)
+    ? { ...seed } : {};
+  const captureId = String(requested.capture_id || "");
+  const sourceRevision = String(requested.capture_source_revision || "");
+  const primarySource = String(requested.pdf_file || "").trim();
+  if (!captureId || !sourceRevision) {
+    statusCrit("CAPTURE PROMOTION FAILED :: REFRESH CAPTURE SOURCE");
+    return null;
+  }
+  const item = itemCreateDraft(requested);
+  const pendingKey = itemCreatePendingKey({
+    capture_id: captureId,
+    source_revision: sourceRevision,
+    item,
+    primary_source: primarySource,
+  });
+  let command = pendingCapturePromotions.get(pendingKey);
+  if (!command) {
+    const random = globalThis.crypto &&
+      typeof globalThis.crypto.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now().toString(36)}-${
+        Math.random().toString(16).slice(2)}`;
+    command = Object.freeze({
+      captureId,
+      sourceRevision,
+      item,
+      primarySource,
+      idempotencyKey: `capture-promote-${random}`,
+    });
+    pendingCapturePromotions.set(pendingKey, command);
+  }
+
+  let result = null;
+  let knownFailure = false;
+  for (let attempt = 0; attempt < 2 && !result; attempt += 1) {
+    try {
+      result = await engineClient.items.promoteCapture(command);
+    } catch (error) {
+      if (!itemCreateMutationAmbiguous(error)) {
+        knownFailure = true;
+        break;
+      }
+    }
+  }
+  if (!result) {
+    if (knownFailure) pendingCapturePromotions.delete(pendingKey);
+    statusCrit("CAPTURE PROMOTION FAILED");
+    return null;
+  }
+
+  pendingCapturePromotions.delete(pendingKey);
+  const itemId = result.item_id;
+  invalidateRepresentationItemIncarnation(itemId);
+  state.builds[itemId] = {
+    ...JSON.parse(JSON.stringify(result.build)),
+    _record_revision: result.record_revision,
+    _representations: [],
+  };
+  try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+  const built = state.builds[itemId];
+  const snap = JSON.parse(JSON.stringify(built));
+  const lifecycle = {
+    tombstone: null, deleteCommand: null, restoreCommand: null,
+  };
+  pushOp(`create build ${label || snap.title || snap.id}`,
+    async () => {
+      await deleteBuildToTombstone(snap.id, lifecycle);
+      if (state.buildSel === snap.id) state.buildSel = null;
+      renderUpload();
+    },
+    async () => {
+      await restoreDeletedBuildFromTombstone(lifecycle, snap.id, snap);
+      renderUpload();
+    }, undefined, originTab);
+  selectBuild(itemId);
+  renderUpload();
+  return built;
+}
+
 function buildSeedFromSource(s) {
   // pdf_source records where the scan lives online; pdf_file is a client-side
   // attachment seed removed by createBuild before its catalogue POST. Locally attached
@@ -18762,15 +18850,21 @@ function buildSeedFromSource(s) {
   } else if (/^https?:\/\/.*\.pdf(\?|$)/i.test(s.url || "")) {
     pdfUrl = s.url;
   }
-  return {
+  const seed = {
     title: s.title, subtitle: s.subtitle, authors: s.author,
     year: s.year, publisher: s.publisher, volume: s.volume || "",
     group_id: buildGroupIdFor(s),
     category_ids: s.category_ids || [],
     extra: s.extra || {}, images: s.images || [], capture_id: s.capture_id || "",
+    capture_source_revision: s.capture_source_revision || "",
     pdf_source: pdfUrl, pdf_file: pdfFile, source_url: s.url,
-    notes: `Source: ${s.archive}${s.matched_title ? " — " + s.matched_title : ""}`,
   };
+  if (!s.capture_id) {
+    seed.notes =
+      `Source: ${s.archive}${
+        s.matched_title ? " — " + s.matched_title : ""}`;
+  }
+  return seed;
 }
 
 let buildPatchConflict = false;  // last patch came back 409 (record reloaded)
@@ -26588,7 +26682,12 @@ function init() {
     const b = ev.target.closest("[data-build-src]");
     if (!b) return;
     const s = (state.uploadSources || [])[parseInt(b.dataset.buildSrc, 10)];
-    if (s) createBuild(buildSeedFromSource(s), s.title.slice(0, 30));
+    if (!s) return;
+    const seed = buildSeedFromSource(s);
+    if (s.capture_id)
+      promoteCaptureBuild(seed, s.title.slice(0, 30));
+    else
+      createBuild(seed, s.title.slice(0, 30));
   });
   for (const t of document.querySelectorAll("#build-tabs .pane-tab")) {
     t.addEventListener("click", () => switchBuildTab(t.dataset.btab));

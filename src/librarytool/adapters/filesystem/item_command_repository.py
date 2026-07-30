@@ -669,6 +669,73 @@ class FilesystemItemCommandUnitOfWork:
         )
         return snapshot
 
+    def stage_managed_create(
+        self,
+        item_id: str,
+        raw_record: Mapping[str, Any],
+    ) -> ItemRecordSnapshot:
+        """Stage a storage-enriched create allocated by this locked unit.
+
+        Composite aggregates sometimes need to publish server-managed fields
+        with the first catalogue row (for example capture identity and an
+        already-validated representation).  Requiring the identity allocated
+        by this unit keeps lifecycle reservations and collision checks in the
+        ordinary item authority while the caller owns validation of those
+        managed fields.
+        """
+
+        self._ensure_stageable()
+        self._item_id(item_id, field_name="item_id")
+        if item_id != self._allocated_item_id:
+            raise RepositoryError(
+                "the managed item create did not use this unit's allocation",
+                code="item_repository_scope_mismatch",
+                details={"item_id": item_id},
+            )
+        if not self._record_in_scope(item_id):
+            raise RepositoryError(
+                "the item create identity is outside this repository",
+                code="item_repository_scope_mismatch",
+            )
+        if not self._identity_reservations().allows(item_id):
+            raise RepositoryError(
+                "the item create identity is reserved by its lifecycle tombstone",
+                code="item_identity_reserved",
+                details={"item_id": item_id},
+            )
+        if item_id.casefold() in {
+            existing.casefold() for existing in self._catalogue
+        }:
+            raise RepositoryError(
+                "the item already exists",
+                code="item_already_exists",
+                details={"item_id": item_id},
+            )
+        try:
+            raw = _strict_plain(raw_record)
+        except (TypeError, ValueError) as exc:
+            raise RepositoryError(
+                "the managed item create record is invalid",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "managed_create_record"},
+            ) from exc
+        if not isinstance(raw, dict):
+            raise RepositoryError(
+                "the managed item create record is not an object",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "managed_create_record"},
+            )
+        snapshot = self._decode_record(item_id, raw)
+        catalogue = _strict_plain(self._catalogue)
+        catalogue[item_id] = raw
+        self._stage(
+            action="create",
+            item_id=item_id,
+            catalogue=catalogue,
+            snapshot=snapshot,
+        )
+        return snapshot
+
     def stage_replace(
         self,
         current: ItemRecordSnapshot,

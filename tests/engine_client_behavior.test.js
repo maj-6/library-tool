@@ -2217,6 +2217,56 @@ test("item commands use versioned idempotent JSON contracts", async () => {
   assert.deepEqual(JSON.parse(calls[1].init.body), { patch });
 });
 
+test("capture promotion owns one source-pinned create contract", async () => {
+  const item = {
+    kind: "book",
+    title: "",
+    metadata: { pdf_source: "https://example.test/scan.pdf" },
+    representations: [],
+  };
+  const body = {
+    ok: true,
+    schema: "librarytool.capture-promotion/1",
+    replayed: false,
+    capture_id: "capture.1",
+    source_revision: `mir-${"a".repeat(64)}`,
+    item_id: "promoted-book",
+    record_revision: "item-r1",
+    build: {
+      id: "promoted-book",
+      title: "Corrected capture",
+      capture_id: "capture.1",
+      updated_at: "item-r1",
+    },
+  };
+  const { client, calls } = harness(body);
+
+  const result = await client.items.promoteCapture({
+    captureId: "capture.1",
+    sourceRevision: `mir-${"a".repeat(64)}`,
+    item,
+    primarySource: "downloads/capture.pdf",
+    idempotencyKey: "capture-promote-1",
+  });
+
+  assert.equal(result.item_id, "promoted-book");
+  assert.equal(calls[0].url, "/api/v1/capture-promotions");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(calls[0].init.headers, {
+    Accept: "application/json",
+    "Idempotency-Key": "capture-promote-1",
+    "Content-Type": "application/json",
+  });
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    promotion: {
+      capture_id: "capture.1",
+      source_revision: `mir-${"a".repeat(64)}`,
+      item,
+      primary_source: "downloads/capture.pdf",
+    },
+  });
+});
+
 test("compatibility acquisition seeding is isolated behind conditional transport", async () => {
   const { client, calls } = harness({ ok: true, build: { id: "book-1" } });
   const compatibility = {
@@ -4861,6 +4911,90 @@ this.createBuild = createBuild;`, context);
     /ATTACH FAILED/.test(event.message)));
   assert.equal(events.some((event) =>
     /ATTACHED|SOURCE ADDED/.test(event.message || "")), false);
+});
+
+test("captured source creation uses one atomic promotion command", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("const ITEM_CREATE_NON_METADATA_FIELDS");
+  const end = app.indexOf("function buildSeedFromSource", start);
+  assert.ok(start >= 0 && end > start);
+  const events = [];
+  const state = { builds: {} };
+  const context = vm.createContext({
+    state,
+    crypto: { randomUUID: () => "promotion-uuid" },
+    engineClient: { items: {
+      create: async () => {
+        throw new Error("generic create must not run");
+      },
+      promoteCapture: async (args) => {
+        events.push({ type: "promotion", args: copyJson(args) });
+        return {
+          ok: true,
+          schema: "librarytool.capture-promotion/1",
+          replayed: false,
+          capture_id: args.captureId,
+          source_revision: args.sourceRevision,
+          item_id: "promoted-book",
+          record_revision: "item-r1",
+          build: {
+            id: "promoted-book",
+            title: "Latest corrected title",
+            authors: "Current Curator",
+            notes: "Corrected capture notes",
+            capture_id: args.captureId,
+            pdf_file: args.primarySource,
+            extra: { generated: { binding: "calf" } },
+            images: ["captures/one.jpg"],
+            updated_at: "item-r1",
+          },
+        };
+      },
+    } },
+    invalidateRepresentationItemIncarnation: (itemId) =>
+      events.push({ type: "incarnation", itemId }),
+    refreshBuildEngineRecord: async () => {
+      throw new Error("optional projection unavailable");
+    },
+    pushOp: () => events.push({ type: "history" }),
+    selectBuild: (id) => events.push({ type: "select", id }),
+    renderUpload: () => events.push({ type: "render" }),
+    statusCrit: (message) => events.push({ type: "critical", message }),
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.promoteCaptureBuild = promoteCaptureBuild;`, context);
+
+  const result = await context.promoteCaptureBuild({
+    title: "Upload-list seed",
+    capture_id: "capture.1",
+    capture_source_revision: `mir-${"a".repeat(64)}`,
+    pdf_file: "downloads/capture.pdf",
+    extra: { private_client_copy: true },
+    images: ["captures/one.jpg"],
+  }, "capture", "workbench");
+
+  const promotion = events.find((event) =>
+    event.type === "promotion").args;
+  assert.equal(promotion.idempotencyKey,
+    "capture-promote-promotion-uuid");
+  assert.equal(promotion.captureId, "capture.1");
+  assert.equal(promotion.sourceRevision, `mir-${"a".repeat(64)}`);
+  assert.equal(promotion.primarySource, "downloads/capture.pdf");
+  assert.deepEqual(promotion.item, {
+    kind: "book",
+    title: "Upload-list seed",
+    metadata: {},
+    representations: [],
+  });
+  assert.equal(events.filter((event) =>
+    event.type === "promotion").length, 1);
+  assert.ok(events.findIndex((event) => event.type === "promotion") <
+    events.findIndex((event) => event.type === "history"));
+  assert.equal(result.title, "Latest corrected title");
+  assert.equal(result.authors, "Current Curator");
+  assert.equal(result.notes, "Corrected capture notes");
+  assert.deepEqual(copyJson(result.extra),
+    { generated: { binding: "calf" } });
 });
 
 test("build creation retains one durable command across ambiguous retries", async () => {

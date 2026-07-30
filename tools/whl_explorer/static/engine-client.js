@@ -1763,6 +1763,7 @@
         list: (args) => this._itemsList(args),
         get: (args) => this._itemGet(args),
         create: (args) => this._itemCreate(args),
+        promoteCapture: (args) => this._capturePromote(args),
         update: (args) => this._itemUpdate(args),
         seedCompatibility: (args) => this._itemSeedCompatibility(args),
         lifecycle: (args) => this._itemLifecycle(args),
@@ -2098,6 +2099,63 @@
         },
         body: { item },
         signal,
+      });
+    }
+
+    _capturePromote({ captureId, sourceRevision, item,
+      primarySource = "", idempotencyKey, signal } = {}) {
+      const capture = portableIdentifier(captureId, "captureId");
+      const revision = String(sourceRevision || "");
+      if (!/^mir-[0-9a-f]{64}$/.test(revision)) {
+        throw new TypeError(
+          "sourceRevision is not a capture source revision");
+      }
+      if (typeof primarySource !== "string" ||
+          primarySource !== primarySource.trim() ||
+          primarySource.length > 8192) {
+        throw new TypeError("primarySource is invalid");
+      }
+      const operation = operationKey(idempotencyKey, "idempotencyKey");
+      const path = "/v1/capture-promotions";
+      return this._requestJson("POST", path, {
+        headers: { "Idempotency-Key": operation },
+        body: {
+          promotion: {
+            capture_id: capture,
+            source_revision: revision,
+            item,
+            primary_source: primarySource,
+          },
+        },
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const valid = (status === 200 || status === 201) &&
+          hasExactKeys(body, [
+            "ok", "schema", "replayed", "capture_id",
+            "source_revision", "item_id", "record_revision", "build",
+          ]) &&
+          body.ok === true &&
+          body.schema === "librarytool.capture-promotion/1" &&
+          typeof body.replayed === "boolean" &&
+          body.capture_id === capture &&
+          body.source_revision === revision &&
+          isObject(body.build) &&
+          body.item_id === body.build.id &&
+          isPortableIdentifier(body.item_id) &&
+          typeof body.record_revision === "string" &&
+          /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(
+            body.record_revision) &&
+          body.build.capture_id === capture &&
+          typeof body.build.title === "string" &&
+          typeof body.build.updated_at === "string";
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid capture promotion",
+            "POST", path, body, undefined, status);
+        }
+        return body;
       });
     }
 

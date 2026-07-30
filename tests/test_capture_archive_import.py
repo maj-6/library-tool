@@ -15,6 +15,7 @@ import libformat
 import pytest
 import server
 from PIL import Image
+from pypdf import PdfWriter
 
 
 @pytest.fixture(autouse=True)
@@ -2088,6 +2089,336 @@ def _canonical_patch(*, title=None, metadata_set=None):
             "representations": None,
         },
     }
+
+
+def _capture_promotion_document(
+        capture_id: str,
+        source_revision: str,
+        *,
+        title: str = "",
+        metadata: dict | None = None,
+        primary_source: str = "",
+) -> dict:
+    return {
+        "promotion": {
+            "capture_id": capture_id,
+            "source_revision": source_revision,
+            "item": {
+                "kind": "book",
+                "title": title,
+                "metadata": metadata or {},
+                "representations": [],
+            },
+            "primary_source": primary_source,
+        },
+    }
+
+
+def test_capture_promotion_hydrates_corrected_metadata_and_replays(
+        monkeypatch, data_root):
+    capture_id = "transactional_promotion_metadata.1"
+    entry_id, association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    with server._manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        source = entries[entry_id]
+        source.update({
+            "title": "Corrected Herbal",
+            "author": "Ada Curator",
+            "city": "London",
+            "notes": "Hand-corrected capture notes",
+        })
+        source["extra"]["generated"] = {
+            "binding": "calf",
+            "confidence": 0.94,
+        }
+        server._save_manual_entries(entries)
+        source_revision = (
+            server._MANUAL_ENTRY_ITEM_CODEC.record_revision(
+                entry_id,
+                entries[entry_id],
+            )
+        )
+    document = _capture_promotion_document(
+        capture_id,
+        source_revision,
+        metadata={"pdf_source": "https://example.test/capture.pdf"},
+        primary_source=str(
+            data_root / "transactional-promotion-source.pdf"
+        ),
+    )
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    with (
+        data_root / "transactional-promotion-source.pdf"
+    ).open("wb") as stream:
+        writer.write(stream)
+    headers = {"Idempotency-Key": "transactional-promotion-1"}
+
+    with server.app.test_client() as client:
+        created = client.post(
+            "/api/v1/capture-promotions",
+            json=document,
+            headers=headers,
+        )
+        replayed = client.post(
+            "/api/v1/capture-promotions",
+            json=document,
+            headers=headers,
+        )
+
+    assert created.status_code == 201, created.get_json()
+    assert replayed.status_code == 200, replayed.get_json()
+    assert replayed.get_json()["replayed"] is True
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    assert len(builds) == 1
+    build = next(iter(builds.values()))
+    assert build["capture_id"] == capture_id
+    assert build["capture_book_id"] == association.book_id
+    assert build["title"] == "Corrected Herbal"
+    assert build["authors"] == "Ada Curator"
+    assert build["publisher_city"] == "London"
+    assert build["notes"] == "Hand-corrected capture notes"
+    assert build["extra"] == {
+        "generated": {
+            "binding": "calf",
+            "confidence": 0.94,
+        },
+    }
+    assert build["images"]
+    assert build["pdf_file"] == str(
+        data_root / "transactional-promotion-source.pdf"
+    )
+    assert "primary" in build["representation_manifest"]["sources"]
+
+    with server.app.test_client() as client:
+        detail = client.get(
+            f"/api/v1/corrections/items/{association.book_id}"
+        )
+        item = detail.get_json()["item"]
+        assert item["metadata"]["extra"] == build["extra"]
+        edited = client.patch(
+            f"/api/v1/corrections/items/{association.book_id}",
+            json={
+                "patch": {
+                    "title": None,
+                    "metadata_set": {
+                        "extra": {
+                            "generated": {
+                                "binding": "vellum",
+                                "confidence": 0.98,
+                            },
+                        },
+                    },
+                    "metadata_remove": [],
+                },
+            },
+            headers={
+                "Idempotency-Key": "promoted-extra-edit-1",
+                "If-Record-Match": (
+                    f'"{item["record_revision"]}"'
+                ),
+            },
+        )
+    assert edited.status_code == 200, edited.get_json()
+    assert lib.load_json(
+        server.BUILDS_PATH, {}
+    )[build["id"]]["extra"]["generated"]["binding"] == "vellum"
+
+
+def test_capture_promotion_stale_seed_conflicts_without_orphan_and_retries(
+        monkeypatch):
+    capture_id = "transactional_promotion_stale_seed.1"
+    entry_id, _association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    source = server._capture_manual_source_snapshot(capture_id)
+    assert source is not None
+    stale_revision = source.record_revision
+    with server._manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        entries[entry_id]["title"] = "Edited after the upload-list seed"
+        entries[entry_id]["author"] = "Latest Curator"
+        server._save_manual_entries(entries)
+        current_revision = (
+            server._MANUAL_ENTRY_ITEM_CODEC.record_revision(
+                entry_id,
+                entries[entry_id],
+            )
+        )
+
+    with server.app.test_client() as client:
+        stale = client.post(
+            "/api/v1/capture-promotions",
+            json=_capture_promotion_document(
+                capture_id,
+                stale_revision,
+                title="Old upload-list title",
+            ),
+            headers={"Idempotency-Key": "stale-seed-promotion"},
+        )
+        assert lib.load_json(server.BUILDS_PATH, {}) == {}
+        retried = client.post(
+            "/api/v1/capture-promotions",
+            json=_capture_promotion_document(
+                capture_id,
+                current_revision,
+            ),
+            headers={"Idempotency-Key": "stale-seed-promotion"},
+        )
+
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "capture_source_revision_conflict"
+    assert retried.status_code == 201, retried.get_json()
+    build = next(iter(lib.load_json(server.BUILDS_PATH, {}).values()))
+    assert build["title"] == "Edited after the upload-list seed"
+    assert build["authors"] == "Latest Curator"
+
+
+def test_capture_promotion_source_failure_leaves_no_orphan(monkeypatch):
+    capture_id = "transactional_promotion_bad_source.1"
+    _entry_id, _association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    source = server._capture_manual_source_snapshot(capture_id)
+    assert source is not None
+
+    with server.app.test_client() as client:
+        response = client.post(
+            "/api/v1/capture-promotions",
+            json=_capture_promotion_document(
+                capture_id,
+                source.record_revision,
+                primary_source="missing/capture-source.pdf",
+            ),
+            headers={"Idempotency-Key": "bad-source-promotion"},
+        )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "representation_source_not_found"
+    assert lib.load_json(server.BUILDS_PATH, {}) == {}
+
+
+def test_capture_promotion_replay_repairs_post_commit_invalidation(
+        monkeypatch):
+    capture_id = "transactional_promotion_replay_gate.1"
+    _entry_id, association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    source = server._capture_manual_source_snapshot(capture_id)
+    assert source is not None
+    real_mark_stale = server._mark_capture_archive_stale
+    calls = []
+
+    def fail_once(requested_capture_id):
+        calls.append(requested_capture_id)
+        if len(calls) == 1:
+            raise server.EngineRepositoryError(
+                "injected post-commit invalidation failure",
+                code="capture_archive_stale_unavailable",
+                retryable=True,
+            )
+        return real_mark_stale(requested_capture_id)
+
+    monkeypatch.setattr(server, "_mark_capture_archive_stale", fail_once)
+    document = _capture_promotion_document(
+        capture_id,
+        source.record_revision,
+        metadata={"source_url": "https://example.test/new-source"},
+    )
+    headers = {"Idempotency-Key": "promotion-replay-gate"}
+
+    with server.app.test_client() as client:
+        failed = client.post(
+            "/api/v1/capture-promotions",
+            json=document,
+            headers=headers,
+        )
+        assert len(lib.load_json(server.BUILDS_PATH, {})) == 1
+        replayed = client.post(
+            "/api/v1/capture-promotions",
+            json=document,
+            headers=headers,
+        )
+
+    assert failed.status_code == 503
+    assert failed.get_json()["code"] == (
+        "capture_archive_stale_unavailable"
+    )
+    assert replayed.status_code == 200, replayed.get_json()
+    assert replayed.get_json()["replayed"] is True
+    assert len(lib.load_json(server.BUILDS_PATH, {})) == 1
+    assert calls == [capture_id, capture_id]
+    stale = server._capture_archive_association(capture_id)
+    assert stale is not None
+    assert stale.state.value == "stale"
+    assert stale.archive_sha256 == association.archive_sha256
+
+
+def test_concurrent_capture_promotions_publish_only_one_build(monkeypatch):
+    capture_id = "transactional_promotion_race.1"
+    _entry_id, _association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    source = server._capture_manual_source_snapshot(capture_id)
+    assert source is not None
+    entered = threading.Event()
+    release = threading.Event()
+    original = server._capture_promotion_draft
+
+    def paused_draft(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_capture_promotion_draft", paused_draft)
+    statuses = {}
+
+    def promote(name):
+        with server.app.test_client() as client:
+            response = client.post(
+                "/api/v1/capture-promotions",
+                json=_capture_promotion_document(
+                    capture_id,
+                    source.record_revision,
+                ),
+                headers={
+                    "Idempotency-Key": f"promotion-race-{name}",
+                },
+            )
+            statuses[name] = (
+                response.status_code,
+                response.get_json(),
+            )
+
+    first = threading.Thread(target=promote, args=("first",))
+    second = threading.Thread(target=promote, args=("second",))
+    first.start()
+    assert entered.wait(5)
+    second.start()
+    second.join(0.2)
+    assert second.is_alive()
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert sorted(status for status, _body in statuses.values()) == [
+        201,
+        409,
+    ]
+    conflict = next(
+        body for status, body in statuses.values() if status == 409
+    )
+    assert conflict["code"] == "capture_build_conflict"
+    assert len(lib.load_json(server.BUILDS_PATH, {})) == 1
 
 
 def test_canonical_item_title_and_metadata_edit_marks_capture_stale(

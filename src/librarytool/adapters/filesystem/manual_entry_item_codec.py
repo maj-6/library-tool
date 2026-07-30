@@ -398,6 +398,36 @@ class ManualEntryItemCodec:
     def valid_record_revision(value: object) -> bool:
         return isinstance(value, str) and bool(_REVISION_RE.fullmatch(value))
 
+    @staticmethod
+    def public_extra(value: Mapping[str, Any]) -> dict[str, Any]:
+        """Return a detached, path-free editable ``extra`` projection."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("manual entry extra must be an object")
+        detached = _json_clone(value, label="manual entry extra")
+        projected = _public_extra_projection(detached)
+        assert isinstance(projected, dict)
+        return projected
+
+    @staticmethod
+    def merge_public_extra(
+        previous: Mapping[str, Any],
+        edited: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Merge public edits while preserving nested server-owned values."""
+
+        if not isinstance(previous, Mapping) or not isinstance(edited, Mapping):
+            raise TypeError("manual entry extra must be an object")
+        detached = _json_clone(edited, label="manual entry extra")
+        if _public_extra_projection(detached) != detached:
+            raise ValueError(
+                "manual entry extra contains server-managed metadata "
+                "or a private locator"
+            )
+        merged = _merge_protected_extra(previous, detached)
+        assert isinstance(merged, dict)
+        return merged
+
     @classmethod
     def record_revision(
         cls,
@@ -484,11 +514,7 @@ class ManualEntryItemCodec:
         if "category_ids" in raw:
             result["category_ids"] = list(raw["category_ids"])
         if "extra" in raw:
-            detached = _json_clone(
-                raw["extra"],
-                label="manual entry extra",
-            )
-            result["extra"] = _public_extra_projection(detached)
+            result["extra"] = cls.public_extra(raw["extra"])
         images = raw.get("images")
         if isinstance(images, (list, tuple)):
             result["image_count"] = len(images)
