@@ -42,6 +42,7 @@ from .item_lifecycle_repository import (
 from .item_repository import FilesystemItemQueryRepository
 from .interchange_repository import FilesystemInterchangeRepository
 from .lib_open_repository import FilesystemOpenLibRepository
+from .manual_entry_item_codec import ManualEntryItemCodec
 from .recoverable_write_set import (
     RecoverableWriteSet,
     RecoveryResult,
@@ -95,6 +96,7 @@ __all__ = [
     "FilesystemInterchangeRepository",
     "FilesystemOpenLibRepository",
     "FilesystemJobHistoryRepository",
+    "ManualEntryItemCodec",
     "FilesystemReplicaRepository",
     "FilesystemRepresentationCommandRepository",
     "FilesystemTranslationRepository",

@@ -17,12 +17,16 @@ import pytest
 from PIL import Image
 from werkzeug.serving import make_server
 
-from librarytool.adapters.filesystem import FilesystemCorrectionTransformStore
+from librarytool.adapters.filesystem import (
+    FilesystemCorrectionTransformStore,
+    FilesystemItemQueryRepository,
+)
 from librarytool.engine import CORRECTION_TRANSFORM_SERVICE
 from librarytool.engine.correction_transforms import (
     OcrFollowupOutcome,
     OcrFollowupState,
 )
+from librarytool.engine.items import ItemQueryService
 
 
 BOOK_ID = "b-11111111111111111111111111111111"
@@ -67,6 +71,7 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
 
     output = tmp_path / "output"
     builds_path = output / "whl_builds.json"
+    manual_entries_path = output / "manual_entries.json"
     entries_dir = output / "entries"
     captures_dir = tmp_path / "captures"
     capture_dir = captures_dir / CAPTURE_ID
@@ -176,12 +181,27 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
             }
         },
     )
+    server.lib.save_json(manual_entries_path, {})
 
     monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
     monkeypatch.setattr(server, "ENTRIES_DIR", entries_dir)
     monkeypatch.setattr(server, "CAPTURES_DIR", captures_dir)
+    monkeypatch.setattr(
+        server.lib,
+        "MANUAL_ENTRIES_PATH",
+        manual_entries_path,
+    )
     session = server._open_engine_session(output)
     _bind_engine_session(monkeypatch, server, session)
+    server._ensure_capture_archive(
+        CAPTURE_ID,
+        {
+            "id": BOOK_ID,
+            "book_id": BOOK_ID,
+            "capture_id": CAPTURE_ID,
+            "title": "Captured Herbal",
+        },
+    )
     try:
         yield content
     finally:
@@ -229,6 +249,364 @@ def test_production_bridge_lists_and_serves_capture_artifacts(
     assert response.mimetype == "image/jpeg"
     assert response.headers["X-Resource-Revision"] == resource["revision"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_capture_only_target_is_visible_and_stays_canonical_after_promotion(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    manual = {
+        "id": manual_id,
+        "title": "Manual Capture",
+        "author": "A. Botanist",
+        "notes": "First observation",
+        "capture_id": CAPTURE_ID,
+        "images": [f"captures/{CAPTURE_ID}/photo_1.jpg"],
+    }
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {manual_id: manual},
+        )
+
+    first = server._corrections_item_snapshot()
+    item = first[BOOK_ID]
+    query_item = ItemQueryService(
+        FilesystemItemQueryRepository(lambda: first)
+    ).get_item(BOOK_ID)
+    rasters = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts"
+        "?representation_id=capture"
+    )
+
+    assert list(first) == [BOOK_ID]
+    assert item["kind"] == "capture"
+    assert item["title"] == "Manual Capture"
+    assert query_item.kind == "capture"
+    assert query_item.metadata["authors"] == "A. Botanist"
+    assert item["metadata"]["origin"] == "captured_entry"
+    assert item["metadata"]["association_state"] == "current"
+    assert item["metadata"]["active_storage_kind"] == "manual"
+    assert item["metadata"]["active_storage_id"].startswith("manual:")
+    assert rasters.status_code == 200
+    assert len(rasters.get_json()["artifacts"]) == 2
+    display = rasters.get_json()["artifacts"][0]
+    classified = client.put(
+        (
+            f"/api/v1/items/{BOOK_ID}/raster-artifacts/"
+            f"{display['key']['artifact_id']}/category"
+        ),
+        json={"category": "title_page"},
+        headers={
+            "Idempotency-Key": "capture-only-title-page",
+            "If-Artifact-Match": f'"{display["revision"]}"',
+        },
+    )
+    assert classified.status_code == 200
+    placeholder = server._corrections_entry_directory(BOOK_ID)
+    assert placeholder == (
+        server.ENTRIES_DIR
+        / server._CORRECTIONS_CAPTURE_ONLY_DIRECTORY
+        / BOOK_ID
+    )
+    assert not placeholder.exists()
+
+    manual["notes"] = "Corrected without an updated_at token"
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {manual_id: manual},
+        )
+    second = server._corrections_item_snapshot()
+    assert second[BOOK_ID]["revision"] != item["revision"]
+
+    active_entry = server.ENTRIES_DIR / "promoted-local"
+    (active_entry / "ocr").mkdir(parents=True)
+    (active_entry / "ocr" / "layout.json").write_text(
+        json.dumps(
+            {
+                "regions": {
+                    "primary": {
+                        "1": {
+                            "doc": "compiled.txt",
+                            "dims": {"w": 100, "h": 200},
+                            "origin": "machine",
+                            "items": [
+                                {
+                                    "id": "r1",
+                                    "rid": "margin-1",
+                                    "role": "marginalia",
+                                    "order": 0,
+                                    "box": {
+                                        "x": 0.1,
+                                        "y": 0.2,
+                                        "w": 0.3,
+                                        "h": 0.1,
+                                    },
+                                    "text": "Handwritten note",
+                                }
+                            ],
+                        }
+                    }
+                },
+                "images": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "promoted-local": {
+                    "id": "promoted-local",
+                    "title": "Promoted Build Wins",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                    "pdf_file": "missing-source.pdf",
+                }
+            },
+        )
+    promoted = server._corrections_item_snapshot()
+
+    assert list(promoted) == [BOOK_ID]
+    assert promoted[BOOK_ID]["kind"] == "book"
+    assert promoted[BOOK_ID]["title"] == "Promoted Build Wins"
+    assert promoted[BOOK_ID]["metadata"]["origin"] == "promoted_capture"
+    assert promoted[BOOK_ID]["metadata"]["active_storage_kind"] == "build"
+    assert promoted[BOOK_ID]["metadata"]["active_storage_id"] == (
+        "promoted-local"
+    )
+    assert server._corrections_entry_directory(BOOK_ID) == (
+        server.ENTRIES_DIR / "promoted-local"
+    )
+    promoted_rasters = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts"
+        "?representation_id=capture"
+    ).get_json()["artifacts"]
+    assert promoted_rasters[0]["effective_category"] == "title_page"
+    boxes = client.get(
+        f"/api/v1/items/{BOOK_ID}/spatial-annotations"
+        "?representation_id=primary"
+    )
+    assert boxes.status_code == 200
+    assert boxes.get_json()["total"] == 1
+    assert boxes.get_json()["annotations"][0]["effective_role"] == (
+        "marginalia"
+    )
+
+
+def test_capture_target_duplicates_and_identity_conflicts_fail_closed(
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                "manual-one": {
+                    "title": "First",
+                    "capture_id": CAPTURE_ID,
+                },
+                "manual-two": {
+                    "title": "Second",
+                    "capture_id": CAPTURE_ID,
+                },
+            },
+        )
+
+    with pytest.raises(server.EngineRepositoryError) as duplicate:
+        server._corrections_item_snapshot()
+    assert duplicate.value.code == "duplicate_corrections_target_claim"
+
+    with server._manual_lock:
+        server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH, {})
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "conflicting-build": {
+                    "id": "conflicting-build",
+                    "title": "Conflict",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": (
+                        "b-22222222222222222222222222222222"
+                    ),
+                }
+            },
+        )
+
+    with pytest.raises(server.EngineRepositoryError) as conflict:
+        server._corrections_item_snapshot()
+    assert conflict.value.code == "corrections_target_identity_conflict"
+
+
+def test_capture_fallback_is_deterministic_and_uncaptured_manual_is_omitted(
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    monkeypatch.setattr(server, "_corrections_association", lambda _value: None)
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                "manual-capture": {
+                    "id": "manual-capture",
+                    "title": "Unassociated Capture",
+                    "capture_id": CAPTURE_ID,
+                }
+            },
+        )
+
+    capture_snapshot = server._corrections_item_snapshot()
+    capture_identity = server.capture_book_id(CAPTURE_ID)
+    assert list(capture_snapshot) == [capture_identity]
+    assert capture_snapshot[capture_identity]["metadata"][
+        "association_state"
+    ] == "missing"
+
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                "legacy manual/key": {
+                    "title": "Uncaptured Manual",
+                },
+                "capture-alias": {
+                    "title": "Aliased Capture",
+                    "capture_id": (
+                        "{11111111-1111-4111-8111-111111111111}"
+                    ),
+                }
+            },
+        )
+    manual_snapshot = server._corrections_item_snapshot()
+    assert manual_snapshot == {}
+
+
+def test_manual_storage_alias_is_private_and_invalid_unicode_fails_closed(
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    raw_manual_id = "../private/" + ("secret-alias-" * 40)
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                raw_manual_id: {
+                    "title": "Legacy Capture",
+                    "capture_id": CAPTURE_ID,
+                }
+            },
+        )
+    snapshot = server._corrections_item_snapshot()
+    serialized = json.dumps(snapshot, sort_keys=True)
+
+    assert list(snapshot) == [BOOK_ID]
+    assert raw_manual_id not in serialized
+    assert snapshot[BOOK_ID]["metadata"]["active_storage_id"].startswith(
+        "manual:"
+    )
+    real_load_json = server.lib.load_json
+
+    def invalid_unicode_snapshot(path, default):
+        if Path(path) == Path(server.BUILDS_PATH):
+            return {}
+        if Path(path) == Path(server.lib.MANUAL_ENTRIES_PATH):
+            return {
+                "\ud800": {
+                    "title": "Invalid Unicode",
+                    "capture_id": CAPTURE_ID,
+                }
+            }
+        return real_load_json(path, default)
+
+    monkeypatch.setattr(server.lib, "load_json", invalid_unicode_snapshot)
+    with pytest.raises(server.EngineRepositoryError) as invalid:
+        server._corrections_item_snapshot()
+    assert invalid.value.code == "invalid_corrections_target_snapshot"
+    assert "\ud800" not in json.dumps(invalid.value.details)
+
+
+def test_build_id_text_layer_source_resolution_is_not_canonicalized(
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "local-build": {
+                    "id": "local-build",
+                    "title": "Captured Build",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                    "pdf_file": "missing-source.pdf",
+                }
+            },
+        )
+
+    source = server._engine_text_layer_source_snapshot(
+        "local-build",
+        "primary",
+    )
+
+    assert source is not None
+    assert source.item_id == "local-build"
+    assert source.representation_id == "primary"
+    assert source.revision.startswith("sr-")
+
+
+def test_normal_build_only_corrections_target_stays_addressable(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    with server._manual_lock:
+        server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH, {})
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "plain-book": {
+                    "id": "plain-book",
+                    "title": "Plain Book",
+                }
+            },
+        )
+
+    snapshot = server._corrections_item_snapshot()
+    response = client.get("/api/v1/items/plain-book/raster-artifacts")
+
+    assert list(snapshot) == ["plain-book"]
+    assert snapshot["plain-book"]["title"] == "Plain Book"
+    assert snapshot["plain-book"]["metadata"]["origin"] == "catalogue"
+    assert response.status_code == 200
+    assert response.get_json()["artifacts"] == []
 
 
 def test_production_bridge_mutations_converge_across_clients(

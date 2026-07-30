@@ -207,6 +207,7 @@ CanvasIdAllocator = Callable[[frozenset[str]], str]
 CorrectionsItemMembership = Callable[[str], bool]
 CorrectionsCaptureIdentity = Callable[[str], str | None]
 CorrectionsCaptureDirectory = Callable[[str], Path]
+CorrectionsEntryDirectory = Callable[[str], Path]
 CorrectionsRepresentationRevision = Callable[[str, str], str | None]
 TextLayerItemMembership = Callable[[str], bool]
 TextLayerSourceSnapshotLoader = Callable[
@@ -434,7 +435,10 @@ class CorrectionsBindings:
     Capture files may live outside the engine write-set (the desktop stores
     them beside ``output``). ``capture_authority_root`` explicitly confines
     that borrowed read authority without moving the write-set or its recovery
-    journals. Entry artifacts remain confined by the common entries resolver.
+    journals. ``entry_directory_for`` may map a canonical Corrections identity
+    to an active compatibility entry; the artifact adapter still confines the
+    result to the engine workspace. Omitting it uses the common entries
+    resolver.
     """
 
     item_exists_for: CorrectionsItemMembership
@@ -443,6 +447,7 @@ class CorrectionsBindings:
     capture_authority_root: Path
     representation_revision_for: CorrectionsRepresentationRevision
     lock_context_for: CatalogueLockFactory
+    entry_directory_for: CorrectionsEntryDirectory | None = None
     job_start_context_for: ItemLockFactory | None = None
     ocr_provider: CorrectionOcrProviderPort | None = None
 
@@ -467,6 +472,11 @@ class CorrectionsBindings:
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+        if (
+            self.entry_directory_for is not None
+            and not callable(self.entry_directory_for)
+        ):
+            raise TypeError("entry_directory_for must be callable or None")
         if (
             self.job_start_context_for is not None
             and not callable(self.job_start_context_for)
@@ -1083,11 +1093,16 @@ def compose_filesystem_engine(
     correction_ocr_proposals = None
     if corrections is not None:
         assert corrections_lock is not None
+        corrections_entry_directory_for = (
+            corrections.entry_directory_for
+            if corrections.entry_directory_for is not None
+            else entry_directory_for
+        )
         corrections_base = FilesystemCorrectionsArtifactRepository(
             resources.write_set,
             item_exists=corrections.item_exists_for,
             capture_id_for=corrections.capture_id_for,
-            entry_directory_for=entry_directory_for,
+            entry_directory_for=corrections_entry_directory_for,
             capture_directory_for=corrections.capture_directory_for,
             capture_authority_root=corrections.capture_authority_root,
             representation_revision_for=(

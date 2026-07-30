@@ -44,6 +44,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -97,6 +98,9 @@ from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E40
 )
 from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
     WhlCatalogueItemCodec,
+)
+from librarytool.adapters.filesystem.manual_entry_item_codec import (  # noqa: E402
+    ManualEntryItemCodec,
 )
 from librarytool.adapters.windows.secret_store import (  # noqa: E402
     SecretCredentialNotConfiguredError,
@@ -5236,8 +5240,12 @@ def _engine_artifact_row(item_id: str, build: dict, *, kind: str,
     return result
 
 
-def _engine_item_artifacts(item_id: str, build: dict) -> list[dict]:
+def _engine_item_artifacts(
+        item_id: str, build: dict, *,
+        identity_item_id: str = "") -> list[dict]:
     """Flatten today's entry-folder summary into portable artifact refs."""
+
+    artifact_item_id = identity_item_id or item_id
     info = _entry_folder_info(item_id, build)
     rows: list[dict] = []
     for row in info.get("ocr") or []:
@@ -5245,35 +5253,41 @@ def _engine_item_artifacts(item_id: str, build: dict) -> list[dict]:
             continue
         source_id = str(row.get("src") or "primary")
         rows.append(_engine_artifact_row(
-            item_id, build, kind="ocr", name=str(row["name"]), row=row,
+            artifact_item_id,
+            build, kind="ocr", name=str(row["name"]), row=row,
             source_id=source_id,
         ))
     for row in info.get("full_text") or []:
         if isinstance(row, dict) and row.get("name"):
             rows.append(_engine_artifact_row(
-                item_id, build, kind="full-text", name=str(row["name"]), row=row,
+                artifact_item_id,
+                build, kind="full-text", name=str(row["name"]), row=row,
             ))
     for row in info.get("translations") or []:
         if isinstance(row, dict) and row.get("name"):
             rows.append(_engine_artifact_row(
-                item_id, build, kind="translation", name=str(row["name"]),
+                artifact_item_id,
+                build, kind="translation", name=str(row["name"]),
                 layer=str(row.get("lang") or ""), row=row,
             ))
     for row in info.get("analysis") or []:
         if isinstance(row, dict) and row.get("name"):
             rows.append(_engine_artifact_row(
-                item_id, build, kind="analysis", name=str(row["name"]), row=row,
+                artifact_item_id,
+                build, kind="analysis", name=str(row["name"]), row=row,
             ))
     for kind in ("summary", "about"):
         row = info.get(kind)
         if isinstance(row, dict) and row.get("exists"):
             rows.append(_engine_artifact_row(
-                item_id, build, kind=kind, name=f"{kind}.md", row=row,
+                artifact_item_id,
+                build, kind=kind, name=f"{kind}.md", row=row,
             ))
     for row in info.get("images") or []:
         if isinstance(row, dict) and row.get("name"):
             rows.append(_engine_artifact_row(
-                item_id, build, kind="figure", name=str(row["name"]), row=row,
+                artifact_item_id,
+                build, kind="figure", name=str(row["name"]), row=row,
             ))
     processed = str(info.get("processed_pdf") or "")
     if processed:
@@ -5283,7 +5297,8 @@ def _engine_item_artifacts(item_id: str, build: dict) -> list[dict]:
         except OSError:
             size = None
         rows.append(_engine_artifact_row(
-            item_id, build, kind="processed-source", name=processed,
+            artifact_item_id,
+            build, kind="processed-source", name=processed,
             row={"size": size},
         ))
     return rows
@@ -5700,21 +5715,449 @@ def _translation_item_exists(item_id: str) -> bool:
     return isinstance(builds, dict) and isinstance(builds.get(item_id), dict)
 
 
-def _corrections_capture_id(item_id: str) -> str | None:
-    """Return the live capture authority linked from one catalogue item."""
+@dataclass(frozen=True, slots=True)
+class _CorrectionsTarget:
+    """One canonical Corrections identity and its active compatibility row."""
 
-    builds = lib.load_json(BUILDS_PATH, {})
-    build = builds.get(item_id) if isinstance(builds, dict) else None
-    if not isinstance(build, dict):
+    canonical_id: str
+    storage_kind: str
+    storage_id: str
+    capture_id: str
+    association_state: str
+    association_book_id: str
+    record_revision: str
+    title: str
+    metadata: Mapping
+    record: Mapping
+    entry_directory: Path
+
+
+_CORRECTIONS_CAPTURE_ONLY_DIRECTORY = "_corrections_capture_only"
+_CORRECTIONS_BOOK_ID_RE = re.compile(r"^b-[0-9a-f]{32}$")
+_corrections_authority_context = threading.local()
+
+
+def _corrections_target_error(
+        message: str, *, code: str, **details) -> EngineRepositoryError:
+    return EngineRepositoryError(message, code=code, details=details)
+
+
+def _corrections_public_storage_id(
+        storage_kind: str, storage_id: object) -> str:
+    """Return a bounded diagnostic id without exposing legacy manual keys."""
+
+    if storage_kind == "build":
+        return str(storage_id or "")[:128]
+    raw = storage_id if isinstance(storage_id, str) else type(storage_id).__name__
+    encoded = raw.encode("utf-8", errors="surrogatepass")
+    return "manual:" + hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def _corrections_capture_identity(
+        value, *, storage_kind: str, storage_id: str) -> str:
+    """Accept only an exact persisted capture id; never rewrite an alias."""
+
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str) or _capture_archive_id(value) != value:
+        raise _corrections_target_error(
+            "a Corrections target has an invalid capture identity",
+            code="invalid_corrections_target_snapshot",
+            storage_kind=storage_kind,
+            storage_id=_corrections_public_storage_id(
+                storage_kind,
+                storage_id,
+            ),
+            field="capture_id",
+        )
+    return value
+
+
+def _corrections_build_storage_id(value) -> str:
+    if (
+        not isinstance(value, str)
+        or not _BUILD_ID_RE.fullmatch(value)
+        or value.endswith(".")
+        or value.split(".", 1)[0].casefold() in _CAPTURE_DEVICE_NAMES
+    ):
+        raise _corrections_target_error(
+            "a Corrections build has an unsafe storage identity",
+            code="invalid_corrections_target_snapshot",
+            storage_kind="build",
+            storage_id=str(value or "")[:128],
+            field="storage_id",
+        )
+    return value
+
+
+def _corrections_association(
+        capture_id: str) -> CaptureArchiveAssociation | None:
+    try:
+        return FilesystemCaptureArchiveRepository.inspect_association(
+            Path(BUILDS_PATH).parent,
+            capture_id,
+        )
+    except EngineError:
+        raise
+    except Exception as exc:
+        raise _corrections_target_error(
+            "the capture archive association could not be inspected",
+            code="corrections_target_repository_unavailable",
+            capture_id=capture_id,
+            cause_type=type(exc).__name__,
+        ) from exc
+
+
+def _corrections_identity_claims(raw: Mapping) -> tuple[tuple[str, object], ...]:
+    claims: list[tuple[str, object]] = [
+        ("capture_book_id", raw.get("capture_book_id")),
+        ("book_id", raw.get("book_id")),
+        ("lib_book_id", raw.get("lib_book_id")),
+    ]
+    extra = raw.get("extra")
+    if isinstance(extra, Mapping):
+        claims.extend((
+            ("extra.book_id", extra.get("book_id")),
+            ("extra.lib_book_id", extra.get("lib_book_id")),
+        ))
+    return tuple(claims)
+
+
+def _corrections_validate_identity_claims(
+        raw: Mapping, *, canonical_id: str, capture_id: str,
+        storage_kind: str, storage_id: str) -> None:
+    for field, value in _corrections_identity_claims(raw):
+        if value in (None, ""):
+            continue
+        if (
+            not isinstance(value, str)
+            or not _CORRECTIONS_BOOK_ID_RE.fullmatch(value)
+        ):
+            raise _corrections_target_error(
+                "a Corrections target has an invalid stable book identity",
+                code="invalid_corrections_target_snapshot",
+                storage_kind=storage_kind,
+                storage_id=_corrections_public_storage_id(
+                    storage_kind,
+                    storage_id,
+                ),
+                capture_id=capture_id,
+                field=field,
+            )
+        if value != canonical_id:
+            raise _corrections_target_error(
+                "a Corrections target carries conflicting book identities",
+                code="corrections_target_identity_conflict",
+                storage_kind=storage_kind,
+                storage_id=_corrections_public_storage_id(
+                    storage_kind,
+                    storage_id,
+                ),
+                capture_id=capture_id,
+                field=field,
+            )
+
+
+def _corrections_capture_authority(
+        capture_id: str) -> tuple[str, str, str]:
+    association = _corrections_association(capture_id)
+    if association is None:
+        return capture_book_id(capture_id), "missing", ""
+    return (
+        association.book_id,
+        association.state.value,
+        association.book_id,
+    )
+
+
+def _corrections_target_metadata(
+        raw: Mapping, *, storage_kind: str, storage_id: str,
+        capture_id: str, canonical_id: str, association_state: str) -> dict:
+    if storage_kind == "manual":
+        metadata = _MANUAL_ENTRY_ITEM_CODEC.metadata(raw)
+        origin = "captured_entry" if capture_id else "manual_entry"
+    else:
+        metadata = {
+            key: value for key, value in raw.items()
+            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
+        }
+        origin = "promoted_capture" if capture_id else "catalogue"
+    active_storage_id = (
+        storage_id
+        if storage_kind == "build"
+        else _corrections_public_storage_id(storage_kind, storage_id)
+    )
+    metadata.update({
+        "origin": origin,
+        "association_state": association_state,
+        "active_storage_kind": storage_kind,
+        # Restore can retain arbitrary legacy manual keys. Keep those raw
+        # aliases private while still exposing a stable diagnostic handle.
+        "active_storage_id": active_storage_id,
+        "capture_id": capture_id,
+        "canonical_item_id": canonical_id,
+    })
+    if canonical_id.startswith("b-"):
+        metadata["canonical_book_id"] = canonical_id
+    return metadata
+
+
+def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
+    """Resolve one fail-closed authority snapshot under build/manual locks."""
+
+    try:
+        builds = lib.load_json(BUILDS_PATH, {})
+        manual_entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _corrections_target_error(
+            "the Corrections target stores could not be loaded",
+            code="corrections_target_repository_unavailable",
+            cause_type=type(exc).__name__,
+        ) from exc
+    if not isinstance(builds, Mapping) or not isinstance(
+        manual_entries, Mapping
+    ):
+        raise _corrections_target_error(
+            "a Corrections target store is not an object",
+            code="invalid_corrections_target_snapshot",
+        )
+
+    manual_by_capture: dict[str, list[tuple[str, Mapping]]] = {}
+    for raw_entry_id, raw in manual_entries.items():
+        entry_id = raw_entry_id
+        if not isinstance(raw, Mapping):
+            # The Corrections manager projects captured entries, not the
+            # entire legacy manual catalogue.
+            continue
+        raw_capture_id = raw.get("capture_id")
+        if (
+            not isinstance(raw_capture_id, str)
+            or not raw_capture_id
+            or _capture_archive_id(raw_capture_id) != raw_capture_id
+        ):
+            continue
+        try:
+            _MANUAL_ENTRY_ITEM_CODEC.validate_record(entry_id, raw)
+        except (TypeError, ValueError) as exc:
+            raise _corrections_target_error(
+                "a manual Corrections target failed its storage codec",
+                code="invalid_corrections_target_snapshot",
+                storage_kind="manual",
+                storage_id=_corrections_public_storage_id(
+                    "manual",
+                    entry_id,
+                ),
+                cause_type=type(exc).__name__,
+            ) from exc
+        capture_id = _corrections_capture_identity(
+            raw_capture_id,
+            storage_kind="manual",
+            storage_id=entry_id,
+        )
+        manual_by_capture.setdefault(capture_id, []).append(
+            (entry_id, raw)
+        )
+
+    build_by_capture: dict[str, list[tuple[str, Mapping]]] = {}
+    uncaptured_builds: list[tuple[str, Mapping]] = []
+    for raw_build_id, raw in builds.items():
+        build_id = _corrections_build_storage_id(raw_build_id)
+        if not isinstance(raw, Mapping):
+            raise _corrections_target_error(
+                "a build Corrections target is not an object",
+                code="invalid_corrections_target_snapshot",
+                storage_kind="build",
+                storage_id=build_id,
+            )
+        try:
+            _engine_validate_managed_build_fields(build_id, raw)
+        except (TypeError, ValueError) as exc:
+            raise _corrections_target_error(
+                "a build Corrections target failed its storage codec",
+                code="invalid_corrections_target_snapshot",
+                storage_kind="build",
+                storage_id=build_id,
+                cause_type=type(exc).__name__,
+            ) from exc
+        capture_id = _corrections_capture_identity(
+            raw.get("capture_id"),
+            storage_kind="build",
+            storage_id=build_id,
+        )
+        if capture_id:
+            build_by_capture.setdefault(capture_id, []).append(
+                (build_id, raw)
+            )
+        else:
+            uncaptured_builds.append((build_id, raw))
+
+    capture_ids = sorted(set(manual_by_capture) | set(build_by_capture))
+    for capture_id in capture_ids:
+        manual_count = len(manual_by_capture.get(capture_id, ()))
+        build_count = len(build_by_capture.get(capture_id, ()))
+        if manual_count > 1 or build_count > 1:
+            raise _corrections_target_error(
+                "a capture identity has duplicate active storage claims",
+                code="duplicate_corrections_target_claim",
+                capture_id=capture_id,
+                manual_claims=manual_count,
+                build_claims=build_count,
+            )
+
+    capture_authorities: dict[str, tuple[str, str, str]] = {}
+    for capture_id in capture_ids:
+        authority = _corrections_capture_authority(capture_id)
+        capture_authorities[capture_id] = authority
+        canonical_id = authority[0]
+        for storage_kind, values in (
+            ("manual", manual_by_capture.get(capture_id, ())),
+            ("build", build_by_capture.get(capture_id, ())),
+        ):
+            for storage_id, raw in values:
+                _corrections_validate_identity_claims(
+                    raw,
+                    canonical_id=canonical_id,
+                    capture_id=capture_id,
+                    storage_kind=storage_kind,
+                    storage_id=storage_id,
+                )
+
+    targets: list[_CorrectionsTarget] = []
+
+    def append_target(
+            storage_kind: str, storage_id: str, raw: Mapping,
+            capture_id: str = "") -> None:
+        if capture_id:
+            (
+                canonical_id,
+                association_state,
+                association_book_id,
+            ) = capture_authorities[capture_id]
+        else:
+            canonical_id = storage_id
+            association_state = "not_applicable"
+            association_book_id = ""
+        revision = (
+            _engine_build_record_revision(storage_id, raw)
+            if storage_kind == "build"
+            else _MANUAL_ENTRY_ITEM_CODEC.record_revision(storage_id, raw)
+        )
+        entry_directory = (
+            _entry_dir(storage_id)
+            if storage_kind == "build"
+            else (
+                ENTRIES_DIR
+                / _CORRECTIONS_CAPTURE_ONLY_DIRECTORY
+                / canonical_id
+            )
+        )
+        targets.append(_CorrectionsTarget(
+            canonical_id=canonical_id,
+            storage_kind=storage_kind,
+            storage_id=storage_id,
+            capture_id=capture_id,
+            association_state=association_state,
+            association_book_id=association_book_id,
+            record_revision=revision,
+            title=str(raw.get("title") or ""),
+            metadata=_corrections_target_metadata(
+                raw,
+                storage_kind=storage_kind,
+                storage_id=storage_id,
+                capture_id=capture_id,
+                canonical_id=canonical_id,
+                association_state=association_state,
+            ),
+            record=dict(raw),
+            entry_directory=entry_directory,
+        ))
+
+    for capture_id in capture_ids:
+        # Promotion leaves the manual source row for compatibility. The build
+        # is the sole active storage target, while the canonical id stays tied
+        # to the verified capture association.
+        candidates = (
+            build_by_capture.get(capture_id)
+            or manual_by_capture[capture_id]
+        )
+        storage_id, raw = candidates[0]
+        append_target(
+            "build" if capture_id in build_by_capture else "manual",
+            storage_id,
+            raw,
+            capture_id,
+        )
+    for storage_id, raw in uncaptured_builds:
+        append_target("build", storage_id, raw)
+
+    resolved: dict[str, _CorrectionsTarget] = {}
+    for target in targets:
+        current = resolved.get(target.canonical_id)
+        if current is not None:
+            raise _corrections_target_error(
+                "multiple Corrections targets resolve to one canonical identity",
+                code="duplicate_corrections_target_identity",
+                item_id=target.canonical_id,
+                first_storage_kind=current.storage_kind,
+                second_storage_kind=target.storage_kind,
+            )
+        resolved[target.canonical_id] = target
+    return resolved
+
+
+def _corrections_targets_for_context() -> Mapping[str, _CorrectionsTarget]:
+    active = getattr(_corrections_authority_context, "targets", None)
+    if active is not None:
+        return active
+    with _corrections_workspace_locks():
+        current = getattr(_corrections_authority_context, "targets", None)
+        assert current is not None
+        return current
+
+
+def _corrections_target_for(item_id: str) -> _CorrectionsTarget | None:
+    return _corrections_targets_for_context().get(item_id)
+
+
+def _corrections_item_exists(item_id: str) -> bool:
+    return _corrections_target_for(item_id) is not None
+
+
+def _corrections_capture_id(item_id: str) -> str | None:
+    """Return the exact capture authority behind one canonical item."""
+
+    target = _corrections_target_for(item_id)
+    if target is None:
         return None
-    capture_id = build.get("capture_id")
-    if capture_id in (None, ""):
-        return None
-    # The filesystem projector validates the persisted identity instead of
-    # accepting a sanitized alias. Keeping that validation at the repository
-    # boundary makes corrupt catalogue state observable rather than silently
-    # hiding its capture artifacts.
-    return capture_id
+    return target.capture_id or None
+
+
+def _corrections_entry_directory(item_id: str) -> Path:
+    """Map a canonical identity to its active build or an empty safe store."""
+
+    target = _corrections_target_for(item_id)
+    if target is None:
+        # Item membership is checked first by the Corrections repository.
+        # Returning a confined placeholder retains a total callback without
+        # granting a missing identity another entry directory.
+        return (
+            ENTRIES_DIR
+            / _CORRECTIONS_CAPTURE_ONLY_DIRECTORY
+            / "missing-item"
+        )
+    if target.storage_kind == "manual" and os.path.lexists(
+        target.entry_directory
+    ):
+        raise _corrections_target_error(
+            "a capture-only Corrections entry placeholder already exists",
+            code="unsafe_corrections_target_entry",
+            item_id=item_id,
+            storage_id=_corrections_public_storage_id(
+                target.storage_kind,
+                target.storage_id,
+            ),
+        )
+    return target.entry_directory
 
 
 def _corrections_representation_revision(
@@ -5722,6 +6165,24 @@ def _corrections_representation_revision(
     representation_id: str,
 ) -> str | None:
     """Resolve a Mistral source against the live representation authority."""
+
+    target = _corrections_target_for(item_id)
+    if target is None or target.storage_kind != "build":
+        return None
+    for representation in _engine_item_representations(
+        target.storage_id,
+        dict(target.record),
+    ):
+        if representation["id"] == representation_id:
+            return str(representation["revision"])
+    return None
+
+
+def _engine_representation_revision(
+    item_id: str,
+    representation_id: str,
+) -> str | None:
+    """Resolve a representation for build-ID-based engine compatibility."""
 
     builds = lib.load_json(BUILDS_PATH, {})
     build = builds.get(item_id) if isinstance(builds, dict) else None
@@ -5733,6 +6194,47 @@ def _corrections_representation_revision(
     return None
 
 
+def _corrections_item_snapshot() -> dict[str, dict]:
+    """Project canonical book/capture records without broadening ItemQuery."""
+
+    with _corrections_workspace_locks():
+        targets = tuple(_corrections_targets_for_context().values())
+        out: dict[str, dict] = {}
+        for target in targets:
+            representations: list[dict] = []
+            artifacts: list[dict] = []
+            if target.storage_kind == "build":
+                representations = _engine_item_representations(
+                    target.storage_id,
+                    dict(target.record),
+                )
+                for representation in representations:
+                    representation["locator"] = _engine_representation_locator(
+                        target.canonical_id,
+                        str(representation["id"]),
+                    )
+                artifacts = _engine_item_artifacts(
+                    target.storage_id,
+                    dict(target.record),
+                    identity_item_id=target.canonical_id,
+                )
+            out[target.canonical_id] = {
+                "id": target.canonical_id,
+                "kind": (
+                    "capture"
+                    if target.storage_kind == "manual" and target.capture_id
+                    else "book"
+                ),
+                "title": target.title,
+                "revision": target.record_revision,
+                "updated_at": str(target.record.get("updated_at") or ""),
+                "metadata": dict(target.metadata),
+                "representations": representations,
+                "artifacts": artifacts,
+            }
+        return out
+
+
 def _engine_text_layer_source_snapshot(
     item_id: str,
     representation_id: str,
@@ -5741,7 +6243,7 @@ def _engine_text_layer_source_snapshot(
 
     if not _translation_item_exists(item_id):
         return None
-    revision = _corrections_representation_revision(
+    revision = _engine_representation_revision(
         item_id,
         representation_id,
     )
@@ -5774,6 +6276,30 @@ def _engine_workspace_locks(_item_id: str):
                 with _manifest_lock:
                     with _builds_lock:
                         yield
+
+
+@contextlib.contextmanager
+def _corrections_workspace_locks():
+    """Pin one coherent build/manual/association authority per operation.
+
+    The build lock is always acquired before the manual-entry lock. A
+    thread-local immutable resolver snapshot lets repository callbacks query
+    membership, capture identity, active entry storage, and representation
+    revisions without trying to reacquire either non-reentrant lock.
+    """
+
+    active = getattr(_corrections_authority_context, "targets", None)
+    if active is not None:
+        yield
+        return
+    with _engine_workspace_locks(""):
+        with _manual_lock:
+            targets = _resolve_corrections_targets_locked()
+            _corrections_authority_context.targets = targets
+            try:
+                yield
+            finally:
+                del _corrections_authority_context.targets
 
 
 @contextlib.contextmanager
@@ -5810,6 +6336,9 @@ _ENGINE_ITEM_CODEC = WhlCatalogueItemCodec(
     advance_revision=_build_updated_at,
     category_ids_for=_engine_item_category_ids,
     validate_representation_manifest=_engine_representation_manifest,
+)
+_MANUAL_ENTRY_ITEM_CODEC = ManualEntryItemCodec(
+    advance_revision=_build_updated_at,
 )
 
 
@@ -5889,16 +6418,17 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             layer_id_factory=lambda: lib.gen_id(),
         ),
         corrections=CorrectionsBindings(
-            item_exists_for=_translation_item_exists,
+            item_exists_for=_corrections_item_exists,
             capture_id_for=_corrections_capture_id,
             capture_authority_root=CAPTURES_DIR,
             capture_directory_for=lambda capture_id: (
                 CAPTURES_DIR / capture_id
             ),
+            entry_directory_for=_corrections_entry_directory,
             representation_revision_for=(
                 _corrections_representation_revision
             ),
-            lock_context_for=lambda: _engine_workspace_locks(""),
+            lock_context_for=_corrections_workspace_locks,
             job_start_context_for=_correction_transform_job_start_guard,
             ocr_provider=_EngineCorrectionOcrProvider(),
         ),
@@ -9698,13 +10228,17 @@ def _item_job_start_guard(
 
 @contextlib.contextmanager
 def _correction_transform_job_start_guard(item_id: str):
-    """Expose the shared host lifecycle gate through the engine binding."""
+    """Keep canonical Corrections membership stable through job registration."""
+
     rejection = EngineNotFoundError(
         "the correction item no longer exists",
         code="correction_item_not_found",
         details={"item_id": str(item_id or "")},
     )
-    with _item_job_start_guard(item_id, rejection=rejection):
+    with _corrections_workspace_locks():
+        target = _corrections_target_for(str(item_id or "").strip())
+        if target is None:
+            raise rejection
         yield
 
 
