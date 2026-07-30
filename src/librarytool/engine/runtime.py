@@ -20,6 +20,10 @@ from .canvas_commands import CanvasPreparationService
 from .corrections import CorrectionService
 from .correction_ocr import CorrectionOcrProposalQueryService
 from .correction_transforms import CorrectionTransformService
+from .document_artifacts import (
+    DocumentArtifactCatalogService,
+    DocumentResourcePageService,
+)
 from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
 from .item_lifecycle import ItemLifecycleService
@@ -454,6 +458,12 @@ CORRECTION_TRANSFORM_SERVICE: ServiceKey[CorrectionTransformService] = ServiceKe
 CORRECTION_OCR_PROPOSAL_QUERY_SERVICE: ServiceKey[
     CorrectionOcrProposalQueryService
 ] = ServiceKey("library.corrections.ocr-proposals")
+DOCUMENT_ARTIFACT_CATALOG_SERVICE: ServiceKey[
+    DocumentArtifactCatalogService
+] = ServiceKey("library.document-artifacts.query")
+DOCUMENT_RESOURCE_PAGE_SERVICE: ServiceKey[
+    DocumentResourcePageService
+] = ServiceKey("library.document-resources.read")
 RASTER_ARTIFACT_QUERY_SERVICE: ServiceKey[RasterArtifactProjectorPort] = ServiceKey(
     "library.raster-artifacts.query"
 )
@@ -702,6 +712,8 @@ __all__ = [
     "CORRECTION_SERVICE",
     "CORRECTION_TRANSFORM_SERVICE",
     "CORRECTION_OCR_PROPOSAL_QUERY_SERVICE",
+    "DOCUMENT_ARTIFACT_CATALOG_SERVICE",
+    "DOCUMENT_RESOURCE_PAGE_SERVICE",
     "DuplicateServiceError",
     "INTERCHANGE_SERVICE",
     "LIB_OPEN_SERVICE",

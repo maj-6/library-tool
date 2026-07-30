@@ -15,6 +15,9 @@ from .canvas_preparation_repository import (
 )
 from .canvas_query_repository import FilesystemCanvasQueryRepository
 from .capture_archive_repository import FilesystemCaptureArchiveRepository
+from .capture_document_artifact_repository import (
+    FilesystemCaptureDocumentArtifactRepository,
+)
 from .correction_repository import FilesystemCorrectionRepository
 from .correction_ocr_proposal_repository import (
     FilesystemCorrectionOcrProposalRepository,
@@ -82,6 +85,7 @@ __all__ = [
     "FilesystemCanvasPreparationRepository",
     "FilesystemCanvasQueryRepository",
     "FilesystemCaptureArchiveRepository",
+    "FilesystemCaptureDocumentArtifactRepository",
     "FilesystemCorrectionRepository",
     "FilesystemCorrectionOcrProposalRepository",
     "FilesystemCorrectionTransformStore",

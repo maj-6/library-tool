@@ -19,6 +19,9 @@ from ..engine.raster_artifacts import (
     CORRECTIONS_WORKBENCH_ID,
     RASTER_ARTIFACTS_READ_CAPABILITY,
 )
+from ..engine.document_artifacts import (
+    DOCUMENT_ARTIFACTS_READ_CAPABILITY,
+)
 from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
@@ -28,6 +31,8 @@ from ..engine.runtime import (
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+    DOCUMENT_RESOURCE_PAGE_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -157,6 +162,12 @@ FIRST_PARTY_MODULE_MANIFESTS = (
             RASTER_ARTIFACTS_READ_CAPABILITY,
             SPATIAL_ANNOTATIONS_READ_CAPABILITY,
         ),
+        requires=(CapabilityRef("library.items.read"),),
+    ),
+    ModuleManifest(
+        "library.corrections.documents",
+        "1.0.0",
+        provides=(DOCUMENT_ARTIFACTS_READ_CAPABILITY,),
         requires=(CapabilityRef("library.items.read"),),
     ),
     ModuleManifest(
@@ -323,6 +334,7 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             CORRECTION_REVIEWS_EDIT_CAPABILITY,
             CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,
             CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,
+            DOCUMENT_ARTIFACTS_READ_CAPABILITY,
         ),
     ),
 )
@@ -463,6 +475,26 @@ def first_party_module_contributions(
                     ),
                 ),
                 workbenches=(workbenches[CORRECTIONS_WORKBENCH_ID],),
+            )
+        )
+
+    if graph.document_artifacts is not None:
+        assert graph.document_resources is not None
+        contributions.append(
+            ModuleContribution(
+                modules["library.corrections.documents"],
+                bindings=(
+                    ServiceBinding(
+                        DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+                        graph.document_artifacts,
+                        (DOCUMENT_ARTIFACTS_READ_CAPABILITY,),
+                    ),
+                    ServiceBinding(
+                        DOCUMENT_RESOURCE_PAGE_SERVICE,
+                        graph.document_resources,
+                        (DOCUMENT_ARTIFACTS_READ_CAPABILITY,),
+                    ),
+                ),
             )
         )
 

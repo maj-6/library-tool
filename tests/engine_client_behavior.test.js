@@ -178,6 +178,70 @@ function rasterArtifact(overrides = {}) {
   };
 }
 
+function documentArtifact(overrides = {}) {
+  return {
+    schema: "librarytool.document-artifact/1",
+    key: {
+      item_id: "book:one",
+      artifact_id: "capture-generated-metadata",
+    },
+    revision: "document-r1",
+    kind: "generated-metadata",
+    label: "Generated metadata",
+    language: "",
+    resource: {
+      state: "available",
+      media_type: "application/json",
+      content_sha256: "c".repeat(64),
+      byte_size: 17,
+      resource: {
+        id: "docres-generated-metadata",
+        revision: "resource-r1",
+      },
+      text_encoding: "utf-8",
+    },
+    source: {
+      kind: "capture",
+      id: "capture:one",
+      revision: "capture-r1",
+    },
+    freshness: "current",
+    lineage: [],
+    provenance: artifactProvenance(),
+    extensions: {},
+    ...overrides,
+  };
+}
+
+function documentResourcePage(overrides = {}) {
+  return {
+    ok: true,
+    schema: "librarytool.document-resource-page/1",
+    key: {
+      item_id: "book:one",
+      artifact_id: "capture-generated-metadata",
+    },
+    artifact_revision: "document-r1",
+    resource: {
+      id: "docres-generated-metadata",
+      revision: "resource-r1",
+    },
+    mode: "text",
+    media_type: "application/json",
+    text_encoding: "utf-8",
+    content_sha256: "c".repeat(64),
+    total_byte_size: 9,
+    offset: 0,
+    max_bytes: 48 * 1024,
+    byte_count: 9,
+    next_offset: null,
+    page_sha256: "d".repeat(64),
+    encoding: "utf-8",
+    data: "sage 🌿",
+    ...overrides,
+  };
+}
+
 function spatialAnnotation(overrides = {}) {
   return {
     key: { item_id: "book:one", annotation_id: "region:one" },
@@ -473,6 +537,9 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.rasterArtifacts.list, "function");
   assert.equal(typeof client.rasterArtifacts.get, "function");
   assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
+  assert.equal(typeof client.documentArtifacts.list, "function");
+  assert.equal(typeof client.documentArtifacts.get, "function");
+  assert.equal(typeof client.documentArtifacts.readPage, "function");
   assert.equal(typeof client.spatialAnnotations.list, "function");
   assert.equal(typeof client.spatialAnnotations.get, "function");
   assert.equal(typeof client.corrections.index, "function");
@@ -634,6 +701,122 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
   }), "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/resource" +
     "?revision=resource-r1");
 });
+
+test("EngineClient owns exact capture document artifact reads", async () => {
+  const artifact = documentArtifact();
+  const bodies = [
+    {
+      ok: true,
+      schema: "librarytool.document-artifact-catalog-page/1",
+      item_id: "book:one",
+      snapshot_revision: `docs-${"a".repeat(64)}`,
+      artifacts: [artifact],
+      next_cursor: "docc-next_page",
+      total: 3,
+    },
+    {
+      ok: true,
+      schema: "librarytool.document-artifact-detail/1",
+      artifact,
+    },
+    documentResourcePage(),
+  ];
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, bodies.shift());
+    },
+  });
+
+  const page = await client.documentArtifacts.list({
+    itemId: "book:one",
+    snapshotRevision: `docs-${"b".repeat(64)}`,
+    limit: 3,
+  });
+  assert.equal(page.artifacts[0].kind, "generated-metadata");
+  assert.equal((await client.documentArtifacts.get({
+    itemId: "book:one",
+    artifactId: "capture-generated-metadata",
+  })).artifact.resource.resource.id, "docres-generated-metadata");
+  const resourcePage = await client.documentArtifacts.readPage({
+    itemId: "book:one",
+    artifactId: "capture-generated-metadata",
+    artifactRevision: "document-r1",
+    resourceId: "docres-generated-metadata",
+    resourceRevision: "resource-r1",
+  });
+  assert.equal(resourcePage.data, "sage 🌿");
+  assert.equal(resourcePage.byte_count, 9,
+    "document paging counts UTF-8 bytes, not JavaScript code units");
+  assert.deepEqual(calls.map(({ url }) => url), [
+    "/api/v1/items/book%3Aone/document-artifacts" +
+      `?snapshot_revision=docs-${"b".repeat(64)}&limit=3`,
+    "/api/v1/items/book%3Aone/document-artifacts/" +
+      "capture-generated-metadata",
+    "/api/v1/items/book%3Aone/document-artifacts/" +
+      "capture-generated-metadata/resource" +
+      "?artifact_revision=document-r1" +
+      "&resource_id=docres-generated-metadata" +
+      "&resource_revision=resource-r1&mode=text&offset=0&max_bytes=49152",
+  ]);
+  assert.ok(calls.every(({ init }) => init.method === "GET"));
+});
+
+test("EngineClient rejects unsafe capture document views and incoherent pages",
+  async () => {
+    const unsafe = documentArtifact({
+      extensions: { local_path: "C:/private/capture.lib" },
+    });
+    const unsafeClient = new EngineClient({
+      transport: async () => response(200, {
+        ok: true,
+        schema: "librarytool.document-artifact-detail/1",
+        artifact: unsafe,
+      }),
+    });
+    await assert.rejects(
+      unsafeClient.documentArtifacts.get({
+        itemId: "book:one",
+        artifactId: "capture-generated-metadata",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+
+    const badPageClient = new EngineClient({
+      transport: async () => response(200, documentResourcePage({
+        byte_count: 8,
+      })),
+    });
+    await assert.rejects(
+      badPageClient.documentArtifacts.readPage({
+        itemId: "book:one",
+        artifactId: "capture-generated-metadata",
+        artifactRevision: "document-r1",
+        resourceId: "docres-generated-metadata",
+        resourceRevision: "resource-r1",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+
+    assert.throws(() => badPageClient.documentArtifacts.readPage({
+      itemId: "book:one",
+      artifactId: "capture-generated-metadata",
+      artifactRevision: "../document-r1",
+      resourceId: "docres-generated-metadata",
+      resourceRevision: "resource-r1",
+    }), TypeError);
+    assert.throws(() => badPageClient.documentArtifacts.readPage({
+      itemId: "book:one",
+      artifactId: "capture-generated-metadata",
+      artifactRevision: "document-r1",
+      resourceId: "docres-generated-metadata",
+      resourceRevision: "resource-r1",
+      maxBytes: 48 * 1024 + 1,
+    }), TypeError);
+  });
 
 test("EngineClient rejects malformed or path-leaking Corrections views", async () => {
   const malformed = rasterArtifact({

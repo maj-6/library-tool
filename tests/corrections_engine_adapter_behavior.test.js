@@ -4,6 +4,7 @@ const test = require("node:test");
 const {
   correctionTransformJob,
   createCorrectionsEnginePorts,
+  decorateDocumentArtifact,
   decorateRasterArtifact,
   decorateSpatialAnnotation,
 } = require(
@@ -82,10 +83,49 @@ function annotation(id, overrides = {}) {
   };
 }
 
+function documentArtifact(
+  id,
+  kind = "generated-metadata",
+  overrides = {},
+) {
+  return {
+    schema: "librarytool.document-artifact/1",
+    key: { item_id: "book-1", artifact_id: id },
+    revision: `${id}-r1`,
+    kind,
+    label: id,
+    language: "",
+    resource: {
+      state: "available",
+      media_type: kind === "ocr-text" ? "text/plain" : "application/json",
+      content_sha256: "c".repeat(64),
+      byte_size: 24,
+      resource: {
+        id: `docres-${id}`,
+        revision: `${id}-resource-r1`,
+      },
+      text_encoding: "utf-8",
+    },
+    source: {
+      kind: "capture",
+      id: "capture-1",
+      revision: "capture-r1",
+    },
+    freshness: "current",
+    lineage: [],
+    provenance: { origin: "capture" },
+    extensions: {},
+    ...overrides,
+  };
+}
+
 
 function engineHarness(overrides = {}) {
   const calls = {
     corrections: [],
+    documentGet: [],
+    documentList: [],
+    documentReadPage: [],
     rasterGet: [],
     rasterList: [],
     resourceUrl: [],
@@ -135,6 +175,28 @@ function engineHarness(overrides = {}) {
   }
   if (overrides.jobs) {
     engineClient.jobs = overrides.jobs;
+  }
+  if (overrides.documentArtifacts) {
+    engineClient.documentArtifacts = {
+      async list(args) {
+        calls.documentList.push(args);
+        return {
+          snapshot_revision: `docs-${"a".repeat(64)}`,
+          artifacts: [],
+          next_cursor: null,
+          total: 0,
+        };
+      },
+      async get(args) {
+        calls.documentGet.push(args);
+        return { artifact: documentArtifact(args.artifactId) };
+      },
+      async readPage(args) {
+        calls.documentReadPage.push(args);
+        return { data: "", next_offset: null };
+      },
+      ...overrides.documentArtifacts,
+    };
   }
   return { calls, engineClient };
 }
@@ -240,9 +302,11 @@ function manualScheduler() {
 test("engine decorations preserve transport values and supply artifact model identity", () => {
   const rawRaster = raster("capture:asset-1:display");
   const rawAnnotation = annotation("region:1");
+  const rawDocument = documentArtifact("capture-notes", "capture-notes");
 
   const decoratedRaster = decorateRasterArtifact(rawRaster);
   const decoratedAnnotation = decorateSpatialAnnotation(rawAnnotation);
+  const decoratedDocument = decorateDocumentArtifact(rawDocument);
 
   assert.equal(decoratedRaster.object_type, "raster-artifact");
   assert.equal(decoratedRaster.artifact_id, "capture:asset-1:display");
@@ -259,8 +323,17 @@ test("engine decorations preserve transport values and supply artifact model ide
   assert.equal(decoratedAnnotation.annotation_id, "region:1");
   assert.equal(decoratedAnnotation.kind, "spatial-annotation");
   assert.equal(decoratedAnnotation.group, "layout-regions");
+  assert.equal(decoratedDocument.object_type, "document-artifact");
+  assert.equal(decoratedDocument.artifact_id, "capture-notes");
+  assert.equal(decoratedDocument.group, "generated-metadata");
+  assert.deepEqual(decoratedDocument.resource, {
+    id: "docres-capture-notes",
+    revision: "capture-notes-resource-r1",
+    variant: "text",
+  });
   assert.equal(Object.hasOwn(rawRaster, "object_type"), false);
   assert.equal(Object.hasOwn(rawAnnotation, "object_type"), false);
+  assert.equal(Object.hasOwn(rawDocument, "object_type"), false);
 });
 
 
@@ -386,6 +459,131 @@ test("spatial catalog and region resources retain engine paging", async () => {
     signal: undefined,
   });
 });
+
+test("capture documents join artifact groups and retain bounded revision pins",
+  async () => {
+    const metadata = documentArtifact("capture-generated-metadata");
+    const ocr = documentArtifact("capture-ocr", "ocr-text");
+    const { calls, engineClient } = engineHarness({
+      documentArtifacts: {
+        async list(args) {
+          calls.documentList.push(args);
+          return {
+            snapshot_revision: `docs-${"a".repeat(64)}`,
+            artifacts: [metadata, ocr],
+            next_cursor: "docc-next",
+            total: 3,
+          };
+        },
+        async get(args) {
+          calls.documentGet.push(args);
+          return { artifact: ocr };
+        },
+        async readPage(args) {
+          calls.documentReadPage.push(args);
+          return {
+            data: args.offset === 0 ? "first " : "second",
+            next_offset: args.offset === 0 ? 6 : null,
+          };
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient);
+    const page = await ports.artifacts.catalog.list({
+      context: { item_id: "book-1" },
+      group: "ocr-text",
+      cursor: null,
+      limit: 20,
+    });
+
+    assert.deepEqual(
+      page.items.map((item) => [item.artifact_id, item.group]),
+      [["capture-ocr", "ocr-text"]],
+    );
+    assert.equal(page.revision, `docs-${"a".repeat(64)}`);
+    assert.equal(page.nextCursor, "docc-next");
+    assert.deepEqual(calls.documentList[0], {
+      itemId: "book-1",
+      cursor: null,
+      limit: 20,
+      signal: undefined,
+    });
+
+    const detail = await ports.artifacts.catalog.get({
+      context: { itemId: "book-1" },
+      key: "document:capture-ocr",
+    });
+    assert.deepEqual(detail.key, {
+      item_id: "book-1",
+      artifact_id: "capture-ocr",
+    });
+    assert.equal(detail.resource.id, "docres-capture-ocr");
+    assert.deepEqual(calls.documentGet[0], {
+      itemId: "book-1",
+      artifactId: "capture-ocr",
+      signal: undefined,
+    });
+
+    const first = await ports.artifacts.resources.readText({
+      itemId: "book-1",
+      artifactId: "capture-ocr",
+      artifactRevision: "capture-ocr-r1",
+      resourceRef: detail.resource,
+      cursor: null,
+      limit: 64 * 1024,
+    });
+    assert.deepEqual(first, { text: "first ", nextCursor: "6" });
+    const second = await ports.artifacts.resources.readText({
+      itemId: "book-1",
+      artifactId: "capture-ocr",
+      artifactRevision: "capture-ocr-r1",
+      resourceRef: detail.resource,
+      cursor: first.nextCursor,
+      limit: 100,
+    });
+    assert.deepEqual(second, { text: "second", nextCursor: null });
+    assert.deepEqual(calls.documentReadPage.map((call) => ({
+      itemId: call.itemId,
+      artifactId: call.artifactId,
+      artifactRevision: call.artifactRevision,
+      resourceId: call.resourceId,
+      resourceRevision: call.resourceRevision,
+      mode: call.mode,
+      offset: call.offset,
+      maxBytes: call.maxBytes,
+    })), [
+      {
+        itemId: "book-1",
+        artifactId: "capture-ocr",
+        artifactRevision: "capture-ocr-r1",
+        resourceId: "docres-capture-ocr",
+        resourceRevision: "capture-ocr-resource-r1",
+        mode: "text",
+        offset: 0,
+        maxBytes: 48 * 1024,
+      },
+      {
+        itemId: "book-1",
+        artifactId: "capture-ocr",
+        artifactRevision: "capture-ocr-r1",
+        resourceId: "docres-capture-ocr",
+        resourceRevision: "capture-ocr-resource-r1",
+        mode: "text",
+        offset: 6,
+        maxBytes: 100,
+      },
+    ]);
+    await assert.rejects(
+      ports.artifacts.resources.readText({
+        itemId: "book-1",
+        artifactId: "capture-ocr",
+        artifactRevision: "capture-ocr-r1",
+        resourceRef: detail.resource,
+        cursor: "../private",
+      }),
+      /cursor is invalid/,
+    );
+  });
 
 
 test("raster details advertise paged regions and pin resource URLs to revisions", async () => {

@@ -15,6 +15,12 @@
       "processed-images",
       "generated-images",
     ]);
+    const DOCUMENT_GROUPS = new Set([
+      "generated-metadata",
+      "ocr-text",
+      "transforms",
+      "unknown",
+    ]);
     const ACTIVE_TRANSFORM_JOB_STATES = new Set([
       "queued", "running", "cancelling",
     ]);
@@ -160,6 +166,39 @@
       return Object.freeze(decorated);
     }
 
+    function decorateDocumentArtifact(value) {
+      const resource = value && value.resource || {};
+      const source = value && value.source || {};
+      const decorated = {
+        ...value,
+        artifact_id: value && value.key && value.key.artifact_id,
+        object_type: "document-artifact",
+        media_type: resource.media_type || value && value.media_type || "",
+        content_sha256: resource.content_sha256,
+        resource_state: resource.state || "unavailable",
+        resource: resource.resource
+          ? { ...resource.resource, variant: "text" }
+          : null,
+        source: {
+          representation_id: source.id || "",
+          representation_revision: source.revision || "",
+        },
+        lineage: Array.isArray(value && value.lineage)
+          ? value.lineage.map((entry) => ({
+              artifact_id: entry && entry.key && entry.key.artifact_id,
+              artifact_revision: entry && entry.artifact_revision,
+              relation: entry && entry.relation,
+            }))
+          : [],
+        metadata: {},
+      };
+      const summary = deps.decodeArtifactSummary(decorated);
+      return Object.freeze({
+        ...decorated,
+        group: summary.group,
+      });
+    }
+
     function parseCatalogKey(key) {
       const value = String(key || "");
       if (value.startsWith("artifact:") && value.length > "artifact:".length) {
@@ -173,6 +212,13 @@
         return Object.freeze({
           objectType: "spatial-annotation",
           id: value.slice("annotation:".length),
+        });
+      }
+      if (value.startsWith("document:") &&
+          value.length > "document:".length) {
+        return Object.freeze({
+          objectType: "document-artifact",
+          id: value.slice("document:".length),
         });
       }
       throw new TypeError("artifact catalog key is invalid");
@@ -1075,6 +1121,11 @@
 
     function createCorrectionsEnginePorts(engineClient, options = {}) {
       const client = requireEngineClient(engineClient);
+      const documents = client.documentArtifacts;
+      const documentsAvailable = !!documents &&
+        typeof documents.list === "function" &&
+        typeof documents.get === "function" &&
+        typeof documents.readPage === "function";
       const portOptions = isPlainObject(options) ? options : {};
       const transformPolling = correctionTransformPollingPort(
         client,
@@ -1113,6 +1164,28 @@
           response.annotations.map(decorateSpatialAnnotation),
           { includeTotal: true },
         );
+      }
+
+      async function listDocumentGroup({
+        context, group, cursor, limit, signal,
+      }) {
+        if (!DOCUMENT_GROUPS.has(group) || !documentsAvailable) {
+          return pageResult(null, []);
+        }
+        const response = await documents.list({
+          itemId: contextValue(context, "itemId", "item_id"),
+          cursor: cursor || null,
+          limit,
+          signal,
+        });
+        const values = response.artifacts
+          .map(decorateDocumentArtifact)
+          .filter((value) => value.group === group);
+        return Object.freeze({
+          revision: response.snapshot_revision || "",
+          items: Object.freeze(values),
+          nextCursor: response.next_cursor || null,
+        });
       }
 
       async function listRegions({
@@ -1177,13 +1250,25 @@
         catalog: Object.freeze({
           list(args = {}) {
             if (args.group === "layout-regions") return listSpatial(args);
-            return listRasterGroup(args);
+            if (RASTER_GROUPS.has(args.group)) return listRasterGroup(args);
+            return listDocumentGroup(args);
           },
           async get({ context, key, signal } = {}) {
             const parsed = parseCatalogKey(key);
             const itemId = contextValue(context, "itemId", "item_id");
             if (parsed.objectType === "raster-artifact") {
               return rasterDetail(context, parsed.id, signal);
+            }
+            if (parsed.objectType === "document-artifact") {
+              if (!documentsAvailable) {
+                throw capabilityError("document artifact detail");
+              }
+              const response = await documents.get({
+                itemId,
+                artifactId: parsed.id,
+                signal,
+              });
+              return decorateDocumentArtifact(response.artifact);
             }
             const response = await client.spatialAnnotations.get({
               itemId,
@@ -1208,8 +1293,43 @@
               }),
             });
           },
-          readText() {
-            return Promise.reject(capabilityError("paged text reader"));
+          readText(args = {}) {
+            if (!documentsAvailable) {
+              return Promise.reject(capabilityError("paged text reader"));
+            }
+            const resource = args.resourceRef || {};
+            let offset = 0;
+            if (args.cursor != null && args.cursor !== "") {
+              if (typeof args.cursor !== "string" ||
+                  !/^(?:0|[1-9][0-9]{0,15})$/.test(args.cursor)) {
+                return Promise.reject(
+                  new TypeError("document resource cursor is invalid"));
+              }
+              offset = Number(args.cursor);
+              if (!Number.isSafeInteger(offset)) {
+                return Promise.reject(
+                  new TypeError("document resource cursor is invalid"));
+              }
+            }
+            const maximum = Math.min(
+              48 * 1024,
+              Number.isSafeInteger(args.limit) ? args.limit : 48 * 1024,
+            );
+            return documents.readPage({
+              itemId: args.itemId,
+              artifactId: args.artifactId,
+              artifactRevision: args.artifactRevision,
+              resourceId: resource.id,
+              resourceRevision: resource.revision,
+              mode: "text",
+              offset,
+              maxBytes: maximum,
+              signal: args.signal,
+            }).then((page) => Object.freeze({
+              text: page.data,
+              nextCursor: page.next_offset == null
+                ? null : String(page.next_offset),
+            }));
           },
           listRegions,
         }),
@@ -1244,6 +1364,7 @@
       correctionTransformPollingPort,
       createCorrectionsEnginePorts,
       decorateRasterArtifact,
+      decorateDocumentArtifact,
       decorateSpatialAnnotation,
     };
   });

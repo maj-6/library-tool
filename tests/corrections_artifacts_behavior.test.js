@@ -52,6 +52,37 @@ function raster(id, kind = "captured-image", overrides = {}) {
   };
 }
 
+function documentArtifact(
+  id,
+  kind = "generated-metadata",
+  overrides = {},
+) {
+  return {
+    schema: "librarytool.document-artifact/1",
+    key: { item_id: "book-1", artifact_id: id },
+    artifact_id: id,
+    object_type: "document-artifact",
+    revision: `${id}-r1`,
+    kind,
+    label: id.replaceAll("-", " "),
+    language: "",
+    media_type: "application/json",
+    resource_state: "available",
+    resource: {
+      id: `docres-${id}`,
+      revision: `${id}-resource-r1`,
+      variant: "text",
+    },
+    freshness: "current",
+    source: {
+      representation_id: "capture-1",
+      representation_revision: "capture-r1",
+    },
+    metadata: {},
+    ...overrides,
+  };
+}
+
 
 function annotation(id, linkedArtifactId = "") {
   return {
@@ -574,7 +605,7 @@ test("paged OCR stays bounded and unavailable artifacts are explicit", async () 
   assert.equal(textResource.text, "first page");
   assert.equal(textResource.paged, true);
   assert.equal(textResource.truncated, true);
-  assert.deepEqual(reads[0], { cursor: null, limit: 64 * 1024 });
+  assert.deepEqual(reads[0], { cursor: null, limit: 48 * 1024 });
   await textResource.loadNext();
   assert.equal(published.at(-1).text, "first page second page");
   assert.equal(published.at(-1).nextCursor, null);
@@ -587,6 +618,85 @@ test("paged OCR stays bounded and unavailable artifacts are explicit", async () 
   assert.equal(missingRow.item.freshness, "stale");
   assert.equal(missingRow.item.generated, true);
 });
+
+test("capture metadata uses bounded document pages and large JSON stays paged",
+  async () => {
+    const metadata = documentArtifact("capture-generated-metadata");
+    const notes = documentArtifact("capture-notes", "capture-notes");
+    const missing = documentArtifact("capture-missing-metadata", "metadata", {
+      resource_state: "missing",
+      resource: null,
+      freshness: "stale",
+    });
+    const byKey = new Map([
+      ["document:capture-generated-metadata", metadata],
+      ["document:capture-notes", notes],
+      ["document:capture-missing-metadata", missing],
+    ]);
+    const reads = [];
+    const { feature, published } = harness({
+      initialExpandedGroups: ["generated-metadata"],
+      catalog: {
+        async list() {
+          return { items: [metadata, notes, missing], nextCursor: null };
+        },
+        async get({ key }) { return byKey.get(key); },
+      },
+      resources: {
+        async readText(args) {
+          reads.push(args);
+          if (args.artifactId === "capture-generated-metadata") {
+            return {
+              text: "{\"title\":\"A Herbal\",\"pages\":42}",
+              nextCursor: null,
+            };
+          }
+          return args.cursor == null
+            ? { text: "{\"cataloguer\":\"Ada\",", nextCursor: "20" }
+            : { text: "\"note\":\"checked\"}", nextCursor: null };
+        },
+      },
+    });
+
+    await feature.setContext({ item_id: "book-1" });
+    await feature.select("document:capture-generated-metadata");
+    const structured = published.at(-1);
+    assert.equal(structured.family, "metadata");
+    assert.deepEqual(structured.metadata, {
+      title: "A Herbal",
+      pages: 42,
+    });
+    assert.equal(reads[0].itemId, "book-1");
+    assert.equal(reads[0].artifactId, "capture-generated-metadata");
+    assert.equal(reads[0].artifactRevision,
+      "capture-generated-metadata-r1");
+    assert.deepEqual(reads[0].resourceRef, {
+      id: "docres-capture-generated-metadata",
+      revision: "capture-generated-metadata-resource-r1",
+      variant: "text",
+    });
+    assert.equal(reads[0].cursor, null);
+    assert.equal(reads[0].limit, 48 * 1024);
+
+    await feature.select("document:capture-notes");
+    const paged = published.at(-1);
+    assert.equal(paged.family, "text");
+    assert.equal(paged.paged, true);
+    assert.equal(paged.truncated, true);
+    assert.equal(paged.text, "{\"cataloguer\":\"Ada\",");
+    await paged.loadNext();
+    assert.equal(published.at(-1).text,
+      "{\"cataloguer\":\"Ada\",\"note\":\"checked\"}");
+    assert.equal(reads[2].cursor, "20");
+    assert.equal(reads[2].artifactId, "capture-notes");
+
+    const readCount = reads.length;
+    await feature.select("document:capture-missing-metadata");
+    assert.equal(reads.length, readCount,
+      "missing capture documents never issue resource reads");
+    assert.equal(published.at(-1).missing, true);
+    assert.equal(published.at(-1).resourceState, "missing");
+  });
 
 
 test("linked image and annotation cross-highlight with selection and soft hot-target hooks", async () => {

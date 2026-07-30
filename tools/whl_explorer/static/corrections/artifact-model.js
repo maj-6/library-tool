@@ -40,6 +40,7 @@
   const KIND_GROUPS = Object.freeze({
     "about": "generated-metadata",
     "analysis": "generated-metadata",
+    "capture-notes": "generated-metadata",
     "generated-metadata": "generated-metadata",
     "metadata": "generated-metadata",
     "structured-metadata": "generated-metadata",
@@ -88,6 +89,7 @@
 
   const OBJECT_PREFIX = Object.freeze({
     artifact: "artifact",
+    "document-artifact": "document",
     "raster-artifact": "artifact",
     annotation: "annotation",
     "spatial-annotation": "annotation",

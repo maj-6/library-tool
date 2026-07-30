@@ -48,6 +48,16 @@ from librarytool.engine.correction_transforms import (
     QueuedCorrectionTransform,
 )
 from librarytool.engine.correction_ocr import CorrectionOcrProposalQueryService
+from librarytool.engine.document_artifacts import (
+    MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT,
+    MAX_DOCUMENT_RESOURCE_PAGE_BYTES,
+    DocumentArtifactCatalogService,
+    DocumentArtifactKey,
+    DocumentPageMode,
+    DocumentResourcePageRequest,
+    DocumentResourcePageService,
+    DocumentResourceRef,
+)
 from librarytool.engine.item_commands import (
     ItemCommandResult,
     ItemPatch,
@@ -68,6 +78,8 @@ from librarytool.engine.runtime import (
     CORRECTION_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+    DOCUMENT_RESOURCE_PAGE_SERVICE,
     ITEM_QUERY_SERVICE,
     RASTER_ARTIFACT_QUERY_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
@@ -241,6 +253,26 @@ def _spatial_service(
         engine_for_request,
         SPATIAL_ANNOTATION_QUERY_SERVICE,
         "spatial annotation",
+    )
+
+
+def _document_artifact_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> DocumentArtifactCatalogService:
+    return _query_service(
+        engine_for_request,
+        DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+        "document artifact",
+    )
+
+
+def _document_resource_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> DocumentResourcePageService:
+    return _query_service(
+        engine_for_request,
+        DOCUMENT_RESOURCE_PAGE_SERVICE,
+        "document resource",
     )
 
 
@@ -2076,6 +2108,181 @@ def _corrections_index(
         )
 
 
+def _document_query_value(
+    name: str,
+    *,
+    required: bool = False,
+    default: str = "",
+    error_code: str = "invalid_document_artifact_query",
+    subject: str = "document artifact",
+) -> str:
+    values = request.args.getlist(name)
+    if len(values) > 1:
+        raise ValidationError(
+            f"the {subject} query contains a repeated field",
+            code=error_code,
+            details={"field": name},
+        )
+    value = values[0] if values else default
+    if required and not value:
+        raise ValidationError(
+            f"the {subject} query is incomplete",
+            code=error_code,
+            details={"field": name},
+        )
+    return value
+
+
+def _document_artifact_list(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    allowed = {"cursor", "limit", "snapshot_revision"}
+    unknown = sorted(set(request.args) - allowed)
+    if unknown:
+        raise ValidationError(
+            "the document artifact query contains unknown fields",
+            code="invalid_document_artifact_query",
+            details={"fields": unknown},
+        )
+    cursor = _document_query_value("cursor") or None
+    snapshot_revision = _document_query_value("snapshot_revision") or None
+    # Repeated limits must not silently collapse to their first value.
+    _document_query_value("limit", default="100")
+    page = _document_artifact_service(
+        engine_for_request
+    ).list_document_artifacts(
+        item_id,
+        cursor=cursor,
+        limit=_limit(maximum=MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT),
+        snapshot_revision=snapshot_revision,
+    )
+    return _conditional_json(
+        {"ok": True, **page.as_dict()},
+        page.snapshot_revision,
+    )
+
+
+def _document_artifact_detail(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    if request.args:
+        raise ValidationError(
+            "document artifact detail does not accept query fields",
+            code="invalid_document_artifact_query",
+            details={"fields": sorted(set(request.args))},
+        )
+    key = DocumentArtifactKey(item_id, artifact_id)
+    artifact = _document_artifact_service(
+        engine_for_request
+    ).get_document_artifact(key)
+    if artifact is None:
+        raise NotFoundError(
+            "the document artifact does not exist",
+            code="document_artifact_not_found",
+            details=key.as_dict(),
+        )
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": "librarytool.document-artifact-detail/1",
+            "artifact": artifact.as_dict(),
+        },
+        artifact.revision,
+    )
+
+
+def _document_resource_page(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    allowed = {
+        "artifact_revision",
+        "resource_id",
+        "resource_revision",
+        "mode",
+        "offset",
+        "max_bytes",
+    }
+    unknown = sorted(set(request.args) - allowed)
+    if unknown:
+        raise ValidationError(
+            "the document resource query contains unknown fields",
+            code="invalid_document_resource_page",
+            details={"fields": unknown},
+        )
+    artifact_revision = _document_query_value(
+        "artifact_revision",
+        required=True,
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    resource_id = _document_query_value(
+        "resource_id",
+        required=True,
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    resource_revision = _document_query_value(
+        "resource_revision",
+        required=True,
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    mode = _document_query_value(
+        "mode",
+        default="text",
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    raw_offset = _document_query_value(
+        "offset",
+        default="0",
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    raw_maximum = _document_query_value(
+        "max_bytes",
+        default=str(MAX_DOCUMENT_RESOURCE_PAGE_BYTES),
+        error_code="invalid_document_resource_page",
+        subject="document resource",
+    )
+    try:
+        offset = int(raw_offset, 10)
+        maximum = int(raw_maximum, 10)
+        page_mode = DocumentPageMode(mode)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(
+            "the document resource query is invalid",
+            code="invalid_document_resource_page",
+        ) from exc
+    page = _document_resource_service(
+        engine_for_request
+    ).read_document_resource_page(
+        DocumentResourcePageRequest(
+            key=DocumentArtifactKey(item_id, artifact_id),
+            artifact_revision=artifact_revision,
+            resource=DocumentResourceRef(
+                resource_id,
+                resource_revision,
+            ),
+            mode=page_mode,
+            offset=offset,
+            max_bytes=maximum,
+        )
+    )
+    response = _conditional_json(
+        {"ok": True, **page.as_dict()},
+        page.page_sha256,
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Resource-Revision"] = page.resource.revision
+    return response
+
+
 def _raster_list(
     engine_for_request: Callable[[], LibraryEngine],
     item_id: str,
@@ -2579,6 +2786,40 @@ def create_corrections_blueprint(
     def list_raster_artifacts(item_id: str):
         try:
             return _raster_list(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get("/api/v1/items/<item_id>/document-artifacts")
+    def list_document_artifacts(item_id: str):
+        try:
+            return _document_artifact_list(engine_for_request, item_id)
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/document-artifacts/<artifact_id>"
+    )
+    def get_document_artifact(item_id: str, artifact_id: str):
+        try:
+            return _document_artifact_detail(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/document-artifacts/"
+        "<artifact_id>/resource"
+    )
+    def get_document_resource(item_id: str, artifact_id: str):
+        try:
+            return _document_resource_page(
+                engine_for_request,
+                item_id,
+                artifact_id,
+            )
         except EngineError as error:
             return _error_response(error)
 

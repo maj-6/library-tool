@@ -818,6 +818,171 @@
       isArtifactExtensionJson(value.extensions);
   }
 
+  function isDocumentRevision(value) {
+    return isArtifactRevision(value) && !/['/]/.test(value) &&
+      !/^[A-Za-z]:/.test(value) &&
+      !/^(?:https?|ftp):/i.test(value);
+  }
+
+  function isDocumentMediaType(value) {
+    return typeof value === "string" && value.length <= 255 &&
+      value === value.toLowerCase() &&
+      /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i
+        .test(value) && !/^image\//i.test(value);
+  }
+
+  function isDocumentTextMediaType(value) {
+    return value.startsWith("text/") ||
+      [
+        "application/json", "application/javascript", "application/xml",
+        "application/x-ndjson", "application/x-yaml",
+      ].includes(value) ||
+      value.endsWith("+json") || value.endsWith("+xml") ||
+      value.endsWith("+yaml");
+  }
+
+  function isDocumentSource(value) {
+    return hasExactKeys(value, ["kind", "id", "revision"]) &&
+      isPortableIdentifier(value.kind) &&
+      isPortableIdentifier(value.id) &&
+      isDocumentRevision(value.revision);
+  }
+
+  function isDocumentResourceSummary(value) {
+    if (!hasExactKeys(value, [
+      "state", "media_type", "content_sha256", "byte_size", "resource",
+      "text_encoding",
+    ]) || !ARTIFACT_RESOURCE_STATES.has(value.state) ||
+        !isDocumentMediaType(value.media_type) ||
+        !["", "utf-8"].includes(value.text_encoding) ||
+        value.text_encoding === "utf-8" &&
+          !isDocumentTextMediaType(value.media_type)) return false;
+    const hasIntegrity = value.content_sha256 !== null ||
+      value.byte_size !== null;
+    if (hasIntegrity && (
+      !/^[0-9a-f]{64}$/.test(value.content_sha256) ||
+      !Number.isSafeInteger(value.byte_size) ||
+      value.byte_size < 0
+    )) return false;
+    if (!hasIntegrity && (
+      value.content_sha256 !== null || value.byte_size !== null
+    )) return false;
+    if (value.state === "available") {
+      return hasIntegrity && hasExactKeys(value.resource, ["id", "revision"]) &&
+        isPortableIdentifier(value.resource.id) &&
+        isDocumentRevision(value.resource.revision);
+    }
+    return value.resource === null;
+  }
+
+  function isDocumentArtifactView(value, itemId, artifactId = null) {
+    if (!hasExactKeys(value, [
+      "schema", "key", "revision", "kind", "label", "language", "resource",
+      "source", "freshness", "lineage", "provenance", "extensions",
+    ]) || value.schema !== "librarytool.document-artifact/1" ||
+        !hasExactKeys(value.key, ["item_id", "artifact_id"]) ||
+        value.key.item_id !== itemId ||
+        (artifactId !== null && value.key.artifact_id !== artifactId) ||
+        !isPortableIdentifier(value.key.item_id) ||
+        !isPortableIdentifier(value.key.artifact_id) ||
+        !isDocumentRevision(value.revision) ||
+        !isPortableIdentifier(value.kind) ||
+        typeof value.label !== "string" || value.label.length > 512 ||
+        typeof value.language !== "string" || value.language.length > 64 ||
+        !(value.language === "" ||
+          /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(value.language)) ||
+        !isDocumentResourceSummary(value.resource) ||
+        !isDocumentSource(value.source) ||
+        !ARTIFACT_FRESHNESS.has(value.freshness) ||
+        !Array.isArray(value.lineage) || value.lineage.length > 64 ||
+        !isArtifactProvenance(value.provenance) ||
+        !isArtifactExtensionJson(value.extensions)) return false;
+    const lineage = new Set();
+    for (const entry of value.lineage) {
+      if (!hasExactKeys(entry, [
+        "key", "artifact_revision", "relation",
+      ]) || !hasExactKeys(entry.key, ["item_id", "artifact_id"]) ||
+          !isPortableIdentifier(entry.key.item_id) ||
+          !isPortableIdentifier(entry.key.artifact_id) ||
+          entry.key.item_id !== itemId ||
+          entry.key.artifact_id === value.key.artifact_id ||
+          !isDocumentRevision(entry.artifact_revision) ||
+          !isPortableIdentifier(entry.relation)) return false;
+      const identity = `${entry.relation}\u0000${entry.key.artifact_id}`;
+      if (lineage.has(identity)) return false;
+      lineage.add(identity);
+    }
+    return !containsCommandFingerprint(value) &&
+      !containsCredentialField(value);
+  }
+
+  function utf8TextBytes(value) {
+    let bytes = 0;
+    for (const character of value) {
+      const codePoint = character.codePointAt(0);
+      if (codePoint <= 0x7f) bytes += 1;
+      else if (codePoint <= 0x7ff) bytes += 2;
+      else if (codePoint <= 0xffff) bytes += 3;
+      else bytes += 4;
+    }
+    return bytes;
+  }
+
+  function base64DecodedBytes(value) {
+    if (typeof value !== "string" || value.length % 4 !== 0 ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+          .test(value)) return null;
+    const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+    return value.length / 4 * 3 - padding;
+  }
+
+  function isDocumentResourcePage(value, expected) {
+    if (!hasExactKeys(value, [
+      "schema", "key", "artifact_revision", "resource", "mode",
+      "media_type", "text_encoding", "content_sha256", "total_byte_size",
+      "offset", "max_bytes", "byte_count", "next_offset", "page_sha256",
+      "encoding", "data",
+    ]) || value.schema !== "librarytool.document-resource-page/1" ||
+        !hasExactKeys(value.key, ["item_id", "artifact_id"]) ||
+        value.key.item_id !== expected.itemId ||
+        value.key.artifact_id !== expected.artifactId ||
+        value.artifact_revision !== expected.artifactRevision ||
+        !hasExactKeys(value.resource, ["id", "revision"]) ||
+        value.resource.id !== expected.resourceId ||
+        value.resource.revision !== expected.resourceRevision ||
+        value.mode !== expected.mode ||
+        !isDocumentMediaType(value.media_type) ||
+        !["", "utf-8"].includes(value.text_encoding) ||
+        !/^[0-9a-f]{64}$/.test(value.content_sha256) ||
+        !Number.isSafeInteger(value.total_byte_size) ||
+        value.total_byte_size < 0 ||
+        value.offset !== expected.offset ||
+        value.max_bytes !== expected.maxBytes ||
+        !Number.isSafeInteger(value.byte_count) ||
+        value.byte_count < 0 || value.byte_count > expected.maxBytes ||
+        !(value.next_offset === null ||
+          Number.isSafeInteger(value.next_offset) &&
+          value.next_offset === value.offset + value.byte_count) ||
+        !/^[0-9a-f]{64}$/.test(value.page_sha256) ||
+        typeof value.data !== "string") return false;
+    if (value.offset + value.byte_count > value.total_byte_size ||
+        value.offset < value.total_byte_size && value.byte_count === 0) {
+      return false;
+    }
+    const expectedNext = value.offset + value.byte_count <
+      value.total_byte_size ? value.offset + value.byte_count : null;
+    if (value.next_offset !== expectedNext) return false;
+    if (value.mode === "text") {
+      return value.encoding === "utf-8" &&
+        value.text_encoding === "utf-8" &&
+        !/[\u0000-\u0008\u000b\u000e-\u001f\u007f\ud800-\udfff]/u
+          .test(value.data) &&
+        utf8TextBytes(value.data) === value.byte_count;
+    }
+    return value.encoding === "base64" &&
+      base64DecodedBytes(value.data) === value.byte_count;
+  }
+
   function isRasterSource(value) {
     if (!isObject(value)) return false;
     const keys = Object.keys(value);
@@ -1780,6 +1945,11 @@
         get: (args) => this._rasterArtifactGet(args),
         resourceUrl: (args) => this._rasterArtifactResourceUrl(args),
       });
+      this.documentArtifacts = Object.freeze({
+        list: (args) => this._documentArtifactList(args),
+        get: (args) => this._documentArtifactGet(args),
+        readPage: (args) => this._documentArtifactReadPage(args),
+      });
       this.spatialAnnotations = Object.freeze({
         list: (args) => this._spatialAnnotationList(args),
         get: (args) => this._spatialAnnotationGet(args),
@@ -2408,6 +2578,150 @@
     _itemArtifacts({ itemId, signal } = {}) {
       return this._requestJson(
         "GET", `/v1/items/${encodePart(itemId)}/artifacts`, { signal });
+    }
+
+    _documentArtifactList({ itemId, cursor, snapshotRevision,
+      limit = 100, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+        throw new TypeError("limit must be an integer from 1 to 256");
+      }
+      if (cursor != null && cursor !== "" &&
+          (typeof cursor !== "string" || cursor.length > 2048)) {
+        throw new TypeError("cursor must be a bounded opaque string");
+      }
+      if (snapshotRevision != null && snapshotRevision !== "" &&
+          (typeof snapshotRevision !== "string" ||
+            !/^docs-[0-9a-f]{64}$/.test(snapshotRevision))) {
+        throw new TypeError(
+          "snapshotRevision is not a document catalog revision");
+      }
+      const path = `/v1/items/${encodePart(item)}/document-artifacts`;
+      return this._requestJson("GET", path, {
+        query: {
+          cursor,
+          snapshot_revision: snapshotRevision,
+          limit,
+        },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "item_id", "snapshot_revision", "artifacts",
+          "next_cursor", "total",
+        ]) && body.ok === true &&
+          body.schema === "librarytool.document-artifact-catalog-page/1" &&
+          body.item_id === item &&
+          /^docs-[0-9a-f]{64}$/.test(body.snapshot_revision) &&
+          Array.isArray(body.artifacts) &&
+          body.artifacts.length <= limit &&
+          body.artifacts.every((value) =>
+            isDocumentArtifactView(value, item)) &&
+          body.artifacts.every((value, index, values) =>
+            index === 0 ||
+            values[index - 1].key.artifact_id < value.key.artifact_id) &&
+          (body.next_cursor === null ||
+            typeof body.next_cursor === "string" &&
+            /^docc-[A-Za-z0-9_-]{1,2043}$/.test(body.next_cursor)) &&
+          Number.isSafeInteger(body.total) && body.total >= 0 &&
+          body.total >= body.artifacts.length &&
+          !containsCommandFingerprint(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid document artifact collection",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _documentArtifactGet({ itemId, artifactId, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      const path = `/v1/items/${encodePart(item)}/document-artifacts/` +
+        encodePart(artifact);
+      return this._requestJson("GET", path, {
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "artifact",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.document-artifact-detail/1" ||
+            !isDocumentArtifactView(body.artifact, item, artifact) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid document artifact detail",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _documentArtifactReadPage({ itemId, artifactId, artifactRevision,
+      resourceId, resourceRevision, mode = "text", offset = 0,
+      maxBytes = 48 * 1024, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      const resource = portableIdentifier(resourceId, "resourceId");
+      if (!isDocumentRevision(artifactRevision)) {
+        throw new TypeError("artifactRevision is not a document revision");
+      }
+      if (!isDocumentRevision(resourceRevision)) {
+        throw new TypeError("resourceRevision is not a document revision");
+      }
+      if (!["text", "bytes"].includes(mode)) {
+        throw new TypeError("mode must be text or bytes");
+      }
+      if (!Number.isSafeInteger(offset) || offset < 0) {
+        throw new TypeError("offset must be a non-negative integer");
+      }
+      if (!Number.isSafeInteger(maxBytes) ||
+          maxBytes < 1 || maxBytes > 48 * 1024) {
+        throw new TypeError("maxBytes must be an integer from 1 to 49152");
+      }
+      const expected = {
+        itemId: item,
+        artifactId: artifact,
+        artifactRevision,
+        resourceId: resource,
+        resourceRevision,
+        mode,
+        offset,
+        maxBytes,
+      };
+      const path = `/v1/items/${encodePart(item)}/document-artifacts/` +
+        `${encodePart(artifact)}/resource`;
+      return this._requestJson("GET", path, {
+        query: {
+          artifact_revision: artifactRevision,
+          resource_id: resource,
+          resource_revision: resourceRevision,
+          mode,
+          offset,
+          max_bytes: maxBytes,
+        },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const page = isObject(body) ? { ...body } : body;
+        if (isObject(page)) delete page.ok;
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "key", "artifact_revision", "resource", "mode",
+          "media_type", "text_encoding", "content_sha256",
+          "total_byte_size", "offset", "max_bytes", "byte_count",
+          "next_offset", "page_sha256", "encoding", "data",
+        ]) || body.ok !== true ||
+            !isDocumentResourcePage(page, expected)) {
+          this._invalidResponse(
+            "Engine returned an invalid document resource page",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
     }
 
     _rasterArtifactList({ itemId, representationId, canvasId, group, cursor,

@@ -31,6 +31,7 @@ from ..adapters.filesystem import (
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
+    FilesystemCaptureDocumentArtifactRepository,
     FilesystemCorrectionOcrProposalRepository,
     FilesystemCorrectionRepository,
     FilesystemCorrectionSourceSnapshotReader,
@@ -69,6 +70,10 @@ from ..engine.corrections import CorrectionService
 from ..engine.correction_transforms import (
     CorrectionTransformService,
     CorrectionTransformWorker,
+)
+from ..engine.document_artifacts import (
+    DocumentArtifactCatalogService,
+    DocumentResourcePageService,
 )
 from ..engine.canvases import CanvasQueryService
 from ..engine.errors import RepositoryError
@@ -118,6 +123,8 @@ from ..engine.runtime import (
     CORRECTION_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
+    DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+    DOCUMENT_RESOURCE_PAGE_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -882,6 +889,8 @@ class FilesystemServiceGraph:
     correction_commands: CorrectionService | None = None
     correction_transforms: CorrectionTransformService | None = None
     correction_ocr_proposals: CorrectionOcrProposalQueryService | None = None
+    document_artifacts: DocumentArtifactCatalogService | None = None
+    document_resources: DocumentResourcePageService | None = None
     raster_artifacts: RasterArtifactProjectorPort | None = None
     spatial_annotations: SpatialAnnotationProjectorPort | None = None
 
@@ -896,6 +905,13 @@ class FilesystemServiceGraph:
             raise ValueError(
                 "raster artifact and spatial annotation projectors must be "
                 "installed together"
+            )
+        if (self.document_artifacts is None) != (
+            self.document_resources is None
+        ):
+            raise ValueError(
+                "document artifact and resource services must be installed "
+                "together"
             )
         if self.secret_store is not None and not isinstance(
             self.secret_store,
@@ -962,6 +978,14 @@ class FilesystemServiceGraph:
                 self.correction_ocr_proposals,
             ),
             (CORRECTION_TRANSFORM_SERVICE, self.correction_transforms),
+            (
+                DOCUMENT_ARTIFACT_CATALOG_SERVICE,
+                self.document_artifacts,
+            ),
+            (
+                DOCUMENT_RESOURCE_PAGE_SERVICE,
+                self.document_resources,
+            ),
             (RASTER_ARTIFACT_QUERY_SERVICE, self.raster_artifacts),
             (
                 SPATIAL_ANNOTATION_QUERY_SERVICE,
@@ -1099,6 +1123,8 @@ def compose_filesystem_engine(
         )
 
     corrections_artifacts = None
+    capture_document_artifacts = None
+    capture_document_resources = None
     correction_commands = None
     correction_transforms = None
     correction_ocr_proposals = None
@@ -1120,6 +1146,20 @@ def compose_filesystem_engine(
                 corrections.representation_revision_for
             ),
             lock_context_for=corrections_lock,
+        )
+        capture_document_repository = (
+            FilesystemCaptureDocumentArtifactRepository(
+                resources.write_set,
+                item_exists_for=corrections.item_exists_for,
+                capture_id_for=corrections.capture_id_for,
+                lock_context_for=corrections_lock,
+            )
+        )
+        capture_document_artifacts = DocumentArtifactCatalogService(
+            capture_document_repository
+        )
+        capture_document_resources = DocumentResourcePageService(
+            capture_document_repository
         )
         correction_source_reader: (
             FilesystemCorrectionSourceSnapshotReader | None
@@ -1416,6 +1456,8 @@ def compose_filesystem_engine(
         correction_commands=correction_commands,
         correction_transforms=correction_transforms,
         correction_ocr_proposals=correction_ocr_proposals,
+        document_artifacts=capture_document_artifacts,
+        document_resources=capture_document_resources,
         raster_artifacts=corrections_artifacts,
         spatial_annotations=corrections_artifacts,
     )
