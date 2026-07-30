@@ -7567,6 +7567,11 @@ class _CapturePromotionResult:
     changes_source: bool
 
 
+_CAPTURE_PROMOTION_OPERATION_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+)
+
+
 @contextlib.contextmanager
 def _capture_promotion_locks():
     """Use the canonical workspace -> build -> manual lock order."""
@@ -8029,7 +8034,7 @@ def _capture_promotion_command() -> _CapturePromotionCommand:
             details={"field": "item"},
         )
     operation_id = _item_command_operation_id()
-    if not _CORRECTIONS_STORAGE_ITEM_ID_RE.fullmatch(operation_id):
+    if not _CAPTURE_PROMOTION_OPERATION_ID_RE.fullmatch(operation_id):
         raise EngineValidationError(
             "the idempotency key is not a portable operation identity",
             code="invalid_operation_id",
