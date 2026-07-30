@@ -428,6 +428,18 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
   assert.deepEqual(broken.layout, normalizeLayoutState({}));
   assert.throws(() => validateProfileKey("corrections/../private"), TypeError);
   assert.throws(() => store.load("corrections/__proto__"), TypeError);
+  assert.equal(store.matchesStorageEvent("corrections/default", {
+    key: store.key("corrections/default"),
+    storageArea: storage,
+  }), true);
+  assert.equal(store.matchesStorageEvent("corrections/default", {
+    key: store.key("corrections/alternate"),
+    storageArea: storage,
+  }), false);
+  assert.equal(store.matchesStorageEvent("corrections/default", {
+    key: store.key("corrections/default"),
+    storageArea: new MemoryStorage(),
+  }), false);
 });
 
 
@@ -477,6 +489,74 @@ test("shell profile persistence restores classification remaps without domain st
   for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
     assert.equal(registry.bindingFor(command.id), command.defaultBinding);
   }
+});
+
+
+test("cross-window layout saves cannot roll back committed Image Adjust brightness", () => {
+  const storage = new MemoryStorage();
+  const createStore = () => new CorrectionsProfileStore({
+    storage,
+    normalizeLayout: normalizeLayoutState,
+    normalizeEditors: (value) => value && typeof value === "object" ? value : {},
+    normalizeTools: (value) => ({
+      imageAdjust: normalizeImageAdjustProfile(value && value.imageAdjust),
+      classification: value && value.classification || { bindings: {} },
+    }),
+  });
+  const firstStore = createStore();
+  const secondStore = createStore();
+  firstStore.save("corrections/default", {
+    tools: {
+      imageAdjust: { lastAppliedBrightness: 0 },
+      classification: { bindings: {} },
+    },
+  });
+
+  function profileShell(store, brightness, navigatorWidth) {
+    const shell = Object.create(CorrectionsShell.prototype);
+    shell.profileKey = "corrections/default";
+    shell.profileStore = store;
+    shell.layout = {
+      getState: () => ({ navigatorWidth }),
+    };
+    shell.editorRegistry = { serializeChoices: () => ({}) };
+    shell.classificationController = null;
+    shell.imageAdjustTool = createImageAdjustTool({
+      profile: { lastAppliedBrightness: brightness },
+    });
+    shell.updateProfileLabel = () => {};
+    return shell;
+  }
+
+  const firstWindow = profileShell(firstStore, 0, 320);
+  const secondWindow = profileShell(secondStore, 0, 410);
+  firstWindow.persistProfile({
+    toolUpdates: {
+      imageAdjust: { lastAppliedBrightness: 37 },
+    },
+  });
+  secondWindow.persistProfile();
+
+  assert.deepEqual(
+    secondStore.load("corrections/default").tools.imageAdjust,
+    { lastAppliedBrightness: 37 },
+    "an unrelated stale window save preserves the successful commit",
+  );
+  assert.equal(secondWindow.handleProfileStorageEvent({
+    key: secondStore.key("corrections/default"),
+    storageArea: storage,
+  }), true);
+  assert.deepEqual(secondWindow.imageAdjustTool.serializeProfile(), {
+    lastAppliedBrightness: 37,
+  });
+  assert.equal(secondWindow.imageAdjustTool.getState().brightness, 37);
+
+  assert.equal(secondWindow.handleProfileStorageEvent({
+    key: secondStore.key("corrections/alternate"),
+    storageArea: storage,
+  }), false);
+  firstWindow.imageAdjustTool.destroy();
+  secondWindow.imageAdjustTool.destroy();
 });
 
 

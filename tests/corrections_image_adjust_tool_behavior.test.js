@@ -36,6 +36,12 @@ const {
   fakeDocument,
 } = require("./fixtures/corrections_fake_dom");
 
+const parityFixture = JSON.parse(fs.readFileSync(path.join(
+  __dirname,
+  "fixtures",
+  "manual_binary_adjust_parity.json",
+), "utf8"));
+
 
 function pins() {
   return {
@@ -255,6 +261,35 @@ test("profile value is pure, bounded, and stable under serialization", () => {
   assert.deepEqual(tool.serializeProfile(), { lastAppliedBrightness: 18 });
 });
 
+
+test("external profile refresh preserves an active draft until the next editor session", () => {
+  const harness = mountedHarness({
+    profile: { lastAppliedBrightness: 5 },
+  });
+  harness.controller.dispatch({
+    type: "SET_TOOL",
+    tool: TOOLS.IMAGE_ADJUST,
+  });
+  harness.tool.syncEditorState(
+    harness.controller.getState(),
+    harness.controller.resource,
+  );
+  harness.tool.setBrightness(16);
+
+  harness.tool.restoreProfile({ lastAppliedBrightness: 37 });
+  assert.equal(harness.tool.getState().brightness, 16);
+  assert.equal(harness.tool.getState().rememberedBrightness, 37);
+
+  harness.cleanup();
+  const cleanup = harness.tool.mount(
+    harness.controller,
+    harness.controller.resource,
+  );
+  assert.equal(harness.tool.getState().brightness, 37);
+  cleanup();
+});
+
+
 test("a mounted hidden command palette does not block the A shortcut", () => {
   const harness = mountedHarness();
   const palette = new FakeNode("dialog", harness.documentRef);
@@ -336,6 +371,33 @@ test("contrast 100 preview is truly binary and mirrors Pillow alpha and RGB-to-L
   );
   assert.deepEqual(Array.from(halfContrast), [64, 64, 64, 255],
     "integer half-up blend matches the processor for non-default contrast");
+});
+
+
+test("browser preview matches the shared Pillow processor parity fixture", () => {
+  assert.equal(
+    parityFixture.schema,
+    "librarytool.manual-binary-preview-parity/1",
+  );
+  const input = new Uint8ClampedArray(parityFixture.input_rgba.flat());
+  for (const expectation of parityFixture.expectations) {
+    const output = applyManualBinaryPreview(
+      input,
+      createManualBinaryAdjustment(expectation.brightness_percent),
+    );
+    const luminance = Array.from(output)
+      .filter((_value, index) => index % 4 === 0);
+    assert.deepEqual(
+      luminance,
+      expectation.output_l,
+      `brightness ${expectation.brightness_percent}`,
+    );
+    assert.ok(
+      Array.from(output).every((value, index) =>
+        index % 4 === 3 ? value === 255 : value === 0 || value === 255),
+      "contrast 100 stays binary and opaque",
+    );
+  }
 });
 
 

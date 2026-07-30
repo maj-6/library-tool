@@ -90,6 +90,12 @@
         return false;
       }
     }
+
+    matchesStorageEvent(profileKey, event) {
+      if (!event || event.key !== this.key(profileKey)) return false;
+      return !event.storageArea || !this.storage ||
+        event.storageArea === this.storage;
+    }
   }
 
   return {
