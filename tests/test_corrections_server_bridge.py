@@ -187,6 +187,11 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(server, "ENTRIES_DIR", entries_dir)
     monkeypatch.setattr(server, "CAPTURES_DIR", captures_dir)
     monkeypatch.setattr(
+        server,
+        "CAPTURE_CLOUD_ASSOCIATION_STATE_PATH",
+        output / "capture_cloud_association_state.json",
+    )
+    monkeypatch.setattr(
         server.lib,
         "MANUAL_ENTRIES_PATH",
         manual_entries_path,
