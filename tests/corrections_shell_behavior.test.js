@@ -560,6 +560,45 @@ test("cross-window layout saves cannot roll back committed Image Adjust brightne
 });
 
 
+test("profile storage listeners are window-scoped and removed on shell destroy", () => {
+  const windowRef = new FakeEventTarget();
+  const shell = Object.create(CorrectionsShell.prototype);
+  const received = [];
+  Object.assign(shell, {
+    windowRef,
+    listeners: [],
+    destroyed: false,
+    contextGeneration: 0,
+    featureContextGeneration: 0,
+    unsubscribeContext: null,
+    unsubscribeTransformResults: null,
+    unsubscribeClassificationBindings: null,
+    classificationControls: null,
+    classificationController: null,
+    booksFeature: null,
+    artifactsFeature: null,
+    itemProperties: null,
+    selectionListeners: new Set(),
+    editorRegistry: null,
+    imageAdjustTool: null,
+    layout: { destroy() {} },
+    handleProfileStorageEvent(event) {
+      received.push(event);
+    },
+  });
+  shell.bindProfileSync();
+
+  const event = { key: "librarytool.corrections-ui-profile:test" };
+  windowRef.emit("storage", event);
+  assert.deepEqual(received, [event]);
+
+  shell.destroy();
+  windowRef.emit("storage", { key: "after-destroy" });
+  assert.deepEqual(received, [event]);
+  assert.equal(windowRef.listeners.get("storage").length, 0);
+});
+
+
 test("classification shortcuts stay scoped and context menus use exact event targets", () => {
   const shell = Object.create(CorrectionsShell.prototype);
   shell.root = { dataset: {} };

@@ -290,6 +290,32 @@ test("external profile refresh preserves an active draft until the next editor s
 });
 
 
+test("external profile refresh updates an inactive mounted editor immediately", () => {
+  const harness = mountedHarness({
+    profile: { lastAppliedBrightness: 5 },
+  });
+  assert.equal(harness.controller.getState().tool, TOOLS.SELECT);
+
+  harness.tool.restoreProfile({ lastAppliedBrightness: 37 });
+
+  assert.equal(harness.tool.getState().brightness, 37);
+  assert.equal(harness.tool.getState().rememberedBrightness, 37);
+  assert.match(
+    byClass(harness.inspector, "image-adjust-threshold")[0].textContent,
+    /brightness 37/,
+  );
+
+  harness.canvas.focus();
+  harness.surface.emit("keydown", {
+    key: "a",
+    target: harness.canvas,
+  });
+  assert.equal(harness.controller.getState().tool, TOOLS.IMAGE_ADJUST);
+  assert.equal(harness.tool.getState().brightness, 37);
+  harness.cleanup();
+});
+
+
 test("a mounted hidden command palette does not block the A shortcut", () => {
   const harness = mountedHarness();
   const palette = new FakeNode("dialog", harness.documentRef);
