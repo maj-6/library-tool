@@ -92,6 +92,21 @@ def _bind_engine_session(monkeypatch, server, session) -> None:
         monkeypatch.setattr(server, name, value)
 
 
+def _unsupported_uncaptured_manual_rows() -> dict:
+    return {
+        "legacy-valid": {
+            "id": "legacy-valid",
+            "title": ["unsupported", "legacy", "shape"],
+            "images": "C:/private/legacy-photo.jpg",
+            "extra": ["unsupported", "legacy", "metadata"],
+        },
+        "legacy row / invalid identity": [
+            "non-object legacy row",
+            {"path": "C:/private/legacy-source.pdf"},
+        ],
+    }
+
+
 @pytest.fixture()
 def corrections_workspace(monkeypatch, tmp_path: Path):
     import server
@@ -779,6 +794,119 @@ def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
             {},
         )["promoted-local"]
     assert promoted_after == promoted_before
+
+
+def test_capture_only_patch_ignores_unsupported_uncaptured_manual_rows(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    excluded = _unsupported_uncaptured_manual_rows()
+    rows = {
+        manual_id: {
+            "id": manual_id,
+            "title": "Captured title",
+            "capture_id": CAPTURE_ID,
+        },
+        **excluded,
+    }
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH, rows)
+
+    endpoint = f"/api/v1/corrections/items/{BOOK_ID}"
+    before = client.get(endpoint).get_json()["item"]
+    response = client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": "Corrected captured title",
+                "metadata_set": {},
+                "metadata_remove": [],
+            }
+        },
+        headers={
+            "Idempotency-Key": "bridge-capture-excluded-manual-rows",
+            "If-Record-Match": f'"{before["record_revision"]}"',
+        },
+    )
+
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["replayed"] is False
+    with server._manual_lock:
+        stored = server.lib.load_json(server.lib.MANUAL_ENTRIES_PATH, {})
+    assert stored[manual_id]["title"] == "Corrected captured title"
+    for entry_id, expected in excluded.items():
+        assert stored[entry_id] == expected
+
+
+def test_promoted_patch_and_replay_ignore_unsupported_uncaptured_manual_rows(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    source = {
+        "id": manual_id,
+        "title": "Compatibility source",
+        "capture_id": CAPTURE_ID,
+    }
+    excluded = _unsupported_uncaptured_manual_rows()
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {manual_id: source, **excluded},
+        )
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "promoted-local": {
+                    "id": "promoted-local",
+                    "title": "Promoted title",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                }
+            },
+        )
+
+    endpoint = f"/api/v1/corrections/items/{BOOK_ID}"
+    before = client.get(endpoint).get_json()["item"]
+    document = {
+        "patch": {
+            "title": "Corrected promoted title",
+            "metadata_set": {},
+            "metadata_remove": [],
+        }
+    }
+    headers = {
+        "Idempotency-Key": "bridge-promoted-excluded-manual-rows",
+        "If-Record-Match": f'"{before["record_revision"]}"',
+    }
+    updated = client.patch(endpoint, json=document, headers=headers)
+    replay = client.patch(endpoint, json=document, headers=headers)
+
+    assert updated.status_code == 200, updated.get_json()
+    assert updated.get_json()["replayed"] is False
+    assert replay.status_code == 200, replay.get_json()
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["item"] == updated.get_json()["item"]
+    with server._builds_lock:
+        build = server.lib.load_json(server.BUILDS_PATH, {})[
+            "promoted-local"
+        ]
+    with server._manual_lock:
+        stored = server.lib.load_json(server.lib.MANUAL_ENTRIES_PATH, {})
+    assert build["title"] == "Corrected promoted title"
+    assert stored[manual_id] == source
+    for entry_id, expected in excluded.items():
+        assert stored[entry_id] == expected
 
 
 def test_promoted_capture_metadata_edit_targets_only_the_active_build(

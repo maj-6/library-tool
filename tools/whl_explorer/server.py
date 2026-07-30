@@ -7204,6 +7204,7 @@ def _corrections_manual_item_repository(
         encode_record=_MANUAL_ENTRY_ITEM_CODEC.encode,
         allocate_item_id=lambda existing: lib.gen_id(set(existing)),
         lock_context_for=_corrections_workspace_locks,
+        record_scope_for=lambda item_id: item_id == storage_id,
         recover=False,
     )
     return repository

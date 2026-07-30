@@ -130,6 +130,7 @@ def _repository(
     allocate_tombstone_id=_allocate_tombstone_id,
     load_identity_reservations=None,
     lock_context_for=None,
+    record_scope_for=None,
     recover: bool = True,
 ):
     store = write_set or RecoverableWriteSet(root, publish_hook=hook)
@@ -142,6 +143,7 @@ def _repository(
         allocate_tombstone_id=allocate_tombstone_id,
         load_identity_reservations=load_identity_reservations,
         lock_context_for=lock_context_for,
+        record_scope_for=record_scope_for,
         recover=recover,
     )
     return store, repository
@@ -253,6 +255,59 @@ def test_create_update_delete_and_durable_replay_share_one_catalogue(tmp_path):
     assert delete_replay.replayed is True
     assert delete_replay.receipt == deleted.receipt
     assert _live_tree(root) == delete_tree
+
+
+def test_scoped_repository_preserves_unselected_legacy_rows(tmp_path):
+    root = tmp_path / "mixed-catalogue"
+    selected = _raw_record()
+    unsupported = {
+        "title": ["legacy", "shape"],
+        "images": "C:/private/legacy.jpg",
+    }
+    invalid_identity = {
+        "title": 17,
+        "extra": ["legacy", "metadata"],
+    }
+    _write_catalogue(
+        root,
+        {
+            "book": selected,
+            "legacy-valid": unsupported,
+            "legacy row / invalid identity": invalid_identity,
+        },
+    )
+    decoded: list[str] = []
+
+    def decode(item_id, raw):
+        decoded.append(item_id)
+        return _decode_record(item_id, raw)
+
+    _, repository = _repository(
+        root,
+        decode_record=decode,
+        record_scope_for=lambda item_id: item_id == "book",
+    )
+    with repository.unit_of_work(operation_id="inspect-scope") as unit:
+        assert unit.get("book") is not None
+        assert unit.get("legacy-valid") is None
+        assert unit.raw_record("legacy-valid") is None
+    assert decoded == ["book"]
+
+    updated = ItemCommandService(repository).update(
+        UpdateItemCommand(
+            item_id="book",
+            expected_revision="rev-1",
+            patch=ItemPatch(title="Corrected Herbal"),
+            operation_id="scoped-update",
+        )
+    )
+
+    assert updated.replayed is False
+    rows = _catalogue(root)
+    assert rows["book"]["title"] == "Corrected Herbal"
+    assert rows["legacy-valid"] == unsupported
+    assert rows["legacy row / invalid identity"] == invalid_identity
+    assert set(decoded) == {"book"}
 
 
 def test_staging_does_not_publish_without_commit(tmp_path):
