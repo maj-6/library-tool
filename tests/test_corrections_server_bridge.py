@@ -1059,7 +1059,14 @@ def test_capture_fallback_is_deterministic_and_uncaptured_manual_is_omitted(
     del corrections_workspace
     import server
 
-    monkeypatch.setattr(server, "_corrections_association", lambda _value: None)
+    persisted_association = server._corrections_association(CAPTURE_ID)
+    assert persisted_association is not None
+    assert persisted_association.book_id == BOOK_ID
+    monkeypatch.setattr(
+        server,
+        "_corrections_association",
+        lambda _value: None,
+    )
     with server._builds_lock:
         server.lib.save_json(server.BUILDS_PATH, {})
     with server._manual_lock:
@@ -1080,6 +1087,34 @@ def test_capture_fallback_is_deterministic_and_uncaptured_manual_is_omitted(
     assert capture_snapshot[capture_identity]["metadata"][
         "association_state"
     ] == "missing"
+
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                "manual-capture": {
+                    "id": "manual-capture",
+                    "title": "Legacy identity capture",
+                    "capture_id": CAPTURE_ID,
+                    "extra": {"lib_book_id": BOOK_ID},
+                }
+            },
+        )
+    legacy_snapshot = server._corrections_item_snapshot()
+    assert list(legacy_snapshot) == [BOOK_ID]
+    assert legacy_snapshot[BOOK_ID]["metadata"][
+        "association_state"
+    ] == "missing"
+    monkeypatch.setattr(
+        server,
+        "_corrections_association",
+        lambda _value: persisted_association,
+    )
+    associated_snapshot = server._corrections_item_snapshot()
+    assert list(associated_snapshot) == [BOOK_ID]
+    assert associated_snapshot[BOOK_ID]["metadata"][
+        "association_state"
+    ] == "current"
 
     with server._manual_lock:
         server.lib.save_json(

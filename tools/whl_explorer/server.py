@@ -5991,10 +5991,29 @@ def _corrections_validate_identity_claims(
 
 
 def _corrections_capture_authority(
-        capture_id: str) -> tuple[str, str, str]:
+        capture_id: str,
+        source: Mapping,
+        *,
+        discovered_identities: Mapping[str, str],
+) -> tuple[str, str, str]:
     association = _corrections_association(capture_id)
     if association is None:
-        return capture_book_id(capture_id), "missing", ""
+        try:
+            canonical_id = (
+                capture_lib_compat.resolve_legacy_capture_book_id(
+                    source,
+                    capture_id,
+                    discovered_identities=discovered_identities,
+                )
+            )
+        except (OSError, TypeError, UnicodeError, ValueError) as exc:
+            raise _corrections_target_error(
+                "a capture's stable book identity could not be resolved",
+                code="invalid_corrections_target_snapshot",
+                capture_id=capture_id,
+                cause_type=type(exc).__name__,
+            ) from exc
+        return canonical_id, "missing", ""
     return (
         association.book_id,
         association.state.value,
@@ -6138,7 +6157,31 @@ def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
 
     capture_authorities: dict[str, tuple[str, str, str]] = {}
     for capture_id in capture_ids:
-        authority = _corrections_capture_authority(capture_id)
+        manual_values = manual_by_capture.get(capture_id, ())
+        build_values = build_by_capture.get(capture_id, ())
+        source = (manual_values or build_values)[0][1]
+        try:
+            discovered_identities = (
+                capture_lib_compat.discover_capture_build_identities(
+                    dict(build_values),
+                    ENTRIES_DIR,
+                    capture_id,
+                )
+                if build_values
+                else {}
+            )
+        except (OSError, TypeError, UnicodeError, ValueError) as exc:
+            raise _corrections_target_error(
+                "a capture's build identities could not be inspected",
+                code="invalid_corrections_target_snapshot",
+                capture_id=capture_id,
+                cause_type=type(exc).__name__,
+            ) from exc
+        authority = _corrections_capture_authority(
+            capture_id,
+            source,
+            discovered_identities=discovered_identities,
+        )
         capture_authorities[capture_id] = authority
         canonical_id = authority[0]
         for storage_kind, values in (
