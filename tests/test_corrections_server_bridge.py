@@ -410,6 +410,288 @@ def test_capture_only_target_is_visible_and_stays_canonical_after_promotion(
     )
 
 
+def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                manual_id: {
+                    "id": manual_id,
+                    "title": "Captured Herbal",
+                    "author": "A. Botanist",
+                    "city": "Bath",
+                    "year": "1799",
+                    "capture_id": CAPTURE_ID,
+                    "images": [
+                        f"captures/{CAPTURE_ID}/private-photo.jpg"
+                    ],
+                    "local_pdf": "C:/private/capture.pdf",
+                }
+            },
+        )
+
+    endpoint = f"/api/v1/corrections/items/{BOOK_ID}"
+    detail = client.get(endpoint)
+    assert detail.status_code == 200
+    before = detail.get_json()["item"]
+    assert before["kind"] == "capture"
+    assert before["metadata"]["authors"] == "A. Botanist"
+    assert before["metadata"]["publisher_city"] == "Bath"
+    assert "local_pdf" not in detail.get_data(as_text=True)
+    assert "private-photo.jpg" not in detail.get_data(as_text=True)
+
+    document = {
+        "patch": {
+            "title": "Captured Herbal, corrected",
+            "metadata_set": {
+                "authors": "B. Botanist",
+                "publisher_city": "Edinburgh",
+                "condition": "Good",
+            },
+            "metadata_remove": ["year"],
+        }
+    }
+    headers = {
+        "Idempotency-Key": "bridge-capture-metadata-edit",
+        "If-Record-Match": f'"{before["record_revision"]}"',
+    }
+    updated = client.patch(endpoint, json=document, headers=headers)
+    replay = client.patch(endpoint, json=document, headers=headers)
+
+    assert updated.status_code == 200, updated.get_json()
+    assert updated.get_json()["replayed"] is False
+    after = updated.get_json()["item"]
+    assert after["id"] == BOOK_ID
+    assert after["title"] == "Captured Herbal, corrected"
+    assert after["metadata"]["authors"] == "B. Botanist"
+    assert after["metadata"]["publisher_city"] == "Edinburgh"
+    assert after["metadata"]["condition"] == "Good"
+    assert "year" not in after["metadata"]
+    assert after["record_revision"] != before["record_revision"]
+    assert replay.status_code == 200
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["item"] == after
+
+    with server._manual_lock:
+        stored = server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )[manual_id]
+    assert stored["title"] == "Captured Herbal, corrected"
+    assert stored["author"] == "B. Botanist"
+    assert stored["city"] == "Edinburgh"
+    assert "year" not in stored
+    assert "authors" not in stored
+    assert "publisher_city" not in stored
+    assert stored["capture_id"] == CAPTURE_ID
+    assert stored["images"] == [
+        f"captures/{CAPTURE_ID}/private-photo.jpg"
+    ]
+    assert stored["local_pdf"] == "C:/private/capture.pdf"
+
+    second_client = client.application.test_client()
+    stale = second_client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": None,
+                "metadata_set": {"condition": "Poor"},
+                "metadata_remove": [],
+            }
+        },
+        headers={
+            "Idempotency-Key": "bridge-capture-metadata-stale",
+            "If-Record-Match": f'"{before["record_revision"]}"',
+        },
+    )
+    managed = second_client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": None,
+                "metadata_set": {"capture_id": "another-capture"},
+                "metadata_remove": [],
+            }
+        },
+        headers={
+            "Idempotency-Key": "bridge-capture-metadata-managed",
+            "If-Record-Match": f'"{after["record_revision"]}"',
+        },
+    )
+    identity_claim = second_client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": None,
+                "metadata_set": {
+                    "extra": {
+                        "book_id": (
+                            "b-22222222222222222222222222222222"
+                        )
+                    }
+                },
+                "metadata_remove": [],
+            }
+        },
+        headers={
+            "Idempotency-Key": "bridge-capture-metadata-identity",
+            "If-Record-Match": f'"{after["record_revision"]}"',
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "item_revision_conflict"
+    assert managed.status_code == 400
+    assert managed.get_json()["code"] == "managed_item_fields_not_writable"
+    assert managed.get_json()["details"]["fields"] == ["capture_id"]
+    assert identity_claim.status_code == 400
+    assert identity_claim.get_json()["code"] == (
+        "managed_item_fields_not_writable"
+    )
+    assert identity_claim.get_json()["details"]["fields"] == [
+        "extra.book_id"
+    ]
+
+
+def test_promoted_capture_metadata_edit_targets_only_the_active_build(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    manual = {
+        "id": manual_id,
+        "title": "Compatibility source",
+        "author": "Original author",
+        "capture_id": CAPTURE_ID,
+    }
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {manual_id: manual},
+        )
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "promoted-local": {
+                    "id": "promoted-local",
+                    "title": "Promoted title",
+                    "authors": "Build author",
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                }
+            },
+        )
+
+    endpoint = f"/api/v1/corrections/items/{BOOK_ID}"
+    before = client.get(endpoint).get_json()["item"]
+    response = client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": "Corrected promoted title",
+                "metadata_set": {"authors": "Corrected build author"},
+                "metadata_remove": [],
+            }
+        },
+        headers={
+            "Idempotency-Key": "bridge-promoted-metadata-edit",
+            "If-Record-Match": f'"{before["record_revision"]}"',
+        },
+    )
+
+    assert response.status_code == 200, response.get_json()
+    item = response.get_json()["item"]
+    assert item["id"] == BOOK_ID
+    assert item["kind"] == "book"
+    assert item["title"] == "Corrected promoted title"
+    assert item["metadata"]["authors"] == "Corrected build author"
+    with server._builds_lock:
+        build = server.lib.load_json(server.BUILDS_PATH, {})[
+            "promoted-local"
+        ]
+    with server._manual_lock:
+        source = server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )[manual_id]
+    assert build["title"] == "Corrected promoted title"
+    assert build["authors"] == "Corrected build author"
+    assert source == manual
+
+
+def test_capture_metadata_edit_does_not_commit_when_archive_invalidation_fails(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    manual = {
+        "id": manual_id,
+        "title": "Captured title",
+        "capture_id": CAPTURE_ID,
+    }
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {manual_id: manual},
+        )
+    endpoint = f"/api/v1/corrections/items/{BOOK_ID}"
+    before = client.get(endpoint).get_json()["item"]
+
+    def fail_invalidation(_capture_id):
+        raise server.EngineRepositoryError(
+            "archive store unavailable",
+            code="capture_archive_repository_unavailable",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_mark_capture_archive_stale",
+        fail_invalidation,
+    )
+    response = client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": "Must not commit",
+                "metadata_set": {},
+                "metadata_remove": [],
+            }
+        },
+        headers={
+            "Idempotency-Key": "bridge-capture-invalidation-failure",
+            "If-Record-Match": f'"{before["record_revision"]}"',
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.get_json()["code"] == "correction_item_update_unavailable"
+    with server._manual_lock:
+        stored = server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )[manual_id]
+    assert stored == manual
+
+
 def test_capture_target_duplicates_and_identity_conflicts_fail_closed(
     corrections_workspace,
 ):

@@ -338,7 +338,10 @@ class ManualEntryItemCodec:
 
         for field in _CANONICAL_EDITABLE_STRING_FIELDS:
             legacy_field = _CANONICAL_TO_LEGACY.get(field, field)
-            result[legacy_field] = draft.metadata.get(field, "")
+            if field not in draft.metadata:
+                result.pop(legacy_field, None)
+            else:
+                result[legacy_field] = draft.metadata[field]
         for field in _OPTIONAL_EDITABLE_FIELDS:
             if field not in draft.metadata:
                 result.pop(field, None)

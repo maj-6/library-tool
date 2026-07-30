@@ -96,6 +96,9 @@ from librarytool.adapters.filesystem.capture_archive_repository import (  # noqa
 from librarytool.adapters.filesystem.item_repository import (  # noqa: E402
     FilesystemItemQueryRepository,
 )
+from librarytool.adapters.filesystem.item_command_repository import (  # noqa: E402
+    FilesystemItemCommandRepository,
+)
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
 )
@@ -288,6 +291,9 @@ app.register_blueprint(
         ),
         correction_item_service_for_request=(
             lambda: _corrections_item_engine()
+        ),
+        correction_item_update_service_for_request=(
+            lambda: _corrections_item_update_engine()
         ),
         correction_actor_id_for_request=(
             lambda: _local_correction_actor_id()
@@ -6752,6 +6758,275 @@ def _corrections_item_engine() -> ItemQueryService:
     return ItemQueryService(
         FilesystemItemQueryRepository(_corrections_item_snapshot)
     )
+
+
+_CORRECTIONS_STORAGE_ITEM_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+)
+_CORRECTIONS_DERIVED_METADATA_FIELDS = frozenset({
+    "active_storage_id",
+    "active_storage_kind",
+    "association_state",
+    "canonical_book_id",
+    "canonical_item_id",
+    "capture_id",
+    "capture_transport",
+    "image_count",
+    "origin",
+})
+
+
+def _corrections_item_read_only_fields(
+        target: "_CorrectionsTarget",
+        patch: ItemPatch,
+) -> tuple[str, ...]:
+    source_fields = (
+        _MANUAL_ENTRY_ITEM_CODEC.server_managed_fields
+        if target.storage_kind == "manual"
+        else _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
+    )
+    fields = (
+        _CORRECTIONS_DERIVED_METADATA_FIELDS
+        | source_fields
+        | {"attention"}
+    )
+    return tuple(sorted(
+        (
+            set(patch.metadata_set)
+            | set(patch.metadata_remove)
+        )
+        & fields
+    ))
+
+
+def _corrections_item_validate_writable_patch(
+        target: "_CorrectionsTarget",
+        patch: ItemPatch,
+) -> None:
+    managed = _corrections_item_read_only_fields(target, patch)
+    if managed:
+        raise EngineValidationError(
+            "server-managed Corrections item fields cannot be changed here",
+            code="managed_item_fields_not_writable",
+            details={"fields": list(managed)},
+        )
+    if target.storage_kind == "manual":
+        unknown = tuple(sorted(
+            (
+                set(patch.metadata_set)
+                | set(patch.metadata_remove)
+            )
+            - _MANUAL_ENTRY_ITEM_CODEC.editable_fields
+        ))
+        if unknown:
+            raise EngineValidationError(
+                "the captured-entry metadata patch contains unsupported fields",
+                code="invalid_item_metadata",
+                details={"fields": list(unknown)},
+            )
+    if "extra" in patch.metadata_set:
+        extra = patch.metadata_set["extra"]
+        if not isinstance(extra, Mapping):
+            raise EngineValidationError(
+                "the Corrections item extra metadata must be an object",
+                code="invalid_item_metadata",
+                details={"field": "extra"},
+            )
+        conflicting_claims = tuple(sorted(
+            field
+            for field in ("book_id", "lib_book_id")
+            if extra.get(field) not in (None, "", target.canonical_id)
+        ))
+        if conflicting_claims:
+            raise EngineValidationError(
+                "stable book identity metadata cannot be reassigned",
+                code="managed_item_fields_not_writable",
+                details={
+                    "fields": [
+                        f"extra.{field}" for field in conflicting_claims
+                    ]
+                },
+            )
+
+
+def _corrections_item_current_target(
+        item_id: str,
+) -> "_CorrectionsTarget":
+    target = _corrections_target_for(item_id)
+    if target is None:
+        raise EngineNotFoundError(
+            "the Corrections item does not exist",
+            code="item_not_found",
+            details={"item_id": item_id},
+        )
+    return target
+
+
+def _corrections_item_invalidate_capture(
+        command: UpdateItemCommand,
+) -> None:
+    changed_fields = (
+        set(command.patch.metadata_set)
+        | set(command.patch.metadata_remove)
+    )
+    capture_fields = (
+        _CAPTURE_ARCHIVE_BUILD_FIELDS
+        | (
+            _MANUAL_ENTRY_ITEM_CODEC.editable_fields
+            - {"attention"}
+        )
+    )
+    if (
+        command.patch.title is None
+        and not changed_fields.intersection(capture_fields)
+    ):
+        return
+    with _corrections_workspace_locks():
+        target = _corrections_target_for(command.item_id)
+        if (
+            target is None
+            or target.record_revision != command.expected_revision
+        ):
+            # Exact replay and ordinary CAS conflicts are resolved by the
+            # delegated item service. Only the still-matched writer can commit.
+            return
+        capture_id = target.capture_id
+    if capture_id:
+        _mark_capture_archive_stale(capture_id)
+
+
+class _CorrectionsManualItemPolicy:
+    """Keep a manual target active while its generic item unit commits."""
+
+    def __init__(self, canonical_id: str, storage_id: str) -> None:
+        self._canonical_id = canonical_id
+        self._storage_id = storage_id
+
+    def validate_create(self, _candidate: ItemDraft) -> None:
+        raise EngineValidationError(
+            "Corrections cannot create captured entries",
+            code="unsupported_item_kind",
+            details={"kind": "capture"},
+        )
+
+    def validate_update(
+        self,
+        current: ItemRecordSnapshot,
+        patch: ItemPatch,
+        candidate: ItemDraft,
+    ) -> None:
+        target = _corrections_target_for(self._canonical_id)
+        if target is None:
+            raise EngineNotFoundError(
+                "the Corrections item does not exist",
+                code="item_not_found",
+                details={"item_id": self._canonical_id},
+            )
+        if (
+            target.storage_kind != "manual"
+            or target.storage_id != self._storage_id
+            or target.record_revision != current.revision
+        ):
+            raise EngineConflictError(
+                "the Corrections item changed storage authority",
+                code="item_revision_conflict",
+                details={
+                    "item_id": self._canonical_id,
+                    "expected_revision": current.revision,
+                    "current_revision": target.record_revision,
+                },
+            )
+        _corrections_item_validate_writable_patch(target, patch)
+        if "category_ids" in patch.metadata_set:
+            values = candidate.metadata.get("category_ids")
+            known = frozenset(_engine_item_category_ids())
+            if (
+                not isinstance(values, tuple)
+                or any(value not in known for value in values)
+            ):
+                raise EngineValidationError(
+                    "the captured entry contains unknown categories",
+                    code="invalid_item_metadata",
+                    details={"field": "category_ids"},
+                )
+        try:
+            _MANUAL_ENTRY_ITEM_CODEC.encode(
+                self._storage_id,
+                candidate,
+                target.record,
+            )
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise EngineValidationError(
+                "the captured-entry metadata patch is invalid",
+                code="invalid_item_metadata",
+                details={"cause_type": type(exc).__name__},
+            ) from exc
+
+
+def _corrections_manual_item_command_engine(
+        canonical_id: str,
+        storage_id: str,
+) -> ItemCommandService:
+    if not _CORRECTIONS_STORAGE_ITEM_ID_RE.fullmatch(storage_id):
+        raise EngineRepositoryError(
+            "the captured entry uses an unsupported legacy storage identity",
+            code="correction_item_update_unavailable",
+            details={"item_id": canonical_id},
+        )
+    session = _ensure_engine_session()
+    repository = FilesystemItemCommandRepository(
+        session.write_set,
+        catalogue_path=lib.MANUAL_ENTRIES_PATH,
+        decode_record=_MANUAL_ENTRY_ITEM_CODEC.decode,
+        encode_record=_MANUAL_ENTRY_ITEM_CODEC.encode,
+        allocate_item_id=lambda existing: lib.gen_id(set(existing)),
+        lock_context_for=_corrections_workspace_locks,
+        recover=False,
+    )
+    return ItemCommandService(
+        repository,
+        policy=_CorrectionsManualItemPolicy(canonical_id, storage_id),
+        allow_legacy_delete=False,
+    )
+
+
+class _CorrectionsItemUpdateService:
+    """Dispatch one canonical metadata edit to its sole active row."""
+
+    def update(self, command: UpdateItemCommand):
+        if not isinstance(command, UpdateItemCommand):
+            raise EngineValidationError(
+                "the Corrections item update is invalid",
+                code="invalid_item_command",
+            )
+        with _corrections_workspace_locks():
+            target = _corrections_item_current_target(command.item_id)
+            _corrections_item_validate_writable_patch(
+                target,
+                command.patch,
+            )
+            storage_kind = target.storage_kind
+            storage_id = target.storage_id
+
+        _corrections_item_invalidate_capture(command)
+        delegated = UpdateItemCommand(
+            item_id=storage_id,
+            expected_revision=command.expected_revision,
+            patch=command.patch,
+            operation_id=command.operation_id,
+        )
+        if storage_kind == "manual":
+            service = _corrections_manual_item_command_engine(
+                command.item_id,
+                storage_id,
+            )
+        else:
+            service = _item_command_engine()
+        return service.update(delegated)
+
+
+def _corrections_item_update_engine() -> _CorrectionsItemUpdateService:
+    return _CorrectionsItemUpdateService()
 
 
 def _item_command_engine() -> ItemCommandService:
