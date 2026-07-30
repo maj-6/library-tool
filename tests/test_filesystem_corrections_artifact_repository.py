@@ -671,7 +671,7 @@ def test_blank_local_display_checksum_keeps_revision_pinned_geometry(
     )
 
 
-def test_partial_legacy_capture_keeps_each_representable_rendition(tmp_path):
+def test_partial_legacy_capture_keeps_explicit_missing_renditions(tmp_path):
     root = tmp_path / "library"
     original = _jpeg_bytes((10, 20, 30), (17, 23))
     display = _jpeg_bytes((40, 50, 60), (19, 29))
@@ -688,17 +688,77 @@ def test_partial_legacy_capture_keeps_each_representable_rendition(tmp_path):
     _write_photo_manifest(root, manifest)
     repository = _repository(root)
 
-    assert [
-        value.key.artifact_id
+    artifacts = {
+        value.key.artifact_id: value
         for value in repository.list_raster_artifacts(ITEM_ID)
-    ] == [CAPTURE_DISPLAY_ID]
+    }
+    assert set(artifacts) == {CAPTURE_DISPLAY_ID, CAPTURE_ORIGINAL_ID}
+    assert artifacts[CAPTURE_DISPLAY_ID].resource_state is ResourceState.AVAILABLE
+    assert artifacts[CAPTURE_ORIGINAL_ID].resource_state is ResourceState.MISSING
+    assert artifacts[CAPTURE_ORIGINAL_ID].dimensions.as_dict() == {
+        "width": 1,
+        "height": 1,
+        "orientation": 6,
+    }
 
     display_path.unlink()
     (directory / "original_asset-1.jpg").write_bytes(original)
-    assert [
-        value.key.artifact_id
+    artifacts = {
+        value.key.artifact_id: value
         for value in repository.list_raster_artifacts(ITEM_ID)
-    ] == [CAPTURE_ORIGINAL_ID]
+    }
+    assert set(artifacts) == {CAPTURE_DISPLAY_ID, CAPTURE_ORIGINAL_ID}
+    assert artifacts[CAPTURE_DISPLAY_ID].resource_state is ResourceState.MISSING
+    assert artifacts[CAPTURE_ORIGINAL_ID].resource_state is ResourceState.AVAILABLE
+
+
+def test_malformed_rendition_and_geometry_preserve_healthy_capture_artifact(
+    tmp_path,
+):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _photo_manifest(original, display)
+    manifest["assets"][0]["original"] = ["invalid", "rendition"]
+    manifest["assets"][0]["geometry"] = ["invalid-geometry"]
+    _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    artifacts = {
+        value.key.artifact_id: value
+        for value in repository.list_raster_artifacts(ITEM_ID)
+    }
+
+    assert set(artifacts) == {CAPTURE_DISPLAY_ID, CAPTURE_ORIGINAL_ID}
+    original_view = artifacts[CAPTURE_ORIGINAL_ID]
+    display_view = artifacts[CAPTURE_DISPLAY_ID]
+    assert original_view.resource_state is ResourceState.UNAVAILABLE
+    assert original_view.resource is None
+    assert original_view.extensions["artifact_diagnostics"] == (
+        {
+            "scope": "capture_rendition",
+            "code": "capture_rendition_invalid",
+            "state": "unavailable",
+            "component": "original",
+        },
+    )
+    assert display_view.resource_state is ResourceState.AVAILABLE
+    assert display_view.resource is not None
+    assert display_view.extensions["artifact_diagnostics"] == (
+        {
+            "scope": "capture_geometry",
+            "code": "capture_geometry_invalid",
+            "state": "unavailable",
+            "component": "display",
+        },
+    )
+    assert repository.list_spatial_annotations(ITEM_ID) == ()
+    assert str(directory) not in json.dumps(
+        [value.as_dict() for value in artifacts.values()]
+    )
 
 
 def test_unsafe_optional_recipe_revision_is_omitted_from_public_provenance(
@@ -1588,6 +1648,55 @@ def test_missing_figure_keeps_manifest_identity_and_safe_state(tmp_path):
         "orientation": 1,
     }
     assert figure.content_sha256 == expected_sha256
+
+
+def test_invalid_mistral_layout_isolated_from_healthy_capture_artifacts(
+    tmp_path,
+):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    capture_directory = _capture(root)
+    capture_directory.mkdir(parents=True)
+    (capture_directory / "orig_1.jpg").write_bytes(original)
+    (capture_directory / "photo_1.jpg").write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+    layout_path = _entry(root) / "ocr" / "layout.json"
+    layout_path.parent.mkdir(parents=True)
+    layout_path.write_text(
+        json.dumps({"regions": [], "images": {}}),
+        encoding="utf-8",
+    )
+    repository = _repository(root)
+
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+
+    healthy = [
+        value
+        for value in artifacts
+        if value.key.artifact_id in {CAPTURE_DISPLAY_ID, CAPTURE_ORIGINAL_ID}
+    ]
+    assert len(healthy) == 2
+    assert all(
+        value.resource_state is ResourceState.AVAILABLE
+        for value in healthy
+    )
+    diagnostic = next(
+        value
+        for value in artifacts
+        if value.kind == "artifact-diagnostic"
+    )
+    assert diagnostic.resource_state is ResourceState.UNAVAILABLE
+    assert diagnostic.resource is None
+    assert diagnostic.label == "Mistral artifacts unavailable"
+    assert diagnostic.extensions["artifact_diagnostics"] == (
+        {
+            "scope": "mistral_layout",
+            "code": "invalid_mistral_layout",
+            "state": "unavailable",
+        },
+    )
+    assert str(layout_path) not in json.dumps(diagnostic.as_dict())
 
 
 def test_region_rid_survives_canonical_save_reorder_and_page_move(

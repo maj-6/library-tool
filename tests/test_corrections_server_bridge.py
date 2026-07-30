@@ -1934,6 +1934,126 @@ def test_capture_only_index_isolates_partial_missing_and_corrupt_assets(
     )
 
 
+def test_capture_only_index_marks_malformed_rendition_and_geometry_partial(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    _use_capture_only_target(server, title="Capture With Partial Metadata")
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "healthy-book": {
+                    "id": "healthy-book",
+                    "title": "Healthy Catalogue Book",
+                }
+            },
+        )
+    manifest_path = (
+        server.CAPTURES_DIR / CAPTURE_ID / "photo_assets.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["assets"][0]["original"] = ["invalid", "rendition"]
+    manifest["assets"][0]["geometry"] = ["invalid-geometry"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200, response.get_json()
+    books = {row["id"]: row for row in response.get_json()["books"]}
+    damaged = books[BOOK_ID]
+    assert damaged["kind"] == "capture"
+    assert damaged["import_state"] == "partial"
+    assert len(damaged["captures"]) == 1
+    assert damaged["captures"][0]["resource_state"] == "available"
+    assert damaged["captures"][0]["import_state"] == "partial"
+    assert "Captured image geometry is incomplete" in damaged["issues"]
+    assert "1 captured image record is incomplete" in damaged["issues"]
+    assert books["healthy-book"]["import_state"] == "ready"
+
+    artifacts_response = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts"
+    )
+    assert artifacts_response.status_code == 200
+    artifacts = artifacts_response.get_json()["artifacts"]
+    scopes = {
+        diagnostic["scope"]
+        for artifact in artifacts
+        for diagnostic in artifact["extensions"].get(
+            "artifact_diagnostics",
+            [],
+        )
+    }
+    assert scopes == {"capture_geometry", "capture_rendition"}
+    assert str(server.CAPTURES_DIR) not in response.get_data(as_text=True)
+    assert str(server.CAPTURES_DIR) not in (
+        artifacts_response.get_data(as_text=True)
+    )
+
+
+def test_corrupt_mistral_layout_isolated_in_real_index_and_artifact_routes(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    with server._builds_lock:
+        builds = server.lib.load_json(server.BUILDS_PATH, {})
+        builds["healthy-book"] = {
+            "id": "healthy-book",
+            "title": "Healthy Catalogue Book",
+        }
+        server.lib.save_json(server.BUILDS_PATH, builds)
+    layout_path = server.ENTRIES_DIR / BOOK_ID / "ocr" / "layout.json"
+    layout_path.write_text('{"regions": [', encoding="utf-8")
+
+    response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200, response.get_json()
+    books = {row["id"]: row for row in response.get_json()["books"]}
+    damaged = books[BOOK_ID]
+    assert damaged["import_state"] == "partial"
+    assert "Mistral artifact layout is unavailable" in damaged["issues"]
+    assert books["healthy-book"]["import_state"] == "ready"
+
+    artifacts_response = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts"
+    )
+    assert artifacts_response.status_code == 200
+    artifacts = artifacts_response.get_json()["artifacts"]
+    diagnostic = next(
+        artifact
+        for artifact in artifacts
+        if artifact["kind"] == "artifact-diagnostic"
+    )
+    assert diagnostic["resource_state"] == "unavailable"
+    assert diagnostic["resource"] is None
+    assert diagnostic["extensions"]["artifact_diagnostics"] == [
+        {
+            "scope": "mistral_layout",
+            "code": "invalid_mistral_layout",
+            "state": "unavailable",
+        }
+    ]
+    assert len(
+        [
+            artifact
+            for artifact in artifacts
+            if artifact["source"]["representation_id"] == "capture"
+        ]
+    ) == 2
+    assert str(layout_path) not in response.get_data(as_text=True)
+    assert str(layout_path) not in artifacts_response.get_data(as_text=True)
+
+
 def test_production_review_bridge_owns_actor_and_reconciles_cas(
     client,
     corrections_workspace,

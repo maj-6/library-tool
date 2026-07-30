@@ -1731,6 +1731,53 @@ def _capture_import_state(value: RasterArtifactView) -> str:
     return "ready"
 
 
+def _artifact_diagnostic_scopes(
+    value: RasterArtifactView,
+) -> frozenset[str]:
+    diagnostics = value.extensions.get("artifact_diagnostics")
+    if (
+        isinstance(diagnostics, (str, bytes))
+        or not isinstance(diagnostics, Sequence)
+        or len(diagnostics) > 128
+    ):
+        return frozenset()
+    known = {
+        "capture_geometry",
+        "capture_rendition",
+        "mistral_figure",
+        "mistral_layout",
+    }
+    return frozenset(
+        scope
+        for diagnostic in diagnostics
+        if isinstance(diagnostic, Mapping)
+        for scope in (diagnostic.get("scope"),)
+        if (
+            isinstance(scope, str)
+            and scope in known
+            and diagnostic.get("state") in {"missing", "unavailable"}
+        )
+    )
+
+
+def _capture_group_import_state(
+    values: Sequence[RasterArtifactView],
+) -> str:
+    states = [_capture_import_state(value) for value in values]
+    if states and all(state == "missing" for state in states):
+        return "missing"
+    if states and all(state == "unavailable" for state in states):
+        return "unavailable"
+    has_diagnostics = any(
+        _artifact_diagnostic_scopes(value)
+        & {"capture_geometry", "capture_rendition"}
+        for value in values
+    )
+    if has_diagnostics or any(state != "ready" for state in states):
+        return "partial"
+    return "ready"
+
+
 def _capture_rank(value: RasterArtifactView) -> tuple[int, str]:
     variant = value.resource.variant if value.resource is not None else ""
     is_display = (
@@ -1766,7 +1813,7 @@ def _capture_rows(
             "label": value.label,
             "effective_category": value.effective_category,
             "resource_state": value.resource_state.value,
-            "import_state": _capture_import_state(value),
+            "import_state": _capture_group_import_state(by_order[order]),
             "freshness": value.freshness.value,
             "thumbnail": None,
         }
@@ -1836,20 +1883,33 @@ def _index_capture_inventory(
 ) -> tuple[list[dict[str, Any]], str, tuple[str, ...]]:
     """Project one independently fallible capture inventory for the index."""
 
-    captures = _capture_rows(
-        item.item_id,
-        _validated_rasters(
-            rasters.list_raster_artifacts(item.item_id),
-            item_id=item.item_id,
-        ),
+    values = _validated_rasters(
+        rasters.list_raster_artifacts(item.item_id),
+        item_id=item.item_id,
     )
+    captures = _capture_rows(item.item_id, values)
+    diagnostic_scopes = frozenset(
+        scope
+        for value in values
+        for scope in _artifact_diagnostic_scopes(value)
+    )
+    issues: list[str] = []
+    if "capture_geometry" in diagnostic_scopes:
+        issues.append("Captured image geometry is incomplete")
+    if "mistral_layout" in diagnostic_scopes:
+        issues.append("Mistral artifact layout is unavailable")
+    if "mistral_figure" in diagnostic_scopes:
+        issues.append("Mistral image artifacts are incomplete")
     if _item_has_capture_inventory(item) and not captures:
         return (
             [],
             "missing",
-            ("Captured image manifest is missing",),
+            ("Captured image manifest is missing", *issues),
         )
-    return captures, _book_import_state(captures), ()
+    import_state = _book_import_state(captures)
+    if diagnostic_scopes & {"mistral_layout", "mistral_figure"}:
+        import_state = "partial" if captures else "unavailable"
+    return captures, import_state, tuple(issues)
 
 
 def _book_issues(
@@ -1873,6 +1933,9 @@ def _book_issues(
     unavailable = sum(
         value["resource_state"] == "unavailable" for value in captures
     )
+    incomplete = sum(
+        value["import_state"] == "partial" for value in captures
+    )
     if missing:
         issues.append(
             f"{missing} captured image"
@@ -1882,6 +1945,11 @@ def _book_issues(
         issues.append(
             f"{unavailable} captured image"
             f"{' is' if unavailable == 1 else 's are'} unavailable"
+        )
+    if incomplete:
+        issues.append(
+            f"{incomplete} captured image record"
+            f"{' is' if incomplete == 1 else 's are'} incomplete"
         )
     values = list(dict.fromkeys(issues))
     if (
