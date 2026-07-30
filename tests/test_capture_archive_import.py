@@ -26,7 +26,7 @@ def _isolate_capture_files(monkeypatch, tmp_path):
     monkeypatch.setattr(
         lib,
         "MANUAL_ENTRIES_PATH",
-        tmp_path / "manual_entries.json",
+        workspace / "manual_entries.json",
     )
     monkeypatch.setattr(
         server, "BUILDS_PATH", workspace / "whl_builds.json"
@@ -2224,6 +2224,149 @@ def test_matching_promotion_attachment_keeps_verified_archive_current(
     assert server._capture_archive_association(
         capture_id
     ).state.value == "current"
+
+
+def test_create_promotion_rejects_a_concurrent_capture_metadata_edit(
+        monkeypatch):
+    capture_id = "create_promotion_metadata_race.1"
+    _entry_id, association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_compare = server._capture_promotion_changes_source
+
+    def paused_compare(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_compare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_capture_promotion_changes_source",
+        paused_compare,
+    )
+    promoted = {}
+
+    def run_promotion():
+        promoted["result"] = server._create_build({
+            "title": "A Capture Herbal",
+            "capture_id": capture_id,
+        })
+
+    worker = threading.Thread(target=run_promotion)
+    worker.start()
+    assert entered.wait(5)
+    with server.app.test_client() as client:
+        before = client.get(
+            f"/api/v1/corrections/items/{association.book_id}"
+        ).get_json()["item"]
+        edited = client.patch(
+            f"/api/v1/corrections/items/{association.book_id}",
+            json={
+                "patch": {
+                    "title": "Human correction during promotion",
+                    "metadata_set": {"authors": "Current cataloguer"},
+                    "metadata_remove": [],
+                }
+            },
+            headers={
+                "Idempotency-Key": "create-promotion-metadata-race",
+                "If-Record-Match": (
+                    f'"{before["record_revision"]}"'
+                ),
+            },
+        )
+    assert edited.status_code == 200, edited.get_json()
+    release.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    build, error = promoted["result"]
+    assert build is None
+    assert error == "capture source changed elsewhere"
+    assert lib.load_json(server.BUILDS_PATH, {}) == {}
+    after = server._capture_manual_source(capture_id)
+    assert after is not None
+    assert after["title"] == "Human correction during promotion"
+    assert after["author"] == "Current cataloguer"
+
+
+def test_attach_promotion_rejects_a_concurrent_capture_metadata_edit(
+        monkeypatch):
+    capture_id = "attach_promotion_metadata_race.1"
+    _entry_id, association = _ingest_associated_capture(
+        monkeypatch,
+        capture_id,
+    )
+    build, error = server._create_build({"title": "A Capture Herbal"})
+    assert error == ""
+    assert build is not None
+    entered = threading.Event()
+    release = threading.Event()
+    original_compare = server._capture_promotion_changes_source
+
+    def paused_compare(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_compare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_capture_promotion_changes_source",
+        paused_compare,
+    )
+    promoted = {}
+
+    def run_promotion():
+        with server.app.test_client() as client:
+            response = client.patch(
+                f"/api/builds/{build['id']}",
+                json={
+                    "capture_id": capture_id,
+                    "expect_updated_at": build["updated_at"],
+                },
+            )
+            promoted["status"] = response.status_code
+            promoted["body"] = response.get_json()
+
+    worker = threading.Thread(target=run_promotion)
+    worker.start()
+    assert entered.wait(5)
+    with server.app.test_client() as client:
+        before = client.get(
+            f"/api/v1/corrections/items/{association.book_id}"
+        ).get_json()["item"]
+        edited = client.patch(
+            f"/api/v1/corrections/items/{association.book_id}",
+            json={
+                "patch": {
+                    "title": "Human correction during attachment",
+                    "metadata_set": {"authors": "Current cataloguer"},
+                    "metadata_remove": [],
+                }
+            },
+            headers={
+                "Idempotency-Key": "attach-promotion-metadata-race",
+                "If-Record-Match": (
+                    f'"{before["record_revision"]}"'
+                ),
+            },
+        )
+    assert edited.status_code == 200, edited.get_json()
+    release.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert promoted["status"] == 409
+    assert promoted["body"]["code"] == "capture_source_revision_conflict"
+    stored = lib.load_json(server.BUILDS_PATH, {})[build["id"]]
+    assert not stored.get("capture_id")
+    after = server._capture_manual_source(capture_id)
+    assert after is not None
+    assert after["title"] == "Human correction during attachment"
+    assert after["author"] == "Current cataloguer"
 
 
 @pytest.mark.parametrize("mode", ["create", "attach"])

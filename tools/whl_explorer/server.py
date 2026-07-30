@@ -181,11 +181,13 @@ from librarytool.engine.jobs import (  # noqa: E402
 )
 from librarytool.engine.item_commands import (  # noqa: E402
     CreateItemCommand,
+    ItemCommandResult,
     ItemCommandService,
     ItemDraft,
     ItemPatch,
     ItemRecordSnapshot,
     UpdateItemCommand,
+    update_item_command_sha256,
 )
 from librarytool.engine.item_lifecycle import (  # noqa: E402
     DeleteItemCommand as LifecycleDeleteItemCommand,
@@ -2062,6 +2064,9 @@ def corrections_workbench():
         ),
         artifact_editors_v=_asset_v("corrections/artifact-editors.js"),
         corrections_properties_v=_asset_v("corrections/properties.js"),
+        corrections_item_properties_v=_asset_v(
+            "corrections/item-properties.js"
+        ),
         corrections_artifacts_v=_asset_v("corrections/artifacts.js"),
         corrections_books_v=_asset_v("corrections/books.js"),
         corrections_reviews_v=_asset_v("corrections/reviews.js"),
@@ -2411,23 +2416,83 @@ _CAPTURE_PROMOTION_SOURCE_FIELDS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _CaptureManualSourceSnapshot:
+    storage_id: str
+    record_revision: str
+    record: Mapping
+
+
+def _capture_manual_source_snapshot_locked(
+        capture_id: str,
+) -> _CaptureManualSourceSnapshot | None:
+    """Read one capture source while the caller holds ``_manual_lock``."""
+
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    matches = [
+        (entry_id, copy.deepcopy(entry))
+        for entry_id, entry in entries.items()
+        if (
+            isinstance(entry_id, str)
+            and isinstance(entry, dict)
+            and _capture_archive_id(entry.get("capture_id"))
+            == capture_id
+        )
+    ] if isinstance(entries, dict) else []
+    if len(matches) > 1:
+        raise ValueError("capture identity is assigned to multiple entries")
+    if not matches:
+        return None
+    storage_id, record = matches[0]
+    return _CaptureManualSourceSnapshot(
+        storage_id=storage_id,
+        record_revision=_MANUAL_ENTRY_ITEM_CODEC.record_revision(
+            storage_id,
+            record,
+        ),
+        record=record,
+    )
+
+
+def _capture_manual_source_snapshot(
+        capture_id: str,
+) -> _CaptureManualSourceSnapshot | None:
+    with _manual_lock:
+        return _capture_manual_source_snapshot_locked(capture_id)
+
+
 def _capture_manual_source(capture_id: str) -> dict | None:
     """Return the one committed compatibility row behind an association."""
 
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
-        matches = [
-            copy.deepcopy(entry)
-            for entry in entries.values()
-            if (
-                isinstance(entry, dict)
-                and _capture_archive_id(entry.get("capture_id"))
-                == capture_id
-            )
-        ] if isinstance(entries, dict) else []
-    if len(matches) > 1:
-        raise ValueError("capture identity is assigned to multiple entries")
-    return matches[0] if matches else None
+    snapshot = _capture_manual_source_snapshot(capture_id)
+    return dict(snapshot.record) if snapshot is not None else None
+
+
+def _capture_source_revision_matches_locked(
+        capture_id: str,
+        expected: _CaptureManualSourceSnapshot | None,
+) -> bool:
+    current = _capture_manual_source_snapshot_locked(capture_id)
+    return (
+        current is not None
+        and expected is not None
+        and current.storage_id == expected.storage_id
+        and current.record_revision == expected.record_revision
+    )
+
+
+def _capture_has_competing_build_locked(
+        builds: Mapping,
+        capture_id: str,
+        *,
+        except_build_id: str = "",
+) -> bool:
+    return any(
+        build_id != except_build_id
+        and isinstance(build, Mapping)
+        and _capture_archive_id(build.get("capture_id")) == capture_id
+        for build_id, build in builds.items()
+    )
 
 
 def _capture_promotion_changes_source(
@@ -2477,9 +2542,14 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
     )
     if capture_id and capture_association is None:
         return None, "capture_id has no verified archive association"
-    capture_source = (
-        _capture_manual_source(capture_id)
+    capture_source_snapshot = (
+        _capture_manual_source_snapshot(capture_id)
         if capture_id
+        else None
+    )
+    capture_source = (
+        dict(capture_source_snapshot.record)
+        if capture_source_snapshot is not None
         else None
     )
     if capture_id and capture_source is None:
@@ -2516,18 +2586,30 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
     ):
         _mark_capture_archive_stale(capture_id)
 
-    with _builds_lock:
-        builds = lib.load_json(BUILDS_PATH, {})
-        build["id"] = lib.gen_id(set(builds))
-        build["created_at"] = _build_updated_at()
-        build["updated_at"] = build["created_at"]
-        build["representation_manifest"] = {
-            "version": 1,
-            "sources": {},
-            "detached": [],
-        }
-        builds[build["id"]] = build
-        lib.save_json(BUILDS_PATH, builds)
+    with _ensure_engine_session().write_set.workspace_lease():
+        with _builds_lock:
+            with _manual_lock:
+                builds = lib.load_json(BUILDS_PATH, {})
+                if capture_id and not _capture_source_revision_matches_locked(
+                    capture_id,
+                    capture_source_snapshot,
+                ):
+                    return None, "capture source changed elsewhere"
+                if capture_id and _capture_has_competing_build_locked(
+                    builds,
+                    capture_id,
+                ):
+                    return None, "capture already has an active build"
+                build["id"] = lib.gen_id(set(builds))
+                build["created_at"] = _build_updated_at()
+                build["updated_at"] = build["created_at"]
+                build["representation_manifest"] = {
+                    "version": 1,
+                    "sources": {},
+                    "detached": [],
+                }
+                builds[build["id"]] = build
+                lib.save_json(BUILDS_PATH, builds)
     try:
         _apply_pending_capture_review(build)
     except Exception as exc:
@@ -2587,6 +2669,7 @@ def api_builds_update(build_id: str):
     requested_capture_id = None
     requested_association = None
     requested_capture_source = None
+    requested_capture_source_snapshot = None
     if "capture_id" in payload:
         raw_capture_id = payload.get("capture_id")
         requested_capture_id = _capture_archive_id(raw_capture_id)
@@ -2606,8 +2689,13 @@ def api_builds_update(build_id: str):
                     "error": "capture_id has no verified archive association",
                     "code": "capture_archive_association_required",
                 }), 409
-            requested_capture_source = _capture_manual_source(
+            requested_capture_source_snapshot = _capture_manual_source_snapshot(
                 requested_capture_id
+            )
+            requested_capture_source = (
+                dict(requested_capture_source_snapshot.record)
+                if requested_capture_source_snapshot is not None
+                else None
             )
             if requested_capture_source is None:
                 return jsonify({
@@ -2689,45 +2777,76 @@ def api_builds_update(build_id: str):
             }), 409
         if requested_association is not None:
             candidate["capture_book_id"] = requested_association.book_id
-        if (
-            not before_capture_id
-            and after_capture_id
-            and requested_capture_source is not None
-             and _capture_promotion_changes_source(
-                 candidate,
-                 requested_capture_source,
-                 explicit_fields=set(payload),
-             )
-        ):
-            stale_capture_ids.add(after_capture_id)
         if before_capture_id and any(
             candidate.get(field) != b.get(field)
             for field in _CAPTURE_ARCHIVE_BUILD_FIELDS
         ):
             stale_capture_ids.add(before_capture_id)
 
+    if (
+        not before_capture_id
+        and after_capture_id
+        and requested_capture_source is not None
+        and _capture_promotion_changes_source(
+            candidate,
+            requested_capture_source,
+            explicit_fields=set(payload),
+        )
+    ):
+        stale_capture_ids.add(after_capture_id)
+
     # Invalidate before committing catalogue state. A failed publication leaves
     # the matched catalogue revision untouched, so the same CAS can retry it.
     for stale_capture_id in sorted(stale_capture_ids):
         _mark_capture_archive_stale(stale_capture_id)
 
-    with _builds_lock:
-        builds = lib.load_json(BUILDS_PATH, {})
-        current = builds.get(build_id)
-        if (
-            not isinstance(current, dict)
-            or str(current.get("updated_at") or "") != snapshot_revision
-        ):
-            return jsonify({
-                "ok": False,
-                "error": "changed elsewhere",
-                "build": current,
-            }), 409
-        assert candidate is not None
-        candidate["updated_at"] = _build_updated_at(snapshot_revision)
-        builds[build_id] = candidate
-        lib.save_json(BUILDS_PATH, builds)
-        b = candidate
+    with _ensure_engine_session().write_set.workspace_lease():
+        with _builds_lock:
+            with _manual_lock:
+                builds = lib.load_json(BUILDS_PATH, {})
+                current = builds.get(build_id)
+                if (
+                    not isinstance(current, dict)
+                    or str(current.get("updated_at") or "")
+                    != snapshot_revision
+                ):
+                    return jsonify({
+                        "ok": False,
+                        "error": "changed elsewhere",
+                        "build": current,
+                    }), 409
+                if (
+                    requested_capture_id
+                    and not _capture_source_revision_matches_locked(
+                        requested_capture_id,
+                        requested_capture_source_snapshot,
+                    )
+                ):
+                    return jsonify({
+                        "ok": False,
+                        "error": "capture source changed elsewhere",
+                        "code": "capture_source_revision_conflict",
+                    }), 409
+                if (
+                    requested_capture_id
+                    and _capture_has_competing_build_locked(
+                        builds,
+                        requested_capture_id,
+                        except_build_id=build_id,
+                    )
+                ):
+                    return jsonify({
+                        "ok": False,
+                        "error": "capture already has an active build",
+                        "code": "capture_build_conflict",
+                    }), 409
+                assert candidate is not None
+                candidate["updated_at"] = _build_updated_at(
+                    snapshot_revision
+                )
+                builds[build_id] = candidate
+                lib.save_json(BUILDS_PATH, builds)
+                b = candidate
     # only the status transition is worth a feed entry; every keystroke is not
     if b["status"] != was and b["status"] in ("ready", "uploaded"):
         activity("uploaded" if b["status"] == "uploaded" else "verified", "book",
@@ -5742,6 +5861,7 @@ class _CorrectionsTarget:
     metadata: Mapping
     record: Mapping
     entry_directory: Path
+    manual_storage_id: str = ""
 
 
 _CORRECTIONS_CAPTURE_ONLY_DIRECTORY = "_corrections_capture_only"
@@ -6038,7 +6158,7 @@ def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
 
     def append_target(
             storage_kind: str, storage_id: str, raw: Mapping,
-            capture_id: str = "") -> None:
+            capture_id: str = "", manual_storage_id: str = "") -> None:
         if capture_id:
             (
                 canonical_id,
@@ -6082,6 +6202,7 @@ def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
             ),
             record=dict(raw),
             entry_directory=entry_directory,
+            manual_storage_id=manual_storage_id,
         ))
 
     for capture_id in capture_ids:
@@ -6093,11 +6214,15 @@ def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
             or manual_by_capture[capture_id]
         )
         storage_id, raw = candidates[0]
+        manual_values = manual_by_capture.get(capture_id, ())
         append_target(
             "build" if capture_id in build_by_capture else "manual",
             storage_id,
             raw,
             capture_id,
+            manual_storage_id=(
+                manual_values[0][0] if manual_values else ""
+            ),
         )
     for storage_id, raw in uncaptured_builds:
         append_target("build", storage_id, raw)
@@ -6915,27 +7040,12 @@ class _CorrectionsManualItemPolicy:
         patch: ItemPatch,
         candidate: ItemDraft,
     ) -> None:
-        target = _corrections_target_for(self._canonical_id)
-        if target is None:
-            raise EngineNotFoundError(
-                "the Corrections item does not exist",
-                code="item_not_found",
-                details={"item_id": self._canonical_id},
-            )
-        if (
-            target.storage_kind != "manual"
-            or target.storage_id != self._storage_id
-            or target.record_revision != current.revision
-        ):
-            raise EngineConflictError(
-                "the Corrections item changed storage authority",
-                code="item_revision_conflict",
-                details={
-                    "item_id": self._canonical_id,
-                    "expected_revision": current.revision,
-                    "current_revision": target.record_revision,
-                },
-            )
+        target = _corrections_require_active_storage(
+            self._canonical_id,
+            storage_kind="manual",
+            storage_id=self._storage_id,
+            current_revision=current.revision,
+        )
         _corrections_item_validate_writable_patch(target, patch)
         if "category_ids" in patch.metadata_set:
             values = candidate.metadata.get("category_ids")
@@ -6963,10 +7073,70 @@ class _CorrectionsManualItemPolicy:
             ) from exc
 
 
-def _corrections_manual_item_command_engine(
+def _corrections_require_active_storage(
+        canonical_id: str,
+        *,
+        storage_kind: str,
+        storage_id: str,
+        current_revision: str,
+) -> "_CorrectionsTarget":
+    target = _corrections_target_for(canonical_id)
+    if target is None:
+        raise EngineNotFoundError(
+            "the Corrections item does not exist",
+            code="item_not_found",
+            details={"item_id": canonical_id},
+        )
+    if (
+        target.storage_kind != storage_kind
+        or target.storage_id != storage_id
+        or target.record_revision != current_revision
+    ):
+        raise EngineConflictError(
+            "the Corrections item changed storage authority",
+            code="item_revision_conflict",
+            details={
+                "item_id": canonical_id,
+                "expected_revision": current_revision,
+                "current_revision": target.record_revision,
+            },
+        )
+    return target
+
+
+class _CorrectionsBuildItemPolicy:
+    """Combine WHL validation with canonical active-target authority."""
+
+    def __init__(self, canonical_id: str, storage_id: str) -> None:
+        self._canonical_id = canonical_id
+        self._storage_id = storage_id
+        self._profile = WhlBookItemCommandPolicy(
+            _engine_item_category_ids
+        )
+
+    def validate_create(self, candidate: ItemDraft) -> None:
+        self._profile.validate_create(candidate)
+
+    def validate_update(
+        self,
+        current: ItemRecordSnapshot,
+        patch: ItemPatch,
+        candidate: ItemDraft,
+    ) -> None:
+        target = _corrections_require_active_storage(
+            self._canonical_id,
+            storage_kind="build",
+            storage_id=self._storage_id,
+            current_revision=current.revision,
+        )
+        _corrections_item_validate_writable_patch(target, patch)
+        self._profile.validate_update(current, patch, candidate)
+
+
+def _corrections_manual_item_repository(
         canonical_id: str,
         storage_id: str,
-) -> ItemCommandService:
+) -> FilesystemItemCommandRepository:
     if not _CORRECTIONS_STORAGE_ITEM_ID_RE.fullmatch(storage_id):
         raise EngineRepositoryError(
             "the captured entry uses an unsupported legacy storage identity",
@@ -6983,11 +7153,81 @@ def _corrections_manual_item_command_engine(
         lock_context_for=_corrections_workspace_locks,
         recover=False,
     )
+    return repository
+
+
+def _corrections_manual_item_command_engine(
+        canonical_id: str,
+        storage_id: str,
+) -> ItemCommandService:
     return ItemCommandService(
-        repository,
+        _corrections_manual_item_repository(
+            canonical_id,
+            storage_id,
+        ),
         policy=_CorrectionsManualItemPolicy(canonical_id, storage_id),
         allow_legacy_delete=False,
     )
+
+
+def _corrections_build_item_command_engine(
+        canonical_id: str,
+        storage_id: str,
+) -> ItemCommandService:
+    repository = FilesystemItemCommandRepository(
+        _ensure_engine_session().write_set,
+        catalogue_path=BUILDS_PATH,
+        decode_record=_engine_item_command_decode,
+        encode_record=_engine_item_command_encode,
+        allocate_item_id=lambda existing: lib.gen_id(set(existing)),
+        lock_context_for=_corrections_workspace_locks,
+        recover=False,
+    )
+    return ItemCommandService(
+        repository,
+        policy=_CorrectionsBuildItemPolicy(canonical_id, storage_id),
+        allow_legacy_delete=False,
+    )
+
+
+def _corrections_promoted_manual_replay(
+        command: UpdateItemCommand,
+        target: "_CorrectionsTarget",
+) -> ItemCommandResult | None:
+    manual_storage_id = target.manual_storage_id
+    if (
+        target.storage_kind != "build"
+        or not manual_storage_id
+        or not _CORRECTIONS_STORAGE_ITEM_ID_RE.fullmatch(
+            manual_storage_id
+        )
+    ):
+        return None
+    repository = _corrections_manual_item_repository(
+        command.item_id,
+        manual_storage_id,
+    )
+    with repository.unit_of_work(
+        operation_id=command.operation_id
+    ) as unit:
+        prior = unit.receipt(command.operation_id)
+    if prior is None or prior.item_id != manual_storage_id:
+        return None
+    expected_hash = update_item_command_sha256(
+        manual_storage_id,
+        command.expected_revision,
+        command.patch,
+    )
+    if (
+        prior.action != "update"
+        or prior.command_sha256 != expected_hash
+    ):
+        raise EngineConflictError(
+            "the operation id was already used for another item command",
+            code="operation_id_conflict",
+            details={"operation_id": command.operation_id},
+        )
+    return ItemCommandResult(prior, replayed=True)
 
 
 class _CorrectionsItemUpdateService:
@@ -7007,6 +7247,12 @@ class _CorrectionsItemUpdateService:
             )
             storage_kind = target.storage_kind
             storage_id = target.storage_id
+        replay = _corrections_promoted_manual_replay(
+            command,
+            target,
+        )
+        if replay is not None:
+            return replay
 
         _corrections_item_invalidate_capture(command)
         delegated = UpdateItemCommand(
@@ -7021,7 +7267,10 @@ class _CorrectionsItemUpdateService:
                 storage_id,
             )
         else:
-            service = _item_command_engine()
+            service = _corrections_build_item_command_engine(
+                command.item_id,
+                storage_id,
+            )
         return service.update(delegated)
 
 

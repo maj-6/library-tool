@@ -442,6 +442,32 @@ def create_item_command_sha256(draft: ItemDraft) -> str:
     ).hexdigest()
 
 
+def update_item_command_sha256(
+    item_id: str,
+    expected_revision: str,
+    patch: ItemPatch,
+) -> str:
+    """Return the canonical identity used by every update-item boundary."""
+
+    item_id = _portable_identifier(item_id, "item_id")
+    expected_revision = _revision(
+        expected_revision,
+        "expected_revision",
+    )
+    if not isinstance(patch, ItemPatch):
+        raise TypeError("patch must be an ItemPatch")
+    return hashlib.sha256(
+        _canonical(
+            {
+                "action": "update",
+                "item_id": item_id,
+                "expected_revision": expected_revision,
+                "patch": patch.as_dict(),
+            }
+        )
+    ).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class UpdateItemCommand:
     item_id: str
@@ -884,13 +910,10 @@ class ItemCommandService:
                 details={"item_id": item_id},
             )
         operation_id = self._operation_id(command.operation_id)
-        command_sha256 = self._command_hash(
-            {
-                "action": "update",
-                "item_id": item_id,
-                "expected_revision": expected_revision,
-                "patch": command.patch.as_dict(),
-            }
+        command_sha256 = update_item_command_sha256(
+            item_id,
+            expected_revision,
+            command.patch,
         )
         try:
             with self._repository.unit_of_work(
@@ -1261,4 +1284,5 @@ __all__ = [
     "RepresentationDraft",
     "UpdateItemCommand",
     "create_item_command_sha256",
+    "update_item_command_sha256",
 ]

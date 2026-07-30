@@ -565,6 +565,42 @@ def test_capture_only_metadata_edit_is_conditional_idempotent_and_path_free(
         "extra.book_id"
     ]
 
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "promoted-local": {
+                    "id": "promoted-local",
+                    "title": after["title"],
+                    "authors": after["metadata"]["authors"],
+                    "publisher_city": (
+                        after["metadata"]["publisher_city"]
+                    ),
+                    "condition": after["metadata"]["condition"],
+                    "capture_id": CAPTURE_ID,
+                    "capture_book_id": BOOK_ID,
+                }
+            },
+        )
+        promoted_before = server.lib.load_json(
+            server.BUILDS_PATH,
+            {},
+        )["promoted-local"]
+    promoted_replay = second_client.patch(
+        endpoint,
+        json=document,
+        headers=headers,
+    )
+    assert promoted_replay.status_code == 200, promoted_replay.get_json()
+    assert promoted_replay.get_json()["replayed"] is True
+    assert promoted_replay.get_json()["item"]["id"] == BOOK_ID
+    with server._builds_lock:
+        promoted_after = server.lib.load_json(
+            server.BUILDS_PATH,
+            {},
+        )["promoted-local"]
+    assert promoted_after == promoted_before
+
 
 def test_promoted_capture_metadata_edit_targets_only_the_active_build(
     client,
@@ -634,6 +670,97 @@ def test_promoted_capture_metadata_edit_targets_only_the_active_build(
     assert build["title"] == "Corrected promoted title"
     assert build["authors"] == "Corrected build author"
     assert source == manual
+
+
+def test_promoted_metadata_edit_does_not_commit_after_authority_conflict(
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                manual_id: {
+                    "id": manual_id,
+                    "title": "Capture source",
+                    "capture_id": CAPTURE_ID,
+                }
+            },
+        )
+    original = {
+        "id": "promoted-a",
+        "title": "Promoted A",
+        "capture_id": CAPTURE_ID,
+        "capture_book_id": BOOK_ID,
+    }
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {"promoted-a": original},
+        )
+    before = server._corrections_item_snapshot()[BOOK_ID]
+    entered = threading.Event()
+    release = threading.Event()
+
+    def pause_before_command(_command):
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(
+        server,
+        "_corrections_item_invalidate_capture",
+        pause_before_command,
+    )
+    result = {}
+
+    def run_edit():
+        with server.app.test_client() as edit_client:
+            response = edit_client.patch(
+                f"/api/v1/corrections/items/{BOOK_ID}",
+                json={
+                    "patch": {
+                        "title": "Must not commit",
+                        "metadata_set": {},
+                        "metadata_remove": [],
+                    }
+                },
+                headers={
+                    "Idempotency-Key": (
+                        "bridge-promoted-authority-conflict"
+                    ),
+                    "If-Record-Match": (
+                        f'"{before["revision"]}"'
+                    ),
+                },
+            )
+            result["status"] = response.status_code
+            result["body"] = response.get_json()
+
+    worker = threading.Thread(target=run_edit)
+    worker.start()
+    assert entered.wait(5)
+    with server._builds_lock:
+        builds = server.lib.load_json(server.BUILDS_PATH, {})
+        builds["promoted-b"] = {
+            "id": "promoted-b",
+            "title": "Conflicting authority",
+            "capture_id": CAPTURE_ID,
+            "capture_book_id": BOOK_ID,
+        }
+        server.lib.save_json(server.BUILDS_PATH, builds)
+    release.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert result["status"] == 500
+    assert result["body"]["code"] == "correction_item_update_unavailable"
+    with server._builds_lock:
+        stored = server.lib.load_json(server.BUILDS_PATH, {})
+    assert stored["promoted-a"] == original
 
 
 def test_capture_metadata_edit_does_not_commit_when_archive_invalidation_fails(
