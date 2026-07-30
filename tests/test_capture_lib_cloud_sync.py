@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from types import SimpleNamespace
 
 import pytest
 import supabase_sync
@@ -608,3 +609,101 @@ def test_capture_association_states_fail_closed_on_malformed_rows(
     )
     with pytest.raises(supabase_sync.SyncError, match="association state"):
         supabase_sync.list_capture_association_states({}, [CAPTURE_ID])
+
+
+def test_scoped_publisher_atomically_imports_pending_null_row(monkeypatch):
+    stable_capability(monkeypatch)
+    service_cfg, scope_cfg = publish_configs()
+    calls = []
+
+    def rest(cfg, method, path, payload=None, prefer=""):
+        calls.append((cfg, method, path, payload, prefer))
+        if method == "GET":
+            return [{
+                "id": CAPTURE_ID,
+                "status": "pending",
+                "lib_association": None,
+                "lib_association_revision": 0,
+                "lib_association_updated_at": None,
+            }]
+        if cfg is scope_cfg:
+            return [prepared_row()]
+        return [accepted_row()]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+    publisher = supabase_sync.ScopedCaptureLibAssociationPublisher(
+        service_cfg,
+        scope_cfg,
+    )
+    publisher.publish(SimpleNamespace(as_dict=lambda: association()))
+
+    assert [call[1] for call in calls] == ["GET", "POST", "POST"]
+    assert calls[0][2].startswith(
+        f"captures?id=in.({CAPTURE_ID})&select=id,status,lib_association,"
+    )
+    assert calls[1][2] == "rpc/prepare_capture_lib_association"
+    assert calls[2][2] == "rpc/publish_capture_lib_association"
+    assert calls[1][3]["p_expected_revision"] == 0
+    assert calls[1][3]["p_mark_imported"] is True
+
+
+def test_scoped_publisher_fills_legacy_imported_null_without_status_race(
+    monkeypatch,
+):
+    stable_capability(monkeypatch)
+    service_cfg, scope_cfg = publish_configs()
+    prepared_payloads = []
+
+    def rest(cfg, method, _path, payload=None, _prefer=""):
+        if method == "GET":
+            return [{
+                "id": CAPTURE_ID,
+                "status": "imported",
+                "lib_association": None,
+                "lib_association_revision": 0,
+                "lib_association_updated_at": None,
+            }]
+        if cfg is scope_cfg:
+            prepared_payloads.append(payload)
+            return [prepared_row(mark_imported=False)]
+        return [accepted_row()]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+    supabase_sync.ScopedCaptureLibAssociationPublisher(
+        service_cfg,
+        scope_cfg,
+    ).publish(SimpleNamespace(as_dict=lambda: association()))
+
+    assert prepared_payloads[0]["p_expected_revision"] == 0
+    assert prepared_payloads[0]["p_mark_imported"] is False
+
+
+def test_scoped_publisher_replays_exact_state_and_rejects_drift_or_expired_lease(
+    monkeypatch,
+):
+    service_cfg, scope_cfg = publish_configs()
+    row = accepted_row()
+    calls = []
+
+    def rest(*_args, **_kwargs):
+        calls.append(True)
+        return [row]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+    publisher = supabase_sync.ScopedCaptureLibAssociationPublisher(
+        service_cfg,
+        scope_cfg,
+    )
+    value = SimpleNamespace(as_dict=lambda: association())
+    publisher.publish(value)
+    assert len(calls) == 1
+
+    row["lib_association"] = association(book_id="b-" + "e" * 32)
+    with pytest.raises(supabase_sync.SyncError, match="conflicting remote"):
+        publisher.publish(value)
+    assert len(calls) == 2
+
+    service_cfg.pop("key")
+    with pytest.raises(supabase_sync.SyncError, match="service credential"):
+        publisher.publish(value)
+    assert len(calls) == 2
