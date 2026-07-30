@@ -671,6 +671,161 @@
       });
     }
 
+    function correctionIndexPollingPort(client, options = {}) {
+      const corrections = client && client.corrections;
+      if (!corrections || typeof corrections.index !== "function") return null;
+      const requestedInterval = Number(options.intervalMs);
+      const intervalMs = Number.isFinite(requestedInterval)
+        ? Math.max(250, Math.min(30_000, Math.round(requestedInterval)))
+        : 2_000;
+      const schedule = typeof options.schedule === "function"
+        ? options.schedule
+        : (callback, delay) => {
+            const token = setTimeout(callback, delay);
+            if (token && typeof token.unref === "function") token.unref();
+            return token;
+          };
+      const cancelSchedule = typeof options.cancelSchedule === "function"
+        ? options.cancelSchedule
+        : (token) => clearTimeout(token);
+      const lifecycle = options.lifecycle &&
+          typeof options.lifecycle.addEventListener === "function"
+        ? options.lifecycle : null;
+      const subscriptions = new Set();
+      let lifecycleListening = false;
+
+      function lifecycleActive() {
+        return !lifecycle || lifecycle.visibilityState !== "hidden";
+      }
+
+      function schedulePoll(subscription, delay = intervalMs) {
+        if (subscription.closed || subscription.timer != null ||
+            subscription.inflight || !lifecycleActive()) return;
+        subscription.timer = schedule(() => {
+          subscription.timer = null;
+          void poll(subscription);
+        }, delay);
+      }
+
+      function stopScheduled(subscription) {
+        if (subscription.timer != null) {
+          cancelSchedule(subscription.timer);
+          subscription.timer = null;
+        }
+      }
+
+      function suspend(subscription) {
+        stopScheduled(subscription);
+        if (subscription.inflight && subscription.inflight.controller) {
+          subscription.inflight.controller.abort();
+        }
+      }
+
+      async function poll(subscription) {
+        if (subscription.closed || subscription.inflight ||
+            !lifecycleActive()) return;
+        const controller = typeof AbortController === "function"
+          ? new AbortController() : null;
+        const inflight = { controller };
+        subscription.inflight = inflight;
+        try {
+          const index = await corrections.index({
+            workspaceId: subscription.workspaceId,
+            signal: controller && controller.signal,
+          });
+          if (subscription.closed || subscription.inflight !== inflight ||
+              !lifecycleActive() ||
+              (controller && controller.signal.aborted) ||
+              !index || typeof index.revision !== "string" ||
+              !index.revision) return;
+          const previous = subscription.revision;
+          subscription.revision = index.revision;
+          if (subscription.observed && previous === index.revision) return;
+          subscription.observed = false;
+          try {
+            subscription.onChange(Object.freeze({
+              schema: "librarytool.corrections-index-change/1",
+              revision: index.revision,
+            }));
+          } catch (error) {
+            // One renderer listener cannot stop future convergence checks.
+          }
+        } catch (error) {
+          // Polling is best-effort. The next bounded pass retries unless the
+          // request was suspended or the subscription was released.
+        } finally {
+          if (subscription.inflight === inflight) {
+            subscription.inflight = null;
+          }
+          schedulePoll(subscription);
+        }
+      }
+
+      function handleLifecycleChange() {
+        for (const subscription of subscriptions) {
+          if (lifecycleActive()) schedulePoll(subscription, 0);
+          else suspend(subscription);
+        }
+      }
+
+      function connectLifecycle() {
+        if (!lifecycle || lifecycleListening) return;
+        lifecycle.addEventListener("visibilitychange", handleLifecycleChange);
+        lifecycleListening = true;
+      }
+
+      function disconnectLifecycle() {
+        if (!lifecycle || !lifecycleListening) return;
+        lifecycle.removeEventListener("visibilitychange", handleLifecycleChange);
+        lifecycleListening = false;
+      }
+
+      function observe(workspaceId, revision) {
+        if (!workspaceId || !revision) return;
+        for (const subscription of subscriptions) {
+          if (subscription.workspaceId === workspaceId) {
+            subscription.revision = revision;
+            subscription.observed = true;
+          }
+        }
+      }
+
+      function subscribe({
+        workspaceId, afterRevision = null, onChange,
+      } = {}) {
+        if (typeof workspaceId !== "string" || !workspaceId) {
+          throw new TypeError("workspaceId is required");
+        }
+        if (typeof onChange !== "function") {
+          throw new TypeError("Corrections change listener is required");
+        }
+        const subscription = {
+          workspaceId,
+          revision: afterRevision || "",
+          observed: Boolean(afterRevision),
+          onChange,
+          timer: null,
+          inflight: null,
+          closed: false,
+        };
+        subscriptions.add(subscription);
+        connectLifecycle();
+        schedulePoll(subscription);
+        return () => {
+          if (subscription.closed) return;
+          subscription.closed = true;
+          subscriptions.delete(subscription);
+          suspend(subscription);
+          if (!subscriptions.size) disconnectLifecycle();
+        };
+      }
+
+      return Object.freeze({
+        observe,
+        subscribe,
+      });
+    }
+
     function correctionCommandPort(client, transformPolling = null) {
       const corrections = client && client.corrections;
       if (!corrections || typeof corrections !== "object") return null;
@@ -809,7 +964,7 @@
       });
     }
 
-    function correctionBooksPort(client) {
+    function correctionBooksPort(client, indexPolling = null) {
       const corrections = client && client.corrections;
       if (!corrections || typeof corrections.index !== "function" ||
           typeof corrections.getReview !== "function" ||
@@ -1061,6 +1216,10 @@
             workspaceId: nextWorkspaceId,
             signal,
           });
+          if (indexPolling && typeof indexPolling.observe === "function" &&
+              !(signal && signal.aborted)) {
+            indexPolling.observe(nextWorkspaceId, index && index.revision);
+          }
           if (generation === workspaceRequestGeneration &&
               requestedWorkspaceId === nextWorkspaceId &&
               !(signal && signal.aborted)) {
@@ -1072,6 +1231,9 @@
           return assembleReview(target, signal);
         },
       };
+      if (indexPolling && typeof indexPolling.subscribe === "function") {
+        books.subscribe = (options = {}) => indexPolling.subscribe(options);
+      }
       if (typeof corrections.resolveCorrections === "function") {
         books.resolveReview = async ({
           target, expectedRevision, operationId, comment = "", signal,
@@ -1132,9 +1294,14 @@
         isPlainObject(portOptions.transformPolling)
           ? portOptions.transformPolling : {},
       );
+      const indexPolling = correctionIndexPollingPort(
+        client,
+        isPlainObject(portOptions.indexPolling)
+          ? portOptions.indexPolling : {},
+      );
       const commands = correctionCommandPort(client, transformPolling);
       const reviews = correctionReviewPort(client);
-      const books = correctionBooksPort(client);
+      const books = correctionBooksPort(client, indexPolling);
 
       async function listRasterGroup({ context, group, cursor, limit, signal }) {
         if (!RASTER_GROUPS.has(group)) {
@@ -1362,6 +1529,7 @@
       correctionTransformJob,
       correctionTransformTerminalResult,
       correctionTransformPollingPort,
+      correctionIndexPollingPort,
       createCorrectionsEnginePorts,
       decorateRasterArtifact,
       decorateDocumentArtifact,

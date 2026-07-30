@@ -323,6 +323,84 @@ test("CAS conflicts reload current detail while retaining the attempted draft", 
   assert.match(root.textContent, /draft was kept/i);
 });
 
+test("external refresh rebases an unsaved caption draft onto the latest artifact revision",
+  async () => {
+    const drafts = new Map();
+    const calls = [];
+    const remote = artifact({
+      revision: "figure-r2",
+      caption_assertions: [
+        {
+          origin: "manual",
+          revision: "caption-manual-r2",
+          text: "Concurrent caption",
+          language: "la",
+        },
+        {
+          origin: "machine",
+          revision: "caption-machine-r1",
+          text: "Machine caption",
+        },
+      ],
+      effective_caption: {
+        origin: "manual",
+        revision: "caption-manual-r2",
+        text: "Concurrent caption",
+        language: "la",
+      },
+    });
+    const committed = artifact({
+      revision: "figure-r3",
+      caption_assertions: [{
+        origin: "manual",
+        revision: "caption-manual-r3",
+        text: "My local correction",
+        language: "la",
+      }],
+      effective_caption: {
+        origin: "manual",
+        revision: "caption-manual-r3",
+        text: "My local correction",
+        language: "la",
+      },
+    });
+    const { inspector, root } = harness({
+      draftStore: drafts,
+      commands: {
+        async setManualCaption(payload) {
+          calls.push(payload);
+          return { detail: committed };
+        },
+        async clearManualCaption() { throw new Error("not used"); },
+        async executeInverse() { throw new Error("not used"); },
+      },
+    });
+    const original = artifact();
+    inspector.setSelection(original);
+    inspector.saveDraft({ text: "My local correction" });
+    const stableKey = captionDraftKey(inspector.detail);
+
+    inspector.setSelection(remote);
+
+    assert.equal(captionDraftKey(inspector.detail), stableKey);
+    assert.equal(inspector.draft.text, "My local correction");
+    assert.equal(inspector.draft.language, "la",
+      "an untouched field adopts the concurrent value");
+    assert.equal(inspector.draft.baseRevision, "figure-r2");
+    assert.equal(drafts.get(stableKey).text, "My local correction");
+    assert.match(root.textContent, /newer artifact revision/i);
+    assert.match(root.textContent, /review concurrent changes to caption text/i);
+
+    await inspector.setManualCaption();
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].expectedArtifactRevision, "figure-r2");
+    assert.equal(calls[0].text, "My local correction");
+    assert.equal(calls[0].language, "la");
+    assert.equal(inspector.detail.revision, "figure-r3");
+    assert.equal(drafts.has(stableKey), false);
+  });
+
 
 test("a re-OCR machine update cannot displace an existing manual assertion", () => {
   const { inspector } = harness();

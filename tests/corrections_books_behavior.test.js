@@ -405,7 +405,9 @@ test("external index notices refresh data without importing another window's sel
     let current = fixture();
     let onChange;
     let loads = 0;
+    const externalChanges = [];
     const store = new CorrectionsIndexStore({
+      onExternalChange: (change) => externalChanges.push(change),
       api: {
         async loadIndex() {
           loads += 1;
@@ -434,6 +436,10 @@ test("external index notices refresh data without importing another window's sel
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(loads, 2);
     assert.deepEqual(store.selection, selection);
+    assert.deepEqual(externalChanges, [{
+      workspaceId: "workspace-1",
+      revision: "index-external-r1",
+    }]);
   });
 
 

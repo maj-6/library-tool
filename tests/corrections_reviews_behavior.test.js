@@ -823,3 +823,56 @@ test("feature factory shares one per-window store and never falls back to sample
     assert.match(textOf(unavailableHarness.booksList), /Books unavailable/);
     unavailable.destroy();
   });
+
+
+test("feature external convergence refreshes the local capture command target",
+  async () => {
+    let current = fixture();
+    let notify;
+    const targets = [];
+    const changes = [];
+    const harness = reviewHarness();
+    const feature = createBooksAttentionFeature({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      api: {
+        async loadIndex() { return current; },
+        subscribe(options) {
+          notify = options.onChange;
+          return () => { notify = null; };
+        },
+      },
+      onSelectionTarget: (target, detail) => targets.push({ target, detail }),
+      onExternalChange: (change) => changes.push(change),
+    });
+    await feature.setContext({
+      workspace_id: "workspace-1",
+      item_id: "book-herbarium",
+      representation_id: "scan-herbarium",
+      canvas_id: "canvas-cover",
+      artifact_id: "capture-cover",
+    });
+    assert.equal(targets.at(-1).target.revision, "capture-cover-r2");
+
+    current = clone(current);
+    current.revision = "index-external-r8";
+    current.books[0].revision = "book-herbarium-r4";
+    current.books[0].captures.find(
+      (capture) => capture.artifact_id === "capture-cover",
+    ).revision = "capture-cover-r3";
+    notify({
+      schema: "librarytool.corrections-index-change/1",
+      revision: "index-external-r8",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(feature.store.selection.artifactId, "capture-cover");
+    assert.equal(targets.at(-1).target.revision, "capture-cover-r3");
+    assert.equal(targets.at(-1).detail.source, "external");
+    assert.deepEqual(changes, [{
+      workspaceId: "workspace-1",
+      revision: "index-external-r8",
+    }]);
+    feature.destroy();
+    assert.equal(notify, null);
+  });

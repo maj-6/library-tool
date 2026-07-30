@@ -589,6 +589,9 @@
       this.onSelectionInvalidated =
         typeof options.onSelectionInvalidated === "function"
           ? options.onSelectionInvalidated : null;
+      this.onExternalChange =
+        typeof options.onExternalChange === "function"
+          ? options.onExternalChange : null;
       this.listeners = new Set();
       this.workspaceId = null;
       this.index = null;
@@ -921,7 +924,20 @@
             try {
               const change = normalizeIndexChange(value);
               if (!this.index || change.revision !== this.index.revision) {
-                this.refresh({ reason: "external" });
+                const workspaceId = this.workspaceId;
+                void Promise.resolve(this.refresh({ reason: "external" }))
+                  .finally(() => {
+                    if (this.destroyed || workspaceId !== this.workspaceId ||
+                        !this.onExternalChange) return;
+                    return this.onExternalChange(Object.freeze({
+                      workspaceId,
+                      revision: change.revision,
+                    }));
+                  })
+                  .catch(() => {
+                    // The index owns its own load error state. A secondary
+                    // panel refresh failure must not break future notices.
+                  });
               }
             } catch (error) {
               this.status = "error";

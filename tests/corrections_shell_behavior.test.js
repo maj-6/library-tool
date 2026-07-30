@@ -842,6 +842,55 @@ test("window activation refreshes shared corrections state once", async () => {
   ]);
 });
 
+test("external index convergence refreshes selected detail panels without a second Books load",
+  async () => {
+    let releaseArtifacts;
+    const calls = [];
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      destroyed: false,
+      externalRefreshPromise: null,
+      booksFeature: {
+        refresh(reason) {
+          calls.push(["books", reason]);
+          return Promise.resolve();
+        },
+      },
+      artifactsFeature: {
+        refresh(options) {
+          calls.push(["artifacts", options]);
+          return new Promise((resolve) => { releaseArtifacts = resolve; });
+        },
+      },
+      itemProperties: {
+        refresh(reason) {
+          calls.push(["metadata", reason]);
+          return Promise.resolve();
+        },
+      },
+    });
+
+    const first = shell.refreshExternalState("external-change", {
+      includeBooks: false,
+    });
+    const coalesced = shell.refreshExternalState("external-change", {
+      includeBooks: false,
+    });
+    await Promise.resolve();
+
+    assert.strictEqual(coalesced, first);
+    assert.deepEqual(calls, [
+      ["artifacts", {
+        preserveSelection: true,
+        reason: "external-change",
+      }],
+      ["metadata", "external-change"],
+    ]);
+    releaseArtifacts();
+    await first;
+    assert.equal(shell.externalRefreshPromise, null);
+  });
+
 
 test("cross-panel selection addresses retain context without carrying stale object IDs", () => {
   const prior = normalizeSelection({
@@ -981,6 +1030,7 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
   assert.equal(typeof standalone.books.getReview, "function");
   assert.equal(typeof standalone.books.resolveReview, "function");
   assert.equal(typeof standalone.books.reopenReview, "function");
+  assert.equal(typeof standalone.books.subscribe, "function");
   assert.equal(typeof standalone.transforms.subscribeResults, "function");
   assert.equal(standalone.books.trustedActor, true);
 

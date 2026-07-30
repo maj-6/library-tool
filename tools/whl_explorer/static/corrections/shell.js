@@ -341,12 +341,22 @@
     return null;
   }
 
-  function correctionsRuntimePorts(windowRef, desktopCorrections) {
+  function correctionsRuntimePorts(
+    windowRef, desktopCorrections, documentRef = null,
+  ) {
     if (desktopCorrections || !windowRef || !windowRef.engineClient ||
         typeof deps.createCorrectionsEnginePorts !== "function") {
       return null;
     }
-    return deps.createCorrectionsEnginePorts(windowRef.engineClient);
+    return deps.createCorrectionsEnginePorts(windowRef.engineClient, {
+      indexPolling: {
+        lifecycle: documentRef || windowRef.document || null,
+        schedule: typeof windowRef.setTimeout === "function"
+          ? windowRef.setTimeout.bind(windowRef) : undefined,
+        cancelSchedule: typeof windowRef.clearTimeout === "function"
+          ? windowRef.clearTimeout.bind(windowRef) : undefined,
+      },
+    });
   }
 
   class CorrectionsShell {
@@ -374,7 +384,7 @@
       this.activeTrayTab = "reviews";
       const desktopCorrections = this.desktop && this.desktop.corrections || null;
       this.engineCorrections = correctionsRuntimePorts(
-        this.windowRef, desktopCorrections);
+        this.windowRef, desktopCorrections, this.documentRef);
       this.booksApi = options.booksApi || desktopCorrections ||
         this.engineCorrections && this.engineCorrections.books || null;
       this.artifactPorts = options.artifactPorts ||
@@ -707,6 +717,10 @@
           }
         },
         onSelectionInvalidated: () => this.clearSelection(),
+        onExternalChange: () =>
+          this.refreshExternalState("external-change", {
+            includeBooks: false,
+          }),
         onStatus: (message, error) => this.setStatus(message, error),
       });
     }
@@ -1049,11 +1063,11 @@
       this.listeners.push(() => target.removeEventListener(type, handler, options));
     }
 
-    refreshExternalState(reason = "window-activation") {
+    refreshExternalState(reason = "window-activation", options = {}) {
       if (this.destroyed) return Promise.resolve([]);
       if (this.externalRefreshPromise) return this.externalRefreshPromise;
       const tasks = [];
-      if (this.booksFeature &&
+      if (options.includeBooks !== false && this.booksFeature &&
           typeof this.booksFeature.refresh === "function") {
         tasks.push(Promise.resolve().then(() =>
           this.booksFeature.refresh(reason)));

@@ -10,6 +10,9 @@ const {
 } = require(
   "../tools/whl_explorer/static/corrections/engine-adapter",
 );
+const {
+  CorrectionsIndexStore,
+} = require("../tools/whl_explorer/static/corrections/books");
 
 
 function deferred() {
@@ -295,6 +298,51 @@ function manualScheduler() {
       return token;
     },
     scheduled,
+  };
+}
+
+function nextScheduled(scheduler) {
+  while (scheduler.scheduled.length) {
+    const token = scheduler.scheduled.shift();
+    if (!token.cancelled) return token;
+  }
+  return null;
+}
+
+function correctionsIndex(revision, title = "A Herbal") {
+  const review = {
+    revision: `review-${revision}`,
+    state: "clear",
+    reason: "",
+    history_count: 0,
+    latest_event: null,
+  };
+  return {
+    schema: "librarytool.corrections-index/2",
+    revision,
+    books: [
+      {
+        id: "book-1",
+        revision: `book-1-${revision}`,
+        kind: "book",
+        title,
+        import_state: "ready",
+        issues: [],
+        review: { ...review },
+        captures: [],
+      },
+      {
+        id: "book-2",
+        revision: `book-2-${revision}`,
+        kind: "book",
+        title: "Second Herbal",
+        import_state: "ready",
+        issues: [],
+        review: { ...review },
+        captures: [],
+      },
+    ],
+    attention: [],
   };
 }
 
@@ -1458,6 +1506,145 @@ test("production books port pins audit paging and trusts the server actor",
       }],
       ["index", { workspaceId: "workspace-1", signal }],
     ]);
+  });
+
+test("production index polling converges a second visible window without sharing selection",
+  async () => {
+    const listeners = new Set();
+    const lifecycle = {
+      visibilityState: "visible",
+      addEventListener(type, listener) {
+        if (type === "visibilitychange") listeners.add(listener);
+      },
+      removeEventListener(type, listener) {
+        if (type === "visibilitychange") listeners.delete(listener);
+      },
+      emit() {
+        for (const listener of [...listeners]) listener();
+      },
+    };
+    const firstScheduler = manualScheduler();
+    const secondScheduler = manualScheduler();
+    let current = correctionsIndex("index-r1");
+    let activeReads = 0;
+    let maximumActiveReads = 0;
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          activeReads += 1;
+          maximumActiveReads = Math.max(maximumActiveReads, activeReads);
+          await Promise.resolve();
+          activeReads -= 1;
+          return current;
+        },
+        async getReview() {
+          throw new Error("not expected");
+        },
+        async listReviewHistory() {
+          throw new Error("not expected");
+        },
+      },
+    });
+    const firstPorts = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...firstScheduler, lifecycle, intervalMs: 250 },
+    });
+    const secondPorts = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...secondScheduler, lifecycle, intervalMs: 250 },
+    });
+    const first = new CorrectionsIndexStore({ api: firstPorts.books });
+    const second = new CorrectionsIndexStore({ api: secondPorts.books });
+    await first.openWorkspace("workspace-1");
+    await second.openWorkspace("workspace-1");
+    first.setSelection({
+      itemId: "book-1",
+      representationId: null,
+      canvasId: null,
+      artifactId: null,
+      annotationId: null,
+    }, { ownedByFeature: true });
+    second.setSelection({
+      itemId: "book-2",
+      representationId: null,
+      canvasId: null,
+      artifactId: null,
+      annotationId: null,
+    }, { ownedByFeature: true });
+
+    current = correctionsIndex("index-r2", "A Herbal, corrected");
+    const poll = nextScheduled(secondScheduler);
+    assert.ok(poll, "the visible production adapter schedules convergence");
+    poll.callback();
+    for (let attempt = 0;
+      attempt < 10 && second.index.revision !== "index-r2";
+      attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(second.index.revision, "index-r2");
+    assert.equal(second.index.books[0].title, "A Herbal, corrected");
+    assert.equal(second.selection.itemId, "book-2");
+    assert.equal(first.index.revision, "index-r1",
+      "another window receives no selection or snapshot state implicitly");
+    assert.equal(first.selection.itemId, "book-1");
+    assert.equal(maximumActiveReads, 1,
+      "a subscription never overlaps its bounded index reads");
+
+    lifecycle.visibilityState = "hidden";
+    lifecycle.emit();
+    assert.equal(
+      secondScheduler.scheduled.some((token) => !token.cancelled),
+      false,
+      "backgrounding cancels the pending production poll",
+    );
+    lifecycle.visibilityState = "visible";
+    lifecycle.emit();
+    assert.equal(nextScheduled(secondScheduler).delay, 0,
+      "a visible window resumes promptly");
+
+    first.destroy();
+    second.destroy();
+    assert.equal(listeners.size, 0,
+      "destroy releases every lifecycle subscription");
+  });
+
+test("production index polling recovers a window whose initial index load failed",
+  async () => {
+    const scheduler = manualScheduler();
+    let calls = 0;
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          calls += 1;
+          if (calls === 1) throw new Error("temporary index failure");
+          return correctionsIndex("index-recovered");
+        },
+        async getReview() {
+          throw new Error("not expected");
+        },
+        async listReviewHistory() {
+          throw new Error("not expected");
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...scheduler, intervalMs: 250 },
+    });
+    const store = new CorrectionsIndexStore({ api: ports.books });
+
+    await store.openWorkspace("workspace-1");
+    assert.equal(store.status, "error");
+    nextScheduled(scheduler).callback();
+    for (let attempt = 0;
+      attempt < 10 && store.status !== "ready";
+      attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(store.status, "ready");
+    assert.equal(store.index.revision, "index-recovered");
+    assert.equal(calls, 3,
+      "the successful probe is followed by one authoritative store load");
+    store.destroy();
   });
 
 test("production books port ignores a late aborted workspace load", async () => {
