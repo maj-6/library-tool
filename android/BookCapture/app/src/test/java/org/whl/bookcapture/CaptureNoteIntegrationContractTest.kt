@@ -66,7 +66,7 @@ class CaptureNoteIntegrationContractTest {
     @Test
     fun controllerGrammarAndPolicyExposeEveryNewVoiceCommand() {
         val controller = source("VoiceController")
-        for (spoken in listOf("restart", "undo", "edit", "notes", "end notes")) {
+        for (spoken in listOf("check", "restart", "undo", "edit", "notes", "end notes")) {
             assertTrue("voice grammar is missing $spoken", controller.contains("\"$spoken\""))
         }
         assertTrue(controller.contains("StateAwareVoiceCommandPolicy.evaluate("))
@@ -88,6 +88,14 @@ class CaptureNoteIntegrationContractTest {
         assertFalse(editSource.contains("setStatus(\""))
         assertFalse(editSource.contains("cues.error(\""))
 
+        assertEquals(
+            PolicyVoiceCommand.CHECK,
+            StateAwareVoiceCommandPolicy.evaluate(
+                "check",
+                VoiceCommandState.IDLE,
+                VoiceRecognitionStability.FINAL,
+            )?.command,
+        )
         assertEquals(
             PolicyVoiceCommand.RESTART,
             StateAwareVoiceCommandPolicy.evaluate(

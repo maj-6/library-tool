@@ -14,6 +14,7 @@ internal enum class VoiceRecognitionStability {
 internal enum class PolicyVoiceCommand(val wireValue: String) {
     START("start"),
     PHOTO("photo"),
+    CHECK("check"),
     DONE("done"),
     CANCEL("cancel"),
     RESTART("restart"),
@@ -49,6 +50,7 @@ internal object StateAwareVoiceCommandPolicy {
     private val idleCommands = setOf(
         PolicyVoiceCommand.START,
         PolicyVoiceCommand.PHOTO,
+        PolicyVoiceCommand.CHECK,
         PolicyVoiceCommand.DONE,
         PolicyVoiceCommand.CANCEL,
         PolicyVoiceCommand.RESTART,
@@ -154,6 +156,7 @@ private val COMMAND_PHRASES = listOf(
     CommandPhrase(PolicyVoiceCommand.CANCEL, "cancel"),
     CommandPhrase(PolicyVoiceCommand.START, "start"),
     CommandPhrase(PolicyVoiceCommand.PHOTO, "photo"),
+    CommandPhrase(PolicyVoiceCommand.CHECK, "check"),
     CommandPhrase(PolicyVoiceCommand.DONE, "done"),
     CommandPhrase(PolicyVoiceCommand.UNDO, "undo"),
     CommandPhrase(PolicyVoiceCommand.NOTES, "notes"),

@@ -19,7 +19,7 @@ class StateAwareVoiceCommandPolicyTest {
             evaluate("done, then photo", VoiceRecognitionStability.STABLE_PARTIAL)?.command,
         )
 
-        for (command in listOf("done", "cancel", "restart", "undo", "notes")) {
+        for (command in listOf("check", "done", "cancel", "restart", "undo", "notes")) {
             assertNull(evaluate(command, VoiceRecognitionStability.STABLE_PARTIAL))
         }
     }
@@ -29,6 +29,7 @@ class StateAwareVoiceCommandPolicyTest {
         val expected = mapOf(
             "start" to PolicyVoiceCommand.START,
             "photo" to PolicyVoiceCommand.PHOTO,
+            "check" to PolicyVoiceCommand.CHECK,
             "done" to PolicyVoiceCommand.DONE,
             "cancel" to PolicyVoiceCommand.CANCEL,
             "restart" to PolicyVoiceCommand.RESTART,
@@ -99,7 +100,7 @@ class StateAwareVoiceCommandPolicyTest {
     @Test
     fun commandWordsNeverMatchInsideLongerWords() {
         assertNull(evaluate(
-            "starter photograph undone restartable notations cancellation",
+            "starter photograph checklist checking undone restartable notations cancellation",
             VoiceRecognitionStability.FINAL,
         ))
         assertNull(StateAwareVoiceCommandPolicy.evaluate(
