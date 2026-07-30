@@ -1,9 +1,11 @@
 package org.whl.bookcapture
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.widget.SeekBar
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +23,26 @@ class SettingsActivity : AppCompatActivity() {
     private var baselineDisplayName = ""
     private var baselineMistral = ""
     private var baselineDeepseek = ""
+
+    /** The grant, not the Uri string, is what authorizes a later background
+     * export — so take it persistably here and re-check it at export time. */
+    private val exportFolderPicker = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val taken = runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        }.isSuccess
+        if (!taken) {
+            binding.exportStatus.text = getString(R.string.set_export_permission_lost)
+            return@registerForActivityResult
+        }
+        Prefs.setExportTreeUri(this, uri.toString())
+        renderCaptureStorage()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -91,6 +113,13 @@ class SettingsActivity : AppCompatActivity() {
         binding.deepseekKey.setText(Prefs.deepseekKey(this))
         binding.extractionInstructions.setText(Prefs.extractionInstructions(this))
         rememberProfileBaseline()
+
+        binding.chooseExportFolder.setOnClickListener { chooseExportFolder() }
+        binding.exportNow.setOnClickListener { exportCaptures() }
+        binding.browseArchive.setOnClickListener {
+            startActivity(Intent(this, ArchiveActivity::class.java))
+        }
+        renderCaptureStorage()
 
         // viewfinder sharpen is a GPU shader on the preview — Android 13+ only
         renderCameraSettings()
@@ -281,6 +310,75 @@ class SettingsActivity : AppCompatActivity() {
             Prefs.ocrRegionOpacityPercent(this),
         )
         binding.showOcrRegionLabels.isChecked = Prefs.showOcrRegionLabels(this)
+    }
+
+    // --- captures on this phone ----------------------------------------------
+
+    private fun chooseExportFolder() {
+        val existing = Prefs.exportTreeUri(this).takeIf { it.isNotBlank() }
+        exportFolderPicker.launch(existing?.let { runCatching { Uri.parse(it) }.getOrNull() })
+    }
+
+    private fun exportCaptures() {
+        val tree = Prefs.exportTreeUri(this)
+        if (!Prefs.exportGrantHeld(this, tree)) {
+            binding.exportStatus.text = getString(
+                if (tree.isBlank()) R.string.set_export_no_folder
+                else R.string.set_export_permission_lost,
+            )
+            return
+        }
+        lifecycleScope.launch {
+            val pending = withContext(Dispatchers.IO) {
+                CaptureExport.plan(
+                    CaptureExport.collect(this@SettingsActivity),
+                    CaptureExport.ExportLedger.exported(this@SettingsActivity, tree),
+                ).pending
+            }
+            if (pending == 0) {
+                binding.exportStatus.text = getString(R.string.set_export_nothing)
+                return@launch
+            }
+            CaptureExportWorker.enqueue(this@SettingsActivity, tree, fullReexport = false)
+            binding.exportStatus.text = getString(R.string.set_export_started, pending)
+        }
+    }
+
+    private fun renderCaptureStorage() {
+        val tree = Prefs.exportTreeUri(this)
+        binding.exportFolder.text = when {
+            tree.isBlank() -> getString(R.string.set_export_no_folder)
+            !Prefs.exportGrantHeld(this, tree) ->
+                getString(R.string.set_export_permission_lost)
+            // The tree Uri's last path segment is the provider's document id,
+            // which is the closest thing to a human-readable folder name that
+            // is available without a query against the provider.
+            else -> getString(
+                R.string.set_export_folder,
+                Uri.decode(tree.substringAfterLast('/')),
+            )
+        }
+        binding.exportNow.isEnabled = Prefs.exportGrantHeld(this, tree)
+        Prefs.lastExportSummary(this)?.let {
+            binding.exportStatus.text = getString(
+                R.string.set_export_last, it.exported, it.unchanged, it.failed,
+            )
+        }
+        lifecycleScope.launch {
+            val summary = withContext(Dispatchers.IO) {
+                Triple(
+                    Entries.recent(this@SettingsActivity).size,
+                    CaptureArchive.archivedIds(this@SettingsActivity).size,
+                    CaptureArchive.archiveBytes(this@SettingsActivity),
+                )
+            }
+            binding.archiveSummary.text = getString(
+                R.string.set_archive_summary,
+                summary.first,
+                summary.second,
+                formatByteSize(summary.third),
+            )
+        }
     }
 
     private fun renderPostProcessingSettings() {

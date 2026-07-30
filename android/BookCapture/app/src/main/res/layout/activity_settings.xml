@@ -441,6 +441,74 @@
                 android:minLines="3" />
         </LinearLayout>
 
+        <!-- Captures and their archive. The archive is what retention displaces
+             rather than deletes; export is the only copy that survives an
+             uninstall, since app storage is allowBackup="false". -->
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/set_captures_section" />
+            <TextView
+                android:id="@+id/archiveSummary"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:fontFamily="monospace"
+                android:textSize="12sp"
+                android:textColor="@color/whl_ink" />
+            <Button
+                android:id="@+id/browseArchive"
+                style="@style/WhlButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textSize="13sp"
+                android:text="@string/set_archive_browse" />
+            <TextView
+                android:id="@+id/exportFolder"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:fontFamily="monospace"
+                android:textSize="12sp"
+                android:textColor="@color/whl_ink_light" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginTop="6dp">
+                <Button
+                    android:id="@+id/chooseExportFolder"
+                    style="@style/WhlButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp"
+                    android:textSize="13sp"
+                    android:text="@string/set_export_choose" />
+                <Button
+                    android:id="@+id/exportNow"
+                    style="@style/WhlButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:textSize="13sp"
+                    android:text="@string/set_export_now" />
+            </LinearLayout>
+            <TextView
+                android:id="@+id/exportStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:fontFamily="monospace"
+                android:textSize="12sp"
+                android:textColor="@color/whl_ink_light" />
+        </LinearLayout>
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

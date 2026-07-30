@@ -208,9 +208,15 @@ internal fun captureLibMarkerPresentation(
 internal fun homeStatusPresentation(rawStatus: String): HomeStatusPresentation {
     val status = rawStatus.trim().lowercase()
     val withoutComplete = status.removePrefix("complete · ").trim()
+    // A delivered capture may carry a pipeline qualifier ("uploaded · no
+    // details read"). The delivery mark is driven by the head so the row still
+    // reads as delivered, while the qualifier becomes the visible text.
+    val head = withoutComplete.substringBefore(" · ").trim()
+    val tail = withoutComplete.substringAfter(" · ", "").trim()
     return when {
-        withoutComplete == "uploaded" || withoutComplete == "imported" ->
+        head == "uploaded" || head == "imported" ->
             HomeStatusPresentation(
+                text = tail,
                 adornment = HomeStatusAdornment.UPLOADED,
                 accessibilityLabel = withoutComplete,
             )
@@ -239,6 +245,45 @@ internal fun homeStatusPresentation(rawStatus: String): HomeStatusPresentation {
             accessibilityLabel = withoutComplete,
         )
     }
+}
+
+/**
+ * The line under an archived capture's title.
+ *
+ * "record only" is stated rather than implied by a missing thumbnail: a
+ * photo-free directory is a deliberate outcome of the photo budget, and it
+ * must not read as a capture that lost its pages to a bug.
+ */
+internal fun archiveRowSubtitle(
+    archivedOn: String,
+    photoCount: Int,
+    recordOnly: Boolean,
+    statusLabel: String,
+): String = buildList {
+    add(if (archivedOn.isBlank()) "archived" else "archived $archivedOn")
+    add(
+        when {
+            recordOnly -> "record only"
+            photoCount == 1 -> "1 page"
+            else -> "$photoCount pages"
+        },
+    )
+    statusLabel.trim().takeIf { it.isNotEmpty() }?.let(::add)
+}.joinToString(" · ")
+
+/** Byte counts for a storage readout. Binary units, one decimal place past
+ * KB, and no locale formatting: this sits next to monospace capture counts. */
+internal fun formatByteSize(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val units = listOf("KB", "MB", "GB", "TB")
+    var value = bytes.toDouble() / 1024
+    var unit = 0
+    while (value >= 1024 && unit < units.lastIndex) {
+        value /= 1024
+        unit++
+    }
+    return if (unit == 0) "${value.toInt()} ${units[unit]}"
+    else String.format("%.1f %s", value, units[unit])
 }
 
 /** A small, dependency-free Markdown projection for the About dialog. */

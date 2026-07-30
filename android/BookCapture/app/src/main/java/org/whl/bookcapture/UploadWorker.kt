@@ -1171,8 +1171,13 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         )
     }.getOrDefault(true)
 
+    /** A user-requested reprocess holds the browsing copy in place until it
+     * finishes. Delivery already defers to this marker; retention must too, or
+     * an explicit retry can have the directory archived out from under it
+     * between the request and the worker run. */
     private fun retainSentEntryLocally(entry: Entries.Entry): Boolean = runCatching {
-        CaptureMetadataStore.hasPendingReviewSync(entry.dir) ||
+        entry.reprocessPending() ||
+            CaptureMetadataStore.hasPendingReviewSync(entry.dir) ||
             hasPendingImportOrPhotoWork(entry)
     }.getOrDefault(true)
 

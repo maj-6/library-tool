@@ -58,6 +58,14 @@
             android:exported="false"
             android:label="@string/app_name" />
 
+        <!-- Read-only view of what retention displaced out of the browsing
+             list. Reached from Settings, not the tab bar: it is a recovery and
+             troubleshooting surface, not part of the capture loop. -->
+        <activity
+            android:name=".ArchiveActivity"
+            android:exported="false"
+            android:label="@string/archive_title" />
+
         <activity
             android:name=".QrScannerActivity"
             android:exported="false"

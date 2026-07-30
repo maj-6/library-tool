@@ -239,14 +239,41 @@ internal object CaptureMetadataStore {
      */
     fun deleteIfNoUnsyncedLocalMutation(dir: File): Boolean = synchronized(fileLock) {
         if (!dir.exists()) return@synchronized true
-        val reviewFile = File(dir, CAPTURE_REVIEW_FILE)
-        if (reviewFile.isFile) {
-            val state = readReviewFile(reviewFile, dir.name)
-            if (state !is CaptureReviewFileState.Valid || state.store.dirty) {
-                return@synchronized false
-            }
-        }
+        if (hasUnsyncedLocalMutation(dir)) return@synchronized false
         dir.deleteRecursively() && !dir.exists()
+    }
+
+    /** Retention's actual exit: move the browsing copy into the archive instead
+     * of destroying it. Same monitor and same outbound-state gate as
+     * [deleteIfNoUnsyncedLocalMutation] — a dirty review must block the move as
+     * firmly as it blocked the delete, because the archive is not a sync
+     * source and an unsent edit parked there would never reach the cloud.
+     *
+     * A move that cannot complete leaves the sent copy exactly where it was;
+     * the caller retries on the next prune. Never fall back to deleting.
+     */
+    fun archiveIfNoUnsyncedLocalMutation(
+        dir: File,
+        destination: File,
+        reason: String,
+        now: Long,
+    ): Boolean = synchronized(fileLock) {
+        if (!dir.exists()) return@synchronized true
+        if (hasUnsyncedLocalMutation(dir)) return@synchronized false
+        destination.parentFile?.mkdirs()
+        // A same-id directory already in the archive is the older copy of the
+        // same capture. Keep it: it may hold photos this one has already lost.
+        if (destination.exists()) return@synchronized false
+        if (!moveDirectoryWithoutCopy(dir, destination)) return@synchronized false
+        CaptureArchive.stamp(destination, reason, now, photosRetained = true)
+        true
+    }
+
+    private fun hasUnsyncedLocalMutation(dir: File): Boolean {
+        val reviewFile = File(dir, CAPTURE_REVIEW_FILE)
+        if (!reviewFile.isFile) return false
+        val state = readReviewFile(reviewFile, dir.name)
+        return state !is CaptureReviewFileState.Valid || state.store.dirty
     }
 
     private fun readDesktopBookFile(file: File): DesktopBookMetadata? {

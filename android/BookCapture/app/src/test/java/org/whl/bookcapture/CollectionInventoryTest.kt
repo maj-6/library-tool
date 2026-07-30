@@ -206,7 +206,7 @@ class CollectionInventoryTest {
     }
 
     @Test
-    fun prunePersistsTheInventoryBeforeDeletingSentFolders() {
+    fun prunePersistsTheInventoryBeforeArchivingSentFolders() {
         val source = File("src/main/java/org/whl/bookcapture/Entries.kt").readText()
         val prune = source.substringAfter("suspend fun pruneSent")
             .substringBefore("fun atomicWrite")
@@ -214,14 +214,18 @@ class CollectionInventoryTest {
         assertTrue(prune.indexOf("CollectionInventory.recordFinalized") >= 0)
         assertTrue(
             prune.indexOf("CollectionInventory.recordFinalized") <
-                prune.indexOf("CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation"),
+                prune.indexOf("CaptureMetadataStore.archiveIfNoUnsyncedLocalMutation"),
         )
         assertTrue(prune.contains("val latest = runCatching { load(dir) }"))
         assertTrue(prune.contains("retainLocally(latest)"))
         assertTrue(
             prune.lastIndexOf("CollectionInventory.recordFinalized") <
-                prune.indexOf("CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation"),
+                prune.indexOf("CaptureMetadataStore.archiveIfNoUnsyncedLocalMutation"),
         )
+        // Retention must never reach a destructive call. A capture displaced
+        // from the browsing list is moved to archive/, not erased.
+        assertFalse(prune.contains("deleteIfNoUnsyncedLocalMutation"))
+        assertFalse(prune.contains("deleteRecursively"))
     }
 
     private fun tempDir(): File = Files.createTempDirectory("collection-inventory").toFile()

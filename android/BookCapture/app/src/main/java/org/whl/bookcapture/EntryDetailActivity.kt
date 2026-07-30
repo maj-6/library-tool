@@ -133,7 +133,12 @@ class EntryDetailActivity : AppCompatActivity() {
     }
 
     private fun render() {
-        val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID).orEmpty())
+        // Opt in to the archive here, and only here: ArchiveActivity links
+        // straight to this screen. Every mutating control below is already
+        // gated on !entry.uploaded, and an archived capture is uploaded by
+        // construction, so the archive renders read-only without a second
+        // code path.
+        val entry = Entries.findIncludingArchive(this, intent.getStringExtra(EXTRA_ID).orEmpty())
             ?: return finish()
         diagnosticsEntry = entry
         val details = BookDetailPresenter.from(entry.meta)

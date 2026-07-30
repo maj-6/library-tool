@@ -94,6 +94,35 @@ internal fun beginCaptureSyncRecord(
     )
 }
 
+/** Why a sync request had nothing to send. "No captures ready to sync" is
+ * true but unhelpful next to a list of rows reading "failed": those rows are
+ * reporting this phone's OCR, and their photos are already delivered. Naming
+ * the actual situation is what separates the two. */
+internal enum class CaptureSyncEmptyReason {
+    REVIEW_QUEUED,
+    LIVE_CAPTURE_ONLY,
+    DELIVERED_WITH_PROCESSING_ISSUES,
+    ALL_DELIVERED,
+    NOTHING,
+}
+
+internal fun captureSyncEmptyReason(
+    requestedCount: Int,
+    pendingReviewChanges: Boolean,
+    liveCaptureOpen: Boolean,
+    deliveredCount: Int,
+    deliveredNeedingAttention: Int,
+): CaptureSyncEmptyReason = when {
+    requestedCount > 0 -> CaptureSyncEmptyReason.NOTHING
+    // Matches the pre-existing precedence: a queued review edit is the one
+    // thing an "empty" sync press still actually did.
+    pendingReviewChanges -> CaptureSyncEmptyReason.REVIEW_QUEUED
+    liveCaptureOpen && deliveredCount == 0 -> CaptureSyncEmptyReason.LIVE_CAPTURE_ONLY
+    deliveredNeedingAttention > 0 -> CaptureSyncEmptyReason.DELIVERED_WITH_PROCESSING_ISSUES
+    deliveredCount > 0 -> CaptureSyncEmptyReason.ALL_DELIVERED
+    else -> CaptureSyncEmptyReason.NOTHING
+}
+
 internal fun aggregateCaptureSyncState(
     record: CaptureSyncRecord?,
     eligibleIds: Collection<String>,
