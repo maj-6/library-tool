@@ -17,9 +17,12 @@ name: release
 # One-time repository setup, all under Settings > Secrets and variables:
 #   vars.SUPABASE_URL                  required for a publishable Android APK
 #   vars.SUPABASE_ANON_KEY             required for a publishable Android APK
-#   secrets.SUPABASE_SERVICE_ROLE_KEY  registers rows in `releases`. Without it
-#                                      the GitHub Release still publishes and
-#                                      registration can be completed manually.
+#   secrets.SUPABASE_RELEASE_SECRET_KEY
+#                                      preferred dedicated `sb_secret_...` key
+#                                      that registers rows in `releases`.
+#   secrets.SUPABASE_SERVICE_ROLE_KEY  legacy fallback while migrating. A tag
+#                                      fails before publication when neither
+#                                      registrar credential is configured.
 #   secrets.ANDROID_KEYSTORE_B64       required to publish Android on a tag:
 #   secrets.ANDROID_KEYSTORE_PASSWORD  base64 of the signing keystore, its
 #   secrets.ANDROID_KEY_ALIAS          password, and the key alias. A tagged
@@ -536,6 +539,19 @@ jobs:
           echo "- Published Android BookCapture signer: \`${{ needs.android.outputs.signer }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Published Android certificate SHA-256: \`${{ needs.android.outputs.signer_sha256 }}\`" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Require Downloads registrar credential
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_RELEASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -z "$SUPABASE_KEY" ]; then
+            echo "::error::No Supabase release registrar credential is configured. \
+          Add SUPABASE_RELEASE_SECRET_KEY (preferred) or \
+          SUPABASE_SERVICE_ROLE_KEY under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          python3 tools/release_publish.py --check-credentials
+
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -753,17 +769,14 @@ jobs:
       - name: Register on the Downloads page
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_RELEASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
           RELEASE_CHANNEL: ${{ needs.preflight.outputs.release_channel }}
           DESKTOP_VERSION: ${{ needs.preflight.outputs.desktop_version }}
           ANDROID_VERSION: ${{ needs.preflight.outputs.android_version }}
         run: |
           if [ -z "$SUPABASE_KEY" ]; then
-            echo "::warning::SUPABASE_SERVICE_ROLE_KEY is not set, so the \
-          Downloads page was not updated. Add it under Settings > Secrets and \
-          re-run this job, or register by hand with tools/release_publish.py."
-            echo "- **warning:** release created, but not registered on the Downloads page (no SUPABASE_SERVICE_ROLE_KEY)." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "::error::Supabase release registrar credential was lost after preflight."
+            exit 1
           fi
           BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
           case "$RELEASE_CHANNEL" in

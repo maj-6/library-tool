@@ -76,7 +76,7 @@ current process. Do not put provider credentials in command-line arguments.
 
 | Variable | Standalone use |
 | --- | --- |
-| `SUPABASE_KEY` | Service-role credential for owner setup, publishing, maintenance, and store status |
+| `SUPABASE_KEY` | Modern secret key (preferred) or legacy service-role credential for owner setup, publishing, maintenance, and store status |
 | `SUPABASE_URL` | Project override; required by `release_publish.py`, optional where the built-in project is appropriate |
 | `SUPABASE_ANON_KEY` | Optional anon-role smoke tests for a custom project |
 | `R2_ACCOUNT_ID` | Cloudflare account identifier |
