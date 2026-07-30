@@ -368,6 +368,7 @@
       this.unsubscribeContext = null;
       this.unsubscribeTransformResults = null;
       this.unsubscribeClassificationBindings = null;
+      this.externalRefreshPromise = null;
       this.restoringProfile = false;
       this.destroyed = false;
       this.activeTrayTab = "reviews";
@@ -1048,6 +1049,48 @@
       this.listeners.push(() => target.removeEventListener(type, handler, options));
     }
 
+    refreshExternalState(reason = "window-activation") {
+      if (this.destroyed) return Promise.resolve([]);
+      if (this.externalRefreshPromise) return this.externalRefreshPromise;
+      const tasks = [];
+      if (this.booksFeature &&
+          typeof this.booksFeature.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.booksFeature.refresh(reason)));
+      }
+      if (this.artifactsFeature &&
+          typeof this.artifactsFeature.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.artifactsFeature.refresh({
+            preserveSelection: true,
+            reason,
+          })));
+      }
+      if (this.itemProperties &&
+          typeof this.itemProperties.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.itemProperties.refresh(reason)));
+      }
+      const refresh = Promise.allSettled(tasks).finally(() => {
+        if (this.externalRefreshPromise === refresh) {
+          this.externalRefreshPromise = null;
+        }
+      });
+      this.externalRefreshPromise = refresh;
+      return refresh;
+    }
+
+    bindExternalRefresh() {
+      this.listen(this.windowRef, "focus", () => {
+        void this.refreshExternalState("window-focus");
+      });
+      this.listen(this.documentRef, "visibilitychange", () => {
+        if (this.documentRef.visibilityState === "visible") {
+          void this.refreshExternalState("window-visible");
+        }
+      });
+    }
+
     mount() {
       this.bindEditorSelector();
       this.bindLayoutReset();
@@ -1066,6 +1109,7 @@
           this.classificationController.setScopeActive(true);
         }
       });
+      this.bindExternalRefresh();
       if (this.booksFeature && typeof this.booksFeature.mount === "function") {
         this.booksFeature.mount();
       }

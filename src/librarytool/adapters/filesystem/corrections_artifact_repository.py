@@ -36,6 +36,7 @@ from typing import (
 from PIL import Image, UnidentifiedImageError
 
 from ...engine.errors import EngineError, NotFoundError, RepositoryError, ValidationError
+from ...engine.corrections import CORRECTION_TARGET_AUTHORITY_EXTENSION
 from ...engine.raster_artifacts import (
     IMAGE_CATEGORIES,
     ArtifactMetadataAssertion,
@@ -1412,6 +1413,9 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item_id,
                 section=section,
                 cause_type=type(exc).__name__,
+                failure_kind=(
+                    "read" if isinstance(exc, OSError) else "decode"
+                ),
             ) from exc
         finally:
             if descriptor >= 0:
@@ -1442,26 +1446,57 @@ class FilesystemCorrectionsArtifactRepository(
         resources: dict[tuple[str, str, str], _ResolvedRasterCandidate] = {}
 
         if capture_directory is not None:
-            photo_assets = self._read_json(
-                capture_directory / PHOTO_ASSETS_NAME,
-                item_id=item_id,
-                section="capture",
-                maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
-            )
-            if photo_assets is not None:
+            try:
+                photo_assets = self._read_json(
+                    capture_directory / PHOTO_ASSETS_NAME,
+                    item_id=item_id,
+                    section="capture",
+                    maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
+                )
+                if photo_assets is None:
+                    capture_views = (
+                        self._capture_inventory_placeholder(
+                            item_id,
+                            capture_id=capture_id,
+                            state=ResourceState.MISSING,
+                            diagnostic_code="capture_manifest_missing",
+                        ),
+                    )
+                    capture_spatial = ()
+                    capture_resources = {}
+                else:
+                    (
+                        capture_views,
+                        capture_spatial,
+                        capture_resources,
+                    ) = self._project_capture(
+                        item_id,
+                        capture_id,
+                        capture_directory,
+                        photo_assets,
+                    )
+            except RepositoryError as error:
+                if not self._recoverable_capture_manifest_error(error):
+                    raise
                 (
                     capture_views,
                     capture_spatial,
                     capture_resources,
-                ) = self._project_capture(
-                    item_id,
-                    capture_id,
-                    capture_directory,
-                    photo_assets,
+                ) = (
+                    (
+                        self._capture_inventory_placeholder(
+                            item_id,
+                            capture_id=capture_id,
+                            state=ResourceState.UNAVAILABLE,
+                            diagnostic_code=error.code,
+                        ),
+                    ),
+                    (),
+                    {},
                 )
-                raster.extend(capture_views)
-                spatial.extend(capture_spatial)
-                resources.update(capture_resources)
+            raster.extend(capture_views)
+            spatial.extend(capture_spatial)
+            resources.update(capture_resources)
 
         layout_path = entry_directory.joinpath(*MISTRAL_LAYOUT_RELATIVE)
         layout = self._read_json(
@@ -1493,6 +1528,108 @@ class FilesystemCorrectionsArtifactRepository(
             field="annotation_id",
         )
         return _Projection(tuple(raster), tuple(spatial), resources)
+
+    @staticmethod
+    def _recoverable_capture_manifest_error(error: RepositoryError) -> bool:
+        """Separate malformed persisted data from authority read failures."""
+
+        if error.details.get("section") != "capture" or error.code not in {
+            "invalid_capture_photo_assets",
+            "unsupported_capture_photo_assets",
+        }:
+            return False
+        # A failed verified read can surface through the same decode boundary.
+        # It remains a repository failure: never turn a concurrent authority
+        # replacement into a benign unavailable placeholder.
+        cause_type = error.details.get("cause_type")
+        return cause_type is None or error.details.get(
+            "failure_kind"
+        ) == "decode"
+
+    def _capture_inventory_placeholder(
+        self,
+        item_id: str,
+        *,
+        capture_id: str,
+        state: ResourceState,
+        diagnostic_code: str,
+    ) -> RasterArtifactView:
+        """Represent an unreadable capture inventory without inventing files."""
+
+        if state not in {ResourceState.MISSING, ResourceState.UNAVAILABLE}:
+            raise TypeError("capture inventory placeholder state is invalid")
+        identity = _opaque_identity(
+            "capture",
+            capture_id,
+            "inventory-placeholder",
+        )
+        artifact_id = f"{identity}:display"
+        source = RasterSourceRef(
+            "capture",
+            _digest_revision(
+                "capture",
+                {
+                    "capture_id": capture_id,
+                    "inventory_state": state.value,
+                },
+            ),
+            identity,
+            _digest_revision(
+                "canvas",
+                {
+                    "capture_id": capture_id,
+                    "inventory_state": state.value,
+                },
+            ),
+        )
+        extensions = _public_extensions(
+            {
+                "capture_order": 0,
+                "capture_inventory": {
+                    "state": state.value,
+                    "diagnostic_code": diagnostic_code,
+                },
+                CORRECTION_TARGET_AUTHORITY_EXTENSION: {
+                    "state": "missing",
+                },
+                "corrections_ui": {"annotation_frame": "canvas"},
+            }
+        )
+        return RasterArtifactView(
+            key=RasterArtifactKey(item_id, artifact_id),
+            revision=_digest_revision(
+                "artifact",
+                {
+                    "artifact_id": artifact_id,
+                    "capture_id": capture_id,
+                    "resource_state": state.value,
+                    "diagnostic_code": diagnostic_code,
+                },
+            ),
+            kind="captured-image",
+            media_type=_UNKNOWN_IMAGE_MEDIA_TYPE,
+            content_sha256=hashlib.sha256(
+                f"capture-inventory\0{capture_id}\0{state.value}".encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+            dimensions=RasterDimensions(1, 1),
+            source=source,
+            resource_state=state,
+            resource=None,
+            label=(
+                "Captured image manifest missing"
+                if state is ResourceState.MISSING
+                else "Captured images unavailable"
+            ),
+            freshness=ArtifactFreshness.UNTRACKED,
+            provenance=ArtifactProvenance(
+                origin="capture",
+                provider_id="android",
+                model="bookcapture",
+            ),
+            extensions=extensions,
+        )
 
     def _unique_projected_ids(
         self,

@@ -1789,9 +1789,42 @@ def _book_import_state(captures: Sequence[Mapping[str, Any]]) -> str:
     return "ready"
 
 
+def _item_has_capture_inventory(item: ItemView) -> bool:
+    if item.kind.casefold() == "capture":
+        return True
+    origin = item.metadata.get("origin")
+    return origin in {"captured_entry", "promoted_capture"} or bool(
+        item.metadata.get("capture_id")
+    )
+
+
+def _index_capture_inventory(
+    rasters: Any,
+    item: ItemView,
+) -> tuple[list[dict[str, Any]], str, tuple[str, ...]]:
+    """Project one independently fallible capture inventory for the index."""
+
+    captures = _capture_rows(
+        item.item_id,
+        _validated_rasters(
+            rasters.list_raster_artifacts(item.item_id),
+            item_id=item.item_id,
+        ),
+    )
+    if _item_has_capture_inventory(item) and not captures:
+        return (
+            [],
+            "missing",
+            ("Captured image manifest is missing",),
+        )
+    return captures, _book_import_state(captures), ()
+
+
 def _book_issues(
     item: ItemView,
     captures: Sequence[Mapping[str, Any]],
+    *,
+    inventory_issues: Sequence[str] = (),
 ) -> list[str]:
     issues = [
         value
@@ -1801,6 +1834,7 @@ def _book_issues(
             and captures
         )
     ]
+    issues.extend(inventory_issues)
     missing = sum(
         value["resource_state"] == "missing" for value in captures
     )
@@ -1931,12 +1965,8 @@ def _corrections_index_projection(
                 code="invalid_correction_review",
                 details={"item_id": item.item_id},
             )
-        captures = _capture_rows(
-            item.item_id,
-            _validated_rasters(
-                rasters.list_raster_artifacts(item.item_id),
-                item_id=item.item_id,
-            ),
+        captures, import_state, inventory_issues = (
+            _index_capture_inventory(rasters, item)
         )
         capture_count += len(captures)
         if capture_count > CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT:
@@ -1954,8 +1984,12 @@ def _corrections_index_projection(
             "id": item.item_id,
             "kind": item_kind,
             "title": item.title,
-            "import_state": _book_import_state(captures),
-            "issues": _book_issues(item, captures),
+            "import_state": import_state,
+            "issues": _book_issues(
+                item,
+                captures,
+                inventory_issues=inventory_issues,
+            ),
             "review": review_summary,
             "captures": captures,
         }

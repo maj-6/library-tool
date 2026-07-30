@@ -1045,6 +1045,69 @@ def test_capture_authority_root_replacement_is_rejected(
     assert _digest(external_display) not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_state", "diagnostic_code"),
+    (
+        (None, ResourceState.MISSING, "capture_manifest_missing"),
+        (
+            '{"assets": [',
+            ResourceState.UNAVAILABLE,
+            "invalid_capture_photo_assets",
+        ),
+        (
+            json.dumps(
+                {
+                    "schema": "future.capture-assets",
+                    "version": 99,
+                    "capture_id": CAPTURE_ID,
+                    "assets": [],
+                }
+            ),
+            ResourceState.UNAVAILABLE,
+            "unsupported_capture_photo_assets",
+        ),
+    ),
+)
+def test_missing_or_malformed_capture_manifest_has_safe_placeholder(
+    tmp_path,
+    payload,
+    expected_state,
+    diagnostic_code,
+):
+    root = tmp_path / "library"
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    if payload is not None:
+        (directory / "photo_assets.json").write_text(
+            payload,
+            encoding="utf-8",
+        )
+    repository = _repository(root)
+
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+
+    assert len(artifacts) == 1
+    placeholder = artifacts[0]
+    assert placeholder.key.artifact_id.endswith(":display")
+    assert placeholder.resource_state is expected_state
+    assert placeholder.resource is None
+    assert placeholder.dimensions.as_dict() == {
+        "width": 1,
+        "height": 1,
+        "orientation": 1,
+    }
+    assert placeholder.extensions["capture_order"] == 0
+    assert placeholder.extensions["capture_inventory"] == {
+        "state": expected_state.value,
+        "diagnostic_code": diagnostic_code,
+    }
+    assert placeholder.extensions["correction_target_authority"] == {
+        "state": "missing",
+    }
+    assert repository.list_spatial_annotations(ITEM_ID) == ()
+    assert str(directory) not in json.dumps(placeholder.as_dict())
+
+
 def test_capture_resources_report_missing_private_and_stale_states(tmp_path):
     root = tmp_path / "library"
     original = _jpeg_bytes((80, 40, 20), (11, 13))

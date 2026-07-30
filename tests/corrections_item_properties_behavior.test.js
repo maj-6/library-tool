@@ -495,6 +495,50 @@ test("unsaved metadata drafts survive rerenders and item navigation", async () =
 });
 
 
+test("external refresh rebases an unsaved capture draft onto current metadata",
+  async () => {
+    let loads = 0;
+    const initial = item({
+      metadata: { authors: "Unknown", condition: "foxed" },
+    });
+    const latest = item({
+      metadata: {
+        authors: "Unknown",
+        condition: "foxed",
+        publisher: "Added in another window",
+      },
+      record_revision: "mir-r2",
+    });
+    const { editor } = harness({
+      api: {
+        async loadItem() {
+          loads += 1;
+          return loads === 1 ? initial : latest;
+        },
+        async updateItem() { throw new Error("not used"); },
+      },
+    });
+    await editor.setSelection(initial.id);
+    editor.updateDraft({
+      title: "My unsaved title",
+      metadataText: JSON.stringify({
+        authors: "Unknown",
+        condition: "stable",
+      }, null, 2),
+    });
+
+    await editor.refresh();
+
+    assert.equal(loads, 2);
+    assert.equal(editor.item.revision, "mir-r2");
+    assert.equal(editor.draft.baseRevision, "mir-r2");
+    assert.equal(editor.draft.title, "My unsaved title");
+    assert.match(editor.draft.metadataText, /Added in another window/);
+    assert.match(editor.draft.metadataText, /"condition": "stable"/);
+    assert.equal(editor.draft.dirty, true);
+  });
+
+
 test("large valid metadata does not block a title-only patch", async () => {
   const description = "x".repeat(70 * 1024);
   assert.ok(description.length > 64 * 1024);

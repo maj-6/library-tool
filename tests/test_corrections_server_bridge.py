@@ -107,6 +107,27 @@ def _unsupported_uncaptured_manual_rows() -> dict:
     }
 
 
+def _use_capture_only_target(server, *, title: str = "Captured Herbal") -> None:
+    """Keep the canonical capture item while removing its promoted build."""
+
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                "manual-capture": {
+                    "id": "manual-capture",
+                    "title": title,
+                    "capture_id": CAPTURE_ID,
+                    "images": [
+                        f"captures/{CAPTURE_ID}/photo_1.jpg",
+                    ],
+                }
+            },
+        )
+
+
 @pytest.fixture()
 def corrections_workspace(monkeypatch, tmp_path: Path):
     import server
@@ -1601,6 +1622,316 @@ def test_production_bridge_mutations_converge_across_clients(
     assert replay.status_code == 200
     assert replay.get_json()["replayed"] is True
     assert replay.get_json()["receipt"] == first.get_json()["receipt"]
+
+
+def test_capture_only_review_mark_resolve_and_reopen_use_canonical_item(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    _use_capture_only_target(server, title="Capture Awaiting Review")
+    monkeypatch.setattr(
+        server,
+        "_auth_doc",
+        lambda: {"session": {"user_id": "capture-reviewer"}},
+    )
+    review_path = f"/api/v1/items/{BOOK_ID}/corrections/review"
+    initial = client.get(review_path).get_json()["review"]
+
+    marked = client.put(
+        f"{review_path}/attention",
+        json={
+            "reason": "Verify the handwritten notes",
+            "comment": "Capture-only review",
+        },
+        headers={
+            "Idempotency-Key": "capture-review-mark",
+            "If-Review-Match": f'"{initial["revision"]}"',
+        },
+    )
+    assert marked.status_code == 200, marked.get_json()
+    marked_review = client.get(review_path).get_json()["review"]
+    assert marked_review["state"] == "needs_attention"
+    assert marked_review["history_tail"][-1]["actor_id"] == (
+        "capture-reviewer"
+    )
+
+    other_window = client.application.test_client()
+    resolved = other_window.post(
+        f"{review_path}/resolve",
+        json={"comment": "Checked against the source capture"},
+        headers={
+            "Idempotency-Key": "capture-review-resolve",
+            "If-Review-Match": f'"{marked_review["revision"]}"',
+        },
+    )
+    assert resolved.status_code == 200, resolved.get_json()
+    resolved_review = client.get(review_path).get_json()["review"]
+    assert resolved_review["state"] == "resolved"
+
+    reopened = client.post(
+        f"{review_path}/reopen",
+        json={"comment": "Caption still needs correction"},
+        headers={
+            "Idempotency-Key": "capture-review-reopen",
+            "If-Review-Match": f'"{resolved_review["revision"]}"',
+        },
+    )
+    assert reopened.status_code == 200, reopened.get_json()
+
+    index = other_window.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    ).get_json()
+    assert [(row["id"], row["kind"]) for row in index["books"]] == [
+        (BOOK_ID, "capture"),
+    ]
+    assert index["books"][0]["review"]["state"] == "needs_attention"
+    assert index["attention"][0]["target"] == {
+        "kind": "book",
+        "item_id": BOOK_ID,
+    }
+    assert index["attention"][0]["review"]["history_count"] == 3
+
+
+def test_capture_only_raster_category_and_caption_round_trip(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    _use_capture_only_target(server)
+    display = next(
+        artifact
+        for artifact in client.get(
+            f"/api/v1/items/{BOOK_ID}/raster-artifacts"
+            "?representation_id=capture"
+        ).get_json()["artifacts"]
+        if artifact["key"]["artifact_id"].endswith(":display")
+    )
+    artifact_id = display["key"]["artifact_id"]
+    detail_path = f"/api/v1/items/{BOOK_ID}/raster-artifacts/{artifact_id}"
+
+    categorized = client.put(
+        f"{detail_path}/category",
+        json={"category": "title_page"},
+        headers={
+            "Idempotency-Key": "capture-category-title",
+            "If-Artifact-Match": f'"{display["revision"]}"',
+        },
+    )
+    assert categorized.status_code == 200, categorized.get_json()
+    categorized_detail = client.get(detail_path).get_json()["artifact"]
+    assert categorized_detail["effective_category"] == "title_page"
+
+    uncategorized = client.delete(
+        f"{detail_path}/category",
+        json={},
+        headers={
+            "Idempotency-Key": "capture-category-clear",
+            "If-Artifact-Match": (
+                f'"{categorized_detail["revision"]}"'
+            ),
+        },
+    )
+    assert uncategorized.status_code == 200, uncategorized.get_json()
+    caption_target = client.get(detail_path).get_json()["artifact"]
+    assert caption_target["effective_category"] == "cover"
+
+    captioned = client.put(
+        f"{detail_path}/caption",
+        json={
+            "text": "Hand-colored medicinal plant",
+            "language": "en",
+        },
+        headers={
+            "Idempotency-Key": "capture-caption-set",
+            "If-Artifact-Match": f'"{caption_target["revision"]}"',
+        },
+    )
+    assert captioned.status_code == 200, captioned.get_json()
+    captioned_detail = client.get(detail_path).get_json()["artifact"]
+    assert captioned_detail["effective_caption"]["text"] == (
+        "Hand-colored medicinal plant"
+    )
+    assert captioned_detail["effective_caption"]["origin"] == "manual"
+    assert captioned_detail["effective_caption"]["language"] == "en"
+
+    cleared = client.delete(
+        f"{detail_path}/caption",
+        json={},
+        headers={
+            "Idempotency-Key": "capture-caption-clear",
+            "If-Artifact-Match": f'"{captioned_detail["revision"]}"',
+        },
+    )
+    assert cleared.status_code == 200, cleared.get_json()
+    assert client.get(detail_path).get_json()["artifact"][
+        "effective_caption"
+    ] is None
+
+
+def test_capture_only_mistral_region_role_assignment_and_clear(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    _use_capture_only_target(server)
+    annotations = client.get(
+        f"/api/v1/items/{BOOK_ID}/spatial-annotations"
+        "?representation_id=capture"
+    ).get_json()["annotations"]
+    annotation = next(
+        row for row in annotations if row["label"] == "Materia medica"
+    )
+    annotation_id = annotation["key"]["annotation_id"]
+    linked_id = annotation["linked_artifact_ids"][0]
+    linked = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/{linked_id}"
+    ).get_json()["artifact"]
+    role_path = (
+        f"/api/v1/items/{BOOK_ID}/spatial-annotations/"
+        f"{annotation_id}/role"
+    )
+
+    assigned = client.put(
+        role_path,
+        json={
+            "role": "MAR",
+            "linked_artifact_id": linked_id,
+        },
+        headers={
+            "Idempotency-Key": "capture-region-mar",
+            "If-Annotation-Match": f'"{annotation["revision"]}"',
+            "If-Linked-Artifact-Match": f'"{linked["revision"]}"',
+        },
+    )
+    assert assigned.status_code == 200, assigned.get_json()
+    assigned_annotation = client.get(
+        f"/api/v1/items/{BOOK_ID}/spatial-annotations/{annotation_id}"
+    ).get_json()["annotation"]
+    assigned_link = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/{linked_id}"
+    ).get_json()["artifact"]
+    assert assigned_annotation["effective_role"] == "marginalia"
+    assert assigned_link["effective_role"] == "marginalia"
+
+    cleared = client.delete(
+        role_path,
+        json={"linked_artifact_id": linked_id},
+        headers={
+            "Idempotency-Key": "capture-region-role-clear",
+            "If-Annotation-Match": (
+                f'"{assigned_annotation["revision"]}"'
+            ),
+            "If-Linked-Artifact-Match": f'"{assigned_link["revision"]}"',
+        },
+    )
+    assert cleared.status_code == 200, cleared.get_json()
+    refreshed = client.get(
+        f"/api/v1/items/{BOOK_ID}/spatial-annotations/{annotation_id}"
+    ).get_json()["annotation"]
+    refreshed_link = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/{linked_id}"
+    ).get_json()["artifact"]
+    assert refreshed["effective_role"] == "text"
+    assert refreshed_link["effective_role"] == ""
+
+
+def test_capture_only_index_isolates_partial_missing_and_corrupt_assets(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    _use_capture_only_target(server, title="Capture With Damaged Assets")
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {
+                "healthy-book": {
+                    "id": "healthy-book",
+                    "title": "Healthy Catalogue Book",
+                }
+            },
+        )
+    manifest_path = (
+        server.CAPTURES_DIR / CAPTURE_ID / "photo_assets.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    first = manifest["assets"][0]
+    missing = json.loads(json.dumps(first))
+    missing["asset_id"] = "asset-missing"
+    missing["capture_order"] = 2
+    missing["capture_file"] = "photo_missing.jpg"
+    missing["original"]["reference"] = "original_missing.jpg"
+    missing["display"]["reference"] = "photo_missing.jpg"
+    missing["geometry"] = []
+    manifest["assets"].append(missing)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    partial_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert partial_response.status_code == 200
+    partial_books = {
+        row["id"]: row for row in partial_response.get_json()["books"]
+    }
+    partial = partial_books[BOOK_ID]
+    assert partial["kind"] == "capture"
+    assert partial["import_state"] == "partial"
+    assert [
+        row["resource_state"] for row in partial["captures"]
+    ] == ["available", "missing"]
+    assert "1 captured image is missing" in partial["issues"]
+    assert partial_books["healthy-book"]["import_state"] == "ready"
+
+    manifest_path.unlink()
+    missing_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert missing_response.status_code == 200
+    missing_books = {
+        row["id"]: row for row in missing_response.get_json()["books"]
+    }
+    missing_capture = missing_books[BOOK_ID]
+    assert missing_capture["import_state"] == "missing"
+    assert len(missing_capture["captures"]) == 1
+    assert missing_capture["captures"][0]["resource_state"] == "missing"
+    assert missing_capture["captures"][0]["thumbnail"] is None
+    assert "1 captured image is missing" in missing_capture["issues"]
+    assert "healthy-book" in missing_books
+
+    manifest_path.write_text('{"assets": [', encoding="utf-8")
+    corrupt_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert corrupt_response.status_code == 200, corrupt_response.get_json()
+    corrupt_books = {
+        row["id"]: row for row in corrupt_response.get_json()["books"]
+    }
+    corrupt_capture = corrupt_books[BOOK_ID]
+    assert corrupt_capture["import_state"] == "unavailable"
+    assert len(corrupt_capture["captures"]) == 1
+    assert corrupt_capture["captures"][0]["resource_state"] == (
+        "unavailable"
+    )
+    assert corrupt_capture["captures"][0]["thumbnail"] is None
+    assert "1 captured image is unavailable" in (
+        corrupt_capture["issues"]
+    )
+    assert corrupt_books["healthy-book"]["title"] == (
+        "Healthy Catalogue Book"
+    )
+    assert str(server.CAPTURES_DIR) not in corrupt_response.get_data(
+        as_text=True
+    )
 
 
 def test_production_review_bridge_owns_actor_and_reconciles_cas(

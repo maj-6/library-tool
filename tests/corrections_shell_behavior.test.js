@@ -775,6 +775,74 @@ test("selection, resources, and drafts remain independent per window instance", 
 });
 
 
+test("window activation refreshes shared corrections state once", async () => {
+  const windowRef = new FakeEventTarget();
+  const documentRef = new FakeEventTarget();
+  documentRef.visibilityState = "visible";
+  let releaseBooks;
+  const calls = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    windowRef,
+    documentRef,
+    listeners: [],
+    destroyed: false,
+    externalRefreshPromise: null,
+    booksFeature: {
+      refresh(reason) {
+        calls.push(["books", reason]);
+        return new Promise((resolve) => { releaseBooks = resolve; });
+      },
+    },
+    artifactsFeature: {
+      refresh(options) {
+        calls.push(["artifacts", options]);
+        return Promise.resolve();
+      },
+    },
+    itemProperties: {
+      refresh(reason) {
+        calls.push(["metadata", reason]);
+        return Promise.resolve();
+      },
+    },
+  });
+  shell.bindExternalRefresh();
+
+  windowRef.emit("focus");
+  documentRef.emit("visibilitychange");
+  await Promise.resolve();
+  assert.deepEqual(calls, [
+    ["books", "window-focus"],
+    ["artifacts", {
+      preserveSelection: true,
+      reason: "window-focus",
+    }],
+    ["metadata", "window-focus"],
+  ], "focus and visibility events share one in-flight refresh");
+  releaseBooks();
+  await shell.externalRefreshPromise;
+
+  documentRef.visibilityState = "hidden";
+  documentRef.emit("visibilitychange");
+  assert.equal(calls.length, 3);
+
+  documentRef.visibilityState = "visible";
+  documentRef.emit("visibilitychange");
+  await Promise.resolve();
+  releaseBooks();
+  await shell.externalRefreshPromise;
+  assert.deepEqual(calls.slice(3), [
+    ["books", "window-visible"],
+    ["artifacts", {
+      preserveSelection: true,
+      reason: "window-visible",
+    }],
+    ["metadata", "window-visible"],
+  ]);
+});
+
+
 test("cross-panel selection addresses retain context without carrying stale object IDs", () => {
   const prior = normalizeSelection({
     itemId: "book-1",

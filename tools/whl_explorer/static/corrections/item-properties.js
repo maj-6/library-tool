@@ -619,6 +619,15 @@
         return this.load();
       }
 
+      refresh() {
+        if (!this.selectedId || this.busy || this.destroyed) {
+          return Promise.resolve(this.item);
+        }
+        return this.load({
+          preservedDraft: this.draft,
+        });
+      }
+
       async load(options = {}) {
         if (!this.selectedId || this.destroyed) return null;
         const selectedId = this.selectedId;
