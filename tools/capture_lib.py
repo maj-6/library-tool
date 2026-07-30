@@ -1664,6 +1664,25 @@ def _diagnostic(
     return diagnostic
 
 
+def _backfill_setup_diagnostic(error: Exception) -> dict[str, Any]:
+    code = (
+        str(error.code)
+        if isinstance(error, EngineError)
+        else "capture_backfill_setup_failed"
+    )
+    if not _DIAGNOSTIC_CODE_RE.fullmatch(code):
+        code = "capture_backfill_setup_failed"
+    message = _bounded_diagnostic_text(error)
+    if not message or _looks_like_local_locator(message):
+        message = "capture backfill setup failed"
+    return _diagnostic(
+        capture_id="",
+        status="failed",
+        code=code,
+        message=message,
+    )
+
+
 def _portable_capture_id(value: Any) -> str:
     if not isinstance(value, str) or value != value.strip():
         return ""
@@ -2455,16 +2474,7 @@ def main(argv: list[str] | None = None) -> int:
                 "omitted_diagnostics": 0,
             },
             "diagnostics": [
-                _diagnostic(
-                    capture_id="",
-                    status="failed",
-                    code=(
-                        str(exc.code)
-                        if isinstance(exc, EngineError)
-                        else "capture_backfill_setup_failed"
-                    ),
-                    message=str(exc) or type(exc).__name__,
-                )
+                _backfill_setup_diagnostic(exc)
             ],
         }
     print(

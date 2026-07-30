@@ -726,3 +726,33 @@ def test_cli_emits_one_machine_readable_dry_run_report(tmp_path, capsys):
     assert report["mode"] == "dry-run"
     assert report["summary"]["would_create"] == 1
     assert not workspace.exists()
+
+
+def test_cli_quarantines_private_setup_failure_details(monkeypatch, capsys):
+    def fail_backfill(**_kwargs):
+        raise RepositoryError(
+            r"failed to read C:\private\workspace\capture-token.json",
+            code="../private-token",
+        )
+
+    monkeypatch.setattr(
+        capture_lib,
+        "run_capture_archive_backfill",
+        fail_backfill,
+    )
+
+    result = capture_lib.main(["--dry-run"])
+
+    output = capsys.readouterr()
+    report = json.loads(output.out)
+    assert output.err == ""
+    assert result == 1
+    assert report["ok"] is False
+    assert report["diagnostics"][0]["code"] == (
+        "capture_backfill_setup_failed"
+    )
+    assert report["diagnostics"][0]["message"] == (
+        "capture backfill setup failed"
+    )
+    assert "private" not in output.out
+    assert "token" not in output.out
