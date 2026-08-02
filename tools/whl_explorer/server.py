@@ -26951,9 +26951,16 @@ def _capture_corrections_relation_missing(owner_cfg: dict,
 def _publish_capture_corrections(owner_cfg: dict) -> dict:
     """Stateless diff-and-publish of corrected capture display renditions.
 
-    Candidates are cloud-imported manual entries. Captures without a cloud
-    row are skipped (the row's FK would fail; LAN-only captures), up-to-date
-    rows are left alone, and one failing capture never stops the others.
+    Candidates are all capture-backed manual entries; ``capture_transport``
+    is never consulted, because imports that predate the field carry none.
+    The authoritative gate is cloud-row existence: captures without a cloud
+    row are skipped as ``no_cloud_row`` (the row's FK would fail; LAN-only
+    or local captures), up-to-date rows are left alone, and one failing
+    capture never stops the others. A capture whose local state cannot be
+    read (a corrupt ``photo_assets.json``) is skipped as
+    ``unreadable_capture`` with a notice — only genuine cloud/API failures
+    count as errors, so a permanently corrupt capture cannot permanently
+    fail the sync run.
     An existing cloud row is only overwritten by a winner that provably
     sorts newer (chain ancestry, else a strictly later order signal) when
     the row's correction is locally known, or by a lexicographically
@@ -26965,14 +26972,14 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
     ``sbase.publish_capture_corrections``."""
 
     result = {"candidates": 0, "pushed": 0, "up_to_date": 0,
-              "no_cloud_row": 0, "notices": [], "errors": []}
+              "no_cloud_row": 0, "unreadable_capture": 0,
+              "notices": [], "errors": []}
     with _manual_lock:
         manual_entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
     candidates = sorted({
         capture_id
         for entry in manual_entries.values()
         if isinstance(entry, dict)
-        and entry.get("capture_transport") == "cloud"
         and (capture_id := _capture_archive_id(entry.get("capture_id")))
     })
     if not candidates:
@@ -27000,7 +27007,14 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
             targets = _capture_correction_targets(
                 capture_id, photo_assets, item_id, engine_root)
         except Exception as exc:
-            result["errors"].append(f"capture {capture_id[:8]}: {exc}")
+            # This block only reads local capture state. A permanently
+            # corrupt capture (say a malformed photo_assets.json) would
+            # otherwise fail EVERY future sync run; unreadability here is a
+            # per-capture skip with a notice, never an error.
+            result["unreadable_capture"] += 1
+            result["notices"].append(
+                f"capture {capture_id[:8]}: skipped an unreadable local "
+                f"capture — {exc}")
             continue
         if targets:
             pending[capture_id] = targets

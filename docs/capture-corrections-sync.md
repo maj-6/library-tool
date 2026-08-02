@@ -104,8 +104,10 @@ after the capture book-metadata sync, under the owner service credential;
 silently skipped when the service credential is absent (contributor desktops).
 
 Stateless diff-and-publish (no local outbox):
-1. Candidate captures: cloud-imported manual entries (`capture_id` +
-   `capture_transport == "cloud"`).
+1. Candidate captures: capture-backed manual entries (`capture_id` present).
+   `capture_transport` is never consulted (legacy entries imported before the
+   field exists lack it); cloud-row existence in step 4 is the authoritative
+   gate.
 2. For each candidate, map committed correction-transform publications to
    `(capture_id, asset_id)`: the publication's `command.artifact_id` must
    resolve — transitively through prior transform outputs — to

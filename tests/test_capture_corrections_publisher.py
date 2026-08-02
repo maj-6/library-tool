@@ -318,7 +318,8 @@ def test_correction_jpeg_transcode_caps_edges_without_upscaling():
 
 
 def _seed_corrected_capture(monkeypatch, *, lifecycle: str = "completed",
-                            pointer_mtime: float | None = None):
+                            pointer_mtime: float | None = None,
+                            transport: str = "cloud"):
     monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
     monkeypatch.setattr(server, "_entry_checks", lambda _entry: {})
     monkeypatch.setattr(server, "activity", lambda *_args, **_kwargs: None)
@@ -332,7 +333,7 @@ def _seed_corrected_capture(monkeypatch, *, lifecycle: str = "completed",
         [_jpeg(capture_id)],
         "",
         ["photo_1.jpg"],
-        transport="cloud",
+        transport=transport,
     )
     assert entry_id
     assert errors == []
@@ -359,6 +360,19 @@ def _seed_corrected_capture(monkeypatch, *, lifecycle: str = "completed",
         "png": png,
         "correction_id": correction_id,
     }
+
+
+def _strip_transport_field(capture_id: str) -> None:
+    """Mimic an import that predates ``capture_transport`` (field absent)."""
+
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    matched = False
+    for entry in entries.values():
+        if isinstance(entry, dict) and entry.get("capture_id") == capture_id:
+            entry.pop("capture_transport", None)
+            matched = True
+    assert matched
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
 
 def _stub_cloud(monkeypatch, capture_id: str, *, owner_rows, existing):
@@ -408,7 +422,8 @@ def test_publish_uploads_objects_and_rows_per_contract(
         {"url": "cloud", "key": "service"})
 
     assert outcome == {"candidates": 1, "pushed": 1, "up_to_date": 0,
-                       "no_cloud_row": 0, "notices": [], "errors": []}
+                       "no_cloud_row": 0, "unreadable_capture": 0,
+                       "notices": [], "errors": []}
     display = server._capture_correction_jpeg(
         seeded["png"], long_edge=1600, quality=90)
     thumbnail = server._capture_correction_jpeg(
@@ -479,7 +494,8 @@ def test_publish_diff_short_circuits_matching_rows(
         {"url": "cloud", "key": "service"})
 
     assert outcome == {"candidates": 1, "pushed": 0, "up_to_date": 1,
-                       "no_cloud_row": 0, "notices": [], "errors": []}
+                       "no_cloud_row": 0, "unreadable_capture": 0,
+                       "notices": [], "errors": []}
     assert calls["uploads"] == []
     assert calls["published"] == []
 
@@ -497,7 +513,50 @@ def test_publish_skips_captures_without_a_cloud_row(
         {"url": "cloud", "key": "service"})
 
     assert outcome == {"candidates": 1, "pushed": 0, "up_to_date": 0,
-                       "no_cloud_row": 1, "notices": [], "errors": []}
+                       "no_cloud_row": 1, "unreadable_capture": 0,
+                       "notices": [], "errors": []}
+    assert calls["uploads"] == []
+    assert calls["published"] == []
+
+
+def test_publish_includes_legacy_entries_without_transport_field(
+        monkeypatch, capture_workspace):
+    """Imports that predate ``capture_transport`` carry no field; the cloud
+    row, not the transport value, gates publication."""
+
+    seeded = _seed_corrected_capture(monkeypatch)
+    _strip_transport_field(seeded["capture_id"])
+    calls = _stub_cloud(
+        monkeypatch, seeded["capture_id"],
+        owner_rows=[{"id": seeded["capture_id"], "created_by": OWNER_ID}],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome == {"candidates": 1, "pushed": 1, "up_to_date": 0,
+                       "no_cloud_row": 0, "unreadable_capture": 0,
+                       "notices": [], "errors": []}
+    (rows,) = calls["published"]
+    assert rows[0]["correction_id"] == seeded["correction_id"]
+
+
+def test_publish_lan_entry_without_cloud_row_skips_as_no_cloud_row(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch, transport="lan")
+    calls = _stub_cloud(
+        monkeypatch, seeded["capture_id"],
+        owner_rows=[],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome == {"candidates": 1, "pushed": 0, "up_to_date": 0,
+                       "no_cloud_row": 1, "unreadable_capture": 0,
+                       "notices": [], "errors": []}
     assert calls["uploads"] == []
     assert calls["published"] == []
 
@@ -515,7 +574,8 @@ def test_publish_skips_lifecycle_failed_assets(
         {"url": "cloud", "key": "service"})
 
     assert outcome == {"candidates": 0, "pushed": 0, "up_to_date": 0,
-                       "no_cloud_row": 0, "notices": [], "errors": []}
+                       "no_cloud_row": 0, "unreadable_capture": 0,
+                       "notices": [], "errors": []}
     assert calls["rest"] == []
     assert calls["uploads"] == []
     assert calls["published"] == []
@@ -529,6 +589,50 @@ def _cloud_row(seeded, *, correction_id: str, display_sha256: str) -> dict:
         "source_original_sha256": seeded["source_sha"],
         "result": {"artifacts": {"display": {"sha256": display_sha256}}},
     }
+
+
+def test_publish_skips_unreadable_capture_with_notice_not_error(
+        monkeypatch, capture_workspace):
+    """A permanently corrupt photo_assets.json is a per-capture skip with a
+    notice; it must never flip every future sync run to ok=false, and the
+    remaining candidates still publish."""
+
+    seeded = _seed_corrected_capture(monkeypatch)
+    corrupt_id = "c7777777-7777-4777-8777-777777777777"
+    entry_id, errors = server.ingest_capture(
+        {
+            "id": corrupt_id,
+            "ocr": {"photo_1.jpg": "Corrupted sage."},
+            "meta": {"title": "Corrupt Herbal"},
+        },
+        [_jpeg(corrupt_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="cloud",
+    )
+    assert entry_id
+    assert errors == []
+    (server.CAPTURES_DIR / corrupt_id / "photo_assets.json").write_text(
+        "{not json", encoding="utf-8")
+    calls = _stub_cloud(
+        monkeypatch, seeded["capture_id"],
+        owner_rows=[{"id": seeded["capture_id"], "created_by": OWNER_ID}],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["errors"] == []
+    assert outcome["unreadable_capture"] == 1
+    (notice,) = outcome["notices"]
+    assert notice.startswith(f"capture {corrupt_id[:8]}: ")
+    assert "unreadable" in notice
+    assert outcome["candidates"] == 1
+    assert outcome["pushed"] == 1
+    assert calls["listed"] == [[seeded["capture_id"]]]
+    (rows,) = calls["published"]
+    assert rows[0]["correction_id"] == seeded["correction_id"]
 
 
 def test_publish_holds_asset_when_cloud_row_ties_on_disturbed_mtimes(
