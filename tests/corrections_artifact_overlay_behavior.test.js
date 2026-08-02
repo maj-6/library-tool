@@ -155,6 +155,19 @@ test("concise overlay codes and metadata retain machine evidence and human overr
   assert.equal(artifactCode(region({
     effectiveRole: "marginalia",
   })), "MAR");
+  assert.equal(artifactCode(region({
+    effectiveRole: "manuscript",
+  })), "MS");
+  assert.equal(artifactCode(region({
+    effectiveRole: "stamp",
+  })), "STP");
+  assert.equal(artifactCode(region({
+    effectiveRole: "damage",
+  })), "DMG");
+  assert.equal(artifactCode(region({
+    effectiveRole: "watermark",
+  })), "WAT",
+  "unknown roles keep the first-three-letters fallback badge");
   assert.equal(artifactCode({
     effectiveCategory: "content_specimen",
   }), "E");

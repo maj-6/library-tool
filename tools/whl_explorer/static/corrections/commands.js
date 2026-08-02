@@ -13,6 +13,9 @@
       contentSpecimen: "corrections.category.content-specimen",
       marginalia: "corrections.role.marginalia",
       illustration: "corrections.role.illustration",
+      manuscript: "corrections.role.manuscript",
+      stamp: "corrections.role.stamp",
+      damage: "corrections.role.damage",
     });
 
     const TARGET_KINDS = Object.freeze({
@@ -80,6 +83,38 @@
         targetKind: TARGET_KINDS.ANNOTATION,
         action: "role.assign",
         value: "figure",
+      }),
+      // manuscript = hand-drawn or pencilled annotations, stamp = stamps,
+      // bookplates, and ownership marks, damage = foxing, stains, and tears.
+      Object.freeze({
+        id: COMMAND_IDS.manuscript,
+        label: "Mark region as manuscript",
+        shortLabel: "Manuscript",
+        code: "MS",
+        defaultBinding: "n",
+        targetKind: TARGET_KINDS.ANNOTATION,
+        action: "role.assign",
+        value: "manuscript",
+      }),
+      Object.freeze({
+        id: COMMAND_IDS.stamp,
+        label: "Mark region as stamp",
+        shortLabel: "Stamp",
+        code: "STP",
+        defaultBinding: "p",
+        targetKind: TARGET_KINDS.ANNOTATION,
+        action: "role.assign",
+        value: "stamp",
+      }),
+      Object.freeze({
+        id: COMMAND_IDS.damage,
+        label: "Mark region as damage",
+        shortLabel: "Damage",
+        code: "DMG",
+        defaultBinding: "d",
+        targetKind: TARGET_KINDS.ANNOTATION,
+        action: "role.assign",
+        value: "damage",
       }),
     ]);
 
@@ -445,10 +480,13 @@
       const focused = candidateValue(context, "focusedTarget");
       const selected = candidateValue(context, "selectionTarget", "selectedTarget");
       const soft = candidateValue(context, "softTarget", "hotTarget");
+      // A hovered target outranks the selection so hover-hotkeys act on the
+      // box under the pointer; kind acceptance below keeps incompatible
+      // commands on the focused or selected target instead.
       const candidates = [
+        ["soft", soft],
         ["focused", focused],
         ["selection", selected],
-        ["soft", soft],
       ];
       const seen = new Set();
       for (const [source, target] of candidates) {

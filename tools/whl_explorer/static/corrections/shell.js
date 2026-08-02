@@ -577,7 +577,8 @@
       });
     }
 
-    classificationEventEligible(event, _command, _context = {}) {
+    classificationEventEligible(event, command, context = {}) {
+      if (this.classificationHoverEligible(command, context)) return true;
       return this.classificationSurfaceEligible(event, [
         "booksList",
         "artifactsTree",
@@ -585,6 +586,18 @@
         "classificationControls",
         "classificationToolbar",
       ]);
+    }
+
+    // A hovered target keeps its hotkeys wherever document focus sits;
+    // typing surfaces and dialogs are still rejected by the keymap's own
+    // gates before this predicate runs.
+    classificationHoverEligible(command, context = {}) {
+      const soft = context && context.softTarget || null;
+      if (!soft) return false;
+      if (!command || typeof deps.resolveClassificationTarget !== "function") {
+        return true;
+      }
+      return Boolean(deps.resolveClassificationTarget({ softTarget: soft }, command));
     }
 
     classificationContextMenuEligible(event) {

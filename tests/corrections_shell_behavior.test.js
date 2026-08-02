@@ -588,8 +588,17 @@ test("classification shortcuts stay scoped and context menus use exact event tar
   assert.equal(shell.classificationEventEligible(
     { target: classificationToolbarButton }, null, {}), true);
   assert.equal(shell.classificationEventEligible(
-    { target: reviewButton }, null, { softTarget: { id: "hovered-image" } }), false,
-    "hover state cannot escape the pane that owns the keyboard event");
+    { target: reviewButton }, null, { softTarget: overlayTarget }), true,
+    "a hovered target keeps its hotkeys while focus sits outside the surfaces");
+  assert.equal(shell.classificationEventEligible(
+    { target: reviewButton },
+    { targetKind: "annotation" },
+    { softTarget: overlayTarget }), true);
+  assert.equal(shell.classificationEventEligible(
+    { target: reviewButton },
+    { targetKind: "image" },
+    { softTarget: overlayTarget }), false,
+    "hover only widens the gate for commands that accept the hovered target");
 
   assert.equal(shell.classificationContextMenuTarget(
     { target: captureButton }), captureTarget);

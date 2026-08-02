@@ -522,7 +522,7 @@ test("raw spatial annotation link ids resolve the linked artifact transaction", 
 });
 
 
-test("focused compatible target wins; a soft-only target is promoted before mutation", async () => {
+test("a hovered compatible target wins over the selection and is promoted first", async () => {
   const order = [];
   const { calls, controller } = harness({
     async promoteSoftTarget(target) {
@@ -545,16 +545,68 @@ test("focused compatible target wins; a soft-only target is promoted before muta
   }));
 
   await controller.invoke(CLASSIFICATION_COMMAND_IDS.cover);
-  assert.equal(calls[0][1].artifactId, "focused");
-  assert.deepEqual(order, [["target", "artifact:focused"]]);
-
-  controller.setSelectionTarget(annotation({ linkedKeys: [] }));
-  await controller.invoke(CLASSIFICATION_COMMAND_IDS.spine);
-  assert.equal(calls[1][1].artifactId, "hovered");
-  assert.deepEqual(order.slice(1), [
+  assert.equal(calls[0][1].artifactId, "hovered");
+  assert.deepEqual(order, [
     ["promote", "artifact:hovered"],
     ["target", "artifact:hovered"],
   ]);
+
+  controller.setSelectionTarget(image({
+    key: "artifact:focused",
+    id: "focused",
+    revision: "focused-r1",
+  }));
+  controller.setHotTarget(annotation({ linkedKeys: [] }));
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.spine);
+  assert.equal(calls[1][1].artifactId, "focused");
+  assert.deepEqual(order.slice(2), [["target", "artifact:focused"]],
+    "kind acceptance keeps image commands off a hovered annotation");
+
+  controller.setHotTarget(null);
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.titlePage);
+  assert.equal(calls[2][1].artifactId, "focused");
+  assert.deepEqual(order.slice(3), [["target", "artifact:focused"]]);
+});
+
+
+test("manuscript, stamp, and damage assign their open-vocabulary region roles", async () => {
+  const { calls, controller, scope } = harness();
+  controller.setSelectionTarget(annotation({ linkedKeys: [] }));
+  controller.mount();
+
+  assert.deepEqual(
+    [
+      CLASSIFICATION_COMMAND_IDS.manuscript,
+      CLASSIFICATION_COMMAND_IDS.stamp,
+      CLASSIFICATION_COMMAND_IDS.damage,
+    ].map((id) => {
+      const command = controller.registry.get(id);
+      return [command.label, command.code, controller.registry.bindingFor(id)];
+    }),
+    [
+      ["Mark region as manuscript", "MS", "n"],
+      ["Mark region as stamp", "STP", "p"],
+      ["Mark region as damage", "DMG", "d"],
+    ],
+  );
+  assert.equal(controller.registry.list().length, 9,
+    "the new default bindings register without a KeyBindingConflictError");
+
+  for (const key of ["n", "p", "d"]) {
+    scope.emit("keydown", { key, target: scope });
+    await settled();
+  }
+
+  assert.deepEqual(calls.map(([route, payload]) => [route, payload.role]), [
+    ["role", "manuscript"],
+    ["role", "stamp"],
+    ["role", "damage"],
+  ]);
+  for (const [, payload] of calls) {
+    assert.equal(payload.itemId, "book-1");
+    assert.equal(payload.annotationId, "region-1");
+    assert.equal(payload.expectedAnnotationRevision, "region-r1");
+  }
 });
 
 

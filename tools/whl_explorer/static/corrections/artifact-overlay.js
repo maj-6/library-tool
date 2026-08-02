@@ -8,11 +8,13 @@
 
     const ROLE_CODES = Object.freeze({
       marginalia: "MAR",
-      manuscript: "MAR",
+      manuscript: "MS",
       handwritten: "MAR",
       figure: "ILL",
       illustration: "ILL",
       image: "ILL",
+      stamp: "STP",
+      damage: "DMG",
     });
     const CATEGORY_CODES = Object.freeze({
       title_page: "T",

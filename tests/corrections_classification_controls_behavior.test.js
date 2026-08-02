@@ -125,14 +125,14 @@ function harness() {
 }
 
 
-test("presenter renders and binds exactly the six visible registered commands", async () => {
+test("presenter renders and binds exactly the nine visible registered commands", async () => {
   const { calls, controller, controls, host } = harness();
   controller.setSelectionTarget(image());
   controller.mount();
   controls.mount();
 
   const buttons = host.querySelectorAll("[data-command-button]");
-  assert.equal(buttons.length, 6);
+  assert.equal(buttons.length, 9);
   assert.deepEqual(
     buttons.map((button) => button.dataset.classificationCommand),
     CLASSIFICATION_CONTROL_COMMAND_IDS,
@@ -149,8 +149,15 @@ test("presenter renders and binds exactly the six visible registered commands", 
     "classificationCommand",
     CLASSIFICATION_COMMAND_IDS.marginalia,
   );
+  const stampButton = byDataset(
+    host,
+    "[data-command-button]",
+    "classificationCommand",
+    CLASSIFICATION_COMMAND_IDS.stamp,
+  );
   assert.equal(titleButton.disabled, false);
   assert.equal(marginaliaButton.disabled, true);
+  assert.equal(stampButton.disabled, true);
   assert.equal(titleButton.getAttribute("aria-keyshortcuts"), "T");
   assert.equal(
     titleButton.querySelector(".classification-command-key").textContent,
@@ -166,6 +173,7 @@ test("presenter renders and binds exactly the six visible registered commands", 
   controller.setSelectionTarget(annotation());
   assert.equal(titleButton.disabled, true);
   assert.equal(marginaliaButton.disabled, false);
+  assert.equal(stampButton.disabled, false);
 });
 
 
@@ -185,8 +193,8 @@ test("toolbar, context menu, and palette reuse the registered command entries", 
   controls.mount();
 
   const toolbarButtons = toolbar.querySelectorAll("[data-command-button]");
-  assert.equal(toolbarButtons.length, 6);
-  assert.equal(controller.registry.list().length, 6,
+  assert.equal(toolbarButtons.length, 9);
+  assert.equal(controller.registry.list().length, 9,
     "additional command surfaces must not register parallel definitions");
   controller.registry.remap(CLASSIFICATION_COMMAND_IDS.titlePage, "x");
   const toolbarTitle = byDataset(
@@ -241,7 +249,7 @@ test("toolbar, context menu, and palette reuse the registered command entries", 
   const palette = scope.querySelector("[data-classification-palette]");
   assert.equal(palette.hidden, false);
   const paletteButtons = palette.querySelectorAll("[data-surface-command]");
-  assert.equal(paletteButtons.length, 6);
+  assert.equal(paletteButtons.length, 9);
   const paletteSpine = byDataset(
     palette,
     "[data-surface-command]",
@@ -294,7 +302,7 @@ test("context menu entries and invocation use the target owned by the event", as
   });
   assert.equal(contextEvent.defaultPrevented, true);
   const menu = scope.querySelector("[data-classification-context-menu]");
-  assert.equal(menu.querySelectorAll("[data-surface-command]").length, 2,
+  assert.equal(menu.querySelectorAll("[data-surface-command]").length, 5,
     "the event-owned annotation determines command availability");
   const marginalia = byDataset(
     menu,
@@ -307,6 +315,22 @@ test("context menu entries and invocation use the target owned by the event", as
   assert.equal(calls.at(-1)[0], "role");
   assert.equal(calls.at(-1)[1].annotationId, "region-1");
   assert.equal(calls.at(-1)[1].role, "marginalia");
+
+  scope.emit("contextmenu", {
+    target: contextTarget,
+    clientX: 16,
+    clientY: 20,
+  });
+  const damage = byDataset(
+    menu,
+    "[data-surface-command]",
+    "surfaceCommand",
+    CLASSIFICATION_COMMAND_IDS.damage,
+  );
+  damage.emit("click");
+  await settled();
+  assert.equal(calls.at(-1)[0], "role");
+  assert.equal(calls.at(-1)[1].role, "damage");
   controls.destroy();
   controller.destroy();
 });
@@ -491,6 +515,6 @@ test("classification controls install through the standalone browser namespace",
   );
   assert.equal(
     context.LibraryToolCorrections.CLASSIFICATION_CONTROL_COMMAND_IDS.length,
-    6,
+    9,
   );
 });

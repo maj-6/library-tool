@@ -210,6 +210,14 @@ def test_ui_role_aliases_project_to_canonical_values_only():
     assert caught.value.code == "invalid_artifact_identity"
 
 
+def test_new_region_roles_round_trip_as_open_vocabulary():
+    for role in ("manuscript", "stamp", "damage"):
+        assert canonical_spatial_role(role) == role
+    with pytest.raises(ValidationError) as caught:
+        canonical_spatial_role("Manuscript")
+    assert caught.value.code == "invalid_spatial_role"
+
+
 def test_annotation_exposes_manual_role_caption_links_and_freshness():
     view = SpatialAnnotationView(
         key=SpatialAnnotationKey("book-1", "figure-1"),

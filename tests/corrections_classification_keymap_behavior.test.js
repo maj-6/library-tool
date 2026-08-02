@@ -326,6 +326,47 @@ test("optional event eligibility gates panes while preserving an allowed soft-ho
 });
 
 
+test("hovering a region is enough for the new role hotkeys to assign it", async () => {
+  const documentRef = fakeDocument();
+  documentRef.hasFocus = () => true;
+  const scope = new FakeNode("main", documentRef);
+  const calls = [];
+  const controller = createClassificationController({
+    scope,
+    documentRef,
+    port: {
+      async assignRegionRole(payload) {
+        calls.push(payload);
+        return {};
+      },
+    },
+    operationIdFactory: () => `hover-role-op-${calls.length + 1}`,
+  });
+  controller.setSelectionTarget(null);
+  controller.setHotTarget({
+    key: "annotation:region-1",
+    objectType: "spatial-annotation",
+    itemId: "book-1",
+    id: "region-1",
+    revision: "region-r1",
+    label: "Pencilled note",
+    linkedKeys: [],
+  });
+  controller.mount();
+
+  for (const key of ["n", "p", "d"]) {
+    const event = scope.emit("keydown", { key, target: scope });
+    await settled();
+    assert.equal(event.defaultPrevented, true);
+  }
+
+  assert.deepEqual(calls.map((payload) => payload.role), [
+    "manuscript", "stamp", "damage",
+  ]);
+  assert.equal(calls[0].annotationId, "region-1");
+});
+
+
 test("selection focus can be demoted without replacing the selected target", () => {
   const documentRef = fakeDocument();
   const scope = new FakeNode("main", documentRef);
