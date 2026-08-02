@@ -25481,6 +25481,518 @@ def _publish_capture_book_metadata(owner_cfg: dict, capture_cfg: dict) -> int:
     return pushed
 
 
+# --- capture corrections publisher (desktop -> phone) ---------------------------
+# Contract: docs/capture-corrections-sync.md. Committed correction-transform
+# display renditions are transcoded to JPEG, uploaded to the private
+# capture-derivatives bucket, and CAS-written one row per (capture_id,
+# asset_id) into capture_corrections for the phone to install.
+
+_CAPTURE_CORRECTION_BUCKET = "capture-derivatives"
+_CAPTURE_CORRECTION_RESULT_SCHEMA = "org.whl.capture-correction-result"
+_CAPTURE_CORRECTION_RECIPE = "whl-desktop-correction-v1"
+_CAPTURE_CORRECTION_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+_CAPTURE_CORRECTION_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CAPTURE_CORRECTION_DISPLAY_EDGE = 1600
+_CAPTURE_CORRECTION_DISPLAY_QUALITY = 90
+_CAPTURE_CORRECTION_THUMBNAIL_EDGE = 512
+_CAPTURE_CORRECTION_THUMBNAIL_QUALITY = 80
+
+
+def _capture_artifact_namespace(capture_id: str, asset_id: str) -> str:
+    """The corrections artifact repository's ``_opaque_identity("capture",
+    capture_id, asset_id)``: the digest input is the canonical JSON array of
+    the parts, not a plain byte join."""
+
+    digest = hashlib.sha256(json.dumps(
+        (capture_id, asset_id),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return f"capture:{digest[:40]}"
+
+
+def _capture_correction_recorded(outputs: list) -> float | None:
+    """Latest parseable output timestamp a publication recorded, if any."""
+
+    stamps = []
+    for output in outputs:
+        provenance = output.get("provenance") \
+            if isinstance(output, dict) else None
+        raw = str((provenance or {}).get("generated_at") or "").strip() \
+            if isinstance(provenance, dict) else ""
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        stamps.append(parsed.timestamp())
+    return max(stamps) if stamps else None
+
+
+def _capture_correction_targets(
+        capture_id: str, photo_assets: Mapping, item_id: str,
+        engine_root: Path) -> dict[str, dict]:
+    """Map committed correction-transform publications onto capture assets.
+
+    A publication counts only when its ``command.artifact_id`` resolves —
+    transitively through earlier publications' output ids — to this capture's
+    ``capture:<ns>:display``/``:original`` artifact. Per asset, chain order
+    is authoritative: a publication whose resolution passes through another
+    candidate's outputs supersedes it. That signal is content-derived — the
+    engine never stamps ``generated_at`` on these outputs, and pointer
+    mtimes do not survive index backfills or DATA_ROOT restores. Chain-
+    unrelated siblings order by recorded output timestamps when present,
+    else the by-item pointer mtime; lifecycle-failed desktop imports are
+    excluded.
+    """
+
+    asset_by_namespace: dict[str, str] = {}
+    source_sha: dict[str, str] = {}
+    failed: set[str] = set()
+    desktop_import = photo_assets.get("desktop_import") \
+        if isinstance(photo_assets, Mapping) else None
+    rows = desktop_import.get("assets") \
+        if isinstance(desktop_import, Mapping) else None
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        asset_id = row.get("asset_id")
+        checksum = str(row.get("source_checksum") or "").strip().lower()
+        if (not isinstance(asset_id, str)
+                or asset_id in source_sha
+                or not _CAPTURE_CORRECTION_ASSET_ID_RE.fullmatch(asset_id)
+                or not _CAPTURE_CORRECTION_SHA256_RE.fullmatch(checksum)):
+            continue
+        asset_by_namespace[
+            _capture_artifact_namespace(capture_id, asset_id)] = asset_id
+        source_sha[asset_id] = checksum
+        if row.get("lifecycle") == "failed":
+            failed.add(asset_id)
+    if not asset_by_namespace:
+        return {}
+
+    transforms = engine_root / ".engine" / "correction-transforms"
+    pointer_dir = transforms / "by-item" / hashlib.sha256(
+        item_id.encode("utf-8")).hexdigest()
+    publications: list[dict] = []
+    for pointer_path in (
+            sorted(pointer_dir.glob("*.json"))
+            if pointer_dir.is_dir() else ()):
+        try:
+            pointer = json.loads(pointer_path.read_text("utf-8"))
+            operation_id = str(pointer["operation_id"])
+            publication = json.loads(
+                (transforms / "publications" /
+                 (hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+                  + ".json")).read_text("utf-8"))
+        except (OSError, KeyError, TypeError, ValueError, UnicodeError):
+            continue    # a torn or foreign document must not block the pass
+        if not isinstance(publication, dict):
+            continue
+        command = publication.get("command")
+        outputs = publication.get("outputs")
+        correction_id = str(publication.get("command_sha256") or "").lower()
+        if (not isinstance(command, dict)
+                or not isinstance(outputs, list)
+                or publication.get("version") != 2
+                or command.get("item_id") != item_id
+                or not _CAPTURE_CORRECTION_SHA256_RE.fullmatch(correction_id)):
+            continue
+        recorded = _capture_correction_recorded(outputs)
+        publications.append({
+            "order": recorded if recorded is not None
+            else pointer_path.stat().st_mtime,
+            "operation_id": operation_id,
+            "command": command,
+            "outputs": outputs,
+            "correction_id": correction_id,
+        })
+
+    by_output: dict[str, dict] = {}
+    for entry in publications:
+        for output in entry["outputs"]:
+            if isinstance(output, dict) and isinstance(
+                    output.get("artifact_id"), str):
+                by_output[output["artifact_id"].casefold()] = entry
+
+    def resolve(entry: dict) -> tuple[str | None, frozenset[str]]:
+        ancestors: set[str] = set()
+        seen: set[str] = set()
+        while True:
+            artifact_id = str(entry["command"].get("artifact_id") or "")
+            namespace, _, rendition = artifact_id.rpartition(":")
+            if rendition in ("display", "original"):
+                asset_id = asset_by_namespace.get(namespace)
+                if asset_id is not None:
+                    return asset_id, frozenset(ancestors)
+            key = artifact_id.casefold()
+            if key in seen:
+                return None, frozenset()
+            seen.add(key)
+            parent = by_output.get(key)
+            if parent is None:
+                return None, frozenset()
+            ancestors.add(parent["correction_id"])
+            entry = parent
+
+    candidates: dict[str, list[dict]] = {}
+    for entry in publications:
+        asset_id, ancestors = resolve(entry)
+        if asset_id is None or asset_id in failed:
+            continue
+        display = next((
+            output for output in entry["outputs"]
+            if isinstance(output, dict)
+            and output.get("kind") == "corrected-display"
+        ), None)
+        display_id = (display or {}).get("artifact_id")
+        display_sha = str((display or {}).get("content_sha256") or "").lower()
+        if (not isinstance(display_id, str)
+                or not _CAPTURE_CORRECTION_SHA256_RE.fullmatch(display_sha)):
+            continue
+        candidates.setdefault(asset_id, []).append({
+            "order": entry["order"],
+            "operation_id": entry["operation_id"],
+            "correction_id": entry["correction_id"],
+            "ancestors": ancestors,
+            "display_id": display_id,
+            "display_sha256": display_sha,
+        })
+
+    winners: dict[str, dict] = {}
+    for asset_id, entries in candidates.items():
+        entries.sort(
+            key=lambda value: (value["order"], value["operation_id"]))
+        superseded = frozenset().union(
+            *(entry["ancestors"] for entry in entries))
+        # Chain order first: anything another candidate derives from lost
+        # already, whatever its clock signals say.
+        current = [entry for entry in entries
+                   if entry["correction_id"] not in superseded]
+        winner = (current or entries)[-1]
+        winners[asset_id] = {
+            "asset_id": asset_id,
+            "source_original_sha256": source_sha[asset_id],
+            "correction_id": winner["correction_id"],
+            "display_sha256": winner["display_sha256"],
+            "display_object": transforms / "objects" / (
+                hashlib.sha256(
+                    winner["display_id"].encode("utf-8")).hexdigest()
+                + ".bin"),
+            "order": winner["order"],
+            "ancestors": winner["ancestors"],
+            # Every candidate, for the publisher's cloud-row overwrite guard.
+            "candidates": {
+                entry["correction_id"]: {
+                    "order": entry["order"],
+                    "ancestors": entry["ancestors"],
+                } for entry in entries
+            },
+        }
+    return winners
+
+
+def _capture_correction_jpeg(png: bytes, *, long_edge: int,
+                             quality: int) -> dict:
+    """Contract transcode: RGB JPEG, bounded long edge, no metadata carried."""
+
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(png)) as source:
+        image = source.convert("RGB")
+    width, height = image.size
+    if max(width, height) > long_edge:
+        scale = long_edge / max(width, height)
+        image = image.resize(
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            Image.LANCZOS)
+    stream = io.BytesIO()
+    image.save(stream, format="JPEG", quality=quality)
+    data = stream.getvalue()
+    return {
+        "data": data,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+        "width": image.width,
+        "height": image.height,
+    }
+
+
+def _capture_correction_owner_ids(owner_cfg: dict, capture_ids) -> dict[str, str]:
+    """Cloud captures-row existence plus ``created_by`` for named captures.
+
+    supabase_sync has no created_by reader and the storage object path needs
+    the owning account id, so this reads it through the module's generic
+    ``_rest`` with the same id-scoped batching as ``list_capture_ids``. The
+    table trigger derives the row's own ``owner_id`` server-side.
+    """
+
+    out: dict[str, str] = {}
+    ids = sbase._capture_sync_ids(capture_ids)
+    table = owner_cfg.get("table") or "captures"
+    for i in range(0, len(ids), 40):
+        batch = ids[i:i + 40]
+        encoded = ",".join(
+            urllib.parse.quote(value, safe="") for value in batch)
+        rows = sbase._rest(
+            owner_cfg, "GET",
+            f"{table}?id=in.({encoded})&select=id,created_by&order=id.asc")
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("id") not in batch:
+                continue
+            try:
+                owner_id = str(uuid.UUID(str(row.get("created_by") or "")))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            out[str(row["id"])] = owner_id
+    return out
+
+
+def _capture_correction_result_doc(target: dict, *, display: dict,
+                                   thumbnail: dict, display_path: str,
+                                   thumbnail_path: str) -> dict:
+    def artifact(rendition: dict, path: str) -> dict:
+        return {
+            "bucket": _CAPTURE_CORRECTION_BUCKET,
+            "path": path,
+            "sha256": rendition["sha256"],
+            "bytes": rendition["bytes"],
+            "width": rendition["width"],
+            "height": rendition["height"],
+            "content_type": "image/jpeg",
+        }
+
+    return {
+        "schema": _CAPTURE_CORRECTION_RESULT_SCHEMA,
+        "version": 1,
+        "processor": "whl-desktop-corrections",
+        "recipe": _CAPTURE_CORRECTION_RECIPE,
+        "correction_id": target["correction_id"],
+        "source": {
+            "original_sha256": target["source_original_sha256"],
+            "desktop_display_sha256": target["display_sha256"],
+        },
+        "geometry_strategy": "replace_and_reocr",
+        "artifacts": {
+            "display": artifact(display, display_path),
+            "thumbnail": artifact(thumbnail, thumbnail_path),
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(
+            timespec="seconds"),
+    }
+
+
+def _capture_correction_row_display_sha(row) -> str:
+    result_doc = row.get("result") if isinstance(row, dict) else None
+    artifacts = result_doc.get("artifacts") \
+        if isinstance(result_doc, dict) else None
+    display = artifacts.get("display") if isinstance(artifacts, dict) else None
+    return str(display.get("sha256") or "").lower() \
+        if isinstance(display, dict) else ""
+
+
+_CAPTURE_CORRECTION_MISSING_NOTICE = (
+    "capture_corrections table missing on the cloud project — apply "
+    "docs/cloud/migrations/023_capture_corrections.sql")
+
+
+def _capture_corrections_relation_missing(owner_cfg: dict,
+                                          exc: Exception) -> bool:
+    """Whether a SyncError says the capture_corrections relation itself is
+    absent (migration 023 not applied). ``sbase._request`` formats these as
+    ``HTTP <code> on <method> <url-sans-query>: <detail>``; PostgREST
+    reports a missing table as 404 with PGRST205 (schema-cache miss) or
+    Postgres 42P01 in the detail. The Android consumer tolerates the
+    missing table, so the desktop treats it as a skipped stage, not a
+    failed run."""
+
+    if not isinstance(exc, sbase.SyncError):
+        return False
+    message = str(exc)
+    table = owner_cfg.get("capture_corrections_table") or "capture_corrections"
+    if f"/rest/v1/{table}" not in message:
+        return False
+    return ("PGRST205" in message or "42P01" in message
+            or message.startswith("HTTP 404 "))
+
+
+def _publish_capture_corrections(owner_cfg: dict) -> dict:
+    """Stateless diff-and-publish of corrected capture display renditions.
+
+    Candidates are cloud-imported manual entries. Captures without a cloud
+    row are skipped (the row's FK would fail; LAN-only captures), up-to-date
+    rows are left alone, and one failing capture never stops the others.
+    An existing cloud row is only overwritten by a winner that provably
+    sorts newer (chain ancestry, else a strictly later order signal) when
+    the row's correction is locally known, or by a lexicographically
+    greater ``correction_id`` when another desktop authored it; ambiguous
+    cases skip with a notice. A cloud project without the
+    capture_corrections table (migration 023) marks the stage skipped
+    instead of failing the run. Re-running converges: uploads are
+    content-addressed and upserted, row writes are CAS'd by
+    ``sbase.publish_capture_corrections``."""
+
+    result = {"candidates": 0, "pushed": 0, "up_to_date": 0,
+              "no_cloud_row": 0, "notices": [], "errors": []}
+    with _manual_lock:
+        manual_entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+    candidates = sorted({
+        capture_id
+        for entry in manual_entries.values()
+        if isinstance(entry, dict)
+        and entry.get("capture_transport") == "cloud"
+        and (capture_id := _capture_archive_id(entry.get("capture_id")))
+    })
+    if not candidates:
+        return result
+    try:
+        with _corrections_workspace_locks():
+            item_by_capture = {
+                target.capture_id: item_id
+                for item_id, target in
+                _corrections_targets_for_context().items()
+                if target.capture_id
+            }
+    except Exception as exc:
+        result["errors"].append(f"corrections authority: {exc}")
+        return result
+    engine_root = _ensure_engine_session().write_set.root
+    pending: dict[str, dict[str, dict]] = {}
+    for capture_id in candidates:
+        item_id = item_by_capture.get(capture_id)
+        if not item_id:
+            continue
+        try:
+            photo_assets = lib.load_json(
+                CAPTURES_DIR / capture_id / "photo_assets.json", {}) or {}
+            targets = _capture_correction_targets(
+                capture_id, photo_assets, item_id, engine_root)
+        except Exception as exc:
+            result["errors"].append(f"capture {capture_id[:8]}: {exc}")
+            continue
+        if targets:
+            pending[capture_id] = targets
+    if not pending:
+        return result
+    result["candidates"] = len(pending)
+    try:
+        owner_ids = _capture_correction_owner_ids(owner_cfg, sorted(pending))
+        existing_rows = sbase.list_capture_corrections(
+            owner_cfg, sorted(pending))
+    except Exception as exc:
+        if _capture_corrections_relation_missing(owner_cfg, exc):
+            result["skipped"] = _CAPTURE_CORRECTION_MISSING_NOTICE
+        else:
+            result["errors"].append(f"corrections read: {exc}")
+        return result
+    existing = {
+        (str(row.get("capture_id")), str(row.get("asset_id"))): row
+        for row in (existing_rows if isinstance(existing_rows, list) else [])
+        if isinstance(row, dict)
+    }
+    rows: list[dict] = []
+    for capture_id in sorted(pending):
+        owner_id = owner_ids.get(capture_id)
+        if not owner_id:
+            result["no_cloud_row"] += 1
+            continue
+        try:
+            for asset_id in sorted(pending[capture_id]):
+                target = pending[capture_id][asset_id]
+                png = target["display_object"].read_bytes()
+                if hashlib.sha256(png).hexdigest() != \
+                        target["display_sha256"]:
+                    raise ValueError(
+                        f"asset {asset_id}: committed display bytes "
+                        "are damaged")
+                display = _capture_correction_jpeg(
+                    png,
+                    long_edge=_CAPTURE_CORRECTION_DISPLAY_EDGE,
+                    quality=_CAPTURE_CORRECTION_DISPLAY_QUALITY)
+                previous = existing.get((capture_id, asset_id))
+                if (previous is not None
+                        and str(previous.get("correction_id") or "").lower()
+                        == target["correction_id"]
+                        and _capture_correction_row_display_sha(previous)
+                        == display["sha256"]):
+                    result["up_to_date"] += 1
+                    continue
+                row_correction = str(
+                    (previous or {}).get("correction_id") or "").lower()
+                if row_correction \
+                        and row_correction != target["correction_id"]:
+                    candidate = target["candidates"].get(row_correction)
+                    if candidate is not None:
+                        # Downgrade guard: replacing a row this desktop also
+                        # holds locally needs proof of newness. A tie means
+                        # the pointer mtimes are disturbed (index backfill,
+                        # DATA_ROOT restore, exFAT granularity) — keep the
+                        # cloud row rather than reinstall old pixels.
+                        newer = (
+                            row_correction in target["ancestors"]
+                            or (target["correction_id"]
+                                not in candidate["ancestors"]
+                                and target["order"] > candidate["order"]))
+                        if not newer:
+                            result["notices"].append(
+                                f"capture {capture_id[:8]}: asset "
+                                f"{asset_id}: kept the cloud correction — "
+                                "the local winner does not sort strictly "
+                                "newer")
+                            continue
+                    elif target["correction_id"] <= row_correction:
+                        # Another desktop authored the row; both sides
+                        # defer to the greater id so they converge on one
+                        # winner instead of ping-ponging the row.
+                        result["notices"].append(
+                            f"capture {capture_id[:8]}: asset {asset_id}: "
+                            "kept another desktop's correction")
+                        continue
+                thumbnail = _capture_correction_jpeg(
+                    png,
+                    long_edge=_CAPTURE_CORRECTION_THUMBNAIL_EDGE,
+                    quality=_CAPTURE_CORRECTION_THUMBNAIL_QUALITY)
+                base = (f"{owner_id}/{capture_id}/{asset_id}/"
+                        f"desktop-{target['correction_id'][:20]}")
+                display_path = f"{base}/display-{display['sha256'][:20]}.jpg"
+                thumbnail_path = \
+                    f"{base}/thumbnail-{thumbnail['sha256'][:20]}.jpg"
+                sbase.upload_object(
+                    owner_cfg, _CAPTURE_CORRECTION_BUCKET, display_path,
+                    display["data"], "image/jpeg")
+                sbase.upload_object(
+                    owner_cfg, _CAPTURE_CORRECTION_BUCKET, thumbnail_path,
+                    thumbnail["data"], "image/jpeg")
+                rows.append({
+                    "capture_id": capture_id,
+                    "asset_id": asset_id,
+                    "correction_id": target["correction_id"],
+                    "source_original_sha256":
+                        target["source_original_sha256"],
+                    "result": _capture_correction_result_doc(
+                        target, display=display, thumbnail=thumbnail,
+                        display_path=display_path,
+                        thumbnail_path=thumbnail_path),
+                })
+        except Exception as exc:
+            result["errors"].append(f"capture {capture_id[:8]}: {exc}")
+    if rows:
+        try:
+            result["pushed"] = int(
+                sbase.publish_capture_corrections(owner_cfg, rows) or 0)
+        except Exception as exc:
+            if _capture_corrections_relation_missing(owner_cfg, exc):
+                result["skipped"] = _CAPTURE_CORRECTION_MISSING_NOTICE
+            else:
+                result["errors"].append(f"corrections rows: {exc}")
+    return result
+
+
 @contextlib.contextmanager
 def _cloud_sync_item_policy_guard():
     """Yield the tombstone policy while lifecycle isolation remains held."""
@@ -25703,6 +26215,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
             }
         pushed = metadata_pushed = 0
         review_sync: dict = {}
+        corrections_sync: dict = {}
         stores: dict = {}
         entries_res: dict = {}
         if owner_cfg:
@@ -25769,6 +26282,21 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                 errors.append(
                     "capture metadata: skipped because builds sync was unsafe")
             _cloudsync_set_stage(
+                "capture_corrections", "Publishing photo corrections",
+                total=0, completed=0, unit="operations",
+                indeterminate=True)
+            try:
+                corrections_sync = _publish_capture_corrections(owner_cfg)
+                errors.extend(
+                    f"capture corrections: {error}"
+                    for error in corrections_sync.get("errors") or [])
+            except Exception as exc:
+                corrections_sync = {
+                    "pushed": 0,
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+                errors.append(f"capture corrections: {exc}")
+            _cloudsync_set_stage(
                 "entry_files", "Synchronizing entry files",
                 total=0, completed=0, unit="operations", indeterminate=True)
             with _lease_r2_cfg() as r2cfg:
@@ -25793,6 +26321,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                   "capture_associations": association_sync,
                   "capture_metadata_pushed": metadata_pushed,
                   "capture_reviews": review_sync,
+                  "capture_corrections": corrections_sync,
                   "stores": stores,
                   "entries": entries_res, "errors": errors,
                   "owner_sync": bool(owner_cfg)}
@@ -25806,11 +26335,12 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
         if result.get("ok"):
             stores = result.get("stores") or {}
             log.info("cloud sync done: %d imported, %d skipped, %d books pushed, "
-                     "%d capture snapshots pushed, "
+                     "%d capture snapshots pushed, %d corrections pushed, "
                      "stores %d up / %d down, entry files %d up / %d down",
                      result.get("imported", 0), result.get("skipped", 0),
                      result.get("books_pushed", 0),
                      result.get("capture_metadata_pushed", 0),
+                     (result.get("capture_corrections") or {}).get("pushed", 0),
                      sum(r.get("pushed", 0) + r.get("tombstoned", 0)
                          for r in stores.values()),
                      sum(r.get("pulled", 0) + r.get("deleted", 0)

@@ -13,6 +13,11 @@ internal const val CLOUD_DERIVATIVE_BUCKET = "capture-derivatives"
 internal const val MAX_CLOUD_DERIVATIVE_BYTES = 32L * 1024L * 1024L
 internal const val MAX_CLOUD_DERIVATIVE_PIXELS = 40L * 1_000_000L
 
+internal const val DESKTOP_CORRECTION_RESULT_SCHEMA = "org.whl.capture-correction-result"
+internal const val DESKTOP_CORRECTION_RESULT_VERSION = 1
+internal const val DESKTOP_CORRECTION_PROCESSOR = "whl-desktop-corrections"
+internal const val DESKTOP_CORRECTION_RECIPE = "whl-desktop-correction-v1"
+
 private val CLOUD_SAFE_TOKEN = Regex("[A-Za-z0-9._-]+")
 private val CLOUD_SHA256 = Regex("[0-9a-f]{64}")
 private val CLOUD_JOB_STATES = setOf(
@@ -250,8 +255,18 @@ internal fun validateCloudPhotoResult(
         currentDisplay.revision == targetRevision &&
             currentDisplay.sha256 == artifact.sha256 -> Unit // idempotent repair/download
         currentDisplay.revision > targetRevision -> return CloudResultDecision.Superseded
-        currentDisplay.revision != mergeRevision || currentDisplay.sha256 != mergeHash ->
+        currentDisplay.revision != mergeRevision || currentDisplay.sha256 != mergeHash -> {
+            // A desktop correction that installed while this job was still in
+            // flight claims the same target revision with different pixels.
+            // That photo was corrected, not broken, so the immutable cloud
+            // result is merely superseded; any other divergence stays a hard
+            // merge-base rejection.
+            if (currentDisplay.recipe == DESKTOP_CORRECTION_RECIPE &&
+                currentDisplay.revision >= targetRevision) {
+                return CloudResultDecision.Superseded
+            }
             return CloudResultDecision.Rejected("local display merge base")
+        }
     }
 
     return CloudResultDecision.Ready(CloudDisplayInstallPlan(
@@ -265,6 +280,145 @@ internal fun validateCloudPhotoResult(
         baseToOutputHomography = homography,
         reocrRequired = reocrRequired,
     ))
+}
+
+/** One CAS-superseded row in capture_corrections: the desktop's latest
+ * committed correction of one capture photo. */
+internal data class CaptureCorrectionRow(
+    val captureId: String,
+    val assetId: String,
+    val ownerId: String,
+    val correctionId: String,
+    val sourceOriginalSha256: String,
+    val result: JSONObject?,
+    val revision: Long,
+    val updatedAt: String,
+)
+
+/** A correction bound to the exact local asset and display base it will bump. */
+internal data class DesktopCorrectionInstallPlan(
+    val row: CaptureCorrectionRow,
+    val artifact: CloudDisplayArtifact,
+    val baseDisplaySha256: String,
+    val baseDisplayRevision: Int,
+    val targetRevision: Int,
+)
+
+internal sealed interface DesktopCorrectionDecision {
+    /** The row is valid but names no asset this handset holds. */
+    data object NotApplicable : DesktopCorrectionDecision
+
+    /** The asset's persisted correction id already matches; a no-op regardless
+     * of the row's server revision. */
+    data object AlreadyApplied : DesktopCorrectionDecision
+
+    data class Rejected(val reason: String) : DesktopCorrectionDecision
+
+    data class Ready(val plan: DesktopCorrectionInstallPlan) : DesktopCorrectionDecision
+}
+
+internal fun captureCorrectionRowFromJson(row: JSONObject): CaptureCorrectionRow? {
+    val captureId = row.strictCloudString("capture_id") ?: return null
+    val assetId = row.strictCloudString("asset_id") ?: return null
+    val ownerId = row.strictCloudString("owner_id") ?: return null
+    val correctionId = row.strictCloudString("correction_id")?.lowercase() ?: return null
+    val sourceSha256 = row.strictCloudString("source_original_sha256")?.lowercase()
+        ?: return null
+    val revision = row.strictCloudLong("revision") ?: return null
+    val updatedAt = row.strictCloudString("updated_at") ?: return null
+    if (!listOf(captureId, assetId, ownerId).all(::cloudSafeToken) ||
+        !correctionId.matches(CLOUD_SHA256) || !sourceSha256.matches(CLOUD_SHA256) ||
+        revision < 1 || updatedAt.isEmpty() || updatedAt.length > 80) return null
+    val result = when (val value = row.opt("result")) {
+        null, JSONObject.NULL -> null
+        is JSONObject -> JSONObject(value.toString())
+        else -> return null
+    }
+    return CaptureCorrectionRow(
+        captureId, assetId, ownerId, correctionId, sourceSha256,
+        result, revision, updatedAt,
+    )
+}
+
+/**
+ * Validate a desktop correction against the immutable camera-original anchor
+ * before any network bytes are trusted. As with cloud results, the display
+ * artifact path is derived independently from the row's own ids, so a
+ * malicious or corrupted result cannot turn the authenticated Storage GET
+ * into an arbitrary-object read.
+ */
+internal fun validateDesktopCorrection(
+    local: CapturePhotoAssets,
+    row: CaptureCorrectionRow,
+    expectedOwnerId: String,
+): DesktopCorrectionDecision {
+    if (row.ownerId != expectedOwnerId || row.captureId != local.captureId) {
+        return DesktopCorrectionDecision.NotApplicable
+    }
+    val asset = local.assets.firstOrNull { it.assetId == row.assetId }
+        ?: return DesktopCorrectionDecision.NotApplicable
+    if (asset.original.sha256.isEmpty() ||
+        asset.original.sha256 != row.sourceOriginalSha256) {
+        return DesktopCorrectionDecision.Rejected("original anchor")
+    }
+    if (asset.appliedDesktopCorrectionId == row.correctionId) {
+        return DesktopCorrectionDecision.AlreadyApplied
+    }
+    val result = row.result ?: return DesktopCorrectionDecision.Rejected("missing result")
+
+    if (result.strictCloudString("schema") != DESKTOP_CORRECTION_RESULT_SCHEMA ||
+        result.strictCloudInt("version") != DESKTOP_CORRECTION_RESULT_VERSION) {
+        return DesktopCorrectionDecision.Rejected("result schema")
+    }
+    if (result.strictCloudString("processor") != DESKTOP_CORRECTION_PROCESSOR) {
+        return DesktopCorrectionDecision.Rejected("processor identity")
+    }
+    if (result.strictCloudString("recipe") != DESKTOP_CORRECTION_RECIPE) {
+        return DesktopCorrectionDecision.Rejected("correction recipe")
+    }
+    if (result.strictCloudString("correction_id")?.lowercase() != row.correctionId) {
+        return DesktopCorrectionDecision.Rejected("correction identity")
+    }
+    val source = result.optJSONObject("source")
+        ?: return DesktopCorrectionDecision.Rejected("missing source anchor")
+    if (source.strictCloudString("original_sha256")?.lowercase() !=
+        row.sourceOriginalSha256) {
+        return DesktopCorrectionDecision.Rejected("source anchor")
+    }
+    // v1 is always replace_and_reocr: desktop pixels have no homography chain
+    // to the phone's display rendition.
+    if (result.strictCloudString("geometry_strategy") != "replace_and_reocr") {
+        return DesktopCorrectionDecision.Rejected("geometry strategy")
+    }
+
+    val artifactJson = result.optJSONObject("artifacts")?.optJSONObject("display")
+        ?: return DesktopCorrectionDecision.Rejected("missing display artifact")
+    val artifact = parseCorrectionDisplayArtifact(artifactJson)
+        ?: return DesktopCorrectionDecision.Rejected("display artifact metadata")
+    val expectedPath = "${row.ownerId}/${row.captureId}/${row.assetId}/" +
+        "desktop-${row.correctionId.take(20)}/display-${artifact.sha256.take(20)}.jpg"
+    if (artifact.bucket != CLOUD_DERIVATIVE_BUCKET || artifact.path != expectedPath) {
+        return DesktopCorrectionDecision.Rejected("display artifact path")
+    }
+
+    return DesktopCorrectionDecision.Ready(DesktopCorrectionInstallPlan(
+        row = row,
+        artifact = artifact,
+        baseDisplaySha256 = asset.display.sha256,
+        baseDisplayRevision = asset.display.revision,
+        targetRevision = asset.display.revision + 1,
+    ))
+}
+
+internal fun desktopCorrectionDisplayFileName(plan: DesktopCorrectionInstallPlan): String =
+    "desktop_${plan.row.assetId}_r${plan.targetRevision}_${plan.artifact.sha256.take(20)}.jpg"
+
+/** The correction result document declares `content_type` where cloud job
+ * results declare `mime`; every other artifact constraint is shared. */
+private fun parseCorrectionDisplayArtifact(value: JSONObject): CloudDisplayArtifact? {
+    val remapped = JSONObject(value.toString())
+    val contentType = remapped.remove("content_type") ?: return null
+    return parseDisplayArtifact(remapped.put("mime", contentType))
 }
 
 private fun parseDisplayArtifact(value: JSONObject): CloudDisplayArtifact? {

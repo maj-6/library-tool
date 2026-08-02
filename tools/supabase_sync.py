@@ -12,8 +12,9 @@ Authenticated-user calls also carry ``access_token``; the project key stays in
 user. Owner-only calls omit ``access_token`` and continue to use the service
 credential as their bearer. Optional keys "table" (default "captures"),
 "bucket" (default "captures"), "books_table" (default "books"),
-"capture_book_metadata_table", and "capture_reviews_table" (the latter two
-use same-named defaults). Errors raise
+"capture_book_metadata_table", "capture_reviews_table", and
+"capture_corrections_table" (the latter three use same-named defaults).
+Errors raise
 SyncError with a readable message — callers report, they don't crash.
 """
 from __future__ import annotations
@@ -56,6 +57,13 @@ _CAPTURE_LIB_ASSOCIATION_FIELDS = frozenset({
     "source_revision",
     "source_fingerprint",
 })
+CAPTURE_CORRECTION_RESULT_SCHEMA = "org.whl.capture-correction-result"
+CAPTURE_CORRECTION_RESULT_VERSION = 1
+CAPTURE_CORRECTION_PROCESSOR = "whl-desktop-corrections"
+CAPTURE_CORRECTION_RECIPE = "whl-desktop-correction-v1"
+CAPTURE_CORRECTION_RESULT_MAX_BYTES = 64 * 1024
+_CAPTURE_CORRECTION_ASSET_ID = re.compile(r"[A-Za-z0-9._-]{1,160}")
+_CAPTURE_CORRECTION_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class SyncError(Exception):
@@ -971,6 +979,185 @@ def write_capture_review(cfg: dict, row: dict,
             len(updated_at) > 80):
         raise SyncError("capture review write did not advance a valid revision")
     return accepted
+
+
+# --- capture corrections: desktop-corrected display renditions --------------------
+
+def list_capture_corrections(cfg: dict, capture_ids,
+                             chunk: int = 40) -> list[dict]:
+    """Read published correction rows for only the named phone captures.
+
+    The service role can see every account, so the explicit id filter is a
+    required scope boundary, not merely an optimization.
+    """
+    out: list[dict] = []
+    ids = _capture_sync_ids(capture_ids)
+    table = cfg.get("capture_corrections_table") or "capture_corrections"
+    for i in range(0, len(ids), chunk):
+        batch = ids[i:i + chunk]
+        encoded = ",".join(urllib.parse.quote(value, safe="") for value in batch)
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?capture_id=in.({encoded})"
+            "&select=capture_id,asset_id,owner_id,correction_id,"
+            "source_original_sha256,result,revision,updated_at"
+            "&order=capture_id.asc",
+        )
+        if isinstance(rows, list):
+            out.extend(row for row in rows if isinstance(row, dict)
+                       and row.get("capture_id") in batch)
+    return out
+
+
+def _capture_correction_write_row(raw: dict) -> dict:
+    """Validate one complete desktop correction row.
+
+    ``owner_id`` is trigger-derived from the capture's creator and therefore
+    never part of the writable projection.
+    """
+    if not isinstance(raw, dict):
+        raise SyncError("capture correction row must be an object")
+    normalized = _capture_sync_ids((raw.get("capture_id"),))
+    asset_id = raw.get("asset_id")
+    correction_id = raw.get("correction_id")
+    source_sha256 = raw.get("source_original_sha256")
+    result = raw.get("result")
+    if (not normalized or not isinstance(asset_id, str) or
+            not _CAPTURE_CORRECTION_ASSET_ID.fullmatch(asset_id) or
+            not isinstance(correction_id, str) or
+            not _CAPTURE_CORRECTION_DIGEST.fullmatch(correction_id) or
+            not isinstance(source_sha256, str) or
+            not _CAPTURE_CORRECTION_DIGEST.fullmatch(source_sha256) or
+            not isinstance(result, dict)):
+        raise SyncError("capture correction row is invalid")
+    try:
+        result_size = len(json.dumps(
+            result, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise SyncError("capture correction result is not JSON") from exc
+    if result_size > CAPTURE_CORRECTION_RESULT_MAX_BYTES:
+        raise SyncError("capture correction result exceeds 64 KiB")
+    version = result.get("version")
+    if (result.get("schema") != CAPTURE_CORRECTION_RESULT_SCHEMA or
+            isinstance(version, bool) or
+            version != CAPTURE_CORRECTION_RESULT_VERSION or
+            result.get("processor") != CAPTURE_CORRECTION_PROCESSOR or
+            result.get("recipe") != CAPTURE_CORRECTION_RECIPE or
+            result.get("correction_id") != correction_id):
+        raise SyncError("capture correction result contradicts its row")
+    return {
+        "capture_id": normalized[0],
+        "asset_id": asset_id,
+        "correction_id": correction_id,
+        "source_original_sha256": source_sha256,
+        "result": result,
+    }
+
+
+def _correction_display_sha256(result) -> str:
+    artifacts = result.get("artifacts") if isinstance(result, dict) else None
+    display = artifacts.get("display") if isinstance(artifacts, dict) else None
+    sha256 = display.get("sha256") if isinstance(display, dict) else None
+    return sha256 if isinstance(sha256, str) else ""
+
+
+def publish_capture_corrections(cfg: dict, rows: list[dict]) -> int:
+    """CAS-publish desktop corrections, one row per (capture_id, asset_id).
+
+    Unlike the book-metadata projection there is no vector clock: the desktop
+    under the owner service credential is the sole writer, so CAS on
+    ``revision`` alone guards against a concurrent desktop run. Invalid rows
+    and revision conflicts are reported after unrelated valid rows have had an
+    opportunity to publish.
+    """
+    desired: dict[tuple[str, str], dict] = {}
+    failures: list[str] = []
+    for raw in rows:
+        if isinstance(raw, dict):
+            label = "/".join((
+                str(raw.get("capture_id") or "").strip() or "<unknown>",
+                str(raw.get("asset_id") or "").strip() or "<unknown>",
+            ))
+        else:
+            label = "<unknown>"
+        try:
+            normalized = _capture_correction_write_row(raw)
+        except SyncError as exc:
+            failures.append(f"{label}: {exc}")
+            continue
+        desired[(normalized["capture_id"], normalized["asset_id"])] = normalized
+    existing = {
+        (str(row.get("capture_id")), str(row.get("asset_id"))): row
+        for row in list_capture_corrections(
+            cfg, (key[0] for key in desired))
+    }
+    table = cfg.get("capture_corrections_table") or "capture_corrections"
+    pushed = 0
+    selected = ("capture_id,asset_id,correction_id,source_original_sha256,"
+                "result,revision,updated_at")
+    for (capture_id, asset_id), row in desired.items():
+        previous = existing.get((capture_id, asset_id))
+        if (previous is not None and
+                str(previous.get("correction_id") or "") ==
+                row["correction_id"] and
+                _correction_display_sha256(previous.get("result")) ==
+                _correction_display_sha256(row["result"])):
+            continue
+        try:
+            if previous is None:
+                response = _rest(
+                    cfg, "POST",
+                    f"{table}?on_conflict=capture_id,asset_id"
+                    f"&select={selected}", [row],
+                    prefer="resolution=ignore-duplicates,return=representation",
+                )
+                expected_revision = 1
+            else:
+                revision = previous.get("revision")
+                if (isinstance(revision, bool) or
+                        not isinstance(revision, int) or revision < 1):
+                    raise SyncError("cloud correction has an invalid revision")
+                encoded_capture = urllib.parse.quote(capture_id, safe="")
+                encoded_asset = urllib.parse.quote(asset_id, safe="")
+                response = _rest(
+                    cfg, "PATCH",
+                    f"{table}?capture_id=eq.{encoded_capture}"
+                    f"&asset_id=eq.{encoded_asset}&revision=eq.{revision}"
+                    f"&select={selected}",
+                    {"correction_id": row["correction_id"],
+                     "source_original_sha256": row["source_original_sha256"],
+                     "result": row["result"]},
+                    prefer="return=representation",
+                )
+                expected_revision = revision + 1
+            if not isinstance(response, list) or len(response) != 1:
+                raise SyncError("capture correction compare-and-set conflict")
+            accepted = response[0]
+            if (not isinstance(accepted, dict) or
+                    accepted.get("capture_id") != capture_id or
+                    accepted.get("asset_id") != asset_id or
+                    accepted.get("correction_id") != row["correction_id"] or
+                    accepted.get("source_original_sha256") !=
+                    row["source_original_sha256"] or
+                    accepted.get("result") != row["result"] or
+                    accepted.get("revision") != expected_revision or
+                    not isinstance(accepted.get("updated_at"), str) or
+                    not accepted.get("updated_at")):
+                raise SyncError(
+                    "capture correction write returned an invalid row")
+            pushed += 1
+        except SyncError as exc:
+            failures.append(f"{capture_id}/{asset_id}: {exc}")
+    if failures:
+        detail = "; ".join(failures[:10])
+        if len(failures) > 10:
+            detail += f"; +{len(failures) - 10} more"
+        raise SyncError(
+            f"{len(failures)} capture correction row(s) failed "
+            f"({pushed} succeeded): {detail}")
+    return pushed
 
 
 # --- desktop working stores (builds / ia_catalog / corrections) -------------------

@@ -208,6 +208,62 @@ class CloudPhotoProcessingTest {
     }
 
     @Test
+    fun desktopCorrectedDisplaySupersedesAnInFlightCloudResultInsteadOfFailing() {
+        fun withDisplay(recipe: String, revision: Int): CapturePhotoAssets {
+            val contract = localContract()
+            return contract.copy(assets = contract.assets.map { asset ->
+                asset.copy(display = asset.display.copy(
+                    sha256 = "f".repeat(64),
+                    revision = revision,
+                    recipe = recipe,
+                ))
+            })
+        }
+
+        // A desktop correction that installed while the phone-requested job
+        // was in flight claims the same target revision with different
+        // pixels: the photo was corrected, not broken, so the immutable
+        // result is quietly superseded rather than stamped FAILED.
+        assertEquals(
+            CloudResultDecision.Superseded,
+            validateCloudPhotoResult(
+                withDisplay(DESKTOP_CORRECTION_RECIPE, revision = 2),
+                completedJob(),
+                ownerId,
+            ),
+        )
+        // Every non-desktop divergence at the merge base stays a hard
+        // rejection — the new branch is reachable only via the correction
+        // recipe.
+        assertEquals(
+            CloudResultDecision.Rejected("local display merge base"),
+            validateCloudPhotoResult(
+                withDisplay("whl-cloud-book-cleanup", revision = 2),
+                completedJob(),
+                ownerId,
+            ),
+        )
+        assertEquals(
+            CloudResultDecision.Rejected("local display merge base"),
+            validateCloudPhotoResult(
+                withDisplay("camera-original", revision = 2),
+                completedJob(),
+                ownerId,
+            ),
+        )
+        // A desktop recipe still below the target revision is a mutated merge
+        // base, not a completed correction; it must not soften the rejection.
+        assertEquals(
+            CloudResultDecision.Rejected("local display merge base"),
+            validateCloudPhotoResult(
+                withDisplay(DESKTOP_CORRECTION_RECIPE, revision = 1),
+                completedJob(),
+                ownerId,
+            ),
+        )
+    }
+
+    @Test
     fun authenticatedDownloadMustMatchMimeSizeJpegChecksumAndDimensions() {
         val dir = Files.createTempDirectory("cloud-download-").toFile()
         try {

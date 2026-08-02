@@ -536,6 +536,60 @@ class SupabaseClient(
         return parsed
     }
 
+    /** Desktop-published corrected-display rows for the retained cloud
+     * captures, grouped by capture. RLS is owner-or-grant; checking owner_id
+     * again fails closed, and unknown or malformed rows are dropped rather
+     * than allowed to suppress unrelated captures' corrections. */
+    internal fun captureCorrections(ids: List<String>): Map<String, List<CaptureCorrectionRow>> {
+        val out = linkedMapOf<String, MutableList<CaptureCorrectionRow>>()
+        for (batch in safeCaptureSyncIds(ids).chunked(CAPTURE_METADATA_BATCH_SIZE)) {
+            fetchCaptureCorrectionsIsolated(batch, out)
+        }
+        return out
+    }
+
+    /** Split only malformed/oversized responses down to one capture, like the
+     * other metadata families. Network and HTTP errors still retry normally. */
+    private fun fetchCaptureCorrectionsIsolated(
+        batch: List<String>,
+        out: MutableMap<String, MutableList<CaptureCorrectionRow>>,
+    ) {
+        if (batch.isEmpty()) return
+        try {
+            val filter = batch.joinToString(",") {
+                URLEncoder.encode(it, Charsets.UTF_8.name())
+            }
+            val conn = open(
+                "GET",
+                "$baseUrl/rest/v1/capture_corrections" +
+                    "?capture_id=in.($filter)&select=" +
+                    "capture_id,asset_id,owner_id,correction_id," +
+                    "source_original_sha256,result,revision,updated_at" +
+                    "&order=capture_id.asc,asset_id.asc",
+                null,
+            )
+            val rows = try {
+                JSONArray(finish(conn).ifEmpty { "[]" })
+            } catch (e: org.json.JSONException) {
+                throw InvalidResponse("invalid capture correction response")
+            }
+            for (index in 0 until rows.length()) {
+                val parsed = rows.optJSONObject(index)?.let(::captureCorrectionRowFromJson)
+                    ?: continue
+                if (parsed.ownerId != ownerId || parsed.captureId !in batch) continue
+                val forCapture = out.getOrPut(parsed.captureId, ::mutableListOf)
+                // One row per (capture_id, asset_id); a duplicate means a
+                // drifted response, so keep only the first occurrence.
+                if (forCapture.none { it.assetId == parsed.assetId }) forCapture += parsed
+            }
+        } catch (e: InvalidResponse) {
+            if (batch.size == 1) return
+            val midpoint = batch.size / 2
+            fetchCaptureCorrectionsIsolated(batch.subList(0, midpoint), out)
+            fetchCaptureCorrectionsIsolated(batch.subList(midpoint, batch.size), out)
+        }
+    }
+
     /** Owner-readable processing rows for the sent captures retained locally. */
     internal fun photoProcessingJobs(ids: List<String>): List<CloudPhotoProcessingJob> {
         val safeIds = ids.distinct().filter {

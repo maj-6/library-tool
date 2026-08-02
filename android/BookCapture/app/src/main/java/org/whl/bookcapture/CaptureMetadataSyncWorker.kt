@@ -1,6 +1,7 @@
 package org.whl.bookcapture
 
 import android.content.Context
+import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
@@ -15,6 +16,7 @@ import androidx.work.workDataOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -29,6 +31,7 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
     companion object {
         const val WORK_NAME = "capture-metadata-explicit-sync"
         const val PULL_WORK_NAME = "capture-metadata-pull"
+        private const val TAG = "CaptureMetadataSync"
         private const val KEY_PUSH_REVIEWS = "push-reviews"
         private const val KEY_ROUTE = "metadata-route"
         private const val MAX_PASSES = 4
@@ -138,6 +141,21 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                 val desktopRows = client.desktopBookMetadata(ids)
                 val reviewRows = client.captureReviews(ids)
                 val importRows = client.captureImportStates(ids)
+                // Corrections are additive to the pull: a project whose
+                // migration has not landed yet (or any family-wide failure)
+                // must not take down the established metadata families.
+                val correctionRows = try {
+                    client.captureCorrections(ids)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: SupabaseClient.SignedOut) {
+                    throw e
+                } catch (e: SupabaseClient.AccountChanged) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "capture corrections unavailable: ${e.message}")
+                    emptyMap()
+                }
 
                 for ((captureId, metadata) in desktopRows) {
                     if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
@@ -174,6 +192,44 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                         throw CaptureMetadataStateException(
                             "conflicting cloud capture state for $captureId",
                         )
+                    }
+                }
+
+                for ((captureId, corrections) in correctionRows) {
+                    var rearmReocr = false
+                    for (row in corrections) {
+                        if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
+                        try {
+                            if (applyDesktopCorrection(ctx, client, owner, row)) {
+                                rearmReocr = true
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: SupabaseClient.SignedOut) {
+                            throw e
+                        } catch (e: SupabaseClient.AccountChanged) {
+                            throw e
+                        } catch (e: Exception) {
+                            // Per-entry: one bad row or failed download must
+                            // not block the rest of the pull. The row stays
+                            // unapplied and the next pull retries it.
+                            Log.w(
+                                TAG,
+                                "desktop correction skipped for $captureId/" +
+                                    "${row.assetId}: ${e.message}",
+                            )
+                        }
+                    }
+                    // CloudDisplayReocrWorker fails terminally once its retry
+                    // budget is spent (or on a permanent pipeline error) while
+                    // deliberately leaving the durable .cloud-reocr marker for
+                    // a later retry. A row that validates AlreadyApplied on a
+                    // later pull is this capture's only recurring signal, so
+                    // re-arm whenever a row addressed our lineage —
+                    // enqueuePending is idempotent and marker-gated, mirroring
+                    // the cloud-job poll path in UploadWorker.
+                    if (rearmReocr) {
+                        CloudDisplayReocrWorker.enqueuePending(ctx, captureId)
                     }
                 }
 
@@ -347,6 +403,82 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
         }
     }
 
+    /** Validate, download, and install one published desktop correction,
+     * mirroring UploadWorker's cloud-display install choreography. True when
+     * the row addressed this handset's asset lineage — a fresh install
+     * (Ready) or one recorded by an earlier pull (AlreadyApplied) — exactly
+     * the cases whose durable re-OCR marker may still be pending. */
+    private suspend fun applyDesktopCorrection(
+        ctx: Context,
+        client: SupabaseClient,
+        owner: String,
+        row: CaptureCorrectionRow,
+    ): Boolean {
+        val staged = EntryOperationLocks.withLock(row.captureId) {
+            val entry = Entries.find(ctx, row.captureId) ?: return@withLock null
+            if (!entry.uploaded || entry.deliveryTransport == "lan" ||
+                cloudUploadOwnership(
+                    readCaptureCreator(ctx, entry.dir), owner,
+                ) != CloudUploadOwnership.ALLOWED || !entry.dir.isDirectory) {
+                return@withLock null
+            }
+            when (val decision = validateDesktopCorrection(
+                PhotoAssetStore.read(entry.dir),
+                row,
+                owner,
+            )) {
+                DesktopCorrectionDecision.AlreadyApplied ->
+                    DesktopCorrectionStage.AlreadyApplied
+                is DesktopCorrectionDecision.Ready -> DesktopCorrectionStage.Download(
+                    decision.plan,
+                    File.createTempFile(
+                        ".desktop-${row.correctionId.take(12)}-",
+                        ".part",
+                        entry.dir,
+                    ),
+                )
+                else -> null
+            }
+        } ?: return false
+        val download = when (staged) {
+            DesktopCorrectionStage.AlreadyApplied -> return true
+            is DesktopCorrectionStage.Download -> staged
+        }
+        val (plan, temporary) = download
+        try {
+            val receipt = client.downloadPrivateObject(
+                plan.artifact.bucket,
+                plan.artifact.path,
+                temporary,
+                plan.artifact.bytes.coerceAtMost(MAX_CLOUD_DERIVATIVE_BYTES),
+            )
+            if (verifyCloudDisplayDownload(
+                    temporary,
+                    plan.artifact,
+                    receipt.contentType,
+                    receipt.bytes,
+                ) == null) {
+                if (Prefs.userId(ctx) != owner) throw SupabaseClient.AccountChanged()
+                EntryOperationLocks.withLock(row.captureId) {
+                    val entry = Entries.find(ctx, row.captureId) ?: return@withLock
+                    if (entry.dir.isDirectory) {
+                        PhotoAssetStore.installDesktopCorrectionDisplay(
+                            entry.dir,
+                            plan,
+                            temporary,
+                            receipt,
+                        )
+                    }
+                }
+            }
+            // A failed byte verification leaves the row unapplied for the
+            // next pull, but the lineage matched, so re-arming stays correct.
+            return true
+        } finally {
+            temporary.delete()
+        }
+    }
+
     private fun finishLanMetadata(ctx: Context, pushReviews: Boolean): Result {
         if (Entries.recent(ctx).any { isCloudMetadataEntry(ctx, it) }) {
             enqueueCloudFollowup(ctx, pushReviews)
@@ -380,6 +512,17 @@ private fun isCloudMetadataEntry(ctx: Context, entry: Entries.Entry): Boolean {
     return cloudUploadOwnership(
         readCaptureCreator(ctx, entry.dir), Prefs.userId(ctx),
     ) == CloudUploadOwnership.ALLOWED
+}
+
+/** Correction staging outcome computed under the entry lock: a validated
+ * download to attempt, or proof an earlier pull already recorded the row. */
+private sealed interface DesktopCorrectionStage {
+    data object AlreadyApplied : DesktopCorrectionStage
+
+    data class Download(
+        val plan: DesktopCorrectionInstallPlan,
+        val temporary: File,
+    ) : DesktopCorrectionStage
 }
 
 private class CaptureMetadataStateException(message: String) : IOException(message)

@@ -189,6 +189,10 @@ internal data class CapturePhotoAsset(
     val role: PhotoRoleAssignment = PhotoRoleAssignment(),
     val geometries: List<PhotoOcrGeometry> = emptyList(),
     val processingRequest: PhotoProcessingRequest? = null,
+    /** Fingerprint of the last installed desktop correction. Empty (and absent
+     * from serialized contracts) until one lands; a capture_corrections row
+     * carrying this id is a no-op, any other id supersedes. */
+    val appliedDesktopCorrectionId: String = "",
 )
 
 internal data class PhotoSelectionChoice(
@@ -1140,38 +1144,6 @@ internal object PhotoAssetStore {
         val destination = File(dir, cloudDisplayFileName(checked))
         if (destination.name == asset.original.reference ||
             destination.name == asset.captureFile) return@synchronized false
-        val destinationExisted = destination.isFile
-        val destinationAlreadyValid = destinationExisted &&
-            verifyCloudDisplayDownload(
-                destination,
-                checked.artifact,
-                checked.artifact.mime,
-                destination.length(),
-            ) == null
-        var movedDownload = false
-        if (destinationAlreadyValid) {
-            downloaded.delete()
-        } else {
-            try {
-                try {
-                    Files.move(
-                        downloaded.toPath(),
-                        destination.toPath(),
-                        StandardCopyOption.ATOMIC_MOVE,
-                        StandardCopyOption.REPLACE_EXISTING,
-                    )
-                } catch (_: Exception) {
-                    Files.move(
-                        downloaded.toPath(),
-                        destination.toPath(),
-                        StandardCopyOption.REPLACE_EXISTING,
-                    )
-                }
-                movedDownload = true
-            } catch (_: Exception) {
-                return@synchronized false
-            }
-        }
 
         val display = PhotoDisplayDerivative(
             reference = destination.name,
@@ -1206,23 +1178,160 @@ internal object PhotoAssetStore {
             ),
             geometries = geometries,
         )
-        val reocrTarget = if (checked.reocrRequired) CloudDisplayReocrTarget(
-            captureId = current.captureId,
-            assetId = asset.assetId,
-            jobId = checked.job.id,
-            displayReference = display.reference,
-            displaySha256 = display.sha256,
-            displayRevision = display.revision,
-        ) else null
+        commitVerifiedDisplayInstall(
+            dir,
+            current,
+            asset,
+            next,
+            checked.artifact,
+            destination,
+            downloaded,
+            if (checked.reocrRequired) CloudDisplayReocrTarget(
+                captureId = current.captureId,
+                assetId = asset.assetId,
+                jobId = checked.job.id,
+                displayReference = display.reference,
+                displaySha256 = display.sha256,
+                displayRevision = display.revision,
+            ) else null,
+        )
+    }
+
+    /**
+     * Atomically promote a verified desktop correction into a new local
+     * display revision. Mirrors [installCloudDisplayDerivative]: a separate
+     * desktop_* file, never photo_N.jpg or original_*, and the same durable
+     * re-OCR marker so CloudDisplayReocrWorker consumes it unchanged.
+     */
+    fun installDesktopCorrectionDisplay(
+        dir: File,
+        proposed: DesktopCorrectionInstallPlan,
+        downloaded: File,
+        receipt: PrivateObjectDownload,
+    ): Boolean = synchronized(monitorFor(dir)) {
+        if (!dir.isDirectory || downloaded.parentFile != dir) return@synchronized false
+        val current = readCurrent(dir) ?: return@synchronized false
+        val checked = when (val decision = validateDesktopCorrection(
+            current,
+            proposed.row,
+            proposed.row.ownerId,
+        )) {
+            is DesktopCorrectionDecision.Ready -> decision.plan
+            else -> return@synchronized false
+        }
+        if (checked.artifact != proposed.artifact ||
+            checked.targetRevision != proposed.targetRevision ||
+            checked.baseDisplaySha256 != proposed.baseDisplaySha256 ||
+            checked.baseDisplayRevision != proposed.baseDisplayRevision) {
+            return@synchronized false
+        }
+        if (verifyCloudDisplayDownload(
+                downloaded,
+                checked.artifact,
+                receipt.contentType,
+                receipt.bytes,
+            ) != null) return@synchronized false
+
+        val asset = current.assets.firstOrNull { it.assetId == checked.row.assetId }
+            ?: return@synchronized false
+        val destination = File(dir, desktopCorrectionDisplayFileName(checked))
+        if (destination.name == asset.original.reference ||
+            destination.name == asset.captureFile) return@synchronized false
+
+        val display = PhotoDisplayDerivative(
+            reference = destination.name,
+            sha256 = checked.artifact.sha256,
+            revision = checked.targetRevision,
+            width = checked.artifact.width,
+            height = checked.artifact.height,
+            orientationDegrees = 0,
+            recipe = DESKTOP_CORRECTION_RECIPE,
+            recipeVersion = "1",
+            sourceToDisplayHomography = null,
+        )
+        val next = asset.copy(
+            display = display,
+            // Desktop-corrected pixels carry no homography chain: geometry
+            // for the new revision comes only from the queued re-OCR.
+            geometries = asset.geometries.filterNot { it.displayRevision == display.revision },
+            appliedDesktopCorrectionId = checked.row.correctionId,
+        )
+        commitVerifiedDisplayInstall(
+            dir,
+            current,
+            asset,
+            next,
+            checked.artifact,
+            destination,
+            downloaded,
+            CloudDisplayReocrTarget(
+                captureId = current.captureId,
+                assetId = asset.assetId,
+                jobId = checked.row.correctionId,
+                displayReference = display.reference,
+                displaySha256 = display.sha256,
+                displayRevision = display.revision,
+            ),
+        )
+    }
+
+    /** Shared commit tail for verified derivative installs: atomically place
+     * the downloaded file, write the optional durable re-OCR marker, and
+     * persist the replacement asset — undoing file effects on any failure. */
+    private fun commitVerifiedDisplayInstall(
+        dir: File,
+        current: CapturePhotoAssets,
+        asset: CapturePhotoAsset,
+        next: CapturePhotoAsset,
+        artifact: CloudDisplayArtifact,
+        destination: File,
+        downloaded: File,
+        reocrTarget: CloudDisplayReocrTarget?,
+    ): Boolean {
+        val destinationExisted = destination.isFile
+        val destinationAlreadyValid = destinationExisted &&
+            verifyCloudDisplayDownload(
+                destination,
+                artifact,
+                artifact.mime,
+                destination.length(),
+            ) == null
+        var movedDownload = false
+        if (destinationAlreadyValid) {
+            downloaded.delete()
+        } else {
+            try {
+                try {
+                    Files.move(
+                        downloaded.toPath(),
+                        destination.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                } catch (_: Exception) {
+                    Files.move(
+                        downloaded.toPath(),
+                        destination.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                }
+                movedDownload = true
+            } catch (_: Exception) {
+                return false
+            }
+        }
+        fun undoMove() {
+            if (movedDownload && !destinationExisted &&
+                asset.display.reference != destination.name) destination.delete()
+        }
         val reocrMarker = reocrTarget?.let { cloudDisplayReocrMarker(dir, it) }
         val markerExisted = reocrMarker?.isFile == true
         if (reocrMarker != null && !markerExisted) {
             try {
                 Entries.atomicWrite(reocrMarker, "pending\n")
             } catch (_: Exception) {
-                if (movedDownload && !destinationExisted &&
-                    asset.display.reference != destination.name) destination.delete()
-                return@synchronized false
+                undoMove()
+                return false
             }
         }
         val saved = persistCurrent(
@@ -1230,9 +1339,8 @@ internal object PhotoAssetStore {
             current.copy(assets = current.assets.filterNot { it.assetId == asset.assetId } + next),
         )
         if (!saved && !markerExisted) reocrMarker?.delete()
-        if (!saved && movedDownload && !destinationExisted &&
-            asset.display.reference != destination.name) destination.delete()
-        saved
+        if (!saved) undoMove()
+        return saved
     }
 
     fun payload(dir: File, manifest: JSONObject? = null): JSONObject =
@@ -1344,6 +1452,7 @@ private fun cloudDisplayReocrTarget(
     contract: CapturePhotoAssets,
     asset: CapturePhotoAsset,
 ): CloudDisplayReocrTarget? {
+    desktopCorrectionReocrTarget(contract, asset)?.let { return it }
     val request = asset.processingRequest ?: return null
     if (asset.lifecycle.state != PhotoAssetLifecycle.COMPLETED ||
         asset.lifecycle.jobId.isBlank() ||
@@ -1359,6 +1468,28 @@ private fun cloudDisplayReocrTarget(
         captureId = contract.captureId,
         assetId = asset.assetId,
         jobId = asset.lifecycle.jobId,
+        displayReference = asset.display.reference,
+        displaySha256 = asset.display.sha256,
+        displayRevision = asset.display.revision,
+    )
+}
+
+/** A desktop-corrected display has no homography chain to the phone's prior
+ * rendition by definition, so it takes the same durable-marker re-OCR route
+ * as a nonlinear cloud derivative. The correction fingerprint stands in for
+ * the cloud job id. */
+private fun desktopCorrectionReocrTarget(
+    contract: CapturePhotoAssets,
+    asset: CapturePhotoAsset,
+): CloudDisplayReocrTarget? {
+    if (asset.appliedDesktopCorrectionId.isEmpty() ||
+        asset.display.recipe != DESKTOP_CORRECTION_RECIPE ||
+        asset.display.sourceToDisplayHomography != null ||
+        asset.display.sha256.isEmpty()) return null
+    return CloudDisplayReocrTarget(
+        captureId = contract.captureId,
+        assetId = asset.assetId,
+        jobId = asset.appliedDesktopCorrectionId,
         displayReference = asset.display.reference,
         displaySha256 = asset.display.sha256,
         displayRevision = asset.display.revision,
@@ -1624,6 +1755,11 @@ private fun CapturePhotoAsset.toJson(): JSONObject = JSONObject()
     .put("role", role.toJson())
     .put("geometry", JSONArray().apply { geometries.forEach { put(it.toJson()) } })
     .put("processing_request", processingRequest?.toJson() ?: JSONObject.NULL)
+    .apply {
+        if (appliedDesktopCorrectionId.isNotEmpty()) {
+            put("applied_desktop_correction_id", appliedDesktopCorrectionId)
+        }
+    }
 
 private fun JSONObject.toPhotoAsset(): CapturePhotoAsset? {
     return try {
@@ -1640,6 +1776,8 @@ private fun JSONObject.toPhotoAsset(): CapturePhotoAsset? {
                 requestValue.toProcessingRequest(id, original, display) ?: return null
             else -> return null
         }
+        val appliedCorrection = optString("applied_desktop_correction_id").trim().lowercase()
+        if (appliedCorrection.isNotEmpty() && !appliedCorrection.matches(SHA256_HEX)) return null
         CapturePhotoAsset(
             id,
             order,
@@ -1652,6 +1790,7 @@ private fun JSONObject.toPhotoAsset(): CapturePhotoAsset? {
                 (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toGeometry() }
             }.orEmpty(),
             processingRequest,
+            appliedCorrection,
         )
     } catch (_: Exception) {
         null
