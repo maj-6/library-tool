@@ -37,8 +37,35 @@
   const COMMITTED_OUTPUT_KINDS = new Set([
     "corrected-display", "ocr-ready", "thumbnail", "transform-manifest",
   ]);
+  // Standalone re-OCR targets a committed transform output; the raster view
+  // advertises that lineage through extensions.correction_transform.
+  const REOCR_SOURCE_KINDS = new Set(["corrected-display", "ocr-ready"]);
   const PORTABLE_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
   let toolSequence = 0;
+  let reocrOperationCounter = 0;
+
+  function defaultReocrOperationId() {
+    const cryptoRef = typeof globalThis !== "undefined" && globalThis.crypto;
+    if (cryptoRef && typeof cryptoRef.randomUUID === "function") {
+      return `reocr-${cryptoRef.randomUUID()}`;
+    }
+    reocrOperationCounter += 1;
+    return `reocr-${Date.now().toString(36)}-${Math.random()
+      .toString(36).slice(2)}-${reocrOperationCounter.toString(36)}`;
+  }
+
+  function reocrEligibleResource(resource) {
+    const summary = resource && (resource.summary || resource);
+    const extensions = summary && summary.extensions;
+    const pin = extensions && extensions.correction_transform;
+    return Boolean(
+      pin && typeof pin === "object" && !Array.isArray(pin) &&
+      REOCR_SOURCE_KINDS.has(pin.output_kind) &&
+      summary && typeof summary.itemId === "string" && summary.itemId &&
+      typeof summary.id === "string" && summary.id &&
+      typeof summary.revision === "string" && summary.revision,
+    );
+  }
 
   function isPlainObject(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -405,12 +432,23 @@
       this.profile = normalizeImageAdjustProfile(options.profile);
       this.brightness = this.profile.lastAppliedBrightness;
       this.rerunOcr = options.rerunOcr === true;
+      this.reocrCapability = options.reocrCapability === true;
+      this.reocrBusy = false;
+      this.reocrOperationIdFactory =
+        typeof options.reocrOperationIdFactory === "function"
+          ? options.reocrOperationIdFactory : defaultReocrOperationId;
       this.pending = new Map();
       this.mountRecord = null;
       this.profileListeners = new Set();
       this.ocrListeners = new Set();
       this.lastOcrOutcome = null;
       this.destroyed = false;
+    }
+
+    setReocrCapability(value) {
+      this.reocrCapability = value === true;
+      this.refreshMount(false);
+      return this.reocrCapability;
     }
 
     restoreProfile(value) {
@@ -432,6 +470,8 @@
         contrast: DEFAULT_CONTRAST,
         rememberedBrightness: this.profile.lastAppliedBrightness,
         rerunOcr: this.rerunOcr,
+        reocrCapability: this.reocrCapability,
+        reocrBusy: this.reocrBusy,
         pendingOperationIds: Array.from(this.pending.keys()),
         lastOcrOutcome: this.lastOcrOutcome && cloneJson(this.lastOcrOutcome),
       };
@@ -594,6 +634,22 @@
       ocrLabel.htmlFor = ocrId;
       ocrRow.append(ocrInput, ocrLabel);
 
+      let reocrRow = null;
+      let reocrButton = null;
+      if (typeof this.options.requestReocr === "function") {
+        reocrRow = element(documentRef, "div", "image-adjust-reocr-control");
+        reocrButton = element(documentRef, "button", "", "Re-OCR");
+        reocrButton.type = "button";
+        setData(reocrButton, "imageReocr", "true");
+        reocrButton.setAttribute(
+          "aria-label", "Queue OCR of this corrected image");
+        const reocrHint = element(
+          documentRef, "span", "image-adjust-reocr-hint",
+          "Proposes machine OCR from the committed rendition.",
+        );
+        reocrRow.append(reocrButton, reocrHint);
+      }
+
       const thresholdStatus = element(
         documentRef, "p", "image-adjust-threshold",
       );
@@ -607,6 +663,7 @@
         brightnessRow,
         brightnessHint,
         ocrRow,
+        ...(reocrRow ? [reocrRow] : []),
         thresholdStatus,
         jobStatus,
       );
@@ -635,6 +692,8 @@
         activeTool,
         brightnessInput,
         ocrInput,
+        reocrRow,
+        reocrButton,
         thresholdStatus,
         jobStatus,
         previewCanvas,
@@ -696,6 +755,11 @@
       addListener(removers, ocrInput, "change", () => {
         this.setRerunOcr(ocrInput.checked === true);
       });
+      if (reocrButton) {
+        addListener(removers, reocrButton, "click", () => {
+          void this.requestStandaloneReocr(record);
+        });
+      }
       addListener(removers, controller.image, "load", () => {
         this.schedulePreview(record);
       });
@@ -743,6 +807,12 @@
       record.brightnessInput.disabled = !active;
       record.brightnessInput.value = String(this.brightness);
       record.ocrInput.checked = this.rerunOcr;
+      if (record.reocrRow) {
+        const available = this.reocrCapability &&
+          reocrEligibleResource(record.resource);
+        record.reocrRow.hidden = !available;
+        record.reocrButton.disabled = !available || this.reocrBusy;
+      }
       const threshold = thresholdForBrightness(this.brightness);
       record.thresholdStatus.textContent =
         `Contrast 100 · brightness ${this.brightness} · binary threshold ${threshold}`;
@@ -807,6 +877,43 @@
         windowRef.requestAnimationFrame(run);
       } else {
         run();
+      }
+    }
+
+    async requestStandaloneReocr(record = this.mountRecord) {
+      if (!record || record.disposed || this.reocrBusy ||
+          typeof this.options.requestReocr !== "function" ||
+          !this.reocrCapability ||
+          !reocrEligibleResource(record.resource)) return null;
+      const summary = record.resource &&
+        (record.resource.summary || record.resource);
+      const request = {
+        operationId: this.reocrOperationIdFactory(),
+        itemId: summary.itemId,
+        artifactId: summary.id,
+        expectedArtifactRevision: summary.revision,
+      };
+      this.reocrBusy = true;
+      this.refreshMount(false);
+      try {
+        const receipt = await this.options.requestReocr(request, {
+          resource: record.resource,
+        });
+        if (!record.disposed && this.mountRecord === record) {
+          record.jobStatus.textContent = receipt && receipt.replayed === true
+            ? "Re-OCR already queued for this rendition."
+            : "Re-OCR queued.";
+        }
+        return receipt;
+      } catch (error) {
+        if (!record.disposed && this.mountRecord === record) {
+          record.jobStatus.textContent = error && error.message ||
+            "Re-OCR could not be queued.";
+        }
+        return null;
+      } finally {
+        this.reocrBusy = false;
+        this.refreshMount(false);
       }
     }
 
@@ -1072,6 +1179,7 @@
     normalizeImageAdjustProfile,
     previewDimensions,
     renderBinaryCanvasPreview,
+    reocrEligibleResource,
     serializeImageAdjustProfile,
     thresholdForBrightness,
   };

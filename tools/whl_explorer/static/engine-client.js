@@ -708,6 +708,23 @@
       isBoundedOcrJson(value[key], state, depth + 1));
   }
 
+  function isCorrectionOcrSource(value) {
+    return hasExactKeys(value, [
+      "kind", "artifact_id", "artifact_revision", "content_sha256",
+    ]) && value.kind === "ocr-ready" &&
+      isPortableIdentifier(value.artifact_id) &&
+      isArtifactRevision(value.artifact_revision) &&
+      /^[0-9a-f]{64}$/.test(value.content_sha256);
+  }
+
+  function isCorrectionOcrProvider(value) {
+    return hasExactKeys(value, ["provider_id", "model"]) &&
+      isPortableIdentifier(value.provider_id) &&
+      typeof value.model === "string" &&
+      value.model.length <= 512 &&
+      value.model === value.model.trim();
+  }
+
   function isCorrectionOcrProposal(value, itemId, proposalRef) {
     if (!hasExactKeys(value, [
       "proposal_ref", "item_id", "operation_id", "source", "provider",
@@ -716,23 +733,28 @@
         !/^cop-[0-9a-f]{40}$/.test(value.proposal_ref) ||
         !isPortableIdentifier(value.item_id) ||
         !isPortableIdentifier(value.operation_id) ||
-        !hasExactKeys(value.source, [
-          "kind", "artifact_id", "artifact_revision", "content_sha256",
-        ]) || value.source.kind !== "ocr-ready" ||
-        !isPortableIdentifier(value.source.artifact_id) ||
-        !isArtifactRevision(value.source.artifact_revision) ||
-        !/^[0-9a-f]{64}$/.test(value.source.content_sha256) ||
-        !hasExactKeys(value.provider, ["provider_id", "model"]) ||
-        !isPortableIdentifier(value.provider.provider_id) ||
-        typeof value.provider.model !== "string" ||
-        value.provider.model.length > 512 ||
-        value.provider.model !== value.provider.model.trim() ||
+        !isCorrectionOcrSource(value.source) ||
+        !isCorrectionOcrProvider(value.provider) ||
         !isObject(value.recognition) ||
         !isBoundedOcrJson(value.recognition) ||
         artifactJsonUtf8Bytes(value.recognition) > 64 * 1024 * 1024 ||
         value.publication_policy !== "machine-proposal-only" ||
         !/^[0-9a-f]{64}$/.test(value.content_sha256)) return false;
     return !containsCredentialField(value);
+  }
+
+  function isCorrectionOcrProposalSummary(value) {
+    return hasExactKeys(value, [
+      "proposal_ref", "operation_id", "source", "provider",
+      "publication_policy", "content_sha256", "availability",
+    ]) && /^cop-[0-9a-f]{40}$/.test(value.proposal_ref) &&
+      isPortableIdentifier(value.operation_id) &&
+      isCorrectionOcrSource(value.source) &&
+      isCorrectionOcrProvider(value.provider) &&
+      value.publication_policy === "machine-proposal-only" &&
+      /^[0-9a-f]{64}$/.test(value.content_sha256) &&
+      value.availability === "available" &&
+      !containsCredentialField(value);
   }
 
   function isArtifactRevision(value, optional = false) {
@@ -1184,6 +1206,10 @@
   const CORRECTION_REVIEW_STATES =
     new Set(["clear", "needs_attention", "resolved"]);
   const CORRECTION_REVIEW_HISTORY_PAGE_LIMIT = 100;
+  const CORRECTION_OCR_PROPOSAL_PAGE_LIMIT = 256;
+  const CORRECTION_OCR_PROPOSAL_SNAPSHOT_RE = /^cops-[0-9a-f]{64}$/;
+  const CORRECTION_REOCR_OPERATION_RE = /^correction-reocr:[0-9a-f]{48}$/;
+  const CORRECTION_REOCR_JOB_ID_RE = /^correction-ocr-[0-9a-f]{24}$/;
   const CORRECTION_REVIEW_HISTORY_TAIL_LIMIT = 8;
   const MAX_CORRECTION_AUDIT_EVENTS = 100000;
   const CORRECTION_REVIEW_TRANSITIONS = Object.freeze({
@@ -1856,6 +1882,59 @@
       typeof output.partial === "boolean");
   }
 
+  // Standalone re-OCR jobs share the transform job envelope but pin the
+  // committed OCR-ready rendition instead of a transform command.
+  function isCorrectionReocrJob(value, expected) {
+    if (!hasExactKeys(value, [
+      "id", "kind", "state", "subject", "progress", "cancellable",
+      "revision", "created_at", "updated_at", "finished_at", "note", "error",
+      "input_revisions", "outputs",
+    ]) || !isPortableIdentifier(value.id) ||
+        value.kind !== "correction.ocr-followup" ||
+        !CORRECTION_JOB_STATES.has(value.state) ||
+        !hasExactKeys(value.subject, ["item_id", "source_id"]) ||
+        value.subject.item_id !== expected.itemId ||
+        value.subject.source_id !== expected.source.artifact_id ||
+        !hasExactKeys(value.progress, [
+          "completed", "total", "unit", "phase",
+        ]) ||
+        !Number.isSafeInteger(value.progress.completed) ||
+        value.progress.completed < 0 ||
+        !Number.isSafeInteger(value.progress.total) ||
+        value.progress.total < value.progress.completed ||
+        typeof value.progress.unit !== "string" ||
+        typeof value.progress.phase !== "string" ||
+        typeof value.cancellable !== "boolean" ||
+        !Number.isSafeInteger(value.revision) || value.revision < 1 ||
+        typeof value.created_at !== "string" ||
+        typeof value.updated_at !== "string" ||
+        typeof value.finished_at !== "string" ||
+        typeof value.note !== "string" ||
+        !isObject(value.input_revisions) ||
+        !Array.isArray(value.outputs) ||
+        containsCommandFingerprint(value)) return false;
+    const inputs = value.input_revisions;
+    const allowedInputKeys = new Set([
+      "parent_operation_id", "artifact_id", "artifact_revision",
+      "source_sha256", "publication_policy",
+    ]);
+    if (!Object.keys(inputs).every((key) => allowedInputKeys.has(key)) ||
+        inputs.parent_operation_id !== expected.operationId ||
+        inputs.artifact_id !== expected.source.artifact_id ||
+        inputs.artifact_revision !== expected.source.artifact_revision ||
+        inputs.source_sha256 !== expected.source.content_sha256 ||
+        inputs.publication_policy !== "machine-proposal-only") return false;
+    if (value.error !== null &&
+        (!isObject(value.error) || typeof value.error.code !== "string" ||
+          typeof value.error.message !== "string" ||
+          typeof value.error.retryable !== "boolean")) return false;
+    return value.outputs.every((output) =>
+      hasExactKeys(output, ["kind", "ref", "partial"]) &&
+      output.kind === "ocr-proposal" &&
+      isPortableIdentifier(output.ref) &&
+      typeof output.partial === "boolean");
+  }
+
   function fallbackCode(status) {
     if (status === 409) return "conflict";
     if (status === 428) return "precondition-required";
@@ -1967,8 +2046,14 @@
           this._correctionClearRegionRole(args),
         queueTransform: (args) =>
           this._correctionQueueTransform(args),
+        queueReocr: (args) =>
+          this._correctionQueueReocr(args),
         getOcrProposal: (args) =>
           this._correctionOcrProposalGet(args),
+        listOcrProposals: (args) =>
+          this._correctionOcrProposalList(args),
+        applyOcrProposal: (args) =>
+          this._correctionOcrProposalApply(args),
         setManualCaption: (args) =>
           this._correctionSetManualCaption(args),
         clearManualCaption: (args) =>
@@ -3426,6 +3511,157 @@
           containsCommandFingerprint(body)) {
         this._invalidResponse(
           "Engine returned an invalid correction transform queue receipt",
+          "POST", path, null, undefined, status);
+      }
+      return body;
+    }
+
+    async _correctionQueueReocr({ itemId, artifactId,
+      expectedArtifactRevision, idempotencyKey, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      if (!isArtifactRevision(expectedArtifactRevision)) {
+        throw new TypeError(
+          "expectedArtifactRevision is not a valid correction revision");
+      }
+      const operationId = operationKey(idempotencyKey, "idempotencyKey");
+      const path = `/v1/items/${encodePart(item)}/raster-artifacts/` +
+        `${encodePart(artifact)}/reocr`;
+      const { body, status } = await this._requestJson("POST", path, {
+        headers: {
+          "Idempotency-Key": operationId,
+          "If-Artifact-Match": quoteRevision(
+            expectedArtifactRevision, "expectedArtifactRevision"),
+        },
+        body: {},
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      });
+      const expectedStatus = body && body.replayed === true ? 200 : 202;
+      if (status !== expectedStatus || !hasExactKeys(body, [
+        "ok", "schema", "replayed", "operation_id", "job_id", "job", "source",
+      ]) || body.ok !== true ||
+          body.schema !== "librarytool.correction-reocr-queue-receipt/1" ||
+          typeof body.replayed !== "boolean" ||
+          !CORRECTION_REOCR_OPERATION_RE.test(body.operation_id) ||
+          !CORRECTION_REOCR_JOB_ID_RE.test(body.job_id) ||
+          !isCorrectionOcrSource(body.source) ||
+          !isCorrectionReocrJob(body.job, {
+            itemId: item,
+            operationId: body.operation_id,
+            source: body.source,
+          }) ||
+          body.job_id !== body.job.id ||
+          containsCommandFingerprint(body) ||
+          containsCredentialField(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid correction re-OCR queue receipt",
+          "POST", path, null, undefined, status);
+      }
+      return body;
+    }
+
+    _correctionOcrProposalList({ itemId, cursor, limit = 100,
+      snapshotRevision, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (cursor != null && cursor !== "" &&
+          (typeof cursor !== "string" || cursor.length > 2048)) {
+        throw new TypeError("cursor must be a bounded opaque string");
+      }
+      if (snapshotRevision != null && snapshotRevision !== "" &&
+          !CORRECTION_OCR_PROPOSAL_SNAPSHOT_RE.test(snapshotRevision)) {
+        throw new TypeError(
+          "snapshotRevision is not an OCR proposal catalog revision");
+      }
+      if (!Number.isSafeInteger(limit) || limit < 1 ||
+          limit > CORRECTION_OCR_PROPOSAL_PAGE_LIMIT) {
+        throw new TypeError(
+          `limit must be an integer from 1 to ${
+            CORRECTION_OCR_PROPOSAL_PAGE_LIMIT}`);
+      }
+      const path = `/v1/items/${encodePart(item)}/ocr-proposals`;
+      return this._requestJson("GET", path, {
+        query: { cursor, limit, snapshot_revision: snapshotRevision },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const proposals = body && body.proposals;
+        const refs = Array.isArray(proposals)
+          ? proposals.map((proposal) => proposal && proposal.proposal_ref)
+          : [];
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "item_id", "snapshot_revision", "proposals",
+          "next_cursor", "total",
+        ]) && body.ok === true &&
+          body.schema === "librarytool.correction-ocr-proposals/1" &&
+          body.item_id === item &&
+          CORRECTION_OCR_PROPOSAL_SNAPSHOT_RE.test(body.snapshot_revision) &&
+          Array.isArray(proposals) && proposals.length <= limit &&
+          proposals.every(isCorrectionOcrProposalSummary) &&
+          refs.every((ref, index) => index === 0 || refs[index - 1] < ref) &&
+          (body.next_cursor === null ||
+            typeof body.next_cursor === "string" &&
+            body.next_cursor.length >= 1 && body.next_cursor.length <= 2048) &&
+          Number.isSafeInteger(body.total) &&
+          body.total >= proposals.length &&
+          !containsCommandFingerprint(body) &&
+          !containsCredentialField(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid OCR proposal catalog page",
+            "GET", path, body, { cursor, limit }, status);
+        }
+        return body;
+      });
+    }
+
+    async _correctionOcrProposalApply({ itemId, proposalRef, idempotencyKey,
+      signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      if (typeof proposalRef !== "string" ||
+          !/^cop-[0-9a-f]{40}$/.test(proposalRef)) {
+        throw new TypeError(
+          "proposalRef must be an opaque OCR proposal reference");
+      }
+      const operationId = operationKey(idempotencyKey, "idempotencyKey");
+      const path = `/v1/items/${encodePart(item)}/ocr-proposals/` +
+        `${encodePart(proposalRef)}/apply`;
+      const { body, status } = await this._requestJson("POST", path, {
+        headers: { "Idempotency-Key": operationId },
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      });
+      const applied = body && body.applied;
+      const boundedId = (value) => typeof value === "string" &&
+        value.length >= 1 && value.length <= 512;
+      if (status !== 200 || !hasExactKeys(body, [
+        "ok", "schema", "replayed", "operation_id", "proposal_ref", "applied",
+      ]) || body.ok !== true ||
+          body.schema !==
+            "librarytool.correction-ocr-proposal-apply-receipt/1" ||
+          typeof body.replayed !== "boolean" ||
+          body.operation_id !== operationId ||
+          body.proposal_ref !== proposalRef ||
+          !hasExactKeys(applied, [
+            "item_id", "capture_id", "asset_id", "source_id", "page", "doc",
+            "regions", "words", "text",
+          ]) || applied.item_id !== item ||
+          !boundedId(applied.capture_id) ||
+          !boundedId(applied.asset_id) ||
+          !boundedId(applied.source_id) ||
+          !Number.isSafeInteger(applied.page) || applied.page < 1 ||
+          !boundedId(applied.doc) ||
+          !["saved", "proposed", "dropped"].includes(applied.regions) ||
+          !["saved", "absent"].includes(applied.words) ||
+          !["merged", "proposed"].includes(applied.text) ||
+          (applied.text === "proposed") !== (applied.regions === "proposed") ||
+          containsCommandFingerprint(body) ||
+          containsCredentialField(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid OCR proposal apply receipt",
           "POST", path, null, undefined, status);
       }
       return body;

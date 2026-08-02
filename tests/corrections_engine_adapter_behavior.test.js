@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const {
   correctionTransformJob,
+  correctionTransformTerminalResult,
   createCorrectionsEnginePorts,
   decorateDocumentArtifact,
   decorateRasterArtifact,
@@ -283,6 +284,57 @@ function transformOutputs() {
       partial: false,
     },
   ];
+}
+
+
+function reocrQueueReceipt(overrides = {}) {
+  const operationId = `correction-reocr:${"c".repeat(48)}`;
+  const jobId = `correction-ocr-${"d".repeat(24)}`;
+  const source = {
+    kind: "ocr-ready",
+    artifact_id: "result-ocr-ready-1",
+    artifact_revision: "ocr-ready-r1",
+    content_sha256: "b".repeat(64),
+    ...(overrides.source || {}),
+  };
+  return {
+    ok: true,
+    schema: "librarytool.correction-reocr-queue-receipt/1",
+    replayed: false,
+    operation_id: operationId,
+    job_id: jobId,
+    job: reocrJob(operationId, source, overrides.job || {}),
+    source,
+    ...(overrides.envelope || {}),
+  };
+}
+
+
+function reocrJob(operationId, source, overrides = {}) {
+  return {
+    id: `correction-ocr-${"d".repeat(24)}`,
+    kind: "correction.ocr-followup",
+    state: "queued",
+    subject: { item_id: "book-1", source_id: source.artifact_id },
+    progress: { completed: 0, total: 4, unit: "phase", phase: "queued" },
+    cancellable: true,
+    revision: 1,
+    created_at: "2026-08-02T12:00:00Z",
+    updated_at: "2026-08-02T12:00:00Z",
+    finished_at: "",
+    note: "",
+    error: null,
+    input_revisions: {
+      parent_operation_id: operationId,
+      artifact_id: source.artifact_id,
+      artifact_revision: source.artifact_revision,
+      source_sha256: source.content_sha256,
+      publication_policy: "machine-proposal-only",
+      command_sha256: "e".repeat(64),
+    },
+    outputs: [],
+    ...overrides,
+  };
 }
 
 
@@ -1142,6 +1194,271 @@ test("transform polling rejects a response missing exact transform pins", {
   assert.equal(result.terminal_state, "failed");
   assert.equal(result.image_commit, null);
   assert.equal(result.failure.code, "invalid-transform-job-result");
+});
+
+
+test("standalone re-OCR queueing tracks the ocr-followup job to its proposal", {
+  timeout: 1000,
+}, async () => {
+  const scheduler = manualScheduler();
+  const queueCalls = [];
+  const jobReads = [];
+  const receipt = reocrQueueReceipt();
+  const runningJob = reocrJob(receipt.operation_id, receipt.source, {
+    state: "running",
+    progress: { completed: 2, total: 4, unit: "phase", phase: "recognizing" },
+    revision: 2,
+  });
+  const terminalJob = reocrJob(receipt.operation_id, receipt.source, {
+    state: "done",
+    progress: { completed: 4, total: 4, unit: "phase", phase: "complete" },
+    cancellable: false,
+    revision: 3,
+    finished_at: "2026-08-02T12:00:02Z",
+    note: "proposal committed",
+    outputs: [
+      { kind: "ocr-proposal", ref: `cop-${"a".repeat(40)}`, partial: false },
+    ],
+  });
+  const { engineClient } = engineHarness({
+    corrections: {
+      async queueReocr(payload) {
+        queueCalls.push(payload);
+        return receipt;
+      },
+      async listOcrProposals() {
+        throw new Error("unused");
+      },
+      async getOcrProposal() {
+        throw new Error("unused");
+      },
+    },
+    jobs: {
+      async get(args) {
+        jobReads.push(args);
+        return {
+          ok: true,
+          job: jobReads.length === 1 ? runningJob : terminalJob,
+        };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient, {
+    transformPolling: scheduler,
+  });
+  const transformResults = [];
+  ports.transforms.subscribeResults((result) => transformResults.push(result));
+  const observed = deferred();
+  const unsubscribe = ports.ocrProposals.subscribeResults(
+    (result, command) => observed.resolve([result, command]),
+  );
+
+  const queued = await ports.ocrProposals.queueReocr({
+    operationId: "reocr-click-1",
+    itemId: "book-1",
+    artifactId: "corrected-display-1",
+    expectedArtifactRevision: "corrected-display-r2",
+  });
+  assert.deepEqual(queueCalls, [{
+    itemId: "book-1",
+    artifactId: "corrected-display-1",
+    expectedArtifactRevision: "corrected-display-r2",
+    idempotencyKey: "reocr-click-1",
+    signal: undefined,
+  }]);
+  assert.equal(queued.job_id, receipt.job_id);
+
+  scheduler.scheduled.shift().callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  scheduler.scheduled.shift().callback();
+  const [result, command] = await observed.promise;
+
+  assert.deepEqual(jobReads, [
+    { jobId: receipt.job_id },
+    { jobId: receipt.job_id },
+  ]);
+  assert.equal(result.terminal_state, "done");
+  assert.equal(result.operation_id, receipt.operation_id);
+  assert.equal(result.image_commit, null);
+  assert.equal(result.ocr_followup.state, "succeeded");
+  assert.equal(result.ocr_followup.proposal_ref, `cop-${"a".repeat(40)}`);
+  assert.deepEqual(result.ocr_followup.source, {
+    kind: "ocr-ready",
+    artifact_id: "result-ocr-ready-1",
+  });
+  assert.equal(result.failure, null);
+  assert.equal(command.item_id, "book-1");
+  assert.equal(command.operation_id, receipt.operation_id);
+  assert.deepEqual(transformResults, [],
+    "standalone results must stay off the image editor's transform stream");
+  const normalized = correctionTransformJob(
+    terminalJob,
+    command,
+    receipt.job_id,
+  );
+  assert.equal(
+    Object.hasOwn(normalized.input_revisions, "command_sha256"),
+    false,
+  );
+  unsubscribe();
+});
+
+
+test("standalone re-OCR jobs reject transform-shaped outputs", {
+  timeout: 1000,
+}, async () => {
+  const scheduler = manualScheduler();
+  const receipt = reocrQueueReceipt();
+  const invalidTerminal = reocrJob(receipt.operation_id, receipt.source, {
+    state: "done",
+    outputs: [
+      { kind: "corrected-display", ref: "sneaky-image-1", partial: false },
+    ],
+  });
+  const { engineClient } = engineHarness({
+    corrections: {
+      async queueReocr() {
+        return receipt;
+      },
+      async listOcrProposals() {
+        throw new Error("unused");
+      },
+      async getOcrProposal() {
+        throw new Error("unused");
+      },
+    },
+    jobs: {
+      async get() {
+        return { ok: true, job: invalidTerminal };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient, {
+    transformPolling: scheduler,
+  });
+  const observed = deferred();
+  ports.ocrProposals.subscribeResults((result) => observed.resolve(result));
+
+  await ports.ocrProposals.queueReocr({
+    operationId: "reocr-click-2",
+    itemId: "book-1",
+    artifactId: "corrected-display-1",
+    expectedArtifactRevision: "corrected-display-r2",
+  });
+  scheduler.scheduled.shift().callback();
+  const result = await observed.promise;
+
+  assert.equal(result.terminal_state, "failed");
+  assert.equal(result.image_commit, null);
+  assert.equal(result.ocr_followup, null);
+  assert.equal(result.failure.code, "invalid-transform-job-result");
+  assert.equal(result.failure.retryable, false);
+});
+
+
+test("standalone re-OCR cancellation and failure map onto the followup shape", () => {
+  const receipt = reocrQueueReceipt();
+  const command = {
+    item_id: "book-1",
+    artifact_id: receipt.source.artifact_id,
+    artifact_revision: receipt.source.artifact_revision,
+    source_sha256: receipt.source.content_sha256,
+    operation_id: receipt.operation_id,
+  };
+  const cancelled = correctionTransformTerminalResult(
+    correctionTransformJob(
+      reocrJob(receipt.operation_id, receipt.source, { state: "cancelled" }),
+      command,
+    ),
+    command,
+  );
+  assert.equal(cancelled.ocr_followup.state, "cancelled");
+  assert.equal(cancelled.failure, null);
+
+  const failed = correctionTransformTerminalResult(
+    correctionTransformJob(
+      reocrJob(receipt.operation_id, receipt.source, {
+        state: "failed",
+        error: {
+          code: "ocr_followup_unavailable",
+          message: "OCR provider is unavailable",
+          retryable: true,
+        },
+      }),
+      command,
+    ),
+    command,
+  );
+  assert.equal(failed.ocr_followup.state, "failed");
+  assert.equal(failed.ocr_followup.failure.code, "ocr_followup_unavailable");
+
+  assert.throws(
+    () => correctionTransformTerminalResult(
+      correctionTransformJob(
+        reocrJob(receipt.operation_id, receipt.source, { state: "done" }),
+        command,
+      ),
+      command,
+    ),
+    (error) => error.code === "invalid-transform-job-result",
+  );
+});
+
+
+test("ocr proposal port delegates catalog reads and apply operation ids", async () => {
+  const calls = { apply: [], get: [], list: [] };
+  const { engineClient } = engineHarness({
+    corrections: {
+      async listOcrProposals(payload) {
+        calls.list.push(payload);
+        return { proposals: [] };
+      },
+      async getOcrProposal(payload) {
+        calls.get.push(payload);
+        return { proposal: {} };
+      },
+      async applyOcrProposal(payload) {
+        calls.apply.push(payload);
+        return { applied: {} };
+      },
+    },
+  });
+  const ports = createCorrectionsEnginePorts(engineClient);
+
+  await ports.ocrProposals.list({
+    itemId: "book-1",
+    cursor: "copc-2",
+    limit: 50,
+    snapshotRevision: `cops-${"e".repeat(64)}`,
+  });
+  await ports.ocrProposals.get({
+    itemId: "book-1",
+    proposalRef: `cop-${"a".repeat(40)}`,
+  });
+  await ports.ocrProposals.apply({
+    operationId: "apply-1",
+    itemId: "book-1",
+    proposalRef: `cop-${"a".repeat(40)}`,
+  });
+
+  assert.deepEqual(calls.list, [{
+    itemId: "book-1",
+    cursor: "copc-2",
+    limit: 50,
+    snapshotRevision: `cops-${"e".repeat(64)}`,
+    signal: undefined,
+  }]);
+  assert.deepEqual(calls.get, [{
+    itemId: "book-1",
+    proposalRef: `cop-${"a".repeat(40)}`,
+    signal: undefined,
+  }]);
+  assert.deepEqual(calls.apply, [{
+    itemId: "book-1",
+    proposalRef: `cop-${"a".repeat(40)}`,
+    idempotencyKey: "apply-1",
+    signal: undefined,
+  }]);
 });
 
 

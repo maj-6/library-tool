@@ -32,7 +32,18 @@
     ]);
     const CORRECTION_JOB_OUTPUT_KINDS =
       new Set([...CORRECTION_IMAGE_OUTPUT_KINDS, "ocr-proposal"]);
+    // Standalone re-OCR shares the "correction.ocr-followup" job kind with
+    // the transform rider; the operation namespace is what tells the tracked
+    // command apart, so the rider's whitelist and guards stay untouched.
+    const CORRECTION_REOCR_OPERATION_PREFIX = "correction-reocr:";
+    const CORRECTION_OCR_FOLLOWUP_JOB_KIND = "correction.ocr-followup";
     const PORTABLE_JOB_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+    function isStandaloneReocrCommand(command) {
+      return isPlainObject(command) &&
+        typeof command.operation_id === "string" &&
+        command.operation_id.startsWith(CORRECTION_REOCR_OPERATION_PREFIX);
+    }
 
     function isPlainObject(value) {
       if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -257,7 +268,121 @@
         artifactId.endsWith(":display");
     }
 
+    // Validates the "correction.ocr-followup" job created for one standalone
+    // re-OCR queue receipt: the pins are the committed OCR-ready rendition,
+    // and the parent operation id carries the "correction-reocr:" namespace.
+    function correctionReocrFollowupJob(value, command, expectedJobId = "") {
+      if (!isPlainObject(command) ||
+          !portableJobValue(command.item_id) ||
+          !portableJobValue(command.artifact_id) ||
+          !portableJobValue(command.operation_id) ||
+          !artifactJobRevision(command.artifact_revision) ||
+          typeof command.source_sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/.test(command.source_sha256)) {
+        throw invalidTransformResult("the tracked correction command is invalid");
+      }
+      if (!hasExactKeys(value, [
+        "id", "kind", "state", "subject", "progress", "cancellable",
+        "revision", "created_at", "updated_at", "finished_at", "note", "error",
+        "input_revisions", "outputs",
+      ]) || !portableJobValue(value.id) ||
+          (expectedJobId && value.id !== expectedJobId) ||
+          value.kind !== CORRECTION_OCR_FOLLOWUP_JOB_KIND ||
+          (!ACTIVE_TRANSFORM_JOB_STATES.has(value.state) &&
+            !TERMINAL_TRANSFORM_JOB_STATES.has(value.state)) ||
+          !hasExactKeys(value.subject, ["item_id", "source_id"]) ||
+          value.subject.item_id !== command.item_id ||
+          value.subject.source_id !== command.artifact_id ||
+          !hasExactKeys(value.progress, [
+            "completed", "total", "unit", "phase",
+          ]) ||
+          !Number.isSafeInteger(value.progress.completed) ||
+          value.progress.completed < 0 ||
+          !Number.isSafeInteger(value.progress.total) ||
+          value.progress.total < value.progress.completed ||
+          typeof value.progress.unit !== "string" ||
+          typeof value.progress.phase !== "string" ||
+          typeof value.cancellable !== "boolean" ||
+          !Number.isSafeInteger(value.revision) || value.revision < 1 ||
+          typeof value.created_at !== "string" ||
+          typeof value.updated_at !== "string" ||
+          typeof value.finished_at !== "string" ||
+          typeof value.note !== "string" ||
+          !isPlainObject(value.input_revisions) ||
+          !Array.isArray(value.outputs)) {
+        throw invalidTransformResult(
+          "the correction OCR job does not match its queued command",
+        );
+      }
+      const inputs = value.input_revisions;
+      const inputKeys = Object.keys(inputs);
+      const allowedInputKeys = new Set([
+        "parent_operation_id", "artifact_id", "artifact_revision",
+        "source_sha256", "publication_policy", "command_sha256",
+      ]);
+      if (!inputKeys.every((key) => allowedInputKeys.has(key)) ||
+          inputs.parent_operation_id !== command.operation_id ||
+          inputs.artifact_id !== command.artifact_id ||
+          inputs.artifact_revision !== command.artifact_revision ||
+          inputs.source_sha256 !== command.source_sha256 ||
+          inputs.publication_policy !== "machine-proposal-only" ||
+          (Object.hasOwn(inputs, "command_sha256") &&
+            (typeof inputs.command_sha256 !== "string" ||
+              !/^[0-9a-f]{64}$/.test(inputs.command_sha256)))) {
+        throw invalidTransformResult(
+          "the correction OCR job input revisions are invalid",
+        );
+      }
+      if (value.error !== null) {
+        const failureKeys = Object.keys(value.error || {}).sort().join(",");
+        if (!isPlainObject(value.error) ||
+            !["code,message,retryable", "code,details,message,retryable"]
+              .includes(failureKeys) ||
+            typeof value.error.code !== "string" ||
+            typeof value.error.message !== "string" ||
+            typeof value.error.retryable !== "boolean" ||
+            (Object.hasOwn(value.error, "details") &&
+              !isPlainObject(value.error.details))) {
+          throw invalidTransformResult(
+            "the correction OCR job failure is invalid",
+          );
+        }
+      }
+      const refs = new Set();
+      for (const output of value.outputs) {
+        if (!hasExactKeys(output, ["kind", "ref", "partial"]) ||
+            output.kind !== "ocr-proposal" ||
+            !portableJobValue(output.ref) ||
+            typeof output.partial !== "boolean" ||
+            refs.has(output.ref)) {
+          throw invalidTransformResult(
+            "the correction OCR job outputs are invalid",
+          );
+        }
+        refs.add(output.ref);
+      }
+      return Object.freeze({
+        ...value,
+        subject: Object.freeze({ ...value.subject }),
+        progress: Object.freeze({ ...value.progress }),
+        error: value.error && Object.freeze(cloneJson(value.error)),
+        input_revisions: Object.freeze(
+          Object.fromEntries(
+            Object.entries(inputs)
+              .filter(([key]) => key !== "command_sha256")
+              .map(([key, entry]) => [key, cloneJson(entry)]),
+          ),
+        ),
+        outputs: Object.freeze(
+          value.outputs.map((output) => Object.freeze({ ...output })),
+        ),
+      });
+    }
+
     function correctionTransformJob(value, command, expectedJobId = "") {
+      if (isStandaloneReocrCommand(command)) {
+        return correctionReocrFollowupJob(value, command, expectedJobId);
+      }
       if (!isPlainObject(command) ||
           !portableJobValue(command.item_id) ||
           !portableJobValue(command.artifact_id) ||
@@ -387,7 +512,92 @@
       return correctionTransformJob(value.job, command, expectedJobId);
     }
 
+    // Standalone jobs never carry an image commit, so the transform rider's
+    // "unexpected OCR proposal" guard does not apply: a durable proposal is
+    // this flow's one legitimate output.
+    function correctionReocrTerminalResult(job, command) {
+      if (ACTIVE_TRANSFORM_JOB_STATES.has(job.state)) return null;
+      if (!TERMINAL_TRANSFORM_JOB_STATES.has(job.state)) {
+        throw invalidTransformResult(
+          "the correction OCR job has an unknown terminal state",
+        );
+      }
+      const proposals = job.outputs.filter(
+        (output) => output.kind === "ocr-proposal",
+      );
+      if (proposals.length > 1) {
+        throw invalidTransformResult(
+          "the correction OCR job repeats an output kind",
+        );
+      }
+      const ocrProposal = proposals[0] || null;
+      if (ocrProposal && ocrProposal.partial === true) {
+        throw invalidTransformResult(
+          "a correction OCR proposal cannot be partial",
+        );
+      }
+      if (job.state === "done" && !ocrProposal) {
+        throw invalidTransformResult(
+          "a completed correction re-OCR job has no proposal output",
+        );
+      }
+      const ocrSource = {
+        kind: "ocr-ready",
+        artifact_id: command.artifact_id,
+      };
+      let ocrFollowup;
+      if (ocrProposal) {
+        ocrFollowup = {
+          state: "succeeded",
+          source: ocrSource,
+          proposal_ref: ocrProposal.ref,
+          failure: null,
+        };
+      } else if (job.state === "cancelled") {
+        ocrFollowup = {
+          state: "cancelled",
+          source: ocrSource,
+          proposal_ref: "",
+          failure: null,
+        };
+      } else if (job.state === "interrupted") {
+        ocrFollowup = {
+          state: "failed",
+          source: ocrSource,
+          proposal_ref: "",
+          failure: {
+            code: "ocr_followup_interrupted",
+            message: "OCR follow-up status is unknown after restart",
+            retryable: false,
+          },
+        };
+      } else {
+        ocrFollowup = {
+          state: "failed",
+          source: ocrSource,
+          proposal_ref: "",
+          failure: cloneJson(job.error) || {
+            code: "ocr_followup_failed",
+            message: job.note || "OCR follow-up failed",
+            retryable: true,
+          },
+        };
+      }
+      return Object.freeze({
+        job_id: job.id,
+        operation_id: command.operation_id,
+        terminal_state: job.state,
+        image_commit: null,
+        ocr_followup: Object.freeze(ocrFollowup),
+        cancelled_before_commit: false,
+        failure: null,
+      });
+    }
+
     function correctionTransformTerminalResult(job, command) {
+      if (isStandaloneReocrCommand(command)) {
+        return correctionReocrTerminalResult(job, command);
+      }
       if (ACTIVE_TRANSFORM_JOB_STATES.has(job.state)) return null;
       if (!TERMINAL_TRANSFORM_JOB_STATES.has(job.state)) {
         throw invalidTransformResult(
@@ -553,12 +763,21 @@
       const retryIntervalMs = Number.isFinite(options.retryIntervalMs)
         ? Math.max(pollIntervalMs, Math.floor(options.retryIntervalMs)) : 1200;
       const listeners = new Set();
+      // Standalone re-OCR results stay off the transform stream so the image
+      // editor never mistakes a proposal-only job for a failed image commit.
+      const reocrListeners = new Set();
       const pending = new Map();
       let timer = null;
       let polling = false;
 
+      function listenerCount() {
+        return listeners.size + reocrListeners.size;
+      }
+
       function emit(result, command) {
-        for (const listener of [...listeners]) {
+        const target = isStandaloneReocrCommand(command)
+          ? reocrListeners : listeners;
+        for (const listener of [...target]) {
           try {
             listener(result, command);
           } catch (error) {
@@ -588,7 +807,7 @@
       }
 
       function schedulePoll(delay = pollIntervalMs) {
-        if (timer != null || polling || !listeners.size || !pending.size) return;
+        if (timer != null || polling || !listenerCount() || !pending.size) return;
         timer = schedule(() => {
           timer = null;
           void poll();
@@ -596,7 +815,7 @@
       }
 
       async function poll() {
-        if (polling || !listeners.size || !pending.size) return;
+        if (polling || !listenerCount() || !pending.size) return;
         polling = true;
         let retry = false;
         try {
@@ -626,7 +845,7 @@
         } finally {
           polling = false;
         }
-        if (pending.size && listeners.size) {
+        if (pending.size && listenerCount()) {
           schedulePoll(retry ? retryIntervalMs : pollIntervalMs);
         }
       }
@@ -650,23 +869,32 @@
         schedulePoll();
       }
 
-      function subscribeResults(listener) {
+      function subscribeSet(target, listener) {
         if (typeof listener !== "function") {
           throw new TypeError("transform result listener is required");
         }
-        listeners.add(listener);
+        target.add(listener);
         schedulePoll(25);
         return () => {
-          listeners.delete(listener);
-          if (!listeners.size && timer != null) {
+          target.delete(listener);
+          if (!listenerCount() && timer != null) {
             cancelSchedule(timer);
             timer = null;
           }
         };
       }
 
+      function subscribeResults(listener) {
+        return subscribeSet(listeners, listener);
+      }
+
+      function subscribeReocrResults(listener) {
+        return subscribeSet(reocrListeners, listener);
+      }
+
       return Object.freeze({
         subscribeResults,
+        subscribeReocrResults,
         track,
       });
     }
@@ -871,6 +1099,33 @@
           return result;
         };
       }
+      if (typeof corrections.queueReocr === "function") {
+        commands.queueReocr = async ({
+          operationId, itemId, artifactId, expectedArtifactRevision, signal,
+        } = {}) => {
+          const receipt = await corrections.queueReocr({
+            itemId,
+            artifactId,
+            expectedArtifactRevision,
+            idempotencyKey: operationId,
+            signal,
+          });
+          if (transformPolling) {
+            // The receipt pins the OCR-ready rendition the job actually
+            // reads; tracking follows that source, not the artifact the
+            // user pointed at.
+            const source = receipt.source || {};
+            transformPolling.track(receipt, {
+              item_id: itemId,
+              artifact_id: source.artifact_id,
+              artifact_revision: source.artifact_revision,
+              source_sha256: source.content_sha256,
+              operation_id: receipt.operation_id,
+            });
+          }
+          return receipt;
+        };
+      }
       if (typeof corrections.setManualCaption === "function") {
         commands.setManualCaption = ({
           operationId, ...payload
@@ -920,6 +1175,40 @@
         });
       }
       return Object.keys(commands).length ? Object.freeze(commands) : null;
+    }
+
+    function correctionOcrProposalPort(client, transformPolling, commands) {
+      const corrections = client && client.corrections;
+      if (!corrections ||
+          typeof corrections.listOcrProposals !== "function" ||
+          typeof corrections.getOcrProposal !== "function") {
+        return null;
+      }
+      const port = {
+        list: ({ itemId, cursor, limit, snapshotRevision, signal } = {}) =>
+          corrections.listOcrProposals({
+            itemId, cursor, limit, snapshotRevision, signal,
+          }),
+        get: ({ itemId, proposalRef, signal } = {}) =>
+          corrections.getOcrProposal({ itemId, proposalRef, signal }),
+      };
+      if (typeof corrections.applyOcrProposal === "function") {
+        port.apply = ({ operationId, itemId, proposalRef, signal } = {}) =>
+          corrections.applyOcrProposal({
+            itemId,
+            proposalRef,
+            idempotencyKey: operationId,
+            signal,
+          });
+      }
+      if (commands && typeof commands.queueReocr === "function") {
+        port.queueReocr = commands.queueReocr;
+      }
+      if (transformPolling &&
+          typeof transformPolling.subscribeReocrResults === "function") {
+        port.subscribeResults = transformPolling.subscribeReocrResults;
+      }
+      return Object.freeze(port);
     }
 
     function correctionReviewPort(client) {
@@ -1302,6 +1591,8 @@
       const commands = correctionCommandPort(client, transformPolling);
       const reviews = correctionReviewPort(client);
       const books = correctionBooksPort(client, indexPolling);
+      const ocrProposals = correctionOcrProposalPort(
+        client, transformPolling, commands);
 
       async function listRasterGroup({ context, group, cursor, limit, signal }) {
         if (!RASTER_GROUPS.has(group)) {
@@ -1516,6 +1807,7 @@
         artifacts,
         ...(books ? { books } : {}),
         ...(reviews ? { reviews } : {}),
+        ...(ocrProposals ? { ocrProposals } : {}),
         ...(invokeCommand ? { invokeCommand } : {}),
         ...(transformPolling ? {
           transforms: Object.freeze({
@@ -1534,5 +1826,6 @@
       decorateRasterArtifact,
       decorateDocumentArtifact,
       decorateSpatialAnnotation,
+      isStandaloneReocrCommand,
     };
   });

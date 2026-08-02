@@ -794,6 +794,143 @@ test("a command adapter observes an immediately returned terminal result", () =>
 });
 
 
+function reocrResource(outputKind = "corrected-display") {
+  return {
+    id: "corrected-display-1",
+    summary: {
+      itemId: "book-1",
+      id: "corrected-display-1",
+      revision: "corrected-display-r2",
+      extensions: {
+        correction_transform: {
+          operation_id: "transform-op-1",
+          output_kind: outputKind,
+          source_revision: "source-r17",
+        },
+      },
+    },
+  };
+}
+
+
+function reocrControls(harness) {
+  const row = byClass(harness.inspector, "image-adjust-reocr-control")[0] || null;
+  const button = row && descendants(row).find((node) =>
+    node.dataset && node.dataset.imageReocr) || null;
+  return { button, row };
+}
+
+
+test("the Re-OCR action gates on capability and committed transform lineage", async () => {
+  const requests = [];
+  const harness = mountedHarness({
+    requestReocr(request) {
+      requests.push(request);
+      return Promise.resolve({ replayed: false });
+    },
+  });
+
+  // The plain capture resource has no correction_transform pin.
+  let controls = reocrControls(harness);
+  assert.ok(controls.row, "wired tools render the Re-OCR row");
+  assert.equal(controls.row.hidden, true);
+
+  harness.tool.mount(harness.controller, reocrResource());
+  controls = reocrControls(harness);
+  assert.equal(controls.row.hidden, true,
+    "the pin alone is not enough without the queue capability");
+
+  harness.tool.setReocrCapability(true);
+  assert.equal(controls.row.hidden, false);
+  assert.equal(controls.button.disabled, false);
+  assert.equal(harness.tool.getState().reocrCapability, true);
+
+  controls.button.emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  controls.button.emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.match(request.operationId, /^reocr-/);
+    assert.equal(request.itemId, "book-1");
+    assert.equal(request.artifactId, "corrected-display-1");
+    assert.equal(request.expectedArtifactRevision, "corrected-display-r2");
+  }
+  assert.notEqual(requests[0].operationId, requests[1].operationId,
+    "every click mints a fresh operation id");
+
+  harness.tool.setReocrCapability(false);
+  assert.equal(controls.row.hidden, true);
+  controls.button.emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2, "a hidden action cannot queue");
+  harness.tool.destroy();
+});
+
+
+test("a queued Re-OCR reports its receipt and stays single-flight", async () => {
+  let release;
+  const requests = [];
+  const harness = mountedHarness({
+    requestReocr(request) {
+      requests.push(request);
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+  harness.tool.mount(harness.controller, reocrResource("ocr-ready"));
+  harness.tool.setReocrCapability(true);
+  const controls = reocrControls(harness);
+
+  controls.button.emit("click");
+  assert.equal(controls.button.disabled, true, "in-flight queueing disables");
+  assert.equal(harness.tool.getState().reocrBusy, true);
+  controls.button.emit("click");
+  assert.equal(requests.length, 1);
+
+  release({ replayed: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controls.button.disabled, false);
+  const jobStatus = byClass(
+    harness.inspector, "image-adjust-job-status")[0];
+  assert.equal(
+    jobStatus.textContent,
+    "Re-OCR already queued for this rendition.",
+  );
+  harness.tool.destroy();
+});
+
+
+test("a failed Re-OCR queue keeps the panel usable and reports the error", async () => {
+  const harness = mountedHarness({
+    requestReocr() {
+      return Promise.reject(new Error("the raster artifact changed elsewhere"));
+    },
+  });
+  harness.tool.mount(harness.controller, reocrResource());
+  harness.tool.setReocrCapability(true);
+  const controls = reocrControls(harness);
+
+  controls.button.emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(controls.button.disabled, false);
+  const jobStatus = byClass(
+    harness.inspector, "image-adjust-job-status")[0];
+  assert.equal(jobStatus.textContent, "the raster artifact changed elsewhere");
+  harness.tool.destroy();
+});
+
+
+test("unwired tools render no Re-OCR affordance at all", () => {
+  const harness = mountedHarness();
+  harness.tool.mount(harness.controller, reocrResource());
+  harness.tool.setReocrCapability(true);
+  assert.equal(reocrControls(harness).row, null);
+  harness.tool.destroy();
+});
+
+
 test("module installs through browser globals as well as CommonJS", () => {
   const context = vm.createContext({});
   const root = path.join(

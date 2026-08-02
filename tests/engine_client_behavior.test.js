@@ -401,6 +401,103 @@ function correctionOcrProposalResult(overrides = {}) {
   };
 }
 
+function correctionReocrSource(overrides = {}) {
+  return {
+    kind: "ocr-ready",
+    artifact_id: "corrected:ocr-ready",
+    artifact_revision: "corrected-r1",
+    content_sha256: "b".repeat(64),
+    ...overrides,
+  };
+}
+
+function correctionReocrQueueResult(overrides = {}) {
+  const operationId = `correction-reocr:${"c".repeat(48)}`;
+  const jobId = `correction-ocr-${"d".repeat(24)}`;
+  const source = correctionReocrSource(overrides.source || {});
+  return {
+    ok: true,
+    schema: "librarytool.correction-reocr-queue-receipt/1",
+    replayed: false,
+    operation_id: operationId,
+    job_id: jobId,
+    job: {
+      id: jobId,
+      kind: "correction.ocr-followup",
+      state: "queued",
+      subject: { item_id: "book:one", source_id: source.artifact_id },
+      progress: { completed: 0, total: 4, unit: "phase", phase: "queued" },
+      cancellable: true,
+      revision: 1,
+      created_at: "2026-08-02T12:00:00+00:00",
+      updated_at: "2026-08-02T12:00:00+00:00",
+      finished_at: "",
+      note: "",
+      error: null,
+      input_revisions: {
+        parent_operation_id: operationId,
+        artifact_id: source.artifact_id,
+        artifact_revision: source.artifact_revision,
+        source_sha256: source.content_sha256,
+        publication_policy: "machine-proposal-only",
+      },
+      outputs: [],
+      ...(overrides.job || {}),
+    },
+    source,
+    ...(overrides.envelope || {}),
+  };
+}
+
+function correctionOcrProposalSummary(overrides = {}) {
+  return {
+    proposal_ref: `cop-${"a".repeat(40)}`,
+    operation_id: `correction-reocr:${"c".repeat(48)}`,
+    source: correctionReocrSource(),
+    provider: { provider_id: "mistral", model: "mistral-ocr-latest" },
+    publication_policy: "machine-proposal-only",
+    content_sha256: "c".repeat(64),
+    availability: "available",
+    ...overrides,
+  };
+}
+
+function correctionOcrProposalPage(overrides = {}) {
+  return {
+    ok: true,
+    schema: "librarytool.correction-ocr-proposals/1",
+    item_id: "book:one",
+    snapshot_revision: `cops-${"e".repeat(64)}`,
+    proposals: [correctionOcrProposalSummary()],
+    next_cursor: null,
+    total: 1,
+    ...overrides,
+  };
+}
+
+function correctionOcrApplyReceipt(overrides = {}) {
+  return {
+    ok: true,
+    schema: "librarytool.correction-ocr-proposal-apply-receipt/1",
+    replayed: false,
+    operation_id: "apply:one",
+    proposal_ref: `cop-${"a".repeat(40)}`,
+    applied: {
+      item_id: "book:one",
+      capture_id: "capture-1",
+      asset_id: "asset-1",
+      source_id: "primary",
+      page: 3,
+      doc: "compiled.txt",
+      regions: "saved",
+      words: "saved",
+      text: "merged",
+      ...(overrides.applied || {}),
+    },
+    ...(overrides.envelope || {}),
+  };
+}
+
 function manualCategoryAssignment(category = "cover") {
   return {
     category,
@@ -2112,6 +2209,275 @@ test("correction transform queue rejects noncanonical commands and receipts", as
     missingPins.corrections.queueTransform({ command }),
     (error) => error instanceof EngineClientError &&
       error.code === "invalid-response",
+  );
+});
+
+test("correction re-OCR queueing owns exact conditional transport", async () => {
+  const calls = [];
+  const body = correctionReocrQueueResult();
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(202, body);
+    },
+  });
+
+  const result = await client.corrections.queueReocr({
+    itemId: "book:one",
+    artifactId: "corrected:display",
+    expectedArtifactRevision: "corrected-display-r1",
+    idempotencyKey: "reocr-op-1",
+  });
+
+  assert.deepEqual(result, body);
+  assert.deepEqual(calls.map((call) => [
+    call.init.method,
+    call.url,
+    call.init.cache,
+    call.init.headers,
+    JSON.parse(call.init.body),
+  ]), [[
+    "POST",
+    "/api/v1/items/book%3Aone/raster-artifacts/corrected%3Adisplay/reocr",
+    "no-store",
+    {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "Idempotency-Key": "reocr-op-1",
+      "If-Artifact-Match": "\"corrected-display-r1\"",
+    },
+    {},
+  ]]);
+
+  const replayBody = correctionReocrQueueResult({
+    envelope: { replayed: true },
+  });
+  const replayClient = new EngineClient({
+    transport: async () => response(200, replayBody),
+  });
+  const replay = await replayClient.corrections.queueReocr({
+    itemId: "book:one",
+    artifactId: "corrected:display",
+    expectedArtifactRevision: "corrected-display-r1",
+    idempotencyKey: "reocr-op-1",
+  });
+  assert.equal(replay.replayed, true);
+});
+
+test("correction re-OCR queueing rejects invalid input and receipts", async () => {
+  let transports = 0;
+  const counting = new EngineClient({
+    transport: async () => {
+      transports += 1;
+      return response(202, correctionReocrQueueResult());
+    },
+  });
+  await assert.rejects(
+    counting.corrections.queueReocr({
+      itemId: "book:one",
+      artifactId: "corrected:display",
+      expectedArtifactRevision: "",
+      idempotencyKey: "reocr-op-1",
+    }),
+    TypeError,
+  );
+  await assert.rejects(
+    counting.corrections.queueReocr({
+      itemId: "book:one",
+      artifactId: "corrected:display",
+      expectedArtifactRevision: "corrected-display-r1",
+      idempotencyKey: "",
+    }),
+    TypeError,
+  );
+  assert.equal(transports, 0);
+
+  const invalidBodies = [
+    // A first queue must answer 202; replay-only 200 bodies cannot claim it.
+    [200, correctionReocrQueueResult()],
+    [202, correctionReocrQueueResult({
+      envelope: { operation_id: "reocr-op-1" },
+    })],
+    [202, correctionReocrQueueResult({
+      job: { kind: "correction.transform" },
+    })],
+    [202, correctionReocrQueueResult({
+      job: { subject: { item_id: "book:two", source_id: "corrected:ocr-ready" } },
+    })],
+    [202, (() => {
+      const body = correctionReocrQueueResult();
+      body.job.input_revisions.command_sha256 = "f".repeat(64);
+      return body;
+    })()],
+    [202, (() => {
+      const body = correctionReocrQueueResult();
+      body.job.input_revisions.artifact_revision = "corrected-r2";
+      return body;
+    })()],
+  ];
+  for (const [status, body] of invalidBodies) {
+    const client = new EngineClient({
+      transport: async () => response(status, body),
+    });
+    await assert.rejects(
+      client.corrections.queueReocr({
+        itemId: "book:one",
+        artifactId: "corrected:display",
+        expectedArtifactRevision: "corrected-display-r1",
+        idempotencyKey: "reocr-op-1",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  }
+});
+
+test("correction OCR proposal catalog reads stay snapshot pinned", async () => {
+  const calls = [];
+  const body = correctionOcrProposalPage();
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, body);
+    },
+  });
+
+  const result = await client.corrections.listOcrProposals({
+    itemId: "book:one",
+    cursor: "copc-page-2",
+    limit: 25,
+    snapshotRevision: `cops-${"e".repeat(64)}`,
+  });
+
+  assert.deepEqual(result, body);
+  assert.deepEqual(calls.map((call) => [call.init.method, call.url]), [[
+    "GET",
+    "/api/v1/items/book%3Aone/ocr-proposals?cursor=copc-page-2&limit=25" +
+      `&snapshot_revision=cops-${"e".repeat(64)}`,
+  ]]);
+
+  assert.throws(
+    () => client.corrections.listOcrProposals({
+      itemId: "book:one",
+      snapshotRevision: "not-a-snapshot",
+    }),
+    TypeError,
+  );
+  assert.throws(
+    () => client.corrections.listOcrProposals({ itemId: "book:one", limit: 0 }),
+    TypeError,
+  );
+
+  const invalidBodies = [
+    correctionOcrProposalPage({ snapshot_revision: "cops-short" }),
+    correctionOcrProposalPage({ total: 0 }),
+    correctionOcrProposalPage({
+      proposals: [
+        correctionOcrProposalSummary({ proposal_ref: `cop-${"b".repeat(40)}` }),
+        correctionOcrProposalSummary({ proposal_ref: `cop-${"a".repeat(40)}` }),
+      ],
+      total: 2,
+    }),
+    correctionOcrProposalPage({
+      proposals: [correctionOcrProposalSummary({
+        provider: {
+          provider_id: "tesseract",
+          model: "local",
+          options: { credential: "must-not-cross" },
+        },
+      })],
+    }),
+  ];
+  for (const invalid of invalidBodies) {
+    const rejecting = new EngineClient({
+      transport: async () => response(200, invalid),
+    });
+    await assert.rejects(
+      rejecting.corrections.listOcrProposals({ itemId: "book:one" }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  }
+});
+
+test("correction OCR proposal apply owns idempotent no-body transport", async () => {
+  const calls = [];
+  const body = correctionOcrApplyReceipt();
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, body);
+    },
+  });
+
+  const result = await client.corrections.applyOcrProposal({
+    itemId: "book:one",
+    proposalRef: `cop-${"a".repeat(40)}`,
+    idempotencyKey: "apply:one",
+  });
+
+  assert.deepEqual(result, body);
+  assert.deepEqual(calls.map((call) => [
+    call.init.method,
+    call.url,
+    call.init.headers,
+    call.init.body === undefined ? null : call.init.body,
+  ]), [[
+    "POST",
+    `/api/v1/items/book%3Aone/ocr-proposals/cop-${"a".repeat(40)}/apply`,
+    { Accept: "application/json", "Idempotency-Key": "apply:one" },
+    null,
+  ]]);
+
+  await assert.rejects(
+    client.corrections.applyOcrProposal({
+      itemId: "book:one",
+      proposalRef: "proposal:one",
+      idempotencyKey: "apply:one",
+    }),
+    TypeError,
+  );
+
+  const invalidBodies = [
+    correctionOcrApplyReceipt({ envelope: { operation_id: "apply:two" } }),
+    correctionOcrApplyReceipt({ applied: { regions: "rewritten" } }),
+    // Text merging is only skipped when regions became proposals.
+    correctionOcrApplyReceipt({ applied: { text: "proposed" } }),
+    correctionOcrApplyReceipt({ applied: { page: 0 } }),
+  ];
+  for (const invalid of invalidBodies) {
+    const rejecting = new EngineClient({
+      transport: async () => response(200, invalid),
+    });
+    await assert.rejects(
+      rejecting.corrections.applyOcrProposal({
+        itemId: "book:one",
+        proposalRef: `cop-${"a".repeat(40)}`,
+        idempotencyKey: "apply:one",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  }
+
+  const conflict = new EngineClient({
+    transport: async () => response(409, {
+      ok: false,
+      error: "the capture has no imported build entry to write into",
+      code: "ocr_apply_capture_entry_unavailable",
+      retryable: false,
+      conflict: "ocr_apply_capture_entry_unavailable",
+    }),
+  });
+  await assert.rejects(
+    conflict.corrections.applyOcrProposal({
+      itemId: "book:one",
+      proposalRef: `cop-${"a".repeat(40)}`,
+      idempotencyKey: "apply:one",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "ocr_apply_capture_entry_unavailable" &&
+      error.status === 409,
   );
 });
 

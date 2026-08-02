@@ -51,6 +51,21 @@
   grid-template-columns: auto 1fr;
 }
 
+.image-adjust-reocr-control {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.image-adjust-reocr-control button {
+  padding: 0.1rem 0.6rem;
+}
+
+.image-adjust-reocr-hint {
+  color: var(--corrections-muted, #a9b3a9);
+  font-size: 0.78rem;
+}
+
 .image-adjust-brightness-hint,
 .image-adjust-threshold {
   color: var(--corrections-muted, #a9b3a9);
