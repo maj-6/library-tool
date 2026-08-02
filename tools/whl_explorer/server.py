@@ -16624,6 +16624,8 @@ def _lease_secret(legacy_key: str):
     repository = _secret_repository
     if repository is None:
         raise RuntimeError("protected credential storage is unavailable")
+    lease_stack = contextlib.ExitStack()
+    credential = ""
     try:
         if legacy_key == "mistralKey":
             # Mistral is account data, not a machine-global provider key. Take
@@ -16651,24 +16653,37 @@ def _lease_secret(legacy_key: str):
                 ):
                     raise RuntimeError(
                         "the required provider credential is not configured")
-                with repository.credential_leases.lease(secret_id) as leased:
-                    if leased.revision != status.revision:
-                        raise RuntimeError(
-                            "protected credential storage is unavailable")
-                    credential = leased.reveal()
-            try:
-                yield credential
-            finally:
-                credential = ""
-            return
-        with repository.credential_leases.lease(secret_id) as leased:
-            yield leased.reveal()
+                leased = lease_stack.enter_context(
+                    repository.credential_leases.lease(secret_id))
+                if leased.revision != status.revision:
+                    raise RuntimeError(
+                        "protected credential storage is unavailable")
+                credential = leased.reveal()
+        else:
+            leased = lease_stack.enter_context(
+                repository.credential_leases.lease(secret_id))
+            credential = leased.reveal()
     except SecretCredentialNotConfiguredError:
+        credential = ""
+        lease_stack.close()
         raise RuntimeError("the required provider credential is not configured") from None
     except RuntimeError:
+        credential = ""
+        lease_stack.close()
         raise
     except Exception:
+        credential = ""
+        lease_stack.close()
         raise RuntimeError("protected credential storage is unavailable") from None
+    try:
+        # Keep provider and sync failures outside the acquisition exception
+        # boundary.  Context-manager exceptions are injected at ``yield``;
+        # catching them above mislabeled a network, OCR, or import failure as
+        # a broken DPAPI vault even when credential acquisition had succeeded.
+        with lease_stack:
+            yield credential
+    finally:
+        credential = ""
 
 
 def _secret_is_configured(legacy_key: str) -> bool:
