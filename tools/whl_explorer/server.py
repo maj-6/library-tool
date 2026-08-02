@@ -18136,6 +18136,11 @@ def api_scans():
 CAPTURES_DIR = lib.DATA_ROOT / "captures"
 _cloudsync_lock = threading.Lock()
 _CLOUDSYNC_EVENT_KEEP = 128
+_CAPTURE_ARCHIVE_BACKFILL_MAX_IDS = 64
+_CAPTURE_ARCHIVE_BACKFILL_MAX_REQUEST_BYTES = 16 * 1024
+_CAPTURE_ARCHIVE_BACKFILL_DIAGNOSTIC_LIMIT = 256
+_CAPTURE_ARCHIVE_BACKFILL_MAX_JSON_DEPTH = 32
+_capture_archive_backfill_lock = threading.Lock()
 _cloudsync = {
     "running": False,
     "run_id": "",
@@ -25843,6 +25848,326 @@ def _cloud_sync_run(claimed_run_id: str = "") -> dict:
         return result
 
 
+def _capture_archive_backfill_json_too_deep(value) -> bool:
+    """Apply one platform-independent nesting limit after JSON decoding."""
+
+    pending = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > _CAPTURE_ARCHIVE_BACKFILL_MAX_JSON_DEPTH:
+            return True
+        if isinstance(current, dict):
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+    return False
+
+
+def _capture_archive_backfill_request() -> tuple[tuple[str, ...], bool]:
+    """Read one bounded, explicit maintenance request from the desktop."""
+
+    if not request.is_json or request.headers.get("Content-Encoding") not in (
+        None,
+        "",
+        "identity",
+    ):
+        raise EngineValidationError(
+            "capture archive backfill requires an unencoded JSON body",
+            code="invalid_capture_archive_backfill_request",
+        )
+    declared = request.content_length
+    if declared is not None and declared > _CAPTURE_ARCHIVE_BACKFILL_MAX_REQUEST_BYTES:
+        raise EngineValidationError(
+            "capture archive backfill request is too large",
+            code="capture_archive_backfill_request_too_large",
+        )
+    encoded = request.stream.read(
+        _CAPTURE_ARCHIVE_BACKFILL_MAX_REQUEST_BYTES + 1
+    )
+    if len(encoded) > _CAPTURE_ARCHIVE_BACKFILL_MAX_REQUEST_BYTES:
+        raise EngineValidationError(
+            "capture archive backfill request is too large",
+            code="capture_archive_backfill_request_too_large",
+        )
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object key")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")
+            ),
+        )
+    except (RecursionError, UnicodeError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "capture archive backfill request is not valid JSON",
+            code="invalid_capture_archive_backfill_request",
+        ) from exc
+    if _capture_archive_backfill_json_too_deep(payload):
+        raise EngineValidationError(
+            "capture archive backfill request is nested too deeply",
+            code="invalid_capture_archive_backfill_request",
+        )
+    if not isinstance(payload, dict) or set(payload) - {"capture_ids", "apply"}:
+        raise EngineValidationError(
+            "capture archive backfill request has unsupported fields",
+            code="invalid_capture_archive_backfill_request",
+        )
+    raw_apply = payload.get("apply", False)
+    if not isinstance(raw_apply, bool):
+        raise EngineValidationError(
+            "apply must be a boolean",
+            code="invalid_capture_archive_backfill_mode",
+        )
+    raw_ids = payload.get("capture_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise EngineValidationError(
+            "capture_ids must be a non-empty list",
+            code="invalid_capture_archive_backfill_scope",
+        )
+    if len(raw_ids) > _CAPTURE_ARCHIVE_BACKFILL_MAX_IDS:
+        raise EngineValidationError(
+            "capture archive backfill scope exceeds its capture limit",
+            code="capture_archive_backfill_scope_too_large",
+            details={"maximum": _CAPTURE_ARCHIVE_BACKFILL_MAX_IDS},
+        )
+    capture_ids: list[str] = []
+    for value in raw_ids:
+        if not isinstance(value, str) or _capture_archive_id(value) != value:
+            raise EngineValidationError(
+                "capture_ids contains a nonportable capture identity",
+                code="invalid_capture_archive_backfill_scope",
+            )
+        if value in capture_ids:
+            raise EngineValidationError(
+                "capture_ids contains a duplicate capture identity",
+                code="duplicate_capture_archive_backfill_scope",
+            )
+        capture_ids.append(value)
+    return tuple(capture_ids), raw_apply
+
+
+@contextlib.contextmanager
+def _capture_archive_backfill_capture_guard(capture_ids: tuple[str, ...]):
+    """Serialize selected legacy captures with ordinary desktop intake."""
+
+    locks = []
+    seen: set[int] = set()
+    for capture_id in sorted(capture_ids):
+        lock = _capture_ingest_lock(capture_id)
+        identity = id(lock)
+        if identity not in seen:
+            seen.add(identity)
+            locks.append(lock)
+    with contextlib.ExitStack() as stack:
+        for lock in locks:
+            stack.enter_context(lock)
+        yield
+
+
+def _capture_archive_backfill_failure_report(
+    *,
+    apply: bool,
+    error: Exception,
+) -> dict:
+    """Return the CLI-compatible, locator-free setup failure envelope."""
+
+    try:
+        diagnostic = capture_lib_compat._backfill_setup_diagnostic(error)
+    except Exception:
+        diagnostic = {
+            "capture_id": "",
+            "entry_id": "",
+            "status": "failed",
+            "code": "capture_backfill_setup_failed",
+            "message": "capture backfill setup failed",
+            "changed": False,
+            "book_id": "",
+            "association": None,
+        }
+    else:
+        # This authenticated HTTP boundary is narrower than the standalone
+        # local CLI. Preserve its safe machine code, but never serialize an
+        # unexpected adapter/provider exception message to a renderer.
+        diagnostic = dict(diagnostic)
+        diagnostic["message"] = "capture backfill setup failed"
+    return {
+        "schema": "org.whl.capture-lib-backfill-report",
+        "version": 1,
+        "mode": "apply" if apply else "dry-run",
+        "ok": False,
+        "summary": {
+            "total": 1,
+            "created": 0,
+            "would_create": 0,
+            "unchanged": 0,
+            "failed": 1,
+            "omitted_diagnostics": 0,
+        },
+        "diagnostics": [diagnostic],
+    }
+
+
+def _run_capture_archive_backfill_host(
+    capture_ids: tuple[str, ...],
+    *,
+    apply: bool,
+) -> dict:
+    """Run one explicitly scoped local repair and optional RLS publication."""
+
+    cloud_candidates = tuple(
+        capture_id
+        for capture_id in capture_ids
+        if _canonical_capture_id(capture_id) == capture_id
+    )
+    authorized_ids: tuple[str, ...] = ()
+    cloud_not_applicable = apply and not cloud_candidates
+    cloud = {
+        "status": (
+            "not_requested"
+            if not apply
+            else "complete" if cloud_not_applicable else "skipped"
+        ),
+        "code": (
+            "dry_run"
+            if not apply
+            else (
+                "capture_cloud_scope_not_applicable"
+                if cloud_not_applicable
+                else "capture_cloud_credentials_unavailable"
+            )
+        ),
+        "candidate_count": len(cloud_candidates),
+        "local_only_count": len(capture_ids) - len(cloud_candidates),
+        "authorized_count": 0,
+        "published": 0,
+        "failed": 0,
+    }
+
+    def run_local(publisher=None) -> dict:
+        try:
+            with _capture_archive_backfill_capture_guard(capture_ids):
+                return capture_lib_compat.run_capture_archive_backfill(
+                    manual_entries_path=lib.MANUAL_ENTRIES_PATH,
+                    capture_root=CAPTURES_DIR,
+                    workspace_root=lib.OUTPUT_DIR,
+                    format_module=libformat,
+                    association_publisher=publisher,
+                    capture_ids=capture_ids,
+                    publication_capture_ids=authorized_ids,
+                    apply=apply,
+                    diagnostic_limit=(
+                        _CAPTURE_ARCHIVE_BACKFILL_DIAGNOSTIC_LIMIT
+                    ),
+                )
+        except Exception as exc:
+            log.error("capture archive backfill failed", exc_info=exc)
+            return _capture_archive_backfill_failure_report(
+                apply=apply,
+                error=exc,
+            )
+
+    report = None
+    if apply and cloud_candidates:
+        try:
+            with contextlib.ExitStack() as credentials:
+                capture_cfg = credentials.enter_context(_lease_capture_cfg())
+                owner_cfg = credentials.enter_context(_lease_cloud_cfg())
+                if capture_cfg and owner_cfg:
+                    rows = sbase.list_capture_association_states(
+                        capture_cfg,
+                        cloud_candidates,
+                    )
+                    observed: set[str] = set()
+                    for row in rows:
+                        row_id = (
+                            _canonical_capture_id(row.get("id"))
+                            if isinstance(row, dict)
+                            else ""
+                        )
+                        if (
+                            not row_id
+                            or row_id not in cloud_candidates
+                            or row_id in observed
+                        ):
+                            raise sbase.SyncError(
+                                "capture association scope returned invalid rows"
+                            )
+                        observed.add(row_id)
+                    authorized_ids = tuple(
+                        capture_id
+                        for capture_id in cloud_candidates
+                        if capture_id in observed
+                    )
+                    cloud.update({
+                        "status": "ready",
+                        "code": "capture_cloud_scope_ready",
+                        "authorized_count": len(authorized_ids),
+                    })
+                    if authorized_ids:
+                        publisher = sbase.ScopedCaptureLibAssociationPublisher(
+                            owner_cfg,
+                            capture_cfg,
+                        )
+                        # The publisher borrows both dictionaries and may run
+                        # only inside this credential lease.
+                        report = run_local(publisher)
+        except Exception:
+            log.warning(
+                "capture archive cloud scope discovery failed",
+                exc_info=True,
+            )
+            cloud.update({
+                "status": "failed",
+                "code": "capture_cloud_scope_discovery_failed",
+                "message": "authorized capture scope could not be read",
+            })
+    if report is None:
+        # Dry-runs, local-only scopes, missing credentials, and failed cloud
+        # discovery all remain useful local maintenance operations.
+        report = run_local()
+
+    summary = report.get("summary") if isinstance(report, dict) else None
+    summary = summary if isinstance(summary, dict) else {}
+    if cloud["status"] == "ready":
+        cloud["published"] = int(summary.get("cloud_succeeded") or 0)
+        cloud["failed"] = int(summary.get("cloud_failed") or 0)
+        cloud["status"] = "failed" if cloud["failed"] else "complete"
+        cloud["code"] = (
+            "capture_cloud_publication_failed"
+            if cloud["failed"]
+            else "capture_cloud_publication_complete"
+        )
+    cloud["unpublished_candidate_count"] = (
+        len(cloud_candidates) - len(authorized_ids)
+    )
+    overall_ok = bool(
+        isinstance(report, dict)
+        and report.get("ok")
+        and cloud["status"] != "failed"
+    )
+    return {
+        "schema": "org.whl.capture-lib-backfill-host-result",
+        "version": 1,
+        "ok": overall_ok,
+        "mode": "apply" if apply else "dry-run",
+        "scope": {
+            "requested": len(capture_ids),
+            "capture_ids": list(capture_ids),
+            "maximum": _CAPTURE_ARCHIVE_BACKFILL_MAX_IDS,
+        },
+        "cloud": cloud,
+        "report": report,
+    }
+
+
 def _cloud_autosync_loop() -> None:
     """Background interval sync; the interval is re-read every tick so a
     settings change applies without a restart (0 = off)."""
@@ -25895,6 +26220,34 @@ def api_cloudsync_status():
     out = _cloudsync_snapshot()
     out["configured"] = bool(_capture_configured() or _cloud_configured())
     return jsonify(out)
+
+
+@app.post("/api/v1/capture-archive-backfills")
+def api_capture_archive_backfill():
+    """Run bounded legacy maintenance outside routine cloud autosync.
+
+    Packaged clients cross the global exact-origin and desktop-capability
+    guards before this handler. JSON-only input prevents form-based CSRF in
+    source mode, and a mutation happens only for a literal ``apply: true``.
+    """
+
+    try:
+        capture_ids, apply = _capture_archive_backfill_request()
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    if not _capture_archive_backfill_lock.acquire(blocking=False):
+        return _engine_error_response(EngineConflictError(
+            "capture archive backfill is already running",
+            code="capture_archive_backfill_busy",
+            retryable=True,
+        ))
+    try:
+        return jsonify(_run_capture_archive_backfill_host(
+            capture_ids,
+            apply=apply,
+        ))
+    finally:
+        _capture_archive_backfill_lock.release()
 
 
 @app.route("/api/cloudsync/test")

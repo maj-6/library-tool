@@ -10,6 +10,7 @@ import threading
 import uuid
 import zipfile
 
+import capture_lib
 import libcommon as lib
 import libformat
 import pytest
@@ -1311,6 +1312,84 @@ def test_imported_null_remote_state_bootstraps_without_changing_status(
     assert malformed["published"] == 0
     assert "null scoped state" in malformed["errors"][0]
     assert publications == []
+
+
+def test_offline_backfill_is_published_by_next_explicit_cloud_sync(
+        monkeypatch):
+    """The documented operator workflow crosses the real reconciliation path."""
+
+    capture_id = "a2525252-2525-4525-8525-252525252525"
+    capture_directory = server.CAPTURES_DIR / capture_id
+    capture_directory.mkdir(parents=True)
+    (capture_directory / "orig_1.jpg").write_bytes(
+        _jpeg(f"{capture_id}-original", width=7, height=11)
+    )
+    (capture_directory / "photo_1.jpg").write_bytes(
+        _jpeg(f"{capture_id}-display", width=5, height=9)
+    )
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, {
+        "manual-backfill": {
+            "id": "manual-backfill",
+            "capture_id": capture_id,
+            "title": "Offline legacy capture",
+            "created_at": "2026-07-30T12:00:00+00:00",
+        },
+    })
+
+    backfill = capture_lib.run_capture_archive_backfill(
+        manual_entries_path=lib.MANUAL_ENTRIES_PATH,
+        capture_root=server.CAPTURES_DIR,
+        workspace_root=server.BUILDS_PATH.parent,
+        format_module=libformat,
+        apply=True,
+    )
+    association = server._capture_archive_association(capture_id)
+
+    assert backfill["ok"] is True
+    assert backfill["summary"]["created"] == 1
+    assert association is not None
+
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, ids, chunk=40: [
+            _scoped_cloud_association(capture_id, status="imported")
+        ] if capture_id in ids else [],
+    )
+    publications = []
+
+    def publish(*args, **kwargs):
+        publications.append((args, kwargs))
+        desired = server.CaptureArchiveAssociation.from_dict(args[3])
+        return _accepted_cloud_association(desired, 1)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        publish,
+    )
+
+    reconciled = server._reconcile_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+    )
+
+    assert reconciled["published"] == 1
+    assert reconciled["errors"] == []
+    assert publications == [(
+        (
+            owner_cfg,
+            capture_cfg,
+            capture_id,
+            association.as_dict(),
+        ),
+        {"expected_revision": 0, "mark_imported": False},
+    )]
+    assert server._capture_cloud_association_state()["shadows"][
+        capture_id
+    ]["association"] == association.as_dict()
 
 
 def test_stale_after_durable_ingest_is_first_acknowledged_as_imported(

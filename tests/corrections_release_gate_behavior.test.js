@@ -8,6 +8,8 @@ const {
 } = require(
   "../tools/whl_explorer/static/corrections/artifact-model");
 const {
+  BooksPanelController,
+  CorrectionsIndexStore,
   normalizeCorrectionsIndex,
   sortedBooks,
 } = require("../tools/whl_explorer/static/corrections/books");
@@ -27,6 +29,10 @@ const {
   serializeCorrectionTransformCommand,
 } = require(
   "../tools/whl_explorer/static/corrections/image-editor-state");
+const {
+  FakeNode,
+  fakeDocument,
+} = require("./fixtures/corrections_fake_dom");
 
 
 // These fixture sizes make the UI specification's 100 ms direct-manipulation
@@ -246,7 +252,7 @@ function capture(index) {
 
 
 test("large cached thumbnail and artifact browsing stays bounded by release budgets",
-  () => {
+  async () => {
     const payload = {
       schema: "librarytool.corrections-index/2",
       revision: "large-index-r1",
@@ -305,6 +311,35 @@ test("large cached thumbnail and artifact browsing stays bounded by release budg
     assert.equal(windowed.totalHeight, rows.length * 28);
     assert.ok(elapsed < CACHED_BROWSE_BUDGET_MS,
       `cached large-book projection took ${elapsed.toFixed(2)} ms`);
+
+    const documentRef = fakeDocument();
+    const booksRoot = new FakeNode("nav", documentRef);
+    const count = new FakeNode("span", documentRef);
+    count.setAttribute("data-books-count", "");
+    const filter = new FakeNode("input", documentRef);
+    filter.setAttribute("data-books-filter", "");
+    const list = new FakeNode("ul", documentRef);
+    list.setAttribute("data-books-list", "");
+    booksRoot.append(count, filter, list);
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => payload },
+    });
+    const panel = new BooksPanelController({
+      root: booksRoot,
+      documentRef,
+      store,
+    }).mount();
+    const renderStarted = performance.now();
+    await store.openWorkspace("local-library");
+    const renderElapsed = performance.now() - renderStarted;
+    const captureButtons = list.querySelectorAll("[data-artifact-id]");
+    assert.equal(captureButtons.length, LARGE_BOOK_CAPTURE_COUNT,
+      "the production Books controller keeps every capture keyboard reachable");
+    assert.equal(captureButtons.at(-1).querySelector("img").loading, "lazy",
+      "off-screen thumbnail decoding remains delegated to the browser");
+    assert.ok(renderElapsed < CACHED_BROWSE_BUDGET_MS,
+      `cached Books rendering took ${renderElapsed.toFixed(2)} ms`);
+    panel.destroy();
   });
 
 
