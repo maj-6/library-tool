@@ -257,10 +257,14 @@ class CaptureMetadataSyncTest {
         assertTrue(CaptureMetadataStore.deleteIfNoUnsyncedLocalMutation(dir))
         assertFalse(dir.exists())
 
+        // Retention itself goes through the archiving variant, which applies
+        // the same unsynced-mutation gate proven above — an unsent review edit
+        // must block the move as firmly as it blocked the delete, because the
+        // archive is not a sync source.
         val entriesSource = java.io.File(
             "src/main/java/org/whl/bookcapture/Entries.kt",
         ).readText()
-        assertTrue(entriesSource.contains("deleteIfNoUnsyncedLocalMutation(dir)"))
+        assertTrue(entriesSource.contains("archiveIfNoUnsyncedLocalMutation("))
     }
 
     @Test

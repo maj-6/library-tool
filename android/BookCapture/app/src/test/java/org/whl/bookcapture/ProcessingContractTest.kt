@@ -109,6 +109,74 @@ class ProcessingContractTest {
         assertTrue(pipeline.contains("absent or equivalent"))
     }
 
+    /** Extraction runs at temperature 0, so a book that trips a shape check
+     * trips it on every attempt. A deviation that loses no value must not make
+     * the record permanently "partial". */
+    @Test
+    fun anUnquotedYearIsKeptAndDoesNotMakeTheRecordPartial() {
+        val response = JSONObject().apply {
+            Pipeline.FIELDS.forEach { put(it, "") }
+            put("title", "The Published Title")
+            put("year", 1897)                     // a JSON number, not a string
+            put("extra", JSONObject())
+        }
+
+        val parsed = Pipeline.parseExtraction(response.toString())
+
+        assertTrue(parsed.complete)
+        assertEquals("1897", parsed.metadata.getString("year"))
+        // The deviation is still reported, just not as a defect.
+        assertTrue(parsed.warning != null && parsed.warning!!.contains("year"))
+    }
+
+    @Test
+    fun anOmittedExtraObjectIsNotAPartialExtraction() {
+        val response = JSONObject().apply {
+            Pipeline.FIELDS.forEach { put(it, "") }
+            put("title", "The Published Title")
+        }
+
+        assertTrue(Pipeline.parseExtraction(response.toString()).complete)
+    }
+
+    @Test
+    fun aMissingFieldIsStillAPartialExtraction() {
+        val response = JSONObject().apply {
+            Pipeline.FIELDS.filterNot { it == "author" }.forEach { put(it, "") }
+            put("title", "The Published Title")
+            put("extra", JSONObject())
+        }
+
+        val parsed = Pipeline.parseExtraction(response.toString())
+
+        assertFalse(parsed.complete)
+        assertTrue(parsed.warning!!.contains("author"))
+    }
+
+    @Test
+    fun aStructuredValueWhereAStringBelongsIsStillAPartialExtraction() {
+        // No honest scalar to keep, so the value really was lost.
+        val response = JSONObject().apply {
+            Pipeline.FIELDS.forEach { put(it, "") }
+            put("title", "The Published Title")
+            put("author", JSONObject().put("first", "Ada"))
+            put("extra", JSONObject())
+        }
+
+        assertFalse(Pipeline.parseExtraction(response.toString()).complete)
+    }
+
+    @Test
+    fun anExtraFieldOfTheWrongTypeIsStillAPartialExtraction() {
+        val response = JSONObject().apply {
+            Pipeline.FIELDS.forEach { put(it, "") }
+            put("title", "The Published Title")
+            put("extra", "not an object")
+        }
+
+        assertFalse(Pipeline.parseExtraction(response.toString()).complete)
+    }
+
     @Test
     fun acceptedMetadataFreezesPostProcessingIntentBeforeCompletion() {
         val worker = source("ProcessWorker")
