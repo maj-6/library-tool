@@ -38,6 +38,17 @@ INDEX_VERSION = 1
 DEFAULT_CSV = lib.ROOT / "whl_catalog.csv"
 
 
+def canonical_source_sha256(source: bytes) -> str:
+    """Fingerprint CSV bytes after normalizing platform line endings.
+
+    Git may check the tracked catalogue out with CRLF on Windows even though
+    the repository blob uses LF.  Normalize exactly that checkout expansion;
+    standalone CR bytes and every other byte remain part of the identity.
+    """
+    canonical = source.replace(b"\r\n", b"\n")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def whl_rows(path: Path) -> list[dict]:
     if not path.is_file():
         raise SystemExit(f"{path} missing")
@@ -116,7 +127,7 @@ def main() -> None:
     source = Path(args.csv)
     source_bytes = source.read_bytes() if source.is_file() else b""
     rows = whl_rows(source)
-    index = build_index(rows, hashlib.sha256(source_bytes).hexdigest())
+    index = build_index(rows, canonical_source_sha256(source_bytes))
     payload = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     out = Path(args.out)

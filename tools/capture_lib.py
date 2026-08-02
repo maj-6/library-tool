@@ -31,6 +31,7 @@ if str(_SRC_ROOT) not in sys.path:
 from librarytool.engine.capture_archives import (  # noqa: E402
     AssociateCaptureArchiveCommand,
     CaptureArchiveAssociation,
+    CaptureArchiveAssociationPublisherPort,
     CaptureArchiveDisposition,
     CaptureArchiveMaterializerPort,
     CaptureArchiveService,
@@ -58,6 +59,7 @@ _MAX_DIAGNOSTIC_TEXT = 240
 _NUMBERED_IMAGE_RE = re.compile(r"^(orig|photo)_([1-9][0-9]*)\.jpg$")
 _BOOK_ID_RE = re.compile(r"^b-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _ASSET_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _WINDOWS_PATH_RE = re.compile(r"(?:^|[\s\"'(])[A-Za-z]:[\\/]")
 _ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
@@ -1610,6 +1612,24 @@ def _bounded_diagnostic_text(value: Any) -> str:
     return text[:_MAX_DIAGNOSTIC_TEXT]
 
 
+def _safe_engine_error_diagnostic(
+    error: EngineError,
+) -> dict[str, Any]:
+    cause_code = str(error.code or "")
+    if not _DIAGNOSTIC_CODE_RE.fullmatch(cause_code):
+        cause_code = "engine_error"
+    message = _bounded_diagnostic_text(error)
+    if not message or _looks_like_local_locator(message):
+        message = "capture cloud update failed"
+    return {
+        "status": "failed",
+        "code": "capture_cloud_update_failed",
+        "cause_code": cause_code,
+        "message": message,
+        "retryable": bool(error.retryable),
+    }
+
+
 def _diagnostic(
     *,
     capture_id: str,
@@ -1620,8 +1640,9 @@ def _diagnostic(
     changed: bool = False,
     book_id: str = "",
     association: Mapping[str, Any] | None = None,
+    cloud_update: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    diagnostic = {
         "capture_id": _bounded_diagnostic_text(capture_id),
         "entry_id": _bounded_diagnostic_text(entry_id),
         "status": status,
@@ -1631,6 +1652,35 @@ def _diagnostic(
         "book_id": _bounded_diagnostic_text(book_id),
         "association": dict(association) if association is not None else None,
     }
+    if cloud_update is not None:
+        detached_cloud_update = dict(cloud_update)
+        diagnostic["cloud_update"] = detached_cloud_update
+        diagnostic["local_status"] = status
+        diagnostic["overall_status"] = (
+            "failed"
+            if detached_cloud_update.get("status") == "failed"
+            else status
+        )
+    return diagnostic
+
+
+def _backfill_setup_diagnostic(error: Exception) -> dict[str, Any]:
+    code = (
+        str(error.code)
+        if isinstance(error, EngineError)
+        else "capture_backfill_setup_failed"
+    )
+    if not _DIAGNOSTIC_CODE_RE.fullmatch(code):
+        code = "capture_backfill_setup_failed"
+    message = _bounded_diagnostic_text(error)
+    if not message or _looks_like_local_locator(message):
+        message = "capture backfill setup failed"
+    return _diagnostic(
+        capture_id="",
+        status="failed",
+        code=code,
+        message=message,
+    )
 
 
 def _portable_capture_id(value: Any) -> str:
@@ -1920,6 +1970,9 @@ def backfill_capture_archives(
     legacy_identity_lookup: (
         Callable[[str], Mapping[str, Any] | None] | None
     ) = None,
+    association_publisher: (
+        CaptureArchiveAssociationPublisherPort | None
+    ) = None,
     apply: bool = False,
     diagnostic_limit: int = _MAX_BACKFILL_DIAGNOSTICS,
 ) -> dict[str, Any]:
@@ -1927,8 +1980,10 @@ def backfill_capture_archives(
 
     The scan is deterministic and independent per capture. Failures are
     reported and skipped, so a later apply resumes from every association that
-    already committed. The compatibility manual catalogue and capture assets
-    are read-only inputs.
+    already committed. An optional association publisher runs only after a
+    local archive is verified; it is retried for an already-associated capture
+    after a prior remote failure. The compatibility manual catalogue and
+    capture assets are read-only inputs.
     """
 
     if not isinstance(manual_entries, Mapping):
@@ -1945,6 +2000,17 @@ def backfill_capture_archives(
         legacy_identity_lookup
     ):
         raise TypeError("legacy_identity_lookup must be callable")
+    if (
+        association_publisher is not None
+        and not isinstance(
+            association_publisher,
+            CaptureArchiveAssociationPublisherPort,
+        )
+    ):
+        raise TypeError(
+            "association_publisher must implement "
+            "CaptureArchiveAssociationPublisherPort"
+        )
     if not isinstance(apply, bool):
         raise TypeError("apply must be boolean")
     if (
@@ -1997,6 +2063,10 @@ def backfill_capture_archives(
         "unchanged": 0,
         "failed": 0,
     }
+    cloud_counts = {
+        "succeeded": 0,
+        "failed": 0,
+    }
     omitted = 0
 
     def record(diagnostic: dict[str, Any]) -> None:
@@ -2007,6 +2077,32 @@ def backfill_capture_archives(
             diagnostics.append(diagnostic)
         else:
             omitted += 1
+
+    def publish_association(
+        association: CaptureArchiveAssociation,
+    ) -> dict[str, str] | None:
+        nonlocal cloud_counts
+        if not apply or association_publisher is None:
+            return None
+        try:
+            association_publisher.publish(association)
+        except EngineError as exc:
+            cloud_counts["failed"] += 1
+            return _safe_engine_error_diagnostic(exc)
+        except Exception as exc:
+            cloud_counts["failed"] += 1
+            return {
+                "status": "failed",
+                "code": "capture_cloud_update_failed",
+                "cause_code": "unexpected_publisher_error",
+                "message": type(exc).__name__,
+            }
+        cloud_counts["succeeded"] += 1
+        return {
+            "status": "succeeded",
+            "code": "capture_cloud_update_succeeded",
+            "message": "capture cloud association/status is current",
+        }
 
     for diagnostic in pending_diagnostics:
         record(diagnostic)
@@ -2028,6 +2124,7 @@ def backfill_capture_archives(
             )
             continue
         if existing is not None:
+            cloud_update = publish_association(existing)
             record(
                 _diagnostic(
                     capture_id=capture_id,
@@ -2037,6 +2134,7 @@ def backfill_capture_archives(
                     message="stable capture archive association already exists",
                     book_id=existing.book_id,
                     association=existing.as_dict(),
+                    cloud_update=cloud_update,
                 )
             )
             continue
@@ -2167,6 +2265,7 @@ def backfill_capture_archives(
             continue
 
         association = result.receipt.association
+        cloud_update = publish_association(association)
         changed = (
             not result.replayed
             and result.receipt.disposition is CaptureArchiveDisposition.CREATED
@@ -2189,23 +2288,32 @@ def backfill_capture_archives(
                 changed=changed,
                 book_id=association.book_id,
                 association=association.as_dict(),
+                cloud_update=cloud_update,
             )
         )
 
-    failed = counts.get("failed", 0)
+    local_failed = counts.get("failed", 0)
+    failed = local_failed + cloud_counts["failed"]
+    summary = {
+        "total": sum(counts.values()),
+        "created": counts.get("created", 0),
+        "would_create": counts.get("would_create", 0),
+        "unchanged": counts.get("unchanged", 0),
+        "failed": failed,
+        "omitted_diagnostics": omitted,
+    }
+    if apply and association_publisher is not None:
+        summary.update({
+            "local_failed": local_failed,
+            "cloud_succeeded": cloud_counts["succeeded"],
+            "cloud_failed": cloud_counts["failed"],
+        })
     return {
         "schema": "org.whl.capture-lib-backfill-report",
         "version": 1,
         "mode": "apply" if apply else "dry-run",
         "ok": failed == 0,
-        "summary": {
-            "total": sum(counts.values()),
-            "created": counts.get("created", 0),
-            "would_create": counts.get("would_create", 0),
-            "unchanged": counts.get("unchanged", 0),
-            "failed": failed,
-            "omitted_diagnostics": omitted,
-        },
+        "summary": summary,
         "diagnostics": diagnostics,
     }
 
@@ -2240,6 +2348,9 @@ def run_capture_archive_backfill(
     capture_root: str | Path,
     workspace_root: str | Path,
     format_module: Any,
+    association_publisher: (
+        CaptureArchiveAssociationPublisherPort | None
+    ) = None,
     apply: bool = False,
     diagnostic_limit: int = _MAX_BACKFILL_DIAGNOSTICS,
 ) -> dict[str, Any]:
@@ -2289,6 +2400,7 @@ def run_capture_archive_backfill(
                 capture_id,
             )
         ),
+        association_publisher=association_publisher,
         apply=apply,
         diagnostic_limit=diagnostic_limit,
     )
@@ -2362,16 +2474,7 @@ def main(argv: list[str] | None = None) -> int:
                 "omitted_diagnostics": 0,
             },
             "diagnostics": [
-                _diagnostic(
-                    capture_id="",
-                    status="failed",
-                    code=(
-                        str(exc.code)
-                        if isinstance(exc, EngineError)
-                        else "capture_backfill_setup_failed"
-                    ),
-                    message=str(exc) or type(exc).__name__,
-                )
+                _backfill_setup_diagnostic(exc)
             ],
         }
     print(

@@ -980,6 +980,19 @@ class CaptureArchiveMaterializerPort(Protocol):
 
 
 @runtime_checkable
+class CaptureArchiveAssociationPublisherPort(Protocol):
+    """Idempotently publish one already-verified capture association.
+
+    Publication is deliberately outside the local archive transaction.  A
+    caller may retry the same association after an ambiguous or failed remote
+    update, so implementations must treat an exact replay as success and must
+    not return until the remote association/status update is durable.
+    """
+
+    def publish(self, association: CaptureArchiveAssociation) -> None: ...
+
+
+@runtime_checkable
 class CaptureArchiveRepositoryPort(Protocol):
     def replay(
         self,
@@ -1183,6 +1196,7 @@ __all__ = [
     "CAPTURE_LIB_RECEIPT_VERSION",
     "AssociateCaptureArchiveCommand",
     "CaptureArchiveAssociation",
+    "CaptureArchiveAssociationPublisherPort",
     "CaptureArchiveDisposition",
     "CaptureArchiveMaterializerPort",
     "CaptureArchivePublication",

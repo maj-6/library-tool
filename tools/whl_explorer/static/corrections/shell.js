@@ -410,7 +410,9 @@
               if (typeof imageAdjustOptions.onProfileChange === "function") {
                 imageAdjustOptions.onProfileChange(value, detail);
               }
-              this.persistProfile();
+              this.persistProfile({
+                toolUpdates: { imageAdjust: value },
+              });
             },
             onOcrOutcome: (outcome, detail) => {
               if (typeof imageAdjustOptions.onOcrOutcome === "function") {
@@ -527,7 +529,12 @@
         this.unsubscribeClassificationBindings =
           this.classificationController.registry.subscribe((change) => {
             if (!this.restoringProfile && change.type === "remapped") {
-              this.persistProfile();
+              this.persistProfile({
+                toolUpdates: {
+                  classification: classificationProfile(
+                    this.classificationController),
+                },
+              });
             }
           });
       }
@@ -1105,11 +1112,18 @@
       });
     }
 
+    bindProfileSync() {
+      this.listen(this.windowRef, "storage", (event) => {
+        this.handleProfileStorageEvent(event);
+      });
+    }
+
     mount() {
       this.bindEditorSelector();
       this.bindLayoutReset();
       this.bindWindowControls();
       this.bindTrayTabs();
+      this.bindProfileSync();
       this.mountClassificationControls();
       this.listen(this.windowRef, "blur", () => {
         if (this.classificationController &&
@@ -1448,18 +1462,58 @@
       }
     }
 
-    persistProfile() {
+    handleProfileStorageEvent(event) {
+      if (!this.profileStore ||
+          typeof this.profileStore.matchesStorageEvent !== "function" ||
+          !this.profileStore.matchesStorageEvent(this.profileKey, event)) {
+        return false;
+      }
+      const profile = this.profileStore.load(this.profileKey);
+      if (this.imageAdjustTool &&
+          typeof this.imageAdjustTool.restoreProfile === "function") {
+        this.imageAdjustTool.restoreProfile(
+          profile.tools && profile.tools.imageAdjust);
+      }
+      return true;
+    }
+
+    persistProfile(options = {}) {
       if (!this.layout || !this.editorRegistry) return;
+      const currentTools = {
+        imageAdjust: this.imageAdjustTool &&
+            typeof this.imageAdjustTool.serializeProfile === "function"
+          ? this.imageAdjustTool.serializeProfile()
+          : {},
+        classification: classificationProfile(this.classificationController),
+      };
+      let tools = currentTools;
+      if (this.profileStore && typeof this.profileStore.load === "function") {
+        const latest = this.profileStore.load(this.profileKey);
+        if (latest.found && isPlainObject(latest.tools)) {
+          tools = { ...latest.tools };
+        }
+      }
+      const toolUpdates = isPlainObject(options.toolUpdates)
+        ? options.toolUpdates : {};
+      if (this.profileStore &&
+          typeof this.profileStore.saveTool === "function") {
+        for (const [toolName, value] of Object.entries(toolUpdates)) {
+          this.profileStore.saveTool(this.profileKey, toolName, value);
+        }
+      }
       this.profileStore.save(this.profileKey, {
         layout: this.layout.getState(),
         editors: this.editorRegistry.serializeChoices(),
-        tools: {
-          imageAdjust: this.imageAdjustTool &&
-              typeof this.imageAdjustTool.serializeProfile === "function"
-            ? this.imageAdjustTool.serializeProfile()
-            : {},
-          classification: classificationProfile(this.classificationController),
-        },
+        // Tool profile fields are durable preferences with independent write
+        // triggers. Merge the latest stored tool document so a layout save in
+        // another Corrections window cannot roll back a successfully committed
+        // Image Adjust brightness (or a keymap remap).
+        tools: { ...tools, ...toolUpdates },
+      }, {
+        // Explicit tool updates were written to independent per-tool sidecars
+        // above. Presentation-only saves must not rewrite another window's
+        // concurrently committed tool preference.
+        writeTools: false,
       });
       this.updateProfileLabel();
     }

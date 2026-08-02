@@ -36,7 +36,7 @@ class WhlIndexTest {
 
         val source = File("../../../whl_catalog.csv")
         assertTrue("tracked whl_catalog.csv is missing", source.isFile)
-        assertEquals(sha256(source), bundled.sourceSha256)
+        assertEquals(canonicalSourceSha256(source.readBytes()), bundled.sourceSha256)
 
         val match = bundled.match("A modern herbal", "M. Grieve")
         assertEquals(WhlCatalogFlag.YES, match.flag)
@@ -105,6 +105,19 @@ class WhlIndexTest {
         assertNull(empty.candidate)
     }
 
+    @Test
+    fun sourceFingerprintIgnoresOnlyLineEndingDifferences() {
+        val lf = "Title,Authors\nHerbal,Ada\n".toByteArray()
+        val crlf = "Title,Authors\r\nHerbal,Ada\r\n".toByteArray()
+        val bareCr = "Title,Authors\nHerbal,Ad\ra\n".toByteArray()
+        val changed = "Title,Authors\nHerbal,Grace\n".toByteArray()
+
+        val expected = canonicalSourceSha256(lf)
+        assertEquals(expected, canonicalSourceSha256(crlf))
+        assertTrue(expected != canonicalSourceSha256(bareCr))
+        assertTrue(expected != canonicalSourceSha256(changed))
+    }
+
     private data class Row(
         val title: String,
         val author: String,
@@ -168,14 +181,24 @@ class WhlIndexTest {
         return WhlIndex.parse(root.toString())
     }
 
-    private fun sha256(file: File): String {
+    private fun canonicalSourceSha256(source: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
+        var index = 0
+        while (index < source.size) {
+            if (source[index] == '\r'.code.toByte()) {
+                if (
+                    index + 1 < source.size &&
+                    source[index + 1] == '\n'.code.toByte()
+                ) {
+                    digest.update('\n'.code.toByte())
+                    index += 2
+                } else {
+                    digest.update(source[index])
+                    index += 1
+                }
+            } else {
+                digest.update(source[index])
+                index += 1
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }

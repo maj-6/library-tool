@@ -559,6 +559,20 @@ missing or corrupt assets produce a bounded diagnostic and processing
 continues, so a later apply resumes failed rows while already-associated rows
 remain unchanged.
 
+An embedding host may provide an idempotent association publisher for the
+cloud association/status acknowledgement. The backfill calls it only after the
+local archive object and association have been committed and verified. A
+publisher failure is reported separately from the successful local archive;
+the next apply detects the existing association and retries that remote phase
+without resealing or replacing originals. Dry-run and failed archive
+transactions never invoke the publisher. When a publisher is present,
+per-capture diagnostics retain the local `status` and add `local_status`,
+`overall_status`, and a nested `cloud_update`. Summary `failed` is the
+aggregate local-plus-cloud failure count, while `local_failed` and
+`cloud_failed` preserve the two phase outcomes. This lets version 1 consumers
+continue treating nonzero `failed` as an unsuccessful run without hiding a
+successfully committed local archive.
+
 Normal intake derives `book_id` from the capture identity only when no prior
 identity exists. Intake and backfill first inspect any build already linked to
 the exact capture id: a persisted `entries/<build>/ocr/lib-id.json` wins, and a
@@ -569,5 +583,6 @@ idempotency fingerprint, and preserves it in the archive and association.
 Conflicting prior identities fail closed. Capture ids are validated verbatim;
 an invalid id is rejected rather than stripped into another capture's id. The
 command never edits the manual catalogue, deletes or replaces capture
-originals, exposes a local path in diagnostics, or advances a cloud
-status/association.
+originals, or exposes a local path in diagnostics. The standalone CLI remains
+local/offline; only an embedding host that explicitly supplies the publisher
+can advance a cloud status/association.
