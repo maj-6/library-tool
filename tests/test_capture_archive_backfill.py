@@ -10,6 +10,7 @@ from pathlib import Path
 
 import capture_lib
 import libformat
+import pytest
 from PIL import Image
 from librarytool.adapters.capture_lib import Lib3CaptureArchiveMaterializer
 from librarytool.adapters.filesystem.capture_archive_repository import (
@@ -304,6 +305,81 @@ def test_cloud_update_is_not_called_for_dry_run_or_archive_failure(tmp_path):
     assert failed["summary"]["cloud_failed"] == 0
     assert publisher.calls == []
     assert service.get(capture_id) is None
+
+
+def test_embedding_scope_backfills_local_ids_and_publishes_only_authorized(
+    tmp_path,
+):
+    cloud_id = str(uuid.uuid4())
+    local_id = "lan-local-capture"
+    unrelated_id = "unrelated-capture"
+    captures = tmp_path / "captures"
+    for capture_id in (cloud_id, local_id, unrelated_id):
+        _assets(captures, capture_id)
+    entries = {
+        "manual-cloud": _entry(cloud_id),
+        "manual-local": _entry(local_id),
+        "manual-unrelated": _entry(unrelated_id),
+    }
+    workspace = tmp_path / "workspace"
+    service, materializer, _write_set = _runtime(workspace)
+    publisher = _ResumableAssociationPublisher()
+
+    report = capture_lib.backfill_capture_archives(
+        entries,
+        captures,
+        service=service,
+        materializer=materializer,
+        association_publisher=publisher,
+        capture_ids=(cloud_id, local_id),
+        publication_capture_ids=(cloud_id,),
+        apply=True,
+    )
+
+    by_capture = {
+        diagnostic["capture_id"]: diagnostic
+        for diagnostic in report["diagnostics"]
+    }
+    assert report["ok"] is True
+    assert report["summary"] == {
+        "total": 2,
+        "created": 2,
+        "would_create": 0,
+        "unchanged": 0,
+        "failed": 0,
+        "omitted_diagnostics": 0,
+        "local_failed": 0,
+        "cloud_succeeded": 1,
+        "cloud_failed": 0,
+    }
+    assert [call["capture_id"] for call in publisher.calls] == [cloud_id]
+    assert by_capture[cloud_id]["cloud_update"]["status"] == "succeeded"
+    assert "cloud_update" not in by_capture[local_id]
+    assert service.get(cloud_id) is not None
+    assert service.get(local_id) is not None
+    assert service.get(unrelated_id) is None
+
+
+def test_embedding_publication_scope_must_be_inside_local_scope(tmp_path):
+    capture_id = "selected-capture"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    service, materializer, _write_set = _runtime(tmp_path / "workspace")
+
+    with pytest.raises(
+        ValueError,
+        match="publication_capture_ids must be a subset",
+    ):
+        capture_lib.backfill_capture_archives(
+            {"manual-selected": _entry(capture_id)},
+            captures,
+            service=service,
+            materializer=materializer,
+            association_publisher=_ResumableAssociationPublisher(),
+            capture_ids=(capture_id,),
+            publication_capture_ids=("another-capture",),
+            apply=True,
+        )
 
 
 def test_cloud_engine_failure_retains_safe_code_and_retryability(tmp_path):
@@ -756,3 +832,40 @@ def test_cli_quarantines_private_setup_failure_details(monkeypatch, capsys):
     )
     assert "private" not in output.out
     assert "token" not in output.out
+
+
+def test_cli_never_composes_host_scope_or_cloud_publisher(monkeypatch, capsys):
+    observed = {}
+
+    def inspect_backfill(**kwargs):
+        observed.update(kwargs)
+        return {
+            "schema": "org.whl.capture-lib-backfill-report",
+            "version": 1,
+            "mode": "apply",
+            "ok": True,
+            "summary": {
+                "total": 0,
+                "created": 0,
+                "would_create": 0,
+                "unchanged": 0,
+                "failed": 0,
+                "omitted_diagnostics": 0,
+            },
+            "diagnostics": [],
+        }
+
+    monkeypatch.setattr(
+        capture_lib,
+        "run_capture_archive_backfill",
+        inspect_backfill,
+    )
+
+    result = capture_lib.main(["--apply"])
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert observed["apply"] is True
+    assert "association_publisher" not in observed
+    assert "capture_ids" not in observed
+    assert "publication_capture_ids" not in observed

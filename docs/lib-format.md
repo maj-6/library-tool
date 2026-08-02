@@ -586,3 +586,32 @@ command never edits the manual catalogue, deletes or replaces capture
 originals, or exposes a local path in diagnostics. The standalone CLI remains
 local/offline; only an embedding host that explicitly supplies the publisher
 can advance a cloud status/association.
+
+The desktop host exposes that credentialed composition only through
+`POST /api/v1/capture-archive-backfills`. The JSON request must name between
+one and 64 exact capture IDs; dry-run remains the default and a write requires
+a literal `"apply": true`. This route is separate from routine cloud autosync,
+so startup or interval sync can never trigger an unbounded legacy rewrite. In
+the packaged desktop it is protected by the exact-origin and per-process
+desktop-capability checks used by every `/api/` route, and it accepts only a
+small, unencoded JSON body.
+
+For apply requests the host first asks the signed-in user's RLS scope which of
+the named UUID capture rows are visible. It then runs the local archive
+backfill for every requested local capture, but supplies
+`ScopedCaptureLibAssociationPublisher` only for that returned subset. A LAN or
+otherwise local-only capture therefore succeeds locally without a cloud write
+or a cloud-failure diagnostic. Each eligible cloud update still occurs only
+after its local archive association verifies. The service credential and user
+session are borrowed only for that bounded request and are cleared before the
+response is returned.
+
+The response is an `org.whl.capture-lib-backfill-host-result` version 1 JSON
+document. `report` is the ordinary machine-readable backfill report; `scope`
+records the bounded request, and `cloud` distinguishes dry-run, missing
+credentials, completed publication, scoped-discovery failure, and per-row
+publication failure without including credentials or provider error bodies.
+The outer `ok` covers both the local report and any requested cloud phase. A
+cloud discovery outage may therefore return outer `ok: false` alongside a
+successful local `report`, making the durable local result and the retryable
+remote phase independently observable.
