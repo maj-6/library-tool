@@ -1428,6 +1428,77 @@ def test_corrections_index_includes_books_and_capture_entries_only():
     }
 
 
+def test_corrections_index_projects_capture_import_timestamps():
+    reviews = _ReviewService(_review_with_history(0, "review-clear-r1"))
+    rows = (
+        _raster(
+            "capture:asset-1:display",
+            extensions={
+                "capture_order": 0,
+                "imported_at": "2026-07-28T09:00:00+00:00",
+            },
+        ),
+        _raster(
+            "capture:asset-2:display",
+            extensions={
+                "capture_order": 1,
+                "imported_at": "2026-07-30T10:15:00Z",
+            },
+        ),
+        _raster(
+            "capture:asset-3:display",
+            extensions={"capture_order": 2},
+        ),
+        _raster(
+            "capture:asset-4:display",
+            extensions={"capture_order": 3, "imported_at": "not a timestamp"},
+        ),
+    )
+    engine = _Engine(
+        _RasterProjector(rows),
+        _SpatialProjector(()),
+        reviews,
+        items=_ItemService((_book_item("book-1", "Captured Herbal"),)),
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    book = response.get_json()["books"][0]
+    assert [
+        capture["imported_at"] for capture in book["captures"]
+    ] == [
+        "2026-07-28T09:00:00+00:00",
+        "2026-07-30T10:15:00Z",
+        "",
+        "",
+    ]
+    assert book["latest_imported_at"] == "2026-07-30T10:15:00Z"
+
+
+def test_corrections_index_tolerates_imports_without_timestamps():
+    reviews = _ReviewService(_review_with_history(0, "review-clear-r1"))
+    engine = _Engine(
+        _RasterProjector(
+            (_raster("capture-only", extensions={"capture_order": 0}),)
+        ),
+        _SpatialProjector(()),
+        reviews,
+        items=_ItemService((_book_item("book-1", "Older Import"),)),
+    )
+
+    response = _app(engine).test_client().get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    book = response.get_json()["books"][0]
+    assert book["captures"][0]["imported_at"] == ""
+    assert book["latest_imported_at"] == ""
+
+
 def test_review_actor_is_server_owned_and_client_spoofing_is_rejected(
     tmp_path,
 ):

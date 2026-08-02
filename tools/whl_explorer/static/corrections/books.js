@@ -140,6 +140,18 @@
     return result;
   }
 
+  // Older desktop imports predate desktop_import.imported_at, so this field
+  // is optional and empty means "import time unknown". The engine passes
+  // through any timestamp its own Python parser accepted — ISO 8601 forms
+  // Date.parse cannot read (comma fractions, basic format) arrive verbatim —
+  // so an unparseable value degrades to "" the same way the engine degrades
+  // its own parse failures, instead of failing the whole index.
+  function normalizeImportTimestamp(value, path) {
+    if (value == null) return "";
+    const result = safeText(value, path, 64);
+    return Number.isFinite(Date.parse(result)) ? result : "";
+  }
+
   function freezeDeep(value) {
     if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
     for (const entry of Object.values(value)) freezeDeep(entry);
@@ -316,7 +328,7 @@
     exactObject(value, path, [
       "artifact_id", "revision", "capture_order", "label", "representation_id",
       "canvas_id", "effective_category", "resource_state", "import_state",
-      "freshness", "thumbnail",
+      "freshness", "imported_at", "thumbnail",
     ], [
       "artifact_id", "revision", "capture_order", "label", "effective_category",
       "resource_state", "import_state", "freshness", "thumbnail",
@@ -333,6 +345,8 @@
       import_state: enumValue(
         value.import_state, `${path}.import_state`, IMPORT_STATES),
       freshness: enumValue(value.freshness, `${path}.freshness`, FRESHNESS_STATES),
+      imported_at: normalizeImportTimestamp(
+        value.imported_at, `${path}.imported_at`),
       thumbnail: normalizeThumbnail(value.thumbnail, `${path}.thumbnail`),
     };
     for (const field of ["representation_id", "canvas_id"]) {
@@ -361,6 +375,9 @@
   function normalizeBook(value, path) {
     exactObject(value, path, [
       "id", "revision", "kind", "title", "import_state", "issues", "review",
+      "captures", "latest_imported_at",
+    ], [
+      "id", "revision", "kind", "title", "import_state", "issues", "review",
       "captures",
     ]);
     const captures = boundedArray(value.captures, `${path}.captures`, 100_000)
@@ -386,6 +403,8 @@
       issues: freezeDeep(issues),
       review: normalizeReviewSummary(value.review, `${path}.review`),
       captures: freezeDeep(captures),
+      latest_imported_at: normalizeImportTimestamp(
+        value.latest_imported_at, `${path}.latest_imported_at`),
     });
   }
 
@@ -522,6 +541,59 @@
       .map((entry) => entry.target.item_id));
     return [...index.books].sort((left, right) =>
       compareBooks(left, right, attentionIds));
+  }
+
+  const BOOKS_PANEL_VIEWS = Object.freeze(["all", "captures", "attention"]);
+
+  function importedAtTime(value) {
+    if (!value) return NaN;
+    const time = Date.parse(value);
+    return Number.isFinite(time) ? time : NaN;
+  }
+
+  function latestImportedAt(book) {
+    let latest = book.latest_imported_at || "";
+    let latestTime = importedAtTime(latest);
+    for (const capture of book.captures) {
+      const time = importedAtTime(capture.imported_at || "");
+      if (!Number.isFinite(time)) continue;
+      if (!Number.isFinite(latestTime) || time > latestTime ||
+          (time === latestTime &&
+            comparePortable(latest, capture.imported_at) < 0)) {
+        latest = capture.imported_at;
+        latestTime = time;
+      }
+    }
+    return Number.isFinite(latestTime) ? latest : "";
+  }
+
+  function compareCaptureBooks(left, right) {
+    const leftTime = importedAtTime(latestImportedAt(left));
+    const rightTime = importedAtTime(latestImportedAt(right));
+    const leftKnown = Number.isFinite(leftTime);
+    if (leftKnown !== Number.isFinite(rightTime)) return leftKnown ? -1 : 1;
+    if (leftKnown && leftTime !== rightTime) return rightTime - leftTime;
+    return comparePortable(stableTitleKey(left.title), stableTitleKey(right.title)) ||
+      comparePortable(left.id, right.id);
+  }
+
+  function captureBooks(index) {
+    if (!index) return [];
+    return index.books
+      .filter((book) => book.captures.length > 0)
+      .sort(compareCaptureBooks);
+  }
+
+  function attentionBooks(index) {
+    if (!index) return [];
+    return sortedBooks(index).filter((book) =>
+      bookNeedsAttention(book, index.attention));
+  }
+
+  function booksForView(index, view) {
+    if (view === "captures") return captureBooks(index);
+    if (view === "attention") return attentionBooks(index);
+    return sortedBooks(index);
   }
 
   function selectionAddressFromTarget(target) {
@@ -1085,6 +1157,11 @@
       this.onStatus = typeof options.onStatus === "function"
         ? options.onStatus : () => {};
       this.filter = "";
+      this.view = "all";
+      this.viewControls = null;
+      this.navControls = null;
+      this.lastViewReference = null;
+      this.pendingStepFocus = null;
       this.unsubscribe = null;
       this.listeners = [];
       this.rowListeners = [];
@@ -1119,8 +1196,65 @@
         this.filter = "";
         this.render(this.store.snapshot());
       });
+      this.mountViewControls();
       this.unsubscribe = this.store.subscribe((snapshot) => this.render(snapshot));
       return this;
+    }
+
+    // The Books markup predates the view control, so the panel builds its own
+    // toolbar row directly above the list.
+    mountViewControls() {
+      if (this.viewControls) return;
+      const list = this.root.querySelector("[data-books-list]");
+      const host = list && list.parentNode;
+      if (!host || typeof host.insertBefore !== "function" ||
+          !this.documentRef) return;
+      const bar = element(this.documentRef, "div", "books-view-bar");
+      // The bar sits beside [data-books-list], outside every surface the
+      // shell keymap accepts; its own hook keeps j/k alive after a click on
+      // the view or prev/next buttons.
+      if (bar.dataset) bar.dataset.booksViewBar = "";
+      const group = element(this.documentRef, "div", "books-view-switch");
+      setAttribute(group, "role", "group");
+      setAttribute(group, "aria-label", "Books view");
+      this.viewControls = new Map();
+      for (const [view, label] of [
+        ["all", "All"], ["captures", "Captures"], ["attention", "Attention"],
+      ]) {
+        const button = element(this.documentRef, "button", "books-view-option");
+        button.type = "button";
+        if (button.dataset) button.dataset.booksView = view;
+        const count = element(this.documentRef, "span", "books-view-count", "0");
+        setAttribute(count, "aria-hidden", "true");
+        button.append(element(this.documentRef, "span", "", label), count);
+        this.listen(button, "click", () => this.setView(view));
+        this.viewControls.set(view, Object.freeze({ button, count }));
+        group.append(button);
+      }
+      const nav = element(this.documentRef, "div", "books-view-nav");
+      this.navControls = new Map();
+      for (const [direction, name, glyph, label] of [
+        [-1, "previous", "‹", "Select the previous item"],
+        [1, "next", "›", "Select the next item"],
+      ]) {
+        const button = element(this.documentRef, "button",
+          "books-nav-button", glyph);
+        button.type = "button";
+        if (button.dataset) button.dataset.booksNav = name;
+        setAttribute(button, "aria-label", label);
+        this.listen(button, "click", () => this.stepSelection(direction));
+        this.navControls.set(direction, button);
+        nav.append(button);
+      }
+      bar.append(group, nav);
+      host.insertBefore(bar, list);
+    }
+
+    setView(view) {
+      if (!BOOKS_PANEL_VIEWS.includes(view) || view === this.view) return this.view;
+      this.view = view;
+      this.render(this.store.snapshot());
+      return this.view;
     }
 
     setSelection(address, options = {}) {
@@ -1152,11 +1286,98 @@
     visibleBooks(snapshot) {
       if (!snapshot.index) return [];
       const query = stableTitleKey(this.filter.trim());
-      return sortedBooks(snapshot.index).filter((book) => {
+      return booksForView(snapshot.index, this.view).filter((book) => {
         if (!query) return true;
         return stableTitleKey(book.title).includes(query) ||
           stableTitleKey(book.id).includes(query);
       });
+    }
+
+    viewOrderKey() {
+      return `${this.view}:${stableTitleKey(this.filter.trim())}`;
+    }
+
+    rememberSelectionIndex(snapshot, books) {
+      const selection = snapshot.selection;
+      const index = selection && selection.itemId
+        ? books.findIndex((book) => book.id === selection.itemId) : -1;
+      if (index >= 0) {
+        this.lastViewReference = Object.freeze({
+          key: this.viewOrderKey(),
+          index,
+        });
+      } else if (this.lastViewReference &&
+          this.lastViewReference.key !== this.viewOrderKey()) {
+        this.lastViewReference = null;
+      }
+    }
+
+    stepTarget(direction) {
+      const snapshot = this.store.snapshot();
+      const books = this.visibleBooks(snapshot);
+      if (!books.length) return null;
+      const selection = snapshot.selection;
+      const currentIndex = selection && selection.itemId
+        ? books.findIndex((book) => book.id === selection.itemId) : -1;
+      if (currentIndex >= 0) return books[currentIndex + direction] || null;
+      const reference = this.lastViewReference &&
+        this.lastViewReference.key === this.viewOrderKey()
+        ? this.lastViewReference.index : null;
+      if (selection && selection.itemId && reference !== null) {
+        // The selected item left this view (for example it was resolved while
+        // in the Attention view): next takes the row now holding its slot,
+        // previous takes the row before that slot. A remembered slot beyond a
+        // since-shrunken view clamps to just past the end, so previous can
+        // still reach the last remaining row instead of going dead.
+        const anchor = Math.min(reference, books.length);
+        const slot = direction > 0
+          ? Math.min(anchor, books.length - 1)
+          : anchor - 1;
+        return slot >= 0 && slot < books.length ? books[slot] : null;
+      }
+      return direction > 0 ? books[0] : books[books.length - 1];
+    }
+
+    canStepSelection(direction) {
+      return this.stepTarget(direction) !== null;
+    }
+
+    stepSelection(direction) {
+      const book = this.stepTarget(direction);
+      if (!book) return null;
+      // Focus follows the step: navigation rebuilds this list (and may
+      // replace the editor), which drops DOM focus onto the document body —
+      // outside every keymap surface — so without a restored focus target
+      // the next j/k would never reach the shell.
+      this.pendingStepFocus = book.id;
+      // Stepping is the fix-page → next-page loop: land on the item's first
+      // capture so its photo opens immediately. Items without captures keep
+      // the bare book address.
+      const capture = book.captures[0];
+      if (capture) this.navigate(captureAddress(book, capture), "image");
+      else this.navigate(bookAddress(book), "book");
+      return book;
+    }
+
+    renderViewControls(snapshot) {
+      if (this.viewControls) {
+        const index = snapshot.index;
+        const counts = {
+          all: index ? index.books.length : 0,
+          captures: index ? captureBooks(index).length : 0,
+          attention: index ? attentionBooks(index).length : 0,
+        };
+        for (const [view, control] of this.viewControls) {
+          setAttribute(control.button, "aria-pressed",
+            view === this.view ? "true" : "false");
+          control.count.textContent = String(counts[view]);
+        }
+      }
+      if (this.navControls) {
+        for (const [direction, button] of this.navControls) {
+          button.disabled = !this.canStepSelection(direction);
+        }
+      }
     }
 
     focusedCapture(list) {
@@ -1187,20 +1408,53 @@
         }) || null;
     }
 
-    restoreCaptureFocus(list, capture) {
-      const button = this.captureElement(list, capture);
-      if (button && typeof button.focus === "function") {
-        try {
-          button.focus({ preventScroll: true });
-        } catch (error) {
-          button.focus();
-        }
+    focusedBook(list) {
+      const active = this.documentRef && this.documentRef.activeElement;
+      if (!active || !nodeInside(list, active)) return null;
+      let owner = active;
+      while (owner && owner !== list) {
+        const dataset = owner.dataset || {};
+        if (dataset.bookSelect) return dataset.bookSelect;
+        owner = owner.parentNode;
       }
+      return null;
+    }
+
+    bookElement(list, itemId) {
+      if (!itemId || !list ||
+          typeof list.querySelectorAll !== "function") return null;
+      return Array.from(list.querySelectorAll("[data-book-select]"))
+        .find((candidate) =>
+          (candidate.dataset || {}).bookSelect === itemId) || null;
+    }
+
+    restoreButtonFocus(button) {
+      if (!button || typeof button.focus !== "function") return;
+      try {
+        button.focus({ preventScroll: true });
+      } catch (error) {
+        button.focus();
+      }
+    }
+
+    restoreCaptureFocus(list, capture) {
+      this.restoreButtonFocus(this.captureElement(list, capture));
+    }
+
+    restoreBookFocus(list, itemId) {
+      this.restoreButtonFocus(this.bookElement(list, itemId));
     }
 
     render(snapshot) {
       const list = this.root.querySelector("[data-books-list]");
-      const focusedCapture = this.focusedCapture(list);
+      // A step owns the next rebuild's focus; otherwise the rebuild only
+      // preserves whichever row or capture button already held it, so
+      // renders that were not caused by a step never steal focus.
+      const stepFocus = this.pendingStepFocus;
+      this.pendingStepFocus = null;
+      const focusedCapture = stepFocus ? null : this.focusedCapture(list);
+      const focusedBook = stepFocus ||
+        (focusedCapture ? null : this.focusedBook(list));
       for (const remove of this.rowListeners.splice(0)) remove();
       // Replacing rows under a stationary pointer fires no pointerleave, so
       // an active hover contribution must be withdrawn before its row goes.
@@ -1211,6 +1465,8 @@
       const count = this.root.querySelector("[data-books-count]");
       if (!list || !this.documentRef) return;
       const books = this.visibleBooks(snapshot);
+      this.rememberSelectionIndex(snapshot, books);
+      this.renderViewControls(snapshot);
       if (count) count.textContent = snapshot.index ? String(snapshot.index.books.length) : "0";
       setAttribute(list, "aria-busy", snapshot.status === "loading" ? "true" : "false");
       if (snapshot.status === "loading" && snapshot.index) {
@@ -1249,12 +1505,21 @@
         return;
       }
       if (!books.length) {
-        list.append(this.messageRow("No matches",
-          `No books match “${this.filter.trim().slice(0, 120)}”.`));
+        if (this.filter.trim()) {
+          list.append(this.messageRow("No matches",
+            `No books match “${this.filter.trim().slice(0, 120)}”.`));
+        } else if (this.view === "captures") {
+          list.append(this.messageRow("No captures",
+            "No items have synced phone captures."));
+        } else {
+          list.append(this.messageRow("Nothing needs attention",
+            "No items are marked for attention."));
+        }
         return;
       }
       for (const book of books) list.append(this.renderBook(book, snapshot));
       this.restoreCaptureFocus(list, focusedCapture);
+      this.restoreBookFocus(list, focusedBook);
     }
 
     renderMessage(list, title, message, error = false) {
@@ -1280,6 +1545,7 @@
       row.dataset && (row.dataset.bookId = book.id);
       const select = element(this.documentRef, "button", "book-select");
       select.type = "button";
+      select.dataset && (select.dataset.bookSelect = book.id);
       const title = book.title.trim() || `Untitled (${book.id})`;
       const selected = snapshot.selection &&
         snapshot.selection.itemId === book.id && !snapshot.selection.artifactId &&
@@ -1419,6 +1685,7 @@
   }
 
   return {
+    BOOKS_PANEL_VIEWS,
     CATEGORY_PRESENTATION,
     CORRECTIONS_INDEX_CHANGE_SCHEMA,
     CORRECTIONS_INDEX_SCHEMA,
@@ -1429,12 +1696,17 @@
     CorrectionsIndexStore,
     CorrectionsReviewConflictError,
     addressEqual,
+    attentionBooks,
     bookAddress,
     bookNeedsAttention,
+    booksForView,
     captureAddress,
+    captureBooks,
     captureCommandTarget,
     captureState,
     compareBooks,
+    compareCaptureBooks,
+    latestImportedAt,
     normalizeAttentionEntry,
     normalizeCorrectionsIndex,
     normalizeIndexChange,

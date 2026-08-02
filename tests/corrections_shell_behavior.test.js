@@ -26,6 +26,7 @@ const {
 const {
   CorrectionCommandRegistry,
   DEFAULT_CLASSIFICATION_COMMANDS,
+  normalizeKeyBinding,
 } = require("../tools/whl_explorer/static/corrections/commands");
 const {
   DEFAULT_LAYOUT,
@@ -39,6 +40,7 @@ const {
   resizeLayoutState,
 } = require("../tools/whl_explorer/static/corrections/layout-controller");
 const {
+  BOOKS_NAVIGATION_COMMANDS,
   CONTEXT_SCHEMA,
   CorrectionsShell,
   CorrectionsWindowState,
@@ -2051,6 +2053,117 @@ test("the shell wires the CH panel to selection, metadata saves, and refreshes",
   assert.equal(shell.chPanelFeature, null);
   assert.equal(chHost.children.length, 0,
     "destroy releases the CH panel's DOM");
+});
+
+
+test("Books navigation commands register on j/k without classification conflicts",
+  async () => {
+    const registry = new CorrectionCommandRegistry();
+    for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+      registry.register({ ...command, execute: async () => null });
+    }
+    const shell = Object.create(CorrectionsShell.prototype);
+    const steps = [];
+    shell.classificationController = { registry };
+    shell.booksFeature = { books: {
+      stepSelection(direction) {
+        steps.push(direction);
+        return { id: "book-1" };
+      },
+      canStepSelection(direction) { return direction === 1; },
+    } };
+    shell.registerBooksNavigationCommands();
+
+    for (const command of BOOKS_NAVIGATION_COMMANDS) {
+      assert.equal(normalizeKeyBinding(command.defaultBinding),
+        command.defaultBinding,
+        "navigation bindings must satisfy the binding grammar");
+      assert.ok(!DEFAULT_CLASSIFICATION_COMMANDS.some((candidate) =>
+        candidate.defaultBinding === command.defaultBinding),
+      "navigation bindings must not shadow classification defaults");
+    }
+    assert.equal(registry.bindingFor("corrections.books.next-item"), "j");
+    assert.equal(registry.bindingFor("corrections.books.previous-item"), "k");
+    assert.equal(
+      registry.commandForBinding("j").id, "corrections.books.next-item");
+    assert.equal(
+      registry.commandForBinding("k").id, "corrections.books.previous-item");
+    for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+      assert.deepEqual(
+        [...registry.conflicts(command.defaultBinding, command.id)], []);
+    }
+    assert.equal(registry.canInvoke("corrections.books.next-item", {}), true);
+    assert.equal(
+      registry.canInvoke("corrections.books.previous-item", {}), false,
+      "previous stays unavailable when the panel has nothing before");
+    await registry.invoke("corrections.books.next-item", {});
+    assert.deepEqual(steps, [1]);
+
+    shell.registerBooksNavigationCommands();
+    assert.equal(registry.bindingFor("corrections.books.next-item"), "j",
+      "re-registration is idempotent");
+  });
+
+
+test("stored classification remaps cannot claim the Books navigation keys", () => {
+  const registry = new CorrectionCommandRegistry();
+  for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+    registry.register({ ...command, execute: async () => null });
+  }
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.classificationController = { registry };
+  shell.booksFeature = { books: {
+    stepSelection: () => null,
+    canStepSelection: () => false,
+  } };
+  shell.restoringProfile = false;
+  shell.registerBooksNavigationCommands();
+  shell.restoreClassificationProfile({
+    bindings: { "corrections.category.cover": "j" },
+  });
+  assert.equal(registry.bindingFor("corrections.category.cover"), "",
+    "a stored remap that collides with a navigation key is dropped");
+  assert.equal(registry.bindingFor("corrections.books.next-item"), "j");
+  assert.equal(registry.bindingFor("corrections.category.spine"), "s",
+    "unrelated classification bindings restore normally");
+});
+
+
+test("Books navigation hotkeys stay scoped to the browsable surfaces", () => {
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.root = { dataset: {} };
+  const navCommand = {
+    id: "corrections.books.next-item",
+    targetKind: "books-item",
+  };
+  const overlayTarget = {
+    key: "annotation:region-1",
+    objectType: "spatial-annotation",
+    itemId: "book-1",
+    id: "region-1",
+    revision: "region-r1",
+  };
+  const outside = {
+    dataset: { reviewAction: "resolve" },
+    parentNode: { dataset: { trayPanel: "reviews" }, parentNode: shell.root },
+  };
+  const booksList = { dataset: { booksList: "" }, parentNode: shell.root };
+  const artifactsTree = { dataset: { artifactsTree: "" }, parentNode: shell.root };
+  const editorHost = { dataset: { editorHost: "" }, parentNode: shell.root };
+  const booksViewBar = { dataset: { booksViewBar: "" }, parentNode: shell.root };
+  const viewBarButton = { dataset: { booksNav: "next" }, parentNode: booksViewBar };
+  assert.equal(shell.classificationEventEligible(
+    { target: outside }, navCommand, { softTarget: overlayTarget }), false,
+  "a hovered region cannot route navigation keys from outside the surfaces");
+  assert.equal(shell.classificationEventEligible(
+    { target: booksList }, navCommand, {}), true);
+  assert.equal(shell.classificationEventEligible(
+    { target: artifactsTree }, navCommand, {}), true);
+  assert.equal(shell.classificationEventEligible(
+    { target: editorHost }, navCommand, {}), true);
+  assert.equal(shell.classificationEventEligible(
+    { target: viewBarButton }, navCommand, {}), true,
+  "the Books view bar (view + prev/next buttons) is a browsable surface");
 });
 
 

@@ -9,7 +9,11 @@ const {
   CORRECTIONS_INDEX_SCHEMA,
   CorrectionsContractError,
   CorrectionsIndexStore,
+  attentionBooks,
   bookNeedsAttention,
+  booksForView,
+  captureBooks,
+  latestImportedAt,
   normalizeCorrectionsIndex,
   sortedBooks,
 } = require("../tools/whl_explorer/static/corrections/books");
@@ -119,6 +123,13 @@ class MiniNode {
       this.children.push(node);
     }
   }
+  insertBefore(node, reference) {
+    const index = reference ? this.children.indexOf(reference) : -1;
+    node.parentNode = this;
+    if (index < 0) this.children.push(node);
+    else this.children.splice(index, 0, node);
+    return node;
+  }
   replaceChildren(...nodes) {
     const active = this.ownerDocument && this.ownerDocument.activeElement;
     if (active && this.contains(active)) {
@@ -189,6 +200,8 @@ function miniHarness() {
   const count = new MiniNode("span", documentRef);
   const filter = new MiniNode("input", documentRef);
   const list = new MiniNode("ul", documentRef);
+  const body = new MiniNode("div", documentRef);
+  body.append(list);
   const nodes = new Map([
     ["[data-books-count]", count],
     ["[data-books-filter]", filter],
@@ -198,7 +211,19 @@ function miniHarness() {
     ownerDocument: documentRef,
     querySelector(selector) { return nodes.get(selector) || null; },
   };
-  return { count, documentRef, filter, list, root };
+  return { body, count, documentRef, filter, list, root };
+}
+
+
+function viewButton(harness, view) {
+  return descendants(harness.body, "button")
+    .find((button) => button.dataset.booksView === view) || null;
+}
+
+
+function navButton(harness, name) {
+  return descendants(harness.body, "button")
+    .find((button) => button.dataset.booksNav === name) || null;
 }
 
 
@@ -717,4 +742,370 @@ test("Books panel distinguishes loading, empty, initial error, and stale refresh
     assert.match(textOf(failingHarness.list), /Books could not be loaded/);
     assert.match(textOf(failingHarness.list), /service offline/);
     failingController.destroy();
+  });
+
+
+test("import timestamps are optional, validated, and default to empty", () => {
+  const normalized = normalizeCorrectionsIndex(fixture());
+  const herbarium = normalized.books.find((book) => book.id === "book-herbarium");
+  assert.equal(herbarium.latest_imported_at, "2026-07-28T09:00:00+00:00");
+  assert.equal(herbarium.captures.find(
+    (capture) => capture.artifact_id === "capture-cover").imported_at,
+  "2026-07-28T09:00:00+00:00");
+  assert.equal(herbarium.captures.find(
+    (capture) => capture.artifact_id === "capture-title").imported_at, "",
+  "captures without desktop_import report an empty import time");
+  const legacy = normalized.books.find((book) => book.id === "book-legacy");
+  assert.equal(legacy.latest_imported_at, "");
+  assert.equal(legacy.captures[0].imported_at, "");
+
+  const older = fixture();
+  for (const book of older.books) {
+    delete book.latest_imported_at;
+    for (const capture of book.captures) delete capture.imported_at;
+  }
+  const normalizedOlder = normalizeCorrectionsIndex(older);
+  assert.ok(normalizedOlder.books.every((book) =>
+    book.latest_imported_at === "" &&
+    book.captures.every((capture) => capture.imported_at === "")),
+  "indexes that predate import timestamps must still validate");
+
+  // The engine keeps any timestamp its own Python parser accepted — forms
+  // Date.parse cannot read (comma fractions, basic format) arrive verbatim
+  // — so the one field degrades to untimed instead of failing the index.
+  const unparseable = fixture();
+  unparseable.books[0].captures[0].imported_at = "2026-07-28T09:00:00,500";
+  unparseable.books[0].latest_imported_at = "20260728T090000";
+  const degraded = normalizeCorrectionsIndex(unparseable);
+  const degradedBook = degraded.books.find(
+    (book) => book.id === "book-herbarium");
+  assert.equal(degradedBook.latest_imported_at, "",
+    "an engine-accepted basic-format timestamp degrades to untimed");
+  assert.equal(degradedBook.captures.find(
+    (capture) => capture.artifact_id === "capture-cover").imported_at, "",
+  "an engine-accepted comma-fraction timestamp degrades to untimed");
+
+  const unsafeCapture = fixture();
+  unsafeCapture.books[0].captures[0].imported_at = "2026-07-28\u0000";
+  assert.throws(() => normalizeCorrectionsIndex(unsafeCapture),
+    /imported_at: must be a safe string/);
+
+  const oversizedBook = fixture();
+  oversizedBook.books[0].latest_imported_at = "9".repeat(65);
+  assert.throws(() => normalizeCorrectionsIndex(oversizedBook),
+    /latest_imported_at: must be a safe string/);
+});
+
+
+test("unparseable engine-accepted timestamps degrade without failing the panel",
+  async () => {
+    const data = fixture();
+    data.books[0].captures[0].imported_at = "2026-07-28T09:00:00,500";
+    data.books[0].latest_imported_at = "2026-07-28T09:00:00,500";
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => data },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    assert.equal(store.snapshot().status, "ready",
+      "one unparseable timestamp must not kill the whole Books panel");
+    assert.doesNotMatch(textOf(harness.list), /Books could not be loaded/);
+    assert.equal(harness.list.children.length, 4);
+    const herbarium = store.index.books.find(
+      (book) => book.id === "book-herbarium");
+    assert.equal(herbarium.latest_imported_at, "");
+    assert.equal(herbarium.captures.find(
+      (capture) => capture.artifact_id === "capture-cover").imported_at, "");
+    controller.setView("captures");
+    assert.deepEqual(
+      harness.list.children.map((row) => row.dataset.bookId),
+      ["book-pending", "book-herbarium", "book-legacy"],
+      "the degraded item sorts as untimed instead of erroring the view");
+    controller.destroy();
+  });
+
+
+test("captures view orders newest import first with untimed items after", () => {
+  const index = normalizeCorrectionsIndex(fixture());
+  assert.deepEqual(captureBooks(index).map((book) => book.id), [
+    "book-pending",
+    "book-herbarium",
+    "book-legacy",
+  ], "newest import first, no-timestamp items after, book-empty excluded");
+  assert.deepEqual(attentionBooks(index).map((book) => book.id), [
+    "book-herbarium",
+    "book-pending",
+  ]);
+  assert.deepEqual(booksForView(index, "all").map((book) => book.id),
+    sortedBooks(index).map((book) => book.id));
+  assert.equal(latestImportedAt(
+    index.books.find((book) => book.id === "book-pending")),
+  "2026-07-30T10:15:00+00:00");
+  assert.equal(latestImportedAt({
+    latest_imported_at: "",
+    captures: [
+      { imported_at: "" },
+      { imported_at: "2026-07-01T00:00:00Z" },
+      { imported_at: "2026-07-02T00:00:00Z" },
+    ],
+  }), "2026-07-02T00:00:00Z",
+  "the item-level timestamp is derivable from capture rows alone");
+});
+
+
+test("Books panel views compose with the text filter and show honest counts",
+  async () => {
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const captures = viewButton(harness, "captures");
+    const attention = viewButton(harness, "attention");
+    const all = viewButton(harness, "all");
+    assert.equal(all.getAttribute("aria-pressed"), "true");
+    assert.equal(textOf(all).includes("4"), true);
+    assert.equal(textOf(captures).includes("3"), true);
+    assert.equal(textOf(attention).includes("2"), true);
+
+    captures.emit("click");
+    assert.equal(captures.getAttribute("aria-pressed"), "true");
+    assert.equal(all.getAttribute("aria-pressed"), "false");
+    assert.deepEqual(
+      harness.list.children.map((row) => row.dataset.bookId),
+      ["book-pending", "book-herbarium", "book-legacy"],
+    );
+
+    harness.filter.value = "materia";
+    harness.filter.emit("input");
+    assert.deepEqual(
+      harness.list.children.map((row) => row.dataset.bookId),
+      ["book-legacy"],
+      "the text filter composes with the active view");
+
+    harness.filter.value = "zzz";
+    harness.filter.emit("input");
+    assert.match(textOf(harness.list), /No matches/);
+
+    harness.filter.value = "";
+    harness.filter.emit("input");
+    attention.emit("click");
+    assert.deepEqual(
+      harness.list.children.map((row) => row.dataset.bookId),
+      ["book-herbarium", "book-pending"],
+    );
+
+    const cleared = fixture();
+    cleared.revision = "index-cleared-r1";
+    for (const book of cleared.books) book.captures = [];
+    controller.setView("captures");
+    controller.render({
+      status: "ready",
+      index: normalizeCorrectionsIndex(cleared),
+      selection: null,
+      error: null,
+    });
+    assert.match(textOf(harness.list), /No captures/);
+    controller.destroy();
+  });
+
+
+test("prev/next walk the current view order with hard end stops", async () => {
+  const store = new CorrectionsIndexStore({
+    api: { loadIndex: async () => fixture() },
+  });
+  const harness = miniHarness();
+  const navigations = [];
+  const controller = new BooksPanelController({
+    root: harness.root,
+    documentRef: harness.documentRef,
+    store,
+    onNavigate: (address, metadata) => navigations.push({ address, metadata }),
+  }).mount();
+  await store.openWorkspace("workspace-1");
+
+  assert.equal(controller.stepSelection(-1).id, "book-legacy",
+    "previous with no selection lands on the view's last item");
+  controller.setSelection(null);
+
+  const order = ["book-herbarium", "book-pending", "book-empty", "book-legacy"];
+  for (const expected of order) {
+    assert.equal(controller.stepSelection(1).id, expected);
+    assert.equal(store.snapshot().selection.itemId, expected);
+  }
+  assert.equal(controller.stepSelection(1), null, "no wrap past the end");
+  assert.equal(navButton(harness, "next").disabled, true);
+  assert.equal(navButton(harness, "previous").disabled, false);
+  assert.equal(controller.stepSelection(-1).id, "book-empty");
+  assert.deepEqual(navigations.at(-1).metadata,
+    { source: "books", targetKind: "book" },
+    "stepping navigates through the same path as a click");
+  assert.deepEqual(navigations.at(-1).address, {
+    itemId: "book-empty",
+    representationId: null,
+    canvasId: null,
+    artifactId: null,
+    annotationId: null,
+  });
+
+  navButton(harness, "previous").emit("click");
+  assert.equal(store.snapshot().selection.itemId, "book-pending");
+  controller.destroy();
+});
+
+
+test("when the selected item leaves the view, next takes its former slot",
+  async () => {
+    const data = fixture();
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => data },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+    }).mount();
+    await store.openWorkspace("workspace-1");
+    controller.setView("attention");
+
+    assert.equal(controller.stepSelection(1).id, "book-herbarium");
+    const resolved = resolvedEntry(data.attention[0]);
+    store.applyAttentionEntry(resolved, "index-r8");
+    assert.deepEqual(
+      harness.list.children.map((row) => row.dataset.bookId),
+      ["book-pending"],
+      "the resolved item leaves the Attention view but stays selected");
+    assert.equal(store.snapshot().selection.itemId, "book-herbarium");
+
+    assert.equal(controller.stepSelection(1).id, "book-pending",
+      "next selects the item now occupying the departed item's slot");
+
+    store.applyAttentionEntry(reopenedEntry(resolved), "index-r9");
+    controller.stepSelection(-1);
+    assert.equal(store.snapshot().selection.itemId, "book-herbarium");
+    store.applyAttentionEntry(resolvedEntry(data.attention[0],
+      "review-resolved-r2"), "index-r10");
+    assert.equal(controller.stepSelection(-1), null,
+      "previous from the departed first slot has nothing before it");
+    controller.destroy();
+  });
+
+
+test("previous clamps a remembered slot that outlived a shrunken view",
+  async () => {
+    let current = fixture();
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => current },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+    }).mount();
+    await store.openWorkspace("workspace-1");
+    // The shell echoes selections unowned; slot 3 (book-legacy) is
+    // remembered for the "all" view.
+    store.setSelection({
+      itemId: "book-legacy",
+      representationId: null,
+      canvasId: null,
+      artifactId: null,
+      annotationId: null,
+    }, { ownedByFeature: false });
+
+    const shrunk = fixture();
+    shrunk.revision = "index-shrunk-r1";
+    shrunk.books = shrunk.books.filter((book) => book.id === "book-empty");
+    shrunk.attention = [];
+    current = shrunk;
+    await store.refresh();
+    assert.equal(store.snapshot().selection.itemId, "book-legacy",
+      "the unowned selection survives the refresh that removed its item");
+    assert.equal(controller.canStepSelection(-1), true,
+      "previous cannot be a dead no-op while next still works");
+    assert.equal(controller.stepSelection(-1).id, "book-empty",
+      "previous from a vanished slot beyond the view takes the last row");
+    controller.destroy();
+  });
+
+
+test("stepping keeps keyboard focus on the stepped row across rebuilds",
+  async () => {
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const navigations = [];
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      onNavigate: (address, metadata) => navigations.push({ address, metadata }),
+    }).mount();
+    await store.openWorkspace("workspace-1");
+    const rowButton = (itemId) => descendants(harness.list, "button")
+      .find((button) => button.dataset.bookSelect === itemId) || null;
+
+    const first = controller.stepSelection(1);
+    assert.equal(first.id, "book-herbarium");
+    assert.deepEqual(navigations.at(-1).address, {
+      itemId: "book-herbarium",
+      representationId: "scan-herbarium",
+      canvasId: "canvas-title",
+      artifactId: "capture-title",
+      annotationId: null,
+    }, "stepping onto a captured item opens its first capture");
+    assert.equal(navigations.at(-1).metadata.targetKind, "image");
+    assert.equal(harness.documentRef.activeElement,
+      rowButton("book-herbarium"),
+      "the selection rebuild puts DOM focus on the stepped-to row");
+
+    // The shell echoes the navigation back as an unowned selection, which
+    // rebuilds the list a second time before the next keystroke.
+    store.setSelection(navigations.at(-1).address, { ownedByFeature: false });
+    assert.equal(harness.documentRef.activeElement,
+      rowButton("book-herbarium"),
+      "the echo rebuild preserves the focused row instead of dropping it");
+
+    const second = controller.stepSelection(1);
+    assert.equal(second.id, "book-pending");
+    assert.equal(navigations.at(-1).address.artifactId, "capture-pending");
+    assert.equal(harness.documentRef.activeElement, rowButton("book-pending"),
+      "the second step still resolves and moves focus onward");
+
+    // Stepping also recovers from focus sitting on a capture thumbnail.
+    descendants(harness.list, "button")
+      .find((button) => button.dataset.artifactId === "capture-pending")
+      .focus();
+    const third = controller.stepSelection(1);
+    assert.equal(third.id, "book-empty");
+    assert.equal(navigations.at(-1).metadata.targetKind, "book",
+      "items without captures keep the bare book address");
+    assert.equal(harness.documentRef.activeElement, rowButton("book-empty"));
+
+    navButton(harness, "next").emit("click");
+    assert.equal(store.snapshot().selection.itemId, "book-legacy");
+    assert.equal(harness.documentRef.activeElement, rowButton("book-legacy"),
+      "the ‹/› buttons hand focus to the stepped-to row too");
+
+    // Renders that were not caused by a step never steal outside focus.
+    harness.filter.focus();
+    controller.render(store.snapshot());
+    assert.equal(harness.documentRef.activeElement, harness.filter,
+      "an external refresh leaves focus outside the list alone");
+    controller.destroy();
   });

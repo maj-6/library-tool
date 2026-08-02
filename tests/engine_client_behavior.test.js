@@ -1223,6 +1223,65 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
   }
 });
 
+test("corrections index degrades engine-accepted timestamps Date.parse rejects",
+  async () => {
+    // The engine keeps any timestamp its own Python parser accepted (comma
+    // fractions, basic format) and degrades its own parse failures to "".
+    // The stricter client degrades the one field the same way instead of
+    // rejecting the whole index.
+    const degraded = correctionsIndex();
+    degraded.books[0].latest_imported_at = "20260723T120000";
+    degraded.books[0].captures = [{
+      artifact_id: "image:one",
+      revision: "capture-r1",
+      capture_order: 0,
+      label: "Title leaf",
+      effective_category: "title_page",
+      resource_state: "unavailable",
+      import_state: "ready",
+      freshness: "current",
+      imported_at: "2026-07-23T12:00:00,500",
+      thumbnail: null,
+    }];
+    const degradedClient = new EngineClient({
+      transport: async () => response(200, degraded),
+    });
+    const index = await degradedClient.corrections.index({
+      workspaceId: "workspace:one",
+    });
+    assert.equal(index.books[0].latest_imported_at, "",
+      "an unparseable basic-format timestamp degrades to untimed");
+    assert.equal(index.books[0].captures[0].imported_at, "",
+      "an unparseable comma-fraction timestamp degrades to untimed");
+    assert.equal(index.books[0].captures[0].label, "Title leaf",
+      "the rest of the capture row passes through untouched");
+
+    const parseable = correctionsIndex();
+    parseable.books[0].latest_imported_at = "2026-07-23T12:00:00+00:00";
+    const parseableClient = new EngineClient({
+      transport: async () => response(200, parseable),
+    });
+    assert.equal(
+      (await parseableClient.corrections.index({
+        workspaceId: "workspace:one",
+      })).books[0].latest_imported_at,
+      "2026-07-23T12:00:00+00:00",
+      "parseable timestamps pass through verbatim",
+    );
+
+    const garbage = correctionsIndex();
+    garbage.books[0].latest_imported_at = 20260723;
+    const garbageClient = new EngineClient({
+      transport: async () => response(200, garbage),
+    });
+    await assert.rejects(
+      garbageClient.corrections.index({ workspaceId: "workspace:one" }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+      "non-string timestamps are contract violations, not degradations",
+    );
+  });
+
 test("correction review reads expose revisioned audit state and reject drift",
   async () => {
     const mark = {

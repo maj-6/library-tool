@@ -39,6 +39,31 @@
     "item_id", "representation_id", "canvas_id", "artifact_id", "annotation_id",
   ];
   const TRAY_TABS = Object.freeze(["reviews", "jobs"]);
+  // The command registry's binding grammar accepts single letters only, so
+  // the bracket-style previous/next keys land on j/k (both unclaimed by the
+  // default classification bindings t/c/s/e/m/i/n/p/d).
+  const BOOKS_NAVIGATION_COMMANDS = Object.freeze([
+    Object.freeze({
+      id: "corrections.books.previous-item",
+      label: "Select the previous Books item",
+      shortLabel: "Previous item",
+      code: "PRV",
+      defaultBinding: "k",
+      targetKind: "books-item",
+      direction: -1,
+    }),
+    Object.freeze({
+      id: "corrections.books.next-item",
+      label: "Select the next Books item",
+      shortLabel: "Next item",
+      code: "NXT",
+      defaultBinding: "j",
+      targetKind: "books-item",
+      direction: 1,
+    }),
+  ]);
+  const BOOKS_NAVIGATION_IDS = new Set(
+    BOOKS_NAVIGATION_COMMANDS.map((command) => command.id));
 
   function isPlainObject(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -282,7 +307,10 @@
     const source = isPlainObject(value) && isPlainObject(value.bindings)
       ? value.bindings : {};
     const bindings = {};
-    const occupied = new Set();
+    // The Books previous/next keys are fixed, so a stored classification
+    // remap can never claim them; the colliding remap is dropped instead.
+    const occupied = new Set(
+      BOOKS_NAVIGATION_COMMANDS.map((command) => command.defaultBinding));
     const definitions = Array.isArray(deps.DEFAULT_CLASSIFICATION_COMMANDS)
       ? deps.DEFAULT_CLASSIFICATION_COMMANDS : [];
     for (const command of definitions) {
@@ -547,6 +575,7 @@
       );
       this.booksFeature = options.booksFeature === false ? null :
         options.booksFeature || this.createBooksFeature(options);
+      this.registerBooksNavigationCommands();
       this.artifactsFeature = options.artifactsFeature === false ? null :
         options.artifactsFeature || this.createArtifactsFeature(options);
       this.itemProperties = options.itemProperties === false ? null :
@@ -594,14 +623,58 @@
     }
 
     classificationEventEligible(event, command, context = {}) {
-      if (this.classificationHoverEligible(command, context)) return true;
+      // Books navigation acts on the panel, not the hovered target, so a
+      // hover must not widen its gate beyond the browsable surfaces.
+      if (!(command && BOOKS_NAVIGATION_IDS.has(command.id)) &&
+          this.classificationHoverEligible(command, context)) return true;
       return this.classificationSurfaceEligible(event, [
         "booksList",
+        "booksViewBar",
         "artifactsTree",
         "editorHost",
         "classificationControls",
         "classificationToolbar",
       ]);
+    }
+
+    booksPanel() {
+      const feature = this.booksFeature;
+      const books = feature && (feature.books || feature);
+      return books && typeof books.stepSelection === "function" ? books : null;
+    }
+
+    registerBooksNavigationCommands() {
+      const registry = this.classificationController &&
+        this.classificationController.registry;
+      if (!registry || typeof registry.register !== "function" ||
+          !this.booksPanel()) return;
+      for (const definition of BOOKS_NAVIGATION_COMMANDS) {
+        if (typeof registry.get === "function" && registry.get(definition.id)) {
+          continue;
+        }
+        const command = {
+          ...definition,
+          available: () => {
+            const books = this.booksPanel();
+            return !!books &&
+              typeof books.canStepSelection === "function" &&
+              books.canStepSelection(definition.direction);
+          },
+          execute: () => {
+            const books = this.booksPanel();
+            if (!books) throw new Error("The Books panel is unavailable");
+            return books.stepSelection(definition.direction);
+          },
+        };
+        try {
+          registry.register(command);
+        } catch (error) {
+          if (!error || error.code !== "key_binding_conflict") throw error;
+          // An injected registry already claimed this key; keep the command
+          // reachable through buttons and the palette without a shortcut.
+          registry.register({ ...command, defaultBinding: "" });
+        }
+      }
     }
 
     // A hovered target keeps its hotkeys wherever document focus sits;
@@ -1891,6 +1964,7 @@
   }
 
   return {
+    BOOKS_NAVIGATION_COMMANDS,
     CONTEXT_SCHEMA,
     CorrectionsShell,
     CorrectionsWindowState,

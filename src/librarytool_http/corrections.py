@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from typing import Any
 from urllib.parse import quote
@@ -1893,6 +1894,41 @@ def _capture_group_import_state(
     return "ready"
 
 
+def _parsed_import_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _capture_imported_at(value: RasterArtifactView) -> str:
+    """Return the desktop import timestamp, or "" for pre-field imports."""
+
+    imported_at = value.extensions.get("imported_at")
+    if (
+        not isinstance(imported_at, str)
+        or not _index_text(imported_at, maximum=64, allow_empty=False)
+        or _parsed_import_timestamp(imported_at) is None
+    ):
+        return ""
+    return imported_at
+
+
+def _latest_imported_at(captures: Sequence[Mapping[str, Any]]) -> str:
+    values = [
+        value
+        for row in captures
+        for value in (row.get("imported_at"),)
+        if isinstance(value, str) and value
+    ]
+    return max(
+        values,
+        key=lambda value: (_parsed_import_timestamp(value), value),
+        default="",
+    )
+
+
 def _capture_rank(value: RasterArtifactView) -> tuple[int, str]:
     variant = value.resource.variant if value.resource is not None else ""
     is_display = (
@@ -1930,6 +1966,7 @@ def _capture_rows(
             "resource_state": value.resource_state.value,
             "import_state": _capture_group_import_state(by_order[order]),
             "freshness": value.freshness.value,
+            "imported_at": _capture_imported_at(value),
             "thumbnail": None,
         }
         if source.representation_id:
@@ -2207,6 +2244,7 @@ def _corrections_index_projection(
             ),
             "review": review_summary,
             "captures": captures,
+            "latest_imported_at": _latest_imported_at(captures),
         }
         book = {
             "id": item.item_id,

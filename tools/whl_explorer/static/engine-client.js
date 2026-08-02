@@ -1364,16 +1364,63 @@
       (!/^data:/i.test(value.url) || /^data:image\//i.test(value.url));
   }
 
+  function isCorrectionsImportTimestamp(value) {
+    if (value === undefined) return true;
+    return isCorrectionsText(value, 64) &&
+      (value === "" || Number.isFinite(Date.parse(value)));
+  }
+
+  // The engine keeps any import timestamp its own Python parser accepted —
+  // ISO 8601 forms Date.parse cannot read (comma fractions, basic format)
+  // arrive verbatim — and degrades its own parse failures to "" (import
+  // time unknown). Parity means degrading that one field the same way
+  // instead of rejecting the whole Corrections index; anything that is not
+  // an otherwise valid timestamp string still fails validation.
+  function degradeUnparseableImportTimestamp(value) {
+    if (typeof value !== "string" || value === "" ||
+        !isCorrectionsText(value, 64) ||
+        Number.isFinite(Date.parse(value))) return value;
+    return "";
+  }
+
+  function withDegradedImportTimestamps(books) {
+    if (!Array.isArray(books)) return books;
+    return books.map((book) => {
+      if (!isObject(book)) return book;
+      const result = { ...book };
+      if (Object.prototype.hasOwnProperty.call(result, "latest_imported_at")) {
+        result.latest_imported_at =
+          degradeUnparseableImportTimestamp(result.latest_imported_at);
+      }
+      if (Array.isArray(result.captures)) {
+        result.captures = result.captures.map((capture) => {
+          if (!isObject(capture) ||
+              !Object.prototype.hasOwnProperty.call(capture, "imported_at")) {
+            return capture;
+          }
+          return {
+            ...capture,
+            imported_at:
+              degradeUnparseableImportTimestamp(capture.imported_at),
+          };
+        });
+      }
+      return result;
+    });
+  }
+
   function isCorrectionsCapture(value) {
     if (!hasAllowedKeys(value, [
       "artifact_id", "revision", "capture_order", "label",
       "representation_id", "canvas_id", "effective_category",
-      "resource_state", "import_state", "freshness", "thumbnail",
+      "resource_state", "import_state", "freshness", "imported_at",
+      "thumbnail",
     ], [
       "artifact_id", "revision", "capture_order", "label",
       "effective_category", "resource_state", "import_state", "freshness",
       "thumbnail",
-    ]) || !isPortableIdentifier(value.artifact_id) ||
+    ]) || !isCorrectionsImportTimestamp(value.imported_at) ||
+        !isPortableIdentifier(value.artifact_id) ||
         !isArtifactRevision(value.revision) ||
         !Number.isSafeInteger(value.capture_order) ||
         value.capture_order < 0 ||
@@ -1392,10 +1439,14 @@
   }
 
   function isCorrectionsBook(value) {
-    if (!hasExactKeys(value, [
+    if (!hasAllowedKeys(value, [
+      "id", "revision", "kind", "title", "import_state", "issues", "review",
+      "captures", "latest_imported_at",
+    ], [
       "id", "revision", "kind", "title", "import_state", "issues", "review",
       "captures",
-    ]) || !isPortableIdentifier(value.id) ||
+    ]) || !isCorrectionsImportTimestamp(value.latest_imported_at) ||
+        !isPortableIdentifier(value.id) ||
         !isArtifactRevision(value.revision) ||
         !["book", "capture"].includes(value.kind) ||
         !isCorrectionsText(value.title, 2048) ||
@@ -3147,7 +3198,7 @@
         const index = body && {
           schema: body.schema,
           revision: body.revision,
-          books: body.books,
+          books: withDegradedImportTimestamps(body.books),
           attention: body.attention,
         };
         if (status !== 200 || !hasExactKeys(body, [

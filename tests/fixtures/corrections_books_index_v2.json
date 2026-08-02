@@ -39,6 +39,7 @@
           "resource_state": "available",
           "import_state": "ready",
           "freshness": "current",
+          "imported_at": "2026-07-28T09:00:00+00:00",
           "thumbnail": {
             "url": "/api/v1/resources/thumb-cover",
             "alt": "Front cover thumbnail",
@@ -59,7 +60,8 @@
           "freshness": "untracked",
           "thumbnail": null
         }
-      ]
+      ],
+      "latest_imported_at": "2026-07-28T09:00:00+00:00"
     },
     {
       "id": "book-pending",
@@ -87,9 +89,11 @@
           "resource_state": "unavailable",
           "import_state": "pending",
           "freshness": "untracked",
+          "imported_at": "2026-07-30T10:15:00+00:00",
           "thumbnail": null
         }
-      ]
+      ],
+      "latest_imported_at": "2026-07-30T10:15:00+00:00"
     },
     {
       "id": "book-legacy",

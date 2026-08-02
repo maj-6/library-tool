@@ -1787,8 +1787,13 @@ class FilesystemCorrectionsArtifactRepository(
                 section="capture",
             )
         import_rows: dict[str, Mapping[str, Any]] = {}
+        imported_at = ""
         desktop_import = manifest.get("desktop_import")
         if isinstance(desktop_import, Mapping):
+            imported_at = _public_text(
+                desktop_import.get("imported_at"),
+                maximum=64,
+            ).strip()
             rows = desktop_import.get("assets")
             if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
                 for row in rows:
@@ -1994,6 +1999,7 @@ class FilesystemCorrectionsArtifactRepository(
                 lineage=(),
                 extensions={
                     "capture_order": order,
+                    **({"imported_at": imported_at} if imported_at else {}),
                     "corrections_ui": {"annotation_frame": "canvas"},
                     "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
                     "rendition": _unknown_fields(
@@ -2119,6 +2125,7 @@ class FilesystemCorrectionsArtifactRepository(
                 lineage=display_lineage,
                 extensions={
                     "capture_order": order,
+                    **({"imported_at": imported_at} if imported_at else {}),
                     "recipe": recipe,
                     "corrections_ui": {"annotation_frame": "canvas"},
                     "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),

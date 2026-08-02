@@ -16,6 +16,93 @@
   opacity: 0.72;
 }
 
+[data-corrections-root] .books-view-bar {
+  align-items: center;
+  display: flex;
+  gap: 0.3rem;
+  justify-content: space-between;
+  margin: 0.35rem 0;
+  min-width: 0;
+}
+
+[data-corrections-root] .books-view-switch {
+  border: 1px solid var(--border-subtle, #3b3f47);
+  border-radius: 0.22rem;
+  display: inline-flex;
+  min-width: 0;
+  overflow: hidden;
+}
+
+[data-corrections-root] .books-view-option {
+  align-items: baseline;
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--border-subtle, #3b3f47);
+  color: var(--text-muted, #bbc1ca);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 0.74rem;
+  gap: 0.22rem;
+  line-height: 1.2;
+  min-width: 0;
+  padding: 0.22rem 0.4rem;
+  white-space: nowrap;
+}
+
+[data-corrections-root] .books-view-option:last-child {
+  border-right: 0;
+}
+
+[data-corrections-root] .books-view-option:hover {
+  background: var(--selection-subtle, #303846);
+}
+
+[data-corrections-root] .books-view-option[aria-pressed="true"] {
+  background: var(--selection-subtle, #303846);
+  color: inherit;
+}
+
+[data-corrections-root] .books-view-count {
+  color: var(--text-muted, #8f96a1);
+  font-size: 0.68rem;
+}
+
+[data-corrections-root] .books-view-nav {
+  display: inline-flex;
+  gap: 0.2rem;
+}
+
+[data-corrections-root] .books-nav-button {
+  background: transparent;
+  border: 1px solid var(--border-subtle, #3b3f47);
+  border-radius: 0.22rem;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  min-height: 1.55rem;
+  min-width: 1.55rem;
+  padding: 0.1rem 0.3rem;
+}
+
+[data-corrections-root] .books-nav-button:hover:not(:disabled) {
+  background: var(--selection-subtle, #303846);
+}
+
+[data-corrections-root] .books-nav-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+[data-corrections-root] :is(
+  .books-view-option,
+  .books-nav-button
+):focus-visible {
+  outline: 2px solid var(--focus, #76a9fa);
+  outline-offset: 1px;
+}
+
 [data-corrections-root] .corrections-book {
   background: var(--panel-subtle, #202329);
   border: 1px solid var(--border-subtle, #3b3f47);
