@@ -25873,9 +25873,23 @@ def _capture_archive_backfill_request() -> tuple[tuple[str, ...], bool]:
             "capture archive backfill request is too large",
             code="capture_archive_backfill_request_too_large",
         )
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object key")
+            value[key] = item
+        return value
+
     try:
-        payload = json.loads(encoded)
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        payload = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")
+            ),
+        )
+    except (RecursionError, UnicodeError, TypeError, ValueError) as exc:
         raise EngineValidationError(
             "capture archive backfill request is not valid JSON",
             code="invalid_capture_archive_backfill_request",
@@ -25957,6 +25971,12 @@ def _capture_archive_backfill_failure_report(
             "book_id": "",
             "association": None,
         }
+    else:
+        # This authenticated HTTP boundary is narrower than the standalone
+        # local CLI. Preserve its safe machine code, but never serialize an
+        # unexpected adapter/provider exception message to a renderer.
+        diagnostic = dict(diagnostic)
+        diagnostic["message"] = "capture backfill setup failed"
     return {
         "schema": "org.whl.capture-lib-backfill-report",
         "version": 1,

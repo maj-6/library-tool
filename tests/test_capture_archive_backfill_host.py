@@ -392,6 +392,22 @@ def test_credential_lease_failure_still_runs_local_phase_and_releases_prior_leas
     assert exits == ["capture"]
 
 
+def test_local_setup_failure_is_generic_at_authenticated_boundary(
+):
+    report = server._capture_archive_backfill_failure_report(
+        apply=True,
+        error=RuntimeError("owner-secret at https://private.invalid"),
+    )
+
+    assert report["ok"] is False
+    assert report["diagnostics"][0]["message"] == (
+        "capture backfill setup failed"
+    )
+    encoded = json.dumps(report)
+    assert "owner-secret" not in encoded
+    assert "private.invalid" not in encoded
+
+
 @pytest.mark.parametrize(
     ("payload", "code"),
     [
@@ -464,6 +480,76 @@ def test_mutation_is_explicit_and_form_posts_are_rejected(client, monkeypatch):
     assert calls == [(('capture-a',), False)]
     assert form.status_code == 400
     assert form.get_json()["code"] == (
+        "invalid_capture_archive_backfill_request"
+    )
+
+
+@pytest.mark.parametrize(
+    ("document", "code"),
+    [
+        (
+            b'{"capture_ids":["capture-a"],"apply":false,"apply":true}',
+            "invalid_capture_archive_backfill_request",
+        ),
+        (
+            b'{"capture_ids":["capture-a"],"apply":NaN}',
+            "invalid_capture_archive_backfill_request",
+        ),
+        (b'{"capture_ids":[true]}', "invalid_capture_archive_backfill_scope"),
+        (
+            b'{"capture_ids":["capture-a",1]}',
+            "invalid_capture_archive_backfill_scope",
+        ),
+    ],
+)
+def test_noncanonical_json_never_reaches_backfill_host(
+    client,
+    monkeypatch,
+    document,
+    code,
+):
+    monkeypatch.setattr(
+        server,
+        "_run_capture_archive_backfill_host",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid request reached the backfill host")
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/capture-archive-backfills",
+        data=document,
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == code
+
+
+def test_excessively_nested_json_fails_closed(client, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_run_capture_archive_backfill_host",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid request reached the backfill host")
+        ),
+    )
+    document = (
+        '{"capture_ids":'
+        + "[" * 1200
+        + '"capture-a"'
+        + "]" * 1200
+        + "}"
+    ).encode("utf-8")
+
+    response = client.post(
+        "/api/v1/capture-archive-backfills",
+        data=document,
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == (
         "invalid_capture_archive_backfill_request"
     )
 

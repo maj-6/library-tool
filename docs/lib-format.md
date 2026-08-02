@@ -584,17 +584,41 @@ Conflicting prior identities fail closed. Capture ids are validated verbatim;
 an invalid id is rejected rather than stripped into another capture's id. The
 command never edits the manual catalogue, deletes or replaces capture
 originals, or exposes a local path in diagnostics. The standalone CLI remains
-local/offline; only an embedding host that explicitly supplies the publisher
-can advance a cloud status/association.
+local/offline and never loads a desktop credential.
 
-The desktop host exposes that credentialed composition only through
+The supported operator workflow deliberately keeps those authorities in two
+steps. Exit the desktop before the offline step so its compatibility stores
+are idle. When running the command from a source checkout against packaged
+data, set `WHL_DATA_ROOT` to the packaged per-user data root documented in the
+repository README (or pass the three explicit path options).
+
+1. Run the standalone command with `--dry-run`, inspect its JSON report, then
+   run it again with `--apply` against the same desktop data profile.
+2. Open the packaged desktop while signed in, with owner cloud publishing
+   configured, and invoke its explicit **Cloud Sync** action. Its normal
+   user-scoped capture reconciliation finds the newly sealed local
+   association, reads only named capture rows visible through that user's RLS
+   policy, and publishes the association/status with the leased desktop
+   credentials.
+
+The second step is idempotent. If publication is interrupted, another Cloud
+Sync re-inspects the verified local association and the exact remote revision.
+Non-UUID LAN/local-only capture identities are excluded from cloud discovery,
+and a UUID absent from the signed-in user's RLS results is not published. This
+is the packaged operator path; the offline command never needs a service key
+or user token.
+
+For bounded host integrations and authenticated test clients, the desktop
+sidecar additionally exposes the one-request composition through
 `POST /api/v1/capture-archive-backfills`. The JSON request must name between
 one and 64 exact capture IDs; dry-run remains the default and a write requires
 a literal `"apply": true`. This route is separate from routine cloud autosync,
 so startup or interval sync can never trigger an unbounded legacy rewrite. In
 the packaged desktop it is protected by the exact-origin and per-process
 desktop-capability checks used by every `/api/` route, and it accepts only a
-small, unencoded JSON body.
+small, unencoded JSON body. The per-process capability is intentionally not an
+operator credential; external scripts should use the two-step workflow above
+rather than attempting to call this internal route in a packaged build.
 
 For apply requests the host first asks the signed-in user's RLS scope which of
 the named UUID capture rows are visible. It then runs the local archive

@@ -1642,14 +1642,29 @@ def _diagnostic(
     association: Mapping[str, Any] | None = None,
     cloud_update: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    capture_identity = _bounded_diagnostic_text(capture_id)
+    if (
+        capture_identity
+        and _portable_capture_id(capture_identity) != capture_identity
+    ):
+        capture_identity = ""
+    entry_identity = _bounded_diagnostic_text(entry_id)
+    if entry_identity and not _BUILD_ID_RE.fullmatch(entry_identity):
+        entry_identity = ""
+    book_identity = _bounded_diagnostic_text(book_id)
+    if book_identity and not _BOOK_ID_RE.fullmatch(book_identity):
+        book_identity = ""
+    diagnostic_message = _bounded_diagnostic_text(message)
+    if _looks_like_local_locator(diagnostic_message):
+        diagnostic_message = "capture backfill diagnostic withheld"
     diagnostic = {
-        "capture_id": _bounded_diagnostic_text(capture_id),
-        "entry_id": _bounded_diagnostic_text(entry_id),
+        "capture_id": capture_identity,
+        "entry_id": entry_identity,
         "status": status,
         "code": code,
-        "message": _bounded_diagnostic_text(message),
+        "message": diagnostic_message,
         "changed": bool(changed),
-        "book_id": _bounded_diagnostic_text(book_id),
+        "book_id": book_identity,
         "association": dict(association) if association is not None else None,
     }
     if cloud_update is not None:

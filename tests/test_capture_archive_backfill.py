@@ -172,6 +172,25 @@ def test_dry_run_validates_without_writing_or_replacing_originals(tmp_path):
     assert (directory / "orig_1.jpg").read_bytes() == original_before
 
 
+def test_diagnostics_quarantine_nonportable_catalogue_identity(tmp_path):
+    capture_id = "capture-safe-entry"
+    captures = tmp_path / "captures"
+    _assets(captures, capture_id)
+    private_entry_id = r"C:\private\catalogue-token.json"
+
+    report, _service, _write_set = _run(
+        {private_entry_id: _entry(capture_id)},
+        captures,
+        tmp_path / "workspace",
+        apply=False,
+    )
+
+    assert report["ok"] is True
+    assert report["diagnostics"][0]["entry_id"] == ""
+    assert "private" not in json.dumps(report)
+    assert "token" not in json.dumps(report)
+
+
 def test_cloud_update_runs_after_archive_and_resumes_without_resealing(
     tmp_path,
 ):
