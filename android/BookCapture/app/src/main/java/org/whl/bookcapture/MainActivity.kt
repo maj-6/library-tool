@@ -39,6 +39,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
@@ -2970,6 +2972,10 @@ class MainActivity : AppCompatActivity() {
             binding.lastBookPrimary.isFocusable = false
             binding.lastBookPrimary.setOnClickListener(null)
             binding.lastBookPrimary.setOnLongClickListener(null)
+            ViewCompat.removeAccessibilityAction(
+                binding.lastBookPrimary,
+                AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK.id,
+            )
             binding.lastBookPreview.isClickable = false
             binding.lastBookPreview.isFocusable = false
             binding.lastBookPreview.setOnClickListener(null)
@@ -2977,6 +2983,10 @@ class MainActivity : AppCompatActivity() {
             binding.lastBookPreview.isLongClickable = false
             binding.lastBookExtras.setOnClickListener(null)
             binding.lastBookExtras.setOnLongClickListener(null)
+            ViewCompat.removeAccessibilityAction(
+                binding.lastBookExtras,
+                AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK.id,
+            )
             return
         }
 
@@ -3025,16 +3035,27 @@ class MainActivity : AppCompatActivity() {
         // outer card remains touch-clickable so its padding is not a dead zone.
         binding.lastBookPreview.isFocusable = false
         binding.lastBookPreview.setOnClickListener(openBook)
-        val attentionListener = View.OnLongClickListener {
-            showEntryAttentionDialog(this, entry.id) { refreshLastCapturedBook() }
+        val showActions = {
+            showEntryActionDialog(this, entry.id) { refreshLastCapturedBook() }
+        }
+        val actionListener = View.OnLongClickListener {
+            showActions()
             true
         }
         // lastBookPrimary owns most touch events inside the card; keep the
         // listener on both it and the outer preview so every part of the card
-        // offers the same desktop-style review gesture.
-        binding.lastBookPrimary.setOnLongClickListener(attentionListener)
+        // offers the same book-action gesture.
+        binding.lastBookPrimary.setOnLongClickListener(actionListener)
+        ViewCompat.replaceAccessibilityAction(
+            binding.lastBookPrimary,
+            AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK,
+            getString(R.string.home_book_actions),
+        ) { _, _ ->
+            showActions()
+            true
+        }
         binding.lastBookPreview.isLongClickable = true
-        binding.lastBookPreview.setOnLongClickListener(attentionListener)
+        binding.lastBookPreview.setOnLongClickListener(actionListener)
 
         val localReview = entry.captureReview
         val needsReview = localReview?.needsReview == true
@@ -3064,10 +3085,22 @@ class MainActivity : AppCompatActivity() {
             )
             binding.lastBookExtras.isEnabled = available
             binding.lastBookExtras.setOnClickListener { showCaptureExtras(entry.id) }
-            binding.lastBookExtras.setOnLongClickListener(attentionListener)
+            binding.lastBookExtras.setOnLongClickListener(actionListener)
+            ViewCompat.replaceAccessibilityAction(
+                binding.lastBookExtras,
+                AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK,
+                getString(R.string.home_book_actions),
+            ) { _, _ ->
+                showActions()
+                true
+            }
         } else {
             binding.lastBookExtras.setOnClickListener(null)
             binding.lastBookExtras.setOnLongClickListener(null)
+            ViewCompat.removeAccessibilityAction(
+                binding.lastBookExtras,
+                AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK.id,
+            )
         }
     }
 

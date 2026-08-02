@@ -58,6 +58,27 @@ class CaptureReliabilityTest {
     }
 
     @Test
+    fun localDeleteResolutionFollowsASentEntryMovedIntoArchive() = withTempDir { root ->
+        val queue = File(root, "queue").apply { mkdirs() }
+        val sent = File(root, "sent").apply { mkdirs() }
+        val archive = File(root, "archive").apply { mkdirs() }
+        val sentEntry = File(sent, "entry-1").apply { mkdirs() }
+
+        assertEquals(
+            sentEntry,
+            resolveExistingLocalEntry(queue, sent, archive, "entry-1") { it },
+        )
+
+        val archivedEntry = File(archive, "entry-1")
+        Files.move(sentEntry.toPath(), archivedEntry.toPath())
+
+        assertEquals(
+            archivedEntry,
+            resolveExistingLocalEntry(queue, sent, archive, "entry-1") { it },
+        )
+    }
+
+    @Test
     fun processingKeepsTheResolutionPromisedByEachCaptureProfile() {
         assertEquals(1600, Pipeline.standardWidthForCaptureProfile(Prefs.CAMERA_PROFILE_FAST))
         assertEquals(2048, Pipeline.standardWidthForCaptureProfile(Prefs.CAMERA_PROFILE_DETAIL))
