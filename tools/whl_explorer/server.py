@@ -176,6 +176,8 @@ from librarytool.engine.correction_transforms import (  # noqa: E402
 from librarytool.engine.correction_ocr import (  # noqa: E402
     CorrectionOcrProviderSelection,
     CorrectionOcrRecognition,
+    CorrectionReocrService,
+    QueuedCorrectionReocr,
 )
 from librarytool.engine.jobs import (  # noqa: E402
     ACTIVE_JOB_STATES,
@@ -226,6 +228,7 @@ from librarytool.engine.representation_commands import (  # noqa: E402
     RepresentationRecordSnapshot,
 )
 from librarytool.engine.runtime import (  # noqa: E402
+    CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
     LIB_OPEN_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
@@ -267,6 +270,8 @@ _jobs_events: dict | None = None
 _jobs_lock: threading.Lock | None = None
 _correction_transform_runs: set[str] = set()
 _correction_transform_runs_lock = threading.Lock()
+_correction_reocr_runs: set[str] = set()
+_correction_reocr_runs_lock = threading.Lock()
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
 # registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
@@ -314,6 +319,12 @@ app.register_blueprint(
             lambda service, command, queued: _submit_correction_transform(
                 service,
                 command,
+                queued,
+            )
+        ),
+        correction_reocr_submitter=(
+            lambda service, queued: _submit_correction_reocr(
+                service,
                 queued,
             )
         ),
@@ -6915,6 +6926,53 @@ def _submit_correction_transform(
         raise
 
 
+def _submit_correction_reocr(
+    service: CorrectionReocrService,
+    queued: QueuedCorrectionReocr,
+) -> None:
+    """Start one process-owned standalone re-OCR worker, like transforms."""
+
+    if not isinstance(service, CorrectionReocrService):
+        raise TypeError("service must be CorrectionReocrService")
+    if not isinstance(queued, QueuedCorrectionReocr):
+        raise TypeError("queued must be QueuedCorrectionReocr")
+
+    job_id = queued.job_id
+    with _correction_reocr_runs_lock:
+        if job_id in _correction_reocr_runs:
+            return
+        _correction_reocr_runs.add(job_id)
+
+    def run() -> None:
+        try:
+            service.execute_queued(queued.request)
+        except EngineConflictError as exc:
+            if exc.code != "correction_ocr_job_already_claimed":
+                log.exception(
+                    "Correction re-OCR conflicted: job=%s",
+                    job_id,
+                )
+        except Exception:
+            # The followup service records failures on the shared JobManager;
+            # this is the process-level diagnostic, not a second transition.
+            log.exception("Correction re-OCR failed: job=%s", job_id)
+        finally:
+            with _correction_reocr_runs_lock:
+                _correction_reocr_runs.discard(job_id)
+
+    worker = threading.Thread(
+        target=run,
+        daemon=True,
+        name=f"correction-reocr-{job_id}",
+    )
+    try:
+        worker.start()
+    except BaseException:
+        with _correction_reocr_runs_lock:
+            _correction_reocr_runs.discard(job_id)
+        raise
+
+
 def _replica_engine() -> ReplicaApplicationService:
     replica = _library_engine().replica
     if replica is None:  # manifest/runtime mismatch is a server fault
@@ -13289,6 +13347,258 @@ def _ocr_execution_cfg(service: str, base_cfg: Mapping):
         finally:
             for key in ("mistral_key", "claude_key", "aws_key", "aws_secret"):
                 cfg.pop(key, None)
+
+
+# --- standalone re-OCR proposal apply (capture authority) --------------------
+# The engine only ever mints immutable machine proposals; applying one into
+# canonical layout/text state is a capture-authority decision made here, with
+# the same protect-human-work persistence the legacy OCR job uses.
+
+_OCR_PROPOSAL_APPLY_SCHEMA = (
+    "librarytool.correction-ocr-proposal-apply-receipt/1"
+)
+_OCR_PROPOSAL_APPLY_DOC = "compiled.txt"
+_OCR_PROPOSAL_APPLY_RECEIPTS = "proposal_applies.json"
+_OCR_PROPOSAL_APPLY_REF_RE = re.compile(r"^cop-[0-9a-f]{40}$")
+
+
+def _ocr_apply_error(status: int, code: str, message: str, **details):
+    body = {"ok": False, "error": message, "code": code, "retryable": False}
+    if details:
+        body["details"] = details
+    response = jsonify(body)
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    return response, status
+
+
+def _ocr_apply_capture_asset(
+        item_id: str, capture_id: str, source_artifact_id: str,
+        engine_root: Path) -> tuple[str, int] | None:
+    """Chain a committed OCR-ready output back to (asset_id, photo page).
+
+    Same tolerant publication scan as ``_capture_correction_targets``: the
+    output's owning publication names its input artifact, and following those
+    inputs transitively lands on the capture's ``capture:<ns>:display`` /
+    ``:original`` artifact whose namespace the photo contract can invert.
+    Pages are the desktop import's photo numbering (``order`` + 1).
+    """
+
+    photo_assets = lib.load_json(
+        CAPTURES_DIR / capture_id / "photo_assets.json", {}) or {}
+    desktop_import = photo_assets.get("desktop_import") \
+        if isinstance(photo_assets, Mapping) else None
+    rows = desktop_import.get("assets") \
+        if isinstance(desktop_import, Mapping) else None
+    asset_by_namespace: dict[str, tuple[str, int]] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        asset_id = row.get("asset_id")
+        order = row.get("order")
+        if (not isinstance(asset_id, str)
+                or not _CAPTURE_CORRECTION_ASSET_ID_RE.fullmatch(asset_id)
+                or isinstance(order, bool) or not isinstance(order, int)
+                or order < 0 or row.get("lifecycle") == "failed"):
+            continue
+        asset_by_namespace[
+            _capture_artifact_namespace(capture_id, asset_id)
+        ] = (asset_id, order + 1)
+    if not asset_by_namespace:
+        return None
+
+    transforms = engine_root / ".engine" / "correction-transforms"
+    pointer_dir = transforms / "by-item" / hashlib.sha256(
+        item_id.encode("utf-8")).hexdigest()
+    parent_by_output: dict[str, str] = {}
+    for pointer_path in (
+            sorted(pointer_dir.glob("*.json"))
+            if pointer_dir.is_dir() else ()):
+        try:
+            pointer = json.loads(pointer_path.read_text("utf-8"))
+            operation_id = str(pointer["operation_id"])
+            publication = json.loads(
+                (transforms / "publications" /
+                 (hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+                  + ".json")).read_text("utf-8"))
+        except (OSError, KeyError, TypeError, ValueError, UnicodeError):
+            continue    # a torn or foreign document must not block the pass
+        if not isinstance(publication, dict):
+            continue
+        command = publication.get("command")
+        outputs = publication.get("outputs")
+        if (not isinstance(command, dict)
+                or not isinstance(outputs, list)
+                or publication.get("version") != 2
+                or command.get("item_id") != item_id
+                or not isinstance(command.get("artifact_id"), str)):
+            continue
+        for output in outputs:
+            if isinstance(output, dict) and isinstance(
+                    output.get("artifact_id"), str):
+                parent_by_output[output["artifact_id"].casefold()] = \
+                    command["artifact_id"]
+
+    current = str(source_artifact_id)
+    seen: set[str] = set()
+    while True:
+        key = current.casefold()
+        if key in seen:
+            return None
+        seen.add(key)
+        parent = parent_by_output.get(key)
+        if parent is None:
+            return None
+        namespace, _, rendition = parent.rpartition(":")
+        if rendition in ("display", "original"):
+            located = asset_by_namespace.get(namespace)
+            if located is not None:
+                return located
+        current = parent
+
+
+@app.route("/api/v1/items/<item_id>/ocr-proposals/<proposal_ref>/apply",
+           methods=["POST"])
+def api_v1_apply_correction_ocr_proposal(item_id: str, proposal_ref: str):
+    """Write one machine OCR proposal into the entry's canonical OCR state."""
+
+    operation_id = request.headers.get("Idempotency-Key")
+    if operation_id is None or operation_id == "":
+        return _engine_error_response(EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={"header": "Idempotency-Key"}))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", operation_id):
+        return _engine_error_response(EngineValidationError(
+            "the idempotency key is invalid",
+            code="invalid_operation_id",
+            details={"header": "Idempotency-Key"}))
+    if not _OCR_PROPOSAL_APPLY_REF_RE.fullmatch(proposal_ref):
+        return _engine_error_response(EngineValidationError(
+            "the OCR proposal reference is invalid",
+            code="invalid_correction_ocr_proposal_ref"))
+    proposals = _library_engine().get_service(
+        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE)
+    if proposals is None:
+        return _engine_error_response(EngineRepositoryError(
+            "the correction ocr proposal module is unavailable",
+            code="correction_ocr_proposal_module_unavailable",
+            retryable=True))
+    try:
+        proposal = proposals.get_proposal(item_id, proposal_ref)
+        target = _corrections_target_for(item_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    if proposal is None:
+        return _engine_error_response(EngineNotFoundError(
+            "the OCR proposal does not exist",
+            code="correction_ocr_proposal_not_found",
+            details={"item_id": item_id, "proposal_ref": proposal_ref}))
+    recognition = proposal.as_dict()["recognition"]
+    regions = recognition.get("regions")
+    dims = recognition.get("dims")
+    if (not isinstance(regions, list)
+            or any(not isinstance(value, dict) for value in regions)
+            or not isinstance(dims, dict)):
+        return _ocr_apply_error(
+            422, "ocr_proposal_recognition_incomplete",
+            "the OCR proposal carries no region layout to apply",
+            proposal_ref=proposal_ref)
+    text = recognition.get("text")
+    text = text if isinstance(text, str) else ""
+    has_words = isinstance(recognition.get("words"), list)
+
+    if target is None:
+        return _engine_error_response(EngineNotFoundError(
+            "the Corrections item does not exist",
+            code="correction_item_not_found",
+            details={"item_id": item_id}))
+    if not target.capture_id:
+        return _ocr_apply_error(
+            422, "ocr_apply_item_not_capture_backed",
+            "only capture-backed items can receive OCR applications",
+            item_id=item_id)
+    if target.storage_kind != "build":
+        return _ocr_apply_error(
+            409, "ocr_apply_capture_entry_unavailable",
+            "the capture has no imported build entry to write into",
+            item_id=item_id)
+    build_id = target.storage_id
+    engine_root = _ensure_engine_session().write_set.root
+    located = _ocr_apply_capture_asset(
+        item_id, target.capture_id, proposal.source.artifact_id, engine_root)
+    if located is None:
+        return _ocr_apply_error(
+            422, "ocr_apply_source_not_capture_derived",
+            "the proposal's rendition does not resolve to a capture photo",
+            proposal_ref=proposal_ref)
+    asset_id, page = located
+    src_key = "primary"
+    doc = _ocr_name(_OCR_PROPOSAL_APPLY_DOC)
+    receipts_path = _entry_dir(build_id) / "ocr" / _OCR_PROPOSAL_APPLY_RECEIPTS
+    with _ocr_merge_lock:
+        receipts = lib.load_json(receipts_path, {})
+        receipts = receipts if isinstance(receipts, dict) else {}
+        previous = receipts.get(operation_id)
+        if isinstance(previous, dict):
+            if previous.get("proposal_ref") != proposal_ref:
+                return _ocr_apply_error(
+                    409, "ocr_apply_operation_conflict",
+                    "the idempotency key was used for another proposal",
+                    operation_id=operation_id)
+            replay = dict(previous.get("receipt") or {})
+            replay["replayed"] = True
+            response = jsonify(replay)
+            response.cache_control.no_store = True
+            response.headers["Pragma"] = "no-cache"
+            return response
+        region_action = _ocr_save_page_regions(
+            build_id, src_key, page,
+            [dict(value) for value in regions], dict(dims), doc=doc,
+            protect_existing=True,
+            provider=proposal.provider.provider_id,
+            proposed_text=text)
+        words_action = "absent"
+        if has_words:
+            # A "words" key marks a geometry-speaking engine and its value is
+            # authoritative ([] = blank page), exactly as in the legacy job.
+            _ocr_save_page_words(
+                build_id, src_key, page,
+                list(recognition.get("words") or []), doc=doc)
+            words_action = "saved"
+        if region_action == "proposed":
+            text_action = "proposed"
+        else:
+            _ocr_merge_page(build_id, _OCR_PROPOSAL_APPLY_DOC, page, text)
+            text_action = "merged"
+        receipt = {
+            "ok": True,
+            "schema": _OCR_PROPOSAL_APPLY_SCHEMA,
+            "replayed": False,
+            "operation_id": operation_id,
+            "proposal_ref": proposal_ref,
+            "applied": {
+                "item_id": item_id,
+                "capture_id": target.capture_id,
+                "asset_id": asset_id,
+                "source_id": src_key,
+                "page": page,
+                "doc": doc,
+                "regions": region_action,
+                "words": words_action,
+                "text": text_action,
+            },
+        }
+        receipts[operation_id] = {
+            "proposal_ref": proposal_ref,
+            "receipt": receipt,
+        }
+        lib.save_json(receipts_path, receipts)
+    _mark_capture_archive_stale(target.capture_id)
+    response = jsonify(receipt)
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 def _replica_detection_pdf(build: dict, source_id: str) -> Path | None:

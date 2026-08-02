@@ -62,9 +62,12 @@ from ..engine.correction_projection import (
 )
 from ..engine.correction_ocr import (
     CORRECTION_OCR_MAX_SOURCE_BYTES,
+    CORRECTION_REOCR_OPERATION_PREFIX,
     CorrectionOcrFollowupService,
+    CorrectionOcrProposalCatalogService,
     CorrectionOcrProposalQueryService,
     CorrectionOcrProviderPort,
+    CorrectionReocrService,
 )
 from ..engine.corrections import CorrectionService
 from ..engine.correction_transforms import (
@@ -121,7 +124,9 @@ from ..engine.runtime import (
     CORRECTION_METADATA_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+    CORRECTION_REOCR_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     DOCUMENT_ARTIFACT_CATALOG_SERVICE,
     DOCUMENT_RESOURCE_PAGE_SERVICE,
@@ -889,6 +894,10 @@ class FilesystemServiceGraph:
     correction_commands: CorrectionService | None = None
     correction_transforms: CorrectionTransformService | None = None
     correction_ocr_proposals: CorrectionOcrProposalQueryService | None = None
+    correction_ocr_proposal_catalog: (
+        CorrectionOcrProposalCatalogService | None
+    ) = None
+    correction_reocr: CorrectionReocrService | None = None
     document_artifacts: DocumentArtifactCatalogService | None = None
     document_resources: DocumentResourcePageService | None = None
     raster_artifacts: RasterArtifactProjectorPort | None = None
@@ -953,6 +962,35 @@ class FilesystemServiceGraph:
                 "correction_ocr_proposals must be a "
                 "CorrectionOcrProposalQueryService or None"
             )
+        if (self.correction_ocr_proposals is None) != (
+            self.correction_ocr_proposal_catalog is None
+        ):
+            raise ValueError(
+                "OCR proposal query and catalog services must be installed "
+                "together"
+            )
+        if self.correction_ocr_proposal_catalog is not None and not isinstance(
+            self.correction_ocr_proposal_catalog,
+            CorrectionOcrProposalCatalogService,
+        ):
+            raise TypeError(
+                "correction_ocr_proposal_catalog must be a "
+                "CorrectionOcrProposalCatalogService or None"
+            )
+        if self.correction_reocr is not None and not isinstance(
+            self.correction_reocr,
+            CorrectionReocrService,
+        ):
+            raise TypeError(
+                "correction_reocr must be a CorrectionReocrService or None"
+            )
+        if (
+            self.correction_reocr is not None
+            and self.correction_ocr_proposals is None
+        ):
+            raise ValueError(
+                "standalone re-OCR requires the OCR proposal services"
+            )
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
@@ -977,6 +1015,11 @@ class FilesystemServiceGraph:
                 CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
                 self.correction_ocr_proposals,
             ),
+            (
+                CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
+                self.correction_ocr_proposal_catalog,
+            ),
+            (CORRECTION_REOCR_SERVICE, self.correction_reocr),
             (CORRECTION_TRANSFORM_SERVICE, self.correction_transforms),
             (
                 DOCUMENT_ARTIFACT_CATALOG_SERVICE,
@@ -1128,6 +1171,8 @@ def compose_filesystem_engine(
     correction_commands = None
     correction_transforms = None
     correction_ocr_proposals = None
+    correction_ocr_proposal_catalog = None
+    correction_reocr = None
     if corrections is not None:
         assert corrections_lock is not None
         corrections_entry_directory_for = (
@@ -1225,9 +1270,34 @@ def compose_filesystem_engine(
             operation_id: str,
             output,
         ) -> bytes | None:
+            resolution_operation = operation_id
+            if operation_id.startswith(CORRECTION_REOCR_OPERATION_PREFIX):
+                # A standalone re-OCR operation names a fresh identity while
+                # the committed bytes still live under the owning transform
+                # publication; recover that operation from the projection pin.
+                resolution_operation = next(
+                    (
+                        pin["operation_id"]
+                        for view in (
+                            correction_transform_store.list_raster_artifacts(
+                                item_id
+                            )
+                        )
+                        if view.key.artifact_id.casefold()
+                        == output.artifact_id.casefold()
+                        for pin in (
+                            view.extensions.get("correction_transform"),
+                        )
+                        if isinstance(pin, Mapping)
+                        and isinstance(pin.get("operation_id"), str)
+                    ),
+                    "",
+                )
+                if not resolution_operation:
+                    return None
             resolved = correction_transform_store.resolve_committed_output(
                 item_id,
-                operation_id,
+                resolution_operation,
                 output,
             )
             if resolved is None:
@@ -1254,12 +1324,19 @@ def compose_filesystem_engine(
         correction_ocr_proposals = CorrectionOcrProposalQueryService(
             correction_ocr_repository
         )
+        correction_ocr_proposal_catalog = CorrectionOcrProposalCatalogService(
+            correction_ocr_repository
+        )
         correction_ocr = None
         if corrections.ocr_provider is not None:
             correction_ocr = CorrectionOcrFollowupService(
                 resources.jobs,
                 correction_ocr_repository,
                 corrections.ocr_provider,
+            )
+            correction_reocr = CorrectionReocrService(
+                correction_ocr,
+                correction_projection,
             )
         correction_transform_worker = CorrectionTransformWorker(
             resources.jobs,
@@ -1456,6 +1533,8 @@ def compose_filesystem_engine(
         correction_commands=correction_commands,
         correction_transforms=correction_transforms,
         correction_ocr_proposals=correction_ocr_proposals,
+        correction_ocr_proposal_catalog=correction_ocr_proposal_catalog,
+        correction_reocr=correction_reocr,
         document_artifacts=capture_document_artifacts,
         document_resources=capture_document_resources,
         raster_artifacts=corrections_artifacts,

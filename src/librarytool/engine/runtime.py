@@ -18,7 +18,11 @@ from .capabilities import (
 from .canvases import CanvasQueryService
 from .canvas_commands import CanvasPreparationService
 from .corrections import CorrectionService
-from .correction_ocr import CorrectionOcrProposalQueryService
+from .correction_ocr import (
+    CorrectionOcrProposalCatalogService,
+    CorrectionOcrProposalQueryService,
+    CorrectionReocrService,
+)
 from .correction_transforms import CorrectionTransformService
 from .document_artifacts import (
     DocumentArtifactCatalogService,
@@ -458,6 +462,12 @@ CORRECTION_TRANSFORM_SERVICE: ServiceKey[CorrectionTransformService] = ServiceKe
 CORRECTION_OCR_PROPOSAL_QUERY_SERVICE: ServiceKey[
     CorrectionOcrProposalQueryService
 ] = ServiceKey("library.corrections.ocr-proposals")
+CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE: ServiceKey[
+    CorrectionOcrProposalCatalogService
+] = ServiceKey("library.corrections.ocr-proposal-catalog")
+CORRECTION_REOCR_SERVICE: ServiceKey[CorrectionReocrService] = ServiceKey(
+    "library.corrections.reocr"
+)
 DOCUMENT_ARTIFACT_CATALOG_SERVICE: ServiceKey[
     DocumentArtifactCatalogService
 ] = ServiceKey("library.document-artifacts.query")
@@ -711,7 +721,9 @@ __all__ = [
     "CORRECTION_REVIEW_SERVICE",
     "CORRECTION_SERVICE",
     "CORRECTION_TRANSFORM_SERVICE",
+    "CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE",
     "CORRECTION_OCR_PROPOSAL_QUERY_SERVICE",
+    "CORRECTION_REOCR_SERVICE",
     "DOCUMENT_ARTIFACT_CATALOG_SERVICE",
     "DOCUMENT_RESOURCE_PAGE_SERVICE",
     "DuplicateServiceError",

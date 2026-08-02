@@ -29,10 +29,23 @@ from .correction_transforms import (
     OcrFollowupState,
 )
 from .jobs import JobFailure, JobManager, JobOutput, JobProgress, JobState, JobView
-from .errors import ConflictError, EngineError, ValidationError
+from .errors import (
+    ConflictError,
+    EngineError,
+    NotFoundError,
+    RepositoryError,
+    ValidationError,
+)
+from .raster_artifacts import RasterArtifactProjectorPort, RasterArtifactView
 
 
 CORRECTION_OCR_JOB_KIND = "correction.ocr-followup"
+# Client idempotency keys map into a hash namespace so a standalone operation
+# id can never accidentally equal a client-chosen transform operation id; a
+# deliberately colliding transform pins a different source and therefore
+# conflicts during replay validation instead of adopting the other domain's
+# durable child job.
+CORRECTION_REOCR_OPERATION_PREFIX = "correction-reocr:"
 CORRECTION_OCR_PROPOSAL_POLICY = "machine-proposal-only"
 CORRECTION_OCR_MAX_SOURCE_BYTES = 256 * 1024 * 1024
 CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT = 10_000
@@ -1038,30 +1051,116 @@ class CorrectionOcrFollowupService:
                     )
                 return self._outcome_from_job(existing, request.source)
 
-            record: MutableMapping[str, Any] = {
-                "id": self.job_id_for(request.operation_id),
-                "kind": CORRECTION_OCR_JOB_KIND,
-                "status": "queued",
-                "operation_id": self.child_operation_id(request.operation_id),
-                "command_sha256": self._command_sha256(request),
-                "subject": {
-                    "item_id": request.item_id,
-                    "source_id": request.source.artifact_id,
-                },
-                "total": 4,
-                "progress": JobProgress(0, 4, "phase", "queued").as_dict(),
-                "input_revisions": {
-                    "parent_operation_id": request.operation_id,
-                    "artifact_id": request.source.artifact_id,
-                    "artifact_revision": request.source.artifact_revision,
-                    "source_sha256": request.source.content_sha256,
-                    "publication_policy": CORRECTION_OCR_PROPOSAL_POLICY,
-                    "command_sha256": self._command_sha256(request),
-                },
-            }
+            record = self._record_template(request)
             self._jobs.track(record, CORRECTION_OCR_JOB_KIND)
             child_hooks = _ChildHooks(self._jobs, record, hooks)
             return self._execute(request, record, child_hooks)
+
+    def queue_ocr_followup(
+        self,
+        request: OcrFollowupRequest,
+    ) -> tuple[JobView, bool]:
+        """Register the durable child job without starting provider work."""
+
+        if not isinstance(request, OcrFollowupRequest):
+            raise TypeError("request must be an OcrFollowupRequest")
+        with self._lock:
+            existing = self._existing_job(request)
+            if existing is None:
+                record = self._record_template(request)
+                try:
+                    self._jobs.track(record, CORRECTION_OCR_JOB_KIND)
+                except ConflictError:
+                    existing = self._existing_job(request)
+                    if existing is None:
+                        raise
+                else:
+                    view = self._jobs.view(record["id"])
+                    if view is None:  # pragma: no cover
+                        raise RuntimeError(
+                            "tracked OCR child job is unavailable"
+                        )
+                    return view, True
+            self._require_matching_job(existing, request)
+            return existing, False
+
+    def execute_queued_ocr_followup(
+        self,
+        request: OcrFollowupRequest,
+        hooks: CorrectionTransformHooksPort,
+    ) -> OcrFollowupOutcome:
+        """Claim one queued child job and run the provider work inline."""
+
+        if not isinstance(request, OcrFollowupRequest):
+            raise TypeError("request must be an OcrFollowupRequest")
+        if not isinstance(hooks, CorrectionTransformHooksPort):
+            raise TypeError("hooks must implement CorrectionTransformHooksPort")
+        with self._lock:
+            existing = self._existing_job(request)
+            if existing is None or existing.state not in {
+                JobState.QUEUED,
+                JobState.CANCELLING,
+            }:
+                raise ConflictError(
+                    "the OCR child job is already claimed or terminal",
+                    code="correction_ocr_job_already_claimed",
+                    details={
+                        "job_id": self.job_id_for(request.operation_id),
+                        "state": (
+                            existing.state.value
+                            if existing is not None
+                            else "unavailable"
+                        ),
+                    },
+                )
+            self._require_matching_job(existing, request)
+            record = self._record_for(existing.job_id)
+            return self._execute(
+                request,
+                record,
+                _ChildHooks(self._jobs, record, hooks),
+            )
+
+    def _record_template(
+        self,
+        request: OcrFollowupRequest,
+    ) -> MutableMapping[str, Any]:
+        return {
+            "id": self.job_id_for(request.operation_id),
+            "kind": CORRECTION_OCR_JOB_KIND,
+            "status": "queued",
+            "operation_id": self.child_operation_id(request.operation_id),
+            "command_sha256": self._command_sha256(request),
+            "subject": {
+                "item_id": request.item_id,
+                "source_id": request.source.artifact_id,
+            },
+            "total": 4,
+            "progress": JobProgress(0, 4, "phase", "queued").as_dict(),
+            "input_revisions": {
+                "parent_operation_id": request.operation_id,
+                "artifact_id": request.source.artifact_id,
+                "artifact_revision": request.source.artifact_revision,
+                "source_sha256": request.source.content_sha256,
+                "publication_policy": CORRECTION_OCR_PROPOSAL_POLICY,
+                "command_sha256": self._command_sha256(request),
+            },
+        }
+
+    @classmethod
+    def _require_matching_job(
+        cls,
+        job: JobView,
+        request: OcrFollowupRequest,
+    ) -> None:
+        try:
+            cls._validate_existing(job, request)
+        except ValueError as exc:
+            raise ConflictError(
+                "the OCR operation was reused for another request",
+                code="correction_ocr_operation_conflict",
+                details={"operation_id": request.operation_id},
+            ) from exc
 
     def _existing_job(self, request: OcrFollowupRequest) -> JobView | None:
         existing = self._jobs.view(self.job_id_for(request.operation_id))
@@ -1444,13 +1543,217 @@ class CorrectionOcrFollowupService:
         )
 
 
+class _DetachedParentHooks:
+    """Standalone child jobs have no parent transform to cancel or notify."""
+
+    def is_cancelled(self) -> bool:
+        return False
+
+    def report_progress(self, progress: JobProgress) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedCorrectionReocr:
+    """Queue receipt pinning the derived operation and OCR-ready source."""
+
+    job: JobView
+    request: OcrFollowupRequest
+    created: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.job, JobView):
+            raise TypeError("job must be a JobView")
+        if not isinstance(self.request, OcrFollowupRequest):
+            raise TypeError("request must be an OcrFollowupRequest")
+        if not isinstance(self.created, bool):
+            raise TypeError("created must be a bool")
+
+    @property
+    def job_id(self) -> str:
+        return self.job.job_id
+
+
+_REOCR_SOURCE_KINDS = frozenset({"corrected-display", "ocr-ready"})
+
+
+class CorrectionReocrService:
+    """Mint standalone OCR proposals against an existing committed transform.
+
+    Operation identity is the client idempotency key: replaying a key returns
+    the stored proposal, a fresh key mints a new ``cop-*`` proposal for the
+    same sha-pinned OCR-ready rendition.  The one-proposal-per-operation
+    receipt stays authoritative; only the key namespace is new.
+    """
+
+    def __init__(
+        self,
+        followup: CorrectionOcrFollowupService,
+        rasters: RasterArtifactProjectorPort,
+    ) -> None:
+        if not isinstance(followup, CorrectionOcrFollowupService):
+            raise TypeError("followup must be a CorrectionOcrFollowupService")
+        if not isinstance(rasters, RasterArtifactProjectorPort):
+            raise TypeError(
+                "rasters must implement RasterArtifactProjectorPort"
+            )
+        self._followup = followup
+        self._rasters = rasters
+
+    @staticmethod
+    def operation_id_for(idempotency_key: str) -> str:
+        key = idempotency_key if isinstance(idempotency_key, str) else ""
+        if _PORTABLE_VALUE.fullmatch(key) is None:
+            raise ValueError("idempotency_key must be a portable identifier")
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return CORRECTION_REOCR_OPERATION_PREFIX + digest[:48]
+
+    def queue_reocr(
+        self,
+        item_id: str,
+        artifact_id: str,
+        *,
+        expected_artifact_revision: str,
+        idempotency_key: str,
+    ) -> QueuedCorrectionReocr:
+        """Register one standalone OCR proposal job without provider work."""
+
+        try:
+            item = _portable(item_id, "item_id")
+            artifact = _portable(artifact_id, "artifact_id")
+            if (
+                not isinstance(expected_artifact_revision, str)
+                or not expected_artifact_revision
+                or len(expected_artifact_revision) > 512
+            ):
+                raise ValueError(
+                    "expected_artifact_revision must be a bounded revision"
+                )
+            operation_id = self.operation_id_for(idempotency_key)
+        except ValueError as exc:
+            raise ValidationError(
+                "the correction re-OCR request is invalid",
+                code="invalid_correction_reocr_request",
+            ) from exc
+        target, ocr_ready = self._locate_source(item, artifact)
+        if target.revision != expected_artifact_revision:
+            raise ConflictError(
+                "the raster artifact changed elsewhere",
+                code="artifact_revision_conflict",
+                details={
+                    "item_id": item,
+                    "artifact_id": target.key.artifact_id,
+                    "expected_revision": expected_artifact_revision,
+                    "current_revision": target.revision,
+                },
+            )
+        request = OcrFollowupRequest(
+            operation_id,
+            item,
+            CommittedCorrectionOutput(
+                "ocr-ready",
+                ocr_ready.key.artifact_id,
+                ocr_ready.revision,
+                ocr_ready.content_sha256,
+            ),
+        )
+        job, created = self._followup.queue_ocr_followup(request)
+        return QueuedCorrectionReocr(job, request, created)
+
+    def execute_queued(
+        self,
+        request: OcrFollowupRequest,
+    ) -> OcrFollowupOutcome:
+        """Run one queued standalone operation registered by this service."""
+
+        if not isinstance(request, OcrFollowupRequest):
+            raise TypeError("request must be an OcrFollowupRequest")
+        if not request.operation_id.startswith(
+            CORRECTION_REOCR_OPERATION_PREFIX
+        ):
+            raise ValidationError(
+                "the operation is not a standalone re-OCR operation",
+                code="invalid_correction_reocr_request",
+            )
+        return self._followup.execute_queued_ocr_followup(
+            request,
+            _DetachedParentHooks(),
+        )
+
+    def _locate_source(
+        self,
+        item_id: str,
+        artifact_id: str,
+    ) -> tuple[RasterArtifactView, RasterArtifactView]:
+        values = tuple(self._rasters.list_raster_artifacts(item_id))
+        target = next(
+            (
+                value
+                for value in values
+                if value.key.artifact_id.casefold() == artifact_id.casefold()
+            ),
+            None,
+        )
+        if target is None:
+            raise NotFoundError(
+                "the raster artifact does not exist",
+                code="raster_artifact_not_found",
+                details={"item_id": item_id, "artifact_id": artifact_id},
+            )
+        kind, operation_id = self._transform_pin(target)
+        if kind not in _REOCR_SOURCE_KINDS:
+            raise ValidationError(
+                "re-OCR requires a committed corrected-display or "
+                "OCR-ready transform output",
+                code="correction_reocr_source_not_transform_output",
+                details={
+                    "item_id": item_id,
+                    "artifact_id": target.key.artifact_id,
+                },
+            )
+        if kind == "ocr-ready":
+            return target, target
+        ocr_ready = next(
+            (
+                value
+                for value in values
+                if self._transform_pin(value) == ("ocr-ready", operation_id)
+            ),
+            None,
+        )
+        if ocr_ready is None:
+            raise RepositoryError(
+                "the committed OCR-ready rendition is unavailable",
+                code="correction_reocr_rendition_unavailable",
+                details={
+                    "item_id": item_id,
+                    "artifact_id": target.key.artifact_id,
+                },
+            )
+        return target, ocr_ready
+
+    @staticmethod
+    def _transform_pin(view: RasterArtifactView) -> tuple[str, str]:
+        pin = view.extensions.get("correction_transform")
+        if not isinstance(pin, Mapping):
+            return "", ""
+        kind = pin.get("output_kind")
+        operation_id = pin.get("operation_id")
+        if not isinstance(kind, str) or not isinstance(operation_id, str):
+            return "", ""
+        return kind, operation_id
+
+
 __all__ = [
     "CORRECTION_OCR_JOB_KIND",
     "CORRECTION_OCR_MAX_SOURCE_BYTES",
     "CORRECTION_OCR_PROPOSAL_CATALOG_MAX_COUNT",
     "CORRECTION_OCR_PROPOSAL_CATALOG_PAGE_LIMIT",
     "CORRECTION_OCR_PROPOSAL_POLICY",
+    "CORRECTION_REOCR_OPERATION_PREFIX",
     "CorrectionOcrFollowupService",
+    "CorrectionReocrService",
+    "QueuedCorrectionReocr",
     "CorrectionOcrProposalAvailability",
     "CorrectionOcrProposalCatalogRepositoryPort",
     "CorrectionOcrProposalCatalogService",

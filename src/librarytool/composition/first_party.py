@@ -27,7 +27,9 @@ from ..engine.runtime import (
     CANVAS_QUERY_SERVICE,
     CORRECTION_CAPTION_SERVICE,
     CORRECTION_METADATA_SERVICE,
+    CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+    CORRECTION_REOCR_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
@@ -87,6 +89,9 @@ CORRECTION_TRANSFORMS_QUEUE_CAPABILITY = CapabilityRef(
 )
 CORRECTION_OCR_PROPOSALS_READ_CAPABILITY = CapabilityRef(
     "library.corrections.ocr-proposals.read"
+)
+CORRECTION_REOCR_QUEUE_CAPABILITY = CapabilityRef(
+    "library.corrections.reocr.queue"
 )
 
 
@@ -217,6 +222,16 @@ FIRST_PARTY_MODULE_MANIFESTS = (
         ),
     ),
     ModuleManifest(
+        "library.corrections.reocr",
+        "1.0.0",
+        provides=(CORRECTION_REOCR_QUEUE_CAPABILITY,),
+        requires=(
+            CapabilityRef("library.jobs"),
+            RASTER_ARTIFACTS_READ_CAPABILITY,
+            CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,
+        ),
+    ),
+    ModuleManifest(
         "library.text-layers",
         "1.0.0",
         provides=(
@@ -334,6 +349,7 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             CORRECTION_REVIEWS_EDIT_CAPABILITY,
             CORRECTION_TRANSFORMS_QUEUE_CAPABILITY,
             CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,
+            CORRECTION_REOCR_QUEUE_CAPABILITY,
             DOCUMENT_ARTIFACTS_READ_CAPABILITY,
         ),
     ),
@@ -554,6 +570,7 @@ def first_party_module_contributions(
 
     if graph.correction_transforms is not None:
         assert graph.correction_ocr_proposals is not None
+        assert graph.correction_ocr_proposal_catalog is not None
         contributions.append(
             ModuleContribution(
                 modules["library.corrections.transforms"],
@@ -568,9 +585,27 @@ def first_party_module_contributions(
                         graph.correction_ocr_proposals,
                         (CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,),
                     ),
+                    ServiceBinding(
+                        CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
+                        graph.correction_ocr_proposal_catalog,
+                        (CORRECTION_OCR_PROPOSALS_READ_CAPABILITY,),
+                    ),
                 ),
             )
         )
+        if graph.correction_reocr is not None:
+            contributions.append(
+                ModuleContribution(
+                    modules["library.corrections.reocr"],
+                    bindings=(
+                        ServiceBinding(
+                            CORRECTION_REOCR_SERVICE,
+                            graph.correction_reocr,
+                            modules["library.corrections.reocr"].provides,
+                        ),
+                    ),
+                )
+            )
 
     if graph.text_layer_aggregate is not None:
         contributions.append(
@@ -706,6 +741,8 @@ def first_party_module_contributions(
 __all__ = [
     "CORRECTION_CAPTIONS_EDIT_CAPABILITY",
     "CORRECTION_METADATA_EDIT_CAPABILITY",
+    "CORRECTION_OCR_PROPOSALS_READ_CAPABILITY",
+    "CORRECTION_REOCR_QUEUE_CAPABILITY",
     "CORRECTION_REVIEWS_EDIT_CAPABILITY",
     "CORRECTION_REVIEWS_READ_CAPABILITY",
     "CORRECTION_TRANSFORMS_QUEUE_CAPABILITY",

@@ -57,9 +57,11 @@ from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.correction_projection import CorrectionProjectionService
 from librarytool.engine.correction_ocr import (
     CORRECTION_OCR_JOB_KIND,
+    CorrectionOcrProposalCatalogService,
     CorrectionOcrProposalQueryService,
     CorrectionOcrProviderSelection,
     CorrectionOcrRecognition,
+    CorrectionReocrService,
 )
 from librarytool.engine.corrections import CorrectionService
 from librarytool.engine.correction_transforms import (
@@ -102,7 +104,9 @@ from librarytool.engine.runtime import (
     CANVAS_QUERY_SERVICE,
     CORRECTION_CAPTION_SERVICE,
     CORRECTION_METADATA_SERVICE,
+    CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+    CORRECTION_REOCR_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
@@ -1050,6 +1054,14 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     tmp_path,
 ):
     capture_root = tmp_path / "captures"
+
+    class _IdleOcrProvider:
+        def select_provider(self):
+            return CorrectionOcrProviderSelection("tesseract", "local")
+
+        def recognize(self, selection, content, hooks):
+            raise AssertionError("composition must not run provider work")
+
     bindings = CorrectionsBindings(
         item_exists_for=lambda item_id: item_id == "book-one",
         capture_id_for=lambda _item_id: None,
@@ -1059,6 +1071,7 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
         capture_authority_root=capture_root,
         representation_revision_for=lambda _item_id, _source_id: None,
         lock_context_for=_catalogue_lock,
+        ocr_provider=_IdleOcrProvider(),
     )
     engine = _composition(
         tmp_path,
@@ -1076,11 +1089,20 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     ocr_proposals = engine.require_service(
         CORRECTION_OCR_PROPOSAL_QUERY_SERVICE
     )
+    ocr_proposal_catalog = engine.require_service(
+        CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE
+    )
+    reocr = engine.require_service(CORRECTION_REOCR_SERVICE)
     assert raster is spatial
     assert isinstance(raster, CorrectionProjectionService)
     assert isinstance(corrections, CorrectionService)
     assert isinstance(transforms, CorrectionTransformService)
     assert isinstance(ocr_proposals, CorrectionOcrProposalQueryService)
+    assert isinstance(
+        ocr_proposal_catalog,
+        CorrectionOcrProposalCatalogService,
+    )
+    assert isinstance(reocr, CorrectionReocrService)
     assert transforms.executable is True
     assert isinstance(raster, FilesystemRasterResourceResolverPort)
     assert raster.list_raster_artifacts("book-one") == ()
@@ -1144,6 +1166,15 @@ def test_complete_corrections_bindings_install_one_projector_and_workbench(
     assert transform_module["provides"] == [
         {"id": "library.corrections.ocr-proposals.read", "version": 1},
         {"id": "library.corrections.transforms.queue", "version": 1},
+    ]
+    reocr_module = next(
+        row
+        for row in document["modules"]
+        if row["id"] == "library.corrections.reocr"
+    )
+    assert reocr_module["status"] == "available"
+    assert reocr_module["provides"] == [
+        {"id": "library.corrections.reocr.queue", "version": 1},
     ]
     workbench = next(
         row
@@ -1590,6 +1621,45 @@ def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
     )
     assert lock_state["held"] is False
     assert lock_state["entries"] > 0
+
+    # A standalone re-OCR against the committed corrected-display output must
+    # resolve the same sha-pinned OCR-ready rendition and mint a second
+    # proposal under the client key's derived operation namespace.
+    corrected = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.extensions.get("correction_transform", {}).get(
+            "output_kind"
+        ) == "corrected-display"
+    )
+    reocr = composed["engine"].require_service(CORRECTION_REOCR_SERVICE)
+    queued_reocr = reocr.queue_reocr(
+        "book-one",
+        corrected.key.artifact_id,
+        expected_artifact_revision=corrected.revision,
+        idempotency_key="fresh-reocr-key",
+    )
+    reocr_outcome = reocr.execute_queued(queued_reocr.request)
+
+    assert queued_reocr.created is True
+    assert queued_reocr.request.operation_id.startswith("correction-reocr:")
+    assert reocr_outcome.state.value == "succeeded"
+    assert reocr_outcome.proposal_ref.startswith("cop-")
+    assert reocr_outcome.proposal_ref != result.ocr_followup.proposal_ref
+    assert len(provider.contents) == 2
+    assert provider.contents[1] == provider.contents[0]
+    standalone_view = composed["engine"].require_service(
+        CORRECTION_OCR_PROPOSAL_QUERY_SERVICE
+    ).get_proposal("book-one", reocr_outcome.proposal_ref)
+    assert standalone_view is not None
+    assert standalone_view.operation_id == queued_reocr.request.operation_id
+    assert standalone_view.source == queued_reocr.request.source
+    catalog_page = composed["engine"].require_service(
+        CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE
+    ).list_proposals("book-one")
+    assert {
+        value.proposal_ref for value in catalog_page.proposals
+    } == {result.ocr_followup.proposal_ref, reocr_outcome.proposal_ref}
 
 
 def test_native_text_layer_vertical_is_absent_without_complete_bindings(

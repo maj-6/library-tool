@@ -47,7 +47,13 @@ from librarytool.engine.correction_transforms import (
     CorrectionTransformService,
     QueuedCorrectionTransform,
 )
-from librarytool.engine.correction_ocr import CorrectionOcrProposalQueryService
+from librarytool.engine.correction_ocr import (
+    CORRECTION_OCR_PROPOSAL_CATALOG_PAGE_LIMIT,
+    CorrectionOcrProposalCatalogService,
+    CorrectionOcrProposalQueryService,
+    CorrectionReocrService,
+    QueuedCorrectionReocr,
+)
 from librarytool.engine.document_artifacts import (
     MAX_DOCUMENT_ARTIFACT_CATALOG_PAGE_LIMIT,
     MAX_DOCUMENT_RESOURCE_PAGE_BYTES,
@@ -76,7 +82,9 @@ from librarytool.engine.runtime import (
     CORRECTION_METADATA_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
+    CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+    CORRECTION_REOCR_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
     DOCUMENT_ARTIFACT_CATALOG_SERVICE,
     DOCUMENT_RESOURCE_PAGE_SERVICE,
@@ -106,6 +114,12 @@ CORRECTION_ITEM_MUTATION_SCHEMA = (
 )
 CORRECTION_TRANSFORM_QUEUE_SCHEMA = (
     "librarytool.correction-transform-queue-receipt/1"
+)
+CORRECTION_REOCR_QUEUE_SCHEMA = (
+    "librarytool.correction-reocr-queue-receipt/1"
+)
+CORRECTION_OCR_PROPOSAL_LIST_SCHEMA = (
+    "librarytool.correction-ocr-proposals/1"
 )
 CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/2"
 CORRECTIONS_INDEX_BOOK_LIMIT = 100_000
@@ -344,6 +358,107 @@ def _correction_ocr_proposal_service(
         CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
         "correction ocr proposal",
     )
+
+
+def _correction_ocr_proposal_catalog_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionOcrProposalCatalogService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
+        "correction ocr proposal catalog",
+    )
+
+
+def _correction_reocr_service(
+    engine_for_request: Callable[[], LibraryEngine],
+) -> CorrectionReocrService:
+    return _query_service(
+        engine_for_request,
+        CORRECTION_REOCR_SERVICE,
+        "correction reocr",
+    )
+
+
+def _correction_ocr_proposal_list(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_id: str,
+) -> Response:
+    cursor = request.args.get("cursor") or None
+    snapshot_revision = request.args.get("snapshot_revision") or None
+    limit = _limit(maximum=CORRECTION_OCR_PROPOSAL_CATALOG_PAGE_LIMIT)
+    page = _correction_ocr_proposal_catalog_service(
+        engine_for_request
+    ).list_proposals(
+        item_id,
+        cursor=cursor,
+        limit=limit,
+        snapshot_revision=snapshot_revision,
+    )
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": CORRECTION_OCR_PROPOSAL_LIST_SCHEMA,
+            **page.as_dict(),
+        },
+        page.snapshot_revision,
+    )
+
+
+def _queue_reocr(
+    engine_for_request: Callable[[], LibraryEngine],
+    submitter: Callable[[CorrectionReocrService, QueuedCorrectionReocr], None]
+    | None,
+    item_id: str,
+    artifact_id: str,
+) -> tuple[Response, int]:
+    idempotency_key = _operation_id()
+    expected_revision = _strong_revision("If-Artifact-Match")
+    _mutation_document(frozenset())
+    if submitter is None:
+        raise RepositoryError(
+            "the correction re-OCR executor is unavailable",
+            code="correction_reocr_executor_unavailable",
+            retryable=True,
+        )
+    service = _correction_reocr_service(engine_for_request)
+    queued = service.queue_reocr(
+        item_id,
+        artifact_id,
+        expected_artifact_revision=expected_revision,
+        idempotency_key=idempotency_key,
+    )
+    if queued.job.state.value in {"queued", "cancelling"}:
+        try:
+            submitter(service, queued)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the correction re-OCR executor is unavailable",
+                code="correction_reocr_executor_unavailable",
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+    job = queued.job.as_dict()
+    input_revisions = dict(job["input_revisions"])
+    input_revisions.pop("command_sha256", None)
+    job["input_revisions"] = input_revisions
+    response = jsonify(
+        {
+            "ok": True,
+            "schema": CORRECTION_REOCR_QUEUE_SCHEMA,
+            "replayed": not queued.created,
+            "operation_id": queued.request.operation_id,
+            "job_id": queued.job_id,
+            "job": job,
+            "source": queued.request.source.as_dict(),
+        }
+    )
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Location"] = f"/api/v1/jobs/{queued.job_id}"
+    return response, 202 if queued.created else 200
 
 
 def _correction_ocr_proposal_detail(
@@ -2731,6 +2846,11 @@ def create_corrections_blueprint(
         None,
     ]
     | None = None,
+    correction_reocr_submitter: Callable[
+        [CorrectionReocrService, QueuedCorrectionReocr],
+        None,
+    ]
+    | None = None,
 ) -> Blueprint:
     """Create the optional Corrections transport.
 
@@ -2801,6 +2921,13 @@ def create_corrections_blueprint(
     ):
         raise TypeError(
             "correction_transform_submitter must be callable or None"
+        )
+    if (
+        correction_reocr_submitter is not None
+        and not callable(correction_reocr_submitter)
+    ):
+        raise TypeError(
+            "correction_reocr_submitter must be callable or None"
         )
     actor_id_for_request = (
         correction_actor_id_for_request
@@ -2928,6 +3055,30 @@ def create_corrections_blueprint(
                 correction_transform_submitter,
                 item_id,
                 artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.post(
+        "/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/reocr"
+    )
+    def queue_correction_reocr(item_id: str, artifact_id: str):
+        try:
+            return _queue_reocr(
+                engine_for_request,
+                correction_reocr_submitter,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get("/api/v1/items/<item_id>/ocr-proposals")
+    def list_correction_ocr_proposals(item_id: str):
+        try:
+            return _correction_ocr_proposal_list(
+                engine_for_request,
+                item_id,
             )
         except EngineError as error:
             return _error_response(error)
@@ -3111,6 +3262,8 @@ __all__ = [
     "CORRECTION_ITEM_METADATA_DEPTH_LIMIT",
     "CORRECTION_ITEM_SCHEMA",
     "CORRECTION_ITEM_MUTATION_SCHEMA",
+    "CORRECTION_OCR_PROPOSAL_LIST_SCHEMA",
+    "CORRECTION_REOCR_QUEUE_SCHEMA",
     "CORRECTION_TRANSFORM_QUEUE_SCHEMA",
     "CORRECTIONS_INDEX_SCHEMA",
     "create_corrections_blueprint",

@@ -14,7 +14,11 @@ from librarytool.composition import (
     first_party_module_contributions,
 )
 from librarytool.engine.capabilities import CapabilityRef
-from librarytool.engine.correction_ocr import CorrectionOcrProposalQueryService
+from librarytool.engine.correction_ocr import (
+    CorrectionOcrProposalCatalogService,
+    CorrectionOcrProposalCatalogSnapshot,
+    CorrectionOcrProposalQueryService,
+)
 from librarytool.engine.correction_transforms import CorrectionTransformService
 from librarytool.engine.corrections import CorrectionService
 from librarytool.engine.document_artifacts import (
@@ -66,6 +70,9 @@ class _EmptyItemRepository:
 class _EmptyCorrectionOcrProposalRepository:
     def get_proposal(self, _item_id, _proposal_ref):
         return None
+
+    def list_proposals(self, item_id):
+        return CorrectionOcrProposalCatalogSnapshot(item_id=item_id)
 
 
 class _EmptyDocumentArtifactRepository:
@@ -149,6 +156,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.corrections.metadata": "1.0.0",
         "library.corrections.reviews": "1.0.0",
         "library.corrections.transforms": "1.0.0",
+        "library.corrections.reocr": "1.0.0",
         "library.text-layers": "1.0.0",
         "library.secrets": "1.0.0",
         "library.providers": "1.0.0",
@@ -329,6 +337,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     assert _capabilities(workbenches["corrections"].enhances) == {
         ("library.jobs", 1),
         ("library.corrections.ocr-proposals.read", 1),
+        ("library.corrections.reocr.queue", 1),
         ("library.corrections.transforms.queue", 1),
         ("library.corrections.captions.edit", 1),
         ("library.corrections.metadata.edit", 1),
@@ -704,6 +713,9 @@ def test_service_graph_allows_independent_correction_command_modules():
         correction_commands=None,
         correction_transforms=transforms,
         correction_ocr_proposals=proposals,
+        correction_ocr_proposal_catalog=CorrectionOcrProposalCatalogService(
+            _EmptyCorrectionOcrProposalRepository()
+        ),
     )
 
     assert command_only.correction_commands is commands

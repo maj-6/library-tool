@@ -28,8 +28,17 @@ from librarytool.engine.correction_transforms import (
 )
 from librarytool.engine.correction_ocr import (
     CORRECTION_OCR_PROPOSAL_POLICY,
+    CORRECTION_REOCR_OPERATION_PREFIX,
+    CorrectionOcrFollowupService,
+    CorrectionOcrProposalCatalogService,
+    CorrectionOcrProposalCatalogSnapshot,
     CorrectionOcrProposalProviderView,
+    CorrectionOcrProposalSummaryView,
     CorrectionOcrProposalView,
+    CorrectionOcrProviderSelection,
+    CorrectionOcrRecognition,
+    CorrectionReocrService,
+    StoredCorrectionOcrProposal,
 )
 from librarytool.engine.jobs import JobManager
 from librarytool.engine.items import ItemView, WorkbenchState
@@ -51,7 +60,9 @@ from librarytool.engine.raster_artifacts import (
 from librarytool.engine.runtime import (
     CORRECTION_CAPTION_SERVICE,
     CORRECTION_METADATA_SERVICE,
+    CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE,
     CORRECTION_OCR_PROPOSAL_QUERY_SERVICE,
+    CORRECTION_REOCR_SERVICE,
     CORRECTION_REVIEW_SERVICE,
     CORRECTION_SERVICE,
     CORRECTION_TRANSFORM_SERVICE,
@@ -208,6 +219,8 @@ class _Engine:
         corrections=None,
         transforms=None,
         ocr_proposals=None,
+        ocr_proposal_catalog=None,
+        reocr=None,
         items=None,
     ):
         self.services = {
@@ -228,6 +241,12 @@ class _Engine:
             self.services[CORRECTION_OCR_PROPOSAL_QUERY_SERVICE] = (
                 ocr_proposals
             )
+        if ocr_proposal_catalog is not None:
+            self.services[CORRECTION_OCR_PROPOSAL_CATALOG_SERVICE] = (
+                ocr_proposal_catalog
+            )
+        if reocr is not None:
+            self.services[CORRECTION_REOCR_SERVICE] = reocr
         if items is not None:
             self.services[ITEM_QUERY_SERVICE] = items
 
@@ -265,6 +284,7 @@ def _app(
     engine,
     resolver=None,
     transform_submitter=None,
+    reocr_submitter=None,
     actor_id_for_request=None,
     workspace_id_for_request=None,
     item_service_for_request=None,
@@ -280,6 +300,7 @@ def _app(
             correction_actor_id_for_request=actor_id_for_request,
             correction_workspace_id_for_request=workspace_id_for_request,
             correction_transform_submitter=transform_submitter,
+            correction_reocr_submitter=reocr_submitter,
         )
     )
     return app
@@ -2066,5 +2087,282 @@ def test_transform_queue_requires_a_process_executor_before_registration():
     assert response.status_code == 503
     assert response.get_json()["code"] == (
         "correction_transform_executor_unavailable"
+    )
+    assert jobs.list() == []
+
+
+def test_ocr_proposal_list_is_versioned_and_revision_pinned():
+    first = _ocr_proposal_view(proposal_ref="cop-" + "a" * 40)
+    second = _ocr_proposal_view(proposal_ref="cop-" + "b" * 40)
+    snapshot = CorrectionOcrProposalCatalogSnapshot(
+        item_id="book-1",
+        proposals=(
+            CorrectionOcrProposalSummaryView.from_proposal(first),
+            CorrectionOcrProposalSummaryView.from_proposal(second),
+        ),
+    )
+
+    class _CatalogRepository:
+        def list_proposals(self, item_id):
+            assert item_id == "book-1"
+            return snapshot
+
+    client = _app(
+        _Engine(
+            _RasterProjector(()),
+            _SpatialProjector(()),
+            ocr_proposal_catalog=CorrectionOcrProposalCatalogService(
+                _CatalogRepository()
+            ),
+        )
+    ).test_client()
+
+    response = client.get("/api/v1/items/book-1/ocr-proposals")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["schema"] == "librarytool.correction-ocr-proposals/1"
+    assert body["item_id"] == "book-1"
+    assert body["snapshot_revision"] == snapshot.snapshot_revision
+    assert [row["proposal_ref"] for row in body["proposals"]] == [
+        first.proposal_ref,
+        second.proposal_ref,
+    ]
+    assert body["next_cursor"] is None
+    assert body["total"] == 2
+    assert response.headers["ETag"] == f'"{snapshot.snapshot_revision}"'
+    serialized = response.get_data(as_text=True).casefold()
+    assert "recognition" not in serialized
+    assert "options" not in serialized
+
+    paged = client.get("/api/v1/items/book-1/ocr-proposals?limit=1")
+    paged_body = paged.get_json()
+    assert [row["proposal_ref"] for row in paged_body["proposals"]] == [
+        first.proposal_ref
+    ]
+    assert paged_body["next_cursor"]
+    rest = client.get(
+        "/api/v1/items/book-1/ocr-proposals",
+        query_string={"cursor": paged_body["next_cursor"], "limit": 1},
+    )
+    assert [row["proposal_ref"] for row in rest.get_json()["proposals"]] == [
+        second.proposal_ref
+    ]
+
+    stale = client.get(
+        "/api/v1/items/book-1/ocr-proposals",
+        query_string={"snapshot_revision": "cops-" + "0" * 64},
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == (
+        "correction_ocr_proposal_catalog_changed"
+    )
+
+    missing = _app(
+        _Engine(_RasterProjector(()), _SpatialProjector(()))
+    ).test_client().get("/api/v1/items/book-1/ocr-proposals")
+    assert missing.status_code == 503
+    assert missing.get_json()["code"] == (
+        "correction_ocr_proposal_catalog_module_unavailable"
+    )
+
+
+class _ReocrProposalRepository:
+    def __init__(self, content):
+        self.content = content
+        self.stored = {}
+
+    def read_source(self, request):
+        return self.content
+
+    def find_proposal(self, request):
+        return self.stored.get(request.operation_id)
+
+    def commit_proposal(self, request, recognition):
+        return self.stored.setdefault(
+            request.operation_id,
+            StoredCorrectionOcrProposal(
+                f"proposal-{len(self.stored) + 1}",
+                request.source,
+                CorrectionOcrProviderSelection(
+                    recognition.provider_id,
+                    recognition.model,
+                    recognition.options,
+                ),
+            ),
+        )
+
+
+class _ReocrProvider:
+    def select_provider(self):
+        return CorrectionOcrProviderSelection("tesseract", "5.4")
+
+    def recognize(self, selection, content, hooks):
+        return CorrectionOcrRecognition(
+            selection.provider_id,
+            selection.model,
+            {"text": "machine"},
+            selection.options,
+        )
+
+
+def _reocr_harness(content=b"ocr ready bytes"):
+    display = _raster(
+        "ctr-display-1",
+        kind="corrected-image",
+        content=b"display bytes",
+        extensions={
+            "correction_transform": {
+                "operation_id": "transform-op-1",
+                "output_kind": "corrected-display",
+            }
+        },
+    )
+    ocr_ready = _raster(
+        "ctr-ocr-1",
+        kind="processed-source",
+        content=content,
+        extensions={
+            "correction_transform": {
+                "operation_id": "transform-op-1",
+                "output_kind": "ocr-ready",
+            }
+        },
+    )
+    projector = _RasterProjector((display, ocr_ready, _raster("image-1")))
+    jobs = JobManager(checkpoint_interval=0)
+    followup = CorrectionOcrFollowupService(
+        jobs,
+        _ReocrProposalRepository(content),
+        _ReocrProvider(),
+    )
+    return display, ocr_ready, jobs, CorrectionReocrService(
+        followup,
+        projector,
+    ), projector
+
+
+def test_reocr_queue_is_versioned_idempotent_and_schedules_outside_http():
+    display, ocr_ready, jobs, reocr, projector = _reocr_harness()
+    submitted = []
+    client = _app(
+        _Engine(projector, _SpatialProjector(()), reocr=reocr),
+        reocr_submitter=lambda service, queued: submitted.append(
+            (service, queued)
+        ),
+    ).test_client()
+    path = "/api/v1/items/book-1/raster-artifacts/ctr-display-1/reocr"
+    headers = {
+        "Idempotency-Key": "reocr-key-1",
+        "If-Artifact-Match": f'"{display.revision}"',
+    }
+
+    first = client.post(path, json={}, headers=headers)
+    replay = client.post(path, json={}, headers=headers)
+
+    assert first.status_code == 202
+    assert replay.status_code == 200
+    body = first.get_json()
+    assert body["schema"] == "librarytool.correction-reocr-queue-receipt/1"
+    assert body["replayed"] is False
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["job_id"] == body["job_id"]
+    assert body["operation_id"].startswith(CORRECTION_REOCR_OPERATION_PREFIX)
+    assert body["job"]["kind"] == "correction.ocr-followup"
+    assert body["source"] == {
+        "kind": "ocr-ready",
+        "artifact_id": "ctr-ocr-1",
+        "artifact_revision": ocr_ready.revision,
+        "content_sha256": ocr_ready.content_sha256,
+    }
+    assert body["job"]["input_revisions"] == {
+        "parent_operation_id": body["operation_id"],
+        "artifact_id": "ctr-ocr-1",
+        "artifact_revision": ocr_ready.revision,
+        "source_sha256": ocr_ready.content_sha256,
+        "publication_policy": CORRECTION_OCR_PROPOSAL_POLICY,
+    }
+    assert "command_sha256" not in str(body)
+    assert first.headers["Location"] == f"/api/v1/jobs/{body['job_id']}"
+    assert first.headers["Cache-Control"] == "no-store"
+    assert len(jobs.list()) == 1
+    assert [value[1].created for value in submitted] == [True, False]
+
+
+def test_reocr_queue_rejects_missing_headers_and_invalid_targets():
+    display, _ocr_ready, jobs, reocr, projector = _reocr_harness()
+    client = _app(
+        _Engine(projector, _SpatialProjector(()), reocr=reocr),
+        reocr_submitter=lambda *_args: None,
+    ).test_client()
+    path = "/api/v1/items/book-1/raster-artifacts/ctr-display-1/reocr"
+    revision = {"If-Artifact-Match": f'"{display.revision}"'}
+
+    missing_key = client.post(path, json={}, headers=revision)
+    missing_revision = client.post(
+        path,
+        json={},
+        headers={"Idempotency-Key": "reocr-key-1"},
+    )
+    extra_field = client.post(
+        path,
+        json={"provider": "forged"},
+        headers={"Idempotency-Key": "reocr-key-1", **revision},
+    )
+    stale = client.post(
+        path,
+        json={},
+        headers={
+            "Idempotency-Key": "reocr-key-1",
+            "If-Artifact-Match": '"stale-revision"',
+        },
+    )
+    not_transform = client.post(
+        "/api/v1/items/book-1/raster-artifacts/image-1/reocr",
+        json={},
+        headers={
+            "Idempotency-Key": "reocr-key-1",
+            "If-Artifact-Match": '"artifact-image-1-r1"',
+        },
+    )
+    unknown = client.post(
+        "/api/v1/items/book-1/raster-artifacts/missing/reocr",
+        json={},
+        headers={
+            "Idempotency-Key": "reocr-key-1",
+            "If-Artifact-Match": '"whatever"',
+        },
+    )
+
+    assert missing_key.status_code == 428
+    assert missing_key.get_json()["code"] == "idempotency_key_required"
+    assert missing_revision.status_code == 428
+    assert missing_revision.get_json()["code"] == (
+        "correction_target_revision_required"
+    )
+    assert extra_field.status_code == 400
+    assert extra_field.get_json()["code"] == (
+        "invalid_correction_mutation_envelope"
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "artifact_revision_conflict"
+    assert not_transform.status_code == 400
+    assert not_transform.get_json()["code"] == (
+        "correction_reocr_source_not_transform_output"
+    )
+    assert unknown.status_code == 404
+    assert unknown.get_json()["code"] == "raster_artifact_not_found"
+    assert jobs.list() == []
+
+    no_executor = _app(
+        _Engine(projector, _SpatialProjector(()), reocr=reocr)
+    ).test_client().post(
+        path,
+        json={},
+        headers={"Idempotency-Key": "reocr-key-1", **revision},
+    )
+    assert no_executor.status_code == 503
+    assert no_executor.get_json()["code"] == (
+        "correction_reocr_executor_unavailable"
     )
     assert jobs.list() == []
