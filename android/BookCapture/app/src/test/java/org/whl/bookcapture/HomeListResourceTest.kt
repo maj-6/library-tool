@@ -192,12 +192,14 @@ class HomeListResourceTest {
         assertEquals("com.google.android.material.button.MaterialButton", sync.tagName)
         assertEquals("@drawable/ic_sync_upload", sync.getAttributeNS(appNs, "icon"))
         assertTrue(source.contains("UploadWorker.enqueueExplicitSync(this)"))
+        assertTrue(source.contains("ProcessWorker.resumePendingForcedRetries(this@HomeActivity)"))
         assertTrue(source.contains("CaptureMetadataSyncWorker.enqueueExplicitSync(this)"))
         val syncSource = source.substringAfter("private fun syncCaptures()")
             .substringBefore("private fun emphasizeTab")
         val normalizedSyncSource = syncSource.filterNot(Char::isWhitespace)
         for (resource in listOf(
             "home_sync_sign_in", "home_sync_none", "home_sync_queued", "home_sync_running",
+            "home_sync_retry",
             "home_sync_captures", "home_sync_complete", "home_sync_partial", "home_sync_failed",
         )) {
             // Some messages share one RemoteUiCatalog call and select the
@@ -210,6 +212,8 @@ class HomeListResourceTest {
         assertTrue(source.contains("R.string.home_sync_review_queued"))
         assertEquals("polite", sync.getAttributeNS(androidNs, "accessibilityLiveRegion"))
         assertTrue(source.contains("binding.syncCaptures.announceForAccessibility(message)"))
+        assertTrue(source.contains("state.active && state.phase != CaptureSyncPhase.QUEUED"))
+        assertTrue(source.contains("binding.syncCaptures.isEnabled = !state.active || canRetryActive"))
 
         val copyrightButton = elementById(scanRow, "copyrightStatus")
         assertEquals("@style/WhlMetadataIconButton", copyrightButton.getAttribute("style"))

@@ -29,8 +29,8 @@ android {
         applicationId = "org.whl.bookcapture"
         minSdk = 26
         targetSdk = 34
-        versionCode = 36
-        versionName = "0.5.2-alpha.5"
+        versionCode = 37
+        versionName = "0.5.2-alpha.6"
         buildConfigField("String", "SUPABASE_URL", "\"${env("WHL_SUPABASE_URL")}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${env("WHL_SUPABASE_ANON_KEY")}\"")
     }
@@ -90,7 +90,7 @@ dependencies {
     // sideloaded/non-GMS devices; CameraX supplies the preview and frames.
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
-    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("androidx.work:work-runtime-ktx:2.11.2")
 
     // Native WebSocket transport for Mistral Voxtral realtime transcription.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

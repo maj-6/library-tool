@@ -346,7 +346,7 @@ class UploadStateTest {
     @Test
     fun cloudRetryWritesAreServerSideIdempotent() {
         val source = File("src/main/java/org/whl/bookcapture/SupabaseClient.kt").readText()
-        assertTrue(source.contains("setRequestProperty(\"x-upsert\", \"true\")"))
+        assertTrue(source.contains(".header(\"x-upsert\", \"true\")"))
         assertTrue(source.contains("resolution=ignore-duplicates"))
     }
 

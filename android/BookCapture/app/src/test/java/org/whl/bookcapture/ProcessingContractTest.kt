@@ -1,5 +1,6 @@
 package org.whl.bookcapture
 
+import androidx.work.WorkInfo
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -65,8 +66,14 @@ class ProcessingContractTest {
         assertTrue(worker.contains("KEY_ENTRY_ID to entryId"))
         assertTrue(worker.contains("ExistingWorkPolicy.APPEND_OR_REPLACE"))
         assertTrue(worker.contains("if (requestedId == null)"))
-        assertTrue(worker.contains("permanent != null && forceReprocess -> Result.failure()"))
-        assertTrue(worker.contains("shouldRetryProcessingWork(\n                transient,"))
+        assertFalse(worker.contains("Result.failure()"))
+        assertTrue(worker.contains("ProcessingWorkDecision.COMPLETE_CHAIN ->"))
+        assertTrue(worker.contains("finishReprocess(error)"))
+        assertTrue(worker.contains("processingWorkDecision(transient, forceReprocess, runAttemptCount)"))
+        assertTrue(
+            worker.indexOf("finishReprocess(error)") <
+                worker.indexOf("transient = transient || outcome.retry"),
+        )
     }
 
     @Test
@@ -207,7 +214,7 @@ class ProcessingContractTest {
     }
 
     @Test
-    fun automaticBacklogRetriesAreBoundedWithoutBoundingExplicitReprocess() {
+    fun automaticAndForcedProcessingRetriesAreBounded() {
         assertFalse(shouldRetryProcessingWork(
             retryRequested = false,
             forceReprocess = false,
@@ -231,7 +238,81 @@ class ProcessingContractTest {
         assertTrue(shouldRetryProcessingWork(
             retryRequested = true,
             forceReprocess = true,
-            runAttemptCount = 1_000,
+            runAttemptCount = MAX_FORCED_PROCESS_RETRIES - 1,
         ))
+        assertFalse(shouldRetryProcessingWork(
+            retryRequested = true,
+            forceReprocess = true,
+            runAttemptCount = MAX_FORCED_PROCESS_RETRIES,
+        ))
+    }
+
+    @Test
+    fun terminalProcessingOutcomesCompleteTheirSerialChain() {
+        assertEquals(
+            ProcessingWorkDecision.COMPLETE_CHAIN,
+            processingWorkDecision(
+                retryRequested = false,
+                forceReprocess = true,
+                runAttemptCount = 0,
+            ),
+        )
+        assertEquals(
+            ProcessingWorkDecision.RETRY,
+            processingWorkDecision(
+                retryRequested = true,
+                forceReprocess = true,
+                runAttemptCount = MAX_FORCED_PROCESS_RETRIES - 1,
+            ),
+        )
+        assertEquals(
+            ProcessingWorkDecision.COMPLETE_CHAIN,
+            processingWorkDecision(
+                retryRequested = true,
+                forceReprocess = true,
+                runAttemptCount = MAX_FORCED_PROCESS_RETRIES,
+            ),
+        )
+        assertEquals(
+            ProcessingWorkDecision.COMPLETE_CHAIN,
+            processingWorkDecision(
+                retryRequested = true,
+                forceReprocess = false,
+                runAttemptCount = MAX_AUTOMATIC_PROCESS_RETRIES,
+            ),
+        )
+    }
+
+    @Test
+    fun strandedForcedRetryRecoveryDoesNotDuplicateUnfinishedWork() {
+        for (state in listOf(
+            WorkInfo.State.ENQUEUED,
+            WorkInfo.State.RUNNING,
+            WorkInfo.State.BLOCKED,
+        )) {
+            assertTrue(isUnfinishedProcessingWork(state))
+        }
+        for (state in listOf(
+            WorkInfo.State.SUCCEEDED,
+            WorkInfo.State.FAILED,
+            WorkInfo.State.CANCELLED,
+        )) {
+            assertFalse(isUnfinishedProcessingWork(state))
+        }
+
+        val worker = source("ProcessWorker")
+        assertTrue(worker.contains("@Synchronized\n        fun resumePendingForcedRetries"))
+        val scan = worker.indexOf("Entries.recent(ctx).asSequence()")
+        val marker = worker.indexOf(".filter { it.reprocessPending() }", scan)
+        val activeCheck = worker.indexOf(
+            "retryWork.any { isUnfinishedProcessingWork(it.state) }",
+            marker,
+        )
+        val enqueue = worker.indexOf("enqueueForcedRetry(ctx, pendingIds)", activeCheck)
+
+        assertTrue(scan >= 0)
+        assertTrue(marker > scan)
+        assertTrue(activeCheck > marker)
+        assertTrue(enqueue > activeCheck)
     }
 }

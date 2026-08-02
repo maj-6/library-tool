@@ -8,6 +8,7 @@ import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
@@ -23,18 +24,53 @@ import java.io.RandomAccessFile
 import java.util.concurrent.TimeUnit
 
 internal const val MAX_AUTOMATIC_PROCESS_RETRIES = 3
+internal const val MAX_FORCED_PROCESS_RETRIES = 3
+
+internal enum class ProcessingWorkDecision {
+    RETRY,
+    COMPLETE_CHAIN,
+}
+
+internal fun isUnfinishedProcessingWork(state: WorkInfo.State): Boolean = when (state) {
+    WorkInfo.State.ENQUEUED,
+    WorkInfo.State.RUNNING,
+    WorkInfo.State.BLOCKED,
+    -> true
+    WorkInfo.State.SUCCEEDED,
+    WorkInfo.State.FAILED,
+    WorkInfo.State.CANCELLED,
+    -> false
+}
 
 /**
- * Automatic captures share one serial WorkManager chain. A permanently partial
- * or invalid response must eventually release that chain so later books can
- * run. Explicit reprocess work is isolated per entry and may keep retrying.
+ * Processing captures share serial WorkManager chains. A permanently partial,
+ * invalid, or repeatedly transient response must eventually release its chain
+ * so later books can run.
  */
 internal fun shouldRetryProcessingWork(
     retryRequested: Boolean,
     forceReprocess: Boolean,
     runAttemptCount: Int,
-): Boolean = retryRequested &&
-    (forceReprocess || runAttemptCount < MAX_AUTOMATIC_PROCESS_RETRIES)
+): Boolean = retryRequested && runAttemptCount < if (forceReprocess) {
+    MAX_FORCED_PROCESS_RETRIES
+} else {
+    MAX_AUTOMATIC_PROCESS_RETRIES
+}
+
+internal fun processingWorkDecision(
+    retryRequested: Boolean,
+    forceReprocess: Boolean,
+    runAttemptCount: Int,
+): ProcessingWorkDecision = if (
+    shouldRetryProcessingWork(retryRequested, forceReprocess, runAttemptCount)
+) {
+    ProcessingWorkDecision.RETRY
+} else {
+    // A terminal result must succeed at the WorkManager level. Both kinds of
+    // retry use serial chains, and a failed WorkManager result would cancel
+    // every capture behind this one even though the error is entry-local.
+    ProcessingWorkDecision.COMPLETE_CHAIN
+}
 
 /**
  * Background processing, kicked after every photo and every seal: standardize
@@ -151,6 +187,33 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             continuation.enqueue()
         }
 
+        /**
+         * Repair explicit-reprocess holds left by an older failed serial chain.
+         * This performs a blocking WorkManager query and must run off the main
+         * thread. An unfinished chain already owns every pending marker; only a
+         * fully terminal or missing chain is safe to rebuild.
+         */
+        @Synchronized
+        fun resumePendingForcedRetries(ctx: Context): Boolean {
+            val pendingIds = Entries.recent(ctx).asSequence()
+                .filter { it.reprocessPending() }
+                .map { it.id }
+                .toList()
+            if (pendingIds.isEmpty()) return false
+
+            val workManager = WorkManager.getInstance(ctx)
+            val retryWork = try {
+                workManager.getWorkInfosForUniqueWork(RETRY_WORK_NAME).get()
+            } catch (error: Exception) {
+                Log.w("ProcessWorker", "Could not inspect explicit retry work", error)
+                return false
+            }
+            if (retryWork.any { isUnfinishedProcessingWork(it.state) }) return false
+
+            enqueueForcedRetry(ctx, pendingIds)
+            return true
+        }
+
         private fun enqueueBacklog(ctx: Context, entryIds: List<String>) {
             val requests = entryIds.distinct().sorted().map { entryId ->
                 processingRequest(entryId, forceReprocess = false)
@@ -185,7 +248,8 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         for (dir in dirs) {
             currentCoroutineContext().ensureActive()
             val outcome = EntryOperationLocks.withLock(dir.name) {
-                if (!dir.isDirectory) DirectoryOutcome()
+                val forced = forceReprocess && requestedId == dir.name
+                val directoryOutcome = if (!dir.isDirectory) DirectoryOutcome()
                 else if (!cleanupCommittedThumbnailDeletes(dir)) {
                     DirectoryOutcome(
                         retry = true,
@@ -197,10 +261,23 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                     dir,
                     mistral,
                     deepseek,
-                    forced = forceReprocess && requestedId == dir.name,
+                    forced = forced,
                     workerRetry = runAttemptCount > 0,
                     workAttempt = runAttemptCount,
                 )
+                if (forced &&
+                    (directoryOutcome.permanentError != null || directoryOutcome.retry) &&
+                    processingWorkDecision(
+                        directoryOutcome.retry,
+                        forceReprocess = true,
+                        runAttemptCount = runAttemptCount,
+                    ) == ProcessingWorkDecision.COMPLETE_CHAIN
+                ) {
+                    val error = directoryOutcome.permanentError ?: directoryOutcome.lastError
+                        ?: "Processing did not complete after ${runAttemptCount + 1} attempts"
+                    Entries.find(ctx, dir.name)?.finishReprocess(error)
+                }
+                directoryOutcome
             }
             transient = transient || outcome.retry
             if (permanent == null) permanent = outcome.permanentError
@@ -212,18 +289,9 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         Prefs.setLastProcError(ctx, permanent ?: lastFailure)
         // Processing is local-only. Delivery starts only from the explicit
         // capture-sync action; its bounded chain rechecks deferred entries.
-        when {
-            shouldRetryProcessingWork(
-                transient,
-                forceReprocess,
-                runAttemptCount,
-            ) -> Result.retry()
-            // A terminal failure belongs to this capture, not the serial
-            // backlog chain. Marking an automatic unit failed would prevent
-            // every dependent book from running. An explicit user-requested
-            // reprocess may still expose WorkInfo.failure to its own observer.
-            permanent != null && forceReprocess -> Result.failure()
-            else -> Result.success()
+        when (processingWorkDecision(transient, forceReprocess, runAttemptCount)) {
+            ProcessingWorkDecision.RETRY -> Result.retry()
+            ProcessingWorkDecision.COMPLETE_CHAIN -> Result.success()
         }
     }
 

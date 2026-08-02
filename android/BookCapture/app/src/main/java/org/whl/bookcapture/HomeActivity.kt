@@ -266,6 +266,7 @@ class HomeActivity : AppCompatActivity() {
             .getWorkInfosLiveData(activeUniqueWorkQuery(
                 ProcessWorker.UNIQUE_WORK_NAME,
                 ProcessWorker.BACKLOG_WORK_NAME,
+                ProcessWorker.RETRY_WORK_NAME,
                 UploadWorker.EXPLICIT_SYNC_WORK_NAME,
                 CaptureMetadataSyncWorker.WORK_NAME,
                 CaptureMetadataSyncWorker.PULL_WORK_NAME,
@@ -304,6 +305,12 @@ class HomeActivity : AppCompatActivity() {
         // new upload batch is created only by the Sync captures button.
         UploadWorker.kick(this)
         ProcessWorker.enqueue(this)
+        // alpha.5 could cancel the tail of a bulk reprocess chain while
+        // leaving its per-capture hold files behind. Rebuild that chain off
+        // the UI thread so an app update can release an already-stalled sync.
+        lifecycleScope.launch(Dispatchers.IO) {
+            ProcessWorker.resumePendingForcedRetries(this@HomeActivity)
+        }
         CollectionSyncWorker.enqueueCoalesced(this)
         CaptureMetadataSyncWorker.enqueuePull(this)
         Prefs.activeCaptureSyncRecord(this)?.let { active ->
@@ -560,6 +567,12 @@ class HomeActivity : AppCompatActivity() {
             ).show()
             return
         }
+        // Retry the alpha.5 marker repair on an explicit recovery press too;
+        // the worker-side synchronized/live-work check makes this a no-op
+        // while a valid processing chain is already running.
+        lifecycleScope.launch(Dispatchers.IO) {
+            ProcessWorker.resumePendingForcedRetries(this@HomeActivity)
+        }
         val known = Entries.recent(this)
         val pendingReviewChanges = known.any {
             CaptureMetadataStore.hasPendingReviewSync(it.dir)
@@ -642,11 +655,23 @@ class HomeActivity : AppCompatActivity() {
                 syncFeedbackPhase = null
             }
         }
-        binding.syncCaptures.isEnabled = !state.active
-        binding.syncCaptures.alpha = if (state.active) .72f else 1f
+        // A process death can leave durable accounting at RUNNING after its
+        // WorkSpec is terminal. Every non-queued active phase is therefore a
+        // safe, explicit restart target; delivery writes are idempotent.
+        val canRetryActive = state.active && state.phase != CaptureSyncPhase.QUEUED
+        val showRetryLabel = state.phase == CaptureSyncPhase.WAITING_FOR_PROCESSING ||
+            state.phase == CaptureSyncPhase.RETRYING
+        binding.syncCaptures.isEnabled = !state.active || canRetryActive
+        binding.syncCaptures.alpha = if (state.active && !canRetryActive) .72f else 1f
         binding.syncCaptures.text = when {
             state.phase == CaptureSyncPhase.QUEUED ->
                 RemoteUiCatalog.text(this, R.string.home_sync_queued)
+            showRetryLabel && state.requestedCount > 0 -> RemoteUiCatalog.text(
+                this,
+                R.string.home_sync_retry,
+                state.syncedCount,
+                state.requestedCount,
+            )
             state.active && state.requestedCount > 0 -> RemoteUiCatalog.text(
                 this,
                 R.string.home_sync_running,

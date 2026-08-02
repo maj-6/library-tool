@@ -3,6 +3,17 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.6 — 2026-08-01
+
+Android version code: `37`.
+
+### Bugfixes
+
+- A failed item in **Retry reading details** no longer cancels every capture behind it and leaves Sync stuck after its first successful upload.
+- Captures stranded by 0.5.2-alpha.5 are recovered automatically after updating; **Retry sync** also remains available while processing or networking is waiting.
+- Cloud continuations now use Android's connected-network scheduling, including Android 15 and 16 fixes from the current WorkManager release.
+- Photo uploads have bounded write and whole-call timeouts, so an unresponsive connection cannot hold the capture queue forever.
+
 ## 0.5.2-alpha.5 — 2026-07-30
 
 Android version code: `36`.
