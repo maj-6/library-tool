@@ -173,6 +173,10 @@
           <dl class="property-list" data-properties-list>
             <div><dt>Selection</dt><dd>Nothing selected</dd></div>
           </dl>
+          <section class="ch-panel-host" data-ch-panel hidden
+                   aria-label="CH master-list match"></section>
+          <section class="ocr-proposals-host" data-ocr-proposals hidden
+                   aria-label="Machine OCR proposals"></section>
         </div>
       </aside>
 
@@ -241,6 +245,8 @@
   <script src="{{ url_for('static', filename='corrections/classification-controls.js') }}?v={{ corrections_classification_controls_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-editor-state.js') }}?v={{ image_editor_state_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-adjust-tool.js') }}?v={{ corrections_image_adjust_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/ocr-proposals.js') }}?v={{ ocr_proposals_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/ch-panel.js') }}?v={{ ch_panel_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-editor.js') }}?v={{ corrections_image_editor_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/shell.js') }}?v={{ corrections_shell_v }}"></script>
 </body>

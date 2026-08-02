@@ -66,6 +66,7 @@ from werkzeug.exceptions import HTTPException
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tools"))
+import build_ch_index as ch_index  # noqa: E402
 import capture_pipeline as capture  # noqa: E402
 import capture_lib as capture_lib_compat  # noqa: E402
 import catalog_checks as checks  # noqa: E402
@@ -2100,6 +2101,8 @@ def corrections_workbench():
         corrections_image_adjust_v=_asset_v(
             "corrections/image-adjust-tool.js"
         ),
+        ocr_proposals_v=_asset_v("corrections/ocr-proposals.js"),
+        ch_panel_v=_asset_v("corrections/ch-panel.js"),
         corrections_image_editor_v=_asset_v("corrections/image-editor.js"),
         corrections_shell_v=_asset_v("corrections/shell.js"),
     )
@@ -7593,6 +7596,537 @@ class _CorrectionsItemUpdateService:
 
 def _corrections_item_update_engine() -> _CorrectionsItemUpdateService:
     return _CorrectionsItemUpdateService()
+
+
+# --- CH master-list reconciliation ---------------------------------------------
+#
+# Link a capture-backed Corrections item to one row of the CH private-library
+# master list (ch_library.json): resolve the phone's approval stamp, propose
+# candidates, and approve/reject from the desktop. All matching math is the
+# shared desktop matcher (catalog_checks/whl_client), reached through
+# build_ch_index so this panel, the APK index, and the phone can never
+# disagree about normalisation or thresholds.
+
+# ChMergePresenter.FIELD_ORDER: the phone joins adopted/conflicts field names
+# in this order, and the desktop stamp must stay byte-compatible with it.
+_CH_STAMP_FIELD_ORDER = (
+    "title", "author", "year", "edition", "volume", "publisher", "city",
+    "pages", "condition", "illustrations", "price", "categories", "notes",
+)
+# merge_fields speaks the phone's field names; the corrections item API spells
+# these two differently (ManualEntryItemCodec's legacy-to-canonical map).
+_CH_FIELD_TO_ITEM_FIELD = {
+    "author": "authors",
+    "city": "publisher_city",
+}
+# WhlCatalogueItemCodec has no columns for these, so a promoted (build-backed)
+# capture can neither adopt nor conflict on them.
+_CH_BUILD_UNSUPPORTED_FIELDS = frozenset({"condition", "illustrations", "price"})
+
+_ch_reconcile_lock = threading.Lock()
+_ch_reconcile_cache: dict = {}
+
+
+def _ch_java_hash_hex(text: str) -> str:
+    """Unsigned lowercase hex of Java String.hashCode(), without padding.
+
+    Cross-platform contract with ChIndex.kt keyFor(): h = 31*h + unit over the
+    UTF-16 code units with 32-bit wrapping, rendered like Integer.toHexString
+    renders the value's unsigned bits. Basis strings are ASCII after
+    whl_client._normalize, but the units are computed exactly so a stray
+    non-ASCII year can never diverge from the phone.
+    """
+    h = 0
+    data = text.encode("utf-16-be")
+    for i in range(0, len(data), 2):
+        h = (h * 31 + ((data[i] << 8) | data[i + 1])) & 0xFFFFFFFF
+    return format(h, "x")
+
+
+def _ch_phone_key(nt: str, na: str, year_text: str) -> str:
+    """The phone's content-derived CH row key (ChIndex.kt keyFor()).
+
+    basis = normalized title + normalized flipped author + year text with NO
+    separators; key = unsigned-hex Java hash + "-" + length in UTF-16 units.
+    """
+    basis = f"{nt}{na}{year_text}"
+    return (
+        f"{_ch_java_hash_hex(basis)}-{len(basis.encode('utf-16-be')) // 2}"
+    )
+
+
+def _ch_reconcile_index() -> dict | None:
+    """Posting lists + phone keys over ch_library.json, cached per file state.
+
+    Mirrors build_ch_index.build_index — same row skip rule, same precomputed
+    normalisation, same bucketing — plus a by-key map for stamp resolution.
+    Returns None when the master list is not available (no error: the CH
+    panel simply reports list_available false).
+    """
+    path = lib.CH_LIBRARY_JSON_PATH
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    signature = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _ch_reconcile_lock:
+        if _ch_reconcile_cache.get("signature") == signature:
+            return _ch_reconcile_cache.get("index")
+    rows = lib.load_json(path, None)
+    index = None
+    if isinstance(rows, list):
+        entries: list[dict] = []
+        by_key: dict[str, list[int]] = {}
+        by_author: dict[str, list[int]] = {}
+        by_title: dict[str, list[int]] = {}
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            title = ch_index.display_title(row)
+            author = str(row.get("authors") or "").strip()
+            if not title and not author:
+                continue
+            # The phone reads the index's "y" through JSONObject.optString,
+            # so a numeric year must render as its plain decimal text.
+            year = row.get("year_of_publication") or ""
+            year_text = year if isinstance(year, str) else str(year)
+            nt = whl_client._normalize(title)
+            position = len(entries)
+            entries.append({
+                "index": row_index,
+                "key": _ch_phone_key(
+                    nt,
+                    whl_client._normalize(whl_client.flip_author(author)),
+                    year_text,
+                ),
+                "title": title,
+                "author": author,
+                "year": year_text,
+                "fields": ch_index.merge_fields(row, title, author),
+            })
+            by_key.setdefault(entries[position]["key"], []).append(position)
+            for token in checks.author_tokens(author):
+                by_author.setdefault(token, []).append(position)
+            if nt:
+                by_title.setdefault(
+                    nt[:ch_index.BUCKET_CHARS], []
+                ).append(position)
+        index = {
+            "entries": entries,
+            "by_key": by_key,
+            "by_author": by_author,
+            "by_title": by_title,
+        }
+    with _ch_reconcile_lock:
+        _ch_reconcile_cache["signature"] = signature
+        _ch_reconcile_cache["index"] = index
+    return index
+
+
+def _ch_scored_positions(
+        index: dict, title: str, author: str) -> list[tuple[float, int]]:
+    """Accepted CH rows for a query, ranked like the phone's bestMatch.
+
+    catalog_checks._candidates bucketing, title_author_match acceptance,
+    full-title similarity ranking; ties stay in CH row order.
+    """
+    positions: set[int] = set()
+    for token in checks.author_tokens(author):
+        positions.update(index["by_author"].get(token, ()))
+    prefix = whl_client._normalize(title)[:ch_index.BUCKET_CHARS]
+    if prefix:
+        positions.update(index["by_title"].get(prefix, ()))
+    scored = []
+    for position in positions:
+        entry = index["entries"][position]
+        if not checks.title_author_match(
+                title, author, entry["title"], entry["author"]):
+            continue
+        scored.append(
+            (whl_client.similarity(title, entry["title"]), position)
+        )
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    return scored
+
+
+def _ch_row_payload(entry: dict, score: float | None = None) -> dict:
+    payload = {
+        "index": entry["index"],
+        "key": entry["key"],
+        "title": entry["title"],
+        "author": entry["author"],
+        "year": entry["year"],
+        "fields": entry["fields"],
+    }
+    if score is not None:
+        payload["score"] = round(score, 3)
+    return payload
+
+
+def _ch_stamp_field_list(value) -> list[str]:
+    """Split a stamp's comma-joined field names; ingest drops empty strings."""
+    return [part for part in str(value or "").split(",") if part]
+
+
+def _ch_resolve_stamp(stamp: Mapping, index: dict | None) -> dict:
+    key = str(stamp.get("key") or "")
+    title = str(stamp.get("title") or "")
+    author = str(stamp.get("author") or "")
+    score = stamp.get("score")
+    match = {
+        "key": key,
+        "title": title,
+        "author": author,
+        "score": score if isinstance(score, (int, float)) else None,
+        "adopted": _ch_stamp_field_list(stamp.get("adopted")),
+        "conflicts": _ch_stamp_field_list(stamp.get("conflicts")),
+        "resolution": "unresolved",
+        "row": None,
+    }
+    if index is None:
+        return match
+    positions = index["by_key"].get(key, ())
+    if len(positions) == 1:
+        match["resolution"] = "key"
+        match["row"] = _ch_row_payload(index["entries"][positions[0]])
+        return match
+    # The CH row was edited since approval, so its content key moved. Recover
+    # by identity, but only a near-exact title may silently re-pin the link.
+    scored = _ch_scored_positions(index, title, author)
+    if scored and scored[0][0] >= checks.TITLE_FULL_STRICT:
+        match["resolution"] = "rematch"
+        match["row"] = _ch_row_payload(index["entries"][scored[0][1]])
+    return match
+
+
+def _ch_item_query_fields(target: "_CorrectionsTarget") -> tuple[str, str]:
+    """The item's matching identity; the ingest placeholder is not a title."""
+    title = str(target.title or "").strip()
+    if _CAPTURE_TITLE_PLACEHOLDER.match(title):
+        title = ""
+    author = str(target.metadata.get("authors") or "").strip()
+    return title, author
+
+
+def _ch_reconcile_state(target: "_CorrectionsTarget") -> dict:
+    index = _ch_reconcile_index()
+    extra = target.metadata.get("extra")
+    extra = extra if isinstance(extra, Mapping) else {}
+    stamp = extra.get("ch_match")
+    review = extra.get("ch_review")
+    rejected = None
+    if isinstance(review, Mapping) and review.get("decision") == "rejected":
+        rejected = {
+            "key": str(review.get("key") or ""),
+            "decided_at": str(review.get("decided_at") or ""),
+        }
+    match = (
+        _ch_resolve_stamp(stamp, index)
+        if isinstance(stamp, Mapping) and str(stamp.get("key") or "")
+        else None
+    )
+    candidates: list[dict] = []
+    if index is not None and (
+        match is None or match["resolution"] == "unresolved"
+    ):
+        title, author = _ch_item_query_fields(target)
+        if title or author:
+            for score, position in _ch_scored_positions(index, title, author):
+                entry = index["entries"][position]
+                if rejected and entry["key"] == rejected["key"]:
+                    continue
+                candidates.append(_ch_row_payload(entry, score=score))
+                if len(candidates) >= 5:
+                    break
+    return {
+        "ok": True,
+        "item_id": target.canonical_id,
+        "list_available": index is not None,
+        "match": match,
+        "candidates": candidates,
+        "rejected": rejected,
+    }
+
+
+def _ch_merge_plan(target: "_CorrectionsTarget", entry: dict) -> dict:
+    """The phone's merge rules against the item's current values.
+
+    Mirrors ChMergePresenter: CH filling an empty field is adoption, loose
+    (normalized) equality is agreement, and any true disagreement keeps the
+    item's value and is surfaced instead of resolved. adopted/conflicts carry
+    the PHONE's field names in its FIELD_ORDER.
+    """
+    metadata = target.metadata
+    adopted: list[str] = []
+    conflicts: list[str] = []
+    metadata_set: dict = {}
+    title_patch = None
+    for name in _CH_STAMP_FIELD_ORDER:
+        ch_value = str(entry["fields"].get(name) or "")
+        if not ch_value:
+            continue
+        if name == "title":
+            current = str(target.title or "").strip()
+            if _CAPTURE_TITLE_PLACEHOLDER.match(current):
+                current = ""
+            if not current:
+                title_patch = ch_value
+                adopted.append(name)
+            elif (
+                whl_client._normalize(current)
+                != whl_client._normalize(ch_value)
+            ):
+                conflicts.append(name)
+            continue
+        if (
+            target.storage_kind == "build"
+            and name in _CH_BUILD_UNSUPPORTED_FIELDS
+        ):
+            continue
+        field = _CH_FIELD_TO_ITEM_FIELD.get(name, name)
+        current = str(metadata.get(field) or "").strip()
+        if not current:
+            metadata_set[field] = ch_value
+            adopted.append(name)
+        elif whl_client._normalize(current) != whl_client._normalize(ch_value):
+            conflicts.append(name)
+    return {
+        "title": title_patch,
+        "metadata_set": metadata_set,
+        "adopted": adopted,
+        "conflicts": conflicts,
+    }
+
+
+def _ch_reconcile_error(status: int, message: str, code: str, **details):
+    body = {"ok": False, "error": message, "code": code}
+    if details:
+        body["details"] = details
+    return jsonify(body), status
+
+
+def _ch_not_capture_backed(item_id: str):
+    return _ch_reconcile_error(
+        422,
+        "the Corrections item is not capture-backed",
+        "not_capture_backed",
+        item_id=item_id,
+    )
+
+
+def _ch_mutation_invalid(item_id: str, key: str, operation_id: str):
+    if not item_id or not key:
+        return _ch_reconcile_error(
+            400, "item_id and key are required", "invalid_ch_request")
+    if not _CAPTURE_PROMOTION_OPERATION_ID_RE.fullmatch(operation_id):
+        return _ch_reconcile_error(
+            400,
+            "operation_id must be a portable identity",
+            "invalid_operation_id",
+        )
+    return None
+
+
+def _ch_required_row(key: str):
+    """The single current CH row behind a content key, or a JSON error."""
+    index = _ch_reconcile_index()
+    if index is None:
+        return None, _ch_reconcile_error(
+            409, "the CH master list is not available", "ch_list_unavailable")
+    positions = index["by_key"].get(key, ())
+    if not positions:
+        return None, _ch_reconcile_error(
+            409,
+            "the key does not resolve to a current CH row",
+            "ch_key_unknown",
+            key=key,
+        )
+    if len(positions) != 1:
+        return None, _ch_reconcile_error(
+            409,
+            "the key resolves to more than one CH row",
+            "ch_key_ambiguous",
+            key=key,
+        )
+    return index["entries"][positions[0]], None
+
+
+def _ch_item_extra(target: "_CorrectionsTarget") -> dict:
+    """A detached copy of the item's public extra, safe to edit and set back."""
+    extra = target.metadata.get("extra")
+    return copy.deepcopy(dict(extra)) if isinstance(extra, Mapping) else {}
+
+
+@app.get("/api/corrections/ch/state")
+def api_corrections_ch_state():
+    """The CH master-list picture for one capture-backed Corrections item."""
+    item_id = str(request.args.get("item_id") or "").strip()
+    if not item_id:
+        return _ch_reconcile_error(
+            400, "item_id is required", "invalid_ch_request")
+    try:
+        with _corrections_workspace_locks():
+            target = _corrections_item_current_target(item_id)
+            if not target.capture_id:
+                return _ch_not_capture_backed(item_id)
+            return jsonify(_ch_reconcile_state(target))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+
+
+@app.post("/api/corrections/ch/approve")
+def api_corrections_ch_approve():
+    """Merge one validated CH row into a capture-backed item.
+
+    Blank-fill only; the stamp records what actually happened in the exact
+    phone wire format so both sides read one shape. Replaying an approval
+    whose key is already stamped returns the recorded outcome instead of
+    restating the stamp against post-merge values.
+    """
+    payload = request.get_json(silent=True) or {}
+    item_id = str(payload.get("item_id") or "").strip()
+    key = str(payload.get("key") or "").strip()
+    operation_id = str(payload.get("operation_id") or "").strip()
+    invalid = _ch_mutation_invalid(item_id, key, operation_id)
+    if invalid is not None:
+        return invalid
+    try:
+        with _corrections_workspace_locks():
+            target = _corrections_item_current_target(item_id)
+            if not target.capture_id:
+                return _ch_not_capture_backed(item_id)
+            entry, error = _ch_required_row(key)
+            if error is not None:
+                return error
+            extra = _ch_item_extra(target)
+            prior = extra.get("ch_match")
+            if isinstance(prior, Mapping) and str(prior.get("key") or "") == key:
+                return jsonify({
+                    "ok": True,
+                    "replayed": True,
+                    "adopted": _ch_stamp_field_list(prior.get("adopted")),
+                    "conflicts": _ch_stamp_field_list(prior.get("conflicts")),
+                    "match": _ch_reconcile_state(target)["match"],
+                })
+            plan = _ch_merge_plan(target, entry)
+            title, _author = _ch_item_query_fields(target)
+            extra.pop("ch_review", None)
+            extra["ch_match"] = {
+                "key": entry["key"],
+                "title": entry["title"],
+                "author": entry["author"],
+                "score": whl_client.similarity(title, entry["title"]),
+                "adopted": ",".join(plan["adopted"]),
+                "conflicts": ",".join(plan["conflicts"]),
+            }
+            metadata_set = dict(plan["metadata_set"])
+            metadata_set["extra"] = extra
+            command = UpdateItemCommand(
+                item_id=item_id,
+                expected_revision=target.record_revision,
+                patch=ItemPatch(
+                    title=plan["title"],
+                    metadata_set=metadata_set,
+                ),
+                operation_id=operation_id,
+            )
+        # Outside the workspace locks: the update service resolves its own
+        # coherent authority and marks the capture archive stale under the
+        # ingest lock, which must never nest inside these locks.
+        result = _corrections_item_update_engine().update(command)
+        with _corrections_workspace_locks():
+            refreshed = _corrections_item_current_target(item_id)
+            match = _ch_reconcile_state(refreshed)["match"]
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return jsonify({
+        "ok": True,
+        "replayed": result.replayed,
+        "adopted": plan["adopted"],
+        "conflicts": plan["conflicts"],
+        "match": match,
+    })
+
+
+@app.post("/api/corrections/ch/reject")
+def api_corrections_ch_reject():
+    """Remember that one CH row is not this book.
+
+    extra.ch_review is desktop-owned (the phone's stamp key stays untouched);
+    the state endpoint reports it and suppresses that candidate. Rejecting the
+    currently approved key revokes the approval, including when the row's
+    content key moved since approval and the stamp only resolves by rematch.
+    """
+    payload = request.get_json(silent=True) or {}
+    item_id = str(payload.get("item_id") or "").strip()
+    key = str(payload.get("key") or "").strip()
+    operation_id = str(payload.get("operation_id") or "").strip()
+    invalid = _ch_mutation_invalid(item_id, key, operation_id)
+    if invalid is not None:
+        return invalid
+    try:
+        with _corrections_workspace_locks():
+            target = _corrections_item_current_target(item_id)
+            if not target.capture_id:
+                return _ch_not_capture_backed(item_id)
+            _entry, error = _ch_required_row(key)
+            if error is not None:
+                return error
+            extra = _ch_item_extra(target)
+            prior = extra.get("ch_match")
+            review = extra.get("ch_review")
+            revokes = (
+                isinstance(prior, Mapping)
+                and str(prior.get("key") or "") == key
+            )
+            if (
+                not revokes
+                and isinstance(prior, Mapping)
+                and str(prior.get("key") or "")
+            ):
+                resolved = _ch_resolve_stamp(prior, _ch_reconcile_index())
+                row = resolved.get("row")
+                revokes = (
+                    isinstance(row, dict)
+                    and str(row.get("key") or "") == key
+                )
+            if (
+                not revokes
+                and isinstance(review, Mapping)
+                and review.get("decision") == "rejected"
+                and str(review.get("key") or "") == key
+            ):
+                return jsonify({
+                    "ok": True,
+                    "replayed": True,
+                    "rejected": {
+                        "key": key,
+                        "decided_at": str(review.get("decided_at") or ""),
+                    },
+                })
+            if revokes:
+                extra.pop("ch_match", None)
+            decided_at = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            extra["ch_review"] = {
+                "decision": "rejected",
+                "key": key,
+                "decided_at": decided_at,
+            }
+            command = UpdateItemCommand(
+                item_id=item_id,
+                expected_revision=target.record_revision,
+                patch=ItemPatch(metadata_set={"extra": extra}),
+                operation_id=operation_id,
+            )
+        result = _corrections_item_update_engine().update(command)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return jsonify({
+        "ok": True,
+        "replayed": result.replayed,
+        "rejected": {"key": key, "decided_at": decided_at},
+    })
 
 
 def _item_command_engine() -> ItemCommandService:

@@ -48,6 +48,10 @@ const {
   normalizeWorkbenchContext,
   selectionContext,
 } = require("../tools/whl_explorer/static/corrections/shell");
+const {
+  FakeNode,
+  fakeDocument,
+} = require("./fixtures/corrections_fake_dom");
 
 
 const root = path.join(__dirname, "..");
@@ -1398,6 +1402,347 @@ test("standalone shell markup exposes accessible panes, tree, editor, tray, and 
     assert.match(separator[0], /aria-valuenow=/);
   }
   assert.doesNotMatch(templateSource, /app\.js/);
+});
+
+
+test("corrections markup hosts the OCR proposals panel and loads its module", () => {
+  assert.match(templateSource, /data-ocr-proposals\b/);
+  const host = templateSource.match(/<section[^>]+data-ocr-proposals[^>]*>/)[0];
+  assert.match(host, /\bhidden\b/,
+    "the panel stays hidden until discovery proves the read capability");
+  assert.match(templateSource, /corrections\/ocr-proposals\.js/);
+  assert.ok(
+    templateSource.indexOf("corrections/image-adjust-tool.js") <
+      templateSource.indexOf("corrections/ocr-proposals.js"),
+  );
+  assert.ok(
+    templateSource.indexOf("corrections/ocr-proposals.js") <
+      templateSource.indexOf("corrections/shell.js"),
+  );
+  assert.match(cssSource, /\.ocr-proposals-host/);
+  assert.match(cssSource, /\.ocr-proposal-text\b/);
+});
+
+
+test("corrections markup hosts the CH panel above OCR proposals and loads its module", () => {
+  assert.match(templateSource, /data-ch-panel\b/);
+  const host = templateSource.match(/<section[^>]+data-ch-panel[^>]*>/)[0];
+  assert.match(host, /\bhidden\b/,
+    "the panel stays hidden until an item proves capture-backed");
+  assert.ok(
+    templateSource.indexOf("data-ch-panel") <
+      templateSource.indexOf("data-ocr-proposals"),
+    "bibliographic context reads above machine OCR output");
+  assert.match(templateSource, /corrections\/ch-panel\.js/);
+  assert.match(templateSource,
+    /ch-panel\.js'\) \}\}\?v=\{\{ ch_panel_v \}\}/);
+  assert.match(templateSource,
+    /ocr-proposals\.js'\) \}\}\?v=\{\{ ocr_proposals_v \}\}/,
+    "each proposals module versions independently of the shell");
+  assert.ok(
+    templateSource.indexOf("corrections/ch-panel.js") <
+      templateSource.indexOf("corrections/shell.js"),
+  );
+  assert.match(cssSource, /\.ch-panel-host/);
+  assert.match(cssSource, /\.ch-candidate\b/);
+});
+
+
+test("the shell wires OCR proposals through discovery, selection, and re-OCR", {
+  timeout: 5000,
+}, async () => {
+  const proposalSummary = {
+    proposal_ref: `cop-${"a".repeat(40)}`,
+    operation_id: `correction-reocr:${"c".repeat(48)}`,
+    source: {
+      kind: "ocr-ready",
+      artifact_id: "result-ocr-ready-1",
+      artifact_revision: "ocr-ready-r1",
+      content_sha256: "b".repeat(64),
+    },
+    provider: { provider_id: "mistral", model: "mistral-ocr-latest" },
+    publication_policy: "machine-proposal-only",
+    content_sha256: "c".repeat(64),
+    availability: "available",
+  };
+  const queueOperationId = `correction-reocr:${"c".repeat(48)}`;
+  const queueJobId = `correction-ocr-${"d".repeat(24)}`;
+  const queuedJob = {
+    id: queueJobId,
+    kind: "correction.ocr-followup",
+    state: "queued",
+    subject: { item_id: "book-1", source_id: "result-ocr-ready-1" },
+    progress: { completed: 0, total: 4, unit: "phase", phase: "queued" },
+    cancellable: true,
+    revision: 1,
+    created_at: "2026-08-02T12:00:00Z",
+    updated_at: "2026-08-02T12:00:00Z",
+    finished_at: "",
+    note: "",
+    error: null,
+    input_revisions: {
+      parent_operation_id: queueOperationId,
+      artifact_id: "result-ocr-ready-1",
+      artifact_revision: "ocr-ready-r1",
+      source_sha256: "b".repeat(64),
+      publication_policy: "machine-proposal-only",
+    },
+    outputs: [],
+  };
+  const terminalJob = {
+    ...queuedJob,
+    state: "done",
+    progress: { completed: 4, total: 4, unit: "phase", phase: "complete" },
+    cancellable: false,
+    revision: 2,
+    finished_at: "2026-08-02T12:00:03Z",
+    note: "proposal committed",
+    outputs: [
+      { kind: "ocr-proposal", ref: `cop-${"a".repeat(40)}`, partial: false },
+    ],
+  };
+  const calls = [];
+  const response = (status, body) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  });
+  const engineClient = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ method: init.method, url });
+      if (url === "/api/v1/capabilities") {
+        return response(200, {
+          ok: true,
+          schema: "librarytool.capabilities/1",
+          capabilities: [
+            {
+              id: "library.corrections.ocr-proposals.read",
+              version: 1,
+              providers: ["library.corrections.transforms"],
+            },
+            {
+              id: "library.corrections.reocr.queue",
+              version: 1,
+              providers: ["library.corrections.reocr"],
+            },
+          ],
+          modules: [],
+          workbenches: [],
+        });
+      }
+      if (url.startsWith("/api/v1/items/book-1/ocr-proposals")) {
+        return response(200, {
+          ok: true,
+          schema: "librarytool.correction-ocr-proposals/1",
+          item_id: "book-1",
+          snapshot_revision: `cops-${"e".repeat(64)}`,
+          proposals: [proposalSummary],
+          next_cursor: null,
+          total: 1,
+        });
+      }
+      if (url.endsWith("/reocr")) {
+        return response(202, {
+          ok: true,
+          schema: "librarytool.correction-reocr-queue-receipt/1",
+          replayed: false,
+          operation_id: queueOperationId,
+          job_id: queueJobId,
+          job: queuedJob,
+          source: { ...proposalSummary.source },
+        });
+      }
+      if (url.startsWith("/api/v1/jobs/")) {
+        return response(200, { ok: true, job: terminalJob });
+      }
+      throw new Error(`unexpected transport: ${init.method} ${url}`);
+    },
+  });
+  const documentRef = fakeDocument();
+  const windowRef = { engineClient, localStorage: new MemoryStorage() };
+  documentRef.defaultView = windowRef;
+  const rootElement = new FakeNode("div", documentRef);
+  const proposalsHost = new FakeNode("section", documentRef);
+  proposalsHost.setAttribute("data-ocr-proposals", "");
+  proposalsHost.hidden = true;
+  const statusNode = new FakeNode("span", documentRef);
+  statusNode.setAttribute("data-status-message", "");
+  rootElement.append(proposalsHost, statusNode);
+
+  const shell = new CorrectionsShell({
+    root: rootElement,
+    documentRef,
+    windowRef,
+    editorRegistry: createDefaultEditorRegistry({ documentRef }),
+    layoutController: {
+      getState: () => ({ ...DEFAULT_LAYOUT }),
+      replaceState() {},
+      destroy() {},
+    },
+    classificationController: false,
+    booksFeature: false,
+    artifactsFeature: false,
+    itemProperties: false,
+  });
+  assert.ok(shell.engineCorrections.ocrProposals,
+    "engine runtime exposes the OCR proposals port");
+  assert.equal(typeof shell.engineCorrections.ocrProposals.queueReocr,
+    "function");
+  assert.ok(shell.ocrProposalsFeature, "the shell owns the mounted panel");
+
+  shell.mount();
+  await shell.capabilitiesPromise;
+  assert.equal(proposalsHost.hidden, false,
+    "discovery unhides the proposals panel");
+  assert.equal(shell.imageAdjustTool.getState().reocrCapability, true,
+    "discovery arms the Re-OCR affordance");
+
+  shell.selectAddress({ itemId: "book-1" });
+  const settled = (predicate) => new Promise((resolve, reject) => {
+    const deadline = Date.now() + 3000;
+    const check = () => {
+      if (predicate()) return resolve(null);
+      if (Date.now() > deadline) return reject(new Error("condition timed out"));
+      setTimeout(check, 20);
+    };
+    check();
+  });
+  await settled(() => {
+    const count = rootElement.querySelector("[data-ocr-proposals-count]");
+    return count && count.textContent === "1";
+  });
+
+  const receipt = await shell.queueStandaloneReocr({
+    operationId: "reocr-click-1",
+    itemId: "book-1",
+    artifactId: "corrected-display-1",
+    expectedArtifactRevision: "corrected-display-r1",
+  });
+  assert.equal(receipt.job_id, queueJobId);
+  assert.equal(statusNode.textContent, "Re-OCR queued");
+
+  // The tracked job completes on the polling port and refreshes the panel.
+  await settled(() =>
+    statusNode.textContent === "Re-OCR complete — proposal ready");
+  assert.ok(calls.some(({ method, url }) =>
+    method === "GET" && url === `/api/v1/jobs/${queueJobId}`));
+  const proposalReads = calls.filter(({ url }) =>
+    url.startsWith("/api/v1/items/book-1/ocr-proposals"));
+  assert.ok(proposalReads.length >= 2,
+    "the terminal result reloads the proposals catalog");
+
+  shell.destroy();
+});
+
+
+test("the shell wires the CH panel to selection, metadata saves, and refreshes", async () => {
+  const fetchCalls = [];
+  const fetchImpl = async (url, init) => {
+    fetchCalls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        item_id: "book-1",
+        list_available: true,
+        match: null,
+        candidates: [],
+        rejected: null,
+      }),
+    };
+  };
+  const item = {
+    id: "book-1",
+    kind: "capture",
+    title: "Captured Herbal",
+    metadata: {},
+    revision: "item-r1",
+  };
+  const loadCalls = [];
+  const itemMetadataApi = {
+    async loadItem({ itemId }) {
+      loadCalls.push(itemId);
+      return item;
+    },
+    async updateItem() {
+      throw new Error("unused");
+    },
+  };
+  const bookRefreshes = [];
+  const documentRef = fakeDocument();
+  const windowRef = { localStorage: new MemoryStorage() };
+  documentRef.defaultView = windowRef;
+  const rootElement = new FakeNode("div", documentRef);
+  const chHost = new FakeNode("section", documentRef);
+  chHost.setAttribute("data-ch-panel", "");
+  chHost.hidden = true;
+  const propertiesHost = new FakeNode("section", documentRef);
+  propertiesHost.setAttribute("data-item-properties", "");
+  const statusNode = new FakeNode("span", documentRef);
+  statusNode.setAttribute("data-status-message", "");
+  rootElement.append(chHost, propertiesHost, statusNode);
+  const shell = new CorrectionsShell({
+    root: rootElement,
+    documentRef,
+    windowRef,
+    fetchImpl,
+    itemMetadataApi,
+    editorRegistry: createDefaultEditorRegistry({ documentRef }),
+    layoutController: {
+      getState: () => ({ ...DEFAULT_LAYOUT }),
+      replaceState() {},
+      destroy() {},
+    },
+    classificationController: false,
+    booksFeature: {
+      mount() {},
+      destroy() {},
+      setSelection() {},
+      refresh(reason) {
+        bookRefreshes.push(reason);
+        return Promise.resolve();
+      },
+    },
+    artifactsFeature: false,
+  });
+  assert.ok(shell.chPanelFeature, "the shell owns the mounted CH panel");
+  shell.mount();
+  assert.equal(chHost.hidden, true,
+    "the panel stays hidden until a capture-backed item is selected");
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  shell.selectAddress({ itemId: "book-1" });
+  await settle();
+  assert.equal(fetchCalls[0].url, "/api/corrections/ch/state?item_id=book-1");
+  assert.equal(fetchCalls[0].init.cache, "no-store");
+  assert.equal(chHost.hidden, false);
+  assert.deepEqual(loadCalls, ["book-1"],
+    "item selection also loads the metadata editor");
+
+  const beforeSave = fetchCalls.length;
+  shell.itemProperties.onChanged(item, { replayed: false });
+  await settle();
+  assert.equal(fetchCalls.length, beforeSave + 1,
+    "a metadata save refreshes the CH match");
+  assert.deepEqual(bookRefreshes, ["metadata"]);
+
+  const beforeExternal = fetchCalls.length;
+  await shell.refreshExternalState("external-change", { includeBooks: false });
+  assert.equal(fetchCalls.length, beforeExternal + 1,
+    "external convergence refreshes the CH panel with the other detail panes");
+
+  const beforeDecision = loadCalls.length;
+  shell.chPanelFeature.onChanged({ ok: true, replayed: false });
+  await settle();
+  assert.equal(loadCalls.length, beforeDecision + 1,
+    "a CH decision reloads the item metadata it rewrote");
+  assert.equal(bookRefreshes.at(-1), "ch-reconcile");
+
+  shell.destroy();
+  assert.equal(shell.chPanelFeature, null);
+  assert.equal(chHost.children.length, 0,
+    "destroy releases the CH panel's DOM");
 });
 
 

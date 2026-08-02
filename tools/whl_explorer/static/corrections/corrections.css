@@ -588,6 +588,280 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.ch-panel-host {
+  padding: 7px 10px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.ch-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ch-panel-header h3 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.ch-panel-header button {
+  margin-left: auto;
+  min-width: 22px;
+  padding: 1px 5px;
+  font-size: 11px;
+}
+
+.ch-state-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 0;
+  font-size: 11px;
+}
+
+.ch-resolution,
+.ch-marker {
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-muted);
+  font-size: 10px;
+}
+
+.ch-marker-conflict {
+  border-color: rgb(226 150 141 / 45%);
+}
+
+.ch-score {
+  color: var(--ink-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ch-rematch-hint,
+.ch-rejected {
+  margin: 3px 0 0;
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+.ch-match-fields {
+  display: grid;
+  grid-template-columns: minmax(64px, 0.6fr) minmax(0, 1.4fr);
+  gap: 2px 8px;
+  margin: 6px 0 0;
+  padding-top: 6px;
+  border-top: 1px solid rgb(61 73 62 / 65%);
+  font-size: 11px;
+}
+
+.ch-match-fields dt {
+  color: var(--ink-muted);
+}
+
+.ch-match-fields dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.ch-markers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 0;
+}
+
+.ch-markers:not(:has(:not([hidden]))) {
+  display: none;
+}
+
+.ch-match-actions {
+  display: flex;
+  gap: 6px;
+  margin: 5px 0 0;
+}
+
+.ch-match-actions button,
+.ch-candidate-actions button {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.ch-candidates {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ch-candidate {
+  display: grid;
+  gap: 2px;
+  padding: 5px 0;
+  border-bottom: 1px solid rgb(61 73 62 / 65%);
+  font-size: 11px;
+}
+
+.ch-candidate-meta {
+  color: var(--ink-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ch-candidate-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.ch-message {
+  min-height: 1.2em;
+  margin: 5px 0 0;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+.ch-message[role="alert"] {
+  color: var(--danger);
+}
+
+.ocr-proposals-host {
+  padding: 7px 10px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.ocr-proposals-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ocr-proposals-header h3 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.ocr-proposals-header button {
+  margin-left: auto;
+  min-width: 22px;
+  padding: 1px 5px;
+  font-size: 11px;
+}
+
+.ocr-proposals-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ocr-proposals-list .empty-row {
+  padding: 5px 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.ocr-proposal-open {
+  width: 100%;
+  display: grid;
+  gap: 1px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  text-align: left;
+  font-size: 11px;
+}
+
+.ocr-proposal-open:hover:not(:disabled) {
+  border-color: var(--line);
+  background: var(--chrome-2);
+}
+
+.ocr-proposal-open[aria-pressed="true"] {
+  border-color: var(--line-strong);
+  background: var(--chrome-2);
+}
+
+.ocr-proposal-row-meta {
+  color: var(--ink-faint);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.ocr-proposal-detail {
+  display: grid;
+  gap: 4px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgb(61 73 62 / 65%);
+}
+
+.ocr-proposal-provider,
+.ocr-proposal-source,
+.ocr-proposal-summary {
+  margin: 0;
+  font-size: 11px;
+}
+
+.ocr-proposal-source,
+.ocr-proposal-summary {
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ocr-proposal-text {
+  max-height: 180px;
+  margin: 2px 0;
+  padding: 6px 8px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--chrome-1);
+  font: 11px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ocr-proposal-text[data-ocr-proposal-text-state="absent"] {
+  color: var(--ink-faint);
+  font-style: italic;
+}
+
+.ocr-proposal-actions {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.ocr-proposal-actions button {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.ocr-proposal-apply-hint {
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+.ocr-proposals-message {
+  min-height: 1.2em;
+  margin: 5px 0 0;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+.ocr-proposals-message[role="alert"] {
+  color: var(--danger);
+}
+
 .tray-header {
   padding-left: 5px;
 }

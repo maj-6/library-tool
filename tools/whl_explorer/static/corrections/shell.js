@@ -13,6 +13,8 @@
     ...require("./classification-controls"),
     ...require("./image-editor"),
     ...require("./image-adjust-tool"),
+    ...require("./ocr-proposals"),
+    ...require("./ch-panel"),
   } : root.LibraryToolCorrections;
   const api = factory(dependencies);
   if (typeof module === "object" && module.exports) module.exports = api;
@@ -404,6 +406,8 @@
       this.imageAdjustTool = options.imageAdjustTool ||
         typeof deps.createImageAdjustTool === "function" &&
           deps.createImageAdjustTool({
+            requestReocr: (request, detail) =>
+              this.queueStandaloneReocr(request, detail),
             ...imageAdjustOptions,
             profile: null,
             onProfileChange: (value, detail) => {
@@ -540,6 +544,11 @@
         options.artifactsFeature || this.createArtifactsFeature(options);
       this.itemProperties = options.itemProperties === false ? null :
         options.itemProperties || this.createItemPropertiesFeature(options);
+      this.capabilitiesPromise = null;
+      this.ocrProposalsFeature = options.ocrProposalsFeature === false ? null :
+        options.ocrProposalsFeature || this.createOcrProposalsFeature(options);
+      this.chPanelFeature = options.chPanelFeature === false ? null :
+        options.chPanelFeature || this.createChPanelFeature(options);
     }
 
     createClassificationFeature(options, profile) {
@@ -812,6 +821,15 @@
         draftStore: this.state,
         operationIdFactory: options.itemMetadataOperationIdFactory,
         onChanged: () => {
+          if (this.chPanelFeature &&
+              typeof this.chPanelFeature.refresh === "function") {
+            void Promise.resolve(this.chPanelFeature.refresh("metadata"))
+              .catch((error) => this.setStatus(
+                error && error.message ||
+                  "Metadata saved, but the CH panel could not be refreshed",
+                true,
+              ));
+          }
           if (!this.booksFeature ||
               typeof this.booksFeature.refresh !== "function") return;
           void Promise.resolve(this.booksFeature.refresh("metadata"))
@@ -823,6 +841,117 @@
         },
         onStatus: (message, error) => this.setStatus(message, error),
       });
+    }
+
+    createOcrProposalsFeature(options) {
+      if (options.features === false ||
+          typeof deps.createOcrProposalsPanel !== "function") return null;
+      const host = this.root.querySelector("[data-ocr-proposals]");
+      const port = options.ocrProposalsPort ||
+        this.engineCorrections && this.engineCorrections.ocrProposals || null;
+      if (!host || !port) return null;
+      return deps.createOcrProposalsPanel({
+        root: host,
+        documentRef: this.documentRef,
+        port,
+        operationIdFactory: options.ocrProposalOperationIdFactory,
+        onStatus: (message, error) => this.setStatus(message, error),
+      });
+    }
+
+    createChPanelFeature(options) {
+      if (options.features === false ||
+          typeof deps.createChPanel !== "function") return null;
+      const host = this.root.querySelector("[data-ch-panel]");
+      if (!host) return null;
+      const fetchImpl = typeof options.fetchImpl === "function"
+        ? options.fetchImpl
+        : this.windowRef && typeof this.windowRef.fetch === "function"
+          ? this.windowRef.fetch.bind(this.windowRef)
+          : typeof fetch === "function" ? fetch.bind(globalThis) : null;
+      if (!fetchImpl) return null;
+      return deps.createChPanel({
+        root: host,
+        documentRef: this.documentRef,
+        fetchImpl,
+        operationIdFactory: options.chOperationIdFactory,
+        onChanged: () => this.refreshChMergeTargets(),
+      });
+    }
+
+    // A CH approval or rejection rewrites the item's metadata server-side, so
+    // the panels showing that metadata must reload their copies.
+    refreshChMergeTargets() {
+      if (this.itemProperties &&
+          typeof this.itemProperties.refresh === "function") {
+        void Promise.resolve(this.itemProperties.refresh("ch-reconcile"))
+          .catch((error) => this.setStatus(
+            error && error.message ||
+              "CH decision saved, but item metadata could not be refreshed",
+            true,
+          ));
+      }
+      if (this.booksFeature &&
+          typeof this.booksFeature.refresh === "function") {
+        void Promise.resolve(this.booksFeature.refresh("ch-reconcile"))
+          .catch((error) => this.setStatus(
+            error && error.message ||
+              "CH decision saved, but the Books panel could not be refreshed",
+            true,
+          ));
+      }
+    }
+
+    // The button and panel stay hidden until engine discovery proves the
+    // corrections workbench enhancements are actually installed.
+    loadWorkbenchCapabilities() {
+      if (this.capabilitiesPromise) return this.capabilitiesPromise;
+      const client = this.windowRef && this.windowRef.engineClient;
+      if (!client || typeof client.capabilities !== "function") {
+        return Promise.resolve(null);
+      }
+      this.capabilitiesPromise = Promise.resolve()
+        .then(() => client.capabilities())
+        .then((discovery) => {
+          if (this.destroyed) return null;
+          const rows = discovery && Array.isArray(discovery.capabilities)
+            ? discovery.capabilities : [];
+          const ids = new Set(rows
+            .map((row) => row && row.id)
+            .filter((id) => typeof id === "string"));
+          if (this.imageAdjustTool &&
+              typeof this.imageAdjustTool.setReocrCapability === "function") {
+            this.imageAdjustTool.setReocrCapability(
+              ids.has("library.corrections.reocr.queue"));
+          }
+          if (this.ocrProposalsFeature &&
+              typeof this.ocrProposalsFeature.setCapabilities === "function") {
+            void this.ocrProposalsFeature.setCapabilities({
+              read: ids.has("library.corrections.ocr-proposals.read"),
+              queue: ids.has("library.corrections.reocr.queue"),
+            });
+          }
+          return ids;
+        })
+        .catch(() => null);
+      return this.capabilitiesPromise;
+    }
+
+    async queueStandaloneReocr(request = {}) {
+      const port = this.engineCorrections &&
+        this.engineCorrections.ocrProposals;
+      if (!port || typeof port.queueReocr !== "function") {
+        throw new Error("Re-OCR is unavailable in this window");
+      }
+      const receipt = await port.queueReocr({
+        operationId: request.operationId,
+        itemId: request.itemId,
+        artifactId: request.artifactId,
+        expectedArtifactRevision: request.expectedArtifactRevision,
+      });
+      this.setStatus(receipt.replayed === true
+        ? "Re-OCR already queued" : "Re-OCR queued");
+      return receipt;
     }
 
     artifactTreeElement(key) {
@@ -1098,6 +1227,11 @@
         tasks.push(Promise.resolve().then(() =>
           this.itemProperties.refresh(reason)));
       }
+      if (this.chPanelFeature &&
+          typeof this.chPanelFeature.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.chPanelFeature.refresh(reason)));
+      }
       const refresh = Promise.allSettled(tasks).finally(() => {
         if (this.externalRefreshPromise === refresh) {
           this.externalRefreshPromise = null;
@@ -1146,6 +1280,15 @@
       if (this.itemProperties && typeof this.itemProperties.mount === "function") {
         this.itemProperties.mount();
       }
+      if (this.ocrProposalsFeature &&
+          typeof this.ocrProposalsFeature.mount === "function") {
+        this.ocrProposalsFeature.mount();
+      }
+      if (this.chPanelFeature &&
+          typeof this.chPanelFeature.mount === "function") {
+        this.chPanelFeature.mount();
+      }
+      void this.loadWorkbenchCapabilities();
       this.connectTransformResults();
       this.renderEditor();
       if (!this.artifactsFeature) this.renderProperties();
@@ -1194,6 +1337,19 @@
         void Promise.resolve(this.itemProperties.setSelection(selection.itemId))
           .catch((error) => this.setStatus(
             error && error.message || "Item metadata could not be loaded", true));
+      }
+      if (this.ocrProposalsFeature &&
+          typeof this.ocrProposalsFeature.setItem === "function") {
+        void Promise.resolve(this.ocrProposalsFeature.setItem(selection.itemId))
+          .catch((error) => this.setStatus(
+            error && error.message || "OCR proposals could not be loaded", true));
+      }
+      if (this.chPanelFeature &&
+          typeof this.chPanelFeature.setItem === "function") {
+        void Promise.resolve(this.chPanelFeature.setItem(selection.itemId))
+          .catch((error) => this.setStatus(
+            error && error.message ||
+              "The CH master-list match could not be loaded", true));
       }
       const changedItem = previous.itemId !== selection.itemId;
       const changedDeepLink = previous.artifactId !== selection.artifactId ||
@@ -1369,6 +1525,21 @@
           this.itemProperties.setSelection(this.state.selection.itemId))
           .catch((error) => this.setStatus(
             error && error.message || "Item metadata could not be loaded", true));
+      }
+      if (this.ocrProposalsFeature &&
+          typeof this.ocrProposalsFeature.setItem === "function") {
+        void Promise.resolve(
+          this.ocrProposalsFeature.setItem(this.state.selection.itemId))
+          .catch((error) => this.setStatus(
+            error && error.message || "OCR proposals could not be loaded", true));
+      }
+      if (this.chPanelFeature &&
+          typeof this.chPanelFeature.setItem === "function") {
+        void Promise.resolve(
+          this.chPanelFeature.setItem(this.state.selection.itemId))
+          .catch((error) => this.setStatus(
+            error && error.message ||
+              "The CH master-list match could not be loaded", true));
       }
       this.updateContextLabels();
       this.renderContextNavigation();
@@ -1606,9 +1777,19 @@
           typeof this.itemProperties.destroy === "function") {
         this.itemProperties.destroy();
       }
+      if (this.ocrProposalsFeature &&
+          typeof this.ocrProposalsFeature.destroy === "function") {
+        this.ocrProposalsFeature.destroy();
+      }
+      if (this.chPanelFeature &&
+          typeof this.chPanelFeature.destroy === "function") {
+        this.chPanelFeature.destroy();
+      }
       this.booksFeature = null;
       this.artifactsFeature = null;
       this.itemProperties = null;
+      this.ocrProposalsFeature = null;
+      this.chPanelFeature = null;
       if (this.selectionListeners) this.selectionListeners.clear();
       if (this.editorRegistry && typeof this.editorRegistry.destroy === "function") {
         this.editorRegistry.destroy();
