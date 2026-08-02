@@ -1,0 +1,242 @@
+{
+  "schema": "org.whl.corrections-release-fixture",
+  "version": 1,
+  "capture_id": "11111111-1111-4111-8111-111111111111",
+  "book_id": "b-11111111111111111111111111111111",
+  "stream_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+  "archive_source": {
+    "source_revision": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "generated_at": "2026-07-23T12:34:56+00:00",
+    "generator": "library-tool/corrections-release-fixture",
+    "resources": {
+      "representations/original.jpg": "corrections-release-original\n",
+      "representations/display.jpg": "Reviewed botanical title page\n"
+    },
+    "manifest": {
+      "created_at": "2026-07-23T10:00:00+00:00",
+      "source": "capture",
+      "meta": {
+        "title": "Captured Herbal"
+      },
+      "instructions": {
+        "book": "Preserve reviewed capture artifacts."
+      },
+      "review_policy": {
+        "mode": "all-durable"
+      },
+      "ext": {
+        "release_fixture": true
+      },
+      "representations": [
+        {
+          "id": "capture-original",
+          "revision": "original-r1",
+          "role": "capture-original",
+          "media_type": "image/jpeg",
+          "member": "representations/original.jpg",
+          "content_sha256": "1b00fd3e3ece6c4863c035d83843a1996d2e4f94bb886fc53ae3f0257e7e4bf7",
+          "dimensions": {
+            "width": 7,
+            "height": 11,
+            "orientation": 1
+          },
+          "lineage": [],
+          "ext": {}
+        },
+        {
+          "id": "capture-display",
+          "revision": "display-r1",
+          "role": "capture-display",
+          "media_type": "image/jpeg",
+          "member": "representations/display.jpg",
+          "content_sha256": "6ed7861a738ab0f6840a1eabfa38cab048afe267b23ecb8961a73646e1c74c53",
+          "dimensions": {
+            "width": 7,
+            "height": 11,
+            "orientation": 1
+          },
+          "lineage": [
+            {
+              "representation_id": "capture-original",
+              "representation_revision": "original-r1",
+              "relation": "derived-from"
+            }
+          ],
+          "ext": {}
+        }
+      ],
+      "artifacts": []
+    }
+  },
+  "lib_confirmation": {
+    "schema": "org.whl.capture-lib-confirmation",
+    "version": 1,
+    "capture_id": "11111111-1111-4111-8111-111111111111",
+    "stream_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "revision": 3,
+    "updated_at": "2026-07-23T13:00:00+00:00",
+    "association": {
+      "schema": "org.whl.capture-lib-association",
+      "version": 1,
+      "capture_id": "11111111-1111-4111-8111-111111111111",
+      "book_id": "b-11111111111111111111111111111111",
+      "archive_sha256": "b6dbca4f5a214e69e012ad88ab4da73b2ee4a6da29eaa60790f99796cfb28b4c",
+      "archive_bytes": 6470,
+      "format_version": "3.0",
+      "state": "current",
+      "generated_at": "2026-07-23T12:34:56+00:00",
+      "source_revision": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "source_fingerprint": "35976648903b4b3d518f74019c439f5001f00df4de4a750dce75aeb5a1f26ee3"
+    }
+  },
+  "cloud_row": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "status": "imported",
+    "created_by": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "lib_association": {
+      "schema": "org.whl.capture-lib-association",
+      "version": 1,
+      "capture_id": "11111111-1111-4111-8111-111111111111",
+      "book_id": "b-11111111111111111111111111111111",
+      "archive_sha256": "b6dbca4f5a214e69e012ad88ab4da73b2ee4a6da29eaa60790f99796cfb28b4c",
+      "archive_bytes": 6470,
+      "format_version": "3.0",
+      "state": "current",
+      "generated_at": "2026-07-23T12:34:56+00:00",
+      "source_revision": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "source_fingerprint": "35976648903b4b3d518f74019c439f5001f00df4de4a750dce75aeb5a1f26ee3"
+    },
+    "lib_association_revision": 3,
+    "lib_association_updated_at": "2026-07-23T13:00:00+00:00"
+  },
+  "android_marker": {
+    "visible": true,
+    "accessibility_label": "Local library archive confirmed"
+  },
+  "corrections": {
+    "expected": {
+      "image_category": "title_page",
+      "caption": "Reviewed botanical title page",
+      "marginalia_role": "marginalia",
+      "illustration_role": "figure",
+      "brightness": 19,
+      "rerun_ocr": true,
+      "ocr_proposal_ref": "ocr-proposal-release-e2e"
+    },
+    "display_artifact": {
+      "key": {
+        "item_id": "b-11111111111111111111111111111111",
+        "artifact_id": "release-display"
+      },
+      "revision": "release-display-r4",
+      "kind": "captured-image",
+      "label": "Title page capture",
+      "media_type": "image/jpeg",
+      "resource_state": "available",
+      "resource": {
+        "resource_id": "release-display-resource",
+        "revision": "display-bytes-r2",
+        "variant": "display"
+      },
+      "freshness": "current",
+      "source": {
+        "representation_id": "capture",
+        "representation_revision": "capture-r2",
+        "canvas_id": "capture-page-1",
+        "canvas_revision": "display-bytes-r2"
+      },
+      "category_assignments": [
+        {
+          "origin": "manual",
+          "revision": "category-human-r2",
+          "category": "title_page"
+        }
+      ],
+      "effective_category": "title_page",
+      "caption_assertions": [
+        {
+          "origin": "manual",
+          "revision": "caption-human-r2",
+          "text": "Reviewed botanical title page",
+          "language": "en"
+        },
+        {
+          "origin": "machine",
+          "revision": "caption-machine-r1",
+          "text": "Botanical title page",
+          "confidence": 0.91
+        }
+      ],
+      "effective_caption": {
+        "origin": "manual",
+        "revision": "caption-human-r2",
+        "text": "Reviewed botanical title page",
+        "language": "en"
+      },
+      "provenance": {
+        "origin": "capture"
+      }
+    },
+    "illustration_region": {
+      "key": {
+        "item_id": "b-11111111111111111111111111111111",
+        "annotation_id": "illustration-1"
+      },
+      "revision": "illustration-r3",
+      "kind": "spatial-annotation",
+      "label": "Botanical illustration",
+      "freshness": "current",
+      "source": {
+        "representation_id": "capture",
+        "representation_revision": "capture-r2",
+        "canvas_id": "capture-page-1",
+        "canvas_revision": "display-bytes-r2"
+      },
+      "selector": {
+        "type": "polygon",
+        "coordinate_space": "canvas-normalized",
+        "coordinate_space_revision": "display-bytes-r2",
+        "points": [
+          { "x": 0.38, "y": 0.18 },
+          { "x": 0.91, "y": 0.18 },
+          { "x": 0.91, "y": 0.88 },
+          { "x": 0.38, "y": 0.88 }
+        ]
+      },
+      "linked_artifact_ids": ["release-display"],
+      "role_assignments": [
+        {
+          "origin": "manual",
+          "revision": "role-human-r2",
+          "role": "figure"
+        },
+        {
+          "origin": "machine",
+          "revision": "role-machine-r1",
+          "role": "illustration",
+          "confidence": 0.94
+        }
+      ],
+      "effective_role": "figure",
+      "caption_assertions": [
+        {
+          "origin": "manual",
+          "revision": "region-caption-human-r2",
+          "text": "Reviewed botanical plate",
+          "language": "en"
+        },
+        {
+          "origin": "machine",
+          "revision": "region-caption-machine-r1",
+          "text": "Botanical plate",
+          "confidence": 0.94
+        }
+      ],
+      "provenance": {
+        "origin": "mistral",
+        "provider_id": "mistral",
+        "model": "mistral-ocr-latest"
+      }
+    }
+  }
+}
