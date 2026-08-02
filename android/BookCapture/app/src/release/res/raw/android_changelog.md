@@ -3,6 +3,20 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.7 — 2026-08-02
+
+Android version code: `38`.
+
+### Additions
+
+- Photo cleanup done on the desktop now comes back to the phone: a corrected page is downloaded, verified, and shown in place of the original capture, which is never overwritten.
+- Text recognition re-runs automatically against a corrected page, so its text and region boxes match what you can actually see.
+
+### Bugfixes
+
+- A page waiting on cloud cleanup no longer ends up marked failed when a desktop correction for it arrives first.
+- Recognition that was interrupted for a corrected page is picked up again on a later sync instead of leaving the page without regions.
+
 ## 0.5.2-alpha.6 — 2026-08-01
 
 Android version code: `37`.
