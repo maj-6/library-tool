@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.1` (version code 32) is the Android
+Library Tool Capture `0.5.2-alpha.6` (version code 37) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -201,7 +201,7 @@ contract. Corrected display artifacts never masquerade as camera originals.
 ## Build
 
 1. Open `android/BookCapture` in Android Studio Koala Feature Drop (2024.1.2)
-   or newer and let it sync. The project uses AGP 8.6, Kotlin 1.9.24, JDK 17,
+   or newer and let it sync. The project uses AGP 8.6, Kotlin 2.1.20, JDK 17,
    and the checked-in Gradle 8.12 wrapper.
 2. Fork maintainers export `WHL_SUPABASE_URL` and `WHL_SUPABASE_ANON_KEY`
    before building. Official release CI injects the project configuration; app

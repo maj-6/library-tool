@@ -18,7 +18,7 @@ import re
 import stat
 import sys
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ if str(_SRC_ROOT) not in sys.path:
 from librarytool.engine.capture_archives import (  # noqa: E402
     AssociateCaptureArchiveCommand,
     CaptureArchiveAssociation,
+    CaptureArchiveAssociationPublisherPort,
     CaptureArchiveDisposition,
     CaptureArchiveMaterializerPort,
     CaptureArchiveService,
@@ -58,6 +59,7 @@ _MAX_DIAGNOSTIC_TEXT = 240
 _NUMBERED_IMAGE_RE = re.compile(r"^(orig|photo)_([1-9][0-9]*)\.jpg$")
 _BOOK_ID_RE = re.compile(r"^b-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _ASSET_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _WINDOWS_PATH_RE = re.compile(r"(?:^|[\s\"'(])[A-Za-z]:[\\/]")
 _ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
@@ -1610,6 +1612,24 @@ def _bounded_diagnostic_text(value: Any) -> str:
     return text[:_MAX_DIAGNOSTIC_TEXT]
 
 
+def _safe_engine_error_diagnostic(
+    error: EngineError,
+) -> dict[str, Any]:
+    cause_code = str(error.code or "")
+    if not _DIAGNOSTIC_CODE_RE.fullmatch(cause_code):
+        cause_code = "engine_error"
+    message = _bounded_diagnostic_text(error)
+    if not message or _looks_like_local_locator(message):
+        message = "capture cloud update failed"
+    return {
+        "status": "failed",
+        "code": "capture_cloud_update_failed",
+        "cause_code": cause_code,
+        "message": message,
+        "retryable": bool(error.retryable),
+    }
+
+
 def _diagnostic(
     *,
     capture_id: str,
@@ -1620,17 +1640,62 @@ def _diagnostic(
     changed: bool = False,
     book_id: str = "",
     association: Mapping[str, Any] | None = None,
+    cloud_update: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "capture_id": _bounded_diagnostic_text(capture_id),
-        "entry_id": _bounded_diagnostic_text(entry_id),
+    capture_identity = _bounded_diagnostic_text(capture_id)
+    if (
+        capture_identity
+        and _portable_capture_id(capture_identity) != capture_identity
+    ):
+        capture_identity = ""
+    entry_identity = _bounded_diagnostic_text(entry_id)
+    if entry_identity and not _BUILD_ID_RE.fullmatch(entry_identity):
+        entry_identity = ""
+    book_identity = _bounded_diagnostic_text(book_id)
+    if book_identity and not _BOOK_ID_RE.fullmatch(book_identity):
+        book_identity = ""
+    diagnostic_message = _bounded_diagnostic_text(message)
+    if _looks_like_local_locator(diagnostic_message):
+        diagnostic_message = "capture backfill diagnostic withheld"
+    diagnostic = {
+        "capture_id": capture_identity,
+        "entry_id": entry_identity,
         "status": status,
         "code": code,
-        "message": _bounded_diagnostic_text(message),
+        "message": diagnostic_message,
         "changed": bool(changed),
-        "book_id": _bounded_diagnostic_text(book_id),
+        "book_id": book_identity,
         "association": dict(association) if association is not None else None,
     }
+    if cloud_update is not None:
+        detached_cloud_update = dict(cloud_update)
+        diagnostic["cloud_update"] = detached_cloud_update
+        diagnostic["local_status"] = status
+        diagnostic["overall_status"] = (
+            "failed"
+            if detached_cloud_update.get("status") == "failed"
+            else status
+        )
+    return diagnostic
+
+
+def _backfill_setup_diagnostic(error: Exception) -> dict[str, Any]:
+    code = (
+        str(error.code)
+        if isinstance(error, EngineError)
+        else "capture_backfill_setup_failed"
+    )
+    if not _DIAGNOSTIC_CODE_RE.fullmatch(code):
+        code = "capture_backfill_setup_failed"
+    message = _bounded_diagnostic_text(error)
+    if not message or _looks_like_local_locator(message):
+        message = "capture backfill setup failed"
+    return _diagnostic(
+        capture_id="",
+        status="failed",
+        code=code,
+        message=message,
+    )
 
 
 def _portable_capture_id(value: Any) -> str:
@@ -1834,8 +1899,38 @@ def _backfill_operation_id(
     return f"capture-backfill-{digest}"
 
 
+def _capture_id_scope(
+    values: Iterable[str] | None,
+    *,
+    field_name: str,
+) -> frozenset[str] | None:
+    """Validate an optional exact capture-id scope for an embedding host."""
+
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes, bytearray)):
+        raise TypeError(f"{field_name} must be an iterable of capture ids")
+    try:
+        candidates = list(values)
+    except TypeError as exc:
+        raise TypeError(
+            f"{field_name} must be an iterable of capture ids"
+        ) from exc
+    normalized: set[str] = set()
+    for value in candidates:
+        capture_id = _portable_capture_id(value)
+        if not capture_id or capture_id != value:
+            raise ValueError(
+                f"{field_name} contains a nonportable capture identity"
+            )
+        normalized.add(capture_id)
+    return frozenset(normalized)
+
+
 def _capture_directories(
     capture_root: Path,
+    *,
+    capture_ids: frozenset[str] | None = None,
 ) -> tuple[dict[str, Path], list[dict[str, Any]]]:
     directories: dict[str, Path] = {}
     diagnostics: list[dict[str, Any]] = []
@@ -1863,24 +1958,34 @@ def _capture_directories(
             )
         )
         return directories, diagnostics
-    try:
-        children = sorted(capture_root.iterdir(), key=lambda path: path.name)
-    except OSError as exc:
-        diagnostics.append(
-            _diagnostic(
-                capture_id="",
-                status="failed",
-                code="capture_root_unavailable",
-                message=f"capture root cannot be listed: {type(exc).__name__}",
+    if capture_ids is None:
+        try:
+            children = sorted(capture_root.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            diagnostics.append(
+                _diagnostic(
+                    capture_id="",
+                    status="failed",
+                    code="capture_root_unavailable",
+                    message=(
+                        "capture root cannot be listed: "
+                        f"{type(exc).__name__}"
+                    ),
+                )
             )
-        )
-        return directories, diagnostics
+            return directories, diagnostics
+    else:
+        # An embedding host can bound maintenance to named captures without
+        # enumerating or diagnosing unrelated private capture directories.
+        children = [capture_root / capture_id for capture_id in sorted(capture_ids)]
     for child in children:
         capture_id = _portable_capture_id(child.name)
         if not capture_id:
             continue
         try:
             info = child.lstat()
+        except FileNotFoundError:
+            continue
         except OSError as exc:
             diagnostics.append(
                 _diagnostic(
@@ -1920,6 +2025,11 @@ def backfill_capture_archives(
     legacy_identity_lookup: (
         Callable[[str], Mapping[str, Any] | None] | None
     ) = None,
+    association_publisher: (
+        CaptureArchiveAssociationPublisherPort | None
+    ) = None,
+    capture_ids: Iterable[str] | None = None,
+    publication_capture_ids: Iterable[str] | None = None,
     apply: bool = False,
     diagnostic_limit: int = _MAX_BACKFILL_DIAGNOSTICS,
 ) -> dict[str, Any]:
@@ -1927,8 +2037,12 @@ def backfill_capture_archives(
 
     The scan is deterministic and independent per capture. Failures are
     reported and skipped, so a later apply resumes from every association that
-    already committed. The compatibility manual catalogue and capture assets
-    are read-only inputs.
+    already committed. An optional association publisher runs only after a
+    local archive is verified; it is retried for an already-associated capture
+    after a prior remote failure. Embedding hosts may bound local work with
+    ``capture_ids`` and independently restrict publication to an authorized
+    subset with ``publication_capture_ids``. The compatibility manual
+    catalogue and capture assets are read-only inputs.
     """
 
     if not isinstance(manual_entries, Mapping):
@@ -1945,8 +2059,35 @@ def backfill_capture_archives(
         legacy_identity_lookup
     ):
         raise TypeError("legacy_identity_lookup must be callable")
+    if (
+        association_publisher is not None
+        and not isinstance(
+            association_publisher,
+            CaptureArchiveAssociationPublisherPort,
+        )
+    ):
+        raise TypeError(
+            "association_publisher must implement "
+            "CaptureArchiveAssociationPublisherPort"
+        )
     if not isinstance(apply, bool):
         raise TypeError("apply must be boolean")
+    capture_scope = _capture_id_scope(
+        capture_ids,
+        field_name="capture_ids",
+    )
+    publication_scope = _capture_id_scope(
+        publication_capture_ids,
+        field_name="publication_capture_ids",
+    )
+    if (
+        capture_scope is not None
+        and publication_scope is not None
+        and not publication_scope.issubset(capture_scope)
+    ):
+        raise ValueError(
+            "publication_capture_ids must be a subset of capture_ids"
+        )
     if (
         not isinstance(diagnostic_limit, int)
         or isinstance(diagnostic_limit, bool)
@@ -1963,7 +2104,10 @@ def backfill_capture_archives(
     )
     if lookup is None:
         raise TypeError("an association lookup is required")
-    directories, initial_diagnostics = _capture_directories(capture_root)
+    directories, initial_diagnostics = _capture_directories(
+        capture_root,
+        capture_ids=capture_scope,
+    )
     entries_by_capture: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
     pending_diagnostics = list(initial_diagnostics)
     for raw_entry_id in sorted(manual_entries, key=lambda value: str(value)):
@@ -1975,6 +2119,8 @@ def backfill_capture_archives(
             continue
         capture_id = _portable_capture_id(raw_capture_id)
         if not capture_id:
+            if capture_scope is not None:
+                continue
             pending_diagnostics.append(
                 _diagnostic(
                     capture_id=_bounded_diagnostic_text(raw_capture_id),
@@ -1985,16 +2131,26 @@ def backfill_capture_archives(
                 )
             )
             continue
+        if capture_scope is not None and capture_id not in capture_scope:
+            continue
         entries_by_capture.setdefault(capture_id, []).append(
             (str(raw_entry_id), raw_entry)
         )
 
-    candidate_ids = sorted(set(entries_by_capture) | set(directories))
+    candidate_ids = sorted(
+        capture_scope
+        if capture_scope is not None
+        else set(entries_by_capture) | set(directories)
+    )
     diagnostics: list[dict[str, Any]] = []
     counts = {
         "created": 0,
         "would_create": 0,
         "unchanged": 0,
+        "failed": 0,
+    }
+    cloud_counts = {
+        "succeeded": 0,
         "failed": 0,
     }
     omitted = 0
@@ -2007,6 +2163,39 @@ def backfill_capture_archives(
             diagnostics.append(diagnostic)
         else:
             omitted += 1
+
+    def publish_association(
+        association: CaptureArchiveAssociation,
+    ) -> dict[str, str] | None:
+        nonlocal cloud_counts
+        if (
+            not apply
+            or association_publisher is None
+            or (
+                publication_scope is not None
+                and association.capture_id not in publication_scope
+            )
+        ):
+            return None
+        try:
+            association_publisher.publish(association)
+        except EngineError as exc:
+            cloud_counts["failed"] += 1
+            return _safe_engine_error_diagnostic(exc)
+        except Exception as exc:
+            cloud_counts["failed"] += 1
+            return {
+                "status": "failed",
+                "code": "capture_cloud_update_failed",
+                "cause_code": "unexpected_publisher_error",
+                "message": type(exc).__name__,
+            }
+        cloud_counts["succeeded"] += 1
+        return {
+            "status": "succeeded",
+            "code": "capture_cloud_update_succeeded",
+            "message": "capture cloud association/status is current",
+        }
 
     for diagnostic in pending_diagnostics:
         record(diagnostic)
@@ -2028,6 +2217,7 @@ def backfill_capture_archives(
             )
             continue
         if existing is not None:
+            cloud_update = publish_association(existing)
             record(
                 _diagnostic(
                     capture_id=capture_id,
@@ -2037,6 +2227,7 @@ def backfill_capture_archives(
                     message="stable capture archive association already exists",
                     book_id=existing.book_id,
                     association=existing.as_dict(),
+                    cloud_update=cloud_update,
                 )
             )
             continue
@@ -2167,6 +2358,7 @@ def backfill_capture_archives(
             continue
 
         association = result.receipt.association
+        cloud_update = publish_association(association)
         changed = (
             not result.replayed
             and result.receipt.disposition is CaptureArchiveDisposition.CREATED
@@ -2189,23 +2381,32 @@ def backfill_capture_archives(
                 changed=changed,
                 book_id=association.book_id,
                 association=association.as_dict(),
+                cloud_update=cloud_update,
             )
         )
 
-    failed = counts.get("failed", 0)
+    local_failed = counts.get("failed", 0)
+    failed = local_failed + cloud_counts["failed"]
+    summary = {
+        "total": sum(counts.values()),
+        "created": counts.get("created", 0),
+        "would_create": counts.get("would_create", 0),
+        "unchanged": counts.get("unchanged", 0),
+        "failed": failed,
+        "omitted_diagnostics": omitted,
+    }
+    if apply and association_publisher is not None:
+        summary.update({
+            "local_failed": local_failed,
+            "cloud_succeeded": cloud_counts["succeeded"],
+            "cloud_failed": cloud_counts["failed"],
+        })
     return {
         "schema": "org.whl.capture-lib-backfill-report",
         "version": 1,
         "mode": "apply" if apply else "dry-run",
         "ok": failed == 0,
-        "summary": {
-            "total": sum(counts.values()),
-            "created": counts.get("created", 0),
-            "would_create": counts.get("would_create", 0),
-            "unchanged": counts.get("unchanged", 0),
-            "failed": failed,
-            "omitted_diagnostics": omitted,
-        },
+        "summary": summary,
         "diagnostics": diagnostics,
     }
 
@@ -2240,6 +2441,11 @@ def run_capture_archive_backfill(
     capture_root: str | Path,
     workspace_root: str | Path,
     format_module: Any,
+    association_publisher: (
+        CaptureArchiveAssociationPublisherPort | None
+    ) = None,
+    capture_ids: Iterable[str] | None = None,
+    publication_capture_ids: Iterable[str] | None = None,
     apply: bool = False,
     diagnostic_limit: int = _MAX_BACKFILL_DIAGNOSTICS,
 ) -> dict[str, Any]:
@@ -2289,6 +2495,9 @@ def run_capture_archive_backfill(
                 capture_id,
             )
         ),
+        association_publisher=association_publisher,
+        capture_ids=capture_ids,
+        publication_capture_ids=publication_capture_ids,
         apply=apply,
         diagnostic_limit=diagnostic_limit,
     )
@@ -2362,16 +2571,7 @@ def main(argv: list[str] | None = None) -> int:
                 "omitted_diagnostics": 0,
             },
             "diagnostics": [
-                _diagnostic(
-                    capture_id="",
-                    status="failed",
-                    code=(
-                        str(exc.code)
-                        if isinstance(exc, EngineError)
-                        else "capture_backfill_setup_failed"
-                    ),
-                    message=str(exc) or type(exc).__name__,
-                )
+                _backfill_setup_diagnostic(exc)
             ],
         }
     print(

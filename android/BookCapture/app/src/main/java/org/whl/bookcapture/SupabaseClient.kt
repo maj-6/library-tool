@@ -1,6 +1,10 @@
 package org.whl.bookcapture
 
 import android.content.Context
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -9,6 +13,7 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
+import java.util.concurrent.TimeUnit
 
 internal data class PrivateObjectDownload(
     val contentType: String,
@@ -20,6 +25,12 @@ private const val DEFAULT_SUPABASE_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 private const val SUPABASE_ERROR_RESPONSE_MAX_BYTES = 16 * 1024
 private const val CAPTURE_REVIEW_RESPONSE_MAX_BYTES = 128 * 1024
 private const val CAPTURE_IMPORT_ROW_MAX_BYTES = 12 * 1024
+internal const val SUPABASE_PHOTO_CONNECT_TIMEOUT_MS = 20_000L
+internal const val SUPABASE_PHOTO_READ_TIMEOUT_MS = 120_000L
+internal const val SUPABASE_PHOTO_WRITE_TIMEOUT_MS = 120_000L
+internal const val SUPABASE_PHOTO_CALL_TIMEOUT_MS = 150_000L
+
+private val JPEG_MEDIA_TYPE = "image/jpeg".toMediaType()
 
 /** A box listing projects short jsonb fields rather than the whole `meta`, so a
  * [REMOTE_COLLECTION_BOOKS_PAGE_SIZE]-row page stays bounded independently of
@@ -46,6 +57,82 @@ internal fun readBoundedSupabaseResponse(input: InputStream, maximum: Int): Byte
         output.write(buffer, 0, count)
     }
     return output.toByteArray()
+}
+
+/** Photo bodies previously used HttpURLConnection, whose write could wait
+ * forever when a peer accepted the socket but stopped consuming the body.
+ * OkHttp applies the write timeout while streaming and the call timeout as a
+ * final bound over DNS, connect, request, and response work. */
+internal fun newSupabasePhotoUploadClient(
+    connectTimeoutMs: Long = SUPABASE_PHOTO_CONNECT_TIMEOUT_MS,
+    readTimeoutMs: Long = SUPABASE_PHOTO_READ_TIMEOUT_MS,
+    writeTimeoutMs: Long = SUPABASE_PHOTO_WRITE_TIMEOUT_MS,
+    callTimeoutMs: Long = SUPABASE_PHOTO_CALL_TIMEOUT_MS,
+): OkHttpClient {
+    require(connectTimeoutMs > 0) { "connect timeout must be bounded" }
+    require(readTimeoutMs > 0) { "read timeout must be bounded" }
+    require(writeTimeoutMs > 0) { "write timeout must be bounded" }
+    require(callTimeoutMs > 0) { "call timeout must be bounded" }
+    return OkHttpClient.Builder()
+        .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
+        .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+        .writeTimeout(writeTimeoutMs, TimeUnit.MILLISECONDS)
+        .callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+        .build()
+}
+
+private val supabasePhotoUploadClient by lazy(::newSupabasePhotoUploadClient)
+
+internal fun newSupabasePhotoUploadRequest(
+    url: String,
+    anonKey: String,
+    accessToken: String,
+    file: File,
+): Request = Request.Builder()
+    .url(url)
+    .header("apikey", anonKey)
+    .header("Authorization", "Bearer $accessToken")
+    .header("Content-Type", "image/jpeg")
+    .header("x-upsert", "true")
+    .post(file.asRequestBody(JPEG_MEDIA_TYPE))
+    .build()
+
+/** Execute a photo upload while retaining SupabaseClient's response and
+ * account-change semantics. OkHttp's call timeout cancels the exchange when
+ * any individual network timeout cannot make progress. */
+internal fun executeSupabasePhotoUpload(
+    client: OkHttpClient,
+    request: Request,
+    ensureOwnerStillCurrent: () -> Unit,
+) {
+    client.newCall(request).execute().use { response ->
+        val code = response.code
+        val body = try {
+            response.body?.byteStream()?.use {
+                readBoundedSupabaseResponse(
+                    it,
+                    if (response.isSuccessful) DEFAULT_SUPABASE_RESPONSE_MAX_BYTES
+                    else SUPABASE_ERROR_RESPONSE_MAX_BYTES,
+                ).decodeToString()
+            } ?: ""
+        } catch (e: SupabaseResponseTooLarge) {
+            if (response.isSuccessful) {
+                throw SupabaseClient.InvalidResponse(e.message.orEmpty())
+            } else {
+                ""
+            }
+        } catch (e: Exception) {
+            if (response.isSuccessful) throw e else ""
+        }
+        ensureOwnerStillCurrent()
+        if (!response.isSuccessful) {
+            throw SupabaseClient.HttpException(
+                code,
+                "HTTP $code: ${body.take(300)}",
+                body,
+            )
+        }
+    }
 }
 
 private fun encodedStoragePath(value: String): String = value.split('/').joinToString("/") {
@@ -241,12 +328,18 @@ class SupabaseClient(
 
     /** Upload one JPEG; objectPath like "PixelBooth/abcd1234/photo_1.jpg". */
     fun uploadPhoto(objectPath: String, file: File) {
-        val conn = open("POST", "$baseUrl/storage/v1/object/captures/$objectPath", "image/jpeg")
-        conn.setRequestProperty("x-upsert", "true")   // retried uploads overwrite
-        conn.doOutput = true
-        conn.setFixedLengthStreamingMode(file.length())
-        conn.outputStream.use { out -> file.inputStream().use { it.copyTo(out) } }
-        finish(conn)
+        if (ownerId.isEmpty() || Prefs.userId(ctx) != ownerId) throw AccountChanged()
+        val token = Auth.accessToken(ctx) ?: throw SignedOut()
+        if (Prefs.userId(ctx) != ownerId) throw AccountChanged()
+        val request = newSupabasePhotoUploadRequest(
+            url = "$baseUrl/storage/v1/object/captures/$objectPath",
+            anonKey = Prefs.anonKey(ctx),
+            accessToken = token,
+            file = file,
+        )
+        executeSupabasePhotoUpload(supabasePhotoUploadClient, request) {
+            if (Prefs.userId(ctx) != ownerId) throw AccountChanged()
+        }
     }
 
     /** Insert the capture row the desktop sync will pick up, carrying the

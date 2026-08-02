@@ -151,6 +151,7 @@ class HomeLifecyclePerformanceTest {
             "override fun onSaveInstanceState",
         )
         assertTrue(observers.contains("getWorkInfosLiveData(activeUniqueWorkQuery("))
+        assertTrue(observers.contains("ProcessWorker.RETRY_WORK_NAME"))
         assertTrue(observers.contains("scheduleWorkerRefresh(contentChanged = true)"))
         assertTrue(observers.contains("scheduleWorkerRefresh(contentChanged = false)"))
         assertFalse(observers.contains("getWorkInfosForUniqueWorkLiveData"))
@@ -172,6 +173,8 @@ class HomeLifecyclePerformanceTest {
         assertTrue(scheduler.contains("Lifecycle.State.STARTED"))
 
         val onResume = section("override fun onResume()", "override fun onStop()")
+        assertTrue(onResume.contains("ProcessWorker.resumePendingForcedRetries"))
+        assertTrue(onResume.contains("lifecycleScope.launch(Dispatchers.IO)"))
         assertTrue(onResume.contains("cancelScheduledWorkerRefresh()"))
         assertTrue(onResume.contains("showTab(activeTab)"))
     }

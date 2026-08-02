@@ -1,4 +1,4 @@
--- 023_capture_corrections -- desktop-corrected display renditions for phones.
+-- 024_capture_corrections -- desktop-corrected display renditions for phones.
 --
 -- The desktop Corrections manager commits corrected display renditions of
 -- phone capture photos.  The credentialed desktop publishes one row per
@@ -89,4 +89,4 @@ create policy capture_corrections_derivatives_select_authorized
 
 notify pgrst, 'reload schema';
 
-insert into schema_migrations (id) values ('023_capture_corrections') on conflict do nothing;
+insert into schema_migrations (id) values ('024_capture_corrections') on conflict do nothing;

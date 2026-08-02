@@ -61,6 +61,12 @@ CAPTURE_LIB_ASSOCIATION_RPC = SQL[
 CAPTURE_LIB_ASSOCIATION_RPC_FLAT = " ".join(
     CAPTURE_LIB_ASSOCIATION_RPC.split()
 )
+CAPTURE_LIB_IMPORT_TRANSITION_GUARD = SQL[
+    "023_capture_lib_import_transition_guard"
+]
+CAPTURE_LIB_IMPORT_TRANSITION_GUARD_FLAT = " ".join(
+    CAPTURE_LIB_IMPORT_TRANSITION_GUARD.split()
+)
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -736,6 +742,78 @@ def test_capture_lib_association_grants_block_phone_forgery_and_keep_rls_reads()
     assert "created_by = (select auth.uid())" in select_policy
     assert "grant_row.ingester_id = (select auth.uid())" in select_policy
     assert "grant_row.contributor_id = captures.created_by" in select_policy
+
+
+def test_capture_lib_import_transition_guard_preserves_only_existing_legacy_nulls():
+    migration = CAPTURE_LIB_IMPORT_TRANSITION_GUARD_FLAT
+    function = migration.split(
+        "create or replace function "
+        "private.guard_capture_lib_import_transition()",
+        1,
+    )[1].split(
+        "revoke all on function "
+        "private.guard_capture_lib_import_transition()",
+        1,
+    )[0]
+    assert "security invoker" in function
+    assert "set search_path = ''" in function
+    assert "if tg_op = 'INSERT' then" in function
+    assert "new.status = 'imported' and new.lib_association is null" in function
+    assert "old.status is distinct from 'imported'" in function
+    assert "or old.lib_association is not null" in function
+    assert (
+        "capture import and library archive association must publish together"
+        in function
+    )
+    # There is deliberately no UPDATE/backfill. Existing imported/null rows
+    # remain the backward-compatible exception; only future transitions fail.
+    assert "update public.captures" not in migration
+
+
+def test_capture_lib_import_transition_guard_rejects_association_removal():
+    migration = CAPTURE_LIB_IMPORT_TRANSITION_GUARD_FLAT
+    assert (
+        "new.status = 'imported' and new.lib_association is null "
+        "and ( old.status is distinct from 'imported' "
+        "or old.lib_association is not null )"
+    ) in migration
+
+
+def test_capture_lib_import_transition_guard_reasserts_rls_and_rpc_only_writes():
+    migration = CAPTURE_LIB_IMPORT_TRANSITION_GUARD_FLAT
+    assert (
+        "create trigger captures_guard_lib_import_transition "
+        "before insert or update of status, lib_association "
+        "on public.captures"
+    ) in migration
+    assert "alter table public.captures enable row level security;" in migration
+    assert "grant select on public.captures to authenticated;" in migration
+    assert (
+        "revoke insert on public.captures "
+        "from authenticated, service_role;"
+    ) in migration
+    assert (
+        "revoke insert ( lib_association, lib_association_revision, "
+        "lib_association_updated_at ) on public.captures "
+        "from authenticated, service_role;"
+    ) in migration
+    assert (
+        "revoke update on public.captures from authenticated, service_role;"
+    ) in migration
+    assert (
+        "revoke update ( lib_association, lib_association_revision, "
+        "lib_association_updated_at ) on public.captures "
+        "from authenticated, service_role;"
+    ) in migration
+    assert (
+        "grant insert ( id, created_at, device, status, photos, note, "
+        "created_by, contributor, ocr, meta ) on public.captures "
+        "to authenticated, service_role;"
+    ) in migration
+    assert (
+        "grant update ( device, status, photos, note, contributor, ocr, meta ) "
+        "on public.captures to authenticated, service_role;"
+    ) in migration
 
 
 # --- 009: shared collections ------------------------------------------------------

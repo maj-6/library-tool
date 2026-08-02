@@ -113,6 +113,18 @@ internal data class ConfirmedDelivery(
     val captureLibConfirmation: CaptureLibConfirmation? = null,
 )
 
+/** Cloud work must be visible to WorkManager as network-bound. LAN and an
+ * unresolved Auto request may need to run on unvalidated, local-only Wi-Fi. */
+internal fun captureUploadRequiresConnectedNetwork(record: CaptureSyncRecord?): Boolean =
+    record?.resolvedTransport == "cloud" || record?.transportMode == "cloud"
+
+/** An older or unresolved Auto WorkSpec cannot gain a network constraint in
+ * place. Hand it off after the frozen request has resolved to cloud. */
+internal fun captureUploadNeedsConnectedHandoff(
+    resolvedTransport: String,
+    scheduledForConnectedNetwork: Boolean,
+): Boolean = resolvedTransport == "cloud" && !scheduledForConnectedNetwork
+
 /** Validate the whole manifest photo set before starting any network writes.
  * Silently skipping one missing page would turn a partial upload into a
  * successful one, so one bad member keeps the entire entry recoverable. */
@@ -352,6 +364,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         private const val CHAIN_SAW_DEFERRED = "upload-chain-saw-deferred"
         private const val CHAIN_HAD_ERROR = "upload-chain-had-error"
         private const val DEFERRED_ROUND = "upload-deferred-round"
+        private const val SCHEDULED_FOR_CONNECTED_NETWORK =
+            "upload-scheduled-for-connected-network"
 
         /**
          * The sole capture-delivery entry point. The eligible folder ids are
@@ -365,8 +379,12 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             if (start.record.targetIds.isNotEmpty()) {
                 WorkManager.getInstance(ctx).enqueueUniqueWork(
                     EXPLICIT_SYNC_WORK_NAME,
-                    if (start.created) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
-                    request(start.record.requestId),
+                    // This path is an explicit button press. Replacing a
+                    // waiting/retrying continuation gives the user a real
+                    // recovery action while retaining the frozen request and
+                    // its durable synced/blocked accounting.
+                    ExistingWorkPolicy.REPLACE,
+                    request(ctx, start.record.requestId),
                 )
             }
             return captureSyncState(ctx)
@@ -400,7 +418,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 .enqueueUniqueWork(
                     EXPLICIT_SYNC_WORK_NAME,
                     ExistingWorkPolicy.KEEP,
-                    request(active.requestId),
+                    request(ctx, active.requestId),
                 )
         }
 
@@ -412,11 +430,12 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             WorkManager.getInstance(ctx).enqueueUniqueWork(
                 EXPLICIT_SYNC_WORK_NAME,
                 ExistingWorkPolicy.REPLACE,
-                request(active.requestId),
+                request(ctx, active.requestId),
             )
         }
 
         private fun request(
+            ctx: Context,
             syncRequestId: String,
             cursor: UploadQueueKey? = null,
             sawDeferred: Boolean = false,
@@ -424,6 +443,9 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             deferredRound: Int = 0,
             delayMs: Long = 0,
         ): OneTimeWorkRequest {
+            val scheduledForConnectedNetwork = captureUploadRequiresConnectedNetwork(
+                Prefs.captureSyncRecord(ctx)?.takeIf { it.requestId == syncRequestId },
+            )
             val builder = OneTimeWorkRequestBuilder<UploadWorker>()
                 .setInputData(workDataOf(
                     SYNC_REQUEST_ID to syncRequestId,
@@ -433,13 +455,15 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                     CHAIN_SAW_DEFERRED to sawDeferred,
                     CHAIN_HAD_ERROR to hadError,
                     DEFERRED_ROUND to deferredRound,
+                    SCHEDULED_FOR_CONNECTED_NETWORK to scheduledForConnectedNetwork,
                 ))
                 .setConstraints(
-                    // LAN Wi-Fi may have no validated Internet capability.
-                    // Transport probes below provide retry semantics for both
-                    // local and cloud destinations.
+                    // LAN Wi-Fi may have no validated Internet capability, but
+                    // cloud work must use JobScheduler's network lifecycle on
+                    // Android 15+ rather than an unconstrained greedy worker.
                     Constraints.Builder().setRequiredNetworkType(
-                        NetworkType.NOT_REQUIRED,
+                        if (scheduledForConnectedNetwork) NetworkType.CONNECTED
+                        else NetworkType.NOT_REQUIRED,
                     ).build())
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             if (delayMs > 0) builder.setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
@@ -459,6 +483,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 EXPLICIT_SYNC_WORK_NAME,
                 ExistingWorkPolicy.APPEND_OR_REPLACE,
                 request(
+                    ctx,
                     syncRequestId,
                     cursor,
                     sawDeferred,
@@ -687,16 +712,41 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             syncRecord.lanHost.isNotEmpty()) {
             try { LanClient(ctx, syncRecord.lanHost) } catch (_: Exception) { null }
         } else null
-        val lanReady = lan?.ping() == true
+        val readyLan = lan?.takeIf { it.ping() }
         if (resolved.isEmpty() && syncRecord.transportMode == "auto") {
-            resolved = if (lanReady) "lan" else "cloud"
+            resolved = if (readyLan != null) "lan" else "cloud"
             resolved = Prefs.resolveCaptureSyncTransport(
                 ctx, syncRequestId, resolved,
             ) ?: return@withContext Result.retry()
         }
+        if (captureUploadNeedsConnectedHandoff(
+                resolved,
+                inputData.getBoolean(SCHEDULED_FOR_CONNECTED_NETWORK, false),
+            )) {
+            // The current WorkSpec was created while Auto was unresolved (or
+            // by an older app version), so it cannot be upgraded in place.
+            // Re-select this same candidate from a CONNECTED continuation.
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+            setUploadProgress(candidate.key.entryId, "waiting-for-network")
+            val persisted = continueUploadChain(
+                ctx = ctx,
+                syncRequestId = syncRequestId,
+                cursor = cursor,
+                sawDeferred = inputData.getBoolean(CHAIN_SAW_DEFERRED, false),
+                hadError = inputData.getBoolean(CHAIN_HAD_ERROR, false),
+                deferredRound = inputData.getInt(DEFERRED_ROUND, 0),
+            )
+            if (!persisted) {
+                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+                return@withContext Result.retry()
+            }
+            return@withContext Result.success(
+                syncResultData(ctx, "waiting-for-network", candidate.key.entryId),
+            )
+        }
         if (resolved == "lan") {
-            if (lanReady && lan != null) {
-                return@withContext uploadOneViaLan(ctx, candidate, lan)
+            if (readyLan != null) {
+                return@withContext uploadOneViaLan(ctx, candidate, readyLan)
             }
             run {
                 Prefs.setLastUploadError(ctx, "paired desktop could not be authenticated")

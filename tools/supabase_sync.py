@@ -553,6 +553,223 @@ def list_capture_association_states(
     return out
 
 
+def _capture_lib_remote_state(raw: dict, capture_id: str) -> dict:
+    """Validate one current RLS-scoped association/CAS row."""
+
+    fields = {
+        "id",
+        "status",
+        "lib_association",
+        "lib_association_revision",
+        "lib_association_updated_at",
+    }
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise SyncError("capture association publisher received an invalid row")
+    ids = _capture_sync_ids((raw.get("id"),))
+    status = raw.get("status")
+    revision = raw.get("lib_association_revision")
+    updated_at = raw.get("lib_association_updated_at")
+    if (
+        not ids
+        or ids[0] != capture_id
+        or raw.get("id") != capture_id
+        or not isinstance(status, str)
+        or not 0 < len(status) <= 40
+        or status != status.strip()
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+        or revision >= 9223372036854775807
+    ):
+        raise SyncError("capture association publisher received an invalid row")
+    raw_association = raw.get("lib_association")
+    if raw_association is None:
+        if revision != 0 or updated_at is not None:
+            raise SyncError(
+                "capture association publisher received invalid null state"
+            )
+        association = None
+    else:
+        association = _capture_lib_association_write(
+            raw_association,
+            capture_id,
+        )
+        if (
+            revision <= 0
+            or not isinstance(updated_at, str)
+            or not 0 < len(updated_at) <= 80
+            or updated_at != updated_at.strip()
+            or not _CAPTURE_LIB_OFFSET_TIMESTAMP.fullmatch(updated_at)
+        ):
+            raise SyncError(
+                "capture association publisher received invalid revision state"
+            )
+        try:
+            parsed_updated_at = datetime.fromisoformat(
+                updated_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise SyncError(
+                "capture association publisher received an invalid timestamp"
+            ) from exc
+        if (
+            parsed_updated_at.tzinfo is None
+            or parsed_updated_at.utcoffset() is None
+        ):
+            raise SyncError(
+                "capture association publisher received an invalid timestamp"
+            )
+    return {
+        "id": capture_id,
+        "status": status,
+        "association": association,
+        "revision": revision,
+    }
+
+
+def _capture_lib_exact_stale_transition(before: dict, after: dict) -> bool:
+    """Whether ``after`` only invalidates the exact accepted archive."""
+
+    if before.get("state") != "current" or after.get("state") != "stale":
+        return False
+    return {
+        key: value for key, value in before.items() if key != "state"
+    } == {
+        key: value for key, value in after.items() if key != "state"
+    }
+
+
+def _capture_lib_publisher_error(
+    message: str,
+    *,
+    code: str,
+    retryable: bool,
+):
+    """Return a privacy-safe engine error for the structural publisher port.
+
+    ``SyncError`` is intentionally useful to interactive Supabase callers and
+    can contain a project URL or a bounded PostgREST response.  The capture
+    backfill engine must never serialize those adapter details, and it can
+    preserve a machine code/retryability flag only for ``EngineError`` values.
+    Import lazily so unrelated standalone Supabase helpers keep their existing
+    dependency boundary.
+    """
+
+    from librarytool.engine.errors import RepositoryError
+
+    return RepositoryError(
+        message,
+        code=code,
+        retryable=retryable,
+    )
+
+
+class ScopedCaptureLibAssociationPublisher:
+    """Structural engine publisher backed by the scoped capability RPC.
+
+    Config dictionaries are borrowed, not copied. The desktop host constructs
+    this adapter only inside its service-key and authenticated-session lease;
+    clearing those dictionaries at lease exit also disables the adapter. The
+    standalone/offline archive CLI therefore never loads, stores, or accepts
+    cloud credentials.
+    """
+
+    def __init__(self, service_cfg: dict, scope_cfg: dict) -> None:
+        _capture_lib_publish_configs(service_cfg, scope_cfg)
+        self._service_cfg = service_cfg
+        self._scope_cfg = scope_cfg
+
+    def publish(self, association) -> None:
+        """Publish/replay one verified association without overwriting drift."""
+
+        try:
+            raw = association.as_dict()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud publisher requires a verified association",
+                code="capture_cloud_association_invalid",
+                retryable=False,
+            ) from exc
+        try:
+            desired = _capture_lib_association_write(raw)
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud publisher requires a verified association",
+                code="capture_cloud_association_invalid",
+                retryable=False,
+            ) from exc
+        capture_id = desired["capture_id"]
+        # Revalidate borrowed credentials for every operation. A publisher that
+        # escapes its server-side credential lease fails before any REST call.
+        try:
+            _capture_lib_publish_configs(self._service_cfg, self._scope_cfg)
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud publication authority is unavailable",
+                code="capture_cloud_publication_authority_unavailable",
+                retryable=False,
+            ) from exc
+        try:
+            rows = list_capture_association_states(
+                self._scope_cfg,
+                [capture_id],
+            )
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud association state is unavailable",
+                code="capture_cloud_state_unavailable",
+                retryable=True,
+            ) from exc
+        if len(rows) != 1:
+            raise _capture_lib_publisher_error(
+                "capture cloud publication target is missing or unauthorized",
+                code="capture_cloud_target_unavailable",
+                retryable=False,
+            )
+        try:
+            remote = _capture_lib_remote_state(rows[0], capture_id)
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud association state is invalid",
+                code="capture_cloud_state_invalid",
+                retryable=False,
+            ) from exc
+        current = remote["association"]
+        status = remote["status"]
+        if current == desired and status == "imported":
+            return
+        if current is not None and current != desired:
+            if not _capture_lib_exact_stale_transition(current, desired):
+                raise _capture_lib_publisher_error(
+                    "capture cloud association conflicts with remote state",
+                    code="capture_cloud_association_conflict",
+                    retryable=False,
+                )
+        if status not in {"pending", "imported"}:
+            raise _capture_lib_publisher_error(
+                "capture cloud publication target is not importable",
+                code="capture_cloud_target_not_importable",
+                retryable=False,
+            )
+        try:
+            publish_capture_lib_association(
+                self._service_cfg,
+                self._scope_cfg,
+                capture_id,
+                desired,
+                expected_revision=remote["revision"],
+                # A legacy imported/null row keeps its terminal status while the
+                # association is filled in. Pending rows transition atomically.
+                mark_imported=status == "pending",
+            )
+        except SyncError as exc:
+            raise _capture_lib_publisher_error(
+                "capture cloud association publication is unavailable",
+                code="capture_cloud_publication_unavailable",
+                retryable=True,
+            ) from exc
+
+
 # --- storage --------------------------------------------------------------------
 
 def download_photo(

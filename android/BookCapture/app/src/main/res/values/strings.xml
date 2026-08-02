@@ -9,6 +9,7 @@
     <string name="home_sync_captures">Sync captures</string>
     <string name="home_sync_queued">Sync queued</string>
     <string name="home_sync_running">Syncing %1$d/%2$d</string>
+    <string name="home_sync_retry">Retry sync %1$d/%2$d</string>
     <string name="home_sync_complete">Synced %1$d capture(s)</string>
     <string name="home_sync_partial">Synced %1$d; %2$d need attention</string>
     <string name="home_sync_failed">Sync failed; captures remain on this device</string>

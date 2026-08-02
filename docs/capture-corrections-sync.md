@@ -28,7 +28,7 @@ Anchor identity: `(capture_id, asset_id, original sha256)`.
 - Desktop display renditions do NOT byte-match phone display renditions, so
   display checksums are never used as the anchor.
 
-## Cloud: table `capture_corrections` (migration 023)
+## Cloud: table `capture_corrections` (migration 024)
 
 One row per `(capture_id, asset_id)` — latest correction wins, superseded in
 place via CAS on `revision`.
@@ -147,7 +147,7 @@ Stateless diff-and-publish (no local outbox):
 Failures are reported per capture in the sync summary and never abort the
 rest of the run. Re-running converges (uploads are content-addressed and
 upserted; row writes are CAS'd). One exception is not a failure: when the
-cloud project lacks the `capture_corrections` table (migration 023 not
+cloud project lacks the `capture_corrections` table (migration 024 not
 applied), the publisher marks its stage skipped with a notice and the run
 still succeeds — mirroring the Android consumer, which tolerates the
 missing table.
@@ -199,6 +199,6 @@ bumping the display revision.
   `(capture_id, asset_id)` do not merge: the lexicographically greater
   `correction_id` wins the cloud row, and the losing desktop keeps its
   version locally, skipping with a notice on every sync.
-- Until migration 023 is applied to the cloud project, the publisher skips
+- Until migration 024 is applied to the cloud project, the publisher skips
   its stage with a notice (the run still succeeds); corrections stay local
   and publish on the first sync after the migration.

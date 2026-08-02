@@ -559,6 +559,20 @@ missing or corrupt assets produce a bounded diagnostic and processing
 continues, so a later apply resumes failed rows while already-associated rows
 remain unchanged.
 
+An embedding host may provide an idempotent association publisher for the
+cloud association/status acknowledgement. The backfill calls it only after the
+local archive object and association have been committed and verified. A
+publisher failure is reported separately from the successful local archive;
+the next apply detects the existing association and retries that remote phase
+without resealing or replacing originals. Dry-run and failed archive
+transactions never invoke the publisher. When a publisher is present,
+per-capture diagnostics retain the local `status` and add `local_status`,
+`overall_status`, and a nested `cloud_update`. Summary `failed` is the
+aggregate local-plus-cloud failure count, while `local_failed` and
+`cloud_failed` preserve the two phase outcomes. This lets version 1 consumers
+continue treating nonzero `failed` as an unsuccessful run without hiding a
+successfully committed local archive.
+
 Normal intake derives `book_id` from the capture identity only when no prior
 identity exists. Intake and backfill first inspect any build already linked to
 the exact capture id: a persisted `entries/<build>/ocr/lib-id.json` wins, and a
@@ -569,5 +583,59 @@ idempotency fingerprint, and preserves it in the archive and association.
 Conflicting prior identities fail closed. Capture ids are validated verbatim;
 an invalid id is rejected rather than stripped into another capture's id. The
 command never edits the manual catalogue, deletes or replaces capture
-originals, exposes a local path in diagnostics, or advances a cloud
-status/association.
+originals, or exposes a local path in diagnostics. The standalone CLI remains
+local/offline and never loads a desktop credential.
+
+The supported operator workflow deliberately keeps those authorities in two
+steps. Exit the desktop before the offline step so its compatibility stores
+are idle. When running the command from a source checkout against packaged
+data, set `WHL_DATA_ROOT` to the packaged per-user data root documented in the
+repository README (or pass the three explicit path options).
+
+1. Run the standalone command with `--dry-run`, inspect its JSON report, then
+   run it again with `--apply` against the same desktop data profile.
+2. Open the packaged desktop while signed in, with owner cloud publishing
+   configured, and invoke its explicit **Cloud Sync** action. Its normal
+   user-scoped capture reconciliation finds the newly sealed local
+   association, reads only named capture rows visible through that user's RLS
+   policy, and publishes the association/status with the leased desktop
+   credentials.
+
+The second step is idempotent. If publication is interrupted, another Cloud
+Sync re-inspects the verified local association and the exact remote revision.
+Non-UUID LAN/local-only capture identities are excluded from cloud discovery,
+and a UUID absent from the signed-in user's RLS results is not published. This
+is the packaged operator path; the offline command never needs a service key
+or user token.
+
+For bounded host integrations and authenticated test clients, the desktop
+sidecar additionally exposes the one-request composition through
+`POST /api/v1/capture-archive-backfills`. The JSON request must name between
+one and 64 exact capture IDs; dry-run remains the default and a write requires
+a literal `"apply": true`. This route is separate from routine cloud autosync,
+so startup or interval sync can never trigger an unbounded legacy rewrite. In
+the packaged desktop it is protected by the exact-origin and per-process
+desktop-capability checks used by every `/api/` route, and it accepts only a
+small, unencoded JSON body. The per-process capability is intentionally not an
+operator credential; external scripts should use the two-step workflow above
+rather than attempting to call this internal route in a packaged build.
+
+For apply requests the host first asks the signed-in user's RLS scope which of
+the named UUID capture rows are visible. It then runs the local archive
+backfill for every requested local capture, but supplies
+`ScopedCaptureLibAssociationPublisher` only for that returned subset. A LAN or
+otherwise local-only capture therefore succeeds locally without a cloud write
+or a cloud-failure diagnostic. Each eligible cloud update still occurs only
+after its local archive association verifies. The service credential and user
+session are borrowed only for that bounded request and are cleared before the
+response is returned.
+
+The response is an `org.whl.capture-lib-backfill-host-result` version 1 JSON
+document. `report` is the ordinary machine-readable backfill report; `scope`
+records the bounded request, and `cloud` distinguishes dry-run, missing
+credentials, completed publication, scoped-discovery failure, and per-row
+publication failure without including credentials or provider error bodies.
+The outer `ok` covers both the local report and any requested cloud phase. A
+cloud discovery outage may therefore return outer `ok: false` alongside a
+successful local `report`, making the durable local result and the retryable
+remote phase independently observable.

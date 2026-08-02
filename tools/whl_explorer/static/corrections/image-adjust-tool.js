@@ -453,7 +453,14 @@
 
     restoreProfile(value) {
       this.profile = normalizeImageAdjustProfile(value);
-      if (!this.mountRecord) this.brightness = this.profile.lastAppliedBrightness;
+      const record = this.mountRecord;
+      const state = record && !record.disposed
+        ? record.controller.getState() : null;
+      const activeDraft = Boolean(state && state.tool === TOOLS.IMAGE_ADJUST);
+      if (!activeDraft) {
+        this.brightness = this.profile.lastAppliedBrightness;
+        if (record && !record.disposed) this.refreshMount(false, state);
+      }
       return this.serializeProfile();
     }
 

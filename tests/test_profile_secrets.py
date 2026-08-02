@@ -362,6 +362,33 @@ def test_signed_out_mistral_stays_usable_as_unowned_local_only_key(
     assert server._sync_profile_mistral_key() is None
 
 
+def test_mistral_lease_does_not_relabel_consumer_failure(mistral_env):
+    env = mistral_env
+    env.seed("account-a-secret", owner="user-a", phase="synced")
+
+    with pytest.raises(ConnectionError, match="provider disconnected"):
+        with server._lease_secret("mistralKey") as credential:
+            assert credential == "account-a-secret"
+            raise ConnectionError("provider disconnected")
+
+
+def test_device_secret_lease_does_not_relabel_consumer_failure(mistral_env):
+    env = mistral_env
+    secret_id = server._SECRET_IDS["aiKey"]
+    before = env.service.get_status(secret_id)
+    env.service.replace(ReplaceSecretCommand(
+        secret_id=secret_id,
+        expected_revision=before.revision,
+        credential="device-secret",
+        operation_id=env.operation("device-secret-replace"),
+    ))
+
+    with pytest.raises(OSError, match="provider transport failed"):
+        with server._lease_secret("aiKey") as credential:
+            assert credential == "device-secret"
+            raise OSError("provider transport failed")
+
+
 def test_signed_out_user_can_start_local_mode_after_synced_empty_account(
         mistral_env):
     env = mistral_env

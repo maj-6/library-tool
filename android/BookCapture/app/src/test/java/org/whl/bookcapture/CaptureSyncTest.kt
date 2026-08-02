@@ -10,6 +10,58 @@ import java.io.File
 class CaptureSyncTest {
 
     @Test
+    fun cloudRoutesRequireConnectedWorkWhileLanAndUnresolvedAutoDoNot() {
+        fun record(mode: String, resolved: String) = CaptureSyncRecord(
+            requestId = "request-1",
+            phase = CaptureSyncPhase.RUNNING,
+            targetIds = setOf("book-a"),
+            syncedIds = emptySet(),
+            blockedIds = emptySet(),
+            transportMode = mode,
+            resolvedTransport = resolved,
+        )
+
+        assertTrue(captureUploadRequiresConnectedNetwork(record("cloud", "cloud")))
+        assertTrue(captureUploadRequiresConnectedNetwork(record("auto", "cloud")))
+        assertTrue(captureUploadRequiresConnectedNetwork(record("cloud", "")))
+        assertFalse(captureUploadRequiresConnectedNetwork(record("lan", "lan")))
+        assertFalse(captureUploadRequiresConnectedNetwork(record("auto", "")))
+        assertFalse(captureUploadRequiresConnectedNetwork(null))
+    }
+
+    @Test
+    fun onlyCloudOnAnUnconstrainedWorkSpecNeedsAHandoff() {
+        assertTrue(captureUploadNeedsConnectedHandoff("cloud", false))
+        assertFalse(captureUploadNeedsConnectedHandoff("cloud", true))
+        assertFalse(captureUploadNeedsConnectedHandoff("lan", false))
+        assertFalse(captureUploadNeedsConnectedHandoff("", false))
+    }
+
+    @Test
+    fun autoCloudResolutionHandsOffBeforeCreatingASupabaseClient() {
+        val upload = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        val resolution = upload.indexOf("resolved = Prefs.resolveCaptureSyncTransport(")
+        val handoff = upload.indexOf("if (captureUploadNeedsConnectedHandoff(", resolution)
+        val cloudClient = upload.indexOf("val client = SupabaseClient(ctx, uploadOwner)", handoff)
+
+        assertTrue(resolution >= 0)
+        assertTrue(handoff > resolution)
+        assertTrue(cloudClient > handoff)
+        val handoffBody = upload.substring(handoff, cloudClient)
+        assertTrue(handoffBody.contains("CaptureSyncPhase.RETRYING"))
+    }
+
+    @Test
+    fun anExplicitSecondPressReplacesAStalledContinuation() {
+        val upload = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        val explicit = upload.substringAfter("internal fun enqueueExplicitSync")
+            .substringBefore("internal fun captureSyncState")
+
+        assertTrue(explicit.contains("ExistingWorkPolicy.REPLACE"))
+        assertFalse(explicit.contains("ExistingWorkPolicy.KEEP"))
+    }
+
+    @Test
     fun activeRequestIsIdempotentAndDoesNotAbsorbLaterCaptures() {
         val active = CaptureSyncRecord(
             requestId = "request-1",
