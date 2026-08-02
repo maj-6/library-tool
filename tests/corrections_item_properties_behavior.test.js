@@ -13,6 +13,8 @@ const {
   createItemMetadataEditor,
   editableMetadata,
   isConflict,
+  itemFormFields,
+  metadataFieldLabel,
   patchFromDraft,
 } = require("../tools/whl_explorer/static/corrections/item-properties");
 const {
@@ -226,6 +228,10 @@ test("captured entries and books show canonical identity without storage details
   assert.doesNotMatch(root.textContent, /manual-row-raw-key|private-capture-key/);
   assert.doesNotMatch(root.querySelector("textarea").value,
     /storage_id|capture_id|manual-row-raw-key|private-capture-key/);
+  const advanced = root.querySelector("[data-item-metadata-advanced]");
+  assert.match(advanced.value, /Aloe, supplied by the cataloguer/);
+  assert.doesNotMatch(advanced.value,
+    /storage_id|capture_id|manual-row-raw-key|private-capture-key/);
   assert.deepEqual(editableMetadata(raw.metadata), {
     authors: "Unknown",
     extra: {
@@ -409,7 +415,8 @@ test("revision conflicts reload current data and preserve attempted edits", asyn
   assert.equal(root.querySelector("input").value, "My corrected title");
   assert.match(root.textContent, /changed elsewhere/i);
   assert.match(root.textContent, /edits were merged/i);
-  assert.match(root.textContent, /authors|title/i);
+  assert.match(root.textContent, /Authors, Condition, Title/,
+    "conflicts are reported with human field names");
   assert.equal(root.dataset.state, "error");
   assert.equal(statuses.at(-1)[1], true);
 });
@@ -488,8 +495,11 @@ test("unsaved metadata drafts survive rerenders and item navigation", async () =
   });
   await editor.setSelection("capture-b9f1");
   assert.equal(root.querySelector("input").value, "Draft title");
-  assert.match(root.querySelector("textarea").value, /Unsaved field note/);
-  assert.match(root.querySelector("textarea").value, /Added concurrently/);
+  assert.equal(root.querySelector('[data-item-field="notes"]').value,
+    "Unsaved field note");
+  assert.equal(root.querySelector('[data-item-field="publisher"]').value,
+    "Added concurrently");
+  assert.match(editor.draft.metadataText, /Added concurrently/);
   assert.equal(editor.draft.baseRevision, "mir-r2");
   assert.equal(editor.draft.dirty, true);
 });
@@ -663,4 +673,258 @@ test("patch construction treats title and metadata changes independently", () =>
     metadata_set: { authors: "Known" },
     metadata_remove: ["year"],
   });
+});
+
+
+test("typed form renders the manual field set from capture storage metadata", async () => {
+  const raw = item({
+    metadata: {
+      active_storage_kind: "manual",
+      authors: "Unknown",
+      condition: "foxed",
+      year: "1897",
+      notes: "Leaf fragment enclosed",
+      extra: { shelf: "B4" },
+    },
+  });
+  const { editor, root } = harness({
+    api: {
+      async loadItem() { return raw; },
+      async updateItem() { throw new Error("not used"); },
+    },
+  });
+
+  await editor.setSelection(raw.id);
+
+  assert.deepEqual(
+    root.querySelectorAll("[data-item-field]")
+      .map((node) => node.getAttribute("data-item-field")),
+    itemFormFields("manual").map((field) => field.key));
+  assert.deepEqual(itemFormFields("manual").map((field) => field.key), [
+    "subtitle", "authors", "publisher", "publisher_city", "year", "edition",
+    "volume", "language", "pages", "condition", "price", "illustrations",
+    "categories", "notes",
+  ]);
+  assert.equal(root.querySelector('[data-item-field="authors"]').value, "Unknown");
+  assert.equal(root.querySelector('[data-item-field="condition"]').value, "foxed");
+  assert.equal(root.querySelector('[data-item-field="year"]').value, "1897");
+  assert.equal(root.querySelector('[data-item-field="subtitle"]').value, "");
+  assert.equal(root.querySelector('[data-item-field="notes"]').tagName, "TEXTAREA");
+  assert.match(root.textContent, /manual storage/);
+  const advanced = root.querySelector("[data-item-metadata-advanced]");
+  assert.deepEqual(JSON.parse(advanced.value), { extra: { shelf: "B4" } });
+  assert.match(root.textContent, /1 key/,
+    "the collapsed Advanced section counts its residual keys");
+});
+
+
+test("build-storage items add description and rights to the typed form", async () => {
+  const raw = item({
+    id: "book-two",
+    kind: "book",
+    title: "Second book",
+    record_revision: "book-r1",
+    metadata: {
+      active_storage_kind: "build",
+      authors: "B. Moss",
+      description: "A field guide.",
+      rights: "public-domain",
+    },
+  });
+  const { editor, root } = harness({
+    api: {
+      async loadItem() { return raw; },
+      async updateItem() { throw new Error("not used"); },
+    },
+  });
+
+  await editor.setSelection(raw.id);
+
+  assert.deepEqual(
+    root.querySelectorAll("[data-item-field]")
+      .map((node) => node.getAttribute("data-item-field")),
+    itemFormFields("build").map((field) => field.key));
+  const description = root.querySelector('[data-item-field="description"]');
+  assert.equal(description.tagName, "TEXTAREA");
+  assert.equal(description.value, "A field guide.");
+  assert.equal(root.querySelector('[data-item-field="rights"]').value,
+    "public-domain");
+  assert.match(root.textContent, /catalogue storage/);
+});
+
+
+test("field set falls back by item kind when the projection omits storage kind",
+  async () => {
+    const raw = item();
+    const { editor, root } = harness({
+      api: {
+        async loadItem() { return raw; },
+        async updateItem() { throw new Error("not used"); },
+      },
+    });
+
+    await editor.setSelection(raw.id);
+    assert.ok(root.querySelector('[data-item-field="condition"]'));
+    assert.equal(root.querySelector('[data-item-field="rights"]'), null);
+
+    raw.kind = "book";
+    raw.id = "book-canonical";
+    raw.record_revision = "book-r1";
+    await editor.setSelection(raw.id);
+    assert.ok(root.querySelector('[data-item-field="rights"]'));
+  });
+
+
+test("typed field edits produce the same patch intents as the JSON editor", async () => {
+  const calls = [];
+  const initial = item({
+    metadata: { authors: "Unknown", publisher: "Field Press" },
+  });
+  const saved = item({
+    metadata: { authors: "A. Green" },
+    record_revision: "mir-r2",
+  });
+  const { editor, root } = harness({
+    api: {
+      async loadItem() { return initial; },
+      async updateItem(payload) {
+        calls.push(payload);
+        return { item: saved, replayed: false };
+      },
+    },
+  });
+  await editor.setSelection(initial.id);
+
+  const authors = root.querySelector('[data-item-field="authors"]');
+  authors.value = "A. Green";
+  authors.emit("input");
+  const publisher = root.querySelector('[data-item-field="publisher"]');
+  publisher.value = "";
+  publisher.emit("input");
+
+  await editor.save();
+
+  assert.deepEqual(calls[0].patch, {
+    title: null,
+    metadata_set: { authors: "A. Green" },
+    metadata_remove: ["publisher"],
+  });
+  assert.equal(editor.item.revision, "mir-r2");
+  assert.equal(editor.draft.dirty, false);
+});
+
+
+test("advanced JSON edits merge residual keys with typed field values", async () => {
+  const initial = item({
+    metadata: { authors: "Unknown", extra: { flag: true } },
+  });
+  const { editor, root } = harness({
+    api: {
+      async loadItem() { return initial; },
+      async updateItem() { throw new Error("not used"); },
+    },
+  });
+  await editor.setSelection(initial.id);
+
+  const advanced = root.querySelector("[data-item-metadata-advanced]");
+  assert.deepEqual(JSON.parse(advanced.value), { extra: { flag: true } });
+  advanced.value = JSON.stringify({
+    extra: { flag: false },
+    source_url: "https://example.test/scan",
+  });
+  advanced.emit("input");
+
+  assert.deepEqual(JSON.parse(editor.draft.metadataText), {
+    authors: "Unknown",
+    extra: { flag: false },
+    source_url: "https://example.test/scan",
+  });
+
+  editor.render();
+  assert.equal(root.querySelector('[data-item-field="authors"]').value,
+    "Unknown");
+  assert.deepEqual(
+    JSON.parse(root.querySelector("[data-item-metadata-advanced]").value),
+    { extra: { flag: false }, source_url: "https://example.test/scan" });
+});
+
+
+test("invalid advanced JSON blocks saving without losing typed fields", async () => {
+  let updates = 0;
+  const { editor, root } = harness({
+    api: {
+      async loadItem() { return item(); },
+      async updateItem() {
+        updates += 1;
+        throw new Error("must not be called");
+      },
+    },
+  });
+  await editor.setSelection("capture-b9f1");
+  editor.updateDraft({ title: "Corrected" });
+  const advanced = root.querySelector("[data-item-metadata-advanced]");
+  advanced.value = "{ not json";
+  advanced.emit("input");
+
+  assert.equal(root.querySelector("[data-item-metadata-save]").disabled, true);
+  assert.equal(await editor.save(), null);
+  assert.equal(updates, 0);
+  assert.match(root.textContent, /Advanced \(JSON\) metadata before saving/);
+  assert.equal(root.querySelector("[data-item-metadata-advanced]").value,
+    "{ not json");
+  assert.equal(root.querySelector('[data-item-field="authors"]').value,
+    "Unknown");
+  assert.deepEqual(JSON.parse(editor.draft.metadataText),
+    { authors: "Unknown", condition: "foxed" });
+
+  const restored = root.querySelector("[data-item-metadata-advanced]");
+  restored.value = "{}";
+  restored.emit("input");
+  assert.equal(editor.advancedError, "");
+  assert.equal(root.querySelector("[data-item-metadata-save]").disabled, false);
+  assert.deepEqual(JSON.parse(editor.draft.metadataText),
+    { authors: "Unknown", condition: "foxed" });
+});
+
+
+test("server field errors mark the matching typed input", async () => {
+  const failure = Object.assign(
+    new Error("server-managed Corrections item fields cannot be changed here"), {
+      status: 422,
+      code: "managed_item_fields_not_writable",
+      details: { fields: ["condition", "extra.book_id"] },
+    });
+  const { editor, root } = harness({
+    api: {
+      async loadItem() { return item(); },
+      async updateItem() { throw failure; },
+    },
+  });
+  await editor.setSelection("capture-b9f1");
+  const condition = root.querySelector('[data-item-field="condition"]');
+  condition.value = "rebound";
+  condition.emit("input");
+
+  await editor.save();
+
+  const marked = root.querySelector('[data-item-field="condition"]');
+  assert.equal(marked.getAttribute("aria-invalid"), "true");
+  assert.match(root.textContent, /Server-managed; not writable/);
+  assert.equal(
+    root.querySelector("[data-item-metadata-advanced-section]").open, true,
+    "errors on keys without a form input open the Advanced section");
+  assert.match(root.textContent, /extra: Server-managed; not writable/);
+
+  marked.value = "foxed";
+  marked.emit("input");
+  assert.equal(editor.fieldErrors, null);
+  assert.equal(marked.getAttribute("aria-invalid"), null);
+});
+
+
+test("conflict reporting names human field labels", () => {
+  assert.equal(metadataFieldLabel("publisher_city"), "Publisher city");
+  assert.equal(metadataFieldLabel("title"), "Title");
+  assert.equal(metadataFieldLabel("rights"), "Rights");
+  assert.equal(metadataFieldLabel("custom_key"), "custom_key");
 });

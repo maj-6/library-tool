@@ -141,6 +141,113 @@
         ? pretty : JSON.stringify(editable);
     }
 
+    function stableMetadataText(value) {
+      const sorted = Object.fromEntries(
+        Object.keys(value).sort().map((key) => [key, value[key]]));
+      const pretty = JSON.stringify(sorted, null, 2);
+      return pretty.length <= MAX_METADATA_TEXT
+        ? pretty : JSON.stringify(sorted);
+    }
+
+    // Writable bibliographic string fields per storage codec: condition,
+    // price, and illustrations exist only in the manual-entry codec, while
+    // description/rights only the catalogue (build) codec accepts.
+    const ITEM_FORM_SHARED_FIELDS = Object.freeze([
+      Object.freeze({ key: "subtitle", label: "Subtitle" }),
+      Object.freeze({ key: "authors", label: "Authors" }),
+      Object.freeze({ key: "publisher", label: "Publisher" }),
+      Object.freeze({ key: "publisher_city", label: "Publisher city" }),
+      Object.freeze({ key: "year", label: "Year" }),
+      Object.freeze({ key: "edition", label: "Edition" }),
+      Object.freeze({ key: "volume", label: "Volume" }),
+      Object.freeze({ key: "language", label: "Language" }),
+      Object.freeze({ key: "pages", label: "Pages" }),
+    ]);
+    const ITEM_FORM_CORE_FIELDS = Object.freeze([
+      ...ITEM_FORM_SHARED_FIELDS,
+      Object.freeze({ key: "condition", label: "Condition" }),
+      Object.freeze({ key: "price", label: "Price" }),
+      Object.freeze({ key: "illustrations", label: "Illustrations" }),
+      Object.freeze({ key: "categories", label: "Categories" }),
+      Object.freeze({ key: "notes", label: "Notes", multiline: true }),
+    ]);
+    const ITEM_FORM_BUILD_FIELDS = Object.freeze([
+      ...ITEM_FORM_SHARED_FIELDS,
+      Object.freeze({ key: "categories", label: "Categories" }),
+      Object.freeze({ key: "notes", label: "Notes", multiline: true }),
+      Object.freeze({ key: "description", label: "Description", multiline: true }),
+      Object.freeze({ key: "rights", label: "Rights" }),
+    ]);
+
+    function itemStorageKind(value) {
+      const raw = value.storageKind !== undefined
+        ? value.storageKind
+        : isPlainObject(value.metadata)
+          ? value.metadata.active_storage_kind : null;
+      return raw === "manual" || raw === "build" ? raw : null;
+    }
+
+    function itemFormFields(storageKind, itemKind) {
+      const kind = storageKind === "manual" || storageKind === "build"
+        ? storageKind
+        : itemKind === "book" ? "build" : "manual";
+      return kind === "build" ? ITEM_FORM_BUILD_FIELDS : ITEM_FORM_CORE_FIELDS;
+    }
+
+    // Form inputs only carry string values; a form key holding any other JSON
+    // type stays in the residual object so the Advanced editor keeps it intact.
+    function splitFormMetadata(metadata, fields) {
+      const source = isPlainObject(metadata) ? metadata : {};
+      const formKeys = new Set(fields.map((field) => field.key));
+      const values = {};
+      const residual = {};
+      for (const [key, value] of Object.entries(source)) {
+        if (formKeys.has(key) && typeof value === "string") values[key] = value;
+        else residual[key] = cloneJson(value);
+      }
+      return { values, residual };
+    }
+
+    function metadataFieldLabel(key) {
+      if (key === "title") return "Title";
+      const field = ITEM_FORM_CORE_FIELDS.find((entry) => entry.key === key)
+        || ITEM_FORM_BUILD_FIELDS.find((entry) => entry.key === key);
+      return field ? field.label : key;
+    }
+
+    function conflictFieldNames(conflicts) {
+      return conflicts.map(metadataFieldLabel).join(", ");
+    }
+
+    function fieldErrorText(code) {
+      if (code === "managed_item_fields_not_writable") {
+        return "Server-managed; not writable";
+      }
+      if (code === "invalid_item_metadata") return "Not accepted for this item";
+      return "Rejected by the server";
+    }
+
+    function fieldErrorsFromSaveError(error) {
+      const details = error && isPlainObject(error.details) ? error.details : null;
+      if (!details) return null;
+      const names = [];
+      if (typeof details.field === "string" && details.field) {
+        names.push(details.field);
+      }
+      if (Array.isArray(details.fields)) {
+        for (const name of details.fields) {
+          if (typeof name === "string" && name) names.push(name);
+        }
+      }
+      const text = fieldErrorText(error.code);
+      const errors = {};
+      for (const name of names) {
+        const key = name.split(".", 1)[0];
+        if (key && !UNSAFE_KEYS.has(key)) errors[key] = text;
+      }
+      return Object.keys(errors).length ? errors : null;
+    }
+
     function decodeCorrectionsItem(value, expectedId = null) {
       if (!isPlainObject(value)) throw new TypeError("item must be an object");
       const id = portableItemId(value.id);
@@ -164,6 +271,9 @@
         title: value.title,
         metadata: Object.freeze(editableMetadata(value.metadata)),
         revision,
+        // Read before editableMetadata strips the server-managed key; kept as
+        // a decoded field so re-decoding an already-decoded item preserves it.
+        storageKind: itemStorageKind(value),
       });
     }
 
@@ -521,6 +631,9 @@
         this.messageError = false;
         this.replayed = false;
         this.draftNotice = null;
+        this.fieldErrors = null;
+        this.advancedError = "";
+        this.advancedText = "";
         this.generation = 0;
         this.abortController = null;
         this.destroyed = false;
@@ -580,8 +693,55 @@
         this.messageError = false;
         this.replayed = false;
         this.draftNotice = null;
+        this.fieldErrors = null;
         this.updateRenderedDraftState();
         return this.draft;
+      }
+
+      applyFieldEdit(key, input) {
+        if (!this.draft || this.busy) return;
+        let metadata;
+        try {
+          metadata = JSON.parse(this.draft.metadataText);
+        } catch (cause) {
+          return;
+        }
+        if (!isPlainObject(metadata)) return;
+        if (input.value === "") delete metadata[key];
+        else metadata[key] = String(input.value);
+        this.updateDraft({ metadataText: stableMetadataText(metadata) });
+      }
+
+      applyAdvancedEdit(input, fieldInputs) {
+        if (!this.draft || this.busy) return;
+        let parsed;
+        try {
+          parsed = JSON.parse(input.value);
+        } catch (cause) {
+          this.setAdvancedError("Advanced metadata must be valid JSON", input.value);
+          return;
+        }
+        if (!isPlainObject(parsed)) {
+          this.setAdvancedError(
+            "Advanced metadata must be a JSON object", input.value);
+          return;
+        }
+        this.advancedError = "";
+        this.advancedText = "";
+        const merged = {};
+        for (const [key, field] of fieldInputs) {
+          if (field.value !== "") merged[key] = String(field.value);
+        }
+        for (const [key, value] of Object.entries(parsed)) {
+          if (!UNSAFE_KEYS.has(key)) merged[key] = cloneJson(value);
+        }
+        this.updateDraft({ metadataText: stableMetadataText(merged) });
+      }
+
+      setAdvancedError(message, text) {
+        this.advancedError = message;
+        this.advancedText = String(text == null ? "" : text);
+        this.updateRenderedDraftState();
       }
 
       updateRenderedDraftState() {
@@ -589,9 +749,29 @@
         const save = this.root.querySelector("[data-item-metadata-save]");
         const reset = this.root.querySelector("[data-item-metadata-reset]");
         const message = this.root.querySelector(".item-metadata-message");
-        if (save) save.disabled = this.busy || !this.draft || !this.draft.dirty;
+        if (save) {
+          save.disabled = this.busy || !this.draft || !this.draft.dirty ||
+            !!this.advancedError;
+        }
         if (reset) reset.disabled = this.busy || !this.draft || !this.draft.dirty;
         if (message) message.hidden = true;
+        const advancedError = this.root.querySelector(".item-advanced-error");
+        if (advancedError) {
+          advancedError.hidden = !this.advancedError;
+          advancedError.textContent = this.advancedError || "";
+        }
+        if (!this.fieldErrors &&
+            typeof this.root.querySelectorAll === "function") {
+          for (const node of this.root.querySelectorAll(".item-field-error")) {
+            node.hidden = true;
+            node.textContent = "";
+          }
+          for (const node of this.root.querySelectorAll('[aria-invalid="true"]')) {
+            if (typeof node.removeAttribute === "function") {
+              node.removeAttribute("aria-invalid");
+            }
+          }
+        }
         if (this.root.dataset) {
           this.root.dataset.state = this.busy
             ? "saving" : this.draft && this.draft.dirty ? "dirty" : "ready";
@@ -611,6 +791,9 @@
         this.messageError = false;
         this.replayed = false;
         this.draftNotice = null;
+        this.fieldErrors = null;
+        this.advancedError = "";
+        this.advancedText = "";
         if (!next) {
           this.abortWork();
           this.render();
@@ -650,6 +833,11 @@
           if (this.draft.dirty) this.rememberDraft();
           else this.drafts.clearDraft(itemDraftKey(this.item.id));
           this.loading = false;
+          this.fieldErrors = null;
+          if (!preserved) {
+            this.advancedError = "";
+            this.advancedText = "";
+          }
           if (this.draftNotice && this.draftNotice.error) {
             this.message = "A newer item revision was loaded, but this draft could not " +
               "be merged until its metadata is valid, editable JSON.";
@@ -661,7 +849,7 @@
               ? "The latest revision already contains your draft changes; no save is needed."
               : conflicts.length
               ? `A newer revision was loaded. Your draft was merged; review concurrent ` +
-                `changes to: ${conflicts.join(", ")}.`
+                `changes to: ${conflictFieldNames(conflicts)}.`
               : "A newer revision was loaded. Your draft changes were merged without " +
                 "discarding concurrent metadata.";
             this.messageError = conflicts.length > 0;
@@ -689,6 +877,9 @@
         this.message = "Unsaved metadata edits reset";
         this.messageError = false;
         this.replayed = false;
+        this.fieldErrors = null;
+        this.advancedError = "";
+        this.advancedText = "";
         this.render();
       }
 
@@ -714,7 +905,7 @@
           } else {
             this.message = conflicts.length
               ? `This item changed elsewhere. Your edits were merged with the latest ` +
-                `revision; review concurrent changes to: ${conflicts.join(", ")}.`
+                `revision; review concurrent changes to: ${conflictFieldNames(conflicts)}.`
               : "This item changed elsewhere. Your edits were merged with the latest " +
                 "revision without discarding concurrent metadata; review and save again.";
           }
@@ -735,6 +926,14 @@
 
       async save() {
         if (!this.item || !this.draft || this.busy || this.destroyed) return null;
+        if (this.advancedError) {
+          this.message = "Fix the Advanced (JSON) metadata before saving";
+          this.messageError = true;
+          this.replayed = false;
+          this.onStatus(this.message, true);
+          this.render();
+          return null;
+        }
         if (this.draft.baseRevision !== this.item.revision) {
           try {
             const result = rebaseItemDraft(this.item, this.draft);
@@ -743,7 +942,7 @@
             else this.drafts.clearDraft(itemDraftKey(this.item.id));
             this.message = result.conflicts.length
               ? `Your draft was merged with the latest revision. Review concurrent ` +
-                `changes to: ${result.conflicts.join(", ")}, then save again.`
+                `changes to: ${conflictFieldNames(result.conflicts)}, then save again.`
               : "Your draft was merged with the latest revision. Review it, then save again.";
             this.messageError = result.conflicts.length > 0;
             this.replayed = false;
@@ -787,6 +986,7 @@
         this.message = "Saving metadata\u2026";
         this.messageError = false;
         this.replayed = false;
+        this.fieldErrors = null;
         this.render();
         try {
           const result = await this.api.updateItem({
@@ -802,6 +1002,8 @@
           this.drafts.clearDraft(itemDraftKey(selectedId));
           this.draft = this.draftFor(this.item);
           this.busy = false;
+          this.advancedError = "";
+          this.advancedText = "";
           this.messageError = false;
           this.replayed = result.replayed === true;
           this.message = this.replayed
@@ -822,6 +1024,7 @@
           this.busy = false;
           this.draft = attempted;
           this.rememberDraft();
+          this.fieldErrors = fieldErrorsFromSaveError(error);
           this.message = error && error.message || "Metadata could not be saved";
           this.messageError = true;
           this.replayed = false;
@@ -841,6 +1044,11 @@
         const id = element(this.documentRef, "code", "canonical-item-id",
           this.selectedId || "");
         wrapper.append(badge, id);
+        if (this.item && this.item.storageKind) {
+          wrapper.append(element(this.documentRef, "span", "item-storage-kind",
+            this.item.storageKind === "build"
+              ? "catalogue storage" : "manual storage"));
+        }
         if (this.item) {
           const revision = element(this.documentRef, "span",
             "item-record-revision", `Revision ${this.item.revision}`);
@@ -923,17 +1131,103 @@
         title.disabled = this.busy;
         title.addEventListener("input", () => this.updateDraft({ title: title.value }));
 
-        const metadataId = `corrections-item-metadata-${this.item.id}`;
-        const metadataLabel = element(this.documentRef, "label", "", "Metadata (JSON)");
-        metadataLabel.htmlFor = metadataId;
+        let parsedMetadata = null;
+        try {
+          const parsed = JSON.parse(this.draft.metadataText);
+          if (isPlainObject(parsed)) parsedMetadata = parsed;
+        } catch (cause) {
+          parsedMetadata = null;
+        }
+        const formMode = parsedMetadata !== null;
+        const fields = itemFormFields(this.item.storageKind, this.item.kind);
+        const split = formMode
+          ? splitFormMetadata(parsedMetadata, fields)
+          : { values: {}, residual: {} };
+        const fieldInputs = new Map();
+        const grid = element(this.documentRef, "div", "item-metadata-fields");
+        if (formMode) {
+          for (const field of fields) {
+            // A form key holding a non-string value is edited in Advanced.
+            if (Object.prototype.hasOwnProperty.call(split.residual, field.key)) {
+              continue;
+            }
+            const row = element(this.documentRef, "div",
+              `item-field${field.multiline ? " item-field-wide" : ""}`);
+            const inputId = `corrections-item-field-${this.item.id}-${field.key}`;
+            const label = element(this.documentRef, "label", "", field.label);
+            label.htmlFor = inputId;
+            const input = element(this.documentRef,
+              field.multiline ? "textarea" : "input");
+            input.id = inputId;
+            if (field.multiline) input.rows = 3;
+            else {
+              input.type = "text";
+              input.maxLength = 4096;
+            }
+            input.value = Object.prototype.hasOwnProperty.call(
+              split.values, field.key) ? split.values[field.key] : "";
+            input.disabled = this.busy;
+            setAttribute(input, "data-item-field", field.key);
+            input.addEventListener("input",
+              () => this.applyFieldEdit(field.key, input));
+            row.append(label, input);
+            if (this.fieldErrors && this.fieldErrors[field.key]) {
+              setAttribute(input, "aria-invalid", "true");
+              row.append(element(this.documentRef, "p", "item-field-error",
+                this.fieldErrors[field.key]));
+            }
+            fieldInputs.set(field.key, input);
+            grid.append(row);
+          }
+        }
+
+        const residualKeys = Object.keys(split.residual).sort();
+        const residualErrors = this.fieldErrors
+          ? Object.keys(this.fieldErrors).filter((key) => !fieldInputs.has(key))
+          : [];
+        const advanced = element(this.documentRef, "details",
+          "item-metadata-advanced");
+        setAttribute(advanced, "data-item-metadata-advanced-section", "");
+        advanced.open = !formMode || !!this.advancedError ||
+          residualErrors.length > 0;
+        if (advanced.open) setAttribute(advanced, "open", "");
+        const summary = element(this.documentRef, "summary", "",
+          "Advanced (JSON)");
+        if (formMode && residualKeys.length) {
+          summary.append(element(this.documentRef, "span", "item-advanced-count",
+            `${residualKeys.length} key${residualKeys.length === 1 ? "" : "s"}`));
+        }
         const metadata = element(this.documentRef, "textarea");
-        metadata.id = metadataId;
-        metadata.rows = 12;
+        metadata.id = `corrections-item-metadata-${this.item.id}`;
+        metadata.rows = formMode ? 6 : 12;
         metadata.maxLength = MAX_METADATA_TEXT;
-        metadata.value = this.draft.metadataText;
+        metadata.value = this.advancedError
+          ? this.advancedText
+          : formMode
+            ? stableMetadataText(split.residual) : this.draft.metadataText;
         metadata.disabled = this.busy;
-        metadata.addEventListener("input", () =>
-          this.updateDraft({ metadataText: metadata.value }));
+        setAttribute(metadata, "data-item-metadata-advanced", "");
+        setAttribute(metadata, "aria-label",
+          formMode ? "Advanced metadata (JSON)" : "Metadata (JSON)");
+        metadata.addEventListener("input", () => formMode
+          ? this.applyAdvancedEdit(metadata, fieldInputs)
+          : this.updateDraft({ metadataText: metadata.value }));
+        const advancedError = element(this.documentRef, "p",
+          "item-advanced-error", this.advancedError || "");
+        advancedError.hidden = !this.advancedError;
+        setAttribute(advancedError, "role", "alert");
+        const advancedNote = element(this.documentRef, "p", "item-metadata-note",
+          formMode
+            ? "Metadata keys the form above does not cover. Changes here merge " +
+              "into the same draft."
+            : "The metadata draft is not valid JSON; fix it here to restore " +
+              "the field form.");
+        advanced.append(summary, metadata, advancedError);
+        for (const key of residualErrors) {
+          advanced.append(element(this.documentRef, "p", "item-field-error",
+            `${metadataFieldLabel(key)}: ${this.fieldErrors[key]}`));
+        }
+        advanced.append(advancedNote);
         const note = element(this.documentRef, "p", "item-metadata-note",
           "Only editable catalogue metadata is shown. Server-managed identifiers, " +
           "file locations, and processing state are omitted.");
@@ -944,7 +1238,7 @@
         save.type = "submit";
         save.dataset && (save.dataset.itemMetadataSave = "");
         setAttribute(save, "data-item-metadata-save", "");
-        save.disabled = this.busy || !this.draft.dirty;
+        save.disabled = this.busy || !this.draft.dirty || !!this.advancedError;
         const reset = element(this.documentRef, "button", "", "Reset edits");
         reset.type = "button";
         reset.dataset && (reset.dataset.itemMetadataReset = "");
@@ -954,10 +1248,10 @@
         actions.append(save, reset);
         form.addEventListener("submit", (event) => {
           event.preventDefault();
-          this.updateDraft({ title: title.value, metadataText: metadata.value });
+          this.updateDraft({ title: title.value });
           void this.save();
         });
-        form.append(titleLabel, title, metadataLabel, metadata, note, actions);
+        form.append(titleLabel, title, grid, advanced, note, actions);
         body.append(form);
         this.renderMessage(body);
         card.append(body);
@@ -989,9 +1283,13 @@
       isConflict,
       isServerManagedMetadataKey,
       itemDraftKey,
+      itemFormFields,
+      metadataFieldLabel,
       parseDraftMetadata,
       patchFromDraft,
       patchIsEmpty,
       quoteRecordRevision,
+      splitFormMetadata,
+      stableMetadataText,
     };
   });
