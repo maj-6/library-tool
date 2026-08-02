@@ -335,6 +335,37 @@ test("overlay renderer exposes named focusable polygons and recomputes on resize
 });
 
 
+test("destroying the overlay releases a live hot target", () => {
+  const documentRef = focusAwareDocument();
+  const root = new FakeNode("div", documentRef);
+  root.clientWidth = 200;
+  root.clientHeight = 100;
+  const soft = [];
+  const overlay = createArtifactOverlay({
+    root,
+    documentRef,
+    onSoftTarget: (target) => soft.push(target && target.key || null),
+  });
+  overlay.setView({ sourceWidth: 400, sourceHeight: 200, orientation: 1 });
+  overlay.setRegions([region()]);
+  overlay.mount();
+
+  const marker = root.querySelector(".corrections-artifact-overlay-shape");
+  marker.emit("pointerenter");
+  assert.deepEqual(soft, ["annotation:region-1"]);
+
+  overlay.destroy();
+  assert.deepEqual(soft, ["annotation:region-1", null],
+    "removal fires no pointerleave, so destroy must emit the null target");
+  assert.equal(overlay.hotKey, "");
+  assert.equal(root.children.length, 0);
+
+  overlay.destroy();
+  assert.deepEqual(soft, ["annotation:region-1", null],
+    "a repeated destroy stays silent");
+});
+
+
 test("perspective and Image Adjust tools retain pointer ownership over classification overlays", () => {
   const source = fs.readFileSync(path.join(
     __dirname,

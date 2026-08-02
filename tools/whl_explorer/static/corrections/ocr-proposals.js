@@ -110,7 +110,11 @@
       this.applyBlocked = new Map();
       this.message = "";
       this.messageError = false;
-      this.generation = 0;
+      // Catalog and detail reads race independently: one shared counter lets
+      // a row click strand an in-flight refresh (loading stuck true) and an
+      // auto-refresh strand an in-flight detail load ("Loading proposal…").
+      this.catalogGeneration = 0;
+      this.detailGeneration = 0;
       this.unsubscribeResults = null;
       this.destroyed = false;
       this.nodes = null;
@@ -190,6 +194,7 @@
       const next = typeof itemId === "string" && itemId ? itemId : null;
       if (next === this.itemId) return Promise.resolve(null);
       this.itemId = next;
+      this.detailGeneration += 1;
       this.proposals = [];
       this.snapshotRevision = "";
       this.loaded = false;
@@ -199,6 +204,10 @@
       this.applyBlocked.clear();
       this.setMessage("");
       if (!next || !this.capabilities.read) {
+        // No refresh will bump the counter here, so a late catalog response
+        // for the previous item must be invalidated explicitly.
+        this.catalogGeneration += 1;
+        this.loading = false;
         this.render();
         return Promise.resolve(null);
       }
@@ -210,18 +219,19 @@
         this.render();
         return null;
       }
-      const generation = ++this.generation;
+      const generation = ++this.catalogGeneration;
       const itemId = this.itemId;
       this.loading = true;
       this.render();
       try {
         const page = await this.loadCatalog(itemId, true);
-        if (this.destroyed || generation !== this.generation) return null;
+        if (this.destroyed || generation !== this.catalogGeneration) return null;
         this.proposals = page.proposals;
         this.snapshotRevision = page.snapshotRevision;
         this.loaded = true;
         if (this.selectedRef && !this.proposals.some(
           (proposal) => proposal.proposal_ref === this.selectedRef)) {
+          this.detailGeneration += 1;
           this.selectedRef = "";
           this.detail = null;
           this.detailError = "";
@@ -229,7 +239,7 @@
         this.setMessage("");
         return page;
       } catch (error) {
-        if (this.destroyed || generation !== this.generation) return null;
+        if (this.destroyed || generation !== this.catalogGeneration) return null;
         this.proposals = [];
         this.snapshotRevision = "";
         this.loaded = false;
@@ -242,7 +252,7 @@
         }
         return null;
       } finally {
-        if (generation === this.generation) {
+        if (generation === this.catalogGeneration) {
           this.loading = false;
           this.render();
         }
@@ -285,7 +295,7 @@
       const summary = this.proposals.find(
         (proposal) => proposal.proposal_ref === proposalRef);
       if (!summary) return null;
-      const generation = ++this.generation;
+      const generation = ++this.detailGeneration;
       this.selectedRef = proposalRef;
       this.detail = null;
       this.detailError = "";
@@ -295,16 +305,16 @@
           itemId: this.itemId,
           proposalRef,
         });
-        if (this.destroyed || generation !== this.generation) return null;
+        if (this.destroyed || generation !== this.detailGeneration) return null;
         this.detail = response.proposal;
         return this.detail;
       } catch (error) {
-        if (this.destroyed || generation !== this.generation) return null;
+        if (this.destroyed || generation !== this.detailGeneration) return null;
         this.detailError = error && error.message ||
           "The OCR proposal could not be loaded.";
         return null;
       } finally {
-        if (generation === this.generation) this.render();
+        if (generation === this.detailGeneration) this.render();
       }
     }
 
@@ -315,7 +325,7 @@
           !this.detail || !recognitionApplicable(this.detail.recognition)) {
         return null;
       }
-      const generation = this.generation;
+      const generation = this.catalogGeneration;
       const proposalRef = this.selectedRef;
       this.applyBusy = true;
       this.render();
@@ -325,7 +335,7 @@
           itemId: this.itemId,
           proposalRef,
         });
-        if (this.destroyed || generation !== this.generation) return receipt;
+        if (this.destroyed || generation !== this.catalogGeneration) return receipt;
         const applied = receipt.applied;
         if (applied.regions === "proposed") {
           this.setMessage(
@@ -337,7 +347,7 @@
         }
         return receipt;
       } catch (error) {
-        if (this.destroyed || generation !== this.generation) return null;
+        if (this.destroyed || generation !== this.catalogGeneration) return null;
         if (error && error.code === "ocr_apply_capture_entry_unavailable") {
           this.applyBlocked.set(proposalRef, APPLY_BLOCKED_HINT);
           this.setMessage("");
@@ -348,7 +358,7 @@
         return null;
       } finally {
         this.applyBusy = false;
-        if (generation === this.generation) this.render();
+        if (generation === this.catalogGeneration) this.render();
       }
     }
 
@@ -469,7 +479,8 @@
     destroy() {
       if (this.destroyed) return;
       this.destroyed = true;
-      this.generation += 1;
+      this.catalogGeneration += 1;
+      this.detailGeneration += 1;
       if (typeof this.unsubscribeResults === "function") {
         this.unsubscribeResults();
       }

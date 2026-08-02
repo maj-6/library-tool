@@ -158,6 +158,13 @@
       const rejected = element(documentRef, "p", "ch-rejected");
       rejected.setAttribute("data-ch-rejected", "true");
       rejected.hidden = true;
+      const rejectedText = element(documentRef, "span", "ch-rejected-text");
+      rejectedText.setAttribute("data-ch-rejected-text", "true");
+      const unreject = element(documentRef, "button", "", "Undo");
+      unreject.type = "button";
+      unreject.setAttribute("data-ch-unreject", "true");
+      unreject.setAttribute("aria-label", "Undo the CH rejection");
+      rejected.append(rejectedText, unreject);
 
       const message = element(documentRef, "p", "ch-message");
       message.setAttribute("data-ch-message", "true");
@@ -168,7 +175,7 @@
       this.nodes = {
         state, stateText, resolution, score, rematchHint, fields, adopted,
         conflicts, actions, approveMatch, rejectMatch, candidates, rejected,
-        message, refresh,
+        rejectedText, unreject, message, refresh,
       };
       refresh.addEventListener("click", () => { void this.refresh(); });
       approveMatch.addEventListener("click", () => {
@@ -177,6 +184,7 @@
       rejectMatch.addEventListener("click", () => {
         void this.reject(this.matchActionKey());
       });
+      unreject.addEventListener("click", () => { void this.unreject(); });
       this.root.hidden = true;
       this.render();
       return this;
@@ -212,6 +220,10 @@
         this.render();
         return null;
       }
+      // While a decision is posting, an external refresh could read
+      // pre-decision state and land after the decision installs its result;
+      // only the decision's own reloads may pass.
+      if (this.busy && options.force !== true) return null;
       const generation = ++this.generation;
       const itemId = this.itemId;
       this.loading = true;
@@ -266,6 +278,37 @@
       }
     }
 
+    // A rejection must be recoverable without a confirm prompt: one Undo on
+    // the rejected line clears it and restores whatever the matcher offers.
+    async unreject() {
+      const itemId = this.itemId;
+      if (this.destroyed || this.busy || !itemId) return null;
+      this.busy = true;
+      this.setMessage("");
+      this.render();
+      try {
+        const body = await this.request("POST", `${this.basePath}/unreject`, {
+          item_id: itemId,
+          operation_id: this.operationIdFactory(),
+        });
+        if (this.destroyed || itemId !== this.itemId) return body;
+        this.setMessage(body.replayed === true
+          ? "There was no rejection to undo."
+          : "CH rejection undone.");
+        await this.refresh({ keepMessage: true, force: true });
+        if (body.replayed !== true) this.onChanged(body);
+        return body;
+      } catch (error) {
+        if (this.destroyed || itemId !== this.itemId) return null;
+        this.setMessage(error && error.message ||
+          "The CH rejection could not be undone.", true);
+        return null;
+      } finally {
+        this.busy = false;
+        if (!this.destroyed && itemId === this.itemId) this.render();
+      }
+    }
+
     async postDecision(kind, itemId, key, retried) {
       try {
         const body = await this.request("POST", `${this.basePath}/${kind}`, {
@@ -276,7 +319,10 @@
         if (this.destroyed || itemId !== this.itemId) return body;
         if (kind === "approve") {
           // An approval leaves exactly this state behind: the stamped match,
-          // no candidates, and any prior rejection cleared.
+          // no candidates, and any prior rejection cleared. A GET raced
+          // before the decision must not overwrite it with pre-decision data.
+          this.generation += 1;
+          this.loading = false;
           this.stateData = {
             ok: true,
             item_id: itemId,
@@ -296,7 +342,7 @@
           this.setMessage(body.replayed === true
             ? "This rejection was already recorded."
             : "CH record rejected.");
-          await this.refresh({ keepMessage: true });
+          await this.refresh({ keepMessage: true, force: true });
         }
         if (body.replayed !== true) this.onChanged(body);
         return body;
@@ -305,7 +351,7 @@
         if (error && error.code === "item_revision_conflict") {
           // A conflicting write landed between the server's read and update;
           // reload and replay the intent once under a fresh operation id.
-          await this.refresh({ keepMessage: true });
+          await this.refresh({ keepMessage: true, force: true });
           if (!retried && !this.destroyed && itemId === this.itemId) {
             return this.postDecision(kind, itemId, key, true);
           }
@@ -315,7 +361,7 @@
         if (error && STALE_LIST_CODES.has(error.code)) {
           this.setMessage(error.message ||
             "The CH master list changed.", true);
-          await this.refresh({ keepMessage: true });
+          await this.refresh({ keepMessage: true, force: true });
           return null;
         }
         this.setMessage(error && error.message ||
@@ -429,13 +475,15 @@
       nodes.approveMatch.hidden = kind !== "rematch";
       nodes.approveMatch.disabled = this.busy;
       nodes.rejectMatch.disabled = this.busy;
+      nodes.refresh.disabled = this.busy;
       this.renderCandidates(nodes, state);
       const rejected = state && state.rejected || null;
       nodes.rejected.hidden = !rejected;
-      nodes.rejected.textContent = rejected
+      nodes.rejectedText.textContent = rejected
         ? `Rejected ${rejected.key}${
           rejected.decided_at ? ` · ${rejected.decided_at}` : ""}`
         : "";
+      nodes.unreject.disabled = this.busy;
     }
 
     renderFields(nodes, match) {

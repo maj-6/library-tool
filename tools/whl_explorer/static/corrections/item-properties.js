@@ -728,14 +728,38 @@
         }
         this.advancedError = "";
         this.advancedText = "";
+        // Form-owned keys keep their draft values verbatim — a stored empty
+        // string is data, not a removal (only applyFieldEdit, where the user
+        // cleared the input, removes) — while the keys this textarea shows
+        // are replaced wholesale by the parsed JSON.
+        let current = null;
+        try {
+          const draftMetadata = JSON.parse(this.draft.metadataText);
+          if (isPlainObject(draftMetadata)) current = draftMetadata;
+        } catch (cause) {
+          current = null;
+        }
         const merged = {};
-        for (const [key, field] of fieldInputs) {
-          if (field.value !== "") merged[key] = String(field.value);
+        if (current) {
+          for (const [key, value] of Object.entries(current)) {
+            if (fieldInputs.has(key)) merged[key] = cloneJson(value);
+          }
+        } else {
+          for (const [key, field] of fieldInputs) {
+            if (field.value !== "") merged[key] = String(field.value);
+          }
         }
         for (const [key, value] of Object.entries(parsed)) {
           if (!UNSAFE_KEYS.has(key)) merged[key] = cloneJson(value);
         }
         this.updateDraft({ metadataText: stableMetadataText(merged) });
+        for (const [key, field] of fieldInputs) {
+          const value = Object.prototype.hasOwnProperty.call(merged, key)
+            ? merged[key] : "";
+          if (typeof value === "string" && field.value !== value) {
+            field.value = value;
+          }
+        }
       }
 
       setAdvancedError(message, text) {

@@ -614,6 +614,46 @@ test("Books rerenders preserve a still-present focused nonselected capture",
   });
 
 
+test("Books rerenders withdraw a hover contribution left without pointerleave",
+  async () => {
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const hot = [];
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      onHotTarget: (target) => hot.push(target),
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const captureButton = (artifactId) => descendants(harness.list, "button")
+      .find((button) => button.dataset.artifactId === artifactId);
+    captureButton("capture-title").emit("pointerenter");
+    assert.equal(hot.at(-1).artifactId, "capture-title");
+
+    controller.render(store.snapshot());
+    assert.equal(hot.at(-1), null,
+      "the replaced row cannot stay hot — no pointerleave will fire for it");
+    assert.equal(hot.length, 2);
+
+    controller.render(store.snapshot());
+    assert.equal(hot.length, 2, "no live hover, nothing to withdraw");
+
+    const replacement = captureButton("capture-title");
+    replacement.emit("pointerenter");
+    replacement.emit("pointerleave");
+    assert.equal(hot.at(-1), null);
+    assert.equal(hot.length, 4);
+    controller.render(store.snapshot());
+    assert.equal(hot.length, 4,
+      "a hover already released by pointerleave is not withdrawn again");
+    controller.destroy();
+  });
+
+
 test("Books panel does not misrepresent a missing production API as an empty library", () => {
   const store = new CorrectionsIndexStore();
   const harness = miniHarness();

@@ -881,6 +881,10 @@ class CorrectionOcrFollowupService:
         self._repository = repository
         self._provider = provider
         self._lock = threading.Lock()
+        # Operations whose provider work runs outside the lock. The registry
+        # lock must never be held across a synchronous recognition, or every
+        # queue/find/run call serializes behind one 30-60s provider round.
+        self._active: set[str] = set()
 
     @staticmethod
     def job_id_for(operation_id: str) -> str:
@@ -1036,25 +1040,20 @@ class CorrectionOcrFollowupService:
                             retryable=False,
                         ),
                     )
-                if existing.state is JobState.INTERRUPTED:
-                    retried = self._jobs.retry_interrupted(existing.job_id)
-                    if retried is None:
-                        return self._outcome_from_job(
-                            existing,
-                            request.source,
-                        )
-                    record = self._record_for(existing.job_id)
-                    return self._execute(
-                        request,
-                        record,
-                        _ChildHooks(self._jobs, record, hooks),
+                if existing.state is not JobState.INTERRUPTED:
+                    return self._outcome_from_job(existing, request.source)
+                retried = self._jobs.retry_interrupted(existing.job_id)
+                if retried is None:
+                    return self._outcome_from_job(
+                        existing,
+                        request.source,
                     )
-                return self._outcome_from_job(existing, request.source)
-
-            record = self._record_template(request)
-            self._jobs.track(record, CORRECTION_OCR_JOB_KIND)
-            child_hooks = _ChildHooks(self._jobs, record, hooks)
-            return self._execute(request, record, child_hooks)
+                record = self._record_for(existing.job_id)
+            else:
+                record = self._record_template(request)
+                self._jobs.track(record, CORRECTION_OCR_JOB_KIND)
+            self._active.add(request.operation_id)
+        return self._execute_claimed(request, record, hooks)
 
     def queue_ocr_followup(
         self,
@@ -1097,10 +1096,15 @@ class CorrectionOcrFollowupService:
             raise TypeError("hooks must implement CorrectionTransformHooksPort")
         with self._lock:
             existing = self._existing_job(request)
-            if existing is None or existing.state not in {
-                JobState.QUEUED,
-                JobState.CANCELLING,
-            }:
+            if (
+                existing is None
+                or existing.state
+                not in {
+                    JobState.QUEUED,
+                    JobState.CANCELLING,
+                }
+                or request.operation_id in self._active
+            ):
                 raise ConflictError(
                     "the OCR child job is already claimed or terminal",
                     code="correction_ocr_job_already_claimed",
@@ -1115,11 +1119,30 @@ class CorrectionOcrFollowupService:
                 )
             self._require_matching_job(existing, request)
             record = self._record_for(existing.job_id)
+            self._active.add(request.operation_id)
+        return self._execute_claimed(request, record, hooks)
+
+    def _execute_claimed(
+        self,
+        request: OcrFollowupRequest,
+        record: MutableMapping[str, Any],
+        hooks: CorrectionTransformHooksPort,
+    ) -> OcrFollowupOutcome:
+        """Run provider work for an operation claimed under the lock.
+
+        The claim set keeps the operation single-flight while the registry
+        lock is released, so queue/find calls answer during a recognition;
+        job-record mutations go through the internally locked JobManager.
+        """
+        try:
             return self._execute(
                 request,
                 record,
                 _ChildHooks(self._jobs, record, hooks),
             )
+        finally:
+            with self._lock:
+                self._active.discard(request.operation_id)
 
     def _record_template(
         self,

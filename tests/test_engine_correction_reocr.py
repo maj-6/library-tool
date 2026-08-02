@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 
 import pytest
 
@@ -164,10 +165,10 @@ class Provider:
         )
 
 
-def _harness():
+def _harness(provider=None):
     jobs = JobManager(checkpoint_interval=0)
     repository = MemoryProposalRepository()
-    provider = Provider()
+    provider = provider or Provider()
     followup = CorrectionOcrFollowupService(jobs, repository, provider)
     display = _transform_view(
         "ctr-display-1",
@@ -326,6 +327,62 @@ def test_standalone_operations_stay_disjoint_from_transform_operations() -> None
         )
     assert conflicted.value.code == "correction_ocr_reconciliation_conflict"
     assert repository.commits == 2
+
+
+def test_queue_ocr_followup_answers_while_a_recognition_is_in_flight() -> None:
+    """The registry lock must not be held across provider recognition: a
+    second operation has to queue while the first is mid-recognition."""
+
+    class GatedProvider(Provider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def recognize(self, selection, content, hooks):
+            self.started.set()
+            assert self.release.wait(timeout=10)
+            return super().recognize(selection, content, hooks)
+
+    provider = GatedProvider()
+    service, _followup, _jobs, repository, _provider, display, _ocr_ready = (
+        _harness(provider)
+    )
+    first = service.queue_reocr(
+        "book-1",
+        display.key.artifact_id,
+        expected_artifact_revision=display.revision,
+        idempotency_key="key-one",
+    )
+    outcomes: list = []
+    worker = threading.Thread(
+        target=lambda: outcomes.append(service.execute_queued(first.request)),
+    )
+    worker.start()
+    queued: list = []
+    try:
+        assert provider.started.wait(timeout=10)
+        prober = threading.Thread(
+            target=lambda: queued.append(service.queue_reocr(
+                "book-1",
+                display.key.artifact_id,
+                expected_artifact_revision=display.revision,
+                idempotency_key="key-two",
+            )),
+        )
+        prober.start()
+        prober.join(timeout=5)
+        assert not prober.is_alive(), (
+            "queue_ocr_followup blocked behind an in-flight recognition"
+        )
+    finally:
+        provider.release.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert queued and queued[0].created is True
+    assert outcomes and outcomes[0].state is OcrFollowupState.SUCCEEDED
+    assert provider.calls == 1
+    assert repository.commits == 1
 
 
 def test_queue_validates_target_revision_and_key() -> None:

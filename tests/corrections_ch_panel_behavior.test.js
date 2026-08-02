@@ -7,6 +7,7 @@ const {
 } = require("../tools/whl_explorer/static/corrections/ch-panel");
 const {
   FakeNode,
+  deferred,
   fakeDocument,
 } = require("./fixtures/corrections_fake_dom");
 
@@ -317,8 +318,10 @@ test("absent, unavailable, unresolved, and rejected states render quiet lines", 
     .getAttribute("data-ch-state"), "rejected");
   const rejectedLine = node(rejected.root, "[data-ch-rejected]");
   assert.equal(rejectedLine.hidden, false);
-  assert.equal(rejectedLine.textContent,
+  assert.equal(node(rejected.root, "[data-ch-rejected-text]").textContent,
     `Rejected ${ROW_KEY} · 2026-08-02T12:00:00+00:00`);
+  assert.ok(node(rejected.root, "[data-ch-unreject]"),
+    "the rejected line offers Undo");
 });
 
 

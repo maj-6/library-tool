@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from types import SimpleNamespace
@@ -82,16 +83,25 @@ class _Engine:
         return None
 
 
-def _publish(engine_root, operation_id, source_artifact_id, outputs) -> None:
+# The full-page quad rectifies nothing: its homography is the identity, so
+# geometry survives the corrected->photo inverse mapping byte-for-byte.
+IDENTITY_QUAD = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+
+
+def _publish(engine_root, operation_id, source_artifact_id, outputs,
+             quad=IDENTITY_QUAD) -> None:
     """Minimal committed publication, laid out the way the store writes it."""
 
     transforms = engine_root / ".engine" / "correction-transforms"
     digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+    command = {"item_id": ITEM_ID, "artifact_id": source_artifact_id}
+    if quad is not None:
+        command["quad"] = quad
     publication = {
         "schema": "librarytool.correction-transform-publication",
         "version": 2,
         "operation_id": operation_id,
-        "command": {"item_id": ITEM_ID, "artifact_id": source_artifact_id},
+        "command": command,
         "outputs": [
             {"kind": kind, "artifact_id": artifact_id}
             for kind, artifact_id in outputs
@@ -250,9 +260,11 @@ def test_apply_replays_the_receipt_and_conflicts_on_key_reuse(
     replay_body = replay.get_json()
     assert replay_body["replayed"] is True
     assert replay_body["applied"] == first.get_json()["applied"]
-    assert apply_workspace.stale_calls == [CAPTURE_ID]
     assert reused.status_code == 409
     assert reused.get_json()["code"] == "ocr_apply_operation_conflict"
+    # Invalidate-first: every attempt that got past validation re-asserted
+    # the stale association BEFORE reading the receipt, replay included.
+    assert apply_workspace.stale_calls == [CAPTURE_ID] * 3
 
 
 def test_apply_protects_human_work_with_a_proposal(
@@ -379,4 +391,195 @@ def test_apply_requires_an_idempotency_key_and_a_known_proposal(
     )
     assert unknown.status_code == 404
     assert unknown.get_json()["code"] == "correction_ocr_proposal_not_found"
+    assert apply_workspace.stale_calls == []
+
+
+def test_apply_maps_geometry_through_the_inverse_transform_quad(
+    monkeypatch, apply_workspace,
+) -> None:
+    """An axis-aligned half-crop is hand-checkable: the corrected raster is
+    the photo's left half, so inverse-mapped x halves and y is unchanged."""
+
+    ocr_ready = "ctr-" + "3" * 40
+    namespace = server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+    _publish(
+        apply_workspace.engine_root,
+        "op-left",
+        f"{namespace}:display",
+        (("corrected-display", "ctr-" + "4" * 40), ("ocr-ready", ocr_ready)),
+        quad=[[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]],
+    )
+    proposal = _proposal(recognition={
+        "text": "Half crop",
+        "words": [{"t": "Half", "x": 0.5, "y": 0.5, "w": 0.25, "h": 0.1}],
+        "regions": [{
+            "role": "text",
+            "box": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+            "order": 1,
+            "text": "Half crop",
+        }],
+        "dims": {"w": 400, "h": 1200, "dpi": 200},
+    }, source_artifact_id=ocr_ready)
+    _install(monkeypatch, (proposal,))
+
+    response = _apply(apply_workspace, proposal.proposal_ref)
+
+    assert response.status_code == 200
+    assert response.get_json()["applied"]["page"] == 1
+    layout = lib.load_json(
+        apply_workspace.entries / BUILD_ID / "ocr" / "layout.json", {})
+    record = layout["regions"]["primary"]["1"]
+    assert record["items"][0]["box"] == {
+        "x": 0.1, "y": 0.2, "w": 0.2, "h": 0.4,
+    }
+    assert layout["words"]["primary"]["1"] == [
+        {"t": "Half", "x": 0.25, "y": 0.5, "w": 0.125, "h": 0.1},
+    ]
+
+
+def test_apply_composes_chained_transform_inverses(
+    monkeypatch, apply_workspace,
+) -> None:
+    """Left-half then top-half crops compose to (x/2, y/2) on the photo."""
+
+    display_one = "ctr-" + "5" * 40
+    ocr_two = "ctr-" + "6" * 40
+    namespace = server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+    _publish(
+        apply_workspace.engine_root,
+        "op-chain-1",
+        f"{namespace}:display",
+        (("corrected-display", display_one), ("ocr-ready", "ctr-" + "7" * 40)),
+        quad=[[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]],
+    )
+    _publish(
+        apply_workspace.engine_root,
+        "op-chain-2",
+        display_one,
+        (("corrected-display", "ctr-" + "8" * 40), ("ocr-ready", ocr_two)),
+        quad=[[0.0, 0.0], [1.0, 0.0], [1.0, 0.5], [0.0, 0.5]],
+    )
+    proposal = _proposal(recognition={
+        "text": "Chained",
+        "regions": [{
+            "role": "text",
+            "box": {"x": 0.2, "y": 0.4, "w": 0.4, "h": 0.2},
+            "order": 1,
+            "text": "Chained",
+        }],
+        "dims": {"w": 400, "h": 600, "dpi": 200},
+    }, source_artifact_id=ocr_two)
+    _install(monkeypatch, (proposal,))
+
+    response = _apply(apply_workspace, proposal.proposal_ref)
+
+    assert response.status_code == 200
+    layout = lib.load_json(
+        apply_workspace.entries / BUILD_ID / "ocr" / "layout.json", {})
+    assert layout["regions"]["primary"]["1"]["items"][0]["box"] == {
+        "x": 0.1, "y": 0.2, "w": 0.2, "h": 0.1,
+    }
+
+
+def test_apply_rejects_chains_it_cannot_map_back(
+    monkeypatch, apply_workspace,
+) -> None:
+    """An original-rooted chain (the entry page is the DISPLAY rendition) and
+    a publication without a quad must both refuse instead of writing
+    displaced boxes."""
+
+    namespace = server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+    original_ready = "ctr-" + "9" * 40
+    _publish(
+        apply_workspace.engine_root,
+        "op-orig",
+        f"{namespace}:original",
+        (("corrected-display", "ctr-" + "ab" * 20),
+         ("ocr-ready", original_ready)),
+    )
+    quadless_ready = "ctr-" + "cd" * 20
+    _publish(
+        apply_workspace.engine_root,
+        "op-noquad",
+        f"{namespace}:display",
+        (("corrected-display", "ctr-" + "ef" * 20),
+         ("ocr-ready", quadless_ready)),
+        quad=None,
+    )
+    original_rooted = _proposal(source_artifact_id=original_ready)
+    quadless = _proposal(
+        proposal_ref="cop-" + "3" * 40,
+        source_artifact_id=quadless_ready,
+    )
+    _install(monkeypatch, (original_rooted, quadless))
+
+    from_original = _apply(apply_workspace, original_rooted.proposal_ref)
+    without_quad = _apply(
+        apply_workspace, quadless.proposal_ref, operation_id="apply-op-2")
+
+    assert from_original.status_code == 422
+    assert from_original.get_json()["code"] == "ocr_apply_geometry_unmappable"
+    assert without_quad.status_code == 422
+    assert without_quad.get_json()["code"] == "ocr_apply_geometry_unmappable"
+    assert apply_workspace.stale_calls == []
+
+
+def test_apply_persists_figure_crops_like_the_legacy_job(
+    monkeypatch, apply_workspace,
+) -> None:
+    crop = b"figure-crop-bytes"
+    proposal = _proposal(recognition={
+        "text": "See ![img-0.jpeg](img-0.jpeg) here",
+        "regions": [{
+            "role": "figure",
+            "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+            "order": 1,
+            "text": "![img-0.jpeg](img-0.jpeg)",
+        }],
+        "dims": {"w": 800, "h": 1200, "dpi": 200},
+        "images": [{
+            "id": "img-0.jpeg",
+            "data": {
+                "encoding": "base64",
+                "data": base64.b64encode(crop).decode("ascii"),
+            },
+            "bbox": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+        }],
+    })
+    _install(monkeypatch, (proposal,))
+
+    response = _apply(apply_workspace, proposal.proposal_ref)
+
+    assert response.status_code == 200
+    saved = (
+        apply_workspace.entries / BUILD_ID / "ocr" / "images" / "p2-img-0.jpeg"
+    )
+    assert saved.read_bytes() == crop
+    layout = lib.load_json(
+        apply_workspace.entries / BUILD_ID / "ocr" / "layout.json", {})
+    figure = layout["images"]["p2-img-0.jpeg"]
+    assert figure["page"] == 2
+    assert figure["src_key"] == "primary"
+    assert figure["sha256"] == hashlib.sha256(crop).hexdigest()
+    assert figure["x"] == 0.1
+    record = layout["regions"]["primary"]["2"]
+    assert record["items"][0]["text"] == "![img-0.jpeg](p2-img-0.jpeg)"
+    compiled = (
+        apply_workspace.entries / BUILD_ID / "ocr" / "compiled.txt"
+    ).read_text(encoding="utf-8")
+    assert "![img-0.jpeg](p2-img-0.jpeg)" in compiled
+
+
+def test_apply_rejects_figures_it_cannot_decode(
+    monkeypatch, apply_workspace,
+) -> None:
+    recognition = dict(RECOGNITION)
+    recognition["images"] = [{"id": "img-0.jpeg", "data": "!!not-base64!!"}]
+    proposal = _proposal(recognition=recognition)
+    _install(monkeypatch, (proposal,))
+
+    response = _apply(apply_workspace, proposal.proposal_ref)
+
+    assert response.status_code == 422
+    assert response.get_json()["code"] == "ocr_proposal_figures_unsupported"
     assert apply_workspace.stale_calls == []

@@ -1916,14 +1916,22 @@
     const inputs = value.input_revisions;
     const allowedInputKeys = new Set([
       "parent_operation_id", "artifact_id", "artifact_revision",
-      "source_sha256", "publication_policy",
+      "source_sha256", "publication_policy", "provider",
     ]);
     if (!Object.keys(inputs).every((key) => allowedInputKeys.has(key)) ||
         inputs.parent_operation_id !== expected.operationId ||
         inputs.artifact_id !== expected.source.artifact_id ||
         inputs.artifact_revision !== expected.source.artifact_revision ||
         inputs.source_sha256 !== expected.source.content_sha256 ||
-        inputs.publication_policy !== "machine-proposal-only") return false;
+        inputs.publication_policy !== "machine-proposal-only" ||
+        // The engine pins provider identity once recognition starts, so a
+        // replayed done receipt carries it; a fresh queue receipt may not.
+        (Object.hasOwn(inputs, "provider") &&
+          (!hasExactKeys(inputs.provider, ["provider_id", "model"]) ||
+            typeof inputs.provider.provider_id !== "string" ||
+            !inputs.provider.provider_id ||
+            typeof inputs.provider.model !== "string" ||
+            !inputs.provider.model))) return false;
     if (value.error !== null &&
         (!isObject(value.error) || typeof value.error.code !== "string" ||
           typeof value.error.message !== "string" ||

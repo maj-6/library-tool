@@ -615,3 +615,247 @@ def test_reject_of_a_rematched_row_key_revokes_the_stale_approval(
     state = _state(client, item_id).get_json()
     assert state["match"] is None
     assert state["rejected"]["key"] == ROW0_KEY
+
+
+# --- extra-held scan values ----------------------------------------------------
+
+
+def test_merge_consults_extra_held_scan_values(monkeypatch, ch_workspace):
+    """CH-only phone fields land in the entry's extra at ingest; the phone's
+    presenter compares against them, so the desktop must not adopt over an
+    agreeing value or overwrite a differing one."""
+    _write_ch_rows()
+    item_id, entry_id = _ingest(monkeypatch, "c1a1000d-0000-4000-8000-00000000000d", {
+        "title": "A Modern Herbal",
+        "pages": "888",       # agrees with the CH row after normalization
+        "price": "999",       # differs from the CH row's "12"
+    })
+    entry = _manual_entry(entry_id)
+    assert entry["extra"]["pages"] == "888"
+    assert not entry.get("pages")
+
+    response = _client().post("/api/corrections/ch/approve", json={
+        "item_id": item_id,
+        "key": ROW0_KEY,
+        "operation_id": "ch-approve-extra-1",
+    })
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert "pages" not in body["adopted"]
+    assert "pages" not in body["conflicts"]
+    assert "price" in body["conflicts"]
+    assert "price" not in body["adopted"]
+    merged = _manual_entry(entry_id)
+    assert not merged.get("pages")        # agreement writes nothing
+    assert not merged.get("price")        # the conflict keeps the scan value
+    assert merged["extra"]["price"] == "999"
+
+
+# --- duplicate CH rows ---------------------------------------------------------
+
+
+def test_duplicate_identical_rows_dedupe_and_resolve_to_the_lowest_index(
+        monkeypatch, ch_workspace):
+    _write_ch_rows([CH_ROWS[0], dict(CH_ROWS[0]), CH_ROWS[2]])
+    item_id, entry_id = _ingest(monkeypatch, "c1a1000e-0000-4000-8000-00000000000e", {
+        "title": "A Modern Herbal",
+        "author": "Grieve, Maud",
+    })
+    client = _client()
+    state = _state(client, item_id).get_json()
+    assert [c["key"] for c in state["candidates"]] == [ROW0_KEY]
+
+    response = client.post("/api/corrections/ch/approve", json={
+        "item_id": item_id,
+        "key": ROW0_KEY,
+        "operation_id": "ch-approve-dupe-1",
+    })
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["match"]["row"]["index"] == 0
+    assert _manual_entry(entry_id)["extra"]["ch_match"]["key"] == ROW0_KEY
+
+
+def test_duplicate_diverging_rows_still_conflict(monkeypatch, ch_workspace):
+    variant = dict(CH_ROWS[0])
+    variant["publisher"] = "Somebody Else"
+    _write_ch_rows([CH_ROWS[0], variant])
+    item_id, _entry_id = _ingest(monkeypatch, "c1a1000f-0000-4000-8000-00000000000f", {
+        "title": "A Modern Herbal",
+        "author": "Grieve, Maud",
+    })
+    client = _client()
+
+    approve = client.post("/api/corrections/ch/approve", json={
+        "item_id": item_id,
+        "key": ROW0_KEY,
+        "operation_id": "ch-approve-ambiguous-1",
+    })
+    reject = client.post("/api/corrections/ch/reject", json={
+        "item_id": item_id,
+        "key": ROW0_KEY,
+        "operation_id": "ch-reject-ambiguous-1",
+    })
+
+    assert approve.status_code == 409
+    assert approve.get_json()["code"] == "ch_key_ambiguous"
+    assert reject.status_code == 409
+    assert reject.get_json()["code"] == "ch_key_ambiguous"
+
+
+# --- re-pin provenance ---------------------------------------------------------
+
+
+def test_approve_re_pin_carries_stamp_provenance_forward(
+        monkeypatch, ch_workspace):
+    """Approving the moved key of an already-stamped row must not restate the
+    merge against post-merge values: the phone's recorded adoptions and
+    conflicts carry into the new stamp, unioned with new adoptions."""
+    _write_ch_rows()
+    item_id, entry_id = _ingest(monkeypatch, "c1a10012-0000-4000-8000-000000000012", {
+        "title": "A Modern Herbal",
+        "author": "Grieve, Maud",
+        "publisher": "Different House",
+        "ch_match": {
+            "key": "deadbeef-39",
+            "title": "A Modern Herbal Volume 1",
+            "author": "Grieve, Maud",
+            "score": 0.92,
+            "adopted": "author,year",
+            "conflicts": "publisher",
+        },
+    })
+    client = _client()
+    match = _state(client, item_id).get_json()["match"]
+    assert match["resolution"] == "rematch"
+    assert match["row"]["key"] == ROW0_KEY
+
+    response = client.post("/api/corrections/ch/approve", json={
+        "item_id": item_id,
+        "key": ROW0_KEY,
+        "operation_id": "ch-approve-repin-1",
+    })
+
+    assert response.status_code == 200
+    body = response.get_json()
+    # "author" survives although the merged record already agrees with CH.
+    assert body["adopted"] == [
+        "author", "year", "edition", "city", "pages", "condition",
+        "illustrations", "price", "categories",
+    ]
+    assert body["conflicts"] == ["title", "publisher"]
+    stamp = _manual_entry(entry_id)["extra"]["ch_match"]
+    assert stamp["key"] == ROW0_KEY
+    assert stamp["adopted"] == (
+        "author,year,edition,city,pages,condition,"
+        "illustrations,price,categories"
+    )
+    assert stamp["conflicts"] == "title,publisher"
+
+
+# --- unreject ------------------------------------------------------------------
+
+
+def test_unreject_clears_the_decision_and_restores_the_candidate(
+        monkeypatch, ch_workspace):
+    _write_ch_rows()
+    item_id, entry_id = _ingest(monkeypatch, "c1a10010-0000-4000-8000-000000000010", {
+        "title": "A Modern Herbal",
+        "author": "Grieve, Maud",
+    })
+    client = _client()
+    rejected = client.post("/api/corrections/ch/reject", json={
+        "item_id": item_id,
+        "key": ROW0_KEY,
+        "operation_id": "ch-unreject-setup",
+    })
+    assert rejected.status_code == 200
+    assert _state(client, item_id).get_json()["candidates"] == []
+
+    response = client.post("/api/corrections/ch/unreject", json={
+        "item_id": item_id,
+        "operation_id": "ch-unreject-1",
+    })
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "replayed": False}
+    # The codec drops an emptied extra from the stored row entirely.
+    assert "ch_review" not in _manual_entry(entry_id).get("extra", {})
+    state = _state(client, item_id).get_json()
+    assert state["rejected"] is None
+    assert [c["key"] for c in state["candidates"]] == [ROW0_KEY]
+
+    replay = client.post("/api/corrections/ch/unreject", json={
+        "item_id": item_id,
+        "operation_id": "ch-unreject-2",
+    })
+    assert replay.status_code == 200
+    assert replay.get_json() == {"ok": True, "replayed": True}
+
+
+def test_unreject_without_a_rejection_replays_without_writing(
+        monkeypatch, ch_workspace):
+    _write_ch_rows()
+    item_id, entry_id = _ingest(monkeypatch, "c1a10013-0000-4000-8000-000000000013", {
+        "title": "A Modern Herbal",
+    })
+    before = _manual_entry(entry_id)
+
+    response = _client().post("/api/corrections/ch/unreject", json={
+        "item_id": item_id,
+        "operation_id": "ch-unreject-noop",
+    })
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "replayed": True}
+    assert _manual_entry(entry_id) == before
+
+
+def test_unreject_validates_like_the_other_ch_mutations(
+        monkeypatch, ch_workspace):
+    _write_ch_rows()
+    item_id, _entry_id = _ingest(monkeypatch, "c1a10011-0000-4000-8000-000000000011", {
+        "title": "A Modern Herbal",
+    })
+    build, error = server._create_build({"title": "Plain catalogue build"})
+    assert error == ""
+    client = _client()
+    rejected = client.post("/api/corrections/ch/reject", json={
+        "item_id": item_id,
+        "key": ROW0_KEY,
+        "operation_id": "ch-unreject-reused",
+    })
+    assert rejected.status_code == 200
+
+    missing_item = client.post("/api/corrections/ch/unreject", json={
+        "operation_id": "ch-unreject-x",
+    })
+    bad_operation = client.post("/api/corrections/ch/unreject", json={
+        "item_id": item_id,
+        "operation_id": "spaces are invalid",
+    })
+    non_capture = client.post("/api/corrections/ch/unreject", json={
+        "item_id": build["id"],
+        "operation_id": "ch-unreject-x",
+    })
+    unknown = client.post("/api/corrections/ch/unreject", json={
+        "item_id": "b-" + "0" * 32,
+        "operation_id": "ch-unreject-x",
+    })
+    reused = client.post("/api/corrections/ch/unreject", json={
+        "item_id": item_id,
+        "operation_id": "ch-unreject-reused",
+    })
+
+    assert missing_item.status_code == 400
+    assert missing_item.get_json()["code"] == "invalid_ch_request"
+    assert bad_operation.status_code == 400
+    assert bad_operation.get_json()["code"] == "invalid_operation_id"
+    assert non_capture.status_code == 422
+    assert non_capture.get_json()["code"] == "not_capture_backed"
+    assert unknown.status_code == 404
+    assert unknown.get_json()["code"] == "item_not_found"
+    assert reused.status_code == 409
+    assert reused.get_json()["code"] == "operation_id_conflict"

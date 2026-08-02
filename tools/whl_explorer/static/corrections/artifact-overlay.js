@@ -621,6 +621,10 @@
 
       destroy() {
         if (this.destroyed) return;
+        // Removing the layer fires no pointerleave, so a hovered region must
+        // release its soft target explicitly or it survives as a stale
+        // hotkey-command target.
+        if (this.hotKey) this.setHotTarget("");
         this.destroyed = true;
         if (this.observer) this.observer.disconnect();
         this.observer = null;

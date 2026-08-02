@@ -338,6 +338,19 @@ function reocrJob(operationId, source, overrides = {}) {
 }
 
 
+// The engine pins credential-free provider identity into the job's public
+// input_revisions before recognition, so every running-after-pin and done
+// poll carries it.
+function reocrPinnedJob(operationId, source, overrides = {}) {
+  const job = reocrJob(operationId, source, overrides);
+  job.input_revisions = {
+    ...job.input_revisions,
+    provider: { provider_id: "tesseract", model: "5.4" },
+  };
+  return job;
+}
+
+
 function manualScheduler() {
   const scheduled = [];
   return {
@@ -1204,12 +1217,12 @@ test("standalone re-OCR queueing tracks the ocr-followup job to its proposal", {
   const queueCalls = [];
   const jobReads = [];
   const receipt = reocrQueueReceipt();
-  const runningJob = reocrJob(receipt.operation_id, receipt.source, {
+  const runningJob = reocrPinnedJob(receipt.operation_id, receipt.source, {
     state: "running",
     progress: { completed: 2, total: 4, unit: "phase", phase: "recognizing" },
     revision: 2,
   });
-  const terminalJob = reocrJob(receipt.operation_id, receipt.source, {
+  const terminalJob = reocrPinnedJob(receipt.operation_id, receipt.source, {
     state: "done",
     progress: { completed: 4, total: 4, unit: "phase", phase: "complete" },
     cancellable: false,
@@ -1300,6 +1313,10 @@ test("standalone re-OCR queueing tracks the ocr-followup job to its proposal", {
     Object.hasOwn(normalized.input_revisions, "command_sha256"),
     false,
   );
+  assert.deepEqual(normalized.input_revisions.provider, {
+    provider_id: "tesseract",
+    model: "5.4",
+  });
   unsubscribe();
 });
 
@@ -1402,6 +1419,76 @@ test("standalone re-OCR cancellation and failure map onto the followup shape", (
     ),
     (error) => error.code === "invalid-transform-job-result",
   );
+});
+
+
+test("standalone re-OCR jobs carry the engine provider pin once recognition starts", () => {
+  const receipt = reocrQueueReceipt();
+  const command = {
+    item_id: "book-1",
+    artifact_id: receipt.source.artifact_id,
+    artifact_revision: receipt.source.artifact_revision,
+    source_sha256: receipt.source.content_sha256,
+    operation_id: receipt.operation_id,
+  };
+
+  const running = correctionTransformJob(
+    reocrPinnedJob(receipt.operation_id, receipt.source, {
+      state: "running",
+      progress: { completed: 2, total: 4, unit: "phase", phase: "recognizing" },
+      revision: 2,
+    }),
+    command,
+  );
+  assert.equal(correctionTransformTerminalResult(running, command), null);
+
+  const done = correctionTransformTerminalResult(
+    correctionTransformJob(
+      reocrPinnedJob(receipt.operation_id, receipt.source, {
+        state: "done",
+        outputs: [
+          { kind: "ocr-proposal", ref: `cop-${"a".repeat(40)}`, partial: false },
+        ],
+      }),
+      command,
+    ),
+    command,
+  );
+  assert.equal(done.terminal_state, "done");
+  assert.equal(done.ocr_followup.state, "succeeded");
+
+  // A poll landing before the pin is installed omits the key entirely.
+  const prePin = correctionTransformJob(
+    reocrJob(receipt.operation_id, receipt.source, {
+      state: "done",
+      outputs: [
+        { kind: "ocr-proposal", ref: `cop-${"a".repeat(40)}`, partial: false },
+      ],
+    }),
+    command,
+  );
+  assert.equal(Object.hasOwn(prePin.input_revisions, "provider"), false);
+
+  const malformedPins = [
+    "tesseract",
+    { provider_id: "tesseract" },
+    { provider_id: "", model: "5.4" },
+    { provider_id: "tesseract", model: "" },
+    { provider_id: "tesseract", model: 5.4 },
+    {
+      provider_id: "tesseract",
+      model: "5.4",
+      options: { tesseract: "/usr/bin/tesseract" },
+    },
+  ];
+  for (const provider of malformedPins) {
+    const job = reocrJob(receipt.operation_id, receipt.source);
+    job.input_revisions.provider = provider;
+    assert.throws(
+      () => correctionTransformJob(job, command),
+      (error) => error.code === "invalid-transform-job-result",
+    );
+  }
 });
 
 

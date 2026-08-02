@@ -1144,6 +1144,13 @@
       return () => {
         controller.image.removeEventListener("load", sync);
         overlay.destroy();
+        // The overlay releases its own soft target on destroy; this covers
+        // hot targets that reached the controller from any other surface the
+        // editor swap is about to invalidate.
+        if (this.classificationController &&
+            typeof this.classificationController.setHotTarget === "function") {
+          this.classificationController.setHotTarget(null);
+        }
       };
     }
 
@@ -1354,6 +1361,14 @@
       const changedItem = previous.itemId !== selection.itemId;
       const changedDeepLink = previous.artifactId !== selection.artifactId ||
         previous.annotationId !== selection.annotationId;
+      // An item or artifact switch replaces the hoverable surfaces without
+      // firing pointerleave, so a stale hot target would keep routing
+      // single-letter hotkeys at content that is no longer visible.
+      if ((changedItem || previous.artifactId !== selection.artifactId) &&
+          this.classificationController &&
+          typeof this.classificationController.setHotTarget === "function") {
+        this.classificationController.setHotTarget(null);
+      }
       if (this.artifactsFeature && metadata.source !== "artifacts" &&
           (changedItem || changedDeepLink || metadata.forceContext === true)) {
         const context = selectionContext(this.state.context, selection);

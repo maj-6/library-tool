@@ -449,6 +449,27 @@ function correctionReocrQueueResult(overrides = {}) {
   };
 }
 
+// Replaying a completed idempotency key returns the done child job, whose
+// public input_revisions carry the engine's credential-free provider pin.
+function correctionReocrReplayResult() {
+  const body = correctionReocrQueueResult({ envelope: { replayed: true } });
+  body.job.state = "done";
+  body.job.progress = {
+    completed: 4, total: 4, unit: "phase", phase: "complete",
+  };
+  body.job.cancellable = false;
+  body.job.finished_at = "2026-08-02T12:00:02+00:00";
+  body.job.note = "OCR proposal ready";
+  body.job.input_revisions.provider = {
+    provider_id: "tesseract",
+    model: "5.4",
+  };
+  body.job.outputs = [
+    { kind: "ocr-proposal", ref: `cop-${"a".repeat(40)}`, partial: false },
+  ];
+  return body;
+}
+
 function correctionOcrProposalSummary(overrides = {}) {
   return {
     proposal_ref: `cop-${"a".repeat(40)}`,
@@ -2249,9 +2270,7 @@ test("correction re-OCR queueing owns exact conditional transport", async () => 
     {},
   ]]);
 
-  const replayBody = correctionReocrQueueResult({
-    envelope: { replayed: true },
-  });
+  const replayBody = correctionReocrReplayResult();
   const replayClient = new EngineClient({
     transport: async () => response(200, replayBody),
   });
@@ -2262,6 +2281,40 @@ test("correction re-OCR queueing owns exact conditional transport", async () => 
     idempotencyKey: "reocr-op-1",
   });
   assert.equal(replay.replayed, true);
+  assert.deepEqual(replay, replayBody);
+
+  // A replay caught mid-recognition carries the pin on a running job; a
+  // replay of a failed run finished without ever pinning a provider.
+  for (const body of [
+    (() => {
+      const running = correctionReocrReplayResult();
+      running.job.state = "running";
+      running.job.progress = {
+        completed: 2, total: 4, unit: "phase", phase: "recognizing",
+      };
+      running.job.cancellable = true;
+      running.job.finished_at = "";
+      running.job.note = "";
+      running.job.outputs = [];
+      return running;
+    })(),
+    (() => {
+      const unpinned = correctionReocrReplayResult();
+      delete unpinned.job.input_revisions.provider;
+      return unpinned;
+    })(),
+  ]) {
+    const client = new EngineClient({
+      transport: async () => response(200, body),
+    });
+    const accepted = await client.corrections.queueReocr({
+      itemId: "book:one",
+      artifactId: "corrected:display",
+      expectedArtifactRevision: "corrected-display-r1",
+      idempotencyKey: "reocr-op-1",
+    });
+    assert.deepEqual(accepted, body);
+  }
 });
 
 test("correction re-OCR queueing rejects invalid input and receipts", async () => {
@@ -2312,6 +2365,37 @@ test("correction re-OCR queueing rejects invalid input and receipts", async () =
     [202, (() => {
       const body = correctionReocrQueueResult();
       body.job.input_revisions.artifact_revision = "corrected-r2";
+      return body;
+    })()],
+    // Provider pins narrower or wider than {provider_id, model} non-empty
+    // strings must not pass — options may hold executable paths.
+    [200, (() => {
+      const body = correctionReocrReplayResult();
+      body.job.input_revisions.provider = "tesseract";
+      return body;
+    })()],
+    [200, (() => {
+      const body = correctionReocrReplayResult();
+      body.job.input_revisions.provider = { provider_id: "tesseract" };
+      return body;
+    })()],
+    [200, (() => {
+      const body = correctionReocrReplayResult();
+      body.job.input_revisions.provider = { provider_id: "", model: "5.4" };
+      return body;
+    })()],
+    [200, (() => {
+      const body = correctionReocrReplayResult();
+      body.job.input_revisions.provider = { provider_id: "tesseract", model: "" };
+      return body;
+    })()],
+    [200, (() => {
+      const body = correctionReocrReplayResult();
+      body.job.input_revisions.provider = {
+        provider_id: "tesseract",
+        model: "5.4",
+        options: { tesseract: "/usr/bin/tesseract" },
+      };
       return body;
     })()],
   ];

@@ -1088,6 +1088,7 @@
       this.unsubscribe = null;
       this.listeners = [];
       this.rowListeners = [];
+      this.hotCapture = false;
       this.mounted = false;
     }
 
@@ -1201,6 +1202,12 @@
       const list = this.root.querySelector("[data-books-list]");
       const focusedCapture = this.focusedCapture(list);
       for (const remove of this.rowListeners.splice(0)) remove();
+      // Replacing rows under a stationary pointer fires no pointerleave, so
+      // an active hover contribution must be withdrawn before its row goes.
+      if (this.hotCapture) {
+        this.hotCapture = false;
+        this.onHotTarget(null, { source: "books" });
+      }
       const count = this.root.querySelector("[data-books-count]");
       if (!list || !this.documentRef) return;
       const books = this.visibleBooks(snapshot);
@@ -1355,10 +1362,14 @@
           chip,
           element(this.documentRef, "span", "capture-state", state),
         );
-        this.listenRow(button, "pointerenter", () =>
-          this.onHotTarget(commandTarget, { element: button, source: "books" }));
-        this.listenRow(button, "pointerleave", () =>
-          this.onHotTarget(null, { element: button, source: "books" }));
+        this.listenRow(button, "pointerenter", () => {
+          this.hotCapture = true;
+          this.onHotTarget(commandTarget, { element: button, source: "books" });
+        });
+        this.listenRow(button, "pointerleave", () => {
+          this.hotCapture = false;
+          this.onHotTarget(null, { element: button, source: "books" });
+        });
         this.listenRow(button, "focus", () =>
           this.onSelectionTarget(commandTarget, {
             element: button,

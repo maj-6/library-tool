@@ -249,6 +249,7 @@ from librarytool.engine.translations import (  # noqa: E402
     TranslationProvenanceService,
     TranslationService,
 )
+from librarytool.processing import raster as raster_kernel  # noqa: E402
 from librarytool.profiles import WhlBookItemCommandPolicy  # noqa: E402
 
 _DESKTOP_CAPABILITY_HEADER = desktop_transport.CAPABILITY_HEADER
@@ -7831,10 +7832,16 @@ def _ch_reconcile_state(target: "_CorrectionsTarget") -> dict:
     ):
         title, author = _ch_item_query_fields(target)
         if title or author:
+            offered: set[str] = set()
             for score, position in _ch_scored_positions(index, title, author):
                 entry = index["entries"][position]
                 if rejected and entry["key"] == rejected["key"]:
                     continue
+                # Duplicate CH rows share one content key; offering the key
+                # twice invites an approve the key can never single out.
+                if entry["key"] in offered:
+                    continue
+                offered.add(entry["key"])
                 candidates.append(_ch_row_payload(entry, score=score))
                 if len(candidates) >= 5:
                     break
@@ -7854,9 +7861,15 @@ def _ch_merge_plan(target: "_CorrectionsTarget", entry: dict) -> dict:
     Mirrors ChMergePresenter: CH filling an empty field is adoption, loose
     (normalized) equality is agreement, and any true disagreement keeps the
     item's value and is surfaced instead of resolved. adopted/conflicts carry
-    the PHONE's field names in its FIELD_ORDER.
+    the PHONE's field names in its FIELD_ORDER. A blank column falls back to
+    the item's extra under the phone's field name: phone-captured CH-only
+    fields (pages, price, ...) land there at ingest, and the phone's
+    scanFields compares against meta top-level AND extra, so a blank column
+    alone must not read as adoptable.
     """
     metadata = target.metadata
+    extra = metadata.get("extra")
+    extra = extra if isinstance(extra, Mapping) else {}
     adopted: list[str] = []
     conflicts: list[str] = []
     metadata_set: dict = {}
@@ -7885,6 +7898,12 @@ def _ch_merge_plan(target: "_CorrectionsTarget", entry: dict) -> dict:
             continue
         field = _CH_FIELD_TO_ITEM_FIELD.get(name, name)
         current = str(metadata.get(field) or "").strip()
+        if not current:
+            held = extra.get(name)
+            # scanFields skips nested JSON values, so a mapping/list in
+            # extra is not a comparable scan value here either.
+            if not isinstance(held, (Mapping, list)):
+                current = str(held or "").strip()
         if not current:
             metadata_set[field] = ch_value
             adopted.append(name)
@@ -7942,12 +7961,24 @@ def _ch_required_row(key: str):
             key=key,
         )
     if len(positions) != 1:
-        return None, _ch_reconcile_error(
-            409,
-            "the key resolves to more than one CH row",
-            "ch_key_ambiguous",
-            key=key,
-        )
+        # The live list holds verbatim duplicate rows (~112 shared keys).
+        # When every row behind the key would produce the same merge, the
+        # lowest index is canonical; the 409 is only for real divergence.
+        entries = [index["entries"][position] for position in positions]
+        first = entries[0]
+        if any(
+            (entry["title"], entry["author"], entry["year"], entry["fields"])
+            != (first["title"], first["author"], first["year"],
+                first["fields"])
+            for entry in entries[1:]
+        ):
+            return None, _ch_reconcile_error(
+                409,
+                "the key resolves to more than one CH row",
+                "ch_key_ambiguous",
+                key=key,
+            )
+        return first, None
     return index["entries"][positions[0]], None
 
 
@@ -8009,6 +8040,27 @@ def api_corrections_ch_approve():
                     "match": _ch_reconcile_state(target)["match"],
                 })
             plan = _ch_merge_plan(target, entry)
+            adopted = plan["adopted"]
+            conflicts = plan["conflicts"]
+            if isinstance(prior, Mapping) and str(prior.get("key") or ""):
+                resolved = _ch_resolve_stamp(prior, _ch_reconcile_index())
+                row = resolved.get("row")
+                if isinstance(row, dict) and str(row.get("key") or "") == key:
+                    # Re-pinning a moved key restates the merge against the
+                    # already-merged record, which reads as adopted="": carry
+                    # the recorded provenance forward, plus new adoptions.
+                    carried = set(resolved["adopted"]) | set(adopted)
+                    adopted = [
+                        name for name in _CH_STAMP_FIELD_ORDER
+                        if name in carried
+                    ]
+                    disputed = (
+                        set(resolved["conflicts"]) | set(conflicts)
+                    ) - carried
+                    conflicts = [
+                        name for name in _CH_STAMP_FIELD_ORDER
+                        if name in disputed
+                    ]
             title, _author = _ch_item_query_fields(target)
             extra.pop("ch_review", None)
             extra["ch_match"] = {
@@ -8016,8 +8068,8 @@ def api_corrections_ch_approve():
                 "title": entry["title"],
                 "author": entry["author"],
                 "score": whl_client.similarity(title, entry["title"]),
-                "adopted": ",".join(plan["adopted"]),
-                "conflicts": ",".join(plan["conflicts"]),
+                "adopted": ",".join(adopted),
+                "conflicts": ",".join(conflicts),
             }
             metadata_set = dict(plan["metadata_set"])
             metadata_set["extra"] = extra
@@ -8042,8 +8094,8 @@ def api_corrections_ch_approve():
     return jsonify({
         "ok": True,
         "replayed": result.replayed,
-        "adopted": plan["adopted"],
-        "conflicts": plan["conflicts"],
+        "adopted": adopted,
+        "conflicts": conflicts,
         "match": match,
     })
 
@@ -8127,6 +8179,50 @@ def api_corrections_ch_reject():
         "replayed": result.replayed,
         "rejected": {"key": key, "decided_at": decided_at},
     })
+
+
+@app.post("/api/corrections/ch/unreject")
+def api_corrections_ch_unreject():
+    """Clear a remembered CH rejection so the candidate can return.
+
+    The inverse of /reject needs no key: extra.ch_review holds at most one
+    desktop decision. Clearing an absent one is a replayed no-write, so Undo
+    stays safe to repeat.
+    """
+    payload = request.get_json(silent=True) or {}
+    item_id = str(payload.get("item_id") or "").strip()
+    operation_id = str(payload.get("operation_id") or "").strip()
+    if not item_id:
+        return _ch_reconcile_error(
+            400, "item_id is required", "invalid_ch_request")
+    if not _CAPTURE_PROMOTION_OPERATION_ID_RE.fullmatch(operation_id):
+        return _ch_reconcile_error(
+            400,
+            "operation_id must be a portable identity",
+            "invalid_operation_id",
+        )
+    try:
+        with _corrections_workspace_locks():
+            target = _corrections_item_current_target(item_id)
+            if not target.capture_id:
+                return _ch_not_capture_backed(item_id)
+            extra = _ch_item_extra(target)
+            review = extra.pop("ch_review", None)
+            if not (
+                isinstance(review, Mapping)
+                and review.get("decision") == "rejected"
+            ):
+                return jsonify({"ok": True, "replayed": True})
+            command = UpdateItemCommand(
+                item_id=item_id,
+                expected_revision=target.record_revision,
+                patch=ItemPatch(metadata_set={"extra": extra}),
+                operation_id=operation_id,
+            )
+        result = _corrections_item_update_engine().update(command)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return jsonify({"ok": True, "replayed": result.replayed})
 
 
 def _item_command_engine() -> ItemCommandService:
@@ -13906,16 +14002,126 @@ def _ocr_apply_error(status: int, code: str, message: str, **details):
     return response, status
 
 
+def _ocr_apply_inverse_matrix(quads: list):
+    """Compose the corrected->capture-photo homography for a proposal chain.
+
+    Each committed transform published the normalized quad its raster warp
+    rectified onto the unit square. Replaying ``apply_perspective_transform``'s
+    exact canonicalized forward math (the raster kernel's own helpers, so the
+    rounding can never drift from what was rendered) and inverting the
+    leaf-to-root composition places proposal geometry back on the raster the
+    entry page still shows. None = a quad is missing or does not define an
+    invertible mapping.
+    """
+    destination = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+    forward = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    try:
+        for quad in quads:
+            validated = raster_kernel.validate_normalized_quad(quad)
+            step = raster_kernel._canonical_matrix(
+                raster_kernel._normalize_matrix(
+                    raster_kernel._homography(validated, destination)))
+            forward = raster_kernel._matrix_multiply(forward, step)
+        return raster_kernel._normalize_matrix(
+            raster_kernel._matrix_inverse(forward))
+    except (raster_kernel.RasterInputError, TypeError, ValueError):
+        return None
+
+
+def _ocr_apply_map_box(matrix, box) -> dict | None:
+    """Project one normalized {x,y,w,h} box back onto the entry-page raster.
+
+    The four corners run through the corrected->source homography and the
+    result is their axis-aligned bounds intersected with the unit square,
+    mirroring ``_map_annotations``' projective-map-and-clip policy: a box
+    that leaves the page (or collapses) returns None and must be DROPPED,
+    never written displaced. A horizon crossing raises ValueError — that
+    geometry has no usable mapping at all.
+    """
+    if not isinstance(box, Mapping):
+        return None
+    try:
+        x = float(box.get("x"))
+        y = float(box.get("y"))
+        w = float(box.get("w"))
+        h = float(box.get("h"))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x, y, w, h)) \
+            or w < 0 or h < 0:
+        return None
+    xs: list[float] = []
+    ys: list[float] = []
+    for cx, cy in ((x, y), (x + w, y), (x + w, y + h), (x, y + h)):
+        denominator = matrix[2][0] * cx + matrix[2][1] * cy + matrix[2][2]
+        if not math.isfinite(denominator) or abs(denominator) <= 1e-12:
+            raise ValueError("box intersects an invalid homography horizon")
+        px = (matrix[0][0] * cx + matrix[0][1] * cy + matrix[0][2]) \
+            / denominator
+        py = (matrix[1][0] * cx + matrix[1][1] * cy + matrix[1][2]) \
+            / denominator
+        if not math.isfinite(px) or not math.isfinite(py):
+            raise ValueError("box mapping produced a non-finite coordinate")
+        xs.append(px)
+        ys.append(py)
+    left, right = max(0.0, min(xs)), min(1.0, max(xs))
+    top, bottom = max(0.0, min(ys)), min(1.0, max(ys))
+    if right - left <= 0 or bottom - top <= 0:
+        return None
+    return {"x": round(left, 5), "y": round(top, 5),
+            "w": round(right - left, 5), "h": round(bottom - top, 5)}
+
+
+def _ocr_apply_decode_figures(raw_images) -> list[dict] | None:
+    """Rehydrate a proposal's figure crops from their durable JSON wrappers.
+
+    The recognition payload stores provider crop bytes as
+    ``{"encoding": "base64", "data": ...}`` (the host normalizer's binary
+    form). None = the images key is present but cannot be decoded losslessly,
+    and the apply must refuse rather than persist dangling references.
+    """
+    if raw_images is None:
+        return []
+    if not isinstance(raw_images, list):
+        return None
+    figures: list[dict] = []
+    for index, image in enumerate(raw_images):
+        if not isinstance(image, Mapping):
+            return None
+        data = image.get("data")
+        if (not isinstance(data, Mapping)
+                or data.get("encoding") != "base64"
+                or not isinstance(data.get("data"), str)):
+            return None
+        try:
+            raw = base64.b64decode(data["data"], validate=True)
+        except (TypeError, ValueError):
+            return None
+        if not raw:
+            return None
+        bbox = image.get("bbox")
+        figures.append({
+            "id": str(image.get("id") or f"img-{index}.jpeg"),
+            "data": raw,
+            "bbox": dict(bbox) if isinstance(bbox, Mapping) else None,
+        })
+    return figures
+
+
 def _ocr_apply_capture_asset(
         item_id: str, capture_id: str, source_artifact_id: str,
-        engine_root: Path) -> tuple[str, int] | None:
-    """Chain a committed OCR-ready output back to (asset_id, photo page).
+        engine_root: Path) -> tuple[str, int, str, list] | None:
+    """Chain a committed OCR-ready output back to its capture photo page.
 
     Same tolerant publication scan as ``_capture_correction_targets``: the
     output's owning publication names its input artifact, and following those
     inputs transitively lands on the capture's ``capture:<ns>:display`` /
     ``:original`` artifact whose namespace the photo contract can invert.
-    Pages are the desktop import's photo numbering (``order`` + 1).
+    Pages are the desktop import's photo numbering (``order`` + 1). Returns
+    ``(asset_id, page, rendition, quads)``: the rendition names which capture
+    artifact roots the chain, and quads carries each traversed publication's
+    normalized correction quad leaf-first so apply can invert the raster
+    frame the proposal geometry was recognized in.
     """
 
     photo_assets = lib.load_json(
@@ -13944,7 +14150,7 @@ def _ocr_apply_capture_asset(
     transforms = engine_root / ".engine" / "correction-transforms"
     pointer_dir = transforms / "by-item" / hashlib.sha256(
         item_id.encode("utf-8")).hexdigest()
-    parent_by_output: dict[str, str] = {}
+    parent_by_output: dict[str, dict] = {}
     for pointer_path in (
             sorted(pointer_dir.glob("*.json"))
             if pointer_dir.is_dir() else ()):
@@ -13970,11 +14176,11 @@ def _ocr_apply_capture_asset(
         for output in outputs:
             if isinstance(output, dict) and isinstance(
                     output.get("artifact_id"), str):
-                parent_by_output[output["artifact_id"].casefold()] = \
-                    command["artifact_id"]
+                parent_by_output[output["artifact_id"].casefold()] = command
 
     current = str(source_artifact_id)
     seen: set[str] = set()
+    quads: list = []
     while True:
         key = current.casefold()
         if key in seen:
@@ -13983,12 +14189,14 @@ def _ocr_apply_capture_asset(
         parent = parent_by_output.get(key)
         if parent is None:
             return None
-        namespace, _, rendition = parent.rpartition(":")
+        quads.append(parent.get("quad"))
+        parent_id = parent["artifact_id"]
+        namespace, _, rendition = parent_id.rpartition(":")
         if rendition in ("display", "original"):
             located = asset_by_namespace.get(namespace)
             if located is not None:
-                return located
-        current = parent
+                return located[0], located[1], rendition, quads
+        current = parent_id
 
 
 @app.route("/api/v1/items/<item_id>/ocr-proposals/<proposal_ref>/apply",
@@ -14066,10 +14274,64 @@ def api_v1_apply_correction_ocr_proposal(item_id: str, proposal_ref: str):
             422, "ocr_apply_source_not_capture_derived",
             "the proposal's rendition does not resolve to a capture photo",
             proposal_ref=proposal_ref)
-    asset_id, page = located
+    asset_id, page, rendition, quads = located
+    # Proposal geometry is normalized to the CORRECTED raster; the entry page
+    # still shows the capture's display rendition, so boxes are only valid
+    # after inverting the transform chain — and only when that chain roots at
+    # the display artifact the page actually is.
+    matrix = (
+        _ocr_apply_inverse_matrix(quads) if rendition == "display" else None
+    )
+    if matrix is None:
+        return _ocr_apply_error(
+            422, "ocr_apply_geometry_unmappable",
+            "the proposal geometry cannot be mapped onto the entry page",
+            proposal_ref=proposal_ref)
+    figures = _ocr_apply_decode_figures(recognition.get("images"))
+    if figures is None:
+        return _ocr_apply_error(
+            422, "ocr_proposal_figures_unsupported",
+            "the proposal carries figure crops that cannot be decoded",
+            proposal_ref=proposal_ref)
+    try:
+        mapped_regions = []
+        for region in regions:
+            mapped = dict(region)
+            box = _ocr_apply_map_box(matrix, mapped.get("box"))
+            if box is None:
+                continue
+            mapped["box"] = box
+            mapped_regions.append(mapped)
+        mapped_words = []
+        for word in recognition.get("words") or []:
+            if not isinstance(word, Mapping):
+                continue
+            mapped = dict(word)
+            box = _ocr_apply_map_box(matrix, mapped)
+            if box is None:
+                continue
+            mapped.update(box)
+            mapped_words.append(mapped)
+        for figure in figures:
+            box = _ocr_apply_map_box(matrix, figure.pop("bbox", None))
+            if box is not None:
+                figure["bbox"] = box
+    except ValueError:
+        return _ocr_apply_error(
+            422, "ocr_apply_geometry_unmappable",
+            "the proposal geometry cannot be mapped onto the entry page",
+            proposal_ref=proposal_ref)
     src_key = "primary"
     doc = _ocr_name(_OCR_PROPOSAL_APPLY_DOC)
     receipts_path = _entry_dir(build_id) / "ocr" / _OCR_PROPOSAL_APPLY_RECEIPTS
+    # Invalidate-first: no canonical OCR state changes (and no receipt, even a
+    # replayed one) until the capture association is durably stale. mark_stale
+    # is idempotent on an already-stale association, so a replay only pays a
+    # cheap re-assertion; a staling failure aborts the apply untouched.
+    try:
+        _mark_capture_archive_stale(target.capture_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
     with _ocr_merge_lock:
         receipts = lib.load_json(receipts_path, {})
         receipts = receipts if isinstance(receipts, dict) else {}
@@ -14086,19 +14348,21 @@ def api_v1_apply_correction_ocr_proposal(item_id: str, proposal_ref: str):
             response.cache_control.no_store = True
             response.headers["Pragma"] = "no-cache"
             return response
-        region_action = _ocr_save_page_regions(
+        # One page-level decision, exactly like the legacy job: figure crops
+        # land under ocr/images/ (or stay staged inside a protected page's
+        # proposal) and the ![id](id) references in text and region records
+        # are rewritten to the saved names.
+        text, region_action = _ocr_save_page_detection(
             build_id, src_key, page,
-            [dict(value) for value in regions], dict(dims), doc=doc,
-            protect_existing=True,
-            provider=proposal.provider.provider_id,
-            proposed_text=text)
+            images=figures, text=text,
+            regions=mapped_regions, dims=dict(dims),
+            doc=doc, provider=proposal.provider.provider_id)
         words_action = "absent"
         if has_words:
             # A "words" key marks a geometry-speaking engine and its value is
             # authoritative ([] = blank page), exactly as in the legacy job.
             _ocr_save_page_words(
-                build_id, src_key, page,
-                list(recognition.get("words") or []), doc=doc)
+                build_id, src_key, page, mapped_words, doc=doc)
             words_action = "saved"
         if region_action == "proposed":
             text_action = "proposed"
@@ -14128,7 +14392,6 @@ def api_v1_apply_correction_ocr_proposal(item_id: str, proposal_ref: str):
             "receipt": receipt,
         }
         lib.save_json(receipts_path, receipts)
-    _mark_capture_archive_stale(target.capture_id)
     response = jsonify(receipt)
     response.cache_control.no_store = True
     response.headers["Pragma"] = "no-cache"

@@ -318,7 +318,7 @@
       const inputKeys = Object.keys(inputs);
       const allowedInputKeys = new Set([
         "parent_operation_id", "artifact_id", "artifact_revision",
-        "source_sha256", "publication_policy", "command_sha256",
+        "source_sha256", "publication_policy", "command_sha256", "provider",
       ]);
       if (!inputKeys.every((key) => allowedInputKeys.has(key)) ||
           inputs.parent_operation_id !== command.operation_id ||
@@ -328,7 +328,15 @@
           inputs.publication_policy !== "machine-proposal-only" ||
           (Object.hasOwn(inputs, "command_sha256") &&
             (typeof inputs.command_sha256 !== "string" ||
-              !/^[0-9a-f]{64}$/.test(inputs.command_sha256)))) {
+              !/^[0-9a-f]{64}$/.test(inputs.command_sha256))) ||
+          // The engine pins provider identity once recognition starts, so a
+          // running or done job may carry it; a pre-pin poll may not.
+          (Object.hasOwn(inputs, "provider") &&
+            (!hasExactKeys(inputs.provider, ["provider_id", "model"]) ||
+              typeof inputs.provider.provider_id !== "string" ||
+              !inputs.provider.provider_id ||
+              typeof inputs.provider.model !== "string" ||
+              !inputs.provider.model))) {
         throw invalidTransformResult(
           "the correction OCR job input revisions are invalid",
         );

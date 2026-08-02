@@ -849,6 +849,87 @@ test("advanced JSON edits merge residual keys with typed field values", async ()
 });
 
 
+test("advanced JSON edits keep untouched empty-string fields out of the removal set",
+  async () => {
+    const calls = [];
+    const initial = item({
+      metadata: { authors: "Unknown", condition: "", extra: { flag: true } },
+    });
+    const saved = item({
+      metadata: { authors: "Unknown", condition: "", extra: { flag: false } },
+      record_revision: "mir-r2",
+    });
+    const { editor, root } = harness({
+      api: {
+        async loadItem() { return initial; },
+        async updateItem(payload) {
+          calls.push(payload);
+          return { item: saved, replayed: false };
+        },
+      },
+    });
+    await editor.setSelection(initial.id);
+    assert.equal(root.querySelector('[data-item-field="condition"]').value, "");
+
+    const advanced = root.querySelector("[data-item-metadata-advanced]");
+    advanced.value = JSON.stringify({ extra: { flag: false } });
+    advanced.emit("input");
+
+    assert.deepEqual(JSON.parse(editor.draft.metadataText), {
+      authors: "Unknown",
+      condition: "",
+      extra: { flag: false },
+    }, "a stored empty string is data, not a pending removal");
+
+    await editor.save();
+    assert.deepEqual(calls[0].patch, {
+      title: null,
+      metadata_set: { extra: { flag: false } },
+      metadata_remove: [],
+    }, "no removal is emitted for a field the user never touched");
+  });
+
+
+test("advanced JSON writes form keys through to the visible inputs", async () => {
+  const initial = item({
+    metadata: { authors: "Unknown", extra: { flag: true } },
+  });
+  const { editor, root } = harness({
+    api: {
+      async loadItem() { return initial; },
+      async updateItem() { throw new Error("not used"); },
+    },
+  });
+  await editor.setSelection(initial.id);
+
+  const advanced = root.querySelector("[data-item-metadata-advanced]");
+  advanced.value = JSON.stringify({
+    authors: "A. Green",
+    condition: "foxed",
+    extra: { flag: true },
+  });
+  advanced.emit("input");
+
+  assert.equal(root.querySelector('[data-item-field="authors"]').value,
+    "A. Green", "the input reflects the Advanced edit without a rerender");
+  assert.equal(root.querySelector('[data-item-field="condition"]').value,
+    "foxed");
+  assert.deepEqual(JSON.parse(editor.draft.metadataText), {
+    authors: "A. Green",
+    condition: "foxed",
+    extra: { flag: true },
+  });
+
+  advanced.value = JSON.stringify({ extra: { flag: false } });
+  advanced.emit("input");
+  assert.deepEqual(JSON.parse(editor.draft.metadataText), {
+    authors: "A. Green",
+    condition: "foxed",
+    extra: { flag: false },
+  }, "a second Advanced edit merges from the draft, not stale inputs");
+});
+
+
 test("invalid advanced JSON blocks saving without losing typed fields", async () => {
   let updates = 0;
   const { editor, root } = harness({

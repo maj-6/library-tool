@@ -653,6 +653,100 @@ test("overlay blur demotes classification focus without erasing its selected tar
 });
 
 
+test("item and artifact switches drop the classification hot target", () => {
+  const shell = Object.create(CorrectionsShell.prototype);
+  const hotCalls = [];
+  Object.assign(shell, {
+    state: new CorrectionsWindowState(),
+    selectionListeners: new Set(),
+    booksFeature: null,
+    itemProperties: null,
+    ocrProposalsFeature: null,
+    chPanelFeature: null,
+    artifactsFeature: null,
+    classificationController: {
+      setHotTarget(target) { hotCalls.push(target); },
+    },
+  });
+
+  shell.selectAddress({ itemId: "book-1", artifactId: "capture-1" });
+  assert.deepEqual(hotCalls, [null],
+    "selecting an item clears any hover left by the previous surfaces");
+
+  shell.selectAddress({
+    itemId: "book-1",
+    artifactId: "capture-1",
+    annotationId: "region-1",
+  });
+  assert.deepEqual(hotCalls, [null],
+    "an annotation-only change keeps the still-visible hover");
+
+  shell.selectAddress({
+    itemId: "book-1",
+    artifactId: "capture-2",
+    annotationId: null,
+  });
+  assert.deepEqual(hotCalls, [null, null],
+    "an artifact switch clears the hover; its regions are gone");
+
+  shell.selectAddress({
+    itemId: "book-2",
+    artifactId: null,
+    annotationId: null,
+  });
+  assert.deepEqual(hotCalls, [null, null, null],
+    "an item switch clears the hover");
+});
+
+
+test("editor overlay teardown clears a hovered classification target", () => {
+  const shell = Object.create(CorrectionsShell.prototype);
+  const documentRef = fakeDocument();
+  const stage = new FakeNode("div", documentRef);
+  const image = new FakeNode("img", documentRef);
+  stage.append(image);
+  const hot = [];
+  Object.assign(shell, {
+    documentRef,
+    windowRef: {},
+    classificationController: {
+      setHotTarget(target, detail) { hot.push({ target, detail }); },
+      setSelectionTarget() {},
+    },
+  });
+  const resource = {
+    summary: { itemId: "book-1" },
+    coordinateSpace: "canvas-normalized",
+    regions: [{
+      annotation_id: "region-1",
+      object_type: "spatial-annotation",
+      revision: "region-r1",
+      selector: {
+        coordinate_space: "canvas-normalized",
+        points: [
+          { x: 0.1, y: 0.1 }, { x: 0.5, y: 0.1 }, { x: 0.5, y: 0.4 },
+        ],
+      },
+    }],
+    dimensions: { width: 100, height: 100 },
+  };
+
+  const cleanup = shell.mountArtifactOverlay({ image }, resource);
+  assert.equal(typeof cleanup, "function");
+  const marker = stage.querySelector(".corrections-artifact-overlay-shape");
+  assert.ok(marker, "the overlay renders the region marker");
+  marker.emit("pointerenter");
+  assert.equal(hot.at(-1).target.key, "annotation:region-1");
+  assert.equal(hot.at(-1).detail.source, "editor-overlay");
+
+  cleanup();
+  assert.equal(hot.at(-1).target, null,
+    "teardown withdraws the hovered region as a command target");
+  assert.equal(stage.querySelector("[data-overlay-key]"), null,
+    "teardown removes the overlay layer");
+});
+
+
 test("category apply, undo, and conflict refresh expanded artifacts once", async () => {
   const artifactRefreshes = [];
   const detailRefreshes = [];
