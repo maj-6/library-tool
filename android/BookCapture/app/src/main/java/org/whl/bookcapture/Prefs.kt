@@ -487,7 +487,8 @@ object Prefs {
         }
 
     /** Freeze the eligible ids at button-press time. A repeated press while
-     * the batch is active reuses the same identity and target set. */
+     * the batch is active retains its identity and reconciles its target set,
+     * so in-flight delivery receipts remain recoverable. */
     internal fun beginCaptureSync(
         ctx: Context,
         targetIds: Collection<String>,
@@ -500,7 +501,9 @@ object Prefs {
             lanHost = lanHost(ctx),
             cloudOwner = userId(ctx),
         )
-        if (!start.created) return@synchronized start
+        if (!start.created && start.record == captureSyncRecordLocked(ctx)) {
+            return@synchronized start
+        }
         check(writeCaptureSyncRecordLocked(ctx, start.record)) {
             "Could not persist capture sync request"
         }
@@ -550,9 +553,24 @@ object Prefs {
         requestId: String,
         phase: CaptureSyncPhase,
     ): Boolean = synchronized(captureSyncLock) {
-        val current = captureSyncRecordLocked(ctx)
-            ?.takeIf { it.requestId == requestId } ?: return@synchronized false
+        val current = activeCaptureSyncRecordForRequest(
+            captureSyncRecordLocked(ctx),
+            requestId,
+        ) ?: return@synchronized false
         writeCaptureSyncRecordLocked(ctx, current.copy(phase = phase))
+    }
+
+    internal fun completeCaptureSyncIfUnchanged(
+        ctx: Context,
+        expected: CaptureSyncRecord,
+        phase: CaptureSyncPhase,
+    ): Boolean = synchronized(captureSyncLock) {
+        val terminal = terminalCaptureSyncRecord(
+            captureSyncRecordLocked(ctx),
+            expected,
+            phase,
+        ) ?: return@synchronized false
+        writeCaptureSyncRecordLocked(ctx, terminal)
     }
 
     internal fun markCaptureSynced(
@@ -560,8 +578,10 @@ object Prefs {
         requestId: String,
         entryId: String,
     ): Boolean = synchronized(captureSyncLock) {
-        val current = captureSyncRecordLocked(ctx)
-            ?.takeIf { it.requestId == requestId && entryId in it.targetIds }
+        val current = activeCaptureSyncRecordForRequest(
+            captureSyncRecordLocked(ctx),
+            requestId,
+        )?.takeIf { entryId in it.targetIds }
             ?: return@synchronized false
         writeCaptureSyncRecordLocked(
             ctx,
@@ -577,11 +597,12 @@ object Prefs {
         requestId: String,
         entryId: String,
     ): Boolean = synchronized(captureSyncLock) {
-        val current = captureSyncRecordLocked(ctx)
-            ?.takeIf {
-                it.requestId == requestId && entryId in it.targetIds &&
-                    entryId !in it.syncedIds
-            } ?: return@synchronized false
+        val current = activeCaptureSyncRecordForRequest(
+            captureSyncRecordLocked(ctx),
+            requestId,
+        )?.takeIf {
+            entryId in it.targetIds && entryId !in it.syncedIds
+        } ?: return@synchronized false
         writeCaptureSyncRecordLocked(
             ctx,
             current.copy(blockedIds = current.blockedIds + entryId),

@@ -47,6 +47,63 @@ internal data class CaptureSyncState(
     val active: Boolean get() = phase.active
 }
 
+internal enum class CaptureSyncFinishDecision {
+    WAIT,
+    COMPLETE,
+    COMPLETE_WITH_ERRORS,
+}
+
+internal fun captureSyncFinishDecision(
+    state: CaptureSyncState,
+    sawDeferred: Boolean,
+    hadError: Boolean,
+): CaptureSyncFinishDecision = when {
+    sawDeferred || state.remainingCount > 0 -> CaptureSyncFinishDecision.WAIT
+    hadError || state.blockedCount > 0 || state.skippedCount > 0 ||
+        state.syncedCount != state.requestedCount ->
+        CaptureSyncFinishDecision.COMPLETE_WITH_ERRORS
+    else -> CaptureSyncFinishDecision.COMPLETE
+}
+
+internal fun captureSyncSkippedTargetIds(
+    record: CaptureSyncRecord,
+    pendingIds: Collection<String>,
+): Set<String> {
+    val targets = normalizedCaptureSyncIds(record.targetIds)
+    val synced = normalizedCaptureSyncIds(record.syncedIds).intersect(targets)
+    val blocked = normalizedCaptureSyncIds(record.blockedIds).intersect(targets - synced)
+    val pending = normalizedCaptureSyncIds(pendingIds).intersect(targets - synced - blocked)
+    return targets - synced - blocked - pending
+}
+
+internal fun captureSyncTerminalReconciliationIds(
+    record: CaptureSyncRecord,
+    pendingIds: Collection<String>,
+): Set<String> {
+    val targets = normalizedCaptureSyncIds(record.targetIds)
+    val synced = normalizedCaptureSyncIds(record.syncedIds).intersect(targets)
+    val blocked = normalizedCaptureSyncIds(record.blockedIds).intersect(targets - synced)
+    return captureSyncSkippedTargetIds(record, pendingIds) + blocked
+}
+
+internal fun activeCaptureSyncRecordForRequest(
+    current: CaptureSyncRecord?,
+    requestId: String,
+): CaptureSyncRecord? = current?.takeIf {
+    it.requestId == requestId && it.phase.active
+}
+
+/** Build a terminal update only when no button press or worker changed the
+ * durable batch after its completion decision was calculated. */
+internal fun terminalCaptureSyncRecord(
+    current: CaptureSyncRecord?,
+    expected: CaptureSyncRecord,
+    phase: CaptureSyncPhase,
+): CaptureSyncRecord? {
+    require(!phase.active) { "Capture sync terminal phase is required" }
+    return current?.takeIf { it == expected && it.phase.active }?.copy(phase = phase)
+}
+
 internal data class CaptureSyncStart(
     val record: CaptureSyncRecord,
     val created: Boolean,
@@ -70,12 +127,30 @@ internal fun beginCaptureSyncRecord(
     lanHost: String = "",
     cloudOwner: String = "",
 ): CaptureSyncStart {
+    val targets = normalizedCaptureSyncIds(targetIds)
     existing?.takeIf { it.phase.active }?.let {
-        return CaptureSyncStart(it, created = false)
+        val existingTargets = normalizedCaptureSyncIds(it.targetIds)
+        val existingSynced = normalizedCaptureSyncIds(it.syncedIds).intersect(existingTargets)
+        // Keep the request identity while work may still be in flight. Replacing
+        // it would let an old worker deliver queue/ -> sent/ with a receipt the
+        // new generation cannot account for. Reconcile the queue snapshot in
+        // place instead. Targets remain monotonic until the batch reaches a
+        // terminal phase: an in-flight worker may already have moved a folder
+        // out of queue/ but not yet recorded it as synced.
+        val reconciledTargets = (existingTargets + targets).toSortedSet()
+        val reconciled = it.copy(
+            targetIds = reconciledTargets,
+            syncedIds = existingSynced.intersect(reconciledTargets),
+            blockedIds = normalizedCaptureSyncIds(it.blockedIds)
+                .intersect(reconciledTargets - existingSynced),
+        )
+        return CaptureSyncStart(
+            record = if (reconciled == it) it else reconciled,
+            created = false,
+        )
     }
     val requestId = newRequestId.trim()
     require(requestId.isNotEmpty()) { "Capture sync request id is required" }
-    val targets = normalizedCaptureSyncIds(targetIds)
     val mode = transportMode.takeIf { it in setOf("cloud", "lan", "auto") }
         ?: "cloud"
     return CaptureSyncStart(
@@ -144,8 +219,8 @@ internal fun aggregateCaptureSyncState(
     val targets = normalizedCaptureSyncIds(record.targetIds)
     val synced = normalizedCaptureSyncIds(record.syncedIds).intersect(targets)
     val blocked = normalizedCaptureSyncIds(record.blockedIds).intersect(targets - synced)
-    val pending = normalizedCaptureSyncIds(pendingIds).intersect(targets - synced)
-    val skipped = targets - synced - blocked - pending
+    val pending = normalizedCaptureSyncIds(pendingIds).intersect(targets - synced - blocked)
+    val skipped = captureSyncSkippedTargetIds(record, pendingIds)
     return CaptureSyncState(
         phase = record.phase,
         eligibleCount = eligible.size,

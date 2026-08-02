@@ -1,5 +1,6 @@
 package org.whl.bookcapture
 
+import androidx.work.ExistingWorkPolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -254,6 +255,73 @@ class UploadStateTest {
         assertEquals(TimeUnit.SECONDS.toMillis(60), deferredUploadRecheckDelayMs(1))
         assertEquals(TimeUnit.SECONDS.toMillis(120), deferredUploadRecheckDelayMs(2))
         assertEquals(TimeUnit.SECONDS.toMillis(120), deferredUploadRecheckDelayMs(20))
+    }
+
+    @Test
+    fun explicitPressKeepsLiveWorkAndRestartsAVisibleRecoveryState() {
+        fun start(phase: CaptureSyncPhase, created: Boolean) = CaptureSyncStart(
+            record = CaptureSyncRecord(
+                requestId = "request-1",
+                phase = phase,
+                targetIds = setOf("entry-1"),
+                syncedIds = emptySet(),
+                blockedIds = emptySet(),
+            ),
+            created = created,
+        )
+
+        assertEquals(
+            ExistingWorkPolicy.KEEP,
+            captureSyncEnqueuePolicy(start(CaptureSyncPhase.RUNNING, created = false)),
+        )
+        assertEquals(
+            ExistingWorkPolicy.KEEP,
+            captureSyncEnqueuePolicy(start(CaptureSyncPhase.QUEUED, created = false)),
+        )
+        assertEquals(
+            ExistingWorkPolicy.REPLACE,
+            captureSyncEnqueuePolicy(start(CaptureSyncPhase.RETRYING, created = false)),
+        )
+        assertEquals(
+            ExistingWorkPolicy.REPLACE,
+            captureSyncEnqueuePolicy(
+                start(CaptureSyncPhase.WAITING_FOR_PROCESSING, created = false),
+            ),
+        )
+        assertEquals(
+            ExistingWorkPolicy.REPLACE,
+            captureSyncEnqueuePolicy(start(CaptureSyncPhase.QUEUED, created = true)),
+        )
+    }
+
+    @Test
+    fun retryableUploadEventuallyYieldsToLaterCapturesWithADiagnostic() {
+        assertTrue(shouldRetryCaptureUpload(0))
+        assertTrue(shouldRetryCaptureUpload(MAX_CAPTURE_UPLOAD_RETRIES - 1))
+        assertFalse(shouldRetryCaptureUpload(MAX_CAPTURE_UPLOAD_RETRIES))
+
+        val message = captureUploadFailureMessage(
+            "entry-123456789",
+            IOException("socket\nclosed"),
+        )
+        assertTrue(message.contains("entry-12"))
+        assertTrue(message.contains("socket closed"))
+        assertFalse(message.contains("\n"))
+    }
+
+    @Test
+    fun unreachableFixedLanUsesTheSameBoundedPerEntryFailurePath() {
+        val source = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        val lanPreflight = source.substringAfter("if (resolved == \"lan\")")
+            .substringBefore("if (!Prefs.configured(ctx)")
+        val boundedFailure = source.substringAfter("private suspend fun retryOrBlockCandidate(")
+            .substringBefore("override suspend fun doWork(): Result")
+
+        assertTrue(lanPreflight.contains("retryOrBlockCandidate("))
+        assertFalse(lanPreflight.contains("Result.retry()"))
+        assertTrue(boundedFailure.contains("shouldRetryCaptureUpload(runAttemptCount)"))
+        assertTrue(boundedFailure.contains("Prefs.markCaptureSyncBlocked("))
+        assertTrue(boundedFailure.contains("continueUploadChain("))
     }
 
     @Test

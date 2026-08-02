@@ -26,6 +26,16 @@ import java.util.concurrent.TimeUnit
 internal const val MAX_AUTOMATIC_PROCESS_RETRIES = 3
 internal const val MAX_FORCED_PROCESS_RETRIES = 3
 
+internal fun pendingForcedRetryRecoveryIds(
+    pendingIds: Collection<String>,
+    unfinishedOwnedIds: Collection<String>,
+    hasUntaggedUnfinishedWork: Boolean,
+): List<String> {
+    val pending = normalizedCaptureSyncIds(pendingIds).toList()
+    val owned = normalizedCaptureSyncIds(unfinishedOwnedIds)
+    return if (hasUntaggedUnfinishedWork) pending else pending.filterNot(owned::contains)
+}
+
 internal enum class ProcessingWorkDecision {
     RETRY,
     COMPLETE_CHAIN,
@@ -147,6 +157,9 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                     KEY_ENTRY_ID to entryId,
                     KEY_FORCE_REPROCESS to forceReprocess,
                 ))
+                .apply {
+                    if (forceReprocess) addTag(retryEntryTag(entryId))
+                }
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -155,6 +168,9 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                 .build()
 
         const val RETRY_WORK_NAME = "capture-process-retry"
+        private const val RETRY_ENTRY_TAG_PREFIX = "capture-reprocess-entry:"
+
+        private fun retryEntryTag(entryId: String) = RETRY_ENTRY_TAG_PREFIX + entryId
 
         /**
          * Re-run the pipeline over captures the user picked out of the
@@ -170,6 +186,14 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
          * the stale error and holds the directory against retention.
          */
         fun enqueueForcedRetry(ctx: Context, entryIds: List<String>) {
+            enqueueForcedRetryChain(ctx, entryIds, ExistingWorkPolicy.APPEND_OR_REPLACE)
+        }
+
+        private fun enqueueForcedRetryChain(
+            ctx: Context,
+            entryIds: List<String>,
+            policy: ExistingWorkPolicy,
+        ) {
             val requests = entryIds.asSequence()
                 .map(String::trim)
                 .filter { it.isNotEmpty() }
@@ -180,7 +204,7 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             if (requests.isEmpty()) return
             var continuation = WorkManager.getInstance(ctx).beginUniqueWork(
                 RETRY_WORK_NAME,
-                ExistingWorkPolicy.APPEND_OR_REPLACE,
+                policy,
                 requests.first(),
             )
             for (request in requests.drop(1)) continuation = continuation.then(request)
@@ -190,8 +214,10 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         /**
          * Repair explicit-reprocess holds left by an older failed serial chain.
          * This performs a blocking WorkManager query and must run off the main
-         * thread. An unfinished chain already owns every pending marker; only a
-         * fully terminal or missing chain is safe to rebuild.
+         * thread. Tagged work identifies the markers a current chain actually
+         * owns. Alpha.6 work had no entry tags, so replace that ambiguous chain
+         * once with a complete snapshot instead of letting unrelated work keep
+         * orphan markers forever.
          */
         @Synchronized
         fun resumePendingForcedRetries(ctx: Context): Boolean {
@@ -208,9 +234,29 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                 Log.w("ProcessWorker", "Could not inspect explicit retry work", error)
                 return false
             }
-            if (retryWork.any { isUnfinishedProcessingWork(it.state) }) return false
+            val unfinished = retryWork.filter { isUnfinishedProcessingWork(it.state) }
+            val ownedIds = unfinished.flatMap { info ->
+                info.tags.mapNotNull { tag ->
+                    tag.removePrefix(RETRY_ENTRY_TAG_PREFIX)
+                        .takeIf { tag.startsWith(RETRY_ENTRY_TAG_PREFIX) && it.isNotEmpty() }
+                }
+            }
+            val hasUntaggedUnfinished = unfinished.any { info ->
+                info.tags.none { it.startsWith(RETRY_ENTRY_TAG_PREFIX) }
+            }
+            val recoveryIds = pendingForcedRetryRecoveryIds(
+                pendingIds,
+                ownedIds,
+                hasUntaggedUnfinished,
+            )
+            if (recoveryIds.isEmpty()) return false
 
-            enqueueForcedRetry(ctx, pendingIds)
+            enqueueForcedRetryChain(
+                ctx,
+                recoveryIds,
+                if (hasUntaggedUnfinished) ExistingWorkPolicy.REPLACE
+                else ExistingWorkPolicy.APPEND_OR_REPLACE,
+            )
             return true
         }
 
@@ -249,14 +295,21 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             currentCoroutineContext().ensureActive()
             val outcome = EntryOperationLocks.withLock(dir.name) {
                 val forced = forceReprocess && requestedId == dir.name
-                val directoryOutcome = if (!dir.isDirectory) DirectoryOutcome()
-                else if (!cleanupCommittedThumbnailDeletes(dir)) {
+                // A recovered replacement can wait behind the older blocking
+                // model call it was meant to repair. If that older worker
+                // completed and cleared the durable hold while we waited, this
+                // request no longer owns a retry and must not overwrite the
+                // successful result with a second forced extraction.
+                val forcedStillPending = !forced ||
+                    Entries.find(ctx, dir.name)?.reprocessPending() == true
+                val directoryOutcome = if (!dir.isDirectory || !forcedStillPending) {
+                    DirectoryOutcome()
+                } else if (!cleanupCommittedThumbnailDeletes(dir)) {
                     DirectoryOutcome(
                         retry = true,
                         lastError = "Waiting for interrupted photo deletion recovery",
                     )
-                }
-                else processDirectory(
+                } else processDirectory(
                     ctx,
                     dir,
                     mistral,
@@ -265,16 +318,18 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                     workerRetry = runAttemptCount > 0,
                     workAttempt = runAttemptCount,
                 )
-                if (forced &&
-                    (directoryOutcome.permanentError != null || directoryOutcome.retry) &&
-                    processingWorkDecision(
+                if (forced && processingWorkDecision(
                         directoryOutcome.retry,
                         forceReprocess = true,
                         runAttemptCount = runAttemptCount,
                     ) == ProcessingWorkDecision.COMPLETE_CHAIN
                 ) {
-                    val error = directoryOutcome.permanentError ?: directoryOutcome.lastError
+                    val error = if (
+                        directoryOutcome.permanentError != null || directoryOutcome.retry
+                    ) {
+                        directoryOutcome.permanentError ?: directoryOutcome.lastError
                         ?: "Processing did not complete after ${runAttemptCount + 1} attempts"
+                    } else null
                     Entries.find(ctx, dir.name)?.finishReprocess(error)
                 }
                 directoryOutcome
