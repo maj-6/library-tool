@@ -554,6 +554,19 @@ def test_excessively_nested_json_fails_closed(client, monkeypatch):
     )
 
 
+def test_json_depth_limit_is_independent_of_the_platform_decoder():
+    value = "capture-a"
+    for _ in range(server._CAPTURE_ARCHIVE_BACKFILL_MAX_JSON_DEPTH + 1):
+        value = [value]
+
+    assert server._capture_archive_backfill_json_too_deep(
+        {"capture_ids": value}
+    ) is True
+    assert server._capture_archive_backfill_json_too_deep(
+        {"capture_ids": ["capture-a"], "apply": True}
+    ) is False
+
+
 def test_packaged_transport_rejects_missing_capability_and_foreign_origin(
     client,
     monkeypatch,

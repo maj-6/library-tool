@@ -18139,6 +18139,7 @@ _CLOUDSYNC_EVENT_KEEP = 128
 _CAPTURE_ARCHIVE_BACKFILL_MAX_IDS = 64
 _CAPTURE_ARCHIVE_BACKFILL_MAX_REQUEST_BYTES = 16 * 1024
 _CAPTURE_ARCHIVE_BACKFILL_DIAGNOSTIC_LIMIT = 256
+_CAPTURE_ARCHIVE_BACKFILL_MAX_JSON_DEPTH = 32
 _capture_archive_backfill_lock = threading.Lock()
 _cloudsync = {
     "running": False,
@@ -25847,6 +25848,21 @@ def _cloud_sync_run(claimed_run_id: str = "") -> dict:
         return result
 
 
+def _capture_archive_backfill_json_too_deep(value) -> bool:
+    """Apply one platform-independent nesting limit after JSON decoding."""
+
+    pending = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > _CAPTURE_ARCHIVE_BACKFILL_MAX_JSON_DEPTH:
+            return True
+        if isinstance(current, dict):
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+    return False
+
+
 def _capture_archive_backfill_request() -> tuple[tuple[str, ...], bool]:
     """Read one bounded, explicit maintenance request from the desktop."""
 
@@ -25894,6 +25910,11 @@ def _capture_archive_backfill_request() -> tuple[tuple[str, ...], bool]:
             "capture archive backfill request is not valid JSON",
             code="invalid_capture_archive_backfill_request",
         ) from exc
+    if _capture_archive_backfill_json_too_deep(payload):
+        raise EngineValidationError(
+            "capture archive backfill request is nested too deeply",
+            code="invalid_capture_archive_backfill_request",
+        )
     if not isinstance(payload, dict) or set(payload) - {"capture_ids", "apply"}:
         raise EngineValidationError(
             "capture archive backfill request has unsupported fields",
