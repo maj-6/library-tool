@@ -23,13 +23,25 @@ class CorrectionsReleaseFixtureTest {
         val captureId = fixture.getString("capture_id")
         val markerFixture = fixture.getJSONObject("android_marker")
         val raw = fixture.getJSONObject("lib_confirmation")
+        val associationWire = raw.getJSONObject("association")
         val parsed = captureLibConfirmationFromJson(raw, captureId)
 
         assertNotNull("desktop LAN confirmation is Android-compatible", parsed)
         val confirmation = requireNotNull(parsed)
         assertEquals(raw.toString(), confirmation.toJson().toString())
         assertEquals(fixture.getString("book_id"), confirmation.association.bookId)
-        assertEquals(6_470L, confirmation.association.archiveBytes)
+        assertEquals(
+            associationWire.getLong("archive_bytes"),
+            confirmation.association.archiveBytes,
+        )
+        assertEquals(
+            associationWire.getString("archive_sha256"),
+            confirmation.association.archiveSha256,
+        )
+        assertEquals(
+            associationWire.getString("source_fingerprint"),
+            confirmation.association.sourceFingerprint,
+        )
         assertEquals(CaptureLibAssociationState.CURRENT, confirmation.association.state)
         assertTrue(confirmation.confirmed)
 

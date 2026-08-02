@@ -29,6 +29,14 @@ const fixturePath = path.join(
   "fixtures",
   "corrections_books_index_v2.json",
 );
+const correctionsTemplatePath = path.join(
+  __dirname,
+  "..",
+  "tools",
+  "whl_explorer",
+  "templates",
+  "corrections.html",
+);
 
 
 function fixture() {
@@ -193,6 +201,9 @@ function nextTurn() {
 
 
 async function keyboardSelect(feature, treeRoot, key) {
+  treeRoot.focus();
+  assert.equal(treeRoot.ownerDocument.activeElement, treeRoot,
+    "tree keyboard events require the production focus target");
   const rows = feature.navigableRows();
   const index = rows.findIndex((row) => row.key === key);
   assert.ok(index >= 0, `${key} must be keyboard reachable`);
@@ -213,6 +224,21 @@ async function keyboardSelect(feature, treeRoot, key) {
   await nextTurn();
   return feature.selectionSnapshot().selected;
 }
+
+
+test("production Corrections markup owns the pane names and live-region contract",
+  () => {
+    const template = fs.readFileSync(correctionsTemplatePath, "utf8");
+    assert.match(template,
+      /<nav\b[^>]*id="corrections-books"[^>]*aria-labelledby="books-heading"/);
+    assert.match(template, /<h2\b[^>]*id="books-heading">Books<\/h2>/);
+    assert.match(template,
+      /<aside\b[^>]*id="corrections-properties"[^>]*aria-labelledby="properties-heading"/);
+    assert.match(template, /<h2\b[^>]*id="properties-heading">Properties<\/h2>/);
+    assert.match(template, /<dl\b[^>]*data-properties-list/);
+    assert.match(template,
+      /<span\b[^>]*data-corrections-command-target[^>]*aria-live="polite"[^>]*aria-atomic="true"/);
+  });
 
 
 test("keyboard-only Corrections modules expose accessible Books, Artifacts, and Properties state",
@@ -447,6 +473,13 @@ test("keyboard-only Corrections modules expose accessible Books, Artifacts, and 
       "artifact:capture-cover",
     );
     assert.equal(selectedImage.objectType, "artifact");
+    const selectedImageRow = treeRoot.querySelectorAll("[data-tree-key]")
+      .find((row) => row.dataset.treeKey === "artifact:capture-cover");
+    assert.ok(selectedImageRow);
+    assert.equal(selectedImageRow.getAttribute("role"), "treeitem");
+    assert.equal(selectedImageRow.getAttribute("aria-selected"), "true");
+    assert.equal(treeRoot.getAttribute("aria-activedescendant"),
+      selectedImageRow.id);
     const titleShortcut = scope.emit("keydown", {
       key: "t",
       target: treeRoot,
@@ -469,6 +502,14 @@ test("keyboard-only Corrections modules expose accessible Books, Artifacts, and 
       "annotation:region-marginalia-1",
     );
     assert.equal(selectedRegion.objectType, "spatial-annotation");
+    const selectedRegionRow = treeRoot.querySelectorAll("[data-tree-key]")
+      .find((row) => row.dataset.treeKey ===
+        "annotation:region-marginalia-1");
+    assert.ok(selectedRegionRow);
+    assert.equal(selectedRegionRow.getAttribute("role"), "treeitem");
+    assert.equal(selectedRegionRow.getAttribute("aria-selected"), "true");
+    assert.equal(treeRoot.getAttribute("aria-activedescendant"),
+      selectedRegionRow.id);
     const marginaliaShortcut = scope.emit("keydown", {
       key: "m",
       target: treeRoot,

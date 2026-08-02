@@ -118,10 +118,7 @@
       "image_category": "title_page",
       "caption": "Reviewed botanical title page",
       "marginalia_role": "marginalia",
-      "illustration_role": "figure",
-      "brightness": 19,
-      "rerun_ocr": true,
-      "ocr_proposal_ref": "ocr-proposal-release-e2e"
+      "illustration_role": "figure"
     },
     "display_artifact": {
       "key": {
@@ -175,6 +172,61 @@
       },
       "provenance": {
         "origin": "capture"
+      }
+    },
+    "marginalia_region": {
+      "key": {
+        "item_id": "b-11111111111111111111111111111111",
+        "annotation_id": "margin-1"
+      },
+      "revision": "marginalia-r3",
+      "kind": "spatial-annotation",
+      "label": "Handwritten marginalia",
+      "freshness": "current",
+      "source": {
+        "representation_id": "capture",
+        "representation_revision": "capture-r2",
+        "canvas_id": "capture-page-1",
+        "canvas_revision": "display-bytes-r2"
+      },
+      "selector": {
+        "type": "polygon",
+        "coordinate_space": "canvas-normalized",
+        "coordinate_space_revision": "display-bytes-r2",
+        "points": [
+          { "x": 0.04, "y": 0.16 },
+          { "x": 0.28, "y": 0.16 },
+          { "x": 0.28, "y": 0.82 },
+          { "x": 0.04, "y": 0.82 }
+        ]
+      },
+      "linked_artifact_ids": ["release-display"],
+      "role_assignments": [
+        {
+          "origin": "manual",
+          "revision": "marginalia-role-human-r2",
+          "role": "marginalia"
+        },
+        {
+          "origin": "machine",
+          "revision": "marginalia-role-machine-r1",
+          "role": "text",
+          "confidence": 0.89
+        }
+      ],
+      "effective_role": "marginalia",
+      "caption_assertions": [
+        {
+          "origin": "machine",
+          "revision": "marginalia-caption-machine-r1",
+          "text": "Handwritten margin note",
+          "confidence": 0.89
+        }
+      ],
+      "provenance": {
+        "origin": "mistral",
+        "provider_id": "mistral",
+        "model": "mistral-ocr-latest"
       }
     },
     "illustration_region": {

@@ -26,12 +26,28 @@ const fixturePath = path.join(
 const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
 
 
-function keyEvent(key) {
-  return {
-    key,
-    prevented: false,
-    preventDefault() { this.prevented = true; },
-  };
+function nextTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+
+async function pressTreeKey(treeRoot, key) {
+  const event = treeRoot.emit("keydown", { key, target: treeRoot });
+  await nextTurn();
+  await nextTurn();
+  return event;
+}
+
+
+async function moveKeyboardTo(feature, treeRoot, key) {
+  const rows = feature.navigableRows();
+  const index = rows.findIndex((row) => row.key === key);
+  assert.ok(index >= 0, `${key} must be keyboard reachable`);
+  await pressTreeKey(treeRoot, "Home");
+  for (let offset = 0; offset < index; offset += 1) {
+    await pressTreeKey(treeRoot, "ArrowDown");
+  }
+  assert.equal(feature.activeKey, key);
 }
 
 
@@ -42,10 +58,18 @@ test("shared release fixture is keyboard navigable into accessible Properties st
     const propertiesRoot = new FakeNode("dl", documentRef);
     const corrections = fixture.corrections;
     const display = corrections.display_artifact;
+    const marginalia = corrections.marginalia_region;
     const illustration = corrections.illustration_region;
     const expected = corrections.expected;
+    assert.deepEqual(Object.keys(expected).sort(), [
+      "caption",
+      "illustration_role",
+      "image_category",
+      "marginalia_role",
+    ]);
     const byKey = new Map([
       [`artifact:${display.key.artifact_id}`, display],
+      [`annotation:${marginalia.key.annotation_id}`, marginalia],
       [`annotation:${illustration.key.annotation_id}`, illustration],
     ]);
     const feature = createArtifactsFeature({
@@ -56,7 +80,7 @@ test("shared release fixture is keyboard navigable into accessible Properties st
       catalog: {
         async list({ group }) {
           const items = group === "source-images" ? [display]
-            : group === "layout-regions" ? [illustration] : [];
+            : group === "layout-regions" ? [marginalia, illustration] : [];
           return { revision: `${group}-fixture-r1`, items, next_cursor: null };
         },
         async get({ key }) {
@@ -68,7 +92,7 @@ test("shared release fixture is keyboard navigable into accessible Properties st
           return { url: "/fixture/capture-display.jpg" };
         },
         async listRegions() {
-          return { items: [illustration], next_cursor: null };
+          return { items: [marginalia, illustration], next_cursor: null };
         },
       },
       commands: {
@@ -86,15 +110,12 @@ test("shared release fixture is keyboard navigable into accessible Properties st
     assert.equal(treeRoot.getAttribute("aria-label"),
       "Artifacts for selected book");
 
-    feature.activeKey = "group:source-images";
-    feature.render();
-    const enterImage = keyEvent("ArrowRight");
-    await feature.handleKeydown(enterImage);
-    assert.equal(enterImage.prevented, true);
+    await moveKeyboardTo(feature, treeRoot, "group:source-images");
+    const enterImage = await pressTreeKey(treeRoot, "ArrowRight");
+    assert.equal(enterImage.defaultPrevented, true);
     assert.equal(feature.activeKey, `artifact:${display.key.artifact_id}`);
-    const selectImage = keyEvent("Enter");
-    await feature.handleKeydown(selectImage);
-    assert.equal(selectImage.prevented, true);
+    const selectImage = await pressTreeKey(treeRoot, "Enter");
+    assert.equal(selectImage.defaultPrevented, true);
     assert.equal(feature.selectedKey, `artifact:${display.key.artifact_id}`);
     assert.ok(treeRoot.getAttribute("aria-activedescendant"));
     assert.equal(
@@ -116,16 +137,30 @@ test("shared release fixture is keyboard navigable into accessible Properties st
     assert.equal(labels[1].textContent, "Language");
     assert.equal(labels[1].htmlFor, language.id);
 
-    feature.activeKey = "group:layout-regions";
-    feature.render();
-    const enterRegions = keyEvent("ArrowRight");
-    await feature.handleKeydown(enterRegions);
-    assert.equal(enterRegions.prevented, true);
-    assert.equal(feature.activeKey,
+    await moveKeyboardTo(feature, treeRoot, "group:layout-regions");
+    const enterRegions = await pressTreeKey(treeRoot, "ArrowRight");
+    assert.equal(enterRegions.defaultPrevented, true);
+    assert.ok([
+      `annotation:${marginalia.key.annotation_id}`,
+      `annotation:${illustration.key.annotation_id}`,
+    ].includes(feature.activeKey),
+    "ArrowRight reaches the first keyboard-accessible region");
+
+    await moveKeyboardTo(feature, treeRoot,
+      `annotation:${marginalia.key.annotation_id}`);
+    const selectMarginalia = await pressTreeKey(treeRoot, "Enter");
+    assert.equal(selectMarginalia.defaultPrevented, true);
+    assert.equal(feature.selectedKey,
+      `annotation:${marginalia.key.annotation_id}`);
+    assert.match(propertiesRoot.textContent,
+      new RegExp(`Effective role${expected.marginalia_role}`));
+    assert.match(propertiesRoot.textContent,
+      new RegExp(`Human role override${expected.marginalia_role}`));
+
+    await moveKeyboardTo(feature, treeRoot,
       `annotation:${illustration.key.annotation_id}`);
-    const selectRegion = keyEvent(" ");
-    await feature.handleKeydown(selectRegion);
-    assert.equal(selectRegion.prevented, true);
+    const selectRegion = await pressTreeKey(treeRoot, " ");
+    assert.equal(selectRegion.defaultPrevented, true);
     assert.equal(feature.selectedKey,
       `annotation:${illustration.key.annotation_id}`);
     assert.match(propertiesRoot.textContent,
