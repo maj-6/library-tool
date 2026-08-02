@@ -71,6 +71,7 @@ downloads/cache/
 # the file itself says not to commit it). The gradle wrapper IS tracked, so a
 # fresh clone can still ./gradlew build.
 android/BookCapture/.gradle/
+android/BookCapture/.kotlin/
 android/BookCapture/build/
 android/BookCapture/app/build/
 android/BookCapture/local.properties
