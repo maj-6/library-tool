@@ -52,17 +52,17 @@ class CaptureSyncTest {
     }
 
     @Test
-    fun anExplicitSecondPressReplacesAStalledContinuation() {
+    fun anExplicitPressUsesThePhaseAwareEnqueuePolicy() {
         val upload = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
         val explicit = upload.substringAfter("internal fun enqueueExplicitSync")
             .substringBefore("internal fun captureSyncState")
 
-        assertTrue(explicit.contains("ExistingWorkPolicy.REPLACE"))
-        assertFalse(explicit.contains("ExistingWorkPolicy.KEEP"))
+        assertTrue(explicit.contains("captureSyncEnqueuePolicy(start)"))
+        assertFalse(explicit.contains("ExistingWorkPolicy.REPLACE"))
     }
 
     @Test
-    fun activeRequestIsIdempotentAndDoesNotAbsorbLaterCaptures() {
+    fun activeRequestIsReusedWhenItsOutstandingSetMatchesCurrentTargets() {
         val active = CaptureSyncRecord(
             requestId = "request-1",
             phase = CaptureSyncPhase.RUNNING,
@@ -73,13 +73,73 @@ class CaptureSyncTest {
 
         val start = beginCaptureSyncRecord(
             existing = active,
-            targetIds = listOf("book-a", "book-b", "book-later"),
+            targetIds = listOf("book-b", "book-b", "../escape"),
             newRequestId = "request-2",
+            transportMode = "lan",
+            lanHost = "new-host",
+            cloudOwner = "new-owner",
         )
 
         assertFalse(start.created)
         assertSame(active, start.record)
-        assertFalse("book-later" in start.record.targetIds)
+    }
+
+    @Test
+    fun expandedOutstandingSetReconcilesWithinTheActiveGeneration() {
+        val active = CaptureSyncRecord(
+            requestId = "request-1",
+            phase = CaptureSyncPhase.RETRYING,
+            targetIds = setOf("book-a", "book-b"),
+            syncedIds = setOf("book-a"),
+            blockedIds = emptySet(),
+            transportMode = "cloud",
+            cloudOwner = "old-owner",
+        )
+
+        val start = beginCaptureSyncRecord(
+            existing = active,
+            targetIds = listOf("book-b", "book-c"),
+            newRequestId = "request-2",
+            transportMode = "lan",
+            lanHost = "new-host",
+            cloudOwner = "new-owner",
+        )
+
+        assertFalse(start.created)
+        assertEquals("request-1", start.record.requestId)
+        assertEquals(setOf("book-a", "book-b", "book-c"), start.record.targetIds)
+        assertEquals(setOf("book-a"), start.record.syncedIds)
+        assertTrue(start.record.blockedIds.isEmpty())
+        assertEquals("cloud", start.record.transportMode)
+        assertEquals("", start.record.lanHost)
+        assertEquals("old-owner", start.record.cloudOwner)
+        assertEquals("cloud", start.record.resolvedTransport)
+    }
+
+    @Test
+    fun activeTargetsStayMonotonicSoInFlightMovesRemainAccountable() {
+        val active = CaptureSyncRecord(
+            requestId = "request-1",
+            phase = CaptureSyncPhase.WAITING_FOR_PROCESSING,
+            targetIds = setOf("book-a", "book-stale", "book-blocked"),
+            syncedIds = setOf("book-a"),
+            blockedIds = setOf("book-blocked"),
+        )
+
+        val start = beginCaptureSyncRecord(
+            existing = active,
+            targetIds = listOf("book-current"),
+            newRequestId = "request-2",
+        )
+
+        assertFalse(start.created)
+        assertEquals("request-1", start.record.requestId)
+        assertEquals(
+            setOf("book-a", "book-stale", "book-blocked", "book-current"),
+            start.record.targetIds,
+        )
+        assertEquals(setOf("book-a"), start.record.syncedIds)
+        assertEquals(setOf("book-blocked"), start.record.blockedIds)
     }
 
     @Test
@@ -134,9 +194,140 @@ class CaptureSyncTest {
         assertEquals(4, state.requestedCount)
         assertEquals(1, state.syncedCount)
         assertEquals(1, state.blockedCount)
-        assertEquals(2, state.remainingCount)
+        assertEquals(1, state.remainingCount)
         assertEquals(1, state.skippedCount)
         assertFalse(state.active)
+    }
+
+    @Test
+    fun blockedTargetsAreNotAlsoCountedAsPending() {
+        val state = aggregateCaptureSyncState(
+            record = CaptureSyncRecord(
+                requestId = "request-1",
+                phase = CaptureSyncPhase.RUNNING,
+                targetIds = setOf("synced", "blocked", "waiting"),
+                syncedIds = setOf("synced"),
+                blockedIds = setOf("blocked"),
+            ),
+            eligibleIds = setOf("blocked", "waiting"),
+            pendingIds = setOf("blocked", "waiting"),
+        )
+
+        assertEquals(1, state.syncedCount)
+        assertEquals(1, state.blockedCount)
+        assertEquals(1, state.remainingCount)
+        assertEquals(0, state.skippedCount)
+    }
+
+    @Test
+    fun terminalReceiptReconciliationCoversBlockedAndMissingTargets() {
+        val record = CaptureSyncRecord(
+            requestId = "request-1",
+            phase = CaptureSyncPhase.RUNNING,
+            targetIds = setOf("synced", "blocked", "pending", "missing"),
+            syncedIds = setOf("synced"),
+            blockedIds = setOf("blocked"),
+        )
+
+        assertEquals(
+            setOf("blocked", "missing"),
+            captureSyncTerminalReconciliationIds(record, pendingIds = setOf("pending")),
+        )
+    }
+
+    @Test
+    fun finishDecisionWaitsForDeferredOrRemainingWork() {
+        val complete = CaptureSyncState(
+            phase = CaptureSyncPhase.RUNNING,
+            eligibleCount = 0,
+            requestedCount = 2,
+            syncedCount = 2,
+            blockedCount = 0,
+            remainingCount = 0,
+            skippedCount = 0,
+        )
+        val remaining = complete.copy(syncedCount = 1, remainingCount = 1)
+
+        assertEquals(
+            CaptureSyncFinishDecision.WAIT,
+            captureSyncFinishDecision(complete, sawDeferred = true, hadError = false),
+        )
+        assertEquals(
+            CaptureSyncFinishDecision.WAIT,
+            captureSyncFinishDecision(remaining, sawDeferred = false, hadError = false),
+        )
+    }
+
+    @Test
+    fun finishDecisionCompletesOnlyFullyAccountedWork() {
+        val complete = CaptureSyncState(
+            phase = CaptureSyncPhase.RUNNING,
+            eligibleCount = 0,
+            requestedCount = 2,
+            syncedCount = 2,
+            blockedCount = 0,
+            remainingCount = 0,
+            skippedCount = 0,
+        )
+
+        assertEquals(
+            CaptureSyncFinishDecision.COMPLETE,
+            captureSyncFinishDecision(complete, sawDeferred = false, hadError = false),
+        )
+        for (state in listOf(
+            complete.copy(blockedCount = 1),
+            complete.copy(skippedCount = 1),
+            complete.copy(syncedCount = 1),
+        )) {
+            assertEquals(
+                CaptureSyncFinishDecision.COMPLETE_WITH_ERRORS,
+                captureSyncFinishDecision(state, sawDeferred = false, hadError = false),
+            )
+        }
+        assertEquals(
+            CaptureSyncFinishDecision.COMPLETE_WITH_ERRORS,
+            captureSyncFinishDecision(complete, sawDeferred = false, hadError = true),
+        )
+    }
+
+    @Test
+    fun terminalTransitionIsRejectedWhenASecondPressExpandedTheBatch() {
+        val expected = CaptureSyncRecord(
+            requestId = "request-1",
+            phase = CaptureSyncPhase.RUNNING,
+            targetIds = setOf("book-a"),
+            syncedIds = setOf("book-a"),
+            blockedIds = emptySet(),
+        )
+
+        assertEquals(
+            expected.copy(phase = CaptureSyncPhase.COMPLETE),
+            terminalCaptureSyncRecord(expected, expected, CaptureSyncPhase.COMPLETE),
+        )
+        assertEquals(
+            null,
+            terminalCaptureSyncRecord(
+                current = expected.copy(targetIds = setOf("book-a", "book-b")),
+                expected = expected,
+                phase = CaptureSyncPhase.COMPLETE,
+            ),
+        )
+    }
+
+    @Test
+    fun terminalRecordsRejectLateWorkerMutations() {
+        val active = CaptureSyncRecord(
+            requestId = "request-1",
+            phase = CaptureSyncPhase.RUNNING,
+            targetIds = setOf("book-a"),
+            syncedIds = emptySet(),
+            blockedIds = emptySet(),
+        )
+        val terminal = active.copy(phase = CaptureSyncPhase.COMPLETE)
+
+        assertEquals(active, activeCaptureSyncRecordForRequest(active, "request-1"))
+        assertEquals(null, activeCaptureSyncRecordForRequest(terminal, "request-1"))
+        assertEquals(null, activeCaptureSyncRecordForRequest(active, "request-2"))
     }
 
     @Test
@@ -268,5 +459,27 @@ class CaptureSyncTest {
             "sent-entry recovery must precede the next pending-queue lookup",
             pendingSelection > deliveredRecovery,
         )
+        val recovery = upload.substringAfter("private suspend fun recoverDeliveredAccounting(")
+            .substringBefore("private suspend fun finishUploadChain(")
+        assertTrue(recovery.contains("Entries.recent(ctx)"))
+        assertTrue(recovery.indexOf("EntryOperationLocks.withLock(targetId)") <
+            recovery.indexOf("Entries.find(ctx, targetId)"))
+        val finish = upload.substringAfter("private suspend fun finishUploadChain(")
+            .substringBefore("override suspend fun doWork(): Result")
+        assertTrue(finish.contains("captureSyncTerminalReconciliationIds("))
+        assertTrue(finish.contains("exactTargetIds = uncheckedTerminal"))
+        assertTrue(finish.contains("Prefs.completeCaptureSyncIfUnchanged("))
+        assertTrue(finish.contains("syncResultData(ctx, \"continuing\")"))
+    }
+
+    @Test
+    fun blockedAndSyncedTargetsAreNotSelectedAgainOnADeferredRound() {
+        val upload = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        val selection = upload.substringAfter("private fun nextPendingCapture(")
+            .substringBefore("private suspend fun setUploadProgress(")
+
+        assertTrue(selection.contains(
+            "record.targetIds - record.syncedIds - record.blockedIds",
+        ))
     }
 }

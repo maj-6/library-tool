@@ -125,6 +125,26 @@ internal fun captureUploadNeedsConnectedHandoff(
     scheduledForConnectedNetwork: Boolean,
 ): Boolean = resolvedTransport == "cloud" && !scheduledForConnectedNetwork
 
+internal const val MAX_CAPTURE_UPLOAD_RETRIES = 3
+
+/** A healthy live WorkSpec must never be canceled by a repeated button press.
+ * KEEP still recreates unique work whose prior chain is already terminal. */
+internal fun captureSyncEnqueuePolicy(start: CaptureSyncStart): ExistingWorkPolicy = when {
+    start.created -> ExistingWorkPolicy.REPLACE
+    start.record.phase == CaptureSyncPhase.WAITING_FOR_PROCESSING -> ExistingWorkPolicy.REPLACE
+    start.record.phase == CaptureSyncPhase.RETRYING -> ExistingWorkPolicy.REPLACE
+    else -> ExistingWorkPolicy.KEEP
+}
+
+internal fun shouldRetryCaptureUpload(runAttemptCount: Int): Boolean =
+    runAttemptCount < MAX_CAPTURE_UPLOAD_RETRIES
+
+internal fun captureUploadFailureMessage(entryId: String, error: Throwable): String {
+    val detail = error.message.orEmpty().replace(Regex("\\s+"), " ").trim().take(120)
+        .ifEmpty { error.javaClass.simpleName.ifEmpty { "unknown error" } }
+    return "Entry ${entryId.take(8).ifEmpty { "unknown" }} could not upload: $detail"
+}
+
 /** Validate the whole manifest photo set before starting any network writes.
  * Silently skipping one missing page would turn a partial upload into a
  * successful one, so one bad member keeps the entire entry recoverable. */
@@ -379,11 +399,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             if (start.record.targetIds.isNotEmpty()) {
                 WorkManager.getInstance(ctx).enqueueUniqueWork(
                     EXPLICIT_SYNC_WORK_NAME,
-                    // This path is an explicit button press. Replacing a
-                    // waiting/retrying continuation gives the user a real
-                    // recovery action while retaining the frozen request and
-                    // its durable synced/blocked accounting.
-                    ExistingWorkPolicy.REPLACE,
+                    captureSyncEnqueuePolicy(start),
                     request(ctx, start.record.requestId),
                 )
             }
@@ -478,28 +494,34 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             hadError: Boolean,
             deferredRound: Int,
             delayMs: Long = 0,
-        ): Boolean = try {
-            WorkManager.getInstance(ctx).enqueueUniqueWork(
-                EXPLICIT_SYNC_WORK_NAME,
-                ExistingWorkPolicy.APPEND_OR_REPLACE,
-                request(
-                    ctx,
-                    syncRequestId,
-                    cursor,
-                    sawDeferred,
-                    hadError,
-                    deferredRound,
-                    delayMs,
-                ),
-            ).result.get()
-            true
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw CancellationException("upload continuation interrupted").also {
-                it.initCause(e)
+        ): Boolean {
+            // A newer explicit press may supersede this worker while a blocking
+            // upload call is returning. Never append stale work behind the new
+            // generation's unique chain.
+            if (Prefs.activeCaptureSyncRecord(ctx)?.requestId != syncRequestId) return true
+            return try {
+                WorkManager.getInstance(ctx).enqueueUniqueWork(
+                    EXPLICIT_SYNC_WORK_NAME,
+                    ExistingWorkPolicy.APPEND_OR_REPLACE,
+                    request(
+                        ctx,
+                        syncRequestId,
+                        cursor,
+                        sawDeferred,
+                        hadError,
+                        deferredRound,
+                        delayMs,
+                    ),
+                ).result.get()
+                true
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw CancellationException("upload continuation interrupted").also {
+                    it.initCause(e)
+                }
+            } catch (_: Exception) {
+                false
             }
-        } catch (_: Exception) {
-            false
         }
 
         private fun pollRequest(delayMs: Long) = OneTimeWorkRequestBuilder<UploadWorker>()
@@ -561,7 +583,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         session: CaptureSession,
         cursor: UploadQueueKey?,
     ): PendingCapture? {
-        val targets = authorizedSyncRecord(applicationContext)?.targetIds.orEmpty()
+        val record = authorizedSyncRecord(applicationContext) ?: return null
+        val targets = record.targetIds - record.syncedIds - record.blockedIds
         val byKey = session.pendingUploads()
             .filter { it.name in targets }
             .associateBy(::queueKey)
@@ -596,13 +619,20 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
     private suspend fun recoverDeliveredAccounting(
         ctx: Context,
         record: CaptureSyncRecord,
+        exactTargetIds: Set<String>? = null,
     ): Boolean {
         var schedulingSucceeded = true
-        for (snapshot in Entries.recent(ctx)) {
-            if (!snapshot.uploaded || snapshot.id !in record.targetIds ||
-                snapshot.id in record.syncedIds) continue
-            EntryOperationLocks.withLock(snapshot.id) {
-                val entry = Entries.find(ctx, snapshot.id)
+        val unresolved = record.targetIds - record.syncedIds
+        val recoveryIds = exactTargetIds?.intersect(unresolved) ?: Entries.recent(ctx)
+            .asSequence()
+            .filter { it.uploaded && it.id in unresolved }
+            .map { it.id }
+            .toSet()
+        for (targetId in recoveryIds) {
+            EntryOperationLocks.withLock(targetId) {
+                // The sent snapshot is only a cheap prefilter. Resolve after
+                // taking the same lock used by delivery before accounting it.
+                val entry = Entries.find(ctx, targetId)
                     ?.takeIf { it.uploaded } ?: return@withLock
                 val receipt = try {
                     JSONObject(File(entry.dir, "manifest.json").readText())
@@ -632,13 +662,50 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
     }
 
     private suspend fun finishUploadChain(ctx: Context, syncRequestId: String): Result {
+        var finishRecord = Prefs.activeCaptureSyncRecord(ctx)?.takeIf {
+            it.requestId == syncRequestId
+        } ?: run {
+            return Result.success(workDataOf(UPLOAD_PROGRESS_STAGE to "superseded"))
+        }
+        val checkedSkipped = mutableSetOf<String>()
+        var pendingIds = CaptureSession(ctx).manualSyncCandidates().map { it.name }
+        var state = aggregateCaptureSyncState(finishRecord, pendingIds, pendingIds)
+        while (true) {
+            // A missing target may be between queue/ and sent/ in a replaced
+            // worker. Lock only those missing targets, not the whole backlog:
+            // OCR/model work holds the same per-entry lock for much longer.
+            val uncheckedTerminal = captureSyncTerminalReconciliationIds(
+                finishRecord,
+                pendingIds,
+            ) - checkedSkipped
+            if (uncheckedTerminal.isEmpty()) break
+            if (!recoverDeliveredAccounting(
+                    ctx,
+                    finishRecord,
+                    exactTargetIds = uncheckedTerminal,
+                )
+            ) {
+                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+                return Result.retry()
+            }
+            checkedSkipped += uncheckedTerminal
+            finishRecord = Prefs.activeCaptureSyncRecord(ctx)?.takeIf {
+                it.requestId == syncRequestId
+            } ?: return Result.success(
+                workDataOf(UPLOAD_PROGRESS_STAGE to "superseded"),
+            )
+            pendingIds = CaptureSession(ctx).manualSyncCandidates().map { it.name }
+            state = aggregateCaptureSyncState(finishRecord, pendingIds, pendingIds)
+        }
         val hadError = inputData.getBoolean(CHAIN_HAD_ERROR, false)
         val sawDeferred = inputData.getBoolean(CHAIN_SAW_DEFERRED, false)
-        if (sawDeferred) {
+        val decision = captureSyncFinishDecision(state, sawDeferred, hadError)
+        if (decision == CaptureSyncFinishDecision.WAIT) {
             Prefs.setCaptureSyncPhase(
                 ctx,
                 syncRequestId,
-                CaptureSyncPhase.WAITING_FOR_PROCESSING,
+                if (sawDeferred) CaptureSyncPhase.WAITING_FOR_PROCESSING
+                else CaptureSyncPhase.RETRYING,
             )
             val round = inputData.getInt(DEFERRED_ROUND, 0)
             val persisted = continueUploadChain(
@@ -655,18 +722,84 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 return Result.retry()
             }
         } else {
-            if (!hadError) Prefs.setLastUploadError(ctx, null)
+            val terminalPhase = if (
+                decision == CaptureSyncFinishDecision.COMPLETE_WITH_ERRORS
+            ) {
+                CaptureSyncPhase.COMPLETE_WITH_ERRORS
+            } else CaptureSyncPhase.COMPLETE
+            if (!Prefs.completeCaptureSyncIfUnchanged(ctx, finishRecord, terminalPhase)) {
+                // A second press expanded the same active request after the
+                // finish decision. Its KEEP enqueue may have found this worker
+                // unfinished, so this worker owns persisting the next round.
+                val stillActive = Prefs.activeCaptureSyncRecord(ctx)
+                    ?.takeIf { it.requestId == syncRequestId }
+                    ?: return Result.success(
+                        workDataOf(UPLOAD_PROGRESS_STAGE to "superseded"),
+                    )
+                val persisted = continueUploadChain(
+                    ctx = ctx,
+                    syncRequestId = stillActive.requestId,
+                    cursor = null,
+                    sawDeferred = false,
+                    hadError = hadError,
+                    deferredRound = inputData.getInt(DEFERRED_ROUND, 0),
+                )
+                if (!persisted) return Result.retry()
+                return Result.success(syncResultData(ctx, "continuing"))
+            }
+            if (decision == CaptureSyncFinishDecision.COMPLETE) {
+                Prefs.setLastUploadError(ctx, null)
+            }
             if (hasPendingImports(ctx)) scheduleImportPolling(ctx)
             Entries.pruneSent(ctx, ::retainSentEntryLocally)
-            Prefs.setCaptureSyncPhase(
-                ctx,
-                syncRequestId,
-                if (hadError) CaptureSyncPhase.COMPLETE_WITH_ERRORS
-                else CaptureSyncPhase.COMPLETE,
+        }
+        val stage = when {
+            decision == CaptureSyncFinishDecision.WAIT && sawDeferred -> "waiting-for-processing"
+            decision == CaptureSyncFinishDecision.WAIT -> "retrying"
+            decision == CaptureSyncFinishDecision.COMPLETE_WITH_ERRORS -> "complete-with-errors"
+            else -> "complete"
+        }
+        return Result.success(syncResultData(ctx, stage))
+    }
+
+    private suspend fun retryOrBlockCandidate(
+        ctx: Context,
+        syncRequestId: String,
+        candidate: PendingCapture,
+        error: String,
+    ): Result {
+        if (authorizedSyncRecord(ctx) == null) {
+            return Result.success(
+                workDataOf(
+                    UPLOAD_PROGRESS_STAGE to "superseded",
+                    UPLOAD_PROGRESS_ENTRY_ID to candidate.key.entryId,
+                ),
             )
         }
-        val stage = if (sawDeferred) "waiting-for-processing" else "complete"
-        return Result.success(syncResultData(ctx, stage))
+        Prefs.setLastUploadError(ctx, error)
+        if (shouldRetryCaptureUpload(runAttemptCount)) {
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+            setUploadProgress(candidate.key.entryId, "retrying")
+            return Result.retry()
+        }
+
+        val terminalError = "$error after ${runAttemptCount + 1} attempts"
+        Prefs.setLastUploadError(ctx, terminalError)
+        Prefs.markCaptureSyncBlocked(ctx, syncRequestId, candidate.key.entryId)
+        setUploadProgress(candidate.key.entryId, "blocked")
+        val persisted = continueUploadChain(
+            ctx = ctx,
+            syncRequestId = syncRequestId,
+            cursor = candidate.key,
+            sawDeferred = inputData.getBoolean(CHAIN_SAW_DEFERRED, false),
+            hadError = true,
+            deferredRound = inputData.getInt(DEFERRED_ROUND, 0),
+        )
+        if (!persisted) {
+            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+            return Result.retry()
+        }
+        return Result.success(syncResultData(ctx, "blocked", candidate.key.entryId))
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
@@ -748,12 +881,15 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             if (readyLan != null) {
                 return@withContext uploadOneViaLan(ctx, candidate, readyLan)
             }
-            run {
-                Prefs.setLastUploadError(ctx, "paired desktop could not be authenticated")
-                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
-                setUploadProgress(candidate.key.entryId, "retrying")
-                return@withContext Result.retry()
-            }
+            return@withContext retryOrBlockCandidate(
+                ctx,
+                syncRequestId,
+                candidate,
+                captureUploadFailureMessage(
+                    candidate.key.entryId,
+                    IOException("paired desktop could not be authenticated"),
+                ),
+            )
         }
 
         if (!Prefs.configured(ctx) || !Auth.signedIn(ctx)) {
@@ -840,19 +976,40 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             } catch (e: SupabaseClient.HttpException) {
                 if (permanent(e.code))
                     permanentError = permanentError ?: (e.message?.take(120) ?: "HTTP ${e.code}")
-                else transient = true
+                else {
+                    transient = true
+                    retryableError = retryableError ?:
+                        captureUploadFailureMessage(candidate.key.entryId, e)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 transient = true      // network et al: keep the folder; retry later
+                retryableError = retryableError ?:
+                    captureUploadFailureMessage(candidate.key.entryId, e)
             }
         }
 
+        if (authorizedSyncRecord(ctx) == null) {
+            if (delivered) scheduleImportPolling(ctx)
+            return@withContext Result.success(
+                workDataOf(
+                    UPLOAD_PROGRESS_STAGE to "superseded",
+                    UPLOAD_PROGRESS_ENTRY_ID to candidate.key.entryId,
+                ),
+            )
+        }
+
         if (transient) {
-            retryableError?.let { Prefs.setLastUploadError(ctx, it) }
-            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
-            setUploadProgress(candidate.key.entryId, "retrying")
-            return@withContext Result.retry()
+            val error = retryableError
+                ?: "Entry ${candidate.key.entryId.take(8)} could not upload"
+            Prefs.setLastUploadError(ctx, error)
+            if (shouldRetryCaptureUpload(runAttemptCount)) {
+                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+                setUploadProgress(candidate.key.entryId, "retrying")
+                return@withContext Result.retry()
+            }
+            permanentError = "$error after ${runAttemptCount + 1} attempts"
         }
 
         val hadError = inputData.getBoolean(CHAIN_HAD_ERROR, false) ||
@@ -1107,19 +1264,39 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             } catch (e: LanClient.HttpException) {
                 if (permanent(e.code))
                     permanentError = permanentError ?: (e.message?.take(120) ?: "HTTP ${e.code}")
-                else transient = true
+                else {
+                    transient = true
+                    retryableError = retryableError ?:
+                        captureUploadFailureMessage(candidate.key.entryId, e)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 transient = true                              // desktop unreachable: retry
+                retryableError = retryableError ?:
+                    captureUploadFailureMessage(candidate.key.entryId, e)
             }
         }
 
+        if (authorizedSyncRecord(ctx) == null) {
+            return Result.success(
+                workDataOf(
+                    UPLOAD_PROGRESS_STAGE to "superseded",
+                    UPLOAD_PROGRESS_ENTRY_ID to candidate.key.entryId,
+                ),
+            )
+        }
+
         if (transient) {
-            retryableError?.let { Prefs.setLastUploadError(ctx, it) }
-            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
-            setUploadProgress(candidate.key.entryId, "retrying")
-            return Result.retry()
+            val error = retryableError
+                ?: "Entry ${candidate.key.entryId.take(8)} could not upload"
+            Prefs.setLastUploadError(ctx, error)
+            if (shouldRetryCaptureUpload(runAttemptCount)) {
+                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+                setUploadProgress(candidate.key.entryId, "retrying")
+                return Result.retry()
+            }
+            permanentError = "$error after ${runAttemptCount + 1} attempts"
         }
 
         val hadError = inputData.getBoolean(CHAIN_HAD_ERROR, false) ||

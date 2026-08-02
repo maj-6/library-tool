@@ -637,7 +637,7 @@ class HomeActivity : AppCompatActivity() {
             val previous = syncFeedbackPhase
             syncFeedbackPhase = state.phase
             if (previous?.active == true && !state.active) {
-                val message = when (state.phase) {
+                val summary = when (state.phase) {
                     CaptureSyncPhase.COMPLETE -> RemoteUiCatalog.text(
                         this, R.string.home_sync_complete, state.syncedCount,
                     )
@@ -645,9 +645,13 @@ class HomeActivity : AppCompatActivity() {
                         this,
                         R.string.home_sync_partial,
                         state.syncedCount,
-                        state.blockedCount,
+                        state.blockedCount + state.skippedCount,
                     )
                     else -> RemoteUiCatalog.text(this, R.string.home_sync_failed)
+                }
+                val message = if (state.phase == CaptureSyncPhase.COMPLETE) summary else {
+                    Prefs.lastUploadError(this)?.takeIf { it.isNotBlank() }
+                        ?.let { "$summary\n$it" } ?: summary
                 }
                 Toast.makeText(this, message, Toast.LENGTH_LONG).show()
                 binding.syncCaptures.announceForAccessibility(message)
@@ -656,8 +660,9 @@ class HomeActivity : AppCompatActivity() {
             }
         }
         // A process death can leave durable accounting at RUNNING after its
-        // WorkSpec is terminal. Every non-queued active phase is therefore a
-        // safe, explicit restart target; delivery writes are idempotent.
+        // WorkSpec is terminal. A press is safe: unchanged RUNNING work uses
+        // KEEP, while a changed queue snapshot is reconciled under the same
+        // request identity before that work resumes.
         val canRetryActive = state.active && state.phase != CaptureSyncPhase.QUEUED
         val showRetryLabel = state.phase == CaptureSyncPhase.WAITING_FOR_PROCESSING ||
             state.phase == CaptureSyncPhase.RETRYING

@@ -3,6 +3,17 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.8 — 2026-08-02
+
+Android version code: `39`.
+
+### Bugfixes
+
+- Starting **Sync captures** now reconciles a saved active batch with every capture currently waiting, so stale **1/23** progress expands to the full queue while pressing Sync again leaves healthy work running.
+- A batch stays active while any selected capture is still waiting and reports completion only after every target is delivered or has an explained error.
+- A capture that repeatedly fails to upload is stopped after a bounded number of attempts and reported, allowing later captures in the same batch to continue.
+- Processing holds left behind without a live retry are rebuilt automatically, and successful processing clears its hold so a ready capture is no longer deferred indefinitely.
+
 ## 0.5.2-alpha.7 — 2026-08-02
 
 Android version code: `38`.

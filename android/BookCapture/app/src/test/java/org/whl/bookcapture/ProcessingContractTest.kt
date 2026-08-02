@@ -284,7 +284,7 @@ class ProcessingContractTest {
     }
 
     @Test
-    fun strandedForcedRetryRecoveryDoesNotDuplicateUnfinishedWork() {
+    fun strandedForcedRetryRecoveryRebuildsOnlyIncompleteOwnership() {
         for (state in listOf(
             WorkInfo.State.ENQUEUED,
             WorkInfo.State.RUNNING,
@@ -300,19 +300,60 @@ class ProcessingContractTest {
             assertFalse(isUnfinishedProcessingWork(state))
         }
 
+        assertEquals(
+            emptyList<String>(),
+            pendingForcedRetryRecoveryIds(
+                pendingIds = listOf("entry-a", "entry-b"),
+                unfinishedOwnedIds = listOf("entry-a", "entry-b"),
+                hasUntaggedUnfinishedWork = false,
+            ),
+        )
+        assertEquals(
+            listOf("entry-b"),
+            pendingForcedRetryRecoveryIds(
+                pendingIds = listOf("entry-b", "entry-a"),
+                unfinishedOwnedIds = listOf("entry-a"),
+                hasUntaggedUnfinishedWork = false,
+            ),
+        )
+        assertEquals(
+            listOf("entry-a", "entry-b"),
+            pendingForcedRetryRecoveryIds(
+                pendingIds = listOf("entry-a", "entry-b"),
+                unfinishedOwnedIds = emptyList(),
+                hasUntaggedUnfinishedWork = true,
+            ),
+        )
+
         val worker = source("ProcessWorker")
         assertTrue(worker.contains("@Synchronized\n        fun resumePendingForcedRetries"))
-        val scan = worker.indexOf("Entries.recent(ctx).asSequence()")
-        val marker = worker.indexOf(".filter { it.reprocessPending() }", scan)
-        val activeCheck = worker.indexOf(
-            "retryWork.any { isUnfinishedProcessingWork(it.state) }",
-            marker,
-        )
-        val enqueue = worker.indexOf("enqueueForcedRetry(ctx, pendingIds)", activeCheck)
+        assertTrue(worker.contains("addTag(retryEntryTag(entryId))"))
+        assertTrue(worker.contains("if (hasUntaggedUnfinished) ExistingWorkPolicy.REPLACE"))
+        assertTrue(worker.contains("else ExistingWorkPolicy.APPEND_OR_REPLACE"))
+    }
 
-        assertTrue(scan >= 0)
-        assertTrue(marker > scan)
-        assertTrue(activeCheck > marker)
-        assertTrue(enqueue > activeCheck)
+    @Test
+    fun everyTerminalForcedOutcomeClearsItsHoldMarker() {
+        val worker = source("ProcessWorker")
+        val terminal = worker.substringAfter("if (forced && processingWorkDecision(")
+            .substringBefore("Entries.find(ctx, dir.name)?.finishReprocess(error)")
+
+        assertTrue(terminal.contains("ProcessingWorkDecision.COMPLETE_CHAIN"))
+        assertTrue(worker.contains("} else null\n                    Entries.find(ctx, dir.name)?.finishReprocess(error)"))
+    }
+
+    @Test
+    fun recoveredForcedWorkRechecksItsDurableMarkerInsideTheEntryLock() {
+        val worker = source("ProcessWorker")
+        val lock = worker.indexOf("EntryOperationLocks.withLock(dir.name)")
+        val markerCheck = worker.indexOf(
+            "Entries.find(ctx, dir.name)?.reprocessPending() == true",
+            lock,
+        )
+        val processing = worker.indexOf("processDirectory(", markerCheck)
+
+        assertTrue(lock >= 0)
+        assertTrue(markerCheck > lock)
+        assertTrue(processing > markerCheck)
     }
 }
