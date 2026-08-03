@@ -49,9 +49,13 @@ class VoiceController(
         const val MODEL_URL =
             "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
         const val MODEL_DIR = "vosk-model-small-en-us-0.15"
+        /** The Vosk decoding grammar (see [buildRecognizer]). A phrase absent
+         * here can never be recognised no matter what the command policy says,
+         * so this list and COMMAND_PHRASES in StateAwareVoiceCommandPolicy must
+         * be kept in step; VoiceCommandVocabularyTest asserts exactly that. */
         val COMMANDS = listOf(
             "start", "photo", "check", "done", "cancel", "restart", "undo", "edit", "notes",
-            "end notes",
+            "end notes", "spine", "cover", "title", "title page",
         )
 
         /** Final recognition is required for actions that seal/delete work or

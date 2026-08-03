@@ -21,6 +21,25 @@ internal enum class PolicyVoiceCommand(val wireValue: String) {
     UNDO("undo"),
     NOTES("notes"),
     END_NOTES("end_notes"),
+
+    // Role-declaring captures. Each shoots exactly like PHOTO and additionally
+    // stamps the resulting asset with a manual role, which is the only way a
+    // role other than the classifier's guess ever gets recorded: the automatic
+    // spine test compares whole-frame dimensions against a 3:1 ratio that a 4:3
+    // camera cannot produce, so it has never once fired.
+    SPINE("spine"),
+    COVER("cover"),
+    TITLE("title"),
+    ;
+
+    /** The photo role this command declares, or null when it is not a capture. */
+    val declaredRole: PhotoRole?
+        get() = when (this) {
+            SPINE -> PhotoRole.SPINE
+            COVER -> PhotoRole.COVER
+            TITLE -> PhotoRole.TITLE_PAGE
+            else -> null
+        }
 }
 
 /**
@@ -56,15 +75,24 @@ internal object StateAwareVoiceCommandPolicy {
         PolicyVoiceCommand.RESTART,
         PolicyVoiceCommand.UNDO,
         PolicyVoiceCommand.NOTES,
+        PolicyVoiceCommand.SPINE,
+        PolicyVoiceCommand.COVER,
+        PolicyVoiceCommand.TITLE,
     )
     private val noteCommands = setOf(
         PolicyVoiceCommand.END_NOTES,
         PolicyVoiceCommand.RESTART,
         PolicyVoiceCommand.UNDO,
     )
+    // Shutter commands fire on a stable partial rather than waiting for the
+    // final result: the user is already holding the book still, and the extra
+    // recogniser latency is what makes hands-free capture feel broken.
     private val stablePartialCommands = setOf(
         PolicyVoiceCommand.START,
         PolicyVoiceCommand.PHOTO,
+        PolicyVoiceCommand.SPINE,
+        PolicyVoiceCommand.COVER,
+        PolicyVoiceCommand.TITLE,
     )
 
     fun evaluate(
@@ -152,6 +180,10 @@ private data class Candidate(val phrase: CommandPhrase, val match: MatchResult)
  * their actual source spans rather than relying on declaration order. */
 private val COMMAND_PHRASES = listOf(
     CommandPhrase(PolicyVoiceCommand.END_NOTES, "end notes"),
+    // "title page" must be listed as its own phrase, not left to the bare
+    // "title": both map to TITLE, and matching the longer span keeps the word
+    // "page" from being left behind for another phrase to pick up.
+    CommandPhrase(PolicyVoiceCommand.TITLE, "title page"),
     CommandPhrase(PolicyVoiceCommand.RESTART, "restart"),
     CommandPhrase(PolicyVoiceCommand.CANCEL, "cancel"),
     CommandPhrase(PolicyVoiceCommand.START, "start"),
@@ -160,6 +192,9 @@ private val COMMAND_PHRASES = listOf(
     CommandPhrase(PolicyVoiceCommand.DONE, "done"),
     CommandPhrase(PolicyVoiceCommand.UNDO, "undo"),
     CommandPhrase(PolicyVoiceCommand.NOTES, "notes"),
+    CommandPhrase(PolicyVoiceCommand.SPINE, "spine"),
+    CommandPhrase(PolicyVoiceCommand.COVER, "cover"),
+    CommandPhrase(PolicyVoiceCommand.TITLE, "title"),
 )
 
 private val TRAILING_COMMAND_DECORATION = Regex("^[\\s\\p{P}]*$")

@@ -574,8 +574,16 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         }
 
         val text = entry.ocrText()
-        if (text.isEmpty()) {
-            val message = "Extraction: OCR returned no text"
+        if (!Pipeline.hasReadableOcr(text)) {
+            // Non-empty but unreadable counts as no text: image placeholders and
+            // our own section headers are not evidence, and handing them to the
+            // model produces a fluent record with nothing behind it.
+            val message = if (text.isEmpty()) {
+                "Extraction: OCR returned no text"
+            } else {
+                "Extraction: OCR recovered no readable text " +
+                    "(${Pipeline.readableOcrChars(text)} usable characters)"
+            }
             failPendingCatalogCheck(dir, message)
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = false)
             entry.finishReprocess(message)

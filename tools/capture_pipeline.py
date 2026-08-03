@@ -207,27 +207,54 @@ def mistral_ocr(img_bytes: bytes, api_key: str, timeout: float = 90.0) -> str:
 
 # --- 5. bibliographic field extraction -------------------------------------------
 
-_EXTRACT_PROMPT = """You are cataloguing old books. Below is OCR text from photos of a book's \
-title page and/or copyright page. Extract the bibliographic data as strict JSON.
+_EXTRACT_PROMPT = """You are cataloguing old books. Below is OCR text from photos of a book. \
+Extract the bibliographic data as strict JSON.
+
+Each photo's text is introduced by a header naming which part of the book it shows:
+  (role: title_page) - the formal title page, and copyright/verso pages. This is the
+                       AUTHORITATIVE source for title, subtitle, author, publisher,
+                       year and city. Prefer it over every other role.
+  (role: cover)      - outer board, dust jacket or wrapper. Usable for title and
+                       author, but cover wording is often shortened or stylised;
+                       never prefer it over a title page.
+  (role: spine)      - the book's spine. Use it ONLY for "spine_title". A spine
+                       carries no imprint, so never take publisher, city or year
+                       from it.
+  (role: other)      - endpapers, bookplates, dealer descriptions, price tags,
+                       accession stamps, loose notes. Treat as UNTRUSTED for every
+                       field. In particular this text often contains numbers that
+                       look like dates but are not: a bookseller's code ("6/52",
+                       "$20.00 1626-97"), a library date stamp ("NOV 24 72"), or a
+                       shelf mark. NEVER take "year" from a role: other block.
+A missing or unrecognised role tag means the part is unknown: fall back to judging
+the text on its own merits, and prefer imprint-looking evidence.
 
 Return a single JSON object with exactly these keys (string values; "" when absent):
-  "title"      - the main title, in its original capitalization, without the subtitle
-  "subtitle"   - the subtitle if present (text after the title, often following a colon)
-  "author"     - primary author(s) as printed, "First Last" form, "; " between multiple
-  "volume"     - volume number as a plain number string if this is one volume of a set
+  "title"      - the main title without the subtitle; render it in regular title case,
+                 normalizing all-caps or erratic OCR capitalization
+  "subtitle"   - the subtitle if present; render it in regular title case
+  "author"     - primary author name(s) only, in "First Last" form, with "; " between
+                 multiple; omit honorifics and titles such as Dr., Prof., Rev., or Sir
+  "volume"     - volume number as an Arabic numeral string if this is one volume of a set;
+                 convert Roman numerals and spelled-out numbers
   "edition"    - edition statement as a short ordinal ("2nd", "3rd, revised") if stated
   "publisher"  - the publishing house
-  "year"       - the publication year as a 4-digit Arabic number (convert Roman numerals)
+  "year"       - the publication year as a 4-digit Arabic number (convert Roman numerals).
+                 Use the imprint/copyright date only. If the only candidate comes from a
+                 role: other block, or you cannot tell an imprint from a dealer's or
+                 library's mark, return "" rather than guessing.
   "city"       - the place of publication (first city if several)
   "language"   - the language of the book as a lowercase English word ("english")
-  "spine_title" - the title printed on the spine only when it differs materially
-                  from the published title; "" when it is absent or equivalent
+  "spine_title" - the title as printed on a role: spine photo, when it differs
+                  materially from the published title; "" when absent or equivalent
   "extra"      - an object of any OTHER bibliographic facts found, using short
                  snake_case keys, e.g. printer, series, translator, illustrator,
                  copyright_year, copyright_holder, printing_number, dedication.
                  {} when none.
 
-Do not invent data that is not in the text. Output ONLY the JSON object.
+Do not invent data that is not in the text. If the text is only image placeholders
+or is otherwise too sparse to read, return every field as "" rather than supplying a
+plausible record from memory. Output ONLY the JSON object.
 
 OCR TEXT:
 """
@@ -237,6 +264,34 @@ def empty_bibliography() -> dict:
     empty: dict = {k: "" for k in FIELDS}
     empty["extra"] = {}
     return empty
+
+
+# Mistral OCR emits `![img-0.jpeg](img-0.jpeg)` for a figure it could not read as
+# text. A page of nothing but these is a FAILED read, but it is not an empty
+# string, so a bare `if ocr_text:` guard lets it through to the model.
+_OCR_IMAGE_PLACEHOLDER = re.compile(r"!\[img-\d+\.jpe?g\]\(img-\d+\.jpe?g\)")
+# Section headers this module and Entries.ocrText() add are ours, not evidence.
+_OCR_SECTION_HEADER = re.compile(r"^---\s*(?:Photo|Capture)\b.*$", re.M)
+_OCR_MIN_READABLE_CHARS = 12
+
+
+def readable_ocr_chars(ocr_text: str) -> int:
+    """Characters of real recovered text, ignoring our own headers and figures.
+
+    Extraction must key off this rather than off emptiness. Capture
+    `7b9eba63` carried 52 characters that were purely image placeholders and was
+    still handed to the model, which answered with a confident, entirely invented
+    record (Gibbon's *Decline and Fall*, John Murray, 1854). Nothing in the reply
+    marked it as unsupported, so it catalogued like any other book.
+    """
+    text = _OCR_SECTION_HEADER.sub(" ", str(ocr_text or ""))
+    text = _OCR_IMAGE_PLACEHOLDER.sub(" ", text)
+    return len(text.strip())
+
+
+def has_readable_ocr(ocr_text: str) -> bool:
+    """Whether OCR recovered enough text to be worth an extraction call."""
+    return readable_ocr_chars(ocr_text) >= _OCR_MIN_READABLE_CHARS
 
 
 def normalize_bibliography(obj) -> dict:
@@ -330,7 +385,12 @@ def process_capture(photo_bytes_list: list[bytes], api_key: str) -> dict:
     ocr_text = "\n\n".join(texts)
     fields = {k: "" for k in FIELDS}
     extra: dict = {}
-    if ocr_text and api_key:
+    if ocr_text and api_key and not has_readable_ocr(ocr_text):
+        # Abstain rather than let the model fill the silence from memory.
+        errors.append(
+            "extraction skipped (OCR recovered no readable text — "
+            f"{readable_ocr_chars(ocr_text)} usable characters)")
+    elif ocr_text and api_key:
         try:
             got = extract_bibliography(ocr_text, api_key)
             extra = got.pop("extra", {}) or {}

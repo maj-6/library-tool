@@ -41,6 +41,28 @@ object Pipeline {
     val FIELDS = listOf("title", "subtitle", "author", "volume", "edition",
                         "publisher", "year", "city", "language", "spine_title")
 
+    // Mistral OCR emits `![img-0.jpeg](img-0.jpeg)` for a figure it could not read
+    // as text, and Entries.ocrText() adds its own `--- Capture N (role: x) ---`
+    // headers. Neither is evidence, but both make the string non-empty, so an
+    // `isEmpty()` guard passes a failed read straight to the extraction model.
+    private val OCR_IMAGE_PLACEHOLDER = Regex("""!\[img-\d+\.jpe?g]\(img-\d+\.jpe?g\)""")
+    private val OCR_SECTION_HEADER = Regex("""(?m)^---\s*(?:Photo|Capture)\b.*$""")
+    private const val OCR_MIN_READABLE_CHARS = 12
+
+    /** Characters of real recovered text, ignoring our headers and figure marks.
+     *
+     * Mirrors `readable_ocr_chars` in tools/capture_pipeline.py. Extraction keys
+     * off this rather than off emptiness: one live capture held 52 characters of
+     * pure image placeholders and the model answered with a confident, wholly
+     * invented record that then catalogued like any other book. */
+    fun readableOcrChars(ocrText: String): Int =
+        OCR_IMAGE_PLACEHOLDER.replace(OCR_SECTION_HEADER.replace(ocrText, " "), " ")
+            .trim().length
+
+    /** Whether OCR recovered enough text to be worth an extraction call. */
+    fun hasReadableOcr(ocrText: String): Boolean =
+        readableOcrChars(ocrText) >= OCR_MIN_READABLE_CHARS
+
     /** A 4xx from an API: retrying won't fix it (bad key, bad request). */
     class PermanentError(message: String) : IOException(message)
 
@@ -197,7 +219,26 @@ object Pipeline {
 
     // Verbatim from tools/capture_pipeline.py (_EXTRACT_PROMPT) — one prompt,
     // two runners, comparable output.
-    private const val EXTRACT_PROMPT = """You are cataloguing old books. Below is OCR text from photos of a book's title page and/or copyright page. Extract the bibliographic data as strict JSON.
+    private const val EXTRACT_PROMPT = """You are cataloguing old books. Below is OCR text from photos of a book. Extract the bibliographic data as strict JSON.
+
+Each photo's text is introduced by a header naming which part of the book it shows:
+  (role: title_page) - the formal title page, and copyright/verso pages. This is the
+                       AUTHORITATIVE source for title, subtitle, author, publisher,
+                       year and city. Prefer it over every other role.
+  (role: cover)      - outer board, dust jacket or wrapper. Usable for title and
+                       author, but cover wording is often shortened or stylised;
+                       never prefer it over a title page.
+  (role: spine)      - the book's spine. Use it ONLY for "spine_title". A spine
+                       carries no imprint, so never take publisher, city or year
+                       from it.
+  (role: other)      - endpapers, bookplates, dealer descriptions, price tags,
+                       accession stamps, loose notes. Treat as UNTRUSTED for every
+                       field. In particular this text often contains numbers that
+                       look like dates but are not: a bookseller's code ("6/52",
+                       "$20.00 1626-97"), a library date stamp ("NOV 24 72"), or a
+                       shelf mark. NEVER take "year" from a role: other block.
+A missing or unrecognised role tag means the part is unknown: fall back to judging
+the text on its own merits, and prefer imprint-looking evidence.
 
 Return a single JSON object with exactly these keys (string values; "" when absent):
   "title"      - the main title without the subtitle; render it in regular title case,
@@ -209,17 +250,22 @@ Return a single JSON object with exactly these keys (string values; "" when abse
                  convert Roman numerals and spelled-out numbers
   "edition"    - edition statement as a short ordinal ("2nd", "3rd, revised") if stated
   "publisher"  - the publishing house
-  "year"       - the publication year as a 4-digit Arabic number (convert Roman numerals)
+  "year"       - the publication year as a 4-digit Arabic number (convert Roman numerals).
+                 Use the imprint/copyright date only. If the only candidate comes from a
+                 role: other block, or you cannot tell an imprint from a dealer's or
+                 library's mark, return "" rather than guessing.
   "city"       - the place of publication (first city if several)
   "language"   - the language of the book as a lowercase English word ("english")
-  "spine_title" - the title printed on the spine only when it differs materially
-                  from the published title; "" when it is absent or equivalent
+  "spine_title" - the title as printed on a role: spine photo, when it differs
+                  materially from the published title; "" when absent or equivalent
   "extra"      - an object of any OTHER bibliographic facts found, using short
                  snake_case keys, e.g. printer, series, translator, illustrator,
                  copyright_year, copyright_holder, printing_number, dedication.
                  {} when none.
 
-Do not invent data that is not in the text. Output ONLY the JSON object.
+Do not invent data that is not in the text. If the text is only image placeholders
+or is otherwise too sparse to read, return every field as "" rather than supplying a
+plausible record from memory. Output ONLY the JSON object.
 
 OCR TEXT:
 """

@@ -153,6 +153,10 @@ class MainActivity : AppCompatActivity() {
         val acceptedAtNanos: Long,
         /** Durable request written before this shot is submitted to CameraX. */
         val catalogCheckRequestId: String?,
+        /** Role declared by the spoken command ("spine"/"cover"/"title"), applied
+         * once the asset exists. Null for a plain "photo", which leaves the
+         * automatic classifier's suggestion in place. */
+        val declaredRole: PhotoRole? = null,
         var startedAtNanos: Long? = null,
     )
 
@@ -1664,6 +1668,19 @@ class MainActivity : AppCompatActivity() {
                 if (!session.active) cues.error("no entry open")
                 else takePhoto()
             }
+            // Say the part instead of "photo" and the shot records what it is.
+            // Declaring the role at the shutter is the only reliable source for
+            // it: after the fact, neither OCR text nor the frame's dimensions
+            // can tell a spine from a half-title.
+            "spine", "cover", "title" -> {
+                val role = when (word) {
+                    "spine" -> PhotoRole.SPINE
+                    "cover" -> PhotoRole.COVER
+                    else -> PhotoRole.TITLE_PAGE
+                }
+                if (!session.active) cues.error("no entry open")
+                else takePhoto(declaredRole = role)
+            }
             "check" -> {
                 if (!session.active) cues.error("no entry open")
                 else takePhoto(checkCatalogs = true)
@@ -2004,14 +2021,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun takePhoto(checkCatalogs: Boolean = false) {
+    private fun takePhoto(
+        checkCatalogs: Boolean = false,
+        declaredRole: PhotoRole? = null,
+    ) {
         if (imageCapture == null) return cues.error("camera not ready")
         if (pendingCommand != null) return cues.error("capture is finishing")
         session.refreshPhotoCount()
 
         when (val acceptance = captureQueue.accept(session.photoCount + 1)) {
             is ShallowCaptureQueue.Acceptance.Started -> {
-                if (!reserveAcceptedShot(acceptance.ticket, checkCatalogs)) {
+                if (!reserveAcceptedShot(acceptance.ticket, checkCatalogs, declaredRole)) {
                     captureQueue.finishActive(success = false)
                     cues.error("could not reserve capture")
                     setStatus("Capture error: could not reserve a file")
@@ -2023,7 +2043,7 @@ class MainActivity : AppCompatActivity() {
                 submitCapture(acceptance.ticket)
             }
             is ShallowCaptureQueue.Acceptance.Queued -> {
-                if (!reserveAcceptedShot(acceptance.ticket, checkCatalogs)) {
+                if (!reserveAcceptedShot(acceptance.ticket, checkCatalogs, declaredRole)) {
                     captureQueue.cancelQueued()
                     cues.error("could not queue capture")
                     setStatus("Capture error: could not reserve a queued file")
@@ -2043,6 +2063,7 @@ class MainActivity : AppCompatActivity() {
     private fun reserveAcceptedShot(
         ticket: ShallowCaptureQueue.Ticket,
         checkCatalogs: Boolean,
+        declaredRole: PhotoRole? = null,
     ): Boolean {
         val reservation = session.reservePhoto(ticket.pageNumber) ?: return false
         val catalogCheckRequestId = if (checkCatalogs) {
@@ -2065,6 +2086,7 @@ class MainActivity : AppCompatActivity() {
             reservation = reservation,
             acceptedAtNanos = SystemClock.elapsedRealtimeNanos(),
             catalogCheckRequestId = catalogCheckRequestId,
+            declaredRole = declaredRole,
         )
         return true
     }
@@ -2159,6 +2181,25 @@ class MainActivity : AppCompatActivity() {
                 else IllegalStateException("could not finalize capture file")
             } catch (error: Exception) {
                 error
+            }
+            // A spoken role is the user's own statement about what they just
+            // photographed, so it is recorded as a manual override and the later
+            // bibliographic classifier leaves it alone. Best-effort: losing the
+            // label must never cost the photo, which is already safely committed.
+            if (commitError == null) {
+                shot.declaredRole?.let { role ->
+                    runCatching {
+                        val dir = checkNotNull(reservation.finalFile.parentFile)
+                        val asset = PhotoAssetStore.descriptor(dir, reservation.finalFile)
+                        if (asset != null) {
+                            PhotoAssetStore.setManualRole(dir, asset.assetId, role)
+                        }
+                    }.onFailure { error ->
+                        Log.w(CAMERA_LOG_TAG,
+                            "Could not stamp spoken role ${role.wireValue} on " +
+                                "page=${reservation.pageNumber}", error)
+                    }
+                }
             }
             val checkRequestId = shot.catalogCheckRequestId
             val checkRequestError =

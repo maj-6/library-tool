@@ -152,9 +152,24 @@ object Entries {
 
         fun thumbnailPhoto(): File? = thumbnailDescriptor()?.displayFile
 
+        /** OCR text for extraction, each block tagged with that photo's role.
+         *
+         * The role tag is not decoration: without it every photo's text arrives
+         * as one undifferentiated blob, so the extractor cannot tell an imprint
+         * from a spine label or from a bookseller's pencilled date — which is how
+         * a dealer's "6/52" stamp became a publication year. It is also the only
+         * way `spine_title` can ever be filled, since that field asks for text
+         * the model would otherwise have no way to locate. Keep the tag vocabulary
+         * identical to [PhotoRole.wireValue] and to `_EXTRACT_PROMPT` in
+         * tools/capture_pipeline.py, which documents what each tag means. */
         fun ocrText(): String = photos().mapIndexedNotNull { i, p ->
             val t = File(dir, p.name + ".txt").takeIf { it.isFile }?.readText()?.trim()
-            if (t.isNullOrEmpty()) null else "--- Capture ${i + 1} ---\n$t"
+            if (t.isNullOrEmpty()) {
+                null
+            } else {
+                val role = photoDescriptor(p)?.roleLabel ?: PhotoRole.OTHER.wireValue
+                "--- Capture ${i + 1} (role: $role) ---\n$t"
+            }
         }.joinToString("\n\n")
 
         /** Exact persisted book JSON for the diagnostics tab. Do not rebuild it
