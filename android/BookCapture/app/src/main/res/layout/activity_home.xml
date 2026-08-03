@@ -332,18 +332,21 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
-        <!-- the way into capture; the app no longer opens straight onto the camera -->
+        <!-- The way into capture; the app no longer opens straight onto the
+             camera. A sync progress label can wrap sooner than "New scan", so
+             both children use LinearLayout's uniform-height pass. -->
         <LinearLayout
             android:id="@+id/scanActions"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:baselineAligned="false"
             android:orientation="horizontal">
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/newScan"
                 style="@style/WhlButton"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="match_parent"
                 android:layout_weight="1"
                 android:layout_marginEnd="6dp"
                 android:fontFamily="@font/roboto_slab"
@@ -361,7 +364,7 @@
                 android:id="@+id/syncCaptures"
                 style="@style/WhlButton"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="match_parent"
                 android:layout_weight="1"
                 android:fontFamily="@font/roboto_slab"
                 android:gravity="center"

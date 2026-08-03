@@ -1572,15 +1572,15 @@ class HomeActivity : AppCompatActivity() {
                 val openBook = {
                     openEntryDetails(e.id)
                 }
-                val markAttention = {
-                    showEntryAttentionDialog(this, e.id) { refreshHome() }
+                val showActions = {
+                    showEntryActionDialog(this, e.id) { refreshHome() }
                 }
                 row.setOnClickListener { openBook() }
                 row.setOnLongClickListener {
-                    markAttention()
+                    showActions()
                     true
                 }
-                configureScanRowAccessibility(row, openBook, markAttention)
+                configureScanRowAccessibility(row, openBook, showActions)
                 RemoteUiCatalog.apply(row)
                 list.addView(row)
                 if (group.key == focusPageGroupKey && pageFocusTarget == null) {
@@ -1869,7 +1869,7 @@ class HomeActivity : AppCompatActivity() {
     private fun configureScanRowAccessibility(
         row: View,
         openBook: () -> Unit,
-        markAttention: () -> Unit,
+        showActions: () -> Unit,
     ) {
         val summaryIds = listOf(
             R.id.captureLibConfirmed,
@@ -1916,9 +1916,9 @@ class HomeActivity : AppCompatActivity() {
         ViewCompat.replaceAccessibilityAction(
             row,
             AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK,
-            getString(R.string.home_mark_needs_attention),
+            getString(R.string.home_book_actions),
         ) { _, _ ->
-            markAttention()
+            showActions()
             true
         }
     }
@@ -1932,8 +1932,8 @@ class HomeActivity : AppCompatActivity() {
      *
      * CH is the only interactive slot, and only while a match is unreviewed:
      * tap approves, long press rejects. Both return true so the gesture does
-     * not fall through to the row's own long-press, which marks the book as
-     * needing attention.
+     * not fall through to the row's own long-press, which opens its action
+     * chooser.
      */
     private fun bindCatalogIndicators(row: View, entry: Entries.Entry) {
         val state = ChMatchStore.read(entry.dir)
@@ -2096,13 +2096,28 @@ class HomeActivity : AppCompatActivity() {
                 ),
             ).filter(String::isNotBlank).joinToString(": ")
             copyrightView.setOnClickListener { showCopyrightRecords(copyright) }
+            val showActions = {
+                showEntryActionDialog(this, entry.id) { refreshHome() }
+            }
             copyrightView.setOnLongClickListener {
-                showEntryAttentionDialog(this, entry.id) { refreshHome() }
+                showActions()
+                true
+            }
+            ViewCompat.replaceAccessibilityAction(
+                copyrightView,
+                AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK,
+                getString(R.string.home_book_actions),
+            ) { _, _ ->
+                showActions()
                 true
             }
         } else {
             copyrightView.setOnClickListener(null)
             copyrightView.setOnLongClickListener(null)
+            ViewCompat.removeAccessibilityAction(
+                copyrightView,
+                AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK.id,
+            )
         }
 
         bindCatalogIndicators(row, entry)

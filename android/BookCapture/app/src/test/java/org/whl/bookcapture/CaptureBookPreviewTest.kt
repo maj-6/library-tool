@@ -239,20 +239,22 @@ class CaptureBookPreviewTest {
     }
 
     @Test
-    fun lastBookCardLongPressUsesTheSharedAttentionDialog() {
+    fun lastBookCardLongPressUsesTheSharedBookActionDialog() {
         val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
         val start = source.indexOf("private fun renderLastCapturedBook(")
         val end = source.indexOf("private fun showCaptureExtras", start)
         val render = source.substring(start, end)
 
-        assertTrue(render.contains("binding.lastBookPreview.setOnLongClickListener(attentionListener)"))
-        assertTrue(render.contains("binding.lastBookPrimary.setOnLongClickListener(attentionListener)"))
-        assertTrue(render.contains("binding.lastBookExtras.setOnLongClickListener(attentionListener)"))
+        assertTrue(render.contains("binding.lastBookPreview.setOnLongClickListener(actionListener)"))
+        assertTrue(render.contains("binding.lastBookPrimary.setOnLongClickListener(actionListener)"))
+        assertTrue(render.contains("binding.lastBookExtras.setOnLongClickListener(actionListener)"))
         assertTrue(render.contains("binding.lastBookAttention.apply"))
         assertTrue(render.contains("binding.lastBookPreview.setOnClickListener(openBook)"))
         assertTrue(render.contains("binding.lastBookPreview.isFocusable = false"))
-        assertTrue(render.contains("showEntryAttentionDialog(this, entry.id)"))
+        assertTrue(render.contains("showEntryActionDialog(this, entry.id)"))
         assertTrue(render.contains("refreshLastCapturedBook()"))
+        assertTrue(render.contains("ViewCompat.replaceAccessibilityAction("))
+        assertTrue(render.contains("R.string.home_book_actions"))
     }
 
     @Test

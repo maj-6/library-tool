@@ -370,7 +370,13 @@ object Entries {
     /** Explicitly opt in to the archive. Kept apart from [find] so no existing
      * caller can start operating on archived captures by accident. */
     fun findIncludingArchive(ctx: Context, id: String): Entry? =
-        find(ctx, id) ?: load(File(CaptureArchive.archiveRoot(ctx), id))
+        resolveExistingLocalEntry(
+            queueRoot(ctx),
+            sentRoot(ctx),
+            CaptureArchive.archiveRoot(ctx),
+            id,
+            ::load,
+        )
 
     /** Persist a phone review immediately and offline. Cloud work is
      * deliberately not enqueued here: only the explicit Sync action may push
@@ -395,16 +401,18 @@ object Entries {
         }
     }
 
-    /** Remove only this device's browsing/queue copy while excluding delivery
-     *  and processing for the same entry. The active in-memory capture must be
-     *  discarded from Camera, never out from under its CaptureSession. */
+    /** Remove this device's queue, sent, or archived copy while excluding
+     *  delivery, processing, and retention for the same entry. Following a
+     *  sent entry into archive matters when retention runs while a confirmation
+     *  dialog is open. The active in-memory capture must be discarded from
+     *  Camera, never out from under its CaptureSession. */
     suspend fun deleteLocalSafely(
         ctx: Context,
         entryId: String,
         allowUploaded: Boolean,
     ): DeleteResult = EntryOperationLocks.withLock(entryId) {
         if (Prefs.currentEntryId(ctx) == entryId) return@withLock DeleteResult.ACTIVE_CAPTURE
-        val entry = find(ctx, entryId) ?: return@withLock DeleteResult.MISSING
+        val entry = findIncludingArchive(ctx, entryId) ?: return@withLock DeleteResult.MISSING
         if (entry.uploaded && !allowUploaded) return@withLock DeleteResult.ALREADY_UPLOADED
         // A local-delete action clears media, not the physical book's place in
         // its box. Preserve the same photo-free summary used by automatic prune.
@@ -665,6 +673,20 @@ object Entries {
 internal val PHOTO_NAME = Regex("photo_\\d+\\.jpg")
 internal fun photoNumber(name: String): Int =
     name.removePrefix("photo_").removeSuffix(".jpg").toIntOrNull() ?: 0
+
+/** Resolve the same entry across its local lifecycle. In particular, a
+ * confirmation can outlive a sent -> archive retention move. */
+internal fun <T> resolveExistingLocalEntry(
+    queueRoot: File,
+    sentRoot: File,
+    archiveRoot: File,
+    entryId: String,
+    load: (File) -> T?,
+): T? = sequenceOf(queueRoot, sentRoot, archiveRoot)
+    .map { root -> File(root, entryId) }
+    .filter(File::isDirectory)
+    .mapNotNull(load)
+    .firstOrNull()
 
 /** Keep "already gone" distinct from an attempted deletion that left files
  * behind. Callers must not dismiss a book as deleted after a storage failure. */

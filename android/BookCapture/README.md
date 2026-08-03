@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.8` (version code 39) is the Android
+Library Tool Capture `0.5.2-alpha.9` (version code 40) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -22,7 +22,9 @@ carries the successful/complete state.
 Scan-row gestures are literal:
 
 - Tap a row to open its book details.
-- Long-press a row to mark or clear its needs-attention note.
+- Long-press a row to add or edit its remark, reprocess the capture, or delete
+  its local copy. Deleting a delivered capture from the phone preserves its
+  copy in Library Tool.
 
 Uploads are opt-in: **Sync captures** creates an explicit batch for ready
 captures and review-only changes. Background work resumes an already-authorized

@@ -120,7 +120,7 @@ class HomeListResourceTest {
     }
 
     @Test
-    fun homeToolbarContainsOnlyIconTabsAndScanRowsOpenOrMarkAttention() {
+    fun homeToolbarContainsOnlyIconTabsAndScanRowsExposeBookActions() {
         val home = xml("src/main/res/layout/activity_home.xml")
         assertFalse(hasElementWithId(home, "btnSelect"))
         assertFalse(hasElementWithId(home, "selectionBar"))
@@ -143,12 +143,16 @@ class HomeListResourceTest {
         assertTrue(source.contains("openEntryDetails(e.id)"))
         assertTrue(source.contains("row.setOnClickListener { openBook() }"))
         assertTrue(source.contains("row.setOnLongClickListener"))
-        assertTrue(source.contains("showEntryAttentionDialog(this, e.id)"))
-        assertTrue(source.contains("configureScanRowAccessibility(row, openBook, markAttention)"))
+        assertTrue(source.contains("showEntryActionDialog(this, e.id)"))
+        assertTrue(source.contains("configureScanRowAccessibility(row, openBook, showActions)"))
         assertTrue(source.contains("AccessibilityActionCompat.ACTION_LONG_CLICK"))
-        assertTrue(source.contains("R.string.home_mark_needs_attention"))
+        assertTrue(source.contains("R.string.home_book_actions"))
         assertTrue(source.contains("copyrightView.setOnLongClickListener"))
-        assertTrue(source.contains("showEntryAttentionDialog(this, entry.id)"))
+        assertTrue(source.contains("showEntryActionDialog(this, entry.id)"))
+        val copyrightBinding = source.substringAfter("private fun bindDesktopMetadata")
+            .substringBefore("private fun showCopyrightRecords")
+        assertTrue(copyrightBinding.contains("ViewCompat.replaceAccessibilityAction("))
+        assertTrue(copyrightBinding.contains("R.string.home_book_actions"))
         assertFalse(source.contains("sections.joinToString(\"\\n\\n\").take(24_000)"))
         assertTrue(source.contains("R.plurals.copyright_records_omitted"))
         assertFalse(source.contains("selectSingle(e.id)"))
@@ -184,6 +188,8 @@ class HomeListResourceTest {
         val strings = File("src/main/res/values/strings.xml").readText()
         assertTrue(strings.contains("<string name=\"app_name\">Library Tool Capture</string>"))
         assertTrue(strings.contains("<string name=\"home_new_scan\">New scan</string>"))
+        val scanActions = elementById(home, "scanActions")
+        assertEquals("false", scanActions.getAttributeNS(androidNs, "baselineAligned"))
         val newScan = elementById(home, "newScan")
         assertEquals("com.google.android.material.button.MaterialButton", newScan.tagName)
         assertEquals("@drawable/ic_camera_new", newScan.getAttributeNS(appNs, "icon"))
@@ -191,6 +197,8 @@ class HomeListResourceTest {
         val sync = elementById(home, "syncCaptures")
         assertEquals("com.google.android.material.button.MaterialButton", sync.tagName)
         assertEquals("@drawable/ic_sync_upload", sync.getAttributeNS(appNs, "icon"))
+        assertEquals("match_parent", newScan.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("match_parent", sync.getAttributeNS(androidNs, "layout_height"))
         assertTrue(source.contains("UploadWorker.enqueueExplicitSync(this)"))
         assertTrue(source.contains("ProcessWorker.resumePendingForcedRetries(this@HomeActivity)"))
         assertTrue(source.contains("CaptureMetadataSyncWorker.enqueueExplicitSync(this)"))
@@ -233,6 +241,44 @@ class HomeListResourceTest {
         assertTrue(metadataStyle.contains("android:layout_width\">48dp"))
         assertTrue(metadataStyle.contains("android:layout_height\">48dp"))
         assertTrue(metadataStyle.contains("android:padding\">14dp"))
+    }
+
+    @Test
+    fun bookActionDialogKeepsRemarkAndUsesSafeReprocessAndDeletePaths() {
+        val actions = source("EntryActionDialog")
+        val remark = actions.indexOf("REMARK(R.string.entry_action_remark)")
+        val reprocess = actions.indexOf("REPROCESS(R.string.entry_action_reprocess)")
+        val delete = actions.indexOf("DELETE(R.string.entry_action_delete)")
+        assertTrue(remark >= 0)
+        assertTrue(reprocess > remark)
+        assertTrue(delete > reprocess)
+        assertTrue(actions.contains("showEntryAttentionDialog(activity, entryId, onChanged)"))
+
+        val lock = actions.indexOf("EntryOperationLocks.withLock(entryId)")
+        val reread = actions.indexOf("Entries.find(activity, entryId)", lock)
+        val marker = actions.indexOf("current.requestReprocess()", reread)
+        assertTrue(lock >= 0)
+        assertTrue(reread > lock)
+        assertTrue(marker > reread)
+        assertTrue(actions.contains("ProcessWorker.enqueueForcedRetry(activity, listOf(entryId))"))
+        assertTrue(actions.contains("Prefs.currentEntryId(activity) == entryId || !current.sealed"))
+
+        val deleteConfirmation = actions.substringAfter("private fun showEntryDeleteConfirmation(")
+            .substringBefore("private fun deleteEntry(")
+        assertTrue(deleteConfirmation.contains("Entries.findIncludingArchive(activity, entryId)"))
+        assertTrue(actions.contains(
+            "Entries.deleteLocalSafely(activity, entryId, allowUploaded = true)",
+        ))
+        assertTrue(actions.contains("RemoteUiCatalog.apply(dialog)"))
+        for (result in listOf(
+            "DELETED", "ACTIVE_CAPTURE", "ALREADY_UPLOADED", "MISSING", "DELETE_FAILED",
+        )) assertTrue(actions.contains("Entries.DeleteResult.$result"))
+
+        val entries = source("Entries")
+        val safeDelete = entries.substringAfter("suspend fun deleteLocalSafely(")
+            .substringBefore("private fun load(")
+        assertTrue(safeDelete.contains("EntryOperationLocks.withLock(entryId)"))
+        assertTrue(safeDelete.contains("findIncludingArchive(ctx, entryId)"))
     }
 
     @Test

@@ -3,6 +3,18 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.9 — 2026-08-02
+
+Android version code: `40`.
+
+### Additions
+
+- Long-pressing a capture now opens a chooser for adding or editing its remark, reprocessing it, or deleting its local copy. Deleting a delivered capture from the phone preserves its copy in Library Tool.
+
+### Bugfixes
+
+- **New scan** and **Sync captures** now stay the same height when sync progress wraps onto another line, so the Sync button is no longer pushed down or clipped.
+
 ## 0.5.2-alpha.8 — 2026-08-02
 
 Android version code: `39`.
