@@ -303,12 +303,195 @@ def test_directory_child_set_must_remain_stable_during_projection(
 
     monkeypatch.setattr(capture_lib, "_read_regular", racing_read)
 
-    with pytest.raises(ValueError, match="directory changed"):
+    with pytest.raises(ValueError, match="changed while it was archived"):
         capture_lib.build_capture_archive_source(
             CAPTURE_ID,
             _entry(),
             directory,
         )
+
+
+def test_directory_snapshot_retries_one_settling_child_publication(
+    tmp_path,
+    monkeypatch,
+):
+    directory = tmp_path / "capture"
+    _write_pair(directory, _jpeg(), _jpeg(13, 9, "gray"))
+    scandir = capture_lib.os.scandir
+    calls = 0
+    directory_mtime = directory.stat().st_mtime_ns
+
+    def racing_scandir(path):
+        nonlocal calls
+        if path != directory:
+            return scandir(path)
+        calls += 1
+        if calls == 1:
+            (directory / "settled-sidecar.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            capture_lib.os.utime(
+                directory,
+                ns=(
+                    directory.stat().st_atime_ns,
+                    directory_mtime + 1_000_000_000,
+                ),
+            )
+        return scandir(path)
+
+    monkeypatch.setattr(capture_lib.os, "scandir", racing_scandir)
+
+    source = capture_lib.build_capture_archive_source(
+        CAPTURE_ID,
+        _entry(),
+        directory,
+    )
+
+    assert calls == 3
+    assert source.resources[
+        "representations/capture-original-1.jpg"
+    ] == _jpeg()
+    assert source.resources[
+        "representations/capture-display-1.jpg"
+    ] == _jpeg(13, 9, "gray")
+
+
+def test_directory_snapshot_rejects_continuous_generation_churn(
+    tmp_path,
+    monkeypatch,
+):
+    directory = tmp_path / "capture"
+    _write_pair(directory, _jpeg(), _jpeg(13, 9, "gray"))
+    scandir = capture_lib.os.scandir
+    calls = 0
+    directory_mtime = directory.stat().st_mtime_ns
+
+    def racing_scandir(path):
+        nonlocal calls
+        nonlocal directory_mtime
+        if path != directory:
+            return scandir(path)
+        calls += 1
+        (directory / f"sidecar-{calls}.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        directory_mtime += 1_000_000_000
+        capture_lib.os.utime(
+            directory,
+            ns=(directory.stat().st_atime_ns, directory_mtime),
+        )
+        return scandir(path)
+
+    monkeypatch.setattr(capture_lib.os, "scandir", racing_scandir)
+
+    with pytest.raises(ValueError, match="changed while it was listed"):
+        capture_lib.build_capture_archive_source(
+            CAPTURE_ID,
+            _entry(),
+            directory,
+        )
+
+    assert calls == capture_lib._CAPTURE_DIRECTORY_SNAPSHOT_ATTEMPTS
+
+
+def test_directory_snapshot_does_not_retry_authority_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    directory = tmp_path / "capture"
+    _write_pair(directory, _jpeg(), _jpeg(13, 9, "gray"))
+    replacement = tmp_path / "replacement"
+    _write_pair(replacement, _jpeg(), _jpeg(13, 9, "gray"))
+    displaced = tmp_path / "displaced"
+    scandir = capture_lib.os.scandir
+    calls = 0
+
+    def racing_scandir(path):
+        nonlocal calls
+        if path != directory:
+            return scandir(path)
+        calls += 1
+        if calls == 1:
+            directory.rename(displaced)
+            replacement.rename(directory)
+        return scandir(path)
+
+    monkeypatch.setattr(capture_lib.os, "scandir", racing_scandir)
+
+    with pytest.raises(ValueError, match="changed while it was listed"):
+        capture_lib.build_capture_archive_source(
+            CAPTURE_ID,
+            _entry(),
+            directory,
+        )
+
+    assert calls == 1
+
+
+def test_directory_snapshot_pins_authority_across_retry(
+    tmp_path,
+    monkeypatch,
+):
+    directory = tmp_path / "capture"
+    _write_pair(directory, _jpeg(), _jpeg(13, 9, "gray"))
+    replacement = tmp_path / "replacement"
+    _write_pair(replacement, _jpeg(color="blue"), _jpeg(13, 9, "green"))
+    displaced = tmp_path / "displaced"
+    scandir = capture_lib.os.scandir
+    snapshot_attempt = capture_lib._capture_directory_snapshot_attempt
+    scandir_calls = 0
+    attempt_calls = 0
+    directory_mtime = directory.stat().st_mtime_ns
+
+    def settling_scandir(path):
+        nonlocal scandir_calls
+        if path != directory:
+            return scandir(path)
+        scandir_calls += 1
+        if scandir_calls == 1:
+            (directory / "settled-sidecar.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            capture_lib.os.utime(
+                directory,
+                ns=(
+                    directory.stat().st_atime_ns,
+                    directory_mtime + 1_000_000_000,
+                ),
+            )
+        return scandir(path)
+
+    def replacing_attempt(path, *, expected_authority):
+        nonlocal attempt_calls
+        attempt_calls += 1
+        result = snapshot_attempt(
+            path,
+            expected_authority=expected_authority,
+        )
+        if attempt_calls == 1:
+            directory.rename(displaced)
+            replacement.rename(directory)
+        return result
+
+    monkeypatch.setattr(capture_lib.os, "scandir", settling_scandir)
+    monkeypatch.setattr(
+        capture_lib,
+        "_capture_directory_snapshot_attempt",
+        replacing_attempt,
+    )
+
+    with pytest.raises(ValueError, match="changed while it was listed"):
+        capture_lib.build_capture_archive_source(
+            CAPTURE_ID,
+            _entry(),
+            directory,
+        )
+
+    assert attempt_calls == 2
+    assert scandir_calls == 1
 
 
 @pytest.mark.parametrize(
