@@ -258,6 +258,83 @@ class UploadStateTest {
     }
 
     @Test
+    fun reprocessHoldCannotBlockPhotoDeliveryForever() {
+        val now = TimeUnit.DAYS.toMillis(20)
+
+        assertTrue(shouldWaitForReprocessBeforeUpload(now - 1, now))
+        assertTrue(shouldWaitForReprocessBeforeUpload(now + 1, now))
+        assertFalse(shouldWaitForReprocessBeforeUpload(0, now))
+        assertFalse(shouldWaitForReprocessBeforeUpload(
+            now + REPROCESS_UPLOAD_HOLD_MS,
+            now,
+        ))
+        assertFalse(shouldWaitForReprocessBeforeUpload(
+            now - REPROCESS_UPLOAD_HOLD_MS,
+            now,
+        ))
+        assertFalse(shouldWaitForReprocessBeforeUpload(
+            now - TimeUnit.DAYS.toMillis(2),
+            now,
+        ))
+    }
+
+    @Test
+    fun staleReprocessMarkerAllowsValidatedDeliveryInBothTransportPaths() = withEntry { dir ->
+        val now = TimeUnit.DAYS.toMillis(20)
+        val marker = File(dir, Entries.REPROCESS_PENDING).also { it.writeText("") }
+        assertTrue(marker.setLastModified(now - REPROCESS_UPLOAD_HOLD_MS - 1))
+        val photo = File(dir, "photo_1.jpg").also { jpeg(it) }
+
+        assertFalse(reprocessUploadHoldIsActive(dir, now))
+        val receipt = deliverValidatedCapture(
+            entryId = "entry-1",
+            deviceFolder = "phone",
+            photos = validateUploadPhotos(dir, listOf(photo.name)),
+            uploadPhoto = { _, _ -> Unit },
+            insertRecord = { Unit },
+        )
+        assertEquals(1, receipt.photoCount)
+        assertTrue("the processing hold must survive delivery", marker.isFile)
+
+        val source = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        assertEquals(1, Regex("reprocessUploadHoldIsActive\\(dir, now\\)").findAll(source).count())
+        assertEquals(1, Regex("reprocessUploadHoldIsActive\\(dir\\)").findAll(source).count())
+        assertFalse(source.contains("if (File(dir, Entries.REPROCESS_PENDING).isFile)"))
+    }
+
+    @Test
+    fun tokenRefreshFailureNeverPoisonsACapture() {
+        assertEquals(
+            CaptureTokenFailureAction.RETRY,
+            captureTokenFailureAction(true, "owner-1", "owner-1"),
+        )
+        assertEquals(
+            CaptureTokenFailureAction.WAIT_FOR_SIGN_IN,
+            captureTokenFailureAction(false, "", "owner-1"),
+        )
+        assertEquals(
+            CaptureTokenFailureAction.ACCOUNT_CHANGED,
+            captureTokenFailureAction(true, "owner-2", "owner-1"),
+        )
+
+        val source = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
+        val signedOut = source.substringAfter("catch (e: SupabaseClient.SignedOut)")
+            .substringBefore("catch (e: SupabaseClient.HttpException)")
+        assertTrue(signedOut.contains("CaptureTokenFailureAction.RETRY"))
+        assertTrue(signedOut.contains("Result.retry()"))
+        assertFalse(signedOut.contains("permanentError"))
+        assertFalse(signedOut.contains("markCaptureSyncBlocked"))
+
+        assertTrue(isCaptureSessionRejection(401))
+        assertFalse(isCaptureSessionRejection(403))
+        val rejected = source.substringAfter("catch (e: SupabaseClient.HttpException)")
+            .substringBefore("catch (e: CancellationException)")
+        assertTrue(rejected.contains("isCaptureSessionRejection(e.code)"))
+        assertTrue(rejected.contains("Prefs.expireAccessToken(ctx, uploadOwner)"))
+        assertTrue(rejected.contains("Result.retry()"))
+    }
+
+    @Test
     fun explicitPressKeepsLiveWorkAndRestartsAVisibleRecoveryState() {
         fun start(phase: CaptureSyncPhase, created: Boolean) = CaptureSyncStart(
             record = CaptureSyncRecord(

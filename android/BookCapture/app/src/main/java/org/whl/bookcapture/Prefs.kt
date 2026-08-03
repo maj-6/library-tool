@@ -609,6 +609,19 @@ object Prefs {
         )
     }
 
+    internal fun reopenCaptureSyncAfterCloudClaim(
+        ctx: Context,
+        currentOwner: String,
+        claimedIds: Collection<String>,
+    ): Boolean = synchronized(captureSyncLock) {
+        val reopened = reopenCaptureSyncAfterCloudClaim(
+            captureSyncRecordLocked(ctx),
+            currentOwner,
+            claimedIds,
+        ) ?: return@synchronized false
+        writeCaptureSyncRecordLocked(ctx, reopened)
+    }
+
     private fun captureSyncRecordLocked(ctx: Context): CaptureSyncRecord? {
         val prefs = sp(ctx)
         val requestId = prefs.getString(CAPTURE_SYNC_REQUEST_ID, "").orEmpty().trim()
@@ -663,6 +676,17 @@ object Prefs {
     fun accessToken(ctx: Context): String = str(ctx, "access_token")
     fun refreshToken(ctx: Context): String = str(ctx, "refresh_token")
     fun tokenExpiry(ctx: Context): Long = sp(ctx).getLong("token_expiry", 0L)
+
+    /** Force the next authenticated request to refresh a server-rejected JWT
+     * without discarding the durable refresh token or changing accounts. */
+    fun expireAccessToken(ctx: Context, expectedOwner: String): Boolean =
+        synchronized(profileLock) {
+            if (userId(ctx) != expectedOwner.trim() || expectedOwner.isBlank()) {
+                return@synchronized false
+            }
+            sp(ctx).edit().putLong("token_expiry", 0L).commit()
+        }
+
     fun userId(ctx: Context): String = str(ctx, "user_id")
     fun email(ctx: Context): String = str(ctx, "email")
     fun displayName(ctx: Context): String = if (userId(ctx).isNotEmpty()) {

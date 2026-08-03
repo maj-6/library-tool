@@ -22,6 +22,10 @@
     <string name="home_sync_live_capture_only">Finish the open capture before syncing</string>
     <string name="home_sync_review_queued">Review changes queued for sync</string>
     <string name="home_sync_sign_in">Sign in before syncing captures</string>
+    <string name="home_sync_claim_title">Claim %1$d local capture(s)?</string>
+    <string name="home_sync_claim_message">These %1$d captures were made without an account. Claiming will permanently associate them with %2$s so Cloud or Auto sync can upload them.</string>
+    <string name="home_sync_claim_confirm">Claim and sync</string>
+    <string name="home_sync_claim_partial">Claimed %1$d of %2$d local captures; the rest remain safely on this device.</string>
 
     <!-- The archive is what retention displaced out of the recent list. It is
          read-only: no worker enumerates it, so an edit made here would never

@@ -79,8 +79,8 @@ class ProcessingContractTest {
     @Test
     fun processingRecoversInterruptedThumbnailDeletesBeforeReadingPhotos() {
         val worker = source("ProcessWorker")
-        val lock = worker.indexOf("EntryOperationLocks.withLock(dir.name)")
-        val recovery = worker.indexOf("cleanupCommittedThumbnailDeletes(dir)", lock)
+        val lock = worker.indexOf("EntryOperationLocks.withLock(entryId)")
+        val recovery = worker.indexOf("cleanupCommittedThumbnailDeletes(currentDir)", lock)
         val processing = worker.indexOf("processDirectory(", recovery)
 
         assertTrue(lock >= 0)
@@ -336,24 +336,26 @@ class ProcessingContractTest {
     fun everyTerminalForcedOutcomeClearsItsHoldMarker() {
         val worker = source("ProcessWorker")
         val terminal = worker.substringAfter("if (forced && processingWorkDecision(")
-            .substringBefore("Entries.find(ctx, dir.name)?.finishReprocess(error)")
+            .substringBefore("Entries.find(ctx, entryId)?.finishReprocess(error)")
 
         assertTrue(terminal.contains("ProcessingWorkDecision.COMPLETE_CHAIN"))
-        assertTrue(worker.contains("} else null\n                    Entries.find(ctx, dir.name)?.finishReprocess(error)"))
+        assertTrue(worker.contains("} else null\n                    Entries.find(ctx, entryId)?.finishReprocess(error)"))
     }
 
     @Test
-    fun recoveredForcedWorkRechecksItsDurableMarkerInsideTheEntryLock() {
+    fun recoveredForcedWorkRechecksItsMovedDirectoryAndMarkerInsideTheEntryLock() {
         val worker = source("ProcessWorker")
-        val lock = worker.indexOf("EntryOperationLocks.withLock(dir.name)")
-        val markerCheck = worker.indexOf(
-            "Entries.find(ctx, dir.name)?.reprocessPending() == true",
-            lock,
-        )
+        val lock = worker.indexOf("EntryOperationLocks.withLock(entryId)")
+        val currentEntry = worker.indexOf("val currentEntry = Entries.find(ctx, entryId)", lock)
+        val currentDir = worker.indexOf("val currentDir = currentEntry?.dir", currentEntry)
+        val markerCheck = worker.indexOf("currentEntry?.reprocessPending() == true", currentDir)
         val processing = worker.indexOf("processDirectory(", markerCheck)
 
         assertTrue(lock >= 0)
+        assertTrue(currentEntry > lock)
+        assertTrue(currentDir > currentEntry)
         assertTrue(markerCheck > lock)
         assertTrue(processing > markerCheck)
+        assertTrue(worker.substring(processing, processing + 200).contains("currentDir"))
     }
 }

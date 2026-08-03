@@ -3,6 +3,20 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.10 — 2026-08-02
+
+Android version code: `41`.
+
+### Additions
+
+- Cloud and Auto sync now identify valid captures made without an account and ask before permanently associating them with the signed-in account. Captures owned by another account are never adopted, and canceling changes nothing.
+
+### Bugfixes
+
+- Sync no longer appears to start and then abort when local ownership checks, an interrupted token refresh, or a rejected access token occur before the first upload. The full batch remains recoverable and the button offers a visible retry.
+- A server-rejected access token is refreshed instead of marking the current capture permanently blocked, while a real sign-out waits for the user without discarding the queue.
+- Stale reprocessing markers can no longer hold photos on the phone indefinitely. If delivery moves a capture to sent history while reprocessing waits, reprocessing follows it there instead of clearing the request without doing the work.
+
 ## 0.5.2-alpha.9 — 2026-08-02
 
 Android version code: `40`.

@@ -101,8 +101,11 @@ internal fun deferredUploadRecheckDelayMs(round: Int): Long {
 internal class UploadEntryProblem(
     message: String,
     val retryable: Boolean = false,
+    val reason: UploadEntryProblemReason = UploadEntryProblemReason.OTHER,
     cause: Throwable? = null,
 ) : IOException(message, cause)
+
+internal enum class UploadEntryProblemReason { OTHER, NEEDS_CLOUD_CLAIM }
 
 internal data class ValidatedPhoto(val name: String, val file: File)
 
@@ -126,6 +129,53 @@ internal fun captureUploadNeedsConnectedHandoff(
 ): Boolean = resolvedTransport == "cloud" && !scheduledForConnectedNetwork
 
 internal const val MAX_CAPTURE_UPLOAD_RETRIES = 3
+
+/** Reprocessing may improve the metadata shipped with a capture, but it must
+ * never pin the photos in queue/ forever. A fresh explicit retry gets the same
+ * grace window as automatic processing; after that, delivery proceeds and the
+ * reprocess worker can safely finish against the retained sent/ copy. */
+internal const val REPROCESS_UPLOAD_HOLD_MS = 10 * 60 * 1000L
+
+internal fun shouldWaitForReprocessBeforeUpload(
+    markerLastModifiedMs: Long,
+    nowMs: Long,
+    holdMs: Long = REPROCESS_UPLOAD_HOLD_MS,
+): Boolean {
+    require(holdMs >= 0)
+    if (markerLastModifiedMs <= 0) return false
+    // A small clock rollback should not defeat a newly-created hold, but a
+    // corrupt/far-future timestamp must not recreate an indefinite pin.
+    if (markerLastModifiedMs >= nowMs) return markerLastModifiedMs - nowMs < holdMs
+    return nowMs - markerLastModifiedMs < holdMs
+}
+
+internal fun reprocessUploadHoldIsActive(
+    dir: File,
+    nowMs: Long = System.currentTimeMillis(),
+): Boolean {
+    val marker = File(dir, Entries.REPROCESS_PENDING)
+    return marker.isFile && shouldWaitForReprocessBeforeUpload(
+        marker.lastModified(),
+        nowMs,
+    )
+}
+
+internal enum class CaptureTokenFailureAction { RETRY, WAIT_FOR_SIGN_IN, ACCOUNT_CHANGED }
+
+/** accessToken() returns null for both a temporary refresh failure and a real
+ * sign-out. Preserve the batch in both cases; only an account switch is a
+ * terminal ownership mismatch. */
+internal fun captureTokenFailureAction(
+    signedIn: Boolean,
+    currentOwner: String,
+    expectedOwner: String,
+): CaptureTokenFailureAction = when {
+    !signedIn || currentOwner.isBlank() -> CaptureTokenFailureAction.WAIT_FOR_SIGN_IN
+    currentOwner.trim() == expectedOwner.trim() -> CaptureTokenFailureAction.RETRY
+    else -> CaptureTokenFailureAction.ACCOUNT_CHANGED
+}
+
+internal fun isCaptureSessionRejection(code: Int): Boolean = code == 401
 
 /** A healthy live WorkSpec must never be canceled by a repeated button press.
  * KEEP still recreates unique work whose prior chain is already terminal. */
@@ -373,7 +423,7 @@ internal fun deliverValidatedCapture(
 class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
     companion object {
-        private const val PROCESS_GRACE_MS = 10 * 60 * 1000L
+        private const val PROCESS_GRACE_MS = REPROCESS_UPLOAD_HOLD_MS
         const val EXPLICIT_SYNC_WORK_NAME = "capture-upload"
         private const val IMPORT_POLL_WORK = "capture-import-poll"
         private const val POLL_ONLY = "poll-only"
@@ -615,6 +665,30 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 UPLOAD_PROGRESS_REMAINING to state.remainingCount,
             )
         }
+
+    private suspend fun waitForSignIn(
+        ctx: Context,
+        syncRequestId: String,
+        entryId: String,
+    ): Result {
+        val message = "Sign in again to continue capture sync"
+        Prefs.setLastUploadError(ctx, message)
+        Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+        setUploadProgress(entryId, "waiting-for-sign-in")
+        return Result.success(syncResultData(ctx, "waiting-for-sign-in", entryId))
+    }
+
+    private suspend fun failForAccountChange(
+        ctx: Context,
+        syncRequestId: String,
+        entryId: String,
+    ): Result {
+        val message = "Capture sync belongs to a different account"
+        Prefs.setLastUploadError(ctx, message)
+        Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.FAILED)
+        setUploadProgress(entryId, "account-changed")
+        return Result.failure(syncResultData(ctx, "account-changed", entryId))
+    }
 
     private suspend fun recoverDeliveredAccounting(
         ctx: Context,
@@ -892,16 +966,21 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             )
         }
 
-        if (!Prefs.configured(ctx) || !Auth.signedIn(ctx)) {
-            Prefs.setLastUploadError(ctx, if (Auth.signedIn(ctx)) null else "signed out")
+        if (!Prefs.configured(ctx)) {
+            Prefs.setLastUploadError(ctx, "Capture sync is not configured")
             Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.FAILED)
             return@withContext Result.failure()
         }
+        if (!Auth.signedIn(ctx)) {
+            return@withContext waitForSignIn(ctx, syncRequestId, candidate.key.entryId)
+        }
         val uploadOwner = syncRecord.cloudOwner.ifEmpty { Prefs.userId(ctx) }
         if (uploadOwner != Prefs.userId(ctx)) {
-            Prefs.setLastUploadError(ctx, "capture sync belongs to a different account")
-            Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.FAILED)
-            return@withContext Result.failure()
+            return@withContext failForAccountChange(
+                ctx,
+                syncRequestId,
+                candidate.key.entryId,
+            )
         }
         val client = SupabaseClient(ctx, uploadOwner)
         var transient = false
@@ -909,14 +988,14 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         var permanentError: String? = null
         var retryableError: String? = null
         var delivered = false
-        val now = System.currentTimeMillis()
-
+        var ownershipClaimRejected = false
         candidate.dir.let { dir ->
             try {
                 EntryOperationLocks.withLock(dir.name) {
                     if (!dir.isDirectory) return@withLock
                     val entry = Entries.find(ctx, dir.name)
-                    if (File(dir, Entries.REPROCESS_PENDING).isFile) {
+                    val now = System.currentTimeMillis()
+                    if (reprocessUploadHoldIsActive(dir, now)) {
                         deferredForProcessing = true
                         return@withLock
                     }
@@ -928,7 +1007,9 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                     CloudUploadOwnership.ALLOWED -> Unit
                     CloudUploadOwnership.NEEDS_CLAIM -> throw UploadEntryProblem(
                         "This local book scan is not claimed by an account. " +
-                            "Open its details and choose Claim for cloud upload.")
+                            "Open its details and choose Claim for cloud upload.",
+                        reason = UploadEntryProblemReason.NEEDS_CLOUD_CLAIM,
+                    )
                     CloudUploadOwnership.DIFFERENT_ACCOUNT -> throw UploadEntryProblem(
                         "This book scan belongs to a different account and was kept on this phone.")
                 }
@@ -969,12 +1050,73 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                     transient = true
                     retryableError = retryableError ?: e.message
                 } else {
+                    ownershipClaimRejected =
+                        e.reason == UploadEntryProblemReason.NEEDS_CLOUD_CLAIM
                     permanentError = permanentError ?: e.message
                 }
             } catch (e: SupabaseClient.SignedOut) {
-                permanentError = permanentError ?: "signed out"
+                when (captureTokenFailureAction(
+                    Auth.signedIn(ctx),
+                    Prefs.userId(ctx),
+                    uploadOwner,
+                )) {
+                    CaptureTokenFailureAction.RETRY -> {
+                        val message = "Session refresh was interrupted; capture sync will retry"
+                        Prefs.setLastUploadError(ctx, message)
+                        Prefs.setCaptureSyncPhase(
+                            ctx,
+                            syncRequestId,
+                            CaptureSyncPhase.RETRYING,
+                        )
+                        setUploadProgress(candidate.key.entryId, "retrying-session")
+                        return@withContext Result.retry()
+                    }
+                    CaptureTokenFailureAction.WAIT_FOR_SIGN_IN ->
+                        return@withContext waitForSignIn(
+                            ctx,
+                            syncRequestId,
+                            candidate.key.entryId,
+                        )
+                    CaptureTokenFailureAction.ACCOUNT_CHANGED ->
+                        return@withContext failForAccountChange(
+                            ctx,
+                            syncRequestId,
+                            candidate.key.entryId,
+                        )
+                }
             } catch (e: SupabaseClient.HttpException) {
-                if (permanent(e.code))
+                if (isCaptureSessionRejection(e.code)) {
+                    when (captureTokenFailureAction(
+                        Auth.signedIn(ctx),
+                        Prefs.userId(ctx),
+                        uploadOwner,
+                    )) {
+                        CaptureTokenFailureAction.RETRY -> {
+                            Prefs.expireAccessToken(ctx, uploadOwner)
+                            val message = "Session was rejected; refreshing before retry"
+                            Prefs.setLastUploadError(ctx, message)
+                            Prefs.setCaptureSyncPhase(
+                                ctx,
+                                syncRequestId,
+                                CaptureSyncPhase.RETRYING,
+                            )
+                            setUploadProgress(candidate.key.entryId, "refreshing-session")
+                            return@withContext Result.retry()
+                        }
+                        CaptureTokenFailureAction.WAIT_FOR_SIGN_IN ->
+                            return@withContext waitForSignIn(
+                                ctx,
+                                syncRequestId,
+                                candidate.key.entryId,
+                            )
+                        CaptureTokenFailureAction.ACCOUNT_CHANGED ->
+                            return@withContext failForAccountChange(
+                                ctx,
+                                syncRequestId,
+                                candidate.key.entryId,
+                            )
+                    }
+                } else if (permanent(e.code))
                     permanentError = permanentError ?: (e.message?.take(120) ?: "HTTP ${e.code}")
                 else {
                     transient = true
@@ -1012,6 +1154,30 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             permanentError = "$error after ${runAttemptCount + 1} attempts"
         }
 
+        var ownershipBlockHandled = false
+        if (permanentError != null && ownershipClaimRejected) {
+            var claimedWhileWorkerWasRunning = false
+            EntryOperationLocks.withLock(candidate.key.entryId) {
+                claimedWhileWorkerWasRunning = cloudUploadOwnership(
+                    readCaptureCreator(ctx, candidate.dir),
+                    uploadOwner,
+                ) == CloudUploadOwnership.ALLOWED
+                if (!claimedWhileWorkerWasRunning) {
+                    Prefs.markCaptureSyncBlocked(
+                        ctx,
+                        syncRequestId,
+                        candidate.key.entryId,
+                    )
+                    ownershipBlockHandled = true
+                }
+            }
+            if (claimedWhileWorkerWasRunning) {
+                Prefs.setCaptureSyncPhase(ctx, syncRequestId, CaptureSyncPhase.RETRYING)
+                setUploadProgress(candidate.key.entryId, "retrying-claimed-capture")
+                return@withContext Result.retry()
+            }
+        }
+
         val hadError = inputData.getBoolean(CHAIN_HAD_ERROR, false) ||
             permanentError != null
         if (permanentError != null) Prefs.setLastUploadError(ctx, permanentError)
@@ -1024,7 +1190,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         }
         when {
             delivered -> Prefs.markCaptureSynced(ctx, syncRequestId, candidate.key.entryId)
-            permanentError != null ->
+            permanentError != null && !ownershipBlockHandled ->
                 Prefs.markCaptureSyncBlocked(ctx, syncRequestId, candidate.key.entryId)
             deferredForProcessing -> Prefs.setCaptureSyncPhase(
                 ctx,
@@ -1227,7 +1393,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             try {
                 EntryOperationLocks.withLock(dir.name) {
                     if (!dir.isDirectory) return@withLock
-                    if (File(dir, Entries.REPROCESS_PENDING).isFile) {
+                    if (reprocessUploadHoldIsActive(dir)) {
                         deferredForProcessing = true
                         return@withLock
                     }
