@@ -3,6 +3,20 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.11 — 2026-08-03
+
+Android version code: `42`.
+
+### Additions
+
+- Say **spine**, **cover** or **title** instead of "photo" to take the shot and record what it is in one step. Plain "photo" is unchanged. Previously nothing could record a spine at all: the automatic guess compared the whole frame against a 3:1 ratio that the 4:3 camera never produces, so of 1,928 photos taken to date not one was labelled a spine.
+- Extraction is now told which part of the book each photo shows, so a title page outranks a cover, and a spine is read only for the spine title.
+
+### Bugfixes
+
+- A book whose photos yielded no readable text no longer gets invented metadata. Pages that OCR could not read return image placeholders rather than an empty result, which counted as text and let the model answer from memory — one capture was catalogued as Gibbon's *Decline and Fall* on the strength of two unreadable photos.
+- Bookseller and library marks are no longer read as publication dates. A dealer's "6/52" pencilled on an endpaper had been taken as the year 1952.
+
 ## 0.5.2-alpha.10 — 2026-08-02
 
 Android version code: `41`.
