@@ -56,6 +56,7 @@ _MAX_PORTABLE_JSON_STRING = 1_000_000
 _MAX_PORTABLE_INTEGER = (1 << 53) - 1
 _MAX_BACKFILL_DIAGNOSTICS = 10_000
 _MAX_DIAGNOSTIC_TEXT = 240
+_CAPTURE_DIRECTORY_SNAPSHOT_ATTEMPTS = 2
 _NUMBERED_IMAGE_RE = re.compile(r"^(orig|photo)_([1-9][0-9]*)\.jpg$")
 _BOOK_ID_RE = re.compile(r"^b-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -116,6 +117,14 @@ class _CaptureDirectorySnapshot:
     children: tuple[tuple[str, tuple[int, ...]], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _CaptureDirectoryAuthority:
+    resolved: Path
+    resolved_parent: Path
+    parent: tuple[int, ...]
+    directory: tuple[int, ...]
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -170,8 +179,12 @@ def _is_redirecting_path(path: Path) -> bool:
     return False
 
 
-def _capture_directory_snapshot(directory: Path) -> _CaptureDirectorySnapshot:
-    """Capture one stable, non-redirecting flat directory generation."""
+def _capture_directory_snapshot_attempt(
+    directory: Path,
+    *,
+    expected_authority: _CaptureDirectoryAuthority | None,
+) -> tuple[_CaptureDirectorySnapshot | None, _CaptureDirectoryAuthority]:
+    """Capture one flat generation, or ``None`` if it changed mid-listing."""
 
     try:
         parent_before = directory.parent.lstat()
@@ -188,6 +201,14 @@ def _capture_directory_snapshot(directory: Path) -> _CaptureDirectorySnapshot:
         or _is_redirecting_path(directory)
     ):
         raise ValueError("the capture asset directory is redirecting or invalid")
+    authority = _CaptureDirectoryAuthority(
+        resolved=resolved,
+        resolved_parent=resolved_parent,
+        parent=_authority_stat_identity(parent_before),
+        directory=_authority_stat_identity(before),
+    )
+    if expected_authority is not None and authority != expected_authority:
+        raise ValueError("the capture asset directory changed while it was listed")
 
     children: list[tuple[str, tuple[int, ...]]] = []
     try:
@@ -205,21 +226,46 @@ def _capture_directory_snapshot(directory: Path) -> _CaptureDirectorySnapshot:
         raise ValueError("the capture asset directory is unavailable") from exc
     if (
         _authority_stat_identity(parent_after)
-        != _authority_stat_identity(parent_before)
+        != authority.parent
         or _is_redirecting_path(directory.parent)
-        or directory.parent.resolve(strict=True) != resolved_parent
-        or
-        _stable_stat_identity(after) != _stable_stat_identity(before)
+        or directory.parent.resolve(strict=True) != authority.resolved_parent
+        or _authority_stat_identity(after)
+        != authority.directory
         or _is_redirecting_path(directory)
-        or directory.resolve(strict=True) != resolved
+        or directory.resolve(strict=True) != authority.resolved
     ):
         raise ValueError("the capture asset directory changed while it was listed")
-    return _CaptureDirectorySnapshot(
-        resolved=resolved,
-        parent=_authority_stat_identity(parent_after),
-        directory=_stable_stat_identity(after),
-        children=tuple(sorted(children)),
+    if _stable_stat_identity(after) != _stable_stat_identity(before):
+        return None, authority
+    return (
+        _CaptureDirectorySnapshot(
+            resolved=authority.resolved,
+            parent=authority.parent,
+            directory=_stable_stat_identity(after),
+            children=tuple(sorted(children)),
+        ),
+        authority,
     )
+
+
+def _capture_directory_snapshot(directory: Path) -> _CaptureDirectorySnapshot:
+    """Capture one stable, non-redirecting flat directory generation.
+
+    A concurrent child publication or filesystem metadata update can overlap
+    one listing without making either settled generation incomplete. Retry the
+    whole listing once so the caller gets one generation. Authority changes,
+    redirects, unavailable paths, and continuous churn still fail closed.
+    """
+
+    authority: _CaptureDirectoryAuthority | None = None
+    for _attempt in range(_CAPTURE_DIRECTORY_SNAPSHOT_ATTEMPTS):
+        snapshot, authority = _capture_directory_snapshot_attempt(
+            directory,
+            expected_authority=authority,
+        )
+        if snapshot is not None:
+            return snapshot
+    raise ValueError("the capture asset directory changed while it was listed")
 
 
 def _validate_capture_directory_snapshot(
