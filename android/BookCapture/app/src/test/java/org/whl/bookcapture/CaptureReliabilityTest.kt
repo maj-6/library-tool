@@ -162,7 +162,11 @@ class CaptureReliabilityTest {
         assertTrue(source.contains("\"check\" ->"))
         assertTrue(source.contains("takePhoto(checkCatalogs = true)"))
         assertTrue(acceptedShot.contains("val catalogCheckRequestId: String?"))
-        assertTrue(source.contains("reserveAcceptedShot(acceptance.ticket, checkCatalogs)"))
+        // Match the leading arguments only. What matters is that the catalog-check
+        // flag is threaded from takePhoto into the reservation before the shutter
+        // fires; reserveAcceptedShot may carry further per-shot state after it
+        // (it also takes the role declared by a spoken "spine"/"cover"/"title").
+        assertTrue(source.contains("reserveAcceptedShot(acceptance.ticket, checkCatalogs"))
         assertTrue(reservation.contains("CatalogCheckStore.request("))
         assertTrue(reservation.contains("page = reservation.pageNumber"))
         assertTrue(source.indexOf("CatalogCheckStore.request(") <

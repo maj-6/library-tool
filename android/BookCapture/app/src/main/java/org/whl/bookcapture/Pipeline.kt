@@ -256,8 +256,9 @@ Return a single JSON object with exactly these keys (string values; "" when abse
                  library's mark, return "" rather than guessing.
   "city"       - the place of publication (first city if several)
   "language"   - the language of the book as a lowercase English word ("english")
-  "spine_title" - the title as printed on a role: spine photo, when it differs
-                  materially from the published title; "" when absent or equivalent
+  "spine_title" - the title as printed on a role: spine photo, and
+                  only when it differs materially from the published title;
+                  "" when it is absent or equivalent
   "extra"      - an object of any OTHER bibliographic facts found, using short
                  snake_case keys, e.g. printer, series, translator, illustrator,
                  copyright_year, copyright_holder, printing_number, dedication.
