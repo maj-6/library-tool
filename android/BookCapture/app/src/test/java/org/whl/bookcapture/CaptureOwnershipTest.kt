@@ -77,6 +77,37 @@ class CaptureOwnershipTest {
     }
 
     @Test
+    fun bulkClaimIncludesOnlyLocalCapturesAndNeedsConfirmation() {
+        val candidates = listOf(
+            "local-b" to CaptureCreator(Prefs.CREATOR_LOCAL, "install-id"),
+            "owned" to CaptureCreator(Prefs.CREATOR_ACCOUNT, "account-a"),
+            "other-account" to CaptureCreator(Prefs.CREATOR_ACCOUNT, "account-b"),
+            "local-a" to CaptureCreator(Prefs.CREATOR_LOCAL, "install-id"),
+        )
+
+        assertEquals(
+            listOf("local-a", "local-b"),
+            captureIdsNeedingCloudClaim(candidates, "account-a"),
+        )
+        val home = source("HomeActivity")
+        assertTrue(home.contains("showCloudClaimConfirmation(claimIds, owner)"))
+        assertTrue(home.contains("R.string.home_sync_claim_confirm"))
+        assertTrue(home.contains("expectedAccountId = owner"))
+        assertTrue(home.contains("transport != \"lan\" && Auth.signedIn(this)"))
+        assertTrue(home.contains("readClaimableCaptureCreator(this@HomeActivity, dir)"))
+        assertTrue(home.contains("withContext(Dispatchers.IO)"))
+        assertTrue(home.contains("session.recoverOrphans(snapshot.map { it.name }.toSet())"))
+        assertTrue(home.contains("finally {"))
+        assertTrue(home.contains("if (syncActionInFlight) return"))
+        assertTrue(home.contains("syncActionInFlight || state.active && !canRetryActive"))
+
+        val upload = source("UploadWorker")
+        assertTrue(upload.contains("UploadEntryProblemReason.NEEDS_CLOUD_CLAIM"))
+        assertTrue(upload.contains("retrying-claimed-capture"))
+        assertTrue(upload.contains("ownershipBlockHandled"))
+    }
+
+    @Test
     fun uploadAndClaimPathsEnforceTheOwnershipContract() {
         val upload = source("UploadWorker")
         val ownership = source("CaptureOwnership")

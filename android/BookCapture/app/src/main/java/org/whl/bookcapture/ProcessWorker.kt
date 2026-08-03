@@ -293,25 +293,33 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         }
         for (dir in dirs) {
             currentCoroutineContext().ensureActive()
-            val outcome = EntryOperationLocks.withLock(dir.name) {
-                val forced = forceReprocess && requestedId == dir.name
+            val entryId = dir.name
+            val outcome = EntryOperationLocks.withLock(entryId) {
+                // Upload may move queue/<id> to sent/<id> while this worker is
+                // waiting for the same lock. Resolve the durable entry only
+                // after acquiring it so forced reprocessing follows that move.
+                val currentEntry = Entries.find(ctx, entryId)
+                val currentDir = currentEntry?.dir
+                val forced = forceReprocess && requestedId == entryId
                 // A recovered replacement can wait behind the older blocking
                 // model call it was meant to repair. If that older worker
                 // completed and cleared the durable hold while we waited, this
                 // request no longer owns a retry and must not overwrite the
                 // successful result with a second forced extraction.
                 val forcedStillPending = !forced ||
-                    Entries.find(ctx, dir.name)?.reprocessPending() == true
-                val directoryOutcome = if (!dir.isDirectory || !forcedStillPending) {
+                    currentEntry?.reprocessPending() == true
+                val directoryOutcome = if (
+                    currentDir == null || !currentDir.isDirectory || !forcedStillPending
+                ) {
                     DirectoryOutcome()
-                } else if (!cleanupCommittedThumbnailDeletes(dir)) {
+                } else if (!cleanupCommittedThumbnailDeletes(currentDir)) {
                     DirectoryOutcome(
                         retry = true,
                         lastError = "Waiting for interrupted photo deletion recovery",
                     )
                 } else processDirectory(
                     ctx,
-                    dir,
+                    currentDir,
                     mistral,
                     deepseek,
                     forced = forced,
@@ -330,7 +338,7 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                         directoryOutcome.permanentError ?: directoryOutcome.lastError
                         ?: "Processing did not complete after ${runAttemptCount + 1} attempts"
                     } else null
-                    Entries.find(ctx, dir.name)?.finishReprocess(error)
+                    Entries.find(ctx, entryId)?.finishReprocess(error)
                 }
                 directoryOutcome
             }

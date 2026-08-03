@@ -221,7 +221,10 @@ class HomeListResourceTest {
         assertEquals("polite", sync.getAttributeNS(androidNs, "accessibilityLiveRegion"))
         assertTrue(source.contains("binding.syncCaptures.announceForAccessibility(message)"))
         assertTrue(source.contains("state.active && state.phase != CaptureSyncPhase.QUEUED"))
-        assertTrue(source.contains("binding.syncCaptures.isEnabled = !state.active || canRetryActive"))
+        assertTrue(source.contains(
+            "syncActionInFlight || state.active && !canRetryActive",
+        ))
+        assertTrue(source.contains("binding.syncCaptures.isEnabled = !syncControlDisabled"))
 
         val copyrightButton = elementById(scanRow, "copyrightStatus")
         assertEquals("@style/WhlMetadataIconButton", copyrightButton.getAttribute("style"))

@@ -150,6 +150,7 @@ class HomeActivity : AppCompatActivity() {
     private var scanPageOffset = 0
     private var syncFeedbackRequestId: String? = null
     private var syncFeedbackPhase: CaptureSyncPhase? = null
+    private var syncActionInFlight = false
 
     private val qrScanner = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -558,6 +559,8 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun syncCaptures() {
+        if (syncActionInFlight) return
+        val transport = Prefs.transport(this)
         val canSync = Prefs.transport(this) != "cloud" || Auth.signedIn(this)
         if (!canSync) {
             Toast.makeText(
@@ -567,6 +570,135 @@ class HomeActivity : AppCompatActivity() {
             ).show()
             return
         }
+
+        // Auto is cloud-capable whenever its LAN destination is unavailable.
+        // Ask before adopting local captures even if this particular run may
+        // select LAN; the user remains in control of the permanent association.
+        if (transport != "lan" && Auth.signedIn(this)) {
+            val owner = Prefs.userId(this)
+            syncActionInFlight = true
+            binding.syncCaptures.isEnabled = false
+            lifecycleScope.launch {
+                try {
+                    val claimIds = withContext(Dispatchers.IO) {
+                        val session = CaptureSession(this@HomeActivity)
+                        val snapshot = session.manualSyncCandidates()
+                        session.recoverOrphans(snapshot.map { it.name }.toSet())
+                        captureIdsNeedingCloudClaim(
+                            session.manualSyncCandidates().mapNotNull { dir ->
+                                readClaimableCaptureCreator(this@HomeActivity, dir)
+                                    ?.let { dir.name to it }
+                            },
+                            owner,
+                        )
+                    }
+                    if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
+                    if (!Auth.signedIn(this@HomeActivity) ||
+                        Prefs.userId(this@HomeActivity) != owner) {
+                        Toast.makeText(
+                            this@HomeActivity,
+                            RemoteUiCatalog.text(this@HomeActivity, R.string.home_sync_sign_in),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@launch
+                    }
+                    if (claimIds.isNotEmpty()) {
+                        showCloudClaimConfirmation(claimIds, owner)
+                    } else {
+                        startCaptureSync()
+                    }
+                } finally {
+                    syncActionInFlight = false
+                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                        refreshSyncButton()
+                    }
+                }
+            }
+            return
+        }
+        startCaptureSync()
+    }
+
+    private fun showCloudClaimConfirmation(entryIds: List<String>, owner: String) {
+        val accountLabel = Prefs.email(this).ifBlank { owner }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(getString(R.string.home_sync_claim_title, entryIds.size))
+            .setMessage(getString(
+                R.string.home_sync_claim_message,
+                entryIds.size,
+                accountLabel,
+            ))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.home_sync_claim_confirm) { _, _ ->
+                lifecycleScope.launch {
+                    if (syncActionInFlight) return@launch
+                    syncActionInFlight = true
+                    binding.syncCaptures.isEnabled = false
+                    try {
+                        val results = withContext(Dispatchers.IO) {
+                            val claimed = mutableListOf<Pair<String, ClaimCaptureResult>>()
+                            for (entryId in entryIds) {
+                                val result = claimCaptureForCloud(
+                                    this@HomeActivity,
+                                    entryId,
+                                    expectedAccountId = owner,
+                                )
+                                claimed += entryId to result
+                                if (result == ClaimCaptureResult.SIGNED_OUT ||
+                                    result == ClaimCaptureResult.DIFFERENT_ACCOUNT) break
+                            }
+                            claimed
+                        }
+                        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
+                        if (!Auth.signedIn(this@HomeActivity) ||
+                            Prefs.userId(this@HomeActivity) != owner) {
+                            Toast.makeText(
+                                this@HomeActivity,
+                                RemoteUiCatalog.text(
+                                    this@HomeActivity,
+                                    R.string.home_sync_sign_in,
+                                ),
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            return@launch
+                        }
+                        val successfulIds = results.mapNotNull { (entryId, result) ->
+                            entryId.takeIf {
+                                result == ClaimCaptureResult.CLAIMED ||
+                                    result == ClaimCaptureResult.ALREADY_OWNED
+                            }
+                        }
+                        Prefs.reopenCaptureSyncAfterCloudClaim(
+                            this@HomeActivity,
+                            owner,
+                            successfulIds,
+                        )
+                        if (successfulIds.size < entryIds.size) {
+                            Toast.makeText(
+                                this@HomeActivity,
+                                RemoteUiCatalog.text(
+                                    this@HomeActivity,
+                                    R.string.home_sync_claim_partial,
+                                    successfulIds.size,
+                                    entryIds.size,
+                                ),
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                        startCaptureSync()
+                    } finally {
+                        syncActionInFlight = false
+                        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                            refreshSyncButton()
+                        }
+                    }
+                }
+            }
+            .show()
+        RemoteUiCatalog.apply(dialog)
+    }
+
+    private fun startCaptureSync() {
         // Retry the alpha.5 marker repair on an explicit recovery press too;
         // the worker-side synchronized/live-work check makes this a no-op
         // while a valid processing chain is already running.
@@ -665,9 +797,12 @@ class HomeActivity : AppCompatActivity() {
         // request identity before that work resumes.
         val canRetryActive = state.active && state.phase != CaptureSyncPhase.QUEUED
         val showRetryLabel = state.phase == CaptureSyncPhase.WAITING_FOR_PROCESSING ||
-            state.phase == CaptureSyncPhase.RETRYING
-        binding.syncCaptures.isEnabled = !state.active || canRetryActive
-        binding.syncCaptures.alpha = if (state.active && !canRetryActive) .72f else 1f
+            state.phase == CaptureSyncPhase.RETRYING ||
+            state.phase == CaptureSyncPhase.COMPLETE_WITH_ERRORS ||
+            state.phase == CaptureSyncPhase.FAILED
+        val syncControlDisabled = syncActionInFlight || state.active && !canRetryActive
+        binding.syncCaptures.isEnabled = !syncControlDisabled
+        binding.syncCaptures.alpha = if (syncControlDisabled) .72f else 1f
         binding.syncCaptures.text = when {
             state.phase == CaptureSyncPhase.QUEUED ->
                 RemoteUiCatalog.text(this, R.string.home_sync_queued)

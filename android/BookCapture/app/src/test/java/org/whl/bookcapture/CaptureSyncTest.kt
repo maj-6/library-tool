@@ -165,6 +165,42 @@ class CaptureSyncTest {
     }
 
     @Test
+    fun claimingReopensOnlyTheMatchingCloudBatch() {
+        val active = CaptureSyncRecord(
+            requestId = "request-1",
+            phase = CaptureSyncPhase.RUNNING,
+            targetIds = setOf("book-a", "book-b", "book-c"),
+            syncedIds = emptySet(),
+            blockedIds = setOf("book-a", "book-b"),
+            transportMode = "auto",
+            cloudOwner = "owner-1",
+            resolvedTransport = "cloud",
+        )
+
+        val reopened = reopenCaptureSyncAfterCloudClaim(
+            active,
+            "owner-1",
+            listOf("book-a", "outside-batch"),
+        )
+
+        assertEquals(CaptureSyncPhase.RETRYING, reopened?.phase)
+        assertEquals(setOf("book-b"), reopened?.blockedIds)
+        assertEquals("request-1", reopened?.requestId)
+        assertEquals(
+            null,
+            reopenCaptureSyncAfterCloudClaim(active, "owner-2", listOf("book-a")),
+        )
+        assertEquals(
+            null,
+            reopenCaptureSyncAfterCloudClaim(
+                active.copy(transportMode = "lan", resolvedTransport = "lan"),
+                "owner-1",
+                listOf("book-a"),
+            ),
+        )
+    }
+
+    @Test
     fun emptyManualBatchCompletesWithoutStartingWork() {
         val start = beginCaptureSyncRecord(null, emptyList(), "request-empty")
 

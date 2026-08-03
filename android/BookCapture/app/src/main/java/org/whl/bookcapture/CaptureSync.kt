@@ -169,6 +169,28 @@ internal fun beginCaptureSyncRecord(
     )
 }
 
+/** A confirmation may complete while the old worker is still finishing its
+ * local ownership rejection. Keep that request identity for delivery-receipt
+ * recovery, but reopen every newly claimable target and replace its chain. */
+internal fun reopenCaptureSyncAfterCloudClaim(
+    record: CaptureSyncRecord?,
+    currentOwner: String,
+    claimedIds: Collection<String>,
+): CaptureSyncRecord? {
+    val current = record?.takeIf { it.phase.active } ?: return null
+    val owner = currentOwner.trim()
+    if (owner.isEmpty() || current.cloudOwner.isNotEmpty() && current.cloudOwner != owner) {
+        return null
+    }
+    if (current.transportMode == "lan" || current.resolvedTransport == "lan") return null
+    val claimed = normalizedCaptureSyncIds(claimedIds).intersect(current.targetIds)
+    if (claimed.isEmpty()) return null
+    return current.copy(
+        phase = CaptureSyncPhase.RETRYING,
+        blockedIds = current.blockedIds - claimed,
+    )
+}
+
 /** Why a sync request had nothing to send. "No captures ready to sync" is
  * true but unhelpful next to a list of rows reading "failed": those rows are
  * reporting this phone's OCR, and their photos are already delivered. Naming
