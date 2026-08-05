@@ -204,6 +204,28 @@ def _repository_files(root: Path) -> dict[str, bytes]:
     }
 
 
+def test_durable_presence_probe_never_invokes_live_loader_and_fails_closed(
+    tmp_path,
+):
+    root = tmp_path / "library"
+    repository = FilesystemCorrectionRepository(
+        RecoverableWriteSet(root),
+        load_aggregate=lambda _item_id: pytest.fail(
+            "presence inspection invoked the live aggregate loader"
+        ),
+    )
+    with repository.unit_of_work(operation_id="presence-absent") as unit:
+        assert unit.has_durable_aggregate("book-1") is False
+
+    path = _aggregate_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"{not-json")
+    with repository.unit_of_work(operation_id="presence-corrupt") as unit:
+        assert unit.has_durable_aggregate("book-1") is True
+        with pytest.raises(RepositoryError):
+            unit.get("book-1")
+
+
 def test_category_mutation_and_exact_replay_survive_repository_restart(tmp_path):
     root = tmp_path / "library"
     first_repository = _repository(root)

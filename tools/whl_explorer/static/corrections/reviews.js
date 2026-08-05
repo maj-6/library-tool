@@ -632,7 +632,17 @@
         });
       },
       setSelection(selection) {
-        store.setSelection(selection, { ownedByFeature: false });
+        const current = store.snapshot().selection;
+        // The shell echoes a Books-originated address back through this
+        // facade. Preserve feature ownership for that identical echo so it
+        // neither emits twice nor loses refresh invalidation semantics.
+        const same = current === null && selection === null ||
+          current !== null && selection !== null &&
+            deps.addressEqual(current, selection);
+        store.setSelection(
+          selection,
+          same ? {} : { ownedByFeature: false },
+        );
         if (typeof books.syncSelectionTarget === "function") {
           books.syncSelectionTarget(selection, {
             focused: false,

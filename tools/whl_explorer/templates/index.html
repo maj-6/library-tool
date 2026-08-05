@@ -169,6 +169,12 @@
         <button id="cloud-sync-btn" class="cad-btn tiny icon-btn" type="button"
                 data-icon="cloudsync" aria-label="Sync Cloud"
                 data-tip="Pull phone captures from the cloud now and push the catalog mirror (also runs automatically on the Settings interval)"></button>
+        <button id="cloud-sync-status-btn"
+                class="cad-btn tiny icon-btn cloud-sync-status-trigger"
+                type="button" data-icon="eye" hidden
+                aria-label="Show cloud sync status"
+                data-tip="Show cloud sync status"
+                aria-controls="cloud-sync-progress" aria-expanded="false"></button>
         <button id="sync-master-btn" class="cad-btn tiny" type="button"
                 data-tip="Sync the master list to Google Sheets">Sync Master List</button>
       </div>
@@ -181,7 +187,14 @@
             <span id="cloud-sync-stage" class="cloud-sync-stage" role="status"
                   aria-live="polite">Waiting</span>
           </div>
-          <span id="cloud-sync-timing" class="cloud-sync-timing"></span>
+          <div class="cloud-sync-head-actions">
+            <span id="cloud-sync-timing" class="cloud-sync-timing"></span>
+            <button id="cloud-sync-dismiss"
+                    class="cad-btn tiny icon-btn cloud-sync-dismiss" type="button"
+                    data-icon="close" aria-label="Hide cloud sync status"
+                    data-tip="Hide cloud sync status"
+                    aria-controls="cloud-sync-progress"></button>
+          </div>
         </div>
         <div class="cloud-sync-meter">
           <progress id="cloud-sync-meter" max="1" value="0"

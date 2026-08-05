@@ -181,6 +181,36 @@ test("visible controls and shortcuts invoke the same registered image command", 
 });
 
 
+test("navigation-only image hints cannot activate a category command", async () => {
+  const { calls, controller, documentRef, scope } = harness({ onError() {} });
+  controller.mount();
+  const button = new FakeNode("button", documentRef);
+  scope.append(button);
+  const binding = controller.bindControl(
+    CLASSIFICATION_COMMAND_IDS.titlePage,
+    button,
+  );
+
+  controller.setSelectionTarget(image({ revision: "index:abc123" }));
+  binding.refresh();
+  assert.equal(button.disabled, true);
+  button.emit("click");
+  await settled();
+  assert.equal(calls.length, 0);
+
+  controller.setSelectionTarget(image({ revision: "scan-r9" }));
+  binding.refresh();
+  assert.equal(button.disabled, false);
+  button.emit("click");
+  await settled();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1].expectedArtifactRevision, "scan-r9");
+
+  binding.destroy();
+  controller.destroy();
+});
+
+
 test("classification commands stay unavailable without a mutation port", () => {
   const documentRef = fakeDocument();
   documentRef.hasFocus = () => true;

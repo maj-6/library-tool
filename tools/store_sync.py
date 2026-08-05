@@ -766,7 +766,10 @@ def sync_entry_files(
     suppressed: set[str] = set()
     planning_allowed: dict[str, bool] = {}
 
-    local_inventory = local_entry_files(base)
+    # The remote inventory is also the bucket/credential preflight.  Do it
+    # before walking (and later hashing) a potentially very large local entry
+    # tree, so a stale bucket setting fails quickly and without needless disk
+    # work.
     remote_inventory = {}
     for key, meta in r2.list_objects_meta(
         r2cfg, prefix=ENTRIES_PREFIX
@@ -775,6 +778,7 @@ def sync_entry_files(
         if not rel or not _safe_rel(rel):
             continue
         remote_inventory[rel] = meta
+    local_inventory = local_entry_files(base)
 
     with _item_policy_scope(
         allow_item, item_policy_guard
@@ -825,6 +829,7 @@ def sync_entry_files(
                 ENTRIES_PREFIX + rel,
                 base / rel,
                 content_type=content_type_for(rel),
+                return_public_url=False,
             )
             pushed += 1
 

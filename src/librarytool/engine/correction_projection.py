@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -559,34 +559,65 @@ class CorrectionProjectionService(
         with self._repository.unit_of_work(operation_id=_QUERY_OPERATION_ID) as unit:
             aggregate = self._state(unit.get(item_id), item_id)
             values = tuple(self._raster_artifacts.list_raster_artifacts(item_id))
-        result = []
-        for value in values:
-            correction = aggregate.artifact(value.key.artifact_id)
-            if correction is None:
-                result.append(value)
-                continue
-            categories = tuple(
-                assignment
-                for assignment in correction.category_assignments
-                if assignment.origin is not AssignmentOrigin.INHERITED
+        return tuple(
+            self._overlay_raster(value, aggregate)
+            for value in values
+        )
+
+    @staticmethod
+    def _overlay_raster(
+        value: RasterArtifactView,
+        aggregate: CorrectionAggregateSnapshot,
+    ) -> RasterArtifactView:
+        correction = aggregate.artifact(value.key.artifact_id)
+        if correction is None:
+            return value
+        categories = tuple(
+            assignment
+            for assignment in correction.category_assignments
+            if assignment.origin is not AssignmentOrigin.INHERITED
+        )
+        inherited = _inherited_category(
+            aggregate,
+            value.key.artifact_id,
+        )
+        if inherited is not None:
+            categories = (*categories, inherited)
+        return replace(
+            value,
+            revision=correction.revision,
+            category_assignments=categories,
+            role_assignments=correction.role_assignments,
+            caption_assertions=correction.caption_assertions,
+            metadata_assertions=correction.metadata_assertions,
+        )
+
+    def list_capture_index_hints(
+        self,
+        item_id: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Expose authority-owned, navigation-only capture summaries.
+
+        Hints intentionally bypass correction overlay reconciliation. Hosts
+        must use them only when no durable correction aggregate exists and
+        must hydrate the real artifact before allowing a mutation.
+        """
+
+        hints = getattr(self._raster_artifacts, "list_capture_index_hints", None)
+        if not callable(hints):
+            return ()
+        values = hints(item_id)
+        if (
+            isinstance(values, (str, bytes))
+            or not isinstance(values, Sequence)
+            or any(not isinstance(value, Mapping) for value in values)
+        ):
+            raise RepositoryError(
+                "the capture index returned invalid navigation hints",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item_id},
             )
-            inherited = _inherited_category(
-                aggregate,
-                value.key.artifact_id,
-            )
-            if inherited is not None:
-                categories = (*categories, inherited)
-            result.append(
-                replace(
-                    value,
-                    revision=correction.revision,
-                    category_assignments=categories,
-                    role_assignments=correction.role_assignments,
-                    caption_assertions=correction.caption_assertions,
-                    metadata_assertions=correction.metadata_assertions,
-                )
-            )
-        return tuple(result)
+        return tuple(values)
 
     def get_raster_artifact(
         self,
@@ -594,14 +625,56 @@ class CorrectionProjectionService(
     ) -> RasterArtifactView | None:
         if not isinstance(key, RasterArtifactKey):
             raise TypeError("key must be RasterArtifactKey")
-        return next(
-            (
-                value
-                for value in self.list_raster_artifacts(key.item_id)
-                if value.key == key
-            ),
+        getter = getattr(self._raster_artifacts, "get_raster_artifact", None)
+        capture_getter = getattr(
+            self._raster_artifacts,
+            "get_capture_raster_artifact",
             None,
         )
+        with self._repository.unit_of_work(
+            operation_id=_QUERY_OPERATION_ID
+        ) as unit:
+            durable = getattr(unit, "has_durable_aggregate", None)
+            if callable(capture_getter) and callable(durable):
+                # Only an exact, lock-coherent absence permits the keyed live
+                # fast path. Recheck after projection so an unsanctioned
+                # external writer cannot silently bypass durable corrections.
+                if durable(key.item_id) is False:
+                    value = capture_getter(key)
+                    if value is not None and durable(key.item_id) is False:
+                        if value is not None and (
+                            not isinstance(value, RasterArtifactView)
+                            or value.key != key
+                        ):
+                            raise RepositoryError(
+                                "the raster artifact projector returned an invalid view",
+                                code="invalid_raster_artifact_projection",
+                                details=key.as_dict(),
+                            )
+                        return value
+            aggregate = self._state(unit.get(key.item_id), key.item_id)
+            if callable(getter):
+                value = getter(key)
+            else:
+                value = next(
+                    (
+                        candidate
+                        for candidate in self._raster_artifacts.list_raster_artifacts(
+                            key.item_id
+                        )
+                        if candidate.key == key
+                    ),
+                    None,
+                )
+        if value is None:
+            return None
+        if not isinstance(value, RasterArtifactView) or value.key != key:
+            raise RepositoryError(
+                "the raster artifact projector returned an invalid view",
+                code="invalid_raster_artifact_projection",
+                details=key.as_dict(),
+            )
+        return self._overlay_raster(value, aggregate)
 
     def get_correction_review(
         self,
@@ -706,6 +779,20 @@ class CorrectionProjectionService(
         if not callable(resolver):
             return None
         return resolver(item_id, resource)
+
+    def resolve_capture_preview(
+        self,
+        item_id: str,
+        artifact_id: str,
+    ) -> Any:
+        resolver = getattr(
+            self._raster_artifacts,
+            "resolve_capture_preview",
+            None,
+        )
+        if not callable(resolver):
+            return None
+        return resolver(item_id, artifact_id)
 
 
 __all__ = [

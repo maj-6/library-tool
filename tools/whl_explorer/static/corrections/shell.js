@@ -357,6 +357,14 @@
       ? `annotation:${id}` : `artifact:${id}`;
   }
 
+  function navigationOnlyTarget(value) {
+    if (!value || typeof value !== "object") return false;
+    const revision = value.revision || value.artifactRevision ||
+      value.artifact_revision || value.annotationRevision ||
+      value.annotation_revision || "";
+    return String(revision).startsWith("index:");
+  }
+
   function nextTrayTab(current, key) {
     const currentIndex = TRAY_TABS.indexOf(current);
     if (currentIndex < 0) return null;
@@ -755,6 +763,35 @@
       ].find((target) => targetKey(target) === key) || null;
     }
 
+    publishClassificationSelectionTarget(target, detail = {}) {
+      const controller = this.classificationController;
+      if (!controller ||
+          typeof controller.setSelectionTarget !== "function") return null;
+      if (!target && detail.address &&
+          typeof controller.stateSnapshot === "function") {
+        const current = controller.stateSnapshot().selectionTarget;
+        const address = detail.address;
+        const currentItemId = current &&
+          (current.itemId || current.item_id || "");
+        const addressItemId = address.itemId || address.item_id || "";
+        const addressArtifactId = address.artifactId || address.artifact_id || "";
+        const addressAnnotationId = address.annotationId ||
+          address.annotation_id || "";
+        const addressKey = addressAnnotationId
+          ? `annotation:${addressAnnotationId}`
+          : addressArtifactId ? `artifact:${addressArtifactId}` : "";
+        if (current && !navigationOnlyTarget(current) &&
+            addressKey && currentItemId === addressItemId &&
+            targetKey(current) === addressKey) {
+          // Books owns only capture rows. Its immediate or delayed null echo
+          // cannot overwrite authoritative detail for the same selected
+          // artifact or annotation, including targets absent from its index.
+          return current;
+        }
+      }
+      return controller.setSelectionTarget(target, detail);
+    }
+
     classificationContextMenuTarget(event) {
       const owner = this.classificationContextMenuOwner(event);
       if (!owner) return null;
@@ -807,10 +844,7 @@
         advanceOnResolve: options.advanceOnResolve,
         onNavigate: (address, metadata) => this.selectAddress(address, metadata),
         onSelectionTarget: (target, detail) => {
-          if (this.classificationController &&
-              typeof this.classificationController.setSelectionTarget === "function") {
-            this.classificationController.setSelectionTarget(target, detail);
-          }
+          this.publishClassificationSelectionTarget(target, detail);
         },
         onHotTarget: (target, detail) => {
           if (this.classificationController &&
@@ -847,24 +881,10 @@
         history: options.correctionHistory,
         operationIdFactory: options.correctionOperationIdFactory,
         initialExpandedGroups: options.initialExpandedArtifactGroups || [
-          "generated-metadata",
-          "ocr-text",
-          "layout-regions",
           "source-images",
         ],
         onResource: (resource) => this.setResource(resource),
-        onSelection: (item) => {
-          if (this.classificationController &&
-              typeof this.classificationController.setSelectionTarget === "function") {
-            this.classificationController.setSelectionTarget(item, {
-              element: this.artifactTreeElement(targetKey(item)),
-              focused: true,
-              source: "artifacts",
-            });
-          }
-          const address = artifactSelection(item, this.state.selection);
-          if (address) this.selectAddress(address, { source: "artifacts" });
-        },
+        onSelection: (item) => this.selectArtifactItem(item),
         onHotTarget: (item) => {
           this.root.dataset.hotArtifactKey = item && item.key || "";
           if (this.classificationController &&
@@ -1032,6 +1052,22 @@
       this.setStatus(receipt.replayed === true
         ? "Re-OCR already queued" : "Re-OCR queued");
       return receipt;
+    }
+
+    selectArtifactItem(item) {
+      // Synchronize cross-panel navigation first. Books can legitimately
+      // publish null when this target is not a capture row. Publishing the
+      // artifact second makes authoritative detail the final command target,
+      // while an index hint still finishes as deliberately unavailable.
+      const address = artifactSelection(item, this.state.selection);
+      if (address) this.selectAddress(address, { source: "artifacts" });
+      const target = navigationOnlyTarget(item) ? null : item;
+      this.publishClassificationSelectionTarget(target, {
+        element: this.artifactTreeElement(targetKey(item)),
+        focused: true,
+        source: "artifacts",
+      });
+      return target;
     }
 
     artifactTreeElement(key) {
@@ -1459,6 +1495,9 @@
       if (this.artifactsFeature && metadata.source !== "artifacts" &&
           (changedItem || changedDeepLink || metadata.forceContext === true)) {
         const context = selectionContext(this.state.context, selection);
+        if (context && metadata.source === "books" && metadata.navigationPreview) {
+          context.navigationPreview = metadata.navigationPreview;
+        }
         void Promise.resolve()
           .then(() => this.artifactsFeature.setContext(context))
           .catch((error) => {
@@ -1971,6 +2010,7 @@
     artifactSelection,
     correctionsRuntimePorts,
     installAutoBoot,
+    navigationOnlyTarget,
     nextTrayTab,
     normalizeSelection,
     normalizeWorkbenchContext,

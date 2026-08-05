@@ -1978,6 +1978,12 @@ main {
 .cloud-sync-progress[hidden] { display: none; }
 .cloud-sync-progress[data-state="error"] { border-left-color: var(--red); }
 .cloud-sync-progress[data-state="done"] { border-left-color: var(--green); }
+.cloud-sync-status-trigger[data-state="running"] { color: var(--cyan); }
+.cloud-sync-status-trigger[data-state="error"] {
+  color: var(--red);
+  border-color: var(--red);
+}
+.cloud-sync-status-trigger[data-state="done"] { color: var(--green); }
 .cloud-sync-head,
 .cloud-sync-meter,
 .cloud-sync-current {
@@ -1986,6 +1992,18 @@ main {
   gap: 8px;
 }
 .cloud-sync-head { justify-content: space-between; }
+.cloud-sync-head > div:first-child { min-width: 0; }
+.cloud-sync-head-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.cloud-sync-dismiss {
+  color: var(--ink-mut);
+  line-height: 1;
+}
 .cloud-sync-title {
   color: var(--ink);
   font-weight: var(--wt-strong, 600);

@@ -463,8 +463,13 @@ test("resource windows retain exact PDF grants and clear every grant on close", 
     "http://127.0.0.1:45678/api/pdf?path=book.pdf&preview=1&pages=20");
   pdfWindow.webContents.emit("did-finish-load");
   assert.equal(harness.authenticatedResourceLoads.has(pdfWindow.webContents.id), true);
-  pdfWindow.emit("closed");
-  assert.equal(harness.authenticatedResourceLoads.has(pdfWindow.webContents.id), false);
+  const pdfWebContentsId = pdfWindow.webContents.id;
+  Object.defineProperty(pdfWindow, "webContents", {
+    configurable: true,
+    get() { throw new Error("Object has been destroyed"); },
+  });
+  assert.doesNotThrow(() => pdfWindow.emit("closed"));
+  assert.equal(harness.authenticatedResourceLoads.has(pdfWebContentsId), false);
   assert.equal(harness.resourceWindows.has(pdfWindow), false);
 
   assert.equal(harness.createAuthenticatedResourceWindow(

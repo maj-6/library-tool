@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 
 TIMEOUT = 30.0
 CAPTURE_PHOTO_MAX_BYTES = 32 * 1024 * 1024
+CAPTURE_DISCOVERY_PAGE_SIZE = 50
+CAPTURE_DISCOVERY_MAX_ROWS = 10_000
 CAPTURE_LIB_ASSOCIATION_SCHEMA = "org.whl.capture-lib-association"
 CAPTURE_LIB_ASSOCIATION_VERSION = 1
 CAPTURE_LIB_FORMAT_VERSION = "3.0"
@@ -67,7 +69,168 @@ _CAPTURE_CORRECTION_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class SyncError(Exception):
-    pass
+    """One bounded cloud-client failure with optional structured HTTP state.
+
+    Supabase Storage is moving from legacy text errors to stable ``code``
+    values.  Keeping that code on the exception lets callers distinguish a
+    missing object from a missing bucket without matching mutable prose.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        error_code: str = "",
+        service: str = "",
+        method: str = "",
+        resource: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_code = str(error_code or "")
+        self.service = str(service or "")
+        self.method = str(method or "")
+        self.resource = str(resource or "")
+
+
+def is_missing_storage_object(exc: BaseException) -> bool:
+    """True only for Storage's explicit, stable missing-object response."""
+
+    return (
+        isinstance(exc, SyncError)
+        and exc.service == "storage"
+        and exc.error_code == "NoSuchKey"
+    )
+
+
+def is_storage_configuration_error(exc: BaseException) -> bool:
+    """Whether repeating the same capture request is certain to fail.
+
+    These failures apply to the project, bucket, or credential rather than one
+    photo.  A sync should stop once and report them instead of poisoning every
+    pending capture row with the same error.
+    """
+
+    if not isinstance(exc, SyncError) or exc.service != "storage":
+        return False
+    return (
+        exc.error_code in {
+            "NoSuchBucket",
+            "InvalidBucketName",
+            "TenantNotFound",
+            "InvalidJWT",
+            "AccessDenied",
+        }
+        or exc.http_status in {401, 403}
+    )
+
+
+def _storage_resource(url: str) -> tuple[str, str]:
+    """Return the decoded (bucket, object) named by a Storage API URL."""
+
+    try:
+        parts = [
+            urllib.parse.unquote(part)
+            for part in urllib.parse.urlsplit(url).path.split("/")
+            if part
+        ]
+        start = next(
+            i for i in range(len(parts) - 1)
+            if parts[i:i + 2] == ["storage", "v1"]
+        )
+    except (StopIteration, ValueError):
+        return "", ""
+    tail = parts[start + 2:]
+    if not tail:
+        return "", ""
+    if tail[0] == "bucket":
+        return (tail[1], "") if len(tail) > 1 else ("", "")
+    if tail[0] != "object" or len(tail) < 2:
+        return "", ""
+    index = 1
+    if tail[index] in {
+        "authenticated", "public", "sign", "info", "list", "move", "copy",
+    }:
+        index += 1
+    if index >= len(tail):
+        return "", ""
+    return tail[index], "/".join(tail[index + 1:])
+
+
+def _http_error_fields(raw: bytes) -> tuple[str, str]:
+    """Extract a bounded stable code/message from new or legacy JSON errors."""
+
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, UnicodeError):
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    nested = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    raw_code = nested.get("code") or payload.get("code")
+    if not raw_code and isinstance(payload.get("error"), str):
+        raw_code = payload.get("error")
+    code = str(raw_code or "").strip()[:80]
+    if code and not re.fullmatch(r"[A-Za-z0-9_.-]+", code):
+        code = ""
+    raw_message = nested.get("message") or payload.get("message")
+    message = str(raw_message or "").strip()[:300]
+    evidence = " ".join((
+        code,
+        str(payload.get("error") or "")[:120],
+        message,
+    )).lower()
+    if "bucket" in evidence and "not found" in evidence:
+        code = "NoSuchBucket"
+    elif (
+        any(label in evidence for label in ("object", "key", "file"))
+        and "not found" in evidence
+    ):
+        code = "NoSuchKey"
+    return code, message
+
+
+def _http_sync_error(method: str, url: str, status: int, raw: bytes) -> SyncError:
+    resource = url.split("?", 1)[0]
+    is_storage = "/storage/v1/" in urllib.parse.urlsplit(url).path
+    code, message = _http_error_fields(raw)
+    if is_storage:
+        bucket, object_path = _storage_resource(url)
+        if code == "NoSuchBucket":
+            detail = (
+                f"Supabase Storage bucket {bucket!r} was not found or is not "
+                f"accessible (NoSuchBucket; HTTP {status}). Verify that the "
+                "bucket exists in the configured project and that this account "
+                "can access it."
+            )
+        elif code == "NoSuchKey":
+            detail = (
+                f"Supabase Storage object {object_path!r} was not found in "
+                f"bucket {bucket!r} (NoSuchKey; HTTP {status})"
+            )
+        else:
+            suffix = f" ({code}; HTTP {status})" if code else f" (HTTP {status})"
+            detail = f"Supabase Storage rejected {method} for bucket {bucket!r}{suffix}"
+            if message:
+                detail += f": {message}"
+        return SyncError(
+            detail,
+            http_status=status,
+            error_code=code,
+            service="storage",
+            method=method,
+            resource=resource,
+        )
+    detail = raw.decode("utf-8", "replace")[:300]
+    return SyncError(
+        f"HTTP {status} on {method} {resource}: {detail}",
+        http_status=status,
+        error_code=code,
+        service="postgrest",
+        method=method,
+        resource=resource,
+    )
 
 
 def _cfg(cfg: dict) -> tuple[str, str, dict]:
@@ -112,12 +275,12 @@ def _request(method: str, url: str, headers: dict, body: bytes | None = None,
                 )
             return payload
     except urllib.error.HTTPError as exc:
-        detail = ""
+        raw = b""
         try:
-            detail = exc.read(301).decode("utf-8", "replace")[:300]
+            raw = exc.read(301)[:300]
         except Exception:
             pass
-        raise SyncError(f"HTTP {exc.code} on {method} {url.split('?')[0]}: {detail}")
+        raise _http_sync_error(method, url, exc.code, raw) from None
     except SyncError:
         raise
     except Exception as exc:
@@ -143,12 +306,82 @@ def _rest(cfg: dict, method: str, path: str, payload=None, prefer: str = "") -> 
 
 # --- captures -------------------------------------------------------------------
 
-def list_pending_captures(cfg: dict, limit: int = 50) -> list[dict]:
+def list_pending_captures(
+    cfg: dict,
+    limit: int | None = None,
+    *,
+    page_size: int = CAPTURE_DISCOVERY_PAGE_SIZE,
+    maximum_rows: int = CAPTURE_DISCOVERY_MAX_ROWS,
+    include_errors: bool = True,
+) -> list[dict]:
+    """List the complete capture import queue in bounded, stable pages.
+
+    ``limit`` remains an optional total-result cap for diagnostic callers.  A
+    normal desktop sync omits it and therefore no longer stops after 50 books.
+    Rows previously marked ``error`` are deliberately retried: older desktop
+    versions classified every HTTP 400/404 as a vanished photo even when the
+    object remained intact.  Import and acknowledgement remain idempotent.
+    """
+
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= 1000
+    ):
+        raise ValueError("capture discovery page_size must be between 1 and 1000")
+    if (
+        limit is not None
+        and (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 0
+        )
+    ):
+        raise ValueError("capture discovery limit must be a non-negative integer")
+    if (
+        isinstance(maximum_rows, bool)
+        or not isinstance(maximum_rows, int)
+        or not 1 <= maximum_rows <= 100_000
+    ):
+        raise ValueError(
+            "capture discovery maximum_rows must be between 1 and 100000"
+        )
+    if not isinstance(include_errors, bool):
+        raise ValueError("capture discovery include_errors must be boolean")
+    if limit == 0:
+        return []
+
     table = cfg.get("table") or "captures"
-    rows = _rest(cfg, "GET",
-                 f"{table}?status=eq.pending&select=*"
-                 f"&order=created_at.asc&limit={int(limit)}")
-    return rows if isinstance(rows, list) else []
+    statuses = "in.(pending,error)" if include_errors else "eq.pending"
+    out: list[dict] = []
+    offset = 0
+    while True:
+        # Read one sentinel row past the safety boundary so exactly-at-limit is
+        # accepted while an unexpectedly unbounded queue fails clearly.
+        request_limit = min(page_size, maximum_rows + 1 - len(out))
+        if limit is not None:
+            request_limit = min(request_limit, limit - len(out))
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?status={statuses}&select=*"
+            f"&order=created_at.asc,id.asc&limit={request_limit}&offset={offset}",
+        )
+        if not isinstance(rows, list):
+            raise SyncError("capture discovery returned an invalid collection")
+        out.extend(rows)
+        if len(out) > maximum_rows:
+            raise SyncError(
+                "capture discovery exceeds the "
+                f"{maximum_rows}-row safety limit; archive or resolve old "
+                "capture rows before retrying"
+            )
+        offset += len(rows)
+        if (
+            len(rows) < request_limit
+            or (limit is not None and len(out) >= limit)
+        ):
+            return out
 
 
 def mark_capture(cfg: dict, capture_id: str, status: str) -> None:
@@ -777,8 +1010,22 @@ def download_photo(
         maximum_bytes: int = CAPTURE_PHOTO_MAX_BYTES) -> bytes:
     url, _, headers = _cfg(cfg)
     bucket = cfg.get("bucket") or "captures"
-    path = urllib.parse.quote(str(object_path).lstrip("/"))
-    return _request("GET", f"{url}/storage/v1/object/{bucket}/{path}",
+    raw_path = str(object_path or "").lstrip("/")
+    if (
+        not raw_path
+        or "\\" in raw_path
+        or any(part in {"", ".", ".."} for part in raw_path.split("/"))
+    ):
+        raise SyncError(
+            "capture photo has an invalid Supabase Storage object path",
+            error_code="InvalidKey",
+            service="storage",
+            method="GET",
+        )
+    path = urllib.parse.quote(raw_path, safe="/")
+    # Private downloads have a distinct authenticated route.  /object/{bucket}
+    # is the upload/delete surface and can answer GET with a misleading 400.
+    return _request("GET", f"{url}/storage/v1/object/authenticated/{bucket}/{path}",
                     headers, timeout=120.0, maximum_bytes=maximum_bytes)
 
 

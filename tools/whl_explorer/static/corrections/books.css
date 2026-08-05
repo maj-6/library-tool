@@ -105,9 +105,9 @@
 
 [data-corrections-root] .corrections-book {
   background: var(--panel-subtle, #202329);
-  border: 1px solid var(--border-subtle, #3b3f47);
+  border: var(--border-w, 1px) solid var(--border-subtle, #3b3f47);
   border-left: 0.25rem solid transparent;
-  border-radius: 0.25rem;
+  border-radius: var(--radius);
   min-width: 0;
 }
 
@@ -219,8 +219,8 @@
 [data-corrections-root] .capture-select {
   align-content: start;
   background: var(--canvas-subtle, #17191e);
-  border: 1px solid var(--border-subtle, #3b3f47);
-  border-radius: 0.22rem;
+  border: var(--border-w, 1px) solid var(--border-subtle, #3b3f47);
+  border-radius: var(--radius);
   cursor: pointer;
   display: grid;
   gap: 0.25rem;
@@ -325,9 +325,9 @@
 [data-corrections-root] .review-filter,
 [data-corrections-root] .review-comment {
   background: var(--input-bg, #17191e);
-  border: 1px solid var(--border-strong, #535965);
-  border-radius: 0.2rem;
-  color: inherit;
+  border: var(--border-w, 1px) solid var(--border-strong, #535965);
+  border-radius: var(--radius);
+  color: var(--input-ink);
   font: inherit;
   min-height: 1.9rem;
   padding: 0.2rem 0.38rem;
@@ -338,8 +338,8 @@
 [data-corrections-root] .review-reopen,
 [data-corrections-root] .review-history {
   background: var(--button-bg, #343943);
-  border: 1px solid var(--border-strong, #535965);
-  border-radius: 0.2rem;
+  border: var(--border-w, 1px) solid var(--border-strong, #535965);
+  border-radius: var(--radius);
   color: inherit;
   cursor: pointer;
   font: inherit;
@@ -371,9 +371,9 @@
 
 [data-corrections-root] .review-entry {
   background: var(--panel-subtle, #202329);
-  border: 1px solid var(--border-subtle, #3b3f47);
+  border: var(--border-w, 1px) solid var(--border-subtle, #3b3f47);
   border-left: 0.25rem solid var(--attention, #f1ad3d);
-  border-radius: 0.25rem;
+  border-radius: var(--radius);
   display: grid;
   gap: 0.4rem;
   padding: 0.5rem;
@@ -423,7 +423,7 @@
 
 [data-corrections-root] .review-audit {
   background: var(--canvas-subtle, #17191e);
-  border-radius: 0.2rem;
+  border-radius: var(--radius);
   padding: 0.5rem;
 }
 

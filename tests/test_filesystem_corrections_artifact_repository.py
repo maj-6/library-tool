@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -12,6 +13,9 @@ import pytest
 from PIL import Image
 
 import libformat
+from librarytool.adapters.filesystem import (
+    corrections_artifact_repository as corrections_artifact_module,
+)
 from librarytool.adapters.filesystem.corrections_artifact_repository import (
     FilesystemCorrectionsArtifactRepository,
     FilesystemRasterResourceResolverPort,
@@ -99,6 +103,7 @@ def _repository(
     *,
     capture_ids: dict[str, str] | None = None,
     representation_revisions: dict[tuple[str, str], str] | None = None,
+    entry_directories: dict[str, Path] | None = None,
 ) -> FilesystemCorrectionsArtifactRepository:
     captures = capture_ids if capture_ids is not None else {ITEM_ID: CAPTURE_ID}
     revisions = (
@@ -120,7 +125,11 @@ def _repository(
         write_set,
         item_exists=lambda item_id: item_id in {ITEM_ID, "book-2"},
         capture_id_for=lambda item_id: captures.get(item_id),
-        entry_directory_for=lambda item_id: _entry(root, item_id),
+        entry_directory_for=lambda item_id: (
+            entry_directories.get(item_id, _entry(root, item_id))
+            if entry_directories is not None
+            else _entry(root, item_id)
+        ),
         capture_directory_for=lambda capture_id: _capture(root, capture_id),
         representation_revision_for=lambda item_id, representation_id: revisions.get(
             (item_id, representation_id)
@@ -759,6 +768,475 @@ def test_malformed_rendition_and_geometry_preserve_healthy_capture_artifact(
     assert str(directory) not in json.dumps(
         [value.as_dict() for value in artifacts.values()]
     )
+
+
+def test_pre_contract_capture_projects_and_resolves_without_manifest(tmp_path):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((13, 23, 33), (17, 23))
+    display = _jpeg_bytes((43, 53, 63), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    repository = _repository(root)
+
+    hints = repository.list_capture_index_hints(ITEM_ID)
+    assert len(hints) == 1
+    assert hints[0]["revision"].startswith("index:")
+    assert hints[0]["import_state"] == "legacy"
+    assert hints[0]["imported_at"] == ""
+    assert hints[0]["resource_state"] == "available"
+
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+    assert len(artifacts) == 2
+    shown = next(
+        value for value in artifacts
+        if value.key.artifact_id.endswith(":display")
+    )
+    assert shown.extensions["legacy_capture"] is True
+    assert shown.resource is not None
+    resolved = repository.resolve_raster_resource(ITEM_ID, shown.resource)
+    assert resolved is not None
+    try:
+        assert resolved.stream.read() == display
+    finally:
+        resolved.stream.close()
+
+
+def test_capture_hints_do_not_open_or_hash_image_bytes(tmp_path, monkeypatch):
+    root = tmp_path / "library"
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "original_asset-1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+    repository = _repository(root)
+
+    def reject_observation(*_args, **_kwargs):
+        raise AssertionError("capture index must not inspect image bytes")
+
+    monkeypatch.setattr(repository, "_observe_resource", reject_observation)
+    hints = repository.list_capture_index_hints(ITEM_ID)
+
+    assert len(hints) == 1
+    assert hints[0]["resource_state"] == "available"
+
+
+def test_capture_hints_match_rendition_group_state_and_import_timestamp(tmp_path):
+    root = tmp_path / "library"
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _photo_manifest(original, display)
+    manifest["desktop_import"]["imported_at"] = "2026-08-04T12:34:56Z"
+    _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    hint = repository.list_capture_index_hints(ITEM_ID)[0]
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+    states = {
+        value.resource.variant: value.resource_state.value
+        for value in artifacts
+        if value.resource is not None
+    }
+    missing = [
+        value
+        for value in artifacts
+        if value.resource_state is ResourceState.MISSING
+    ]
+
+    assert hint["resource_state"] == "available"
+    assert hint["import_state"] == "partial"
+    assert hint["imported_at"] == "2026-08-04T12:34:56Z"
+    assert states == {"display": "available"}
+    assert len(missing) == 1
+    assert missing[0].key.artifact_id.endswith(":original")
+
+
+def test_invalid_display_rendition_cannot_preview_imported_display_ref(tmp_path):
+    root = tmp_path / "library"
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _photo_manifest(original, display)
+    manifest["assets"][0]["display"] = ["invalid rendition"]
+    _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    hint = repository.list_capture_index_hints(ITEM_ID)[0]
+
+    assert hint["resource_state"] == "unavailable"
+    assert hint["import_state"] == "partial"
+    assert repository.resolve_capture_preview(
+        ITEM_ID,
+        CAPTURE_DISPLAY_ID,
+    ) is None
+
+
+def test_malformed_capture_manifest_degrades_to_unavailable_index_hint(tmp_path):
+    root = tmp_path / "library"
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "photo_assets.json").write_text("{", encoding="utf-8")
+
+    hints = _repository(root).list_capture_index_hints(ITEM_ID)
+
+    assert len(hints) == 1
+    assert hints[0]["capture_order"] == 0
+    assert hints[0]["resource_state"] == "unavailable"
+    assert hints[0]["import_state"] == "unavailable"
+    assert hints[0]["imported_at"] == ""
+
+
+def test_entry_directory_change_invalidates_projection_and_resource_caches(
+    tmp_path,
+):
+    root = tmp_path / "library"
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+
+    figure = _png_bytes((20, 130, 50), (41, 37))
+    image_dir = _entry(root) / "ocr" / "images"
+    image_dir.mkdir(parents=True)
+    (image_dir / "p3-fig.png").write_bytes(figure)
+    _write_layout(root, _layout(_digest(figure)))
+    manual_entry = root / "entries" / "_corrections_capture_only" / ITEM_ID
+    entry_directories = {ITEM_ID: manual_entry}
+    repository = _repository(root, entry_directories=entry_directories)
+
+    selected = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+    assert selected is not None and selected.resource is not None
+    assert all(
+        value.key.artifact_id != FIGURE_ID
+        for value in repository.list_raster_artifacts(ITEM_ID)
+    )
+
+    entry_directories[ITEM_ID] = _entry(root)
+
+    assert repository.resolve_raster_resource(ITEM_ID, selected.resource) is None
+    assert any(
+        value.key.artifact_id == FIGURE_ID
+        for value in repository.list_raster_artifacts(ITEM_ID)
+    )
+
+
+def test_capture_only_lookup_filters_non_capture_from_warm_union_cache(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    capture_directory = _capture(root)
+    capture_directory.mkdir(parents=True)
+    (capture_directory / "orig_1.jpg").write_bytes(original)
+    (capture_directory / "photo_1.jpg").write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+
+    figure = _png_bytes((20, 130, 50), (41, 37))
+    image_directory = _entry(root) / "ocr" / "images"
+    image_directory.mkdir(parents=True)
+    (image_directory / "p3-fig.png").write_bytes(figure)
+    _write_layout(root, _layout(_digest(figure)))
+    repository = _repository(root)
+
+    union = repository.list_raster_artifacts(ITEM_ID)
+    assert any(value.key.artifact_id == FIGURE_ID for value in union)
+    monkeypatch.setattr(
+        repository,
+        "_project_capture",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a valid warm union cache was unexpectedly reprojected"
+        ),
+    )
+
+    assert repository.get_capture_raster_artifact(
+        RasterArtifactKey(ITEM_ID, FIGURE_ID)
+    ) is None
+    capture = repository.get_capture_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+    assert capture is not None
+    assert capture.source.representation_id == "capture"
+
+
+def test_projection_cache_coalesces_reads_and_invalidates_on_resource_change(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "library"
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "original_asset-1.jpg").write_bytes(original)
+    (directory / "orig_1.jpg").write_bytes(original)
+    display_path = directory / "photo_1.jpg"
+    display_path.write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+    repository = _repository(root)
+    observed = []
+    original_observe = repository._observe_resource
+
+    def record_observation(*args, **kwargs):
+        observed.append(args[0])
+        return original_observe(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "_observe_resource", record_observation)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(
+            lambda _index: repository.list_raster_artifacts(ITEM_ID),
+            range(8),
+        ))
+    assert all(len(result) == 2 for result in results)
+    assert len(observed) == 2
+
+    replacement = _jpeg_bytes((1, 2, 3), (31, 37))
+    display_path.write_bytes(replacement)
+    repository.list_raster_artifacts(ITEM_ID)
+    assert len(observed) > 2
+
+
+def test_projection_changed_during_cache_publication_is_not_cached(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "library"
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    replacement = _jpeg_bytes((1, 2, 3), (31, 37))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "original_asset-1.jpg").write_bytes(original)
+    (directory / "orig_1.jpg").write_bytes(original)
+    display_path = directory / "photo_1.jpg"
+    display_path.write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+    repository = _repository(root)
+    original_project = repository._project_locked
+    original_path_stamp = repository._path_stamp
+    project_count = 0
+    display_stamp_count = 0
+    changed = False
+
+    def count_projection(*args, **kwargs):
+        nonlocal project_count
+        project_count += 1
+        return original_project(*args, **kwargs)
+
+    def replace_before_second_display_stamp(path):
+        nonlocal changed, display_stamp_count
+        if path == display_path:
+            display_stamp_count += 1
+        if path == display_path and display_stamp_count == 2:
+            changed = True
+            display_path.write_bytes(replacement)
+        return original_path_stamp(path)
+
+    monkeypatch.setattr(repository, "_project_locked", count_projection)
+    monkeypatch.setattr(repository, "_path_stamp", replace_before_second_display_stamp)
+    first = repository.list_raster_artifacts(ITEM_ID)
+    second = repository.list_raster_artifacts(ITEM_ID)
+
+    first_display = next(
+        value for value in first
+        if value.key.artifact_id == CAPTURE_DISPLAY_ID
+    )
+    second_display = next(
+        value for value in second
+        if value.key.artifact_id == CAPTURE_DISPLAY_ID
+    )
+    assert changed is True
+    assert project_count == 2
+    assert first_display.resource_state is ResourceState.AVAILABLE
+    assert second_display.resource_state is ResourceState.UNAVAILABLE
+
+
+def test_keyed_capture_detail_and_preview_do_not_observe_sibling_images(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "library"
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    manifest = _photo_manifest(
+        _jpeg_bytes((1, 2, 3), (17, 23)),
+        _jpeg_bytes((4, 5, 6), (19, 29)),
+    )
+    manifest["assets"] = []
+    manifest["desktop_import"]["assets"] = []
+    displays: dict[int, bytes] = {}
+    for index in range(1, 13):
+        original = _jpeg_bytes((index, 20, 30), (17 + index, 23))
+        display = _jpeg_bytes((40, index, 60), (19 + index, 29))
+        displays[index] = display
+        (directory / f"orig_{index}.jpg").write_bytes(original)
+        (directory / f"photo_{index}.jpg").write_bytes(display)
+        asset = copy.deepcopy(_photo_manifest(original, display)["assets"][0])
+        asset["asset_id"] = f"asset-{index}"
+        asset["capture_order"] = index
+        asset["capture_file"] = f"photo_{index}.jpg"
+        asset["original"]["reference"] = f"original_asset-{index}.jpg"
+        asset["display"]["reference"] = f"photo_{index}.jpg"
+        manifest["assets"].append(asset)
+        manifest["desktop_import"]["assets"].append(
+            {
+                "order": index - 1,
+                "asset_id": f"asset-{index}",
+                "raw_ref": f"orig_{index}.jpg",
+                "display_ref": f"photo_{index}.jpg",
+                "source_checksum": _digest(original),
+                "derivative_checksum": _digest(display),
+                "transport_representation": "original",
+                "recipe": "desktop_perspective_standardize_v1",
+                "lifecycle": "completed",
+            }
+        )
+    _write_photo_manifest(root, manifest)
+    selected_index = 9
+    namespace = _opaque_identity(
+        "capture",
+        CAPTURE_ID,
+        f"asset-{selected_index}",
+    )
+    selected_id = f"{namespace}:display"
+    repository = _repository(root)
+    observed: list[str] = []
+    observe = repository._observe_resource
+
+    def record_observation(_item_id, _directory, reference, **kwargs):
+        observed.append(reference)
+        return observe(_item_id, _directory, reference, **kwargs)
+
+    monkeypatch.setattr(repository, "_observe_resource", record_observation)
+    selected = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, selected_id)
+    )
+    assert selected is not None
+    assert observed == [f"orig_{selected_index}.jpg", f"photo_{selected_index}.jpg"]
+
+    full = _repository(root).list_raster_artifacts(ITEM_ID)
+    assert selected == next(value for value in full if value.key.artifact_id == selected_id)
+
+    opened_images: list[str] = []
+    open_regular = corrections_artifact_module._open_verified_regular
+
+    def record_open(path, *args, **kwargs):
+        if Path(path).suffix.casefold() in {".jpg", ".jpeg"}:
+            opened_images.append(Path(path).name)
+        return open_regular(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        corrections_artifact_module,
+        "_open_verified_regular",
+        record_open,
+    )
+    preview = repository.resolve_capture_preview(ITEM_ID, selected_id)
+    assert preview is not None
+    try:
+        assert preview.stream.read() == displays[selected_index]
+    finally:
+        preview.stream.close()
+    assert opened_images == [f"photo_{selected_index}.jpg"]
+
+    monkeypatch.setattr(
+        repository,
+        "_project",
+        lambda _item_id: pytest.fail("keyed candidate cache fell back to full projection"),
+    )
+    resolved = repository.resolve_raster_resource(ITEM_ID, selected.resource)
+    assert resolved is not None
+    try:
+        assert resolved.stream.read() == displays[selected_index]
+    finally:
+        resolved.stream.close()
+
+    (directory / f"photo_{selected_index}.jpg").write_bytes(
+        _jpeg_bytes((200, 1, 2), (41, 43))
+    )
+    assert repository.resolve_raster_resource(ITEM_ID, selected.resource) is None
+
+
+def test_keyed_resource_candidate_revalidates_capture_manifest(tmp_path, monkeypatch):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest_path = _write_photo_manifest(
+        root,
+        _photo_manifest(original, display),
+    )
+    repository = _repository(root)
+    selected = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+    assert selected is not None and selected.resource is not None
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["assets"] = []
+    manifest["desktop_import"]["assets"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    project = repository._project
+    projected = 0
+
+    def count_projection(item_id):
+        nonlocal projected
+        projected += 1
+        return project(item_id)
+
+    monkeypatch.setattr(repository, "_project", count_projection)
+    assert repository.resolve_raster_resource(ITEM_ID, selected.resource) is None
+    assert projected == 0, "the stale keyed candidate must not be re-authorized"
+
+
+def test_keyed_resource_candidate_rejects_changed_representation_revision(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "library"
+    figure = _png_bytes((20, 130, 50), (41, 37))
+    image_dir = _entry(root) / "ocr" / "images"
+    image_dir.mkdir(parents=True)
+    (image_dir / "p3-fig.png").write_bytes(figure)
+    _write_layout(root, _layout(_digest(figure)))
+    revisions = {(ITEM_ID, "primary"): "rep-primary-r1"}
+    repository = _repository(
+        root,
+        capture_ids={},
+        representation_revisions=revisions,
+    )
+    selected = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, FIGURE_ID)
+    )
+    assert selected is not None and selected.resource is not None
+
+    revisions[(ITEM_ID, "primary")] = "rep-primary-r2"
+    monkeypatch.setattr(
+        repository,
+        "_project",
+        lambda _item_id: pytest.fail(
+            "a changed representation must not re-authorize a stale resource"
+        ),
+    )
+
+    assert repository.resolve_raster_resource(ITEM_ID, selected.resource) is None
 
 
 def test_unsafe_optional_recipe_revision_is_omitted_from_public_provenance(

@@ -19,6 +19,7 @@ from werkzeug.serving import make_server
 
 from librarytool.adapters.filesystem import (
     FilesystemCorrectionTransformStore,
+    FilesystemCorrectionsArtifactRepository,
     FilesystemItemQueryRepository,
 )
 from librarytool.engine import (
@@ -26,6 +27,7 @@ from librarytool.engine import (
     RASTER_ARTIFACT_QUERY_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
 )
+from librarytool.engine.correction_projection import CorrectionProjectionService
 from librarytool.engine.correction_transforms import (
     CorrectionTransformCommand,
     OcrFollowupOutcome,
@@ -229,6 +231,23 @@ def corrections_workspace(monkeypatch, tmp_path: Path):
         ],
         "selections": {},
         "transport": {"representation": "original", "version": 1},
+        "desktop_import": {
+            "version": 1,
+            "imported_at": "2026-08-04T12:34:56Z",
+            "assets": [
+                {
+                    "order": 0,
+                    "asset_id": "asset-1",
+                    "raw_ref": "orig_1.jpg",
+                    "display_ref": "photo_1.jpg",
+                    "source_checksum": digest,
+                    "derivative_checksum": digest,
+                    "transport_representation": "original",
+                    "recipe": "desktop_perspective_standardize_v1",
+                    "lifecycle": "completed",
+                }
+            ],
+        },
     }
     (capture_dir / "photo_assets.json").write_text(
         json.dumps(manifest),
@@ -525,7 +544,7 @@ def test_corrections_index_resolves_capture_authority_once_per_capture(
         server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH, {})
 
     original = (
-        server.FilesystemCaptureArchiveRepository.inspect_association
+        server.FilesystemCaptureArchiveRepository.inspect_association_identity
     )
     inspected: list[str] = []
 
@@ -535,8 +554,17 @@ def test_corrections_index_resolves_capture_authority_once_per_capture(
 
     monkeypatch.setattr(
         server.FilesystemCaptureArchiveRepository,
-        "inspect_association",
+        "inspect_association_identity",
         classmethod(inspect_once),
+    )
+    monkeypatch.setattr(
+        server.FilesystemCaptureArchiveRepository,
+        "inspect_association",
+        classmethod(
+            lambda _cls, _workspace_root, _capture_id: pytest.fail(
+                "the Corrections index hashed a capture archive payload"
+            )
+        ),
     )
 
     first = client.get(
@@ -1575,6 +1603,295 @@ def test_normal_build_only_corrections_target_stays_addressable(
     assert response.get_json()["artifacts"] == []
 
 
+def test_uncorrected_build_index_never_reads_capture_or_layout_bytes(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+
+    monkeypatch.setattr(
+        FilesystemCorrectionsArtifactRepository,
+        "_observe_resource",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an uncorrected build index inspected capture image bytes"
+        ),
+    )
+    monkeypatch.setattr(
+        CorrectionProjectionService,
+        "get_correction_review",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an uncorrected build index loaded a correction aggregate"
+        ),
+    )
+
+    response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    books = response.get_json()["books"]
+    assert [book["id"] for book in books] == [BOOK_ID]
+    assert len(books[0]["captures"]) == 1
+    assert books[0]["captures"][0]["revision"].startswith("index:")
+    assert books[0]["captures"][0]["thumbnail"]["url"].endswith("/preview")
+    assert books[0]["captures"][0]["imported_at"] == (
+        "2026-08-04T12:34:56Z"
+    )
+    assert books[0]["latest_imported_at"] == "2026-08-04T12:34:56Z"
+
+
+def test_lazy_and_full_indexes_match_missing_original_and_import_time(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    (server.CAPTURES_DIR / CAPTURE_ID / "orig_1.jpg").unlink()
+
+    lazy = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    monkeypatch.setattr(
+        server,
+        "_corrections_uses_lazy_capture_index",
+        lambda _item_id: False,
+    )
+    full = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert lazy.status_code == full.status_code == 200
+    lazy_book = lazy.get_json()["books"][0]
+    full_book = full.get_json()["books"][0]
+    for field in ("import_state", "resource_state", "imported_at"):
+        assert lazy_book["captures"][0][field] == full_book["captures"][0][field]
+    assert lazy_book["captures"][0]["import_state"] == "partial"
+    assert lazy_book["latest_imported_at"] == full_book["latest_imported_at"]
+    assert lazy_book["latest_imported_at"] == "2026-08-04T12:34:56Z"
+
+
+def test_lazy_and_full_indexes_match_legacy_capture_state(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    (server.CAPTURES_DIR / CAPTURE_ID / "photo_assets.json").unlink()
+
+    lazy = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    monkeypatch.setattr(
+        server,
+        "_corrections_uses_lazy_capture_index",
+        lambda _item_id: False,
+    )
+    full = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert lazy.status_code == full.status_code == 200
+    lazy_capture = lazy.get_json()["books"][0]["captures"][0]
+    full_capture = full.get_json()["books"][0]["captures"][0]
+    assert lazy_capture["import_state"] == "legacy"
+    assert full_capture["import_state"] == "legacy"
+    assert lazy_capture["resource_state"] == full_capture["resource_state"]
+    assert lazy_capture["imported_at"] == full_capture["imported_at"] == ""
+
+
+def test_lazy_and_full_indexes_match_malformed_legacy_geometry(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    manifest_path = server.CAPTURES_DIR / CAPTURE_ID / "photo_assets.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["legacy_fallback"] = True
+    manifest.pop("desktop_import")
+    manifest["assets"][0]["geometry"] = ["invalid-geometry"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    lazy = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    monkeypatch.setattr(
+        server,
+        "_corrections_uses_lazy_capture_index",
+        lambda _item_id: False,
+    )
+    full = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert lazy.status_code == full.status_code == 200
+    lazy_book = lazy.get_json()["books"][0]
+    full_book = full.get_json()["books"][0]
+    assert lazy_book["import_state"] == full_book["import_state"] == "partial"
+    assert lazy_book["captures"][0]["import_state"] == "partial"
+    assert full_book["captures"][0]["import_state"] == "partial"
+    assert "Captured image geometry is incomplete" in lazy_book["issues"]
+    assert lazy_book["issues"] == full_book["issues"]
+
+
+def test_malformed_capture_does_not_hide_healthy_index_item(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    manifest = server.CAPTURES_DIR / CAPTURE_ID / "photo_assets.json"
+    manifest.write_text("{", encoding="utf-8")
+    with server._builds_lock:
+        builds = server.lib.load_json(server.BUILDS_PATH, {})
+        builds["plain-book"] = {
+            "id": "plain-book",
+            "title": "Unaffiliated Healthy Book",
+        }
+        server.lib.save_json(server.BUILDS_PATH, builds)
+
+    response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert response.status_code == 200
+    books = {book["id"]: book for book in response.get_json()["books"]}
+    assert set(books) == {BOOK_ID, "plain-book"}
+    assert books["plain-book"]["captures"] == []
+    assert books[BOOK_ID]["captures"][0]["resource_state"] == "unavailable"
+    assert books[BOOK_ID]["captures"][0]["import_state"] == "unavailable"
+
+
+def test_manual_archive_uses_lazy_index_then_byte_verified_preview(
+    client,
+    corrections_workspace,
+    monkeypatch,
+    tmp_path,
+):
+    import server
+
+    manual_book_id = "b-22222222222222222222222222222222"
+    manual_path = tmp_path / "manual_entries.json"
+    server.lib.save_json(
+        manual_path,
+        {
+            "manual-row": {
+                "id": "manual-row",
+                "title": "Archived Manual Herbal",
+                "capture_id": CAPTURE_ID,
+                "created_at": "2026-08-04T00:00:00Z",
+            }
+        },
+    )
+    server.lib.save_json(server.BUILDS_PATH, {})
+    monkeypatch.setattr(server.lib, "MANUAL_ENTRIES_PATH", manual_path)
+
+    class AssociationIdentity:
+        book_id = manual_book_id
+
+        class state:
+            value = "current"
+
+    monkeypatch.setattr(
+        server.FilesystemCaptureArchiveRepository,
+        "inspect_association_identity",
+        lambda _root, capture_id: (
+            AssociationIdentity() if capture_id == CAPTURE_ID else None
+        ),
+    )
+    read_json = FilesystemCorrectionsArtifactRepository._read_json
+
+    def reject_layout_read(repository, path, *args, **kwargs):
+        if kwargs.get("section") == "layout":
+            pytest.fail("an uncorrected build index read layout bytes")
+        return read_json(repository, path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        FilesystemCorrectionsArtifactRepository,
+        "_read_json",
+        reject_layout_read,
+    )
+    monkeypatch.setattr(
+        server.FilesystemCaptureArchiveRepository,
+        "inspect_association",
+        lambda _root, capture_id: (
+            AssociationIdentity() if capture_id == CAPTURE_ID else None
+        ),
+    )
+    original_observe = FilesystemCorrectionsArtifactRepository._observe_resource
+    original_review = CorrectionProjectionService.get_correction_review
+
+    def reject_image_read(*_args, **_kwargs):
+        raise AssertionError("the navigation index read capture bytes")
+
+    monkeypatch.setattr(
+        FilesystemCorrectionsArtifactRepository,
+        "_observe_resource",
+        reject_image_read,
+    )
+    monkeypatch.setattr(
+        CorrectionProjectionService,
+        "get_correction_review",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("the lazy index loaded a correction aggregate")
+        ),
+    )
+
+    index = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert index.status_code == 200
+    books = index.get_json()["books"]
+    assert [book["id"] for book in books] == [manual_book_id]
+    capture = books[0]["captures"][0]
+    assert capture["revision"].startswith("index:")
+    assert capture["thumbnail"]["url"].endswith("/preview")
+    assert books[0]["latest_imported_at"] == "2026-08-04T12:34:56Z"
+
+    monkeypatch.setattr(
+        FilesystemCorrectionsArtifactRepository,
+        "_observe_resource",
+        original_observe,
+    )
+    preview = client.get(capture["thumbnail"]["url"])
+    bad_preview = client.get(capture["thumbnail"]["url"] + "?revision=index")
+
+    assert preview.status_code == 200
+    assert preview.data == corrections_workspace
+    assert preview.mimetype == "image/jpeg"
+    assert bad_preview.status_code == 400
+    assert bad_preview.get_json()["code"] == "invalid_raster_preview_query"
+
+    monkeypatch.setattr(
+        CorrectionProjectionService,
+        "get_correction_review",
+        original_review,
+    )
+    aggregate = (
+        server._ensure_engine_session().write_set.root
+        / ".engine"
+        / "corrections"
+        / "aggregates"
+        / f"{hashlib.sha256(manual_book_id.encode('utf-8')).hexdigest()}.json"
+    )
+    aggregate.parent.mkdir(parents=True, exist_ok=True)
+    aggregate.write_text("{}", encoding="utf-8")
+    corrupt = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert corrupt.status_code == 500
+    assert corrupt.is_json
+    assert corrupt.get_json()["code"] == "invalid_correction_snapshot"
+
+
 def test_production_bridge_mutations_converge_across_clients(
     client,
     corrections_workspace,
@@ -2022,7 +2339,7 @@ def test_capture_promotion_preserves_human_corrections_and_one_identity(
     }
 
 
-def test_capture_only_index_isolates_partial_missing_and_corrupt_assets(
+def test_capture_only_index_isolates_partial_legacy_and_corrupt_assets(
     client,
     corrections_workspace,
 ):
@@ -2072,20 +2389,20 @@ def test_capture_only_index_isolates_partial_missing_and_corrupt_assets(
     assert partial_books["healthy-book"]["import_state"] == "ready"
 
     manifest_path.unlink()
-    missing_response = client.get(
+    legacy_response = client.get(
         "/api/v1/corrections/index?workspace_id=local-library"
     )
-    assert missing_response.status_code == 200
-    missing_books = {
-        row["id"]: row for row in missing_response.get_json()["books"]
+    assert legacy_response.status_code == 200
+    legacy_books = {
+        row["id"]: row for row in legacy_response.get_json()["books"]
     }
-    missing_capture = missing_books[BOOK_ID]
-    assert missing_capture["import_state"] == "missing"
-    assert len(missing_capture["captures"]) == 1
-    assert missing_capture["captures"][0]["resource_state"] == "missing"
-    assert missing_capture["captures"][0]["thumbnail"] is None
-    assert "1 captured image is missing" in missing_capture["issues"]
-    assert "healthy-book" in missing_books
+    legacy_capture = legacy_books[BOOK_ID]
+    assert legacy_capture["import_state"] == "legacy"
+    assert len(legacy_capture["captures"]) == 1
+    assert legacy_capture["captures"][0]["resource_state"] == "available"
+    assert legacy_capture["captures"][0]["thumbnail"] is not None
+    assert "1 captured image is missing" not in legacy_capture["issues"]
+    assert "healthy-book" in legacy_books
 
     manifest_path.write_text('{"assets": [', encoding="utf-8")
     corrupt_response = client.get(
@@ -2116,6 +2433,7 @@ def test_capture_only_index_isolates_partial_missing_and_corrupt_assets(
 def test_capture_only_index_marks_malformed_rendition_and_geometry_partial(
     client,
     corrections_workspace,
+    monkeypatch,
 ):
     del corrections_workspace
     import server
@@ -2142,10 +2460,23 @@ def test_capture_only_index_marks_malformed_rendition_and_geometry_partial(
     response = client.get(
         "/api/v1/corrections/index?workspace_id=local-library"
     )
+    monkeypatch.setattr(
+        server,
+        "_corrections_uses_lazy_capture_index",
+        lambda _item_id: False,
+    )
+    full_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
 
     assert response.status_code == 200, response.get_json()
+    assert full_response.status_code == 200, full_response.get_json()
     books = {row["id"]: row for row in response.get_json()["books"]}
+    full_books = {
+        row["id"]: row for row in full_response.get_json()["books"]
+    }
     damaged = books[BOOK_ID]
+    full_damaged = full_books[BOOK_ID]
     assert damaged["kind"] == "capture"
     assert damaged["import_state"] == "partial"
     assert len(damaged["captures"]) == 1
@@ -2153,6 +2484,11 @@ def test_capture_only_index_marks_malformed_rendition_and_geometry_partial(
     assert damaged["captures"][0]["import_state"] == "partial"
     assert "Captured image geometry is incomplete" in damaged["issues"]
     assert "1 captured image record is incomplete" in damaged["issues"]
+    assert damaged["import_state"] == full_damaged["import_state"]
+    assert damaged["captures"][0]["import_state"] == (
+        full_damaged["captures"][0]["import_state"]
+    )
+    assert damaged["issues"] == full_damaged["issues"]
     assert books["healthy-book"]["import_state"] == "ready"
 
     artifacts_response = client.get(
@@ -2199,8 +2535,8 @@ def test_corrupt_mistral_layout_isolated_in_real_index_and_artifact_routes(
     assert response.status_code == 200, response.get_json()
     books = {row["id"]: row for row in response.get_json()["books"]}
     damaged = books[BOOK_ID]
-    assert damaged["import_state"] == "partial"
-    assert "Mistral artifact layout is unavailable" in damaged["issues"]
+    assert damaged["import_state"] == "ready"
+    assert "Mistral artifact layout is unavailable" not in damaged["issues"]
     assert books["healthy-book"]["import_state"] == "ready"
 
     artifacts_response = client.get(

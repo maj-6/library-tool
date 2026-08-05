@@ -72,6 +72,8 @@ from librarytool.engine.item_commands import (
 )
 from librarytool.engine.items import ItemQueryService, ItemView
 from librarytool.engine.raster_artifacts import (
+    IMAGE_CATEGORIES,
+    ArtifactFreshness,
     RasterArtifactKey,
     RasterArtifactProjectorPort,
     RasterArtifactView,
@@ -140,6 +142,7 @@ _ITEM_OPERATION_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 )
 _OCR_PROPOSAL_REF_RE = re.compile(r"^cop-[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UNSAFE_TEXT_RE = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]"
 )
@@ -177,6 +180,16 @@ _RASTER_GROUP_KINDS = {
         {"generated-image", "reworked-figure", "reworked-image"}
     ),
 }
+_RASTER_MEDIA_TYPES = frozenset(
+    {
+        "image/bmp",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/tiff",
+        "image/webp",
+    }
+)
 
 
 def _raster_group(value: RasterArtifactView) -> str:
@@ -1844,6 +1857,8 @@ def _capture_import_state(value: RasterArtifactView) -> str:
         return "missing"
     if value.resource_state is ResourceState.UNAVAILABLE:
         return "unavailable"
+    if value.extensions.get("legacy_capture") is True:
+        return "legacy"
     return "ready"
 
 
@@ -1889,7 +1904,11 @@ def _capture_group_import_state(
         & {"capture_geometry", "capture_rendition"}
         for value in values
     )
-    if has_diagnostics or any(state != "ready" for state in states):
+    if has_diagnostics:
+        return "partial"
+    if states and all(state == "legacy" for state in states):
+        return "legacy"
+    if any(state != "ready" for state in states):
         return "partial"
     return "ready"
 
@@ -1980,8 +1999,7 @@ def _capture_rows(
             thumbnail_url = (
                 f"/api/v1/items/{quote(item_id, safe='')}/"
                 "raster-artifacts/"
-                f"{quote(value.key.artifact_id, safe='')}/resource?"
-                f"revision={quote(value.resource.revision, safe='')}"
+                f"{quote(value.key.artifact_id, safe='')}/preview"
             )
             if not _index_text(
                 thumbnail_url,
@@ -2007,6 +2025,161 @@ def _capture_rows(
     return rows
 
 
+def _capture_hint_rows(
+    item_id: str,
+    values: Any,
+) -> tuple[list[dict[str, Any]], frozenset[str]]:
+    """Validate adapter-owned capture hints into the public index shape."""
+
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise _invalid_index_projection(
+            "the Corrections capture hints are not a collection",
+            item_id=item_id,
+        )
+    rows = list(values)
+    if len(rows) > CORRECTIONS_INDEX_CAPTURE_LIMIT:
+        raise _invalid_index_projection(
+            "the Corrections index contains too many captures",
+            item_id=item_id,
+        )
+    required = frozenset(
+        {
+            "artifact_id",
+            "revision",
+            "capture_order",
+            "label",
+            "representation_id",
+            "canvas_id",
+            "effective_category",
+            "resource_state",
+            "import_state",
+            "freshness",
+            "imported_at",
+        }
+    )
+    optional = frozenset({"diagnostic_scopes"})
+    known_diagnostic_scopes = frozenset(
+        {
+            "capture_geometry",
+            "capture_rendition",
+            "mistral_figure",
+            "mistral_layout",
+        }
+    )
+    result: list[dict[str, Any]] = []
+    projected_diagnostic_scopes: set[str] = set()
+    for value in rows:
+        if (
+            not isinstance(value, Mapping)
+            or not required <= frozenset(value)
+            or frozenset(value) - required - optional
+        ):
+            raise _invalid_index_projection(
+                "a Corrections capture hint has an invalid shape",
+                item_id=item_id,
+            )
+        artifact_id = value["artifact_id"]
+        revision = value["revision"]
+        order = value["capture_order"]
+        label = value["label"]
+        representation_id = value["representation_id"]
+        canvas_id = value["canvas_id"]
+        resource_state = value["resource_state"]
+        import_state = value["import_state"]
+        freshness = value["freshness"]
+        imported_at = value["imported_at"]
+        diagnostic_scopes = value.get("diagnostic_scopes", ())
+        if (
+            not isinstance(artifact_id, str)
+            or not _CORRECTIONS_IDENTIFIER_RE.fullmatch(artifact_id)
+            or not isinstance(revision, str)
+            or not revision.startswith("index:")
+            or len(revision) > 512
+            or any(
+                not 0x21 <= ord(character) <= 0x7E
+                or character in {'"', "\\"}
+                for character in revision
+            )
+            or isinstance(order, bool)
+            or not isinstance(order, int)
+            or order < 0
+            or order > (1 << 53) - 1
+            or not _index_text(label, maximum=512)
+            or not isinstance(representation_id, str)
+            or not _CORRECTIONS_IDENTIFIER_RE.fullmatch(representation_id)
+            or not isinstance(canvas_id, str)
+            or not _CORRECTIONS_IDENTIFIER_RE.fullmatch(canvas_id)
+            or value["effective_category"] not in IMAGE_CATEGORIES
+            or resource_state not in {state.value for state in ResourceState}
+            or import_state
+            not in {"ready", "pending", "legacy", "partial", "missing", "unavailable"}
+            or freshness not in {state.value for state in ArtifactFreshness}
+            or not _index_text(imported_at, maximum=64)
+            or (
+                bool(imported_at)
+                and _parsed_import_timestamp(imported_at) is None
+            )
+            or isinstance(diagnostic_scopes, (str, bytes))
+            or not isinstance(diagnostic_scopes, Sequence)
+            or len(diagnostic_scopes) > len(known_diagnostic_scopes)
+            or any(
+                not isinstance(scope, str)
+                or scope not in known_diagnostic_scopes
+                for scope in diagnostic_scopes
+            )
+            or len(set(diagnostic_scopes)) != len(diagnostic_scopes)
+        ):
+            raise _invalid_index_projection(
+                "a Corrections capture hint is not portable",
+                item_id=item_id,
+            )
+        thumbnail = None
+        if resource_state == ResourceState.AVAILABLE.value:
+            thumbnail_url = (
+                f"/api/v1/items/{quote(item_id, safe='')}/"
+                "raster-artifacts/"
+                f"{quote(artifact_id, safe='')}/preview"
+            )
+            thumbnail = {
+                "url": thumbnail_url,
+                "alt": label or f"Capture {order}",
+            }
+        result.append(
+            {
+                "artifact_id": artifact_id,
+                "revision": revision,
+                "capture_order": order,
+                "label": label,
+                "representation_id": representation_id,
+                "canvas_id": canvas_id,
+                "effective_category": value["effective_category"],
+                "resource_state": resource_state,
+                "import_state": import_state,
+                "freshness": freshness,
+                "imported_at": imported_at,
+                "thumbnail": thumbnail,
+            }
+        )
+        projected_diagnostic_scopes.update(diagnostic_scopes)
+    identities = [value["artifact_id"].casefold() for value in result]
+    orders = [value["capture_order"] for value in result]
+    if len(identities) != len(set(identities)) or len(orders) != len(set(orders)):
+        raise _invalid_index_projection(
+            "the Corrections capture hints contain duplicate identities",
+            item_id=item_id,
+        )
+    return (
+        sorted(
+            result,
+            key=lambda value: (
+                value["capture_order"],
+                value["artifact_id"],
+            ),
+        ),
+        frozenset(projected_diagnostic_scopes),
+    )
+
+
 def _book_import_state(captures: Sequence[Mapping[str, Any]]) -> str:
     if not captures:
         return "ready"
@@ -2015,7 +2188,11 @@ def _book_import_state(captures: Sequence[Mapping[str, Any]]) -> str:
         return "missing"
     if all(value == "unavailable" for value in states):
         return "unavailable"
-    if any(value != "ready" for value in states):
+    if all(value == "legacy" for value in states):
+        return "legacy"
+    if any(value not in {"ready", "legacy"} for value in states):
+        return "partial"
+    if any(value == "legacy" for value in states):
         return "partial"
     return "ready"
 
@@ -2187,6 +2364,7 @@ def _validate_corrections_workspace(
 def _corrections_index_projection(
     engine_for_request: Callable[[], LibraryEngine],
     item_service_for_request: Callable[[], ItemQueryService] | None = None,
+    lazy_capture_index_for_item: Callable[[str], bool] | None = None,
 ) -> Response:
     reviews = _review_service(engine_for_request)
     rasters = _raster_service(engine_for_request)
@@ -2210,16 +2388,94 @@ def _corrections_index_projection(
         item_kind = item.kind.casefold()
         if item_kind not in {"book", "capture"}:
             continue
-        review = reviews.get_review(item.item_id)
-        if not isinstance(review, CorrectionReviewSnapshot):
-            raise RepositoryError(
-                "the correction service returned an invalid review",
-                code="invalid_correction_review",
-                details={"item_id": item.item_id},
+        use_hints = False
+        if lazy_capture_index_for_item is not None:
+            try:
+                use_hints = lazy_capture_index_for_item(item.item_id)
+            except EngineError:
+                raise
+            except Exception as exc:
+                raise RepositoryError(
+                    "the Corrections capture hint policy is unavailable",
+                    code="corrections_index_authority_unavailable",
+                    details={
+                        "item_id": item.item_id,
+                        "cause_type": type(exc).__name__,
+                    },
+                    retryable=True,
+                ) from exc
+            if not isinstance(use_hints, bool):
+                raise RepositoryError(
+                    "the Corrections capture hint policy returned invalid state",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item.item_id},
+                )
+        if use_hints:
+            list_hints = getattr(rasters, "list_capture_index_hints", None)
+            if not callable(list_hints):
+                raise RepositoryError(
+                    "the Corrections capture hint service is unavailable",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item.item_id},
+                )
+            captures, diagnostic_scopes = _capture_hint_rows(
+                item.item_id,
+                list_hints(item.item_id),
             )
-        captures, import_state, inventory_issues = (
-            _index_capture_inventory(rasters, item)
-        )
+            inventory_issues_list: list[str] = []
+            if "capture_geometry" in diagnostic_scopes:
+                inventory_issues_list.append(
+                    "Captured image geometry is incomplete"
+                )
+            if "mistral_layout" in diagnostic_scopes:
+                inventory_issues_list.append(
+                    "Mistral artifact layout is unavailable"
+                )
+            if "mistral_figure" in diagnostic_scopes:
+                inventory_issues_list.append(
+                    "Mistral image artifacts are incomplete"
+                )
+            if _item_has_capture_inventory(item) and not captures:
+                import_state = "missing"
+                inventory_issues = (
+                    "Captured image manifest is missing",
+                    *inventory_issues_list,
+                )
+            else:
+                import_state = _book_import_state(captures)
+                if (
+                    diagnostic_scopes
+                    & {"capture_geometry", "capture_rendition"}
+                    and import_state not in {"missing", "unavailable"}
+                ):
+                    import_state = "partial"
+                if diagnostic_scopes & {"mistral_layout", "mistral_figure"}:
+                    import_state = "partial" if captures else "unavailable"
+                inventory_issues = tuple(inventory_issues_list)
+            review_summary = {
+                "revision": _collection_revision(
+                    "review-index-",
+                    ({"item_id": item.item_id, "item_revision": item.revision},),
+                ),
+                "state": "clear",
+                "reason": "",
+                "history_count": 0,
+                "latest_event": None,
+            }
+            review_state = "clear"
+        else:
+            review = reviews.get_review(item.item_id)
+            if not isinstance(review, CorrectionReviewSnapshot):
+                raise RepositoryError(
+                    "the correction service returned an invalid review",
+                    code="invalid_correction_review",
+                    details={"item_id": item.item_id},
+                )
+            captures, import_state, inventory_issues = (
+                _index_capture_inventory(rasters, item)
+            )
+            review_summary = _index_review_summary(review)
+            review_state = review.state.value
         capture_count += len(captures)
         if capture_count > CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT:
             raise _invalid_index_projection(
@@ -2231,7 +2487,6 @@ def _corrections_index_projection(
                     )
                 },
             )
-        review_summary = _index_review_summary(review)
         without_revision = {
             "id": item.item_id,
             "kind": item_kind,
@@ -2271,7 +2526,7 @@ def _corrections_index_projection(
                 details={"maximum_bytes": CORRECTIONS_INDEX_MAX_BYTES},
             )
         books.append(book)
-        if review.state.value != "clear":
+        if review_state != "clear":
             entry = {
                 "key": _attention_key(item.item_id),
                 "target": {
@@ -2315,6 +2570,7 @@ def _corrections_index(
     workspace_id_for_request: Callable[[], str],
     item_service_for_request: Callable[[], ItemQueryService] | None = None,
     index_context_for_request: Callable[[], Any] | None = None,
+    lazy_capture_index_for_item: Callable[[str], bool] | None = None,
 ) -> Response:
     _validate_corrections_workspace(workspace_id_for_request)
     operation_context = (
@@ -2326,6 +2582,7 @@ def _corrections_index(
         return _corrections_index_projection(
             engine_for_request,
             item_service_for_request,
+            lazy_capture_index_for_item,
         )
 
 
@@ -2746,6 +3003,8 @@ def _resource_response(
     resolver_for_request: Callable[[], Any] | None,
     item_id: str,
     artifact_id: str,
+    *,
+    require_revision: bool = True,
 ) -> Response:
     key = RasterArtifactKey(item_id, artifact_id)
     artifact = _raster_service(engine_for_request).get_raster_artifact(key)
@@ -2770,23 +3029,24 @@ def _resource_response(
             code="raster_resource_not_found",
             details=key.as_dict(),
         )
-    requested_revision = request.args.get("revision", "")
-    if not requested_revision:
-        raise PreconditionRequiredError(
-            "a raster resource revision is required",
-            code="raster_resource_revision_required",
-            details={"query": "revision", **key.as_dict()},
-        )
-    if requested_revision != artifact.resource.revision:
-        raise ConflictError(
-            "the raster resource revision changed",
-            code="raster_resource_revision_conflict",
-            details={
-                **key.as_dict(),
-                "expected_revision": requested_revision,
-                "actual_revision": artifact.resource.revision,
-            },
-        )
+    if require_revision:
+        requested_revision = request.args.get("revision", "")
+        if not requested_revision:
+            raise PreconditionRequiredError(
+                "a raster resource revision is required",
+                code="raster_resource_revision_required",
+                details={"query": "revision", **key.as_dict()},
+            )
+        if requested_revision != artifact.resource.revision:
+            raise ConflictError(
+                "the raster resource revision changed",
+                code="raster_resource_revision_conflict",
+                details={
+                    **key.as_dict(),
+                    "expected_revision": requested_revision,
+                    "actual_revision": artifact.resource.revision,
+                },
+            )
     if resolver_for_request is None:
         raise EngineError(
             "the raster resource resolver is unavailable",
@@ -2811,6 +3071,53 @@ def _resource_response(
                 "resource_revision": artifact.resource.revision,
             },
         )
+    return _resolved_resource_response(
+        resolved,
+        key,
+        expected_media_type=artifact.media_type,
+        expected_content_sha256=artifact.content_sha256,
+        expected_revision=artifact.resource.revision,
+    )
+
+
+def _preview_response(
+    resolver_for_request: Callable[[], Any] | None,
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    key = RasterArtifactKey(item_id, artifact_id)
+    if resolver_for_request is None:
+        raise EngineError(
+            "the raster resource resolver is unavailable",
+            code="raster_resource_resolver_unavailable",
+            retryable=True,
+        )
+    resolver = resolver_for_request()
+    resolve = getattr(resolver, "resolve_capture_preview", None)
+    if not callable(resolve):
+        raise EngineError(
+            "the raster preview resolver is unavailable",
+            code="raster_resource_resolver_unavailable",
+            retryable=True,
+        )
+    resolved = resolve(item_id, artifact_id)
+    if resolved is None:
+        raise NotFoundError(
+            "the raster preview is not available",
+            code="raster_resource_not_found",
+            details=key.as_dict(),
+        )
+    return _resolved_resource_response(resolved, key)
+
+
+def _resolved_resource_response(
+    resolved: Any,
+    key: RasterArtifactKey,
+    *,
+    expected_media_type: str = "",
+    expected_content_sha256: str = "",
+    expected_revision: str = "",
+) -> Response:
     stream = getattr(resolved, "stream", None)
     media_type = getattr(resolved, "media_type", None)
     content_sha256 = getattr(resolved, "content_sha256", None)
@@ -2821,13 +3128,20 @@ def _resource_response(
         or not callable(getattr(stream, "seek", None))
         or not callable(getattr(stream, "close", None))
         or not isinstance(media_type, str)
-        or media_type != artifact.media_type
+        or media_type not in _RASTER_MEDIA_TYPES
+        or bool(expected_media_type) and media_type != expected_media_type
         or not isinstance(content_sha256, str)
-        or content_sha256 != artifact.content_sha256
+        or _SHA256_RE.fullmatch(content_sha256) is None
+        or bool(expected_content_sha256)
+        and content_sha256 != expected_content_sha256
         or isinstance(size, bool)
         or not isinstance(size, int)
         or size < 0
-        or revision != artifact.resource.revision
+        or not isinstance(revision, str)
+        or not revision
+        or len(revision) > 512
+        or _UNSAFE_TEXT_RE.search(revision) is not None
+        or bool(expected_revision) and revision != expected_revision
     ):
         _close_stream(stream)
         raise RepositoryError(
@@ -2875,6 +3189,9 @@ def create_corrections_blueprint(
     ) = None,
     correction_actor_id_for_request: Callable[[], str] | None = None,
     correction_workspace_id_for_request: Callable[[], str] | None = None,
+    correction_lazy_capture_index_for_item: (
+        Callable[[str], bool] | None
+    ) = None,
     correction_transform_submitter: Callable[
         [
             CorrectionTransformService,
@@ -2954,6 +3271,13 @@ def create_corrections_blueprint(
             "correction_workspace_id_for_request must be callable or None"
         )
     if (
+        correction_lazy_capture_index_for_item is not None
+        and not callable(correction_lazy_capture_index_for_item)
+    ):
+        raise TypeError(
+            "correction_lazy_capture_index_for_item must be callable or None"
+        )
+    if (
         correction_transform_submitter is not None
         and not callable(correction_transform_submitter)
     ):
@@ -3011,6 +3335,7 @@ def create_corrections_blueprint(
                 workspace_id_for_request,
                 correction_item_service_for_request,
                 correction_index_context_for_request,
+                correction_lazy_capture_index_for_item,
             )
         except EngineError as error:
             return _error_response(error)
@@ -3076,6 +3401,24 @@ def create_corrections_blueprint(
         try:
             return _resource_response(
                 engine_for_request,
+                raster_resource_resolver_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/preview"
+    )
+    def get_raster_preview(item_id: str, artifact_id: str):
+        try:
+            if request.args:
+                raise ValidationError(
+                    "raster preview does not accept query parameters",
+                    code="invalid_raster_preview_query",
+                )
+            return _preview_response(
                 raster_resource_resolver_for_request,
                 item_id,
                 artifact_id,

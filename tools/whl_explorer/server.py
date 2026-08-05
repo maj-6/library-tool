@@ -317,6 +317,9 @@ app.register_blueprint(
         correction_workspace_id_for_request=(
             lambda: _local_correction_workspace_id()
         ),
+        correction_lazy_capture_index_for_item=(
+            lambda item_id: _corrections_uses_lazy_capture_index(item_id)
+        ),
         correction_transform_submitter=(
             lambda service, command, queued: _submit_correction_transform(
                 service,
@@ -2062,6 +2065,7 @@ def corrections_workbench():
     """Independent desktop document for correction and review workflows."""
     return render_template(
         "corrections.html",
+        corrections_main_css_v=_asset_v("style.css"),
         corrections_css_v=_asset_v("corrections/corrections.css"),
         corrections_books_css_v=_asset_v("corrections/books.css"),
         corrections_artifacts_css_v=_asset_v("corrections/artifacts.css"),
@@ -5457,9 +5461,9 @@ def _engine_item_artifacts(
     return rows
 
 
-def _engine_item_snapshot() -> dict[str, dict]:
-    """Read the transitional build store as portable engine item records."""
-    builds = lib.load_json(BUILDS_PATH, {})
+def _engine_item_snapshot_from(builds: Mapping) -> dict[str, dict]:
+    """Project one already-read build mapping into portable item records."""
+
     if not isinstance(builds, dict):
         raise ValueError("the build catalogue is not an object")
     out = {}
@@ -5485,6 +5489,12 @@ def _engine_item_snapshot() -> dict[str, dict]:
             "artifacts": _engine_item_artifacts(str(item_id), build),
         }
     return out
+
+
+def _engine_item_snapshot() -> dict[str, dict]:
+    """Read the transitional build store as portable engine item records."""
+
+    return _engine_item_snapshot_from(lib.load_json(BUILDS_PATH, {}))
 
 
 class _EngineItemRepository:
@@ -5947,7 +5957,16 @@ def _corrections_build_storage_id(value) -> str:
 def _corrections_association(
         capture_id: str) -> CaptureArchiveAssociation | None:
     try:
-        return FilesystemCaptureArchiveRepository.inspect_association(
+        inspect = (
+            FilesystemCaptureArchiveRepository.inspect_association_identity
+            if getattr(
+                _corrections_authority_context,
+                "association_identity_only",
+                False,
+            )
+            else FilesystemCaptureArchiveRepository.inspect_association
+        )
+        return inspect(
             Path(BUILDS_PATH).parent,
             capture_id,
         )
@@ -6331,6 +6350,24 @@ def _corrections_item_exists(item_id: str) -> bool:
     return _corrections_target_for(item_id) is not None
 
 
+def _corrections_uses_lazy_capture_index(item_id: str) -> bool:
+    """Use bounded capture hints only before human corrections exist."""
+
+    if not _corrections_item_exists(item_id):
+        return False
+    digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+    aggregate = (
+        _ensure_engine_session().write_set.root
+        / ".engine"
+        / "corrections"
+        / "aggregates"
+        / f"{digest}.json"
+    )
+    # Any object at the aggregate authority path (including malformed or
+    # redirecting state) disables hints so the reconciled read diagnoses it.
+    return not os.path.lexists(aggregate)
+
+
 def _corrections_capture_id(item_id: str) -> str | None:
     """Return the exact capture authority behind one canonical item."""
 
@@ -6523,9 +6560,22 @@ def _corrections_workspace_locks():
 def _corrections_index_authority_context():
     """Share one capture authority snapshot across the whole index read."""
 
-    with _ensure_engine_session().write_set.workspace_lease():
-        with _corrections_workspace_locks():
-            yield
+    missing = object()
+    previous = getattr(
+        _corrections_authority_context,
+        "association_identity_only",
+        missing,
+    )
+    _corrections_authority_context.association_identity_only = True
+    try:
+        with _ensure_engine_session().write_set.workspace_lease():
+            with _corrections_workspace_locks():
+                yield
+    finally:
+        if previous is missing:
+            del _corrections_authority_context.association_identity_only
+        else:
+            _corrections_authority_context.association_identity_only = previous
 
 
 @contextlib.contextmanager
@@ -12268,13 +12318,14 @@ def _item_job_start_guard(
 def _correction_transform_job_start_guard(item_id: str):
     """Keep canonical Corrections membership stable through job registration."""
 
+    normalized = str(item_id or "").strip()
     rejection = EngineNotFoundError(
         "the correction item no longer exists",
         code="correction_item_not_found",
-        details={"item_id": str(item_id or "")},
+        details={"item_id": normalized},
     )
     with _corrections_workspace_locks():
-        target = _corrections_target_for(str(item_id or "").strip())
+        target = _corrections_target_for(normalized)
         if target is None:
             raise rejection
         yield
@@ -17011,14 +17062,32 @@ def api_manual_restore():
 
 @app.route("/api/manual/<entry_id>", methods=["DELETE"])
 def api_manual_delete(entry_id: str):
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        if entry_id not in entries:
-            abort(404)
-        record = entries[entry_id]
-        title = record.get("title", "")
-        del entries[entry_id]
-        _save_manual_entries(entries)
+    try:
+        with _corrections_workspace_locks():
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+            if entry_id not in entries:
+                abort(404)
+            record = entries[entry_id]
+            target = next(
+                (
+                    candidate
+                    for candidate in _corrections_targets_for_context().values()
+                    if candidate.storage_kind == "manual"
+                    and candidate.storage_id == entry_id
+                ),
+                None,
+            )
+            deletion_guard = (
+                _job_manager.item_deletion_guard(target.canonical_id)
+                if target is not None
+                else contextlib.nullcontext()
+            )
+            with deletion_guard:
+                title = record.get("title", "")
+                del entries[entry_id]
+                _save_manual_entries(entries)
+    except EngineError as exc:
+        return _engine_error_response(exc)
     _trash_put("manual_entry", f"Manual entry: {title or entry_id}",
                {"entry_id": entry_id}, {},
                {"record.json": json.dumps(record, ensure_ascii=False)})
@@ -21396,6 +21465,54 @@ def _r2_public_cfg() -> dict:
             "public_base": str(s.get("r2PublicBase") or "").strip()}
 
 
+def _r2_configuration_present() -> bool:
+    public = _r2_public_cfg()
+    return bool(
+        any(public.values()) or
+        _secret_is_configured("r2KeyId") or
+        _secret_is_configured("r2Secret")
+    )
+
+
+def _r2_configuration_issue() -> str:
+    """Describe a partial or malformed desktop R2 configuration.
+
+    An entirely blank configuration means the optional entry-file mirror is
+    disabled. Once any field is present, silently treating it as disabled hides
+    stale account/bucket settings and makes every sync outcome misleading.
+    """
+    public = _r2_public_cfg()
+    key_present = _secret_is_configured("r2KeyId")
+    secret_present = _secret_is_configured("r2Secret")
+    if not (any(public.values()) or key_present or secret_present):
+        return ""
+    missing = []
+    if not public["account"]:
+        missing.append("account ID")
+    if not public["bucket"]:
+        missing.append("bucket name")
+    if not key_present:
+        missing.append("access key ID")
+    if not secret_present:
+        missing.append("secret access key")
+    if missing:
+        return (
+            "R2 configuration is incomplete; add " + ", ".join(missing) +
+            " in Settings > AI & Cloud, or clear the remaining R2 fields to "
+            "disable entry-file storage"
+        )
+    try:
+        # Placeholder values validate public shape without leasing plaintext.
+        r2.validate_config({
+            **public,
+            "key_id": "configured",
+            "secret": "configured",
+        })
+    except r2.StoreError as exc:
+        return f"R2 configuration is invalid: {exc}"
+    return ""
+
+
 def _r2_configured() -> bool:
     cfg = _r2_public_cfg()
     return bool(cfg["account"] and cfg["bucket"] and
@@ -25387,9 +25504,9 @@ def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
             photo_paths,
         )
     except sbase.SyncError as exc:
-        if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
+        if sbase.is_missing_storage_object(exc):
             # the photos are gone — this row can never import; stop retrying it
-            sbase.mark_capture(capture_cfg, cap["id"], "error")
+            sbase.mark_capture(capture_cfg, cap["id"], "void")
         raise
     new_id, errors = ingest_capture(
         cap, raw_photos, mistral_key, photo_paths, transport="cloud")
@@ -27143,6 +27260,50 @@ def _cloud_sync_item_policy_guard():
         yield deletion_index.allows
 
 
+def _r2_error_text(exc: Exception) -> str:
+    if isinstance(exc, r2.StoreError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _cloud_sync_entry_files() -> dict:
+    """Run the optional R2 phase with a complete phase-local outcome."""
+    issue = _r2_configuration_issue()
+    if issue:
+        return {"error": issue}
+    present = _r2_configuration_present()
+    try:
+        with _lease_r2_cfg() as r2cfg:
+            if not r2.configured(r2cfg):
+                return ({"error": "protected R2 credential is unavailable"}
+                        if present else
+                        {"skipped": "Cloudflare R2 not configured"})
+            return store_sync.sync_entry_files(
+                r2cfg,
+                item_policy_guard=_cloud_sync_item_policy_guard,
+            )
+    except Exception as exc:
+        return {"error": _r2_error_text(exc)}
+
+
+def _r2_connection_test() -> dict | None:
+    """Test the exact bucket used by entry-file sync, when R2 is enabled."""
+    issue = _r2_configuration_issue()
+    if issue:
+        return {"ok": False, "error": issue}
+    present = _r2_configuration_present()
+    try:
+        with _lease_r2_cfg() as r2cfg:
+            if not r2.configured(r2cfg):
+                return ({"ok": False,
+                         "error": "protected R2 credential is unavailable"}
+                        if present else None)
+            r2.check_bucket(r2cfg)
+            return {"ok": True, "bucket": str(r2cfg.get("bucket") or "")}
+    except Exception as exc:
+        return {"ok": False, "error": _r2_error_text(exc)}
+
+
 def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                                  capture_cfg: dict | None,
                                  claimed_run_id: str = "") -> dict:
@@ -27264,6 +27425,23 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                             details = list(item_event.get("details") or [])
                             details.append(sync_error)
                             item_event["details"] = details
+                except sbase.SyncError as exc:
+                    if sbase.is_storage_configuration_error(exc):
+                        # Every following capture would hit the same project,
+                        # bucket, or credential failure. Report it once without
+                        # changing any more capture rows.
+                        raise
+                    failed += 1
+                    detail = f"{type(exc).__name__}: {exc}"
+                    errors.append(f"capture {capture_id[:8]}: {detail}")
+                    item_event = {
+                        "kind": "capture",
+                        "status": "failed",
+                        "capture_id": capture_id,
+                        "book_id": "",
+                        "title": title_hint,
+                        "message": detail,
+                    }
                 except Exception as exc:  # one bad capture must not stop the rest
                     failed += 1
                     detail = f"{type(exc).__name__}: {exc}"
@@ -27438,19 +27616,12 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                 }
                 errors.append(f"capture corrections: {exc}")
             _cloudsync_set_stage(
-                "entry_files", "Synchronizing entry files",
+                "entry_files", "Synchronizing entry files (Cloudflare R2)",
                 total=0, completed=0, unit="operations", indeterminate=True)
-            with _lease_r2_cfg() as r2cfg:
-                if r2.configured(r2cfg):
-                    try:
-                        entries_res = store_sync.sync_entry_files(
-                            r2cfg,
-                            item_policy_guard=_cloud_sync_item_policy_guard,
-                        )
-                    except Exception as exc:
-                        errors.append(f"entry files: {exc}")
-                else:
-                    entries_res = {"skipped": "R2 not configured"}
+            entries_res = _cloud_sync_entry_files()
+            if entries_res.get("error"):
+                errors.append(
+                    f"Cloudflare R2 entry files: {entries_res['error']}")
         else:
             entries_res = {"skipped": "owner sync not configured"}
         _cloudsync_set_stage(
@@ -27918,20 +28089,44 @@ def api_capture_archive_backfill():
 
 @app.route("/api/cloudsync/test")
 def api_cloudsync_test():
+    primary: dict
     if _capture_configured():
         with _lease_capture_cfg() as capture_cfg:
             if capture_cfg:
-                return jsonify(sbase.test_connection(capture_cfg))
-            return jsonify({"ok": False,
-                            "error": "protected auth credential is unavailable"})
-    if not _cloud_configured():
-        return jsonify({"ok": False,
-                        "error": "Sign in to your Library Tool account to test phone sync"})
-    with _lease_cloud_cfg() as owner_cfg:
-        if not owner_cfg:
-            return jsonify({"ok": False,
-                            "error": "protected cloud credential is unavailable"})
-        return jsonify(sbase.test_connection(owner_cfg))
+                primary = dict(sbase.test_connection(capture_cfg) or {})
+            else:
+                primary = {
+                    "ok": False,
+                    "error": "protected auth credential is unavailable",
+                }
+    elif _cloud_configured():
+        with _lease_cloud_cfg() as owner_cfg:
+            if owner_cfg:
+                primary = dict(sbase.test_connection(owner_cfg) or {})
+            else:
+                primary = {
+                    "ok": False,
+                    "error": "protected cloud credential is unavailable",
+                }
+    else:
+        primary = {
+            "ok": False,
+            "error": "Sign in to your Library Tool account to test phone sync",
+        }
+
+    entry_files = _r2_connection_test()
+    if entry_files is None:
+        return jsonify(primary)
+    supabase = copy.deepcopy(primary)
+    out = dict(primary)
+    out["services"] = {"supabase": supabase, "entry_files": entry_files}
+    if not entry_files.get("ok"):
+        out["ok"] = False
+        entry_error = f"Entry-file storage: {entry_files.get('error') or 'failed'}"
+        primary_error = str(primary.get("error") or "").strip()
+        out["error"] = "; ".join(
+            value for value in (primary_error, entry_error) if value)
+    return jsonify(out)
 
 
 @app.route("/api/capture/image")

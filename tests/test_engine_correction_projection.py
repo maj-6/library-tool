@@ -116,12 +116,19 @@ class _RasterProjector:
         self.rows = tuple(rows)
         self.resolved = resolved
         self.resolve_calls = []
+        self.list_calls = []
+        self.get_calls = []
 
     def list_raster_artifacts(self, item_id):
+        self.list_calls.append(item_id)
         return tuple(row for row in self.rows if row.key.item_id == item_id)
 
     def get_raster_artifact(self, key):
+        self.get_calls.append(key)
         return next((row for row in self.rows if row.key == key), None)
+
+    def get_capture_raster_artifact(self, key):
+        return self.get_raster_artifact(key)
 
     def resolve_raster_resource(self, item_id, resource):
         self.resolve_calls.append((item_id, resource))
@@ -171,6 +178,30 @@ class _ReadRepository:
     def unit_of_work(self, *, operation_id):
         self.operations.append(operation_id)
         yield _ReadUnit(self.state)
+
+
+class _DurableProbeUnit(_ReadUnit):
+    def __init__(self, state, values):
+        super().__init__(state)
+        self.values = list(values)
+        self.get_calls = []
+
+    def has_durable_aggregate(self, item_id):
+        assert item_id == self.state.item_id
+        return self.values.pop(0)
+
+    def get(self, item_id):
+        self.get_calls.append(item_id)
+        return super().get(item_id)
+
+
+class _DurableProbeRepository:
+    def __init__(self, unit):
+        self.unit = unit
+
+    @contextmanager
+    def unit_of_work(self, *, operation_id):
+        yield self.unit
 
 
 def _project(
@@ -530,6 +561,54 @@ def test_projection_service_exposes_linked_artifact_role_assignments():
     assert projected.role_assignments == (manual_role,)
     assert projected.effective_role == "figure"
     assert projected.as_dict()["effective_role"] == "figure"
+
+
+def test_keyed_projection_skips_aggregate_loading_only_for_stable_absence():
+    raster = _raster("image-a")
+    aggregate = _project((raster,))
+    projector = _RasterProjector((raster,))
+    unit = _DurableProbeUnit(aggregate, [False, False])
+    service = CorrectionProjectionService(
+        projector,
+        _SpatialProjector(()),
+        _DurableProbeRepository(unit),
+    )
+
+    projected = service.get_raster_artifact(raster.key)
+
+    assert projected == raster
+    assert projector.get_calls == [raster.key]
+    assert projector.list_calls == []
+    assert unit.get_calls == []
+
+
+def test_keyed_projection_falls_back_when_durable_state_appears_mid_read():
+    raster = _raster("image-a")
+    live = _project((raster,))
+    correction = replace(
+        live.artifact("image-a"),
+        revision="artifact-correction-r9",
+    )
+    durable = replace(
+        live,
+        revision="aggregate-correction-r9",
+        artifacts=(correction,),
+    )
+    projector = _RasterProjector((raster,))
+    unit = _DurableProbeUnit(durable, [False, True])
+    service = CorrectionProjectionService(
+        projector,
+        _SpatialProjector(()),
+        _DurableProbeRepository(unit),
+    )
+
+    projected = service.get_raster_artifact(raster.key)
+
+    assert projected is not None
+    assert projected.revision == "artifact-correction-r9"
+    assert projector.get_calls == [raster.key, raster.key]
+    assert projector.list_calls == []
+    assert unit.get_calls == ["book-1"]
 
 
 def test_reconciliation_marks_disappeared_targets_unavailable_until_they_return():

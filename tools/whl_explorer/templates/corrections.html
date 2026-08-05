@@ -6,6 +6,8 @@
   <title>Corrections · Library Tool</title>
   <link rel="icon" href="{{ url_for('static', filename='icon.png') }}" />
   <link rel="stylesheet"
+        href="{{ url_for('static', filename='style.css') }}?v={{ corrections_main_css_v }}" />
+  <link rel="stylesheet"
         href="{{ url_for('static', filename='corrections/corrections.css') }}?v={{ corrections_css_v }}" />
   <link rel="stylesheet"
         href="{{ url_for('static', filename='corrections/books.css') }}?v={{ corrections_books_css_v }}" />
@@ -18,35 +20,46 @@
   <link rel="stylesheet"
         href="{{ url_for('static', filename='corrections/image-adjust-tool.css') }}?v={{ corrections_image_adjust_css_v }}" />
 </head>
-<body>
+<body data-theme="sage">
   <a class="skip-link" href="#corrections-editor">Skip to editor</a>
 
   <div class="corrections-app" data-corrections-root data-compact="false">
-    <header class="app-titlebar" aria-label="Corrections window">
+    <header class="app-titlebar" id="titlebar" aria-label="Corrections window">
       <div class="titlebar-identity">
-        <span class="app-mark" aria-hidden="true">WHL</span>
-        <span class="titlebar-title">Corrections</span>
         <span class="titlebar-context" data-context-label>No workspace selected</span>
       </div>
-      <div class="window-controls" aria-label="Window controls">
-        <button type="button" data-window-action="minimize" aria-label="Minimize window">
-          <span aria-hidden="true">—</span>
+      <span class="tb-title titlebar-title">
+        <span class="tb-tab">Corrections :: </span>Library Tool
+      </span>
+      <div class="win-controls window-controls" aria-label="Window controls">
+        <button type="button" class="win-btn" data-window-action="minimize"
+                title="Minimize" aria-label="Minimize window">
+          <svg viewBox="0 0 10 10" aria-hidden="true">
+            <rect x="0" y="4.5" width="10" height="1" />
+          </svg>
         </button>
-        <button type="button" data-window-action="maximize" aria-label="Maximize window">
-          <span aria-hidden="true">□</span>
+        <button type="button" class="win-btn" data-window-action="maximize"
+                title="Maximize" aria-label="Maximize window">
+          <svg viewBox="0 0 10 10" aria-hidden="true">
+            <rect x="0.5" y="0.5" width="9" height="9" fill="none"
+                  stroke="currentColor" />
+          </svg>
         </button>
-        <button type="button" class="window-close" data-window-action="close"
-                aria-label="Close window">
-          <span aria-hidden="true">×</span>
+        <button type="button" class="win-btn win-close window-close"
+                data-window-action="close" title="Close" aria-label="Close window">
+          <svg viewBox="0 0 10 10" aria-hidden="true">
+            <path d="M0.7 0.7 L9.3 9.3 M9.3 0.7 L0.7 9.3"
+                  stroke="currentColor" stroke-width="1.1" />
+          </svg>
         </button>
       </div>
     </header>
 
     <nav class="workspace-toolbar" aria-label="Workspace controls">
       <div class="toolbar-group compact-tools" aria-label="Compact window drawers">
-        <button type="button" data-drawer-toggle="navigator" aria-expanded="false"
+        <button type="button" class="cad-btn" data-drawer-toggle="navigator" aria-expanded="false"
                 aria-controls="corrections-navigator">Books and artifacts</button>
-        <button type="button" data-drawer-toggle="properties" aria-expanded="false"
+        <button type="button" class="cad-btn" data-drawer-toggle="properties" aria-expanded="false"
                 aria-controls="corrections-properties">Properties</button>
       </div>
       <div class="toolbar-context" aria-live="polite" data-workspace-status>
@@ -57,15 +70,15 @@
         <div class="classification-workspace-toolbar"
              data-classification-toolbar
              aria-label="Classification commands"></div>
-        <button type="button" data-classification-palette-trigger
+        <button type="button" class="cad-btn" data-classification-palette-trigger
                 aria-label="Open classification command palette">
           Commands
         </button>
       </div>
       <div class="toolbar-group">
-        <button type="button" data-layout-action="maximize-primary" aria-pressed="false"
+        <button type="button" class="cad-btn" data-layout-action="maximize-primary" aria-pressed="false"
                 aria-controls="corrections-editor">Maximize editor</button>
-        <button type="button" data-layout-action="reset">Reset layout</button>
+        <button type="button" class="cad-btn" data-layout-action="reset">Reset layout</button>
       </div>
     </nav>
 
@@ -86,7 +99,7 @@
           <div class="pane-body" id="books-body">
             <label class="panel-search">
               <span class="sr-only">Filter books</span>
-              <input type="search" data-books-filter placeholder="Filter books"
+              <input type="search" class="cad-input" data-books-filter placeholder="Filter books"
                      autocomplete="off" />
             </label>
             <ul class="books-list" data-books-list aria-label="Books">
@@ -139,7 +152,8 @@
           </div>
           <label class="editor-selector-label">
             <span>Editor type</span>
-            <select data-editor-selector aria-describedby="editor-selector-help"></select>
+            <select class="cad-input" data-editor-selector
+                    aria-describedby="editor-selector-help"></select>
           </label>
           <span class="sr-only" id="editor-selector-help">
             Only editors compatible with the selected resource are available.
@@ -219,8 +233,8 @@
               aria-label="Close side panels"></button>
     </div>
 
-    <footer class="statusbar" aria-label="Workbench status">
-      <span data-status-message>Ready</span>
+    <footer class="statusbar" id="statusbar" aria-label="Workbench status">
+      <span id="status-msg" data-status-message>Ready</span>
       <span data-profile-label>Profile: corrections/default</span>
       <span class="sr-only" data-corrections-command-target
             aria-live="polite" aria-atomic="true"></span>

@@ -463,7 +463,17 @@
           .includes(text(read(target, "kind"), 64).toLowerCase());
     }
 
+    function commandRevision(target) {
+      return text(read(
+        target,
+        "revision", "artifactRevision", "artifact_revision",
+        "annotationRevision", "annotation_revision",
+      ), 512);
+    }
+
     function targetAccepted(target, command) {
+      const revision = commandRevision(target);
+      if (!revision || revision.startsWith("index:")) return false;
       return command.targetKind === TARGET_KINDS.IMAGE
         ? imageTarget(target) : annotationTarget(target);
     }
@@ -516,14 +526,10 @@
       const key = targetKey(target);
       const keyId = key.includes(":") ? key.split(":").slice(1).join(":") : "";
       const itemId = identifier(read(target, "itemId", "item_id"), "item id");
-      const revision = text(read(
-        target,
-        "revision", "artifactRevision", "artifact_revision",
-        "annotationRevision", "annotation_revision",
-      ), 512);
-      if (!revision) {
+      const revision = commandRevision(target);
+      if (!revision || revision.startsWith("index:")) {
         throw new CorrectionCommandError(
-          "The selected target has no revision pin",
+          "The selected target has no authoritative revision pin",
           "target_revision_required",
         );
       }
@@ -582,9 +588,9 @@
         value,
         "revision", "artifactRevision", "artifact_revision",
       ), 512);
-      if (!revision) {
+      if (!revision || revision.startsWith("index:")) {
         throw new CorrectionCommandError(
-          "The linked artifact has no revision pin",
+          "The linked artifact has no authoritative revision pin",
           "linked_artifact_revision_required",
         );
       }

@@ -797,7 +797,7 @@ test("raster details advertise paged regions and pin resource URLs to revisions"
   assert.equal(fullCanvas.extensions.corrections_ui.paged_regions, true,
     "known full-canvas rasters retain revision-filtered overlays");
 
-  const resolved = ports.artifacts.resources.resolveRaster({
+  const resolved = await ports.artifacts.resources.resolveRaster({
     itemId: "book-1",
     artifactId: "figure:1",
     resourceRef: {

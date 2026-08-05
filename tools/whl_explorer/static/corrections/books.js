@@ -705,8 +705,18 @@
     }
 
     setSelection(value, options = {}) {
-      this.selection = value == null ? null : normalizeSelectionAddress(value);
-      this.selectionOwned = options.ownedByFeature === true;
+      const next = value == null ? null : normalizeSelectionAddress(value);
+      const ownsSelection = Object.prototype.hasOwnProperty.call(
+        options, "ownedByFeature")
+        ? options.ownedByFeature === true : this.selectionOwned;
+      const unchanged = this.selection === null && next === null ||
+        this.selection !== null && next !== null &&
+          addressEqual(this.selection, next);
+      if (unchanged && this.selectionOwned === ownsSelection) {
+        return this.selection;
+      }
+      this.selection = next;
+      this.selectionOwned = ownsSelection;
       this.emit();
       return this.selection;
     }
@@ -1102,6 +1112,12 @@
   }
 
   function captureCommandTarget(book, capture) {
+    // ``index:`` revisions are navigation hints derived without reading image
+    // bytes. They are never valid optimistic-concurrency preconditions. The
+    // artifact feature publishes an authoritative target after detail hydration.
+    if (String(capture && capture.revision || "").startsWith("index:")) {
+      return null;
+    }
     return freezeDeep({
       key: `artifact:${capture.artifact_id}`,
       objectType: "raster-artifact",
@@ -1118,6 +1134,22 @@
         representationId: capture.representation_id || "",
         canvasId: capture.canvas_id || "",
       },
+    });
+  }
+
+  function captureIsNavigationHint(capture) {
+    return String(capture && capture.revision || "").startsWith("index:");
+  }
+
+  function captureNavigationPreview(book, capture) {
+    if (!captureIsNavigationHint(capture) || !capture.thumbnail) return null;
+    return freezeDeep({
+      itemId: book.id,
+      representationId: capture.representation_id || null,
+      canvasId: capture.canvas_id || null,
+      artifactId: capture.artifact_id,
+      url: capture.thumbnail.url,
+      label: capture.label.trim() || `Capture ${capture.capture_order + 1}`,
     });
   }
 
@@ -1162,6 +1194,24 @@
       this.navControls = null;
       this.lastViewReference = null;
       this.pendingStepFocus = null;
+      this.renderBatch = Number.isSafeInteger(options.renderBatch) &&
+        options.renderBatch >= 8 && options.renderBatch <= 200
+        ? options.renderBatch : 48;
+      this.renderLimit = this.renderBatch;
+      this.captureRenderBatch = Number.isSafeInteger(options.captureRenderBatch) &&
+        options.captureRenderBatch >= 4 && options.captureRenderBatch <= 100
+        ? options.captureRenderBatch : 12;
+      this.captureRenderLimits = new Map();
+      this.captureRenderRevision = 0;
+      this.renderedIndex = null;
+      this.renderedStatus = "";
+      this.renderedError = null;
+      this.renderedFilter = "";
+      this.renderedView = "";
+      this.renderedBookPin = "";
+      this.renderedCapturePin = "";
+      this.renderedLimit = 0;
+      this.renderedCaptureRevision = 0;
       this.unsubscribe = null;
       this.listeners = [];
       this.rowListeners = [];
@@ -1187,6 +1237,7 @@
       const filter = this.root.querySelector("[data-books-filter]");
       this.listen(filter, "input", () => {
         this.filter = String(filter.value || "");
+        this.renderLimit = this.renderBatch;
         this.render(this.store.snapshot());
       });
       this.listen(filter, "keydown", (event) => {
@@ -1194,6 +1245,7 @@
         event.preventDefault();
         filter.value = "";
         this.filter = "";
+        this.renderLimit = this.renderBatch;
         this.render(this.store.snapshot());
       });
       this.mountViewControls();
@@ -1253,32 +1305,45 @@
     setView(view) {
       if (!BOOKS_PANEL_VIEWS.includes(view) || view === this.view) return this.view;
       this.view = view;
+      this.renderLimit = this.renderBatch;
       this.render(this.store.snapshot());
       return this.view;
     }
 
     setSelection(address, options = {}) {
-      this.store.setSelection(address, {
-        ownedByFeature: options.ownedByFeature === true,
-      });
+      const storeOptions = {};
+      if (Object.prototype.hasOwnProperty.call(options, "ownedByFeature")) {
+        storeOptions.ownedByFeature = options.ownedByFeature === true;
+      }
+      this.store.setSelection(address, storeOptions);
       this.syncSelectionTarget(address, { focused: false, source: "selection" });
     }
 
     commandTargetForSelection(address) {
+      const match = this.captureForSelection(address);
+      return match ? captureCommandTarget(match.book, match.capture) : null;
+    }
+
+    captureForSelection(address) {
       if (!address || !address.itemId || !address.artifactId) return null;
       const snapshot = this.store.snapshot();
       const book = snapshot.index && snapshot.index.books
         .find((candidate) => candidate.id === address.itemId);
       const capture = book && book.captures
         .find((candidate) => candidate.artifact_id === address.artifactId);
-      return book && capture ? captureCommandTarget(book, capture) : null;
+      return book && capture ? { book, capture } : null;
     }
 
     syncSelectionTarget(address, options = {}) {
-      const target = this.commandTargetForSelection(address);
+      const match = this.captureForSelection(address);
+      const target = match
+        ? captureCommandTarget(match.book, match.capture) : null;
       this.onSelectionTarget(target, {
         focused: options.focused === true,
         source: options.source || "books",
+        navigationHint: !!match && captureIsNavigationHint(match.capture),
+        address: match
+          ? captureAddress(match.book, match.capture) : address || null,
       });
       return target;
     }
@@ -1354,7 +1419,13 @@
       // capture so its photo opens immediately. Items without captures keep
       // the bare book address.
       const capture = book.captures[0];
-      if (capture) this.navigate(captureAddress(book, capture), "image");
+      if (capture) {
+        this.navigate(
+          captureAddress(book, capture),
+          "image",
+          captureNavigationPreview(book, capture),
+        );
+      }
       else this.navigate(bookAddress(book), "book");
       return book;
     }
@@ -1445,16 +1516,99 @@
       this.restoreButtonFocus(this.bookElement(list, itemId));
     }
 
+    syncRenderedSelection(list, snapshot) {
+      if (!list || typeof list.querySelectorAll !== "function") return;
+      const selection = snapshot.selection;
+      for (const button of Array.from(list.querySelectorAll("button"))) {
+        const dataset = button.dataset || {};
+        if (!dataset.itemId) continue;
+        const selected = !!selection && selection.itemId === dataset.itemId &&
+          (dataset.artifactId
+            ? selection.artifactId === dataset.artifactId
+            : !selection.artifactId && !selection.annotationId);
+        setAttribute(button, "aria-pressed", selected ? "true" : "false");
+      }
+    }
+
+    selectionRenderPins(snapshot, books) {
+      const selection = snapshot.selection;
+      if (!selection || !selection.itemId) {
+        return { book: "", capture: "" };
+      }
+      const bookIndex = books.findIndex((book) => book.id === selection.itemId);
+      if (bookIndex < 0) return { book: "", capture: "" };
+      const book = books[bookIndex];
+      const bookPin = bookIndex >= this.renderLimit ? book.id : "";
+      if (!selection.artifactId) return { book: bookPin, capture: "" };
+      const captureIndex = book.captures.findIndex((capture) =>
+        capture.artifact_id === selection.artifactId);
+      const captureLimit = this.captureRenderLimits.get(book.id) ||
+        this.captureRenderBatch;
+      const capturePin = captureIndex >= captureLimit
+        ? JSON.stringify([book.id, selection.artifactId]) : "";
+      return { book: bookPin, capture: capturePin };
+    }
+
     render(snapshot) {
       const list = this.root.querySelector("[data-books-list]");
       // A step owns the next rebuild's focus; otherwise the rebuild only
       // preserves whichever row or capture button already held it, so
       // renders that were not caused by a step never steal focus.
       const stepFocus = this.pendingStepFocus;
-      this.pendingStepFocus = null;
       const focusedCapture = stepFocus ? null : this.focusedCapture(list);
       const focusedBook = stepFocus ||
         (focusedCapture ? null : this.focusedBook(list));
+      const count = this.root.querySelector("[data-books-count]");
+      if (!list || !this.documentRef) return;
+      if (this.renderedIndex !== snapshot.index) {
+        this.renderLimit = this.renderBatch;
+        this.captureRenderLimits.clear();
+        this.captureRenderRevision += 1;
+      }
+      const books = this.visibleBooks(snapshot);
+      const renderPins = this.selectionRenderPins(snapshot, books);
+      const renderedButtons = typeof list.querySelectorAll === "function"
+        ? Array.from(list.querySelectorAll("button")) : [];
+      const selectedNodeMissing = !!(
+        snapshot.selection && snapshot.selection.itemId &&
+        (!snapshot.selection.artifactId ||
+          !this.captureElement(list, snapshot.selection)) &&
+        !renderedButtons.some((button) => {
+          const dataset = button.dataset || {};
+          return dataset.itemId === snapshot.selection.itemId &&
+            (!snapshot.selection.artifactId ||
+              dataset.artifactId === snapshot.selection.artifactId);
+        })
+      );
+      const selectionOnly = !this.hotCapture &&
+        this.renderedIndex === snapshot.index &&
+        this.renderedStatus === snapshot.status &&
+        this.renderedError === snapshot.error &&
+        this.renderedFilter === this.filter &&
+        this.renderedView === this.view &&
+        this.renderedBookPin === renderPins.book &&
+        this.renderedCapturePin === renderPins.capture &&
+        this.renderedLimit === this.renderLimit &&
+        this.renderedCaptureRevision === this.captureRenderRevision &&
+        !selectedNodeMissing;
+      this.rememberSelectionIndex(snapshot, books);
+      this.renderViewControls(snapshot);
+      if (selectionOnly) {
+        this.syncRenderedSelection(list, snapshot);
+        this.pendingStepFocus = null;
+        this.restoreBookFocus(list, stepFocus);
+        return;
+      }
+      this.renderedIndex = snapshot.index;
+      this.renderedStatus = snapshot.status;
+      this.renderedError = snapshot.error;
+      this.renderedFilter = this.filter;
+      this.renderedView = this.view;
+      this.renderedBookPin = renderPins.book;
+      this.renderedCapturePin = renderPins.capture;
+      this.renderedLimit = this.renderLimit;
+      this.renderedCaptureRevision = this.captureRenderRevision;
+      this.pendingStepFocus = null;
       for (const remove of this.rowListeners.splice(0)) remove();
       // Replacing rows under a stationary pointer fires no pointerleave, so
       // an active hover contribution must be withdrawn before its row goes.
@@ -1462,11 +1616,6 @@
         this.hotCapture = false;
         this.onHotTarget(null, { source: "books" });
       }
-      const count = this.root.querySelector("[data-books-count]");
-      if (!list || !this.documentRef) return;
-      const books = this.visibleBooks(snapshot);
-      this.rememberSelectionIndex(snapshot, books);
-      this.renderViewControls(snapshot);
       if (count) count.textContent = snapshot.index ? String(snapshot.index.books.length) : "0";
       setAttribute(list, "aria-busy", snapshot.status === "loading" ? "true" : "false");
       if (snapshot.status === "loading" && snapshot.index) {
@@ -1517,7 +1666,41 @@
         }
         return;
       }
-      for (const book of books) list.append(this.renderBook(book, snapshot));
+      let visible = books.slice(0, this.renderLimit);
+      const selectedBook = snapshot.selection && books.find(
+        (book) => book.id === snapshot.selection.itemId);
+      if (selectedBook && !visible.includes(selectedBook)) {
+        visible = [
+          ...visible.slice(0, Math.max(0, this.renderLimit - 1)),
+          selectedBook,
+        ];
+      }
+      for (const book of visible) list.append(this.renderBook(book, snapshot));
+      if (visible.length < books.length) {
+        const row = element(this.documentRef, "li", "books-load-more");
+        const button = element(
+          this.documentRef,
+          "button",
+          "books-load-more-button",
+          `Show ${Math.min(this.renderBatch, books.length - visible.length)} more`,
+        );
+        button.type = "button";
+        if (button.dataset) button.dataset.booksLoadMore = "";
+        setAttribute(button, "aria-label", button.textContent);
+        this.listenRow(button, "click", () => {
+          const firstNewBook = books[this.renderLimit] || null;
+          this.renderLimit += this.renderBatch;
+          this.render(this.store.snapshot());
+          const replacement = typeof list.querySelectorAll === "function"
+            ? Array.from(list.querySelectorAll("[data-books-load-more]"))[0] || null
+            : null;
+          if (replacement) this.restoreButtonFocus(replacement);
+          else this.restoreBookFocus(list, firstNewBook && firstNewBook.id);
+        });
+        row.append(button);
+        list.append(row);
+      }
+      this.syncRenderedSelection(list, snapshot);
       this.restoreCaptureFocus(list, focusedCapture);
       this.restoreBookFocus(list, focusedBook);
     }
@@ -1545,7 +1728,10 @@
       row.dataset && (row.dataset.bookId = book.id);
       const select = element(this.documentRef, "button", "book-select");
       select.type = "button";
-      select.dataset && (select.dataset.bookSelect = book.id);
+      if (select.dataset) {
+        select.dataset.bookSelect = book.id;
+        select.dataset.itemId = book.id;
+      }
       const title = book.title.trim() || `Untitled (${book.id})`;
       const selected = snapshot.selection &&
         snapshot.selection.itemId === book.id && !snapshot.selection.artifactId &&
@@ -1584,8 +1770,23 @@
       }
       const captures = element(this.documentRef, "ul", "book-captures");
       setAttribute(captures, "aria-label", `Captured images for ${title}`);
-      for (const capture of book.captures) {
+      const captureLimit = this.captureRenderLimits.get(book.id) ||
+        this.captureRenderBatch;
+      let visibleCaptures = book.captures.slice(0, captureLimit);
+      const selectedCapture = snapshot.selection &&
+        snapshot.selection.itemId === book.id &&
+        book.captures.find((capture) =>
+          capture.artifact_id === snapshot.selection.artifactId);
+      if (selectedCapture && !visibleCaptures.includes(selectedCapture)) {
+        visibleCaptures = [
+          ...visibleCaptures.slice(0, Math.max(0, captureLimit - 1)),
+          selectedCapture,
+        ];
+      }
+      for (const capture of visibleCaptures) {
         const commandTarget = captureCommandTarget(book, capture);
+        const address = captureAddress(book, capture);
+        const navigationHint = captureIsNavigationHint(capture);
         const item = element(this.documentRef, "li", "book-capture");
         const button = element(this.documentRef, "button", "capture-select");
         button.type = "button";
@@ -1596,7 +1797,7 @@
         setAttribute(button, "aria-label",
           `${label}, ${category.label}, ${state}`);
         const captureSelected =
-          addressEqual(snapshot.selection, captureAddress(book, capture));
+          addressEqual(snapshot.selection, address);
         setAttribute(button, "aria-pressed", captureSelected ? "true" : "false");
         if (button.dataset) {
           button.dataset.itemId = book.id;
@@ -1641,11 +1842,20 @@
             element: button,
             focused: true,
             source: "books",
+            navigationHint,
+            address,
           }));
         this.listenRow(button, "blur", () => {
           const selection = this.store.snapshot().selection;
           const selectedTarget = this.commandTargetForSelection(selection);
           const list = this.root.querySelector("[data-books-list]");
+          // A navigation hint has no mutation revision. Once the artifact
+          // feature hydrates and publishes the authoritative target, a later
+          // blur must not replace it with this deliberate null placeholder.
+          // Annotation selection is equally authoritative even though it has
+          // no capture artifact ID for the Books index to resolve.
+          if (!selectedTarget && selection &&
+              (selection.artifactId || selection.annotationId)) return;
           this.onSelectionTarget(selectedTarget, {
             element: this.captureElement(list, selection),
             focused: false,
@@ -1657,22 +1867,68 @@
             element: button,
             focused: true,
             source: "books",
+            navigationHint,
+            address,
           });
-          this.navigate(captureAddress(book, capture), "image");
+          this.navigate(
+            address,
+            "image",
+            captureNavigationPreview(book, capture),
+          );
         });
         item.append(button);
         captures.append(item);
+      }
+      if (visibleCaptures.length < book.captures.length) {
+        const moreItem = element(
+          this.documentRef, "li", "book-captures-load-more");
+        const remaining = book.captures.length - visibleCaptures.length;
+        const more = element(
+          this.documentRef,
+          "button",
+          "book-captures-load-more-button",
+          `Show ${Math.min(this.captureRenderBatch, remaining)} more captures`,
+        );
+        more.type = "button";
+        if (more.dataset) more.dataset.capturesLoadMore = book.id;
+        setAttribute(more, "aria-label",
+          `${more.textContent} for ${title}`);
+        this.listenRow(more, "click", () => {
+          const firstNewCapture = book.captures[captureLimit] || null;
+          this.captureRenderLimits.set(book.id,
+            captureLimit + this.captureRenderBatch);
+          this.captureRenderRevision += 1;
+          this.render(this.store.snapshot());
+          const currentList = this.root.querySelector("[data-books-list]");
+          const replacement = currentList &&
+              typeof currentList.querySelectorAll === "function"
+            ? Array.from(currentList.querySelectorAll("[data-captures-load-more]"))
+              .find((button) =>
+                (button.dataset || {}).capturesLoadMore === book.id) || null
+            : null;
+          if (replacement) this.restoreButtonFocus(replacement);
+          else if (firstNewCapture) {
+            this.restoreCaptureFocus(currentList, {
+              itemId: book.id,
+              artifactId: firstNewCapture.artifact_id,
+            });
+          }
+        });
+        moreItem.append(more);
+        captures.append(moreItem);
       }
       row.append(captures);
       return row;
     }
 
-    navigate(address, targetKind) {
+    navigate(address, targetKind, navigationPreview = null) {
       this.store.setSelection(address, { ownedByFeature: true });
-      this.onNavigate(address, Object.freeze({
+      const metadata = {
         source: "books",
         targetKind,
-      }));
+      };
+      if (navigationPreview) metadata.navigationPreview = navigationPreview;
+      this.onNavigate(address, freezeDeep(metadata));
     }
 
     destroy() {

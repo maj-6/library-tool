@@ -189,6 +189,46 @@ class FilesystemCaptureArchiveRepository:
             repository._validate_archive(association)
         return association
 
+    @classmethod
+    def inspect_association_identity(
+        cls,
+        workspace_root: str | Path,
+        capture_id: str,
+    ) -> CaptureArchiveAssociation | None:
+        """Read one authoritative association without reopening its archive.
+
+        Navigation indexes need the persisted ``book_id`` but must not hash
+        every potentially large ``.lib`` object during startup.  This narrow
+        read still applies the repository's redirect checks, bounded regular-
+        file read, canonical-JSON check, schema validation, and exact capture
+        identity check.  Archive-consuming operations continue to use
+        :meth:`inspect_association` or :meth:`get`, which additionally verify
+        the complete archive payload.
+        """
+
+        capture_book_id(capture_id)
+        configured = Path(workspace_root)
+        if not os.path.lexists(configured):
+            return None
+        try:
+            info = configured.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or _is_redirecting_path(configured)
+            ):
+                raise ValueError("workspace root is redirecting or invalid")
+            root = configured.resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise _repository_failure(
+                "the capture archive workspace cannot be inspected read-only",
+                code="invalid_capture_archive_storage",
+                cause=exc,
+                retryable=True,
+            ) from exc
+        repository = cls.__new__(cls)
+        repository._write_set = _ReadOnlyWorkspaceRoot(root)
+        return repository._read_association(capture_id)
+
     def replay(
         self,
         command: AssociateCaptureArchiveCommand,

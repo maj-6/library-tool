@@ -246,6 +246,84 @@ def test_supabase_photo_download_caps_http_error_detail(monkeypatch):
     assert reads == [301]
 
 
+@pytest.mark.parametrize(
+    ("code", "status", "expected_marks"),
+    [
+        ("NoSuchKey", 404, [("a8888888-8888-4888-8888-888888888888", "void")]),
+        ("NoSuchBucket", 404, []),
+        ("InvalidKey", 400, []),
+    ],
+)
+def test_cloud_import_only_terminalizes_confirmed_missing_object(
+        monkeypatch, tmp_path, code, status, expected_marks):
+    capture_id = "a8888888-8888-4888-8888-888888888888"
+    monkeypatch.setattr(lib, "MANUAL_ENTRIES_PATH",
+                        tmp_path / "manual_entries.json")
+    failure = server.sbase.SyncError(
+        "storage failure",
+        http_status=status,
+        error_code=code,
+        service="storage",
+        method="GET",
+    )
+    monkeypatch.setattr(
+        server,
+        "_download_cloud_capture_photos",
+        lambda *_args: (_ for _ in ()).throw(failure),
+    )
+    marks = []
+    monkeypatch.setattr(
+        server.sbase,
+        "mark_capture",
+        lambda _cfg, cap_id, value: marks.append((cap_id, value)),
+    )
+
+    with pytest.raises(server.sbase.SyncError) as caught:
+        server._import_capture(
+            None,
+            {"url": "cloud"},
+            {"id": capture_id, "photos": ["photo.jpg"]},
+            "",
+            False,
+        )
+
+    assert caught.value is failure
+    assert marks == expected_marks
+
+
+def test_cloud_run_aborts_once_on_storage_configuration_error(monkeypatch):
+    captures = [
+        {"id": "cap-one", "title": "One", "photos": ["1.jpg"]},
+        {"id": "cap-two", "title": "Two", "photos": ["2.jpg"]},
+    ]
+    attempted = []
+    monkeypatch.setattr(server, "_client_settings", lambda: {})
+    monkeypatch.setattr(server, "_refresh_collection_aliases",
+                        lambda *_args: [])
+    monkeypatch.setattr(server.sbase, "list_pending_captures",
+                        lambda _cfg: captures)
+    monkeypatch.setattr(server, "_secret_is_configured", lambda _key: False)
+
+    def import_one(_owner, _capture, cap, *_args, **_kwargs):
+        attempted.append(cap["id"])
+        raise server.sbase.SyncError(
+            "Supabase Storage bucket 'captures' was not found",
+            http_status=404,
+            error_code="NoSuchBucket",
+            service="storage",
+            method="GET",
+        )
+
+    monkeypatch.setattr(server, "_import_capture", import_one)
+
+    result = server._cloud_sync_run_with_configs(None, {"key": "user"})
+
+    assert attempted == ["cap-one"]
+    assert result["ok"] is False
+    assert result["captures_total"] == 1
+    assert "bucket 'captures' was not found" in result["error"]
+
+
 def test_same_capture_lan_cloud_race_has_one_asset_writer_and_one_row(
         monkeypatch, tmp_path):
     manual_path = tmp_path / "manual_entries.json"

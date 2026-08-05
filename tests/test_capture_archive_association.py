@@ -626,11 +626,38 @@ def test_first_publication_and_replays_return_one_portable_association(tmp_path)
     assert association.state is CaptureArchiveState.CURRENT
     assert association.source_revision == source.source_revision
     assert restarted_service.get(source.capture_id) == association
+    assert FilesystemCaptureArchiveRepository.inspect_association_identity(
+        tmp_path,
+        source.capture_id,
+    ) == association
     assert len(list(tmp_path.glob(".engine/capture-lib/objects/*.lib"))) == 1
     portable = json.dumps(created.receipt.as_dict(), sort_keys=True)
     assert str(tmp_path) not in portable
     assert "\\" not in portable
     assert "/" not in portable
+
+
+def test_identity_only_association_read_rejects_noncanonical_sidecar(tmp_path):
+    service, _repository, _materializer = _service(tmp_path)
+    source = _source()
+    association = service.associate(
+        AssociateCaptureArchiveCommand(source, "operation-import-1")
+    ).receipt.association
+    sidecar = next(
+        tmp_path.glob(".engine/capture-lib/associations/*.json")
+    )
+    sidecar.write_text(
+        json.dumps(association.as_dict(), indent=2),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RepositoryError) as invalid:
+        FilesystemCaptureArchiveRepository.inspect_association_identity(
+            tmp_path,
+            source.capture_id,
+        )
+
+    assert invalid.value.code == "invalid_capture_archive_storage"
 
 
 def test_existing_association_wins_after_materializer_version_changes(tmp_path):
