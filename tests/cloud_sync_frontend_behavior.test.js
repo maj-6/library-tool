@@ -63,7 +63,8 @@ test("cloud sync panel exposes accessible live progress and durable details", ()
     "cloud-sync-progress", "cloud-sync-stage", "cloud-sync-meter",
     "cloud-sync-counts", "cloud-sync-current", "cloud-sync-details",
     "cloud-sync-recent", "cloud-sync-terminal", "cloud-sync-terminal-facts",
-    "cloud-sync-store-list", "cloud-sync-error-list",
+    "cloud-sync-store-list", "cloud-sync-error-list", "cloud-sync-dismiss",
+    "cloud-sync-status-btn",
   ]) {
     assert.match(template, new RegExp(`id=["']${id}["']`), `${id} exists`);
   }
@@ -72,9 +73,64 @@ test("cloud sync panel exposes accessible live progress and durable details", ()
   assert.match(template, /id="cloud-sync-progress"[^>]*aria-busy="false"/);
   assert.match(template,
     /id="cloud-sync-meter"[^>]*aria-labelledby="cloud-sync-title"/);
+  assert.match(template,
+    /id="cloud-sync-status-btn"[^>]*aria-controls="cloud-sync-progress"/);
+  assert.match(template,
+    /id="cloud-sync-status-btn"[^>]*aria-expanded="false"/);
+  assert.match(template,
+    /id="cloud-sync-dismiss"[^>]*aria-controls="cloud-sync-progress"/);
   assert.match(styles, /\.cloud-sync-progress\[data-state="error"\]/);
+  assert.match(styles, /\.cloud-sync-status-trigger\[data-state="error"\]/);
   assert.match(styles, /\.cloud-sync-recent\s*\{[^}]*max-height/s);
   assert.match(styles, /\.cloud-sync-terminal-facts\s*\{/);
+});
+
+test("cloud sync display can hide and reopen without discarding job state", () => {
+  const nodes = Object.fromEntries([
+    "cloud-sync-progress", "cloud-sync-status-btn", "cloud-sync-dismiss",
+  ].map((id) => [id, {
+    id,
+    hidden: false,
+    attributes: {},
+    focused: false,
+    setAttribute(name, value) { this.attributes[name] = value; },
+    focus() { this.focused = true; },
+  }]));
+  nodes["cloud-sync-status-btn"].hidden = true;
+  const lastStatus = { running: true, run_id: "run-9", revision: 17 };
+  const cloudSyncUi = {
+    hasStatus: true,
+    dismissed: false,
+    runId: "run-9",
+    revision: 17,
+    lastStatus,
+    seenItems: new Set(["run-9:1"]),
+  };
+  const context = vm.createContext({
+    cloudSyncUi,
+    el: (id) => nodes[id],
+  });
+  vm.runInContext([
+    declaration("updateCloudSyncPanelVisibility"),
+    declaration("setCloudSyncPanelDismissed"),
+    "this.dismiss = setCloudSyncPanelDismissed;",
+  ].join("\n"), context);
+
+  context.dismiss(true);
+  assert.equal(nodes["cloud-sync-progress"].hidden, true);
+  assert.equal(nodes["cloud-sync-status-btn"].hidden, false);
+  assert.equal(nodes["cloud-sync-status-btn"].attributes["aria-expanded"], "false");
+  assert.equal(nodes["cloud-sync-status-btn"].focused, true);
+  assert.equal(cloudSyncUi.runId, "run-9");
+  assert.equal(cloudSyncUi.revision, 17);
+  assert.equal(cloudSyncUi.lastStatus, lastStatus);
+  assert.deepEqual([...cloudSyncUi.seenItems], ["run-9:1"]);
+
+  context.dismiss(false);
+  assert.equal(nodes["cloud-sync-progress"].hidden, false);
+  assert.equal(nodes["cloud-sync-status-btn"].hidden, true);
+  assert.equal(nodes["cloud-sync-status-btn"].attributes["aria-expanded"], "true");
+  assert.equal(nodes["cloud-sync-dismiss"].focused, true);
 });
 
 test("failure headline stays concise while detailed errors remain available", () => {
@@ -237,6 +293,7 @@ test("manual start ignores idle status until the claimed run identity appears", 
     revision: 4,
     terminalKey: "",
     lastStatus: null,
+    dismissed: true,
   };
   const context = vm.createContext({
     cloudSyncUi,
@@ -255,6 +312,7 @@ test("manual start ignores idle status until the claimed run identity appears", 
     running: false, run_id: "old-run", revision: 4,
   }), false);
   assert.equal(cloudSyncUi.commandPending, true);
+  assert.equal(cloudSyncUi.dismissed, true);
   assert.deepEqual(rendered, []);
   assert.equal(button.disabled, undefined);
 
@@ -264,6 +322,7 @@ test("manual start ignores idle status until the claimed run identity appears", 
   }), true);
   assert.equal(cloudSyncUi.commandPending, false);
   assert.equal(cloudSyncUi.pendingRunId, "");
+  assert.equal(cloudSyncUi.dismissed, false);
   assert.deepEqual(rendered, ["new-run"]);
   assert.equal(button.disabled, true);
 });

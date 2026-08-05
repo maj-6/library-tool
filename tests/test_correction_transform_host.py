@@ -26,6 +26,28 @@ def _command() -> CorrectionTransformCommand:
     )
 
 
+def _manual_target(tmp_path, *, record=None) -> server._CorrectionsTarget:
+    record = record or {
+        "id": "manual-1",
+        "title": "Manual capture",
+        "capture_id": "capture-1",
+    }
+    return server._CorrectionsTarget(
+        canonical_id="book-1",
+        storage_kind="manual",
+        storage_id="manual-1",
+        capture_id="capture-1",
+        association_state="unmatched",
+        association_book_id="",
+        record_revision="record-r1",
+        title="Manual capture",
+        metadata={},
+        record=record,
+        entry_directory=tmp_path / "entries" / "manual-1",
+        manual_storage_id="manual-1",
+    )
+
+
 def test_process_host_rejects_transform_start_after_item_disappears(
     monkeypatch,
 ):
@@ -41,6 +63,70 @@ def test_process_host_rejects_transform_start_after_item_disappears(
 
     assert missing.value.code == "correction_item_not_found"
     assert jobs.list() == []
+
+
+def test_process_host_accepts_archived_manual_capture_transform(
+    monkeypatch,
+    tmp_path,
+):
+    target = _manual_target(tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_resolve_corrections_targets_locked",
+        lambda: {target.canonical_id: target},
+    )
+    jobs = JobManager()
+    service = CorrectionTransformService(
+        jobs,
+        start_guard_for=server._correction_transform_job_start_guard,
+    )
+
+    queued = service.queue(_command())
+
+    assert queued.job_id
+    assert len(jobs.list()) == 1
+
+
+def test_manual_delete_refuses_active_correction_transform(
+    monkeypatch,
+    tmp_path,
+):
+    item_id = "book-1"
+    capture_id = "capture-1"
+    builds_path = tmp_path / "builds.json"
+    manual_path = tmp_path / "manual.json"
+    server.lib.save_json(builds_path, {})
+    record = {
+        "id": "manual-1",
+        "title": "Manual capture",
+        "capture_id": capture_id,
+    }
+    server.lib.save_json(manual_path, {"manual-1": record})
+    monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
+    monkeypatch.setattr(server.lib, "MANUAL_ENTRIES_PATH", manual_path)
+    target = _manual_target(tmp_path, record=record)
+    monkeypatch.setattr(
+        server,
+        "_resolve_corrections_targets_locked",
+        lambda: {item_id: target},
+    )
+    jobs = JobManager()
+    monkeypatch.setattr(server, "_job_manager", jobs)
+    service = CorrectionTransformService(
+        jobs,
+        start_guard_for=server._correction_transform_job_start_guard,
+    )
+    service.queue(_command())
+
+    with server.app.test_request_context(
+        "/api/manual/manual-1",
+        method="DELETE",
+    ):
+        response, status = server.api_manual_delete("manual-1")
+
+    assert status == 409
+    assert response.get_json()["code"] == "item_jobs_active"
+    assert "manual-1" in server.lib.load_json(manual_path, {})
 
 
 def test_process_host_deduplicates_window_independent_transform_threads(

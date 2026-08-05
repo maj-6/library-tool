@@ -17,6 +17,10 @@
     const MAX_TEXT_CHUNKS = 4;
     const MAX_REGION_PAGES = 4;
     const DETAIL_CACHE_LIMIT = 64;
+    const NAVIGATION_PREVIEW_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
+    const NAVIGATION_PREVIEW_FIELDS = new Set([
+      "itemId", "representationId", "canvasId", "artifactId", "url", "label",
+    ]);
 
     function capabilityError(capability) {
       const error = new Error(`${capability} is not available`);
@@ -109,6 +113,67 @@
       if (/^data:/i.test(url) && !/^data:image\//i.test(url)) return "";
       if (/^data:image\/svg\+xml/i.test(url)) return "";
       return url;
+    }
+
+    function navigationPreviewId(value, required = false) {
+      if (value == null || value === "") return required ? null : "";
+      return typeof value === "string" && NAVIGATION_PREVIEW_ID_RE.test(value)
+        ? value : null;
+    }
+
+    function normalizeNavigationPreview(value, context) {
+      if (!value || typeof value !== "object" || Array.isArray(value) || !context ||
+          Object.keys(value).some((field) => !NAVIGATION_PREVIEW_FIELDS.has(field))) {
+        return null;
+      }
+      const contextIds = {
+        itemId: navigationPreviewId(context.itemId, true),
+        representationId: navigationPreviewId(context.representationId),
+        canvasId: navigationPreviewId(context.canvasId),
+        artifactId: navigationPreviewId(
+          context.artifactId || context.artifact_id,
+          true,
+        ),
+      };
+      const previewIds = {
+        itemId: navigationPreviewId(value.itemId, true),
+        representationId: navigationPreviewId(value.representationId),
+        canvasId: navigationPreviewId(value.canvasId),
+        artifactId: navigationPreviewId(value.artifactId, true),
+      };
+      const contextAnnotationId = navigationPreviewId(
+        context.annotationId || context.annotation_id,
+      );
+      if (!contextIds.itemId || !contextIds.artifactId ||
+          contextAnnotationId === null || contextAnnotationId ||
+          Object.keys(contextIds).some((field) =>
+            contextIds[field] === null || previewIds[field] === null ||
+            contextIds[field] !== previewIds[field])) {
+        return null;
+      }
+      const url = typeof value.url === "string" ? safeRasterUrl(value.url) : "";
+      if (!url) return null;
+      const rawLabel = typeof value.label === "string" && value.label.length <= 512 &&
+        !/[\u0000-\u001f]/.test(value.label) ? value.label.trim() : "";
+      return Object.freeze({
+        ...previewIds,
+        url,
+        label: rawLabel || previewIds.artifactId,
+      });
+    }
+
+    function navigationPreviewResource(preview) {
+      return Object.freeze({
+        id: preview.artifactId,
+        itemId: preview.itemId,
+        label: preview.label,
+        kind: "capture-preview",
+        family: "image",
+        media_type: "image/*",
+        url: preview.url,
+        loading: true,
+        navigationOnly: true,
+      });
     }
 
     function resourceCursor(value) {
@@ -348,6 +413,10 @@
       async setContext(value) {
         if (this.destroyed) return null;
         const context = cloneContext(value);
+        const navigationPreview = normalizeNavigationPreview(
+          value && value.navigationPreview,
+          context,
+        );
         this.contextGeneration += 1;
         this.abortContextWork();
         this.abortSelectionWork();
@@ -370,16 +439,41 @@
           return null;
         }
         const generation = this.contextGeneration;
-        const expandedLoads = Array.from(this.expandedGroups,
-          (group) => this.loadGroup(group));
         const deepArtifact = value && (value.artifactId || value.artifact_id);
         const deepAnnotation = value && (value.annotationId || value.annotation_id);
-        let deepLoad = null;
-        if (deepArtifact) deepLoad = this.openDeepLink(`artifact:${deepArtifact}`);
-        else if (deepAnnotation) deepLoad = this.openDeepLink(`annotation:${deepAnnotation}`);
-        await Promise.allSettled([...expandedLoads, ...(deepLoad ? [deepLoad] : [])]);
+        const deepKey = deepArtifact ? `artifact:${deepArtifact}` :
+          deepAnnotation ? `annotation:${deepAnnotation}` : "";
+        let deepResult = null;
+        if (deepKey) {
+          if (navigationPreview) {
+            this.publishResource(navigationPreviewResource(navigationPreview));
+          }
+          // A capture click should hydrate and display that exact image before
+          // unrelated expanded groups start paging. This also prevents four
+          // concurrent calls from each triggering the same expensive initial
+          // source projection.
+          deepResult = await this.openDeepLink(deepKey);
+          if (generation !== this.contextGeneration || this.destroyed) {
+            return null;
+          }
+        }
+        const expandedLoads = Array.from(this.expandedGroups,
+          (group) => this.loadGroup(group));
+        if (deepKey) {
+          void Promise.allSettled(expandedLoads).then(() => {
+            if (deepResult && generation === this.contextGeneration &&
+                !this.destroyed) {
+              this.onStatus("Artifact context ready", false);
+            }
+          });
+        } else {
+          await Promise.allSettled(expandedLoads);
+        }
         if (generation === this.contextGeneration && !this.destroyed) {
-          this.onStatus("Artifact context ready", false);
+          if (!deepKey || deepResult) {
+            this.onStatus(deepKey ? "Selected artifact ready" :
+              "Artifact context ready", false);
+          }
         }
         return context;
       }
@@ -840,6 +934,12 @@
       async select(key, options = {}) {
         const summary = this.items.get(key);
         if (!summary || this.destroyed) return null;
+        const navigationPreview = this.currentResource &&
+          this.currentResource.navigationOnly === true &&
+          this.currentResource.id === summary.id &&
+          this.currentResource.itemId === summary.itemId &&
+          summary.family === "image"
+          ? this.currentResource : null;
         this.selectedKey = key;
         this.activeKey = key;
         this.relatedKeys = new Set(this.linkIndex.get(key) || []);
@@ -848,7 +948,7 @@
         const selectionGeneration = this.selectionGeneration;
         this.emitSelection(summary);
         if (this.properties) this.properties.setSelection(summary, { loading: true });
-        this.publishResource(this.loadingResource(summary));
+        this.publishResource(navigationPreview || this.loadingResource(summary));
         this.render();
         if (options.focus && typeof this.treeRoot.focus === "function") this.treeRoot.focus();
         try {
@@ -970,7 +1070,6 @@
         }
         if (detail.family === "image") {
           const display = await this.resolveRaster(detail, "display", selectionGeneration);
-          const regions = await this.imageRegions(detail, selectionGeneration);
           const resource = {
             id: detail.id,
             label: resourceLabel(detail),
@@ -982,7 +1081,7 @@
             freshness: detail.freshness,
             correction: detail.correction,
             dimensions: detail.dimensions,
-            regions,
+            regions: detail.regions,
             coordinateSpace: detail.extensions &&
               (detail.extensions.coordinate_space ||
                 detail.extensions.coordinateSpace) || "",
@@ -991,6 +1090,17 @@
               detail, "full", this.selectionGeneration),
           };
           this.publishResource(resource);
+          const correctionsUi = detail.extensions &&
+            detail.extensions.corrections_ui || {};
+          const source = detail.source || {};
+          if (correctionsUi.paged_regions !== true || !source.canvasId ||
+              !this.resources || typeof this.resources.listRegions !== "function") {
+            return;
+          }
+          const regions = await this.imageRegions(detail, selectionGeneration);
+          if (selectionGeneration !== this.selectionGeneration || this.destroyed ||
+              this.currentResource !== resource) return;
+          this.publishResource({ ...resource, regions });
           return;
         }
         if (detail.family === "text") {

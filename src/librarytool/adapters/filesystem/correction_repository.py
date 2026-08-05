@@ -691,6 +691,37 @@ class FilesystemCorrectionUnitOfWork:
         self._loaded[item_id] = aggregate
         return aggregate
 
+    def has_durable_aggregate(self, item_id: str) -> bool:
+        """Report persisted aggregate presence without invoking live loading.
+
+        Any filesystem object at the canonical aggregate target counts as
+        present. The subsequent ordinary ``get`` owns validation, so a corrupt
+        file or directory can never be mistaken for the safe absent fast path.
+        The unit-of-work already holds the workspace and catalogue locks.
+        """
+
+        self._ensure_open()
+        FilesystemCorrectionRepository._identifier(
+            item_id,
+            field_name="item_id",
+        )
+        path = self._safe_target(
+            self._aggregate_relative(item_id),
+            artifact="correction_aggregate",
+        )
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise _repository_error(
+                "correction aggregate presence could not be inspected",
+                code="correction_repository_unavailable",
+                error=exc,
+                retryable=True,
+            ) from exc
+        return True
+
     def _reconcile(
         self,
         live: CorrectionAggregateSnapshot,

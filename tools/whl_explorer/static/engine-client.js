@@ -28,6 +28,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function engineClientFactory() {
   "use strict";
 
+  const RASTER_RESOURCE_MAX_BYTES = 100 * 1024 * 1024;
+
   function encodePart(value) {
     // encodeURIComponent deliberately leaves !'()* alone.  Encoding them too
     // keeps path components and query values unambiguous across transports.
@@ -2081,6 +2083,7 @@
       this.rasterArtifacts = Object.freeze({
         list: (args) => this._rasterArtifactList(args),
         get: (args) => this._rasterArtifactGet(args),
+        resolveResource: (args) => this._rasterArtifactResolveResource(args),
         resourceUrl: (args) => this._rasterArtifactResourceUrl(args),
       });
       this.documentArtifacts = Object.freeze({
@@ -2267,6 +2270,128 @@
         });
       }
       return options.includeStatus ? { body, status } : body;
+    }
+
+    async _requestBlob(method, path, options = {}) {
+      const url = this._url(path, options.query);
+      const headers = { Accept: "image/*", ...(options.headers || {}) };
+      const init = { method, headers, cache: options.cache || "no-store" };
+      if (options.signal) init.signal = options.signal;
+      let response;
+      try {
+        response = await this._transport(url, init);
+      } catch (cause) {
+        const aborted = cause && cause.name === "AbortError";
+        throw new EngineClientError(aborted ? "Engine request aborted" :
+          (cause && cause.message || "Unable to reach the engine"), {
+          status: 0, code: aborted ? "aborted" : "network-error",
+          retryable: !aborted, method, url, cause,
+        });
+      }
+      const status = Number(response && response.status) || 0;
+      const responseOk = response && typeof response.ok === "boolean"
+        ? response.ok : status >= 200 && status < 300;
+      if (!responseOk) {
+        let body = null;
+        try {
+          if (response && typeof response.json === "function") {
+            body = await response.json();
+          }
+        } catch (error) { /* best-effort structured error */ }
+        const payload = body && typeof body === "object" ? body : {};
+        throw new EngineClientError(payload.error || payload.message ||
+          `Engine request failed (${status || "no status"})`, {
+          status,
+          code: payload.code || payload.error_code || fallbackCode(status),
+          details: payload.details || payload.conflict || null,
+          conflict: payload.conflict || null,
+          retryable: payload.retryable,
+          method, url, body,
+        });
+      }
+      const getHeader = response && response.headers &&
+        typeof response.headers.get === "function"
+        ? (name) => response.headers.get(name) : () => null;
+      const mediaType = String(getHeader("Content-Type") || "")
+        .split(";", 1)[0].trim().toLowerCase();
+      const revision = String(getHeader("X-Resource-Revision") || "");
+      const encodedLength = String(getHeader("Content-Length") || "");
+      const declaredLength = /^[1-9][0-9]*$/.test(encodedLength)
+        ? Number(encodedLength) : 0;
+      if (!/^image\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i.test(mediaType) ||
+          !isArtifactRevision(revision) ||
+          options.expectedRevision && revision !== options.expectedRevision ||
+          !Number.isSafeInteger(declaredLength) || declaredLength < 1) {
+        throw new EngineClientError(
+          "Engine returned an invalid raster resource response", {
+            status, code: "invalid-response", retryable: false,
+            method, url,
+          });
+      }
+      if (declaredLength > RASTER_RESOURCE_MAX_BYTES) {
+        throw new EngineClientError(
+          "Raster resource exceeds the renderer byte limit", {
+            status, code: "raster-resource-too-large", retryable: false,
+            method, url,
+          });
+      }
+      let blob;
+      try {
+        if (response.body && typeof response.body.getReader === "function") {
+          const reader = response.body.getReader();
+          const chunks = [];
+          let received = 0;
+          while (true) {
+            const part = await reader.read();
+            if (part.done) break;
+            const chunk = part.value;
+            if (!chunk || typeof chunk.byteLength !== "number") {
+              throw new TypeError("raster stream returned an invalid chunk");
+            }
+            received += chunk.byteLength;
+            if (received > declaredLength ||
+                received > RASTER_RESOURCE_MAX_BYTES) {
+              if (typeof reader.cancel === "function") {
+                await reader.cancel("raster resource exceeded its byte limit");
+              }
+              throw new EngineClientError(
+                "Raster resource exceeds its declared byte length", {
+                  status, code: "raster-resource-too-large", retryable: false,
+                  method, url,
+                });
+            }
+            chunks.push(chunk);
+          }
+          if (received !== declaredLength || typeof Blob !== "function") {
+            throw new TypeError("raster stream length does not match its response");
+          }
+          blob = new Blob(chunks, { type: mediaType });
+        } else {
+          if (!response || typeof response.blob !== "function") {
+            throw new TypeError("transport response has no bounded body reader");
+          }
+          blob = await response.blob();
+        }
+      } catch (cause) {
+        if (cause instanceof EngineClientError) throw cause;
+        const aborted = cause && cause.name === "AbortError";
+        throw new EngineClientError(
+          aborted ? "Engine request aborted" :
+            "Engine returned an unreadable raster resource", {
+            status, code: aborted ? "aborted" : "invalid-response",
+            retryable: false,
+            method, url, cause,
+          });
+      }
+      if (!blob || typeof blob.size !== "number" ||
+          blob.size !== declaredLength || blob.size > RASTER_RESOURCE_MAX_BYTES) {
+        throw new EngineClientError(
+          "Engine returned an invalid raster resource body", {
+            status, code: "invalid-response", retryable: false,
+            method, url,
+          });
+      }
+      return Object.freeze({ blob, mediaType, revision });
     }
 
     _pdfInfo({ path, signal } = {}) {
@@ -2963,6 +3088,20 @@
           `${encodePart(artifact)}/resource`,
         { revision },
       );
+    }
+
+    _rasterArtifactResolveResource({ itemId, artifactId, revision,
+      signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      if (!isArtifactRevision(revision)) {
+        throw new TypeError("revision is not a valid raster resource revision");
+      }
+      const path = `/v1/items/${encodePart(item)}/raster-artifacts/` +
+        `${encodePart(artifact)}/resource`;
+      return this._requestBlob("GET", path, {
+        query: { revision }, signal, expectedRevision: revision,
+      });
     }
 
     _spatialAnnotationList({ itemId, representationId, canvasId,

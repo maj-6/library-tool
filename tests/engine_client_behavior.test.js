@@ -654,6 +654,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.items.readiness, "function");
   assert.equal(typeof client.rasterArtifacts.list, "function");
   assert.equal(typeof client.rasterArtifacts.get, "function");
+  assert.equal(typeof client.rasterArtifacts.resolveResource, "function");
   assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
   assert.equal(typeof client.documentArtifacts.list, "function");
   assert.equal(typeof client.documentArtifacts.get, "function");
@@ -935,6 +936,116 @@ test("EngineClient rejects unsafe capture document views and incoherent pages",
       maxBytes: 48 * 1024 + 1,
     }), TypeError);
   });
+
+test("raster resources cross authenticated transport as bounded blobs", async () => {
+  const payload = new Uint8Array([1, 2, 3, 4]);
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get(name) {
+            return {
+              "Content-Type": "image/jpeg",
+              "Content-Length": String(payload.byteLength),
+              "X-Resource-Revision": "resource-r1",
+            }[name] || null;
+          },
+        },
+        blob: async () => new Blob([payload], { type: "image/jpeg" }),
+      };
+    },
+  });
+
+  const resolved = await client.rasterArtifacts.resolveResource({
+    itemId: "book:one",
+    artifactId: "image:one",
+    revision: "resource-r1",
+  });
+
+  assert.equal(resolved.blob.size, 4);
+  assert.equal(resolved.mediaType, "image/jpeg");
+  assert.equal(resolved.revision, "resource-r1");
+  assert.equal(calls[0].url,
+    "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/resource" +
+    "?revision=resource-r1");
+  assert.equal(calls[0].init.headers.Accept, "image/*");
+  assert.equal(calls[0].init.cache, "no-store");
+});
+
+
+test("raster resources reject oversized and mismatched bodies", async () => {
+  let blobRead = false;
+  const oversized = new EngineClient({
+    transport: async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name) {
+          return {
+            "Content-Type": "image/jpeg",
+            "Content-Length": String(100 * 1024 * 1024 + 1),
+            "X-Resource-Revision": "resource-r1",
+          }[name] || null;
+        },
+      },
+      async blob() {
+        blobRead = true;
+        return new Blob([]);
+      },
+    }),
+  });
+  await assert.rejects(
+    oversized.rasterArtifacts.resolveResource({
+      itemId: "book:one", artifactId: "image:one", revision: "resource-r1",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "raster-resource-too-large",
+  );
+  assert.equal(blobRead, false, "oversized content is rejected before buffering");
+
+  const mismatch = new EngineClient({
+    transport: async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name) {
+          return {
+            "Content-Type": "image/png",
+            "Content-Length": "2",
+            "X-Resource-Revision": "resource-r1",
+          }[name] || null;
+        },
+      },
+      blob: async () => new Blob([new Uint8Array([1, 2, 3])]),
+    }),
+  });
+  await assert.rejects(
+    mismatch.rasterArtifacts.resolveResource({
+      itemId: "book:one", artifactId: "image:one", revision: "resource-r1",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
+
+  const aborted = new EngineClient({
+    transport: async () => {
+      const error = new Error("cancelled");
+      error.name = "AbortError";
+      throw error;
+    },
+  });
+  await assert.rejects(
+    aborted.rasterArtifacts.resolveResource({
+      itemId: "book:one", artifactId: "image:one", revision: "resource-r1",
+    }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "aborted" && error.retryable === false,
+  );
+});
 
 test("EngineClient rejects malformed or path-leaking Corrections views", async () => {
   const malformed = rasterArtifact({

@@ -43,22 +43,22 @@
 
 .artifact-tree-row[data-active="true"] {
   border-color: color-mix(in srgb, var(--focus, #9fc982) 62%, transparent);
-  background: rgb(89 115 75 / 22%);
+  background: color-mix(in srgb, var(--focus) 12%, transparent);
   color: var(--ink, #edf1eb);
 }
 
 .artifact-tree-row[aria-selected="true"] {
-  background: rgb(114 150 91 / 34%);
+  background: var(--row-checked);
   color: var(--ink, #edf1eb);
 }
 
 .artifact-tree-row[data-linked="true"] {
-  box-shadow: inset 3px 0 0 #dfb873;
+  box-shadow: inset 3px 0 0 var(--amber);
 }
 
 .artifact-tree-row[data-hot="true"] {
   border-style: dashed;
-  border-color: #dfb873;
+  border-color: var(--amber);
 }
 
 .artifact-tree-row[aria-disabled="true"] {
@@ -70,7 +70,7 @@
   width: 10px;
   flex: 0 0 10px;
   color: var(--ink-faint, #778076);
-  content: "›";
+  content: "\203A";
   font-size: 15px;
   transform-origin: 50% 50%;
 }
@@ -93,7 +93,7 @@
   flex: 0 0 auto;
   padding: 2px 4px;
   border-radius: 2px;
-  background: rgb(72 84 72 / 62%);
+  background: color-mix(in srgb, var(--face-sh) 68%, var(--face-hi));
   color: var(--ink-muted, #b4bdb2);
   font-size: 9px;
   line-height: 1.15;
@@ -104,13 +104,13 @@
 .artifact-state-missing,
 .artifact-state-unavailable,
 .artifact-state-stale {
-  background: rgb(136 73 61 / 58%);
-  color: #f2d2cb;
+  background: color-mix(in srgb, var(--red) 16%, var(--face-hi));
+  color: var(--red);
 }
 
 .artifact-state-generated {
-  background: rgb(73 93 136 / 58%);
-  color: #d8e0f4;
+  background: color-mix(in srgb, var(--blue2) 18%, var(--face-hi));
+  color: var(--blue);
 }
 
 .property-loading,
@@ -118,19 +118,19 @@
   margin: 7px 10px;
   padding: 7px 9px;
   border-left: 3px solid var(--focus, #9fc982);
-  background: rgb(89 115 75 / 18%);
+  background: color-mix(in srgb, var(--focus) 10%, transparent);
   color: var(--ink-muted, #b4bdb2);
   font-size: 11px;
 }
 
 .property-error {
-  border-color: #d98370;
-  background: rgb(136 73 61 / 22%);
-  color: #f2d2cb;
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
 }
 
 .property-card {
-  border-bottom: 1px solid rgb(61 73 62 / 65%);
+  border-bottom: var(--border-w, 1px) solid var(--line);
 }
 
 .property-card-title {
@@ -139,7 +139,7 @@
   z-index: 1;
   display: block;
   padding: 8px 10px;
-  background: #171d18;
+  background: var(--face);
   color: var(--ink, #edf1eb);
   font-size: 10px;
   font-weight: 700;
@@ -162,7 +162,7 @@
   grid-template-columns: minmax(78px, 0.8fr) minmax(0, 1.2fr);
   gap: 8px;
   padding: 6px 0;
-  border-bottom: 1px solid rgb(61 73 62 / 42%);
+  border-bottom: var(--border-w, 1px) solid var(--line);
   font-size: 11px;
 }
 
@@ -207,11 +207,11 @@
   box-sizing: border-box;
   width: 100%;
   padding: 6px 7px;
-  border: 1px solid var(--line, #3e493f);
-  border-radius: 3px;
+  border: var(--border-w, 1px) solid var(--line, #3e493f);
+  border-radius: var(--radius);
   outline: 0;
-  background: #101411;
-  color: var(--ink, #edf1eb);
+  background: var(--input-bg);
+  color: var(--input-ink);
   font: 11px/1.45 inherit;
 }
 
@@ -237,9 +237,9 @@
 .property-actions button,
 .artifact-load-more {
   padding: 5px 7px;
-  border: 1px solid var(--line, #3e493f);
-  border-radius: 3px;
-  background: #222a23;
+  border: var(--border-w, 1px) solid var(--line, #3e493f);
+  border-radius: var(--radius);
+  background: var(--face-hi);
   color: var(--ink, #edf1eb);
   font: inherit;
 }
@@ -500,19 +500,19 @@
 .artifact-region-polygon {
   position: absolute;
   inset: 0;
-  border: 1px solid #dfb873;
-  background: rgb(223 184 115 / 24%);
+  border: 1px solid var(--amber);
+  background: color-mix(in srgb, var(--amber) 24%, transparent);
   pointer-events: none;
 }
 
 .artifact-region-polygon[data-linked="true"] {
-  background: rgb(159 201 130 / 32%);
+  background: color-mix(in srgb, var(--green) 30%, transparent);
 }
 
 .generic-artifact-surface h2 {
   max-width: 78ch;
   margin: 0 auto 14px;
-  font-family: "WHL Slab", Georgia, serif;
+  font-family: var(--ui);
 }
 
 @media (prefers-reduced-motion: reduce) {

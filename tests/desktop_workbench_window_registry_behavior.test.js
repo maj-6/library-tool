@@ -307,6 +307,24 @@ test("restored bounds are profile-scoped, clamped, and persisted on close", () =
 });
 
 
+test("closed windows unregister without touching destroyed webContents", () => {
+  const harness = registryHarness();
+  const opened = harness.open({ context: context(), newWindow: false });
+  const id = opened.record.webContentsId;
+  assert.equal(harness.registry.byWebContentsId.get(id), opened.record);
+
+  opened.record.window.destroyed = true;
+  Object.defineProperty(opened.record.window, "webContents", {
+    configurable: true,
+    get() { throw new Error("Object has been destroyed"); },
+  });
+
+  assert.doesNotThrow(() => opened.record.window.emit("closed"));
+  assert.equal(harness.registry.byWindowId.has(opened.record.windowId), false);
+  assert.equal(harness.registry.byWebContentsId.has(id), false);
+});
+
+
 test("bounds restoration keeps partially visible windows on their display", () => {
   assert.deepEqual(clampWindowBounds(
     { x: 1810, y: 900, width: 1200, height: 800 },

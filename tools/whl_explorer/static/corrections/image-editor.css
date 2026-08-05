@@ -1,15 +1,15 @@
 .perspective-editor {
-  --perspective-accent: #9ad77d;
-  --perspective-fallback: #f0b45e;
-  --perspective-danger: #ff7770;
+  --perspective-accent: var(--cyan);
+  --perspective-fallback: var(--amber);
+  --perspective-danger: var(--red);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   width: 100%;
   min-width: 0;
   min-height: 100%;
   overflow: hidden;
-  background: #0d110d;
-  color: #e6eae2;
+  background: var(--canvas);
+  color: var(--ink);
 }
 
 .perspective-toolbar {
@@ -20,8 +20,8 @@
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-bottom: 1px solid #2c352d;
-  background: #171c17;
+  border-bottom: var(--border-w, 1px) solid var(--line);
+  background: var(--face);
 }
 
 .perspective-tool-group,
@@ -33,26 +33,26 @@
 
 .perspective-toolbar button,
 .perspective-corner-inspector button {
-  min-height: 28px;
+  min-height: var(--ctl-h);
   padding: 4px 9px;
-  border: 1px solid #3d493e;
-  border-radius: 3px;
-  background: #202720;
-  color: #e6eae2;
+  border: var(--border-w, 1px) solid var(--line);
+  border-radius: var(--radius);
+  background: var(--face-hi);
+  color: var(--ink);
   font: inherit;
   cursor: pointer;
 }
 
 .perspective-toolbar button:hover:not(:disabled),
 .perspective-corner-inspector button:hover:not(:disabled) {
-  border-color: #667867;
-  background: #293229;
+  border-color: var(--line-strong);
+  background: var(--face-active);
 }
 
 .perspective-tool-button[aria-pressed="true"] {
   border-color: var(--perspective-accent);
-  background: #33452f;
-  color: #f1faeb;
+  background: var(--row-checked);
+  color: var(--ink);
 }
 
 .perspective-toolbar button:disabled,
@@ -63,7 +63,7 @@
 
 .perspective-history-group {
   padding-left: 7px;
-  border-left: 1px solid #344034;
+  border-left: var(--border-w, 1px) solid var(--line);
 }
 
 .perspective-proposal-badge {
@@ -71,22 +71,24 @@
   margin-left: auto;
   padding: 3px 8px;
   overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--perspective-accent) 52%, #39423a);
+  border: var(--border-w, 1px) solid color-mix(
+    in srgb, var(--perspective-accent) 52%, var(--line));
   border-radius: 999px;
-  color: #cde9be;
+  color: var(--cyan);
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .perspective-proposal-badge[data-quad-based-on="fallback"] {
-  border-color: color-mix(in srgb, var(--perspective-fallback) 58%, #493e2f);
-  color: #f5d9ae;
+  border-color: color-mix(in srgb, var(--perspective-fallback) 58%, var(--line));
+  color: var(--amber);
 }
 
 .perspective-queue-button {
-  border-color: #66865b !important;
-  background: #314b2b !important;
+  border-color: var(--ink) !important;
+  background: var(--ink) !important;
+  color: var(--face-hi) !important;
   font-weight: 650 !important;
 }
 
@@ -167,8 +169,8 @@
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  border-left: 1px solid #2d372e;
-  background: #171c17;
+  border-left: var(--border-w, 1px) solid var(--line);
+  background: var(--face);
 }
 
 .perspective-corner-fieldset {
@@ -181,7 +183,7 @@
 .perspective-corner-fieldset legend {
   width: 100%;
   padding: 2px 0 7px;
-  color: #eff3eb;
+  color: var(--ink);
   font-size: 13px;
   font-weight: 700;
 }
@@ -191,7 +193,7 @@
 .perspective-validation-status,
 .perspective-queue-status {
   margin: 0;
-  color: #aab4aa;
+  color: var(--ink-muted);
   font-size: 11px;
   line-height: 1.45;
 }
@@ -206,11 +208,12 @@
   gap: 7px;
   align-items: end;
   padding: 8px 0;
-  border-top: 1px solid #2a332b;
+  border-top: var(--border-w, 1px) solid var(--line);
 }
 
 .perspective-corner-row[data-selected="true"] {
-  background: linear-gradient(90deg, rgb(154 215 125 / 9%), transparent);
+  background: linear-gradient(
+    90deg, color-mix(in srgb, var(--perspective-accent) 10%, transparent), transparent);
 }
 
 .perspective-corner-select {
@@ -220,7 +223,7 @@
 
 .perspective-corner-select[aria-pressed="true"] {
   border-color: var(--perspective-accent);
-  background: #30422d;
+  background: var(--row-checked);
 }
 
 .perspective-coordinate-pair {
@@ -236,7 +239,7 @@
 
 .perspective-coordinate-control label {
   overflow: hidden;
-  color: #aab4aa;
+  color: var(--ink-muted);
   font-size: 9px;
   line-height: 1.2;
   text-overflow: ellipsis;
@@ -248,16 +251,16 @@
   min-width: 0;
   height: 28px;
   padding: 3px 4px;
-  border: 1px solid #465247;
-  border-radius: 3px;
-  background: #0f130f;
-  color: #edf1e9;
-  font: 11px/1.2 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  border: var(--border-w, 1px) solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--input-bg);
+  color: var(--input-ink);
+  font: 11px/1.2 var(--mono);
 }
 
 .perspective-coordinate-control input[aria-invalid="true"] {
   border-color: var(--perspective-danger);
-  box-shadow: 0 0 0 1px rgb(255 119 112 / 25%);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--perspective-danger) 25%, transparent);
 }
 
 .perspective-coordinate-control input:focus-visible,
@@ -270,22 +273,22 @@
 .perspective-validation-status {
   min-height: 33px;
   padding: 8px 0 2px;
-  border-top: 1px solid #2a332b;
+  border-top: var(--border-w, 1px) solid var(--line);
 }
 
 .perspective-validation-status:not([data-validation-code="valid"]) {
-  color: #ffaaa5;
+  color: var(--red);
 }
 
 .perspective-tool-instruction,
 .perspective-queue-status {
   min-height: 34px;
   padding: 7px 10px;
-  border-top: 1px solid #2a332b;
+  border-top: var(--border-w, 1px) solid var(--line);
 }
 
 .perspective-queue-status {
-  color: #c8d7c5;
+  color: var(--ink-muted);
 }
 
 @media (max-width: 820px) {
@@ -304,7 +307,7 @@
   }
 
   .perspective-corner-inspector {
-    border-top: 1px solid #2d372e;
+    border-top: var(--border-w, 1px) solid var(--line);
     border-left: 0;
   }
 

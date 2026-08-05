@@ -14,6 +14,7 @@ const {
   booksForView,
   captureBooks,
   latestImportedAt,
+  captureCommandTarget,
   normalizeCorrectionsIndex,
   sortedBooks,
 } = require("../tools/whl_explorer/static/corrections/books");
@@ -532,6 +533,242 @@ test("Books panel renders honest states, accessible chips, and keyboard-focusabl
   });
 
 
+test("navigation-only capture revisions cannot become correction targets", () => {
+  const value = fixture().books[0];
+  const capture = { ...value.captures[0], revision: "index:abc123" };
+
+  assert.equal(captureCommandTarget(value, capture), null);
+});
+
+
+test("index-only capture clicks carry a validated thumbnail navigation preview",
+  async () => {
+    const value = fixture();
+    const capture = value.books[0].captures.find((candidate) =>
+      candidate.artifact_id === "capture-cover");
+    capture.revision = "index:cover-preview-r1";
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => value },
+    });
+    const harness = miniHarness();
+    const navigations = [];
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      onNavigate: (address, metadata) => navigations.push({ address, metadata }),
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const button = descendants(harness.list, "button").find((candidate) =>
+      candidate.dataset.artifactId === "capture-cover");
+    button.emit("click");
+
+    assert.deepEqual(navigations[0].metadata, {
+      source: "books",
+      targetKind: "image",
+      navigationPreview: {
+        itemId: "book-herbarium",
+        representationId: "scan-herbarium",
+        canvasId: "canvas-cover",
+        artifactId: "capture-cover",
+        url: "/api/v1/resources/thumb-cover",
+        label: "Front cover",
+      },
+    });
+    assert.equal(Object.isFrozen(navigations[0].metadata.navigationPreview), true);
+    controller.destroy();
+  });
+
+
+test("hint capture blur does not clobber an authoritative hydrated target",
+  async () => {
+    const value = fixture();
+    value.books[0].captures[0].revision = "index:abc123";
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => value },
+    });
+    const harness = miniHarness();
+    let classificationTarget = null;
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      onSelectionTarget(target) { classificationTarget = target; },
+    }).mount();
+    await store.openWorkspace("workspace-1");
+    const button = descendants(harness.list, "button").find((candidate) =>
+      candidate.dataset.artifactId === value.books[0].captures[0].artifact_id);
+
+    button.emit("click");
+    const hydrated = { artifactId: button.dataset.artifactId, revision: "artifact-r9" };
+    classificationTarget = hydrated;
+    button.emit("blur");
+
+    assert.equal(classificationTarget, hydrated,
+      "classification keeps the artifact detail revision after leaving the hint row");
+
+    store.setSelection({
+      itemId: value.books[0].id,
+      representationId: value.books[0].representation_id,
+      canvasId: value.books[0].captures[0].canvas_id,
+      artifactId: null,
+      annotationId: "region-1",
+    }, { ownedByFeature: false });
+    const annotation = { key: "annotation:region-1", revision: "region-r1" };
+    classificationTarget = annotation;
+    button.emit("blur");
+    assert.equal(classificationTarget, annotation,
+      "a later Books blur cannot clear an authoritative annotation target");
+    controller.destroy();
+  });
+
+
+test("Books panel bounds book and capture DOM while retaining deep selections",
+  async () => {
+    const source = fixture();
+    const base = source.books[0];
+    const books = Array.from({ length: 70 }, (_value, index) => ({
+      ...clone(base),
+      id: `book-batch-${index}`,
+      revision: `book-batch-r${index}`,
+      title: `Book ${String(index).padStart(2, "0")}`,
+      review: {
+        revision: `review-batch-r${index}`,
+        state: "clear",
+        reason: "",
+        history_count: 0,
+        latest_event: null,
+      },
+      captures: base.captures.map((capture, captureIndex) => ({
+        ...clone(capture),
+        artifact_id: `capture-batch-${index}-${captureIndex}`,
+        revision: `capture-batch-r${index}-${captureIndex}`,
+        capture_order: captureIndex,
+        canvas_id: `canvas-batch-${index}-${captureIndex}`,
+      })),
+    }));
+    const indexValue = {
+      schema: CORRECTIONS_INDEX_SCHEMA,
+      revision: "index-batch-r1",
+      books,
+      attention: [],
+    };
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => indexValue },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    assert.equal(harness.list.children.length, 49,
+      "48 book rows plus one load-more row are rendered");
+    store.setSelection({
+      itemId: "book-batch-69",
+      representationId: null,
+      canvasId: null,
+      artifactId: "capture-batch-69-1",
+      annotationId: null,
+    }, { ownedByFeature: true });
+    assert.ok(harness.list.children.some((row) =>
+      row.dataset.bookId === "book-batch-69"));
+    assert.ok(descendants(harness.list, "button").some((button) =>
+      button.dataset.artifactId === "capture-batch-69-1"));
+    store.setSelection({
+      itemId: "book-batch-0",
+      representationId: null,
+      canvasId: null,
+      artifactId: null,
+      annotationId: null,
+    }, { ownedByFeature: true });
+    assert.ok(harness.list.children.some((row) =>
+      row.dataset.bookId === "book-batch-47"),
+    "leaving a deep selection restores the natural bounded book window");
+    assert.equal(harness.list.children.some((row) =>
+      row.dataset.bookId === "book-batch-69"), false,
+    "the former deep-selection pin does not remain cached");
+
+    const booksMore = descendants(harness.list, "button").find((button) =>
+      Object.prototype.hasOwnProperty.call(button.dataset, "booksLoadMore"));
+    booksMore.focus();
+    booksMore.emit("click");
+    assert.equal(harness.documentRef.activeElement.dataset.bookSelect,
+      "book-batch-48",
+    "the last Books page focuses its first newly revealed row");
+
+    const many = clone(indexValue);
+    many.revision = "index-many-captures-r1";
+    const captureTemplate = clone(base.captures[1]);
+    many.books = [{
+      ...clone(base),
+      id: "book-many-captures",
+      revision: "book-many-captures-r1",
+      review: {
+        revision: "review-many-captures-r1",
+        state: "clear",
+        reason: "",
+        history_count: 0,
+        latest_event: null,
+      },
+      captures: Array.from({ length: 30 }, (_capture, captureIndex) => ({
+        ...clone(captureTemplate),
+        artifact_id: `capture-many-${captureIndex}`,
+        revision: `capture-many-r${captureIndex}`,
+        capture_order: captureIndex,
+        canvas_id: `canvas-many-${captureIndex}`,
+      })),
+    }];
+    await store.openWorkspace("workspace-2", { selection: null });
+    // Replace the API result for the new workspace and force the bounded load.
+    store.index = normalizeCorrectionsIndex(many);
+    store.status = "ready";
+    store.emit();
+    assert.equal(descendants(harness.list, "button").filter((button) =>
+      button.dataset.artifactId).length, 12);
+    store.setSelection({
+      itemId: "book-many-captures",
+      representationId: "scan-herbarium",
+      canvasId: "canvas-many-29",
+      artifactId: "capture-many-29",
+      annotationId: null,
+    }, { ownedByFeature: true });
+    assert.ok(descendants(harness.list, "button").some((button) =>
+      button.dataset.artifactId === "capture-many-29"));
+    assert.equal(descendants(harness.list, "button").filter((button) =>
+      button.dataset.artifactId).length, 12);
+    store.setSelection({
+      itemId: "book-many-captures",
+      representationId: "scan-herbarium",
+      canvasId: "canvas-many-0",
+      artifactId: "capture-many-0",
+      annotationId: null,
+    }, { ownedByFeature: true });
+    assert.ok(descendants(harness.list, "button").some((button) =>
+      button.dataset.artifactId === "capture-many-11"),
+    "leaving a deep capture restores the natural bounded capture window");
+    assert.equal(descendants(harness.list, "button").some((button) =>
+      button.dataset.artifactId === "capture-many-29"), false,
+    "the former deep capture pin does not remain cached");
+
+    const capturesMore = () => descendants(harness.list, "button")
+      .find((button) =>
+        button.dataset.capturesLoadMore === "book-many-captures");
+    capturesMore().focus();
+    capturesMore().emit("click");
+    assert.equal(harness.documentRef.activeElement, capturesMore(),
+      "an intermediate capture page keeps focus on the replacement pager");
+    capturesMore().emit("click");
+    assert.equal(harness.documentRef.activeElement.dataset.artifactId,
+      "capture-many-24",
+    "the last capture page focuses its first newly revealed capture");
+    controller.destroy();
+  });
+
+
 test("capture rerenders restore focused selection and blur reads the live selection",
   async () => {
     const store = new CorrectionsIndexStore({
@@ -567,12 +804,20 @@ test("capture rerenders restore focused selection and blur reads the live select
     assert.equal(targets.at(-1).detail.focused, false);
 
     const original = nonselectedCover;
+    const originalThumbnail = descendants(original, "img")[0];
+    let selectionEmits = 0;
+    const unsubscribe = store.subscribe(() => { selectionEmits += 1; });
+    selectionEmits = 0;
     original.focus();
     original.emit("click");
     const replacement = captureButton("capture-cover");
-    assert.notEqual(replacement, original, "selection rerenders the capture row");
-    assert.equal(harness.documentRef.activeElement, replacement,
-      "the replacement for the selected capture recovers DOM focus");
+    assert.equal(replacement, original,
+      "selection-only updates preserve the capture DOM node");
+    assert.equal(descendants(replacement, "img")[0], originalThumbnail,
+      "selection-only updates do not restart a thumbnail request");
+    assert.equal(selectionEmits, 1,
+      "one capture click publishes one store selection");
+    assert.equal(harness.documentRef.activeElement, replacement);
     assert.equal(replacement.getAttribute("aria-pressed"), "true");
     assert.equal(replacement.dataset.itemId, "book-herbarium");
     assert.equal(targets.at(-1).target.artifactId, "capture-cover");
@@ -594,6 +839,7 @@ test("capture rerenders restore focused selection and blur reads the live select
     assert.equal(legacyFocusCalls.length, 2);
     assert.equal(legacyFocusCalls[1], undefined,
       "focus restoration falls back for browsers without focus options");
+    unsubscribe();
     controller.destroy();
   });
 
@@ -628,8 +874,8 @@ test("Books rerenders preserve a still-present focused nonselected capture",
 
     controller.render(store.snapshot());
     const replacement = captureButton("capture-cover");
-    assert.notEqual(replacement, original);
-    assert.equal(harness.documentRef.activeElement, replacement);
+    assert.equal(replacement, original);
+    assert.equal(harness.documentRef.activeElement, original);
     assert.equal(replacement.getAttribute("aria-pressed"), "false");
     assert.equal(store.snapshot().selection.artifactId, "capture-title",
       "restoring focus must not change the selected capture");

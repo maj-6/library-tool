@@ -46,6 +46,7 @@ const {
   CorrectionsWindowState,
   artifactSelection,
   correctionsRuntimePorts,
+  navigationOnlyTarget,
   nextTrayTab,
   normalizeSelection,
   normalizeWorkbenchContext,
@@ -843,6 +844,165 @@ test("classification shortcuts stay scoped and context menus use exact event tar
 });
 
 
+test("navigation hints stay inactive and cannot overwrite hydrated selection targets", () => {
+  const hint = {
+    key: "artifact:capture-1",
+    objectType: "raster-artifact",
+    itemId: "book-1",
+    id: "capture-1",
+    revision: "index:abc123",
+  };
+  const hydrated = { ...hint, revision: "capture-r9" };
+  assert.equal(navigationOnlyTarget(hint), true);
+  assert.equal(navigationOnlyTarget(hydrated), false);
+
+  const published = [];
+  let current = null;
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.classificationController = {
+    stateSnapshot: () => ({ selectionTarget: current }),
+    setSelectionTarget(target, detail) {
+      current = target;
+      published.push({ target, detail });
+      return target;
+    },
+  };
+  const hintEcho = {
+    source: "selection",
+    navigationHint: true,
+    address: { itemId: "book-1", artifactId: "capture-1" },
+  };
+
+  shell.publishClassificationSelectionTarget(null, hintEcho);
+  shell.publishClassificationSelectionTarget(hydrated, { source: "artifacts" });
+  shell.publishClassificationSelectionTarget(null, hintEcho);
+
+  assert.equal(current, hydrated);
+  assert.deepEqual(published.map((entry) => entry.target), [null, hydrated],
+    "the Books echo is ignored only after matching artifact detail hydrates");
+
+  shell.publishClassificationSelectionTarget(null, {
+    ...hintEcho,
+    address: { itemId: "book-1", artifactId: "capture-2" },
+  });
+  assert.equal(current, null,
+    "a different hinted capture still clears the previous target");
+});
+
+
+test("artifact selection finishes with authoritative non-Books targets", () => {
+  const raster = {
+    key: "artifact:processed-1",
+    objectType: "raster-artifact",
+    itemId: "book-1",
+    id: "processed-1",
+    revision: "processed-r1",
+    source: { representationId: "primary", canvasId: "page-1" },
+  };
+  const annotation = {
+    key: "annotation:region-1",
+    objectType: "spatial-annotation",
+    itemId: "book-1",
+    id: "region-1",
+    revision: "region-r1",
+    source: { representationId: "primary", canvasId: "page-1" },
+  };
+  let current = null;
+  const published = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.state = {
+    selection: {
+      itemId: "book-1",
+      representationId: "primary",
+      canvasId: "page-1",
+      artifactId: null,
+      annotationId: null,
+    },
+  };
+  shell.artifactTreeElement = () => null;
+  shell.classificationController = {
+    stateSnapshot: () => ({ selectionTarget: current }),
+    setSelectionTarget(target) {
+      current = target;
+      published.push(target);
+      return target;
+    },
+  };
+  shell.selectAddress = (address) => {
+    shell.state.selection = address;
+    // Model the Books facade echo for a target absent from the capture index.
+    shell.publishClassificationSelectionTarget(null, {
+      source: "selection",
+      navigationHint: false,
+      address,
+    });
+    return address;
+  };
+
+  shell.selectArtifactItem(raster);
+  assert.equal(current, raster);
+  shell.selectArtifactItem(annotation);
+  assert.equal(current, annotation);
+  assert.deepEqual(published, [null, raster, null, annotation]);
+});
+
+
+test("later Books null echoes preserve same-address authoritative targets", () => {
+  const raster = {
+    key: "artifact:processed-1",
+    objectType: "raster-artifact",
+    itemId: "book-1",
+    id: "processed-1",
+    revision: "processed-r1",
+  };
+  const annotation = {
+    key: "annotation:region-1",
+    objectType: "spatial-annotation",
+    itemId: "book-1",
+    id: "region-1",
+    revision: "region-r1",
+  };
+  let current = null;
+  const published = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.classificationController = {
+    stateSnapshot: () => ({ selectionTarget: current }),
+    setSelectionTarget(target, detail) {
+      current = target;
+      published.push({ target, detail });
+      return target;
+    },
+  };
+
+  shell.publishClassificationSelectionTarget(raster, { source: "artifacts" });
+  shell.publishClassificationSelectionTarget(null, {
+    source: "refresh",
+    navigationHint: false,
+    address: { itemId: "book-1", artifactId: "processed-1" },
+  });
+  assert.equal(current, raster,
+    "a delayed Books refresh cannot clear the selected processed image");
+
+  shell.publishClassificationSelectionTarget(annotation, { source: "artifacts" });
+  shell.publishClassificationSelectionTarget(null, {
+    source: "context",
+    navigationHint: false,
+    address: { itemId: "book-1", annotationId: "region-1" },
+  });
+  assert.equal(current, annotation,
+    "a slower Books context load cannot clear the selected annotation");
+  assert.deepEqual(published.map((entry) => entry.target), [raster, annotation]);
+
+  shell.publishClassificationSelectionTarget(null, {
+    source: "selection",
+    navigationHint: false,
+    address: { itemId: "book-1", artifactId: "processed-2" },
+  });
+  assert.equal(current, null,
+    "a different object address still clears the previous target");
+});
+
+
 test("overlay blur demotes classification focus without erasing its selected target", () => {
   const shell = Object.create(CorrectionsShell.prototype);
   const target = { key: "annotation:box-1" };
@@ -1251,6 +1411,53 @@ test("cross-panel selection addresses retain context without carrying stale obje
   }, prior);
   assert.equal(transform.artifactId, null);
   assert.equal(transform.annotationId, null);
+});
+
+
+test("Books navigation previews are forwarded only into the artifact context", async () => {
+  const artifactContexts = [];
+  const state = new CorrectionsWindowState();
+  state.applyContext(context());
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    artifactsFeature: {
+      setContext(value) {
+        artifactContexts.push(value);
+        return Promise.resolve();
+      },
+    },
+    destroyed: false,
+    root: { querySelector() { return null; } },
+    selectionListeners: new Set(),
+    setStatus() {},
+    state,
+  });
+  const navigationPreview = Object.freeze({
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "page-1",
+    artifactId: "capture-1",
+    url: "/thumb/capture-1.jpg",
+    label: "Capture 1",
+  });
+
+  shell.selectAddress({
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "page-1",
+    artifactId: "capture-1",
+    annotationId: null,
+  }, {
+    source: "books",
+    targetKind: "image",
+    navigationPreview,
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(artifactContexts.at(-1).navigationPreview, navigationPreview);
+  assert.equal(Object.hasOwn(state.context, "navigationPreview"), false,
+    "temporary display metadata must not enter durable window context");
 });
 
 

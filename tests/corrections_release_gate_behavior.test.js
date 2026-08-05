@@ -333,10 +333,12 @@ test("large cached thumbnail and artifact browsing stays bounded by release budg
     await store.openWorkspace("local-library");
     const renderElapsed = performance.now() - renderStarted;
     const captureButtons = list.querySelectorAll("[data-artifact-id]");
-    assert.equal(captureButtons.length, LARGE_BOOK_CAPTURE_COUNT,
-      "the production Books controller keeps every capture keyboard reachable");
+    assert.equal(captureButtons.length, 12,
+      "the production Books controller bounds the initial capture DOM");
+    assert.ok(list.querySelector("[data-captures-load-more]"),
+      "the remaining captures stay explicitly reachable in bounded batches");
     assert.equal(captureButtons.at(-1).querySelector("img").loading, "lazy",
-      "off-screen thumbnail decoding remains delegated to the browser");
+      "mounted thumbnail decoding remains delegated to the browser");
     assert.ok(renderElapsed < CACHED_BROWSE_BUDGET_MS,
       `cached Books rendering took ${renderElapsed.toFixed(2)} ms`);
     panel.destroy();

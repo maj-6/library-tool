@@ -775,20 +775,78 @@ class _CorrectionProjectionUnion:
             )
         return tuple(sorted(values, key=lambda value: value.key.artifact_id))
 
+    def list_capture_index_hints(
+        self,
+        item_id: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Delegate navigation-only capture hints to the authority adapter."""
+
+        hints = getattr(self._base, "list_capture_index_hints", None)
+        if not callable(hints):
+            return ()
+        with self._read_context():
+            values = hints(item_id)
+        if (
+            isinstance(values, (str, bytes))
+            or not isinstance(values, Sequence)
+            or any(not isinstance(value, Mapping) for value in values)
+        ):
+            raise RepositoryError(
+                "the correction capture index returned invalid hints",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item_id},
+            )
+        return tuple(values)
+
     def get_raster_artifact(
         self,
         key: RasterArtifactKey,
     ) -> RasterArtifactView | None:
         if not isinstance(key, RasterArtifactKey):
             raise TypeError("key must be a RasterArtifactKey")
-        return next(
-            (
-                value
-                for value in self.list_raster_artifacts(key.item_id)
-                if value.key == key
-            ),
-            None,
-        )
+        with self._read_context():
+            base = self._base.get_raster_artifact(key)
+            transformed = self._transforms.get_raster_artifact(key)
+        if base is not None and transformed is not None:
+            raise RepositoryError(
+                "a correction transform output reuses a raster identity",
+                code="invalid_correction_transform_storage",
+                details={"item_id": key.item_id},
+            )
+        return base if base is not None else transformed
+
+    def get_capture_raster_artifact(
+        self,
+        key: RasterArtifactKey,
+    ) -> RasterArtifactView | None:
+        """Return only base capture authority for the no-durable fast path."""
+
+        if not isinstance(key, RasterArtifactKey):
+            raise TypeError("key must be a RasterArtifactKey")
+        getter = getattr(self._base, "get_capture_raster_artifact", None)
+        if not callable(getter):
+            return None
+        with self._read_context():
+            return getter(key)
+
+    def resolve_capture_preview(
+        self,
+        item_id: str,
+        artifact_id: str,
+    ) -> Any:
+        key = RasterArtifactKey(item_id, artifact_id)
+        with self._read_context():
+            preview = getattr(self._base, "resolve_capture_preview", None)
+            if callable(preview):
+                resolved = preview(item_id, artifact_id)
+                if resolved is not None:
+                    return resolved
+            # Non-capture and transformed artifacts preserve the ordinary
+            # authoritative keyed projection/resource grant as a fallback.
+            artifact = self.get_raster_artifact(key)
+            if artifact is None or artifact.resource is None:
+                return None
+            return self.resolve_raster_resource(item_id, artifact.resource)
 
     def resolve_raster_resource(
         self,
@@ -801,7 +859,11 @@ class _CorrectionProjectionUnion:
             if resource.resource_id.startswith("correction-raster:"):
                 # Recheck item membership under the same authority lock as
                 # the immutable-object snapshot.
-                self._base.list_raster_artifacts(item_id)
+                membership = getattr(self._base, "assert_item_exists", None)
+                if callable(membership):
+                    membership(item_id)
+                else:
+                    self._base.list_raster_artifacts(item_id)
                 return self._transforms.resolve_raster_resource(
                     item_id,
                     resource,

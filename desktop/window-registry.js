@@ -390,6 +390,11 @@ class WorkbenchWindowRegistry {
     }
     const record = {
       windowId: this.makeWindowId(),
+      // Electron may make BrowserWindow.webContents throw as soon as the
+      // window reaches its `closed` event.  Keep the immutable lookup key
+      // while the object is unquestionably live so teardown never needs to
+      // dereference a destroyed native wrapper.
+      webContentsId: win.webContents.id,
       role: values.role,
       workbenchId: values.workbenchId,
       documentPath,
@@ -402,7 +407,7 @@ class WorkbenchWindowRegistry {
       window: win,
     };
     this.byWindowId.set(record.windowId, record);
-    this.byWebContentsId.set(win.webContents.id, record);
+    this.byWebContentsId.set(record.webContentsId, record);
     if (record.persistBounds && typeof win.on === "function") {
       win.on("close", () => this._saveBounds(record));
     }
@@ -431,9 +436,7 @@ class WorkbenchWindowRegistry {
     const current = this.byWindowId.get(record.windowId);
     if (current !== record) return false;
     this.byWindowId.delete(record.windowId);
-    if (record.window && record.window.webContents) {
-      this.byWebContentsId.delete(record.window.webContents.id);
-    }
+    this.byWebContentsId.delete(record.webContentsId);
     return true;
   }
 

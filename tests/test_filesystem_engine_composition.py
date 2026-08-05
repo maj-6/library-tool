@@ -1282,6 +1282,7 @@ def test_corrections_source_uses_installed_native_text_layer_service(
 
 def test_production_composition_reopens_projected_transform_outputs(
     tmp_path,
+    monkeypatch,
 ):
     capture_root = tmp_path / "captures"
     _write_composition_capture(capture_root)
@@ -1352,6 +1353,23 @@ def test_production_composition_reopens_projected_transform_outputs(
         == "corrected-display"
     )
     assert corrected.resource is not None
+    projection_union = reopened_raster._raster_artifacts
+    base_list = projection_union._base.list_raster_artifacts
+    monkeypatch.setattr(
+        projection_union._base,
+        "list_raster_artifacts",
+        lambda _item_id: pytest.fail(
+            "keyed transformed detail listed every base capture"
+        ),
+    )
+    transformed = projection_union.get_raster_artifact(corrected.key)
+    assert transformed is not None and transformed.key == corrected.key
+    monkeypatch.setattr(
+        projection_union._base,
+        "list_raster_artifacts",
+        base_list,
+    )
+    assert reopened_raster.get_raster_artifact(corrected.key) == corrected
     resolved = reopened_raster.resolve_raster_resource(
         "book-one",
         corrected.resource,

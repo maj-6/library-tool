@@ -270,6 +270,229 @@ test("context and selection generations discard stale results and abort prior wo
 });
 
 
+test("navigation previews stay non-authoritative while deferred detail remains stale-safe",
+  async () => {
+    const firstDetail = deferred();
+    const secondDetail = deferred();
+    const rasterStarted = deferred();
+    const rasterResponse = deferred();
+    const detailRequests = [];
+    const rasterRequests = [];
+    const { feature, published, selections } = harness({
+      initialExpandedGroups: [],
+      catalog: {
+        async list() { return { items: [] }; },
+        get({ key, signal }) {
+          detailRequests.push({ key, signal });
+          return key === "artifact:capture-1"
+            ? firstDetail.promise : secondDetail.promise;
+        },
+      },
+      resources: {
+        async resolveRaster({ artifactId }) {
+          rasterRequests.push(artifactId);
+          rasterStarted.resolve();
+          return rasterResponse.promise;
+        },
+      },
+    });
+    const preview = (artifactId, canvasId) => ({
+      itemId: "book-1",
+      representationId: "scan-1",
+      canvasId,
+      artifactId,
+      url: `/thumb/${artifactId}.jpg`,
+      label: artifactId,
+    });
+
+    const firstContext = feature.setContext({
+      item_id: "book-1",
+      representation_id: "scan-1",
+      canvas_id: "page-1",
+      artifact_id: "capture-1",
+      navigationPreview: preview("capture-1", "page-1"),
+    });
+    const firstPreview = feature.currentResource;
+    assert.equal(firstPreview.url, "/thumb/capture-1.jpg");
+    assert.equal(firstPreview.navigationOnly, true);
+    assert.equal(feature.getCommandTarget(), null);
+    assert.deepEqual(selections, [null],
+      "preview publication must not emit an artifact selection");
+    for (const field of [
+      "revision", "resourceRef", "correction", "requestFull", "summary",
+    ]) {
+      assert.equal(Object.hasOwn(firstPreview, field), false,
+        `preview must not expose ${field}`);
+    }
+
+    const secondContext = feature.setContext({
+      item_id: "book-1",
+      representation_id: "scan-1",
+      canvas_id: "page-2",
+      artifact_id: "capture-2",
+      navigationPreview: preview("capture-2", "page-2"),
+    });
+    const secondPreview = feature.currentResource;
+    assert.equal(secondPreview.url, "/thumb/capture-2.jpg");
+    assert.equal(feature.getCommandTarget(), null);
+    assert.equal(detailRequests[0].signal.aborted, true);
+
+    firstDetail.resolve(raster("capture-1"));
+    assert.equal(await firstContext, null);
+    assert.equal(feature.currentResource, secondPreview,
+      "a superseded detail response must not replace the current preview");
+    assert.deepEqual(rasterRequests, []);
+
+    secondDetail.resolve(raster("capture-2", "captured-image", {
+      source: {
+        representation_id: "scan-1",
+        representation_revision: "scan-r1",
+        canvas_id: "page-2",
+        canvas_revision: "page-2-r1",
+      },
+    }));
+    await rasterStarted.promise;
+    assert.equal(feature.currentResource, secondPreview,
+      "the matching preview must remain visible while the display raster resolves");
+    assert.equal(feature.getCommandTarget().id, "capture-2",
+      "only hydrated detail, not the preview, becomes a command target");
+    rasterResponse.resolve({ url: "/resolved/capture-2.jpg" });
+    await secondContext;
+
+    assert.equal(feature.currentResource.url, "/resolved/capture-2.jpg");
+    assert.notEqual(feature.currentResource, secondPreview);
+    assert.notEqual(feature.currentResource.navigationOnly, true);
+    assert.equal(feature.currentResource.summary.revision, "capture-2-r1");
+    assert.equal(typeof feature.currentResource.requestFull, "function");
+    assert.equal(feature.getCommandTarget().id, "capture-2");
+    assert.equal(selections.at(-1).id, "capture-2");
+    assert.deepEqual(rasterRequests, ["capture-2"]);
+  });
+
+
+test("navigation previews reject mismatched addresses and unsafe raster URLs", async () => {
+  const firstDetail = deferred();
+  const secondDetail = deferred();
+  const { feature, published } = harness({
+    initialExpandedGroups: [],
+    catalog: {
+      async list() { return { items: [] }; },
+      get({ key }) {
+        return key === "artifact:capture-1"
+          ? firstDetail.promise : secondDetail.promise;
+      },
+    },
+    resources: {
+      async resolveRaster({ artifactId }) {
+        return { url: `/resolved/${artifactId}.jpg` };
+      },
+    },
+  });
+  const basePreview = {
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "page-1",
+    artifactId: "capture-1",
+    url: "/thumb/capture-1.jpg",
+    label: "Capture 1",
+  };
+
+  const mismatched = feature.setContext({
+    item_id: "book-1",
+    representation_id: "scan-1",
+    canvas_id: "page-1",
+    artifact_id: "capture-1",
+    navigationPreview: { ...basePreview, itemId: "book-other" },
+  });
+  assert.equal(feature.currentResource, null);
+
+  const unsafe = feature.setContext({
+    item_id: "book-1",
+    representation_id: "scan-1",
+    canvas_id: "page-2",
+    artifact_id: "capture-2",
+    navigationPreview: {
+      ...basePreview,
+      canvasId: "page-2",
+      artifactId: "capture-2",
+      url: "javascript:alert(1)",
+    },
+  });
+  assert.equal(feature.currentResource, null);
+  assert.equal(published.some((resource) =>
+    resource && resource.navigationOnly === true), false);
+
+  firstDetail.resolve(raster("capture-1"));
+  assert.equal(await mismatched, null);
+  secondDetail.resolve(raster("capture-2", "captured-image", {
+    source: {
+      representation_id: "scan-1",
+      canvas_id: "page-2",
+      canvas_revision: "page-2-r1",
+    },
+  }));
+  await unsafe;
+  assert.equal(feature.currentResource.url, "/resolved/capture-2.jpg");
+});
+
+
+test("superseded deep links cannot start group loads against a newer context",
+  async () => {
+    const oldDetail = deferred();
+    const listCalls = [];
+    const { feature } = harness({
+      initialExpandedGroups: ["source-images"],
+      catalog: {
+        async list({ context }) {
+          listCalls.push(context.itemId);
+          return { items: [] };
+        },
+        get({ context }) {
+          if (context.itemId === "book-old") return oldDetail.promise;
+          return Promise.resolve(raster("capture-new", "captured-image", {
+            key: { item_id: "book-new", artifact_id: "capture-new" },
+          }));
+        },
+      },
+    });
+
+    const oldContext = feature.setContext({
+      item_id: "book-old", artifact_id: "capture-old",
+    });
+    const newContext = feature.setContext({ item_id: "book-new" });
+    await newContext;
+    oldDetail.resolve(raster("capture-old", "captured-image", {
+      key: { item_id: "book-old", artifact_id: "capture-old" },
+    }));
+    await oldContext;
+
+    assert.deepEqual(listCalls, ["book-new"]);
+    assert.equal(feature.context.itemId, "book-new");
+  });
+
+
+test("failed deep links retain their error status", async () => {
+  const { feature, statuses } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() { return { items: [] }; },
+      async get() { throw new Error("capture detail unavailable"); },
+    },
+  });
+
+  await feature.setContext({
+    item_id: "book-1", artifact_id: "missing-capture",
+  });
+  await Promise.resolve();
+
+  assert.ok(statuses.some(([message, error]) =>
+    message === "capture detail unavailable" && error === true));
+  assert.equal(statuses.some(([message, error]) =>
+    error === false && /(?:Selected artifact|Artifact context) ready/.test(message)),
+  false);
+});
+
+
 test("refresh evicts same-revision details before restoring inherited-category selection", async () => {
   let effectiveCategory = "cover";
   let detailReads = 0;
@@ -476,6 +699,52 @@ test("engine-backed images page same-canvas annotations into the editor overlay"
   assert.deepEqual(
     published.at(-1).regions.map((value) => value.annotation_id),
     ["region-1", "region-2"],
+  );
+});
+
+
+test("paged image regions do not delay the resolved display resource", async () => {
+  const regionRequest = deferred();
+  const regionPage = deferred();
+  const overlay = annotation("region-1");
+  const { feature, published } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() { return { items: [raster("capture-1")] }; },
+      async get() {
+        return raster("capture-1", "captured-image", {
+          extensions: { corrections_ui: { paged_regions: true } },
+        });
+      },
+    },
+    resources: {
+      async resolveRaster() { return { url: "/safe/display.jpg" }; },
+      async listRegions() {
+        regionRequest.resolve();
+        return regionPage.promise;
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  const selection = feature.select("artifact:capture-1");
+  await regionRequest.promise;
+
+  const display = published.at(-1);
+  assert.equal(display.url, "/safe/display.jpg");
+  assert.deepEqual(display.regions, []);
+  assert.equal(feature.currentResource, display);
+
+  regionPage.resolve({ items: [overlay], nextCursor: null });
+  await selection;
+
+  const enriched = published.at(-1);
+  assert.notEqual(enriched, display);
+  assert.equal(enriched.url, "/safe/display.jpg");
+  assert.deepEqual(
+    enriched.regions.map((value) =>
+      value.annotation_id || value.key && value.key.annotation_id),
+    ["region-1"],
   );
 });
 

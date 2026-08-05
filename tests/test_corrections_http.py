@@ -5,6 +5,7 @@ import io
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import pytest
 from flask import Flask
 
 from librarytool.adapters.filesystem import (
@@ -657,6 +658,81 @@ def test_raster_resource_requires_its_pin_and_never_serializes_a_path(tmp_path):
         headers={"If-None-Match": response.headers["ETag"]},
     )
     assert cached.status_code == 304
+
+
+def test_raster_preview_uses_bytes_only_resolver_without_artifact_projection():
+    content = b"\x89PNG\r\n\x1a\npreview-bytes"
+    digest = hashlib.sha256(content).hexdigest()
+
+    class ExplodingProjector:
+        def list_raster_artifacts(self, _item_id):
+            pytest.fail("preview listed authoritative artifacts")
+
+        def get_raster_artifact(self, _key):
+            pytest.fail("preview projected authoritative artifact detail")
+
+    class PreviewResolver:
+        def __init__(self):
+            self.calls = []
+
+        def resolve_capture_preview(self, item_id, artifact_id):
+            self.calls.append((item_id, artifact_id))
+            return _Resolved(
+                io.BytesIO(content),
+                "image/png",
+                digest,
+                len(content),
+                f"bytes:{digest}",
+            )
+
+    resolver = PreviewResolver()
+    client = _app(
+        _Engine(ExplodingProjector(), _SpatialProjector(())),
+        resolver,
+    ).test_client()
+    endpoint = "/api/v1/items/book-1/raster-artifacts/image-a/preview"
+
+    response = client.get(endpoint)
+
+    assert response.status_code == 200
+    assert response.data == content
+    assert response.mimetype == "image/png"
+    assert response.headers["X-Resource-Revision"] == f"bytes:{digest}"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["Content-Digest"].startswith("sha-256=:")
+    assert response.cache_control.private is True
+    assert response.cache_control.no_cache is True
+    assert resolver.calls == [("book-1", "image-a")]
+
+    rejected = client.get(f"{endpoint}?revision=not-accepted")
+    assert rejected.status_code == 400
+    assert resolver.calls == [("book-1", "image-a")]
+
+
+def test_invalid_preview_resolution_closes_its_owned_stream():
+    stream = io.BytesIO(b"invalid preview metadata")
+
+    class InvalidPreviewResolver:
+        def resolve_capture_preview(self, _item_id, _artifact_id):
+            return _Resolved(
+                stream,
+                "text/plain",
+                "not-a-digest",
+                len(stream.getvalue()),
+                "preview-r1",
+            )
+
+    client = _app(
+        _Engine(_RasterProjector(()), _SpatialProjector(())),
+        InvalidPreviewResolver(),
+    ).test_client()
+    response = client.get(
+        "/api/v1/items/book-1/raster-artifacts/image-a/preview"
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["code"] == "invalid_raster_resource_resolution"
+    assert stream.closed is True
 
 
 def test_invalid_resolver_result_closes_its_owned_stream():

@@ -20,7 +20,9 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import warnings
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,7 +92,11 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _FIGURE_REFERENCE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _MAX_PHOTO_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_LAYOUT_BYTES = 64 * 1024 * 1024
+_MAX_RASTER_RESOURCE_BYTES = 100 * 1024 * 1024
 _MAX_CAPTURE_ASSETS = 4096
+_MAX_PROJECTION_CACHE_ENTRIES = 1024
+_MAX_CACHED_PROJECTION_TARGETS = 512
+_MAX_RESOURCE_CANDIDATE_CACHE_ENTRIES = 4096
 _MAX_CAPTURE_GEOMETRIES_PER_ASSET = 64
 _MAX_CAPTURE_REGIONS_PER_GEOMETRY = 500
 _MAX_CAPTURE_POLYGON_POINTS = 16
@@ -117,6 +123,10 @@ _PIL_MEDIA_TYPES = {
     "WEBP": "image/webp",
 }
 _UNKNOWN_IMAGE_MEDIA_TYPE = "image/unknown"
+_LEGACY_CAPTURE_IMAGE_RE = re.compile(
+    r"^(orig|photo)_([1-9][0-9]{0,5})\.(?:bmp|gif|jpe?g|png|tiff?|webp)$",
+    re.IGNORECASE,
+)
 _PHOTO_ASSET_FIELDS = frozenset(
     {
         "asset_id",
@@ -818,6 +828,12 @@ class FilesystemRasterResourceResolverPort(Protocol):
         resource: RasterResourceRef,
     ) -> ResolvedRasterResource | None: ...
 
+    def resolve_capture_preview(
+        self,
+        item_id: str,
+        artifact_id: str,
+    ) -> ResolvedRasterResource | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class _ResourceObservation:
@@ -835,6 +851,40 @@ class _Projection:
     raster_artifacts: tuple[RasterArtifactView, ...]
     spatial_annotations: tuple[SpatialAnnotationView, ...]
     resources: Mapping[tuple[str, str, str], _ResolvedRasterCandidate]
+
+
+@dataclass(frozen=True, slots=True)
+class _CaptureAssetRecord:
+    raw: Mapping[str, Any]
+    asset_id: str
+    order: int
+    original: Mapping[str, Any]
+    display: Mapping[str, Any]
+    imported: Mapping[str, Any]
+    namespace: str
+    original_id: str
+    display_id: str
+    original_valid: bool
+    display_valid: bool
+    imported_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedResourceCandidate:
+    capture_id: str
+    entry_directory: Path
+    candidate: _ResolvedRasterCandidate
+    watched_paths: tuple[tuple[Path, tuple[int, ...] | None], ...]
+    representation_revisions: tuple[tuple[str, str | None], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedProjection:
+    projection: _Projection
+    capture_id: str
+    entry_directory: Path
+    watched_paths: tuple[tuple[Path, tuple[int, ...] | None], ...]
+    representation_revisions: tuple[tuple[str, str | None], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -900,6 +950,21 @@ class FilesystemCorrectionsArtifactRepository(
             )
         self._representation_revision_for = representation_revision_for
         self._lock_context_for = lock_context_for
+        # Projection verifies and hashes image bytes. Corrections may ask for
+        # the same immutable projection through the index, several artifact
+        # groups, detail, annotations, and finally resource resolution. Keep a
+        # bounded process-local result keyed by cheap authoritative stat
+        # identities so one interaction does not reread gigabytes of captures.
+        # Resource delivery still opens, hashes, and compares the live bytes in
+        # ``resolve_raster_resource`` before granting a stream.
+        self._projection_cache: OrderedDict[str, _CachedProjection] = (
+            OrderedDict()
+        )
+        self._projection_cache_lock = threading.RLock()
+        self._projection_locks = tuple(threading.RLock() for _ in range(64))
+        self._resource_candidate_cache: OrderedDict[
+            tuple[str, str, str, str], _CachedResourceCandidate
+        ] = OrderedDict()
 
     def list_raster_artifacts(
         self,
@@ -907,20 +972,307 @@ class FilesystemCorrectionsArtifactRepository(
     ) -> tuple[RasterArtifactView, ...]:
         return self._project(item_id).raster_artifacts
 
+    def assert_item_exists(self, item_id: str) -> None:
+        """Check catalogue membership without projecting any artifacts."""
+
+        item = _identifier(
+            item_id,
+            item_id=str(item_id or ""),
+            field="item_id",
+        )
+        with self._write_set.workspace_lease():
+            with self._lock_context_for():
+                if not self._live_item_exists(item):
+                    raise NotFoundError(
+                        "the item does not exist",
+                        code="item_not_found",
+                        details={"item_id": item},
+                    )
+
     def get_raster_artifact(
         self,
         key: RasterArtifactKey,
     ) -> RasterArtifactView | None:
         if not isinstance(key, RasterArtifactKey):
             raise TypeError("key must be RasterArtifactKey")
-        return next(
-            (
-                artifact
-                for artifact in self.list_raster_artifacts(key.item_id)
-                if artifact.key == key
-            ),
-            None,
+        return self._project_raster_key(key)
+
+    def get_capture_raster_artifact(
+        self,
+        key: RasterArtifactKey,
+    ) -> RasterArtifactView | None:
+        """Project a key only when it belongs to current capture authority."""
+
+        if not isinstance(key, RasterArtifactKey):
+            raise TypeError("key must be RasterArtifactKey")
+        return self._project_raster_key(key, capture_only=True)
+
+    def list_capture_index_hints(
+        self,
+        item_id: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Return bounded capture navigation hints without reading image bytes.
+
+        These hints are deliberately not raster artifact views and their
+        ``index:`` revisions must never be used as mutation preconditions.
+        Selecting a hint loads the authoritative artifact detail, which hashes
+        and verifies that one capture before any edit or resource grant.
+        """
+
+        item = _identifier(
+            item_id,
+            item_id=str(item_id or ""),
+            field="item_id",
         )
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    if not self._live_item_exists(item):
+                        raise NotFoundError(
+                            "the item does not exist",
+                            code="item_not_found",
+                            details={"item_id": item},
+                        )
+                    capture_id = self._live_capture_id(item)
+                    if not capture_id:
+                        return ()
+                    directory = self._managed_directory(
+                        self._capture_directory_for,
+                        capture_id,
+                        item_id=item,
+                        section="capture",
+                        authority_root=self._capture_authority_root,
+                    )
+                    try:
+                        manifest = self._read_json(
+                            directory / PHOTO_ASSETS_NAME,
+                            item_id=item,
+                            section="capture",
+                            maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
+                        )
+                        if manifest is None:
+                            manifest = self._legacy_capture_manifest(
+                                item,
+                                capture_id=capture_id,
+                                directory=directory,
+                            )
+                        if manifest is None:
+                            return (
+                                self._capture_inventory_index_hint(
+                                    capture_id,
+                                    state=ResourceState.MISSING,
+                                    diagnostic_code="capture_manifest_missing",
+                                ),
+                            )
+                        return self._capture_index_hints(
+                            item,
+                            capture_id=capture_id,
+                            directory=directory,
+                            manifest=manifest,
+                        )
+                    except RepositoryError as error:
+                        if not self._recoverable_capture_manifest_error(error):
+                            raise
+                        return (
+                            self._capture_inventory_index_hint(
+                                capture_id,
+                                state=ResourceState.UNAVAILABLE,
+                                diagnostic_code=error.code,
+                            ),
+                        )
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the Corrections capture index is unavailable",
+                code="corrections_artifact_repository_unavailable",
+                item_id=item,
+                cause_type=type(exc).__name__,
+            ) from exc
+
+    def resolve_capture_preview(
+        self,
+        item_id: str,
+        artifact_id: str,
+    ) -> ResolvedRasterResource | None:
+        """Snapshot one navigation-hint display without projecting siblings.
+
+        This read intentionally returns bytes only. It does not manufacture a
+        public artifact revision and therefore cannot authorize a mutation.
+        """
+
+        key = RasterArtifactKey(item_id, artifact_id)
+        item = key.item_id
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    if not self._live_item_exists(item):
+                        raise NotFoundError(
+                            "the item does not exist",
+                            code="item_not_found",
+                            details={"item_id": item},
+                        )
+                    capture_id = self._live_capture_id(item)
+                    if not capture_id:
+                        return None
+                    directory = self._managed_directory(
+                        self._capture_directory_for,
+                        capture_id,
+                        item_id=item,
+                        section="capture",
+                        authority_root=self._capture_authority_root,
+                    )
+                    manifest = self._read_json(
+                        directory / PHOTO_ASSETS_NAME,
+                        item_id=item,
+                        section="capture",
+                        maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
+                    )
+                    if manifest is None:
+                        manifest = self._legacy_capture_manifest(
+                            item,
+                            capture_id=capture_id,
+                            directory=directory,
+                        )
+                    if manifest is None:
+                        return None
+                    records, _revision_value, _legacy = (
+                        self._capture_manifest_records(
+                            item,
+                            capture_id,
+                            manifest,
+                        )
+                    )
+                    selected = next(
+                        (
+                            record
+                            for record in records
+                            if record.display_id == key.artifact_id
+                        ),
+                        None,
+                    )
+                    if selected is None or not selected.display_valid:
+                        return None
+                    reference = (
+                        selected.imported.get("display_ref")
+                        or selected.display.get("reference")
+                    )
+                    declared_sha256 = _sha256(
+                        selected.imported.get("derivative_checksum")
+                        or selected.display.get("sha256")
+                    )
+                    return self._snapshot_capture_preview(
+                        item,
+                        directory,
+                        reference,
+                        declared_sha256=declared_sha256,
+                    )
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the Corrections capture preview is unavailable",
+                code="corrections_artifact_repository_unavailable",
+                item_id=item,
+                cause_type=type(exc).__name__,
+            ) from exc
+
+    def _snapshot_capture_preview(
+        self,
+        item_id: str,
+        directory: Path,
+        reference: Any,
+        *,
+        declared_sha256: str,
+    ) -> ResolvedRasterResource | None:
+        expected_media_type = _media_type(reference)
+        if (
+            not isinstance(reference, str)
+            or _RESOURCE_LEAF_RE.fullmatch(reference) is None
+            or "/" in reference
+            or "\\" in reference
+            or reference in {".", ".."}
+            or not expected_media_type
+        ):
+            return None
+        path = directory / reference
+        descriptor = -1
+        snapshot: BinaryIO | None = None
+        granted = False
+        try:
+            authority = self._assert_safe_path(
+                path,
+                item_id=item_id,
+                section="capture",
+            )
+            named = path.lstat()
+            if (
+                _is_redirecting_path(path)
+                or not stat.S_ISREG(named.st_mode)
+                or named.st_nlink != 1
+                or named.st_size < 1
+                or named.st_size > _MAX_RASTER_RESOURCE_BYTES
+            ):
+                return None
+            snapshot = tempfile.TemporaryFile(mode="w+b")
+            descriptor, opened = _open_verified_regular(
+                path,
+                named,
+                authority=authority,
+            )
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                block = os.read(descriptor, 1 << 20)
+                if not block:
+                    break
+                size += len(block)
+                if size > _MAX_RASTER_RESOURCE_BYTES:
+                    return None
+                digest.update(block)
+                snapshot.write(block)
+            _finish_verified_regular(
+                path,
+                descriptor,
+                named_before=named,
+                opened_before=opened,
+            )
+            self._assert_safe_path(
+                path,
+                item_id=item_id,
+                section="capture",
+            )
+            # Recheck once more after the named-path validation. A hostile
+            # ancestor replacement performed as that validation returns must
+            # not turn the verified snapshot into an authority grant.
+            self._assert_safe_path(
+                path,
+                item_id=item_id,
+                section="capture",
+            )
+            actual_sha256 = digest.hexdigest()
+            verified = _verified_image_properties(snapshot)
+            if verified is None or verified[2] != expected_media_type:
+                return None
+            if declared_sha256 and actual_sha256 != declared_sha256:
+                return None
+            snapshot.seek(0)
+            result = ResolvedRasterResource(
+                stream=snapshot,
+                media_type=verified[2],
+                content_sha256=actual_sha256,
+                size=size,
+                revision=f"bytes:{actual_sha256}",
+            )
+            granted = True
+            return result
+        except (OSError, RepositoryError):
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if snapshot is not None and not granted:
+                snapshot.close()
 
     def list_spatial_annotations(
         self,
@@ -970,12 +1322,43 @@ class FilesystemCorrectionsArtifactRepository(
     ) -> ResolvedRasterResource | None:
         if not isinstance(resource, RasterResourceRef):
             raise TypeError("resource must be RasterResourceRef")
-        projection = self._project(item_id)
-        candidate = projection.resources.get(
-            (resource.resource_id, resource.revision, resource.variant)
-        )
+        candidate = self._resource_candidate(item_id, resource)
         if candidate is None:
             return None
+        # A cached projection deliberately avoids reopening every unchanged
+        # image. Before granting one selected resource, pin its named identity
+        # once independently of the streaming descriptor. This preserves the
+        # original rename/ancestor race checks while keeping repeated catalogue
+        # and detail projections cheap.
+        probe = -1
+        try:
+            authority = self._assert_safe_path(
+                candidate.path,
+                item_id=item_id,
+                section=candidate.section,
+            )
+            named = candidate.path.lstat()
+            if (
+                _is_redirecting_path(candidate.path)
+                or _stable_stat_identity(named) != candidate.file_identity
+            ):
+                return None
+            probe, opened = _open_verified_regular(
+                candidate.path,
+                named,
+                authority=authority,
+            )
+            _finish_verified_regular(
+                candidate.path,
+                probe,
+                named_before=named,
+                opened_before=opened,
+            )
+        except (OSError, RepositoryError):
+            return None
+        finally:
+            if probe >= 0:
+                os.close(probe)
         try:
             snapshot = tempfile.TemporaryFile(mode="w+b")
         except OSError:
@@ -1019,6 +1402,14 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item_id,
                 section=candidate.section,
             )
+            # Recheck once more after the named-path validation. A hostile
+            # ancestor replacement performed as that validation returns must
+            # not turn the verified descriptor into an authority grant.
+            self._assert_safe_path(
+                candidate.path,
+                item_id=item_id,
+                section=candidate.section,
+            )
             if (
                 size != candidate.size
                 or digest.hexdigest() != candidate.content_sha256
@@ -1041,6 +1432,330 @@ class FilesystemCorrectionsArtifactRepository(
                 os.close(descriptor)
             if not granted:
                 snapshot.close()
+
+    def _resource_candidate(
+        self,
+        item_id: str,
+        resource: RasterResourceRef,
+    ) -> _ResolvedRasterCandidate | None:
+        item = _identifier(
+            item_id,
+            item_id=str(item_id or ""),
+            field="item_id",
+        )
+        cache_key = (
+            item,
+            resource.resource_id,
+            resource.revision,
+            resource.variant,
+        )
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    if not self._live_item_exists(item):
+                        raise NotFoundError(
+                            "the item does not exist",
+                            code="item_not_found",
+                            details={"item_id": item},
+                        )
+                    capture_id = self._live_capture_id(item)
+                    entry_directory = self._managed_directory(
+                        self._entry_directory_for,
+                        item,
+                        item_id=item,
+                        section="entry",
+                        authority_root=self._write_set.root,
+                    )
+                    with self._projection_cache_lock:
+                        cached = self._resource_candidate_cache.get(cache_key)
+                        if cached is not None:
+                            if (
+                                cached.capture_id == capture_id
+                                and cached.entry_directory == entry_directory
+                                and all(
+                                    self._path_stamp(path) == expected
+                                    for path, expected in cached.watched_paths
+                                )
+                                and all(
+                                    self._live_representation_revision(
+                                        item,
+                                        representation_id,
+                                    )
+                                    == expected
+                                    for representation_id, expected
+                                    in cached.representation_revisions
+                                )
+                            ):
+                                self._resource_candidate_cache.move_to_end(
+                                    cache_key
+                                )
+                                return cached.candidate
+                            self._resource_candidate_cache.pop(cache_key, None)
+                            # This reference was issued by a keyed projection,
+                            # so an authority change is a conflict rather than
+                            # a cache miss. Falling through to a fresh full
+                            # projection could re-authorize the stale reference
+                            # when the underlying bytes happen to be identical.
+                            return None
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the Corrections resource authority is unavailable",
+                code="corrections_artifact_repository_unavailable",
+                item_id=item,
+                cause_type=type(exc).__name__,
+            ) from exc
+        projection = self._project(item)
+        return projection.resources.get(
+            (resource.resource_id, resource.revision, resource.variant)
+        )
+
+    def _remember_resource_candidates(
+        self,
+        item_id: str,
+        capture_id: str,
+        entry_directory: Path,
+        resources: Mapping[
+            tuple[str, str, str], _ResolvedRasterCandidate
+        ],
+        *,
+        watched_paths: tuple[
+            tuple[Path, tuple[int, ...] | None], ...
+        ],
+        representation_revisions: tuple[
+            tuple[str, str | None], ...
+        ] = (),
+    ) -> None:
+        if not resources:
+            return
+        with self._projection_cache_lock:
+            if any(
+                self._path_stamp(path) != expected
+                for path, expected in watched_paths
+            ):
+                return
+            if any(
+                self._live_representation_revision(
+                    item_id,
+                    representation_id,
+                )
+                != expected
+                for representation_id, expected
+                in representation_revisions
+            ):
+                return
+            for resource_key, candidate in resources.items():
+                cache_key = (item_id, *resource_key)
+                self._resource_candidate_cache[cache_key] = (
+                    _CachedResourceCandidate(
+                        capture_id,
+                        entry_directory,
+                        candidate,
+                        watched_paths,
+                        representation_revisions,
+                    )
+                )
+                self._resource_candidate_cache.move_to_end(cache_key)
+            while (
+                len(self._resource_candidate_cache)
+                > _MAX_RESOURCE_CANDIDATE_CACHE_ENTRIES
+            ):
+                self._resource_candidate_cache.popitem(last=False)
+
+    def _project_raster_key(
+        self,
+        key: RasterArtifactKey,
+        *,
+        capture_only: bool = False,
+    ) -> RasterArtifactView | None:
+        item = _identifier(
+            key.item_id,
+            item_id=str(key.item_id or ""),
+            field="item_id",
+        )
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    if not self._live_item_exists(item):
+                        raise NotFoundError(
+                            "the item does not exist",
+                            code="item_not_found",
+                            details={"item_id": item},
+                        )
+                    capture_id = self._live_capture_id(item)
+                    entry_directory = self._managed_directory(
+                        self._entry_directory_for,
+                        item,
+                        item_id=item,
+                        section="entry",
+                        authority_root=self._write_set.root,
+                    )
+                    capture_directory = (
+                        self._managed_directory(
+                            self._capture_directory_for,
+                            capture_id,
+                            item_id=item,
+                            section="capture",
+                            authority_root=self._capture_authority_root,
+                        )
+                        if capture_id
+                        else None
+                    )
+                    lock_index = hashlib.sha256(
+                        item.encode("utf-8")
+                    ).digest()[0] % len(self._projection_locks)
+                    with self._projection_locks[lock_index]:
+                        cached = self._cached_projection(
+                            item,
+                            capture_id=capture_id,
+                            entry_directory=entry_directory,
+                        )
+                        if cached is not None:
+                            selected = next(
+                                (
+                                    value
+                                    for value in cached.raster_artifacts
+                                    if value.key == key
+                                ),
+                                None,
+                            )
+                            if (
+                                capture_only
+                                and selected is not None
+                                and selected.source.representation_id
+                                != "capture"
+                            ):
+                                return None
+                            return selected
+                        if capture_directory is not None:
+                            capture_watches = tuple(
+                                (path, self._path_stamp(path))
+                                for path in (
+                                    capture_directory,
+                                    capture_directory / PHOTO_ASSETS_NAME,
+                                )
+                            )
+                            manifest = self._read_json(
+                                capture_directory / PHOTO_ASSETS_NAME,
+                                item_id=item,
+                                section="capture",
+                                maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
+                            )
+                            if manifest is None:
+                                manifest = self._legacy_capture_manifest(
+                                    item,
+                                    capture_id=capture_id,
+                                    directory=capture_directory,
+                                )
+                            if manifest is not None:
+                                raster, _spatial, resources = (
+                                    self._project_capture(
+                                        item,
+                                        capture_id,
+                                        capture_directory,
+                                        manifest,
+                                        artifact_id=key.artifact_id,
+                                    )
+                                )
+                                selected = next(
+                                    (
+                                        value
+                                        for value in raster
+                                        if value.key == key
+                                    ),
+                                    None,
+                                )
+                                if selected is not None:
+                                    self._remember_resource_candidates(
+                                        item,
+                                        capture_id,
+                                        entry_directory,
+                                        resources,
+                                        watched_paths=capture_watches,
+                                    )
+                                    return selected
+                        if capture_only:
+                            return None
+                        # Non-capture artifacts preserve the existing layout
+                        # projection semantics without paying to re-observe
+                        # every capture rendition first.
+                        layout_watches = tuple(
+                            (path, self._path_stamp(path))
+                            for path in (
+                                entry_directory,
+                                entry_directory / "ocr",
+                                entry_directory.joinpath(
+                                    *MISTRAL_LAYOUT_RELATIVE
+                                ),
+                                entry_directory / "ocr" / "images",
+                            )
+                        )
+                        layout = self._read_json(
+                            entry_directory.joinpath(*MISTRAL_LAYOUT_RELATIVE),
+                            item_id=item,
+                            section="layout",
+                            maximum_bytes=_MAX_LAYOUT_BYTES,
+                        )
+                        if layout is None:
+                            return None
+                        raster, _spatial, resources = self._project_layout(
+                            item,
+                            entry_directory,
+                            layout,
+                        )
+                        selected = next(
+                            (
+                                value
+                                for value in raster
+                                if value.key == key
+                            ),
+                            None,
+                        )
+                        if selected is not None:
+                            selected_resources: Mapping[
+                                tuple[str, str, str],
+                                _ResolvedRasterCandidate,
+                            ] = {}
+                            selected_revisions: tuple[
+                                tuple[str, str | None], ...
+                            ] = ()
+                            if selected.resource is not None:
+                                selected_key = (
+                                    selected.resource.resource_id,
+                                    selected.resource.revision,
+                                    selected.resource.variant,
+                                )
+                                selected_resources = {
+                                    selected_key: resources[selected_key]
+                                }
+                            if (
+                                selected.source.representation_id
+                                and selected.source.representation_id
+                                != "capture"
+                            ):
+                                selected_revisions = ((
+                                    selected.source.representation_id,
+                                    selected.source.representation_revision,
+                                ),)
+                            self._remember_resource_candidates(
+                                item,
+                                capture_id,
+                                entry_directory,
+                                selected_resources,
+                                watched_paths=layout_watches,
+                                representation_revisions=selected_revisions,
+                            )
+                        return selected
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the Corrections raster artifact is unavailable",
+                code="corrections_artifact_repository_unavailable",
+                item_id=item,
+                cause_type=type(exc).__name__,
+            ) from exc
 
     def _project(self, item_id: str) -> _Projection:
         item = _identifier(
@@ -1076,12 +1791,43 @@ class FilesystemCorrectionsArtifactRepository(
                         if capture_id
                         else None
                     )
-                    return self._project_locked(
-                        item,
-                        entry_directory=entry_directory,
-                        capture_id=capture_id,
-                        capture_directory=capture_directory,
-                    )
+                    lock_index = hashlib.sha256(
+                        item.encode("utf-8")
+                    ).digest()[0] % len(self._projection_locks)
+                    with self._projection_locks[lock_index]:
+                        # A second request can arrive after the first cache
+                        # check but before projection completes. Rechecking
+                        # inside the item stripe ensures the expensive byte
+                        # verification happens once per unchanged item.
+                        cached = self._cached_projection(
+                            item,
+                            capture_id=capture_id,
+                            entry_directory=entry_directory,
+                        )
+                        if cached is not None:
+                            return cached
+                        authority_paths = self._projection_authority_paths(
+                            entry_directory,
+                            capture_directory,
+                        )
+                        authority_before = tuple(
+                            (path, self._path_stamp(path))
+                            for path in authority_paths
+                        )
+                        projection = self._project_locked(
+                            item,
+                            entry_directory=entry_directory,
+                            capture_id=capture_id,
+                            capture_directory=capture_directory,
+                        )
+                        self._remember_projection(
+                            item,
+                            projection,
+                            capture_id=capture_id,
+                            entry_directory=entry_directory,
+                            authority_before=authority_before,
+                        )
+                        return projection
         except EngineError:
             raise
         except Exception as exc:
@@ -1091,6 +1837,156 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item,
                 cause_type=type(exc).__name__,
             ) from exc
+
+    @staticmethod
+    def _path_stamp(path: Path) -> tuple[int, ...] | None:
+        try:
+            return _stable_stat_identity(path.lstat())
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # An unreadable path must invalidate the cache and fall through to
+            # the repository's ordinary diagnosable error path.
+            return ()
+
+    @staticmethod
+    def _projection_authority_paths(
+        entry_directory: Path,
+        capture_directory: Path | None,
+    ) -> tuple[Path, ...]:
+        paths = {
+            entry_directory,
+            entry_directory / "ocr",
+            entry_directory.joinpath(*MISTRAL_LAYOUT_RELATIVE),
+            entry_directory / "ocr" / "images",
+        }
+        if capture_directory is not None:
+            paths.update(
+                {
+                    capture_directory,
+                    capture_directory / PHOTO_ASSETS_NAME,
+                }
+            )
+        return tuple(sorted(paths, key=lambda value: str(value)))
+
+    def _cached_projection(
+        self,
+        item_id: str,
+        *,
+        capture_id: str,
+        entry_directory: Path,
+    ) -> _Projection | None:
+        with self._projection_cache_lock:
+            cached = self._projection_cache.get(item_id)
+            if cached is None:
+                return None
+            if (
+                cached.capture_id != capture_id
+                or cached.entry_directory != entry_directory
+            ):
+                self._projection_cache.pop(item_id, None)
+                return None
+            if any(
+                self._path_stamp(path) != expected
+                for path, expected in cached.watched_paths
+            ):
+                self._projection_cache.pop(item_id, None)
+                return None
+            for representation_id, expected in cached.representation_revisions:
+                if (
+                    self._live_representation_revision(
+                        item_id,
+                        representation_id,
+                    )
+                    != expected
+                ):
+                    self._projection_cache.pop(item_id, None)
+                    return None
+            self._projection_cache.move_to_end(item_id)
+            return cached.projection
+
+    def _remember_projection(
+        self,
+        item_id: str,
+        projection: _Projection,
+        *,
+        capture_id: str,
+        entry_directory: Path,
+        authority_before: tuple[tuple[Path, tuple[int, ...] | None], ...],
+    ) -> None:
+        target_count = (
+            len(projection.raster_artifacts)
+            + len(projection.spatial_annotations)
+        )
+        if target_count > _MAX_CACHED_PROJECTION_TARGETS:
+            return
+        # Missing/unavailable files have no read-time candidate identity. Do
+        # not cache those projections: an in-place repair could otherwise be
+        # invisible to directory stamps on some filesystems.
+        if any(
+            value.resource_state is not ResourceState.AVAILABLE
+            for value in projection.raster_artifacts
+        ):
+            return
+        # Preserve the exact identities that surrounded projection. Never
+        # restamp here: doing so could pair old projected content with a file
+        # replaced between the validation stamp and cache publication.
+        expected_stamps: dict[Path, tuple[int, ...] | None] = {}
+        for path, expected in authority_before:
+            prior = expected_stamps.setdefault(path, expected)
+            if prior != expected:
+                return
+        for candidate in projection.resources.values():
+            prior = expected_stamps.setdefault(
+                candidate.path,
+                candidate.file_identity,
+            )
+            if prior != candidate.file_identity:
+                return
+        watched = tuple(
+            sorted(expected_stamps.items(), key=lambda value: str(value[0]))
+        )
+        source_revisions: dict[str, str] = {}
+        for value in (
+            *projection.raster_artifacts,
+            *projection.spatial_annotations,
+        ):
+            representation_id = value.source.representation_id
+            if not representation_id or representation_id == "capture":
+                continue
+            expected = value.source.representation_revision
+            prior = source_revisions.setdefault(representation_id, expected)
+            if prior != expected:
+                return
+        revisions = tuple(sorted(source_revisions.items()))
+        if any(
+            self._live_representation_revision(item_id, representation_id)
+            != expected
+            for representation_id, expected in revisions
+        ):
+            return
+        if self._live_capture_id(item_id) != capture_id:
+            return
+        cached = _CachedProjection(
+            projection,
+            capture_id,
+            entry_directory,
+            watched,
+            revisions,
+        )
+        with self._projection_cache_lock:
+            # Close the publication window after all potentially slow live
+            # callbacks. A subsequent filesystem change is harmless because
+            # every cache read revalidates these same stamps.
+            if any(
+                self._path_stamp(path) != expected
+                for path, expected in watched
+            ):
+                return
+            self._projection_cache[item_id] = cached
+            self._projection_cache.move_to_end(item_id)
+            while len(self._projection_cache) > _MAX_PROJECTION_CACHE_ENTRIES:
+                self._projection_cache.popitem(last=False)
 
     def _live_item_exists(self, item_id: str) -> bool:
         try:
@@ -1455,16 +2351,28 @@ class FilesystemCorrectionsArtifactRepository(
                     maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
                 )
                 if photo_assets is None:
-                    capture_views = (
-                        self._capture_inventory_placeholder(
-                            item_id,
-                            capture_id=capture_id,
-                            state=ResourceState.MISSING,
-                            diagnostic_code="capture_manifest_missing",
-                        ),
+                    photo_assets = self._legacy_capture_manifest(
+                        item_id,
+                        capture_id=capture_id,
+                        directory=capture_directory,
                     )
-                    capture_spatial = ()
-                    capture_resources = {}
+                if photo_assets is None:
+                    (
+                        capture_views,
+                        capture_spatial,
+                        capture_resources,
+                    ) = (
+                        (
+                            self._capture_inventory_placeholder(
+                                item_id,
+                                capture_id=capture_id,
+                                state=ResourceState.MISSING,
+                                diagnostic_code="capture_manifest_missing",
+                            ),
+                        ),
+                        (),
+                        {},
+                    )
                 else:
                     (
                         capture_views,
@@ -1479,11 +2387,7 @@ class FilesystemCorrectionsArtifactRepository(
             except RepositoryError as error:
                 if not self._recoverable_capture_manifest_error(error):
                     raise
-                (
-                    capture_views,
-                    capture_spatial,
-                    capture_resources,
-                ) = (
+                capture_views, capture_spatial, capture_resources = (
                     (
                         self._capture_inventory_placeholder(
                             item_id,
@@ -1735,6 +2639,460 @@ class FilesystemCorrectionsArtifactRepository(
             extensions=extensions,
         )
 
+    def _legacy_capture_manifest(
+        self,
+        item_id: str,
+        *,
+        capture_id: str,
+        directory: Path,
+    ) -> Mapping[str, Any] | None:
+        """Adapt pre-photo-contract capture generations without writing them.
+
+        Desktop ingest has always published a private flat generation with
+        ``orig_N`` and ``photo_N`` image pairs. Older generations predate
+        ``photo_assets.json``. Their persisted dense numeric identity is enough
+        to create stable read-only artifact identities; image bytes remain
+        subject to the same safe-path, media verification, hashing, and
+        resource revalidation as contract-backed captures.
+        """
+
+        originals: dict[int, str] = {}
+        displays: dict[int, str] = {}
+        try:
+            children = list(directory.iterdir())
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise _repository_error(
+                "the legacy capture generation cannot be listed",
+                code="corrections_artifact_repository_unavailable",
+                item_id=item_id,
+                section="capture",
+                cause_type=type(exc).__name__,
+            ) from exc
+        if len(children) > _MAX_CAPTURE_ASSETS * 3 + 32:
+            raise _repository_error(
+                "the legacy capture generation exceeds its item limit",
+                code="invalid_capture_photo_assets",
+                item_id=item_id,
+                section="capture",
+            )
+        for child in children:
+            match = _LEGACY_CAPTURE_IMAGE_RE.fullmatch(child.name)
+            if match is None:
+                continue
+            index = int(match.group(2))
+            target = originals if match.group(1).casefold() == "orig" else displays
+            if index in target:
+                raise _repository_error(
+                    "the legacy capture sequence aliases an image identity",
+                    code="invalid_capture_photo_assets",
+                    item_id=item_id,
+                    section="capture",
+                )
+            target[index] = child.name
+        if not displays:
+            return None
+        if len(displays) > _MAX_CAPTURE_ASSETS:
+            raise _repository_error(
+                "the legacy capture generation exceeds its image limit",
+                code="invalid_capture_photo_assets",
+                item_id=item_id,
+                section="capture",
+            )
+        expected = set(range(1, len(displays) + 1))
+        if set(displays) != expected or not set(originals).issubset(expected):
+            raise _repository_error(
+                "the legacy capture sequence is not dense and one-based",
+                code="invalid_capture_photo_assets",
+                item_id=item_id,
+                section="capture",
+            )
+        assets = []
+        for index in sorted(displays):
+            display_name = displays[index]
+            original_name = originals.get(index, display_name)
+            assets.append(
+                {
+                    "asset_id": f"legacy-{index}",
+                    "capture_order": index,
+                    "capture_file": display_name,
+                    "original": {
+                        "reference": original_name,
+                        "revision": 1,
+                        "orientation": 1,
+                    },
+                    "display": {
+                        "reference": display_name,
+                        "revision": 1,
+                        "orientation": 1,
+                        "recipe": "legacy-desktop-import",
+                        "recipe_version": "1",
+                    },
+                    "lifecycle": {"state": "completed"},
+                    "role": {},
+                    "geometry": [],
+                    "processing_request": {},
+                }
+            )
+        return {
+            "schema": PHOTO_ASSETS_SCHEMA,
+            "version": PHOTO_ASSETS_VERSION,
+            "capture_id": capture_id,
+            "legacy_fallback": True,
+            "assets": assets,
+            "selections": {},
+            "transport": {"representation": "legacy-desktop", "version": 1},
+        }
+
+    def _capture_index_resource_state(
+        self,
+        item_id: str,
+        directory: Path,
+        reference: Any,
+    ) -> tuple[ResourceState, tuple[int, ...] | None]:
+        if (
+            not isinstance(reference, str)
+            or _RESOURCE_LEAF_RE.fullmatch(reference) is None
+            or "/" in reference
+            or "\\" in reference
+            or reference in {".", ".."}
+            or not _media_type(reference)
+        ):
+            return ResourceState.UNAVAILABLE, None
+        path = directory / reference
+        try:
+            self._assert_safe_path(
+                path,
+                item_id=item_id,
+                section="capture",
+            )
+            info = path.lstat()
+        except FileNotFoundError:
+            return ResourceState.MISSING, None
+        except (OSError, RepositoryError):
+            return ResourceState.UNAVAILABLE, None
+        if (
+            _is_redirecting_path(path)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size < 1
+            or info.st_size > _MAX_RASTER_RESOURCE_BYTES
+        ):
+            return ResourceState.UNAVAILABLE, None
+        return ResourceState.AVAILABLE, _stable_stat_identity(info)
+
+    @staticmethod
+    def _capture_index_geometry_is_incomplete(
+        record: _CaptureAssetRecord,
+    ) -> bool:
+        """Validate geometry metadata without decoding its display image."""
+
+        raw_geometry = record.raw.get("geometry")
+        if raw_geometry is None or raw_geometry == []:
+            return False
+        if (
+            isinstance(raw_geometry, (str, bytes))
+            or not isinstance(raw_geometry, Sequence)
+            or len(raw_geometry) > _MAX_CAPTURE_GEOMETRIES_PER_ASSET
+        ):
+            return True
+        original_revision = _positive_integer(
+            record.original.get("revision")
+        )
+        display_revision = _positive_integer(record.display.get("revision"))
+        if original_revision is None or display_revision is None:
+            return True
+        original_sha256 = _sha256(record.original.get("sha256"))
+        display_width = _non_negative_integer(record.display.get("width")) or 0
+        display_height = (
+            _non_negative_integer(record.display.get("height")) or 0
+        )
+        display_orientation = _orientation_degrees(
+            1
+            if record.imported
+            else _orientation(record.display.get("orientation"))
+        )
+        seen_regions: set[tuple[str, str, str]] = set()
+        for geometry in raw_geometry:
+            if not isinstance(geometry, Mapping):
+                return True
+            geometry_width = _non_negative_integer(geometry.get("width")) or 0
+            geometry_height = (
+                _non_negative_integer(geometry.get("height")) or 0
+            )
+            if (
+                geometry.get("asset_id") != record.asset_id
+                or geometry.get("coordinate_space") != "display_normalized"
+                or _positive_integer(geometry.get("source_revision"))
+                != original_revision
+                or _positive_integer(geometry.get("display_revision"))
+                != display_revision
+                or (
+                    original_sha256
+                    and _sha256(geometry.get("source_sha256"))
+                    != original_sha256
+                )
+                or (
+                    display_width
+                    and geometry_width
+                    and geometry_width != display_width
+                )
+                or (
+                    display_height
+                    and geometry_height
+                    and geometry_height != display_height
+                )
+                or geometry.get("orientation") != display_orientation
+            ):
+                return True
+            regions = geometry.get("regions")
+            if (
+                isinstance(regions, (str, bytes))
+                or not isinstance(regions, Sequence)
+                or len(regions) > _MAX_CAPTURE_REGIONS_PER_GEOMETRY
+            ):
+                return True
+            engine = _public_text(geometry.get("engine"), maximum=80)
+            model = _public_text(geometry.get("model"), maximum=120)
+            for region in regions:
+                if not isinstance(region, Mapping):
+                    return True
+                region_id = _public_text(
+                    region.get("id"),
+                    maximum=120,
+                ).strip()
+                polygon = region.get("polygon")
+                if (
+                    not region_id
+                    or isinstance(polygon, (str, bytes))
+                    or not isinstance(polygon, Sequence)
+                    or not 3 <= len(polygon) <= _MAX_CAPTURE_POLYGON_POINTS
+                ):
+                    return True
+                try:
+                    points = tuple(
+                        NormalizedPoint(point[0], point[1])
+                        for point in polygon
+                        if (
+                            isinstance(point, Sequence)
+                            and not isinstance(point, (str, bytes))
+                            and len(point) >= 2
+                        )
+                    )
+                except ValidationError:
+                    return True
+                if len(points) != len(polygon):
+                    return True
+                identity = (engine, model, region_id)
+                if identity in seen_regions:
+                    return True
+                seen_regions.add(identity)
+        return False
+
+    @staticmethod
+    def _capture_inventory_index_hint(
+        capture_id: str,
+        *,
+        state: ResourceState,
+        diagnostic_code: str,
+        diagnostic_scopes: Sequence[str] = (),
+    ) -> Mapping[str, Any]:
+        if state not in {ResourceState.MISSING, ResourceState.UNAVAILABLE}:
+            raise TypeError("capture inventory hint state is invalid")
+        namespace = _opaque_identity(
+            "capture",
+            capture_id,
+            "inventory-placeholder",
+        )
+        return {
+            "artifact_id": f"{namespace}:display",
+            "revision": _digest_revision(
+                "index",
+                {
+                    "capture_id": capture_id,
+                    "inventory_state": state.value,
+                    "diagnostic_code": diagnostic_code,
+                },
+            ),
+            "capture_order": 0,
+            "label": (
+                "Captured image manifest missing"
+                if state is ResourceState.MISSING
+                else "Captured images unavailable"
+            ),
+            "representation_id": "capture",
+            "canvas_id": namespace,
+            "effective_category": "other",
+            "resource_state": state.value,
+            "import_state": state.value,
+            "freshness": ArtifactFreshness.UNTRACKED.value,
+            "imported_at": "",
+            "diagnostic_scopes": tuple(sorted(set(diagnostic_scopes))),
+        }
+
+    def _capture_index_hints(
+        self,
+        item_id: str,
+        *,
+        capture_id: str,
+        directory: Path,
+        manifest: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], ...]:
+        records, _representation_revision, legacy = (
+            self._capture_manifest_records(item_id, capture_id, manifest)
+        )
+        hints: list[Mapping[str, Any]] = []
+        for record in records:
+            raw = record.raw
+            asset_id = record.asset_id
+            order = record.order
+            original = record.original
+            display = record.display
+            imported = record.imported
+            original_ref = imported.get("raw_ref") or original.get("reference")
+            display_ref = (
+                imported.get("display_ref")
+                or display.get("reference")
+            )
+            original_state, original_identity = (
+                self._capture_index_resource_state(
+                    item_id,
+                    directory,
+                    original_ref,
+                )
+                if record.original_valid
+                else (ResourceState.UNAVAILABLE, None)
+            )
+            resource_state, display_identity = (
+                self._capture_index_resource_state(
+                    item_id,
+                    directory,
+                    display_ref,
+                )
+                if record.display_valid
+                else (ResourceState.UNAVAILABLE, None)
+            )
+            rendition_states = tuple(
+                (
+                    "missing"
+                    if state is ResourceState.MISSING
+                    else "unavailable"
+                    if state is ResourceState.UNAVAILABLE
+                    else "legacy"
+                    if legacy
+                    else "ready"
+                )
+                for state in (original_state, resource_state)
+            )
+            record_diagnostic_scopes: set[str] = set()
+            if self._capture_index_geometry_is_incomplete(record):
+                record_diagnostic_scopes.add("capture_geometry")
+            if (
+                not record.original_valid
+                or not record.display_valid
+                or original_state is not ResourceState.AVAILABLE
+                or resource_state is not ResourceState.AVAILABLE
+            ):
+                record_diagnostic_scopes.add("capture_rendition")
+            if all(state == "missing" for state in rendition_states):
+                import_state = "missing"
+            elif all(state == "unavailable" for state in rendition_states):
+                import_state = "unavailable"
+            elif record_diagnostic_scopes & {
+                "capture_geometry",
+                "capture_rendition",
+            }:
+                import_state = "partial"
+            elif all(state == "legacy" for state in rendition_states):
+                import_state = "legacy"
+            elif any(state != "ready" for state in rendition_states):
+                import_state = "partial"
+            else:
+                import_state = "ready"
+            namespace = record.namespace
+            artifact_id = record.display_id
+            assignments = self._capture_assignments(
+                item_id,
+                raw.get("role"),
+                asset_id=asset_id,
+            )
+            effective_category = "other"
+            for origin in (AssignmentOrigin.MANUAL, AssignmentOrigin.SUGGESTED):
+                assignment = next(
+                    (
+                        value
+                        for value in assignments
+                        if value.origin is origin
+                    ),
+                    None,
+                )
+                if assignment is not None:
+                    effective_category = assignment.category
+                    break
+            lifecycle = raw.get("lifecycle")
+            lifecycle_state = (
+                str(lifecycle.get("state") or "")
+                if isinstance(lifecycle, Mapping)
+                else ""
+            )
+            freshness = (
+                ArtifactFreshness.STALE
+                if lifecycle_state in {"failed", "cancelled"}
+                else ArtifactFreshness.CURRENT
+                if resource_state is ResourceState.AVAILABLE
+                else ArtifactFreshness.UNTRACKED
+            )
+            revision = _digest_revision(
+                "index",
+                {
+                    "capture_id": capture_id,
+                    "asset_id": asset_id,
+                    "capture_order": order,
+                    "original": original,
+                    "display": display,
+                    "import": imported,
+                    "role": raw.get("role"),
+                    "lifecycle": raw.get("lifecycle"),
+                    "geometry": raw.get("geometry"),
+                    "original_valid": record.original_valid,
+                    "display_valid": record.display_valid,
+                    "original_file_identity": original_identity,
+                    "display_file_identity": display_identity,
+                    "imported_at": record.imported_at,
+                    "diagnostic_scopes": tuple(
+                        sorted(record_diagnostic_scopes)
+                    ),
+                },
+            )
+            hints.append(
+                {
+                    "artifact_id": artifact_id,
+                    "revision": revision,
+                    "capture_order": order,
+                    "label": f"Capture {order} display",
+                    "representation_id": "capture",
+                    "canvas_id": namespace,
+                    "effective_category": effective_category,
+                    "resource_state": resource_state.value,
+                    "import_state": import_state,
+                    "freshness": freshness.value,
+                    "imported_at": "" if legacy else record.imported_at,
+                    "diagnostic_scopes": tuple(
+                        sorted(record_diagnostic_scopes)
+                    ),
+                }
+            )
+        return tuple(
+            sorted(
+                hints,
+                key=lambda value: (
+                    value["capture_order"],
+                    value["artifact_id"],
+                ),
+            )
+        )
+
     def _unique_projected_ids(
         self,
         values: Sequence[str] | Any,
@@ -1751,17 +3109,18 @@ class FilesystemCorrectionsArtifactRepository(
                 field=field,
             )
 
-    def _project_capture(
+    def _capture_manifest_records(
         self,
         item_id: str,
         capture_id: str,
-        directory: Path,
         manifest: Mapping[str, Any],
     ) -> tuple[
-        tuple[RasterArtifactView, ...],
-        tuple[SpatialAnnotationView, ...],
-        Mapping[tuple[str, str, str], _ResolvedRasterCandidate],
+        tuple[_CaptureAssetRecord, ...],
+        str,
+        bool,
     ]:
+        """Validate the complete identity catalogue without reading rasters."""
+
         if (
             manifest.get("schema") != PHOTO_ASSETS_SCHEMA
             or manifest.get("version") != PHOTO_ASSETS_VERSION
@@ -1799,31 +3158,17 @@ class FilesystemCorrectionsArtifactRepository(
                 for row in rows:
                     if not isinstance(row, Mapping):
                         continue
-                    asset_id = row.get("asset_id")
-                    if isinstance(asset_id, str) and asset_id not in import_rows:
-                        import_rows[asset_id] = row
+                    imported_id = row.get("asset_id")
+                    if (
+                        isinstance(imported_id, str)
+                        and imported_id not in import_rows
+                    ):
+                        import_rows[imported_id] = row
 
-        manifest_source = []
-        for raw in assets:
-            if isinstance(raw, Mapping):
-                original = raw.get("original")
-                if isinstance(original, Mapping):
-                    manifest_source.append(
-                        {
-                            "asset_id": raw.get("asset_id"),
-                            "sha256": original.get("sha256"),
-                            "revision": original.get("revision"),
-                        }
-                    )
-        representation_revision = _digest_revision(
-            "capture",
-            {"capture_id": capture_id, "originals": manifest_source},
-        )
-        values: list[RasterArtifactView] = []
-        spatial: list[SpatialAnnotationView] = []
-        resources: dict[tuple[str, str, str], _ResolvedRasterCandidate] = {}
+        records: list[_CaptureAssetRecord] = []
         seen_assets: set[str] = set()
         seen_orders: set[int] = set()
+        manifest_source: list[Mapping[str, Any]] = []
         for raw in assets:
             if not isinstance(raw, Mapping):
                 raise _repository_error(
@@ -1850,15 +3195,82 @@ class FilesystemCorrectionsArtifactRepository(
                     item_id=item_id,
                     section="capture",
                 )
-            seen_assets.add(asset_id)
-            seen_orders.add(order)
             original_value = raw.get("original")
             display_value = raw.get("display")
             original_valid = isinstance(original_value, Mapping)
             display_valid = isinstance(display_value, Mapping)
             original = original_value if original_valid else {}
             display = display_value if display_valid else {}
-            imported = import_rows.get(asset_id, {})
+            seen_assets.add(asset_id)
+            seen_orders.add(order)
+            namespace = _opaque_identity("capture", capture_id, asset_id)
+            records.append(
+                _CaptureAssetRecord(
+                    raw=raw,
+                    asset_id=asset_id,
+                    order=order,
+                    original=original,
+                    display=display,
+                    imported=import_rows.get(asset_id, {}),
+                    namespace=namespace,
+                    original_id=f"{namespace}:original",
+                    display_id=f"{namespace}:display",
+                    original_valid=original_valid,
+                    display_valid=display_valid,
+                    imported_at=imported_at,
+                )
+            )
+            manifest_source.append(
+                {
+                    "asset_id": asset_id,
+                    "sha256": original.get("sha256"),
+                    "revision": original.get("revision"),
+                }
+            )
+        return (
+            tuple(records),
+            _digest_revision(
+                "capture",
+                {"capture_id": capture_id, "originals": manifest_source},
+            ),
+            manifest.get("legacy_fallback") is True,
+        )
+
+    def _project_capture(
+        self,
+        item_id: str,
+        capture_id: str,
+        directory: Path,
+        manifest: Mapping[str, Any],
+        *,
+        artifact_id: str = "",
+    ) -> tuple[
+        tuple[RasterArtifactView, ...],
+        tuple[SpatialAnnotationView, ...],
+        Mapping[tuple[str, str, str], _ResolvedRasterCandidate],
+    ]:
+        records, representation_revision, legacy_capture = (
+            self._capture_manifest_records(item_id, capture_id, manifest)
+        )
+        if artifact_id:
+            records = tuple(
+                record
+                for record in records
+                if artifact_id in {record.original_id, record.display_id}
+            )
+        values: list[RasterArtifactView] = []
+        spatial: list[SpatialAnnotationView] = []
+        resources: dict[tuple[str, str, str], _ResolvedRasterCandidate] = {}
+        for record in records:
+            raw = record.raw
+            asset_id = record.asset_id
+            order = record.order
+            original = record.original
+            display = record.display
+            imported = record.imported
+            original_valid = record.original_valid
+            display_valid = record.display_valid
+            imported_at = record.imported_at
             original_ref = imported.get("raw_ref") or original.get("reference")
             display_ref = imported.get("display_ref") or display.get("reference")
             original_sha = _sha256(
@@ -1867,14 +3279,9 @@ class FilesystemCorrectionsArtifactRepository(
             display_sha = _sha256(
                 imported.get("derivative_checksum") or display.get("sha256")
             )
-            capture_namespace = _opaque_identity(
-                "capture",
-                capture_id,
-                asset_id,
-            )
-            original_id = f"{capture_namespace}:original"
-            display_id = f"{capture_namespace}:display"
-            canvas_id = capture_namespace
+            original_id = record.original_id
+            display_id = record.display_id
+            canvas_id = record.namespace
             original_observation = (
                 self._observe_resource(
                     item_id,
@@ -1999,6 +3406,7 @@ class FilesystemCorrectionsArtifactRepository(
                 lineage=(),
                 extensions={
                     "capture_order": order,
+                    "legacy_capture": legacy_capture,
                     **({"imported_at": imported_at} if imported_at else {}),
                     "corrections_ui": {"annotation_frame": "canvas"},
                     "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
@@ -2125,6 +3533,7 @@ class FilesystemCorrectionsArtifactRepository(
                 lineage=display_lineage,
                 extensions={
                     "capture_order": order,
+                    "legacy_capture": legacy_capture,
                     **({"imported_at": imported_at} if imported_at else {}),
                     "recipe": recipe,
                     "corrections_ui": {"annotation_frame": "canvas"},
@@ -2729,6 +4138,8 @@ class FilesystemCorrectionsArtifactRepository(
             _is_redirecting_path(path)
             or not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
+            or info.st_size < 1
+            or info.st_size > _MAX_RASTER_RESOURCE_BYTES
         ):
             return self._placeholder_observation(
                 artifact_id=artifact_id,

@@ -17125,6 +17125,8 @@ const cloudSyncUi = {
   commandPending: false,
   pendingRunId: "",
   revision: -1,
+  hasStatus: false,
+  dismissed: false,
 };
 
 function cloudSyncNumber(value) {
@@ -17134,6 +17136,26 @@ function cloudSyncNumber(value) {
 
 function cloudSyncRunKey(sync) {
   return String((sync && (sync.run_id || sync.started_at || sync.last_run)) || "");
+}
+
+function updateCloudSyncPanelVisibility() {
+  const panel = el("cloud-sync-progress");
+  const trigger = el("cloud-sync-status-btn");
+  if (!panel || !trigger) return;
+  const hasStatus = !!cloudSyncUi.hasStatus;
+  const expanded = hasStatus && !cloudSyncUi.dismissed;
+  panel.hidden = !expanded;
+  trigger.hidden = !hasStatus || expanded;
+  trigger.setAttribute("aria-expanded", String(expanded));
+}
+
+function setCloudSyncPanelDismissed(dismissed, moveFocus = true) {
+  cloudSyncUi.dismissed = !!dismissed;
+  updateCloudSyncPanelVisibility();
+  if (!moveFocus) return;
+  const target = el(cloudSyncUi.dismissed
+    ? "cloud-sync-status-btn" : "cloud-sync-dismiss");
+  if (target && !target.hidden) target.focus();
 }
 
 function cloudSyncStageText(sync) {
@@ -17451,11 +17473,20 @@ function renderCloudSyncStatus(sync) {
   const result = sync.last_result;
   const hasRun = !!(sync.running || cloudSyncRunKey(sync) || result ||
     recent.length);
-  panel.hidden = !hasRun;
+  cloudSyncUi.hasStatus = hasRun;
+  updateCloudSyncPanelVisibility();
   if (!hasRun) return;
   const failed = !sync.running && result && result.ok === false;
-  panel.dataset.state = sync.running ? "running" : failed ? "error" : "done";
+  const stateName = sync.running ? "running" : failed ? "error" : "done";
+  panel.dataset.state = stateName;
   panel.setAttribute("aria-busy", String(!!sync.running));
+
+  const statusTrigger = el("cloud-sync-status-btn");
+  statusTrigger.dataset.state = stateName;
+  const statusLabel = `Show cloud sync status (${sync.running
+    ? "running" : failed ? "failed" : "complete"})`;
+  statusTrigger.setAttribute("aria-label", statusLabel);
+  statusTrigger.dataset.tip = statusLabel;
 
   const stage = failed
     ? `Failed · ${cloudSyncFailureHeadline(sync)}`
@@ -17598,6 +17629,7 @@ async function applyCloudSyncStatus(sync) {
     cloudSyncUi.runId = runId;
     cloudSyncUi.seenItems.clear();
     cloudSyncUi.revision = -1;
+    cloudSyncUi.dismissed = false;
   }
   if (Number.isFinite(revision)) cloudSyncUi.revision = revision;
   renderCloudSyncStatus(sync);
@@ -17655,6 +17687,10 @@ async function pollCloudSyncStatus() {
 
 function initCloudSync() {
   el("cloud-sync-btn").addEventListener("click", runCloudSync);
+  el("cloud-sync-dismiss").addEventListener("click", () =>
+    setCloudSyncPanelDismissed(true));
+  el("cloud-sync-status-btn").addEventListener("click", () =>
+    setCloudSyncPanelDismissed(false));
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") scheduleCloudSyncPoll(0);
   });
@@ -17667,6 +17703,7 @@ async function runCloudSync() {
   cloudSyncUi.commandGeneration += 1;
   cloudSyncUi.commandPending = true;
   cloudSyncUi.pendingRunId = "";
+  cloudSyncUi.dismissed = false;
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
   // Keep the prior completion visible until the server assigns the new run.

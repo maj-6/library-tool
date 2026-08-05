@@ -847,12 +847,15 @@ function createAuthenticatedResourceWindow(value, parentWindow = mainWindow) {
   });
   resourceWindows.add(child);
   denyUnrequestedPermissions(child.webContents.session);
-  authenticatedResourceLoads.set(child.webContents.id, {
+  // Cache this while the webContents is live. Electron can throw
+  // "Object has been destroyed" when its wrapper is touched from `closed`.
+  const resourceWebContentsId = child.webContents.id;
+  authenticatedResourceLoads.set(resourceWebContentsId, {
     url: networkUrl,
     mainFrame: child.webContents.mainFrame,
     mode: grantMode,
   });
-  const clearGrant = () => authenticatedResourceLoads.delete(child.webContents.id);
+  const clearGrant = () => authenticatedResourceLoads.delete(resourceWebContentsId);
   if (grantMode === "one-shot") {
     child.webContents.once("did-finish-load", clearGrant);
     child.webContents.once("did-fail-load", clearGrant);

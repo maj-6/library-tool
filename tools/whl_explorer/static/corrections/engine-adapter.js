@@ -1745,11 +1745,19 @@
           },
         }),
         resources: Object.freeze({
-          resolveRaster({
-            itemId, artifactId, resourceRef,
+          async resolveRaster({
+            itemId, artifactId, resourceRef, signal,
           } = {}) {
             if (!resourceRef || !resourceRef.revision) {
               throw new TypeError("raster resource revision is required");
+            }
+            if (typeof client.rasterArtifacts.resolveResource === "function") {
+              return client.rasterArtifacts.resolveResource({
+                itemId,
+                artifactId,
+                revision: resourceRef.revision,
+                signal,
+              });
             }
             return Object.freeze({
               url: client.rasterArtifacts.resourceUrl({
