@@ -24031,12 +24031,15 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
     if not (ocr or has_metadata):
         return None                       # phone had no keys / extracted nothing
 
-    photos, errors = [], []
+    photos, traces, errors = [], [], []
     for i, raw in enumerate(raw_photos, 1):
         try:
-            photos.append(capture.process_photo(raw))
+            processed, trace = capture.process_photo_traced(raw)
+            photos.append(processed)
+            traces.append(trace)
         except Exception as exc:          # noqa: BLE001 - never lose a photo to a bad warp
             photos.append(raw)
+            traces.append(None)
             errors.append(f"photo {i}: processing failed ({type(exc).__name__})")
     # OCR text in page order, keyed by the object path's basename
     parts = []
@@ -24064,7 +24067,8 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
     spine_title = fields.get("spine_title", "")
     if spine_title:
         extra.setdefault("spine_title", spine_title)
-    return {"photos": photos, "ocr_text": "\n\n".join(parts),
+    return {"photos": photos, "photo_traces": traces,
+            "ocr_text": "\n\n".join(parts),
             "fields": fields, "extra": extra, "errors": errors}
 
 
@@ -24316,16 +24320,19 @@ def _publish_capture_assets(
             _write_capture_asset(attempt, f"orig_{index}.jpg", raw)
         if photo_contract:
             import_assets = []
+            desktop_geometry: dict[str, list] = {}
+            photo_traces = result.get("photo_traces") or []
             for index, raw in enumerate(raw_photos, 1):
                 derivative = result["photos"][index - 1]
                 source_asset = transported_assets[index - 1]
+                derivative_sha = hashlib.sha256(derivative).hexdigest()
                 import_assets.append({
                     "order": index - 1,
                     "asset_id": source_asset["asset_id"],
                     "raw_ref": f"orig_{index}.jpg",
                     "display_ref": f"photo_{index}.jpg",
                     "source_checksum": hashlib.sha256(raw).hexdigest(),
-                    "derivative_checksum": hashlib.sha256(derivative).hexdigest(),
+                    "derivative_checksum": derivative_sha,
                     "transport_representation": "original",
                     "recipe": "desktop_perspective_standardize_v1",
                     "lifecycle": "failed" if any(
@@ -24333,7 +24340,37 @@ def _publish_capture_assets(
                         for error in result["errors"]
                     ) else "completed",
                 })
+                # The phone's OCR geometry describes its own rendition. Pin a
+                # remapped copy to the derivative just written so Corrections
+                # can project region boxes over the image it actually shows.
+                trace = (photo_traces[index - 1]
+                         if index - 1 < len(photo_traces) else None)
+                if trace:
+                    try:
+                        records = capture.remap_phone_geometry_for_import(
+                            source_asset.get("geometry"), trace, derivative_sha)
+                    except Exception:     # noqa: BLE001 - geometry must never block import
+                        records = []
+                    if records:
+                        desktop_geometry[str(source_asset["asset_id"])] = records
             stored_contract = dict(photo_contract)
+            if desktop_geometry and isinstance(
+                    photo_contract.get("assets"), list):
+                stored_contract["assets"] = [
+                    (
+                        {
+                            **asset,
+                            "geometry": (
+                                list(asset.get("geometry") or [])
+                                + desktop_geometry[str(asset.get("asset_id"))]
+                            ),
+                        }
+                        if isinstance(asset, Mapping)
+                        and str(asset.get("asset_id")) in desktop_geometry
+                        else asset
+                    )
+                    for asset in photo_contract["assets"]
+                ]
             stored_contract["desktop_import"] = {
                 "version": 1,
                 "imported_at": datetime.now(timezone.utc).isoformat(

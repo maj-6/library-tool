@@ -630,6 +630,56 @@ def test_android_geometry_projects_only_on_its_revision_pinned_display(tmp_path)
         CAPTURE_DISPLAY_ID,
         CAPTURE_ORIGINAL_ID,
     }
+    # The phone-frame record no longer describes the granted derivative:
+    # nothing projects, and the artifact reports the geometry as
+    # unavailable rather than silently empty.
+    assert repository.list_spatial_annotations(ITEM_ID) == ()
+
+    # A desktop-remapped record pinned to the derivative's content hash
+    # projects over the imported display; the phone-frame record stays
+    # superseded without a staleness diagnostic.
+    pinned = copy.deepcopy(imported)
+    pinned_record = copy.deepcopy(geometry)
+    pinned_record["display_sha256"] = _digest(transformed)
+    pinned_record["remap_recipe"] = "desktop-geometry-remap-v1"
+    pinned_record["regions"][0]["polygon"] = [
+        [0.15, 0.25],
+        [0.85, 0.25],
+        [0.85, 0.35],
+        [0.15, 0.35],
+    ]
+    pinned["assets"][0]["geometry"] = [
+        copy.deepcopy(geometry),
+        pinned_record,
+    ]
+    manifest_path.write_text(json.dumps(pinned), encoding="utf-8")
+    pinned_annotations = repository.list_spatial_annotations(ITEM_ID)
+    assert len(pinned_annotations) == 1
+    assert [
+        point.as_dict() for point in pinned_annotations[0].selector.points
+    ] == [
+        {"x": 0.15, "y": 0.25},
+        {"x": 0.85, "y": 0.25},
+        {"x": 0.85, "y": 0.35},
+        {"x": 0.15, "y": 0.35},
+    ]
+    display_artifact = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+    assert display_artifact is not None
+    assert not [
+        diagnostic
+        for diagnostic in display_artifact.extensions.get("diagnostics", [])
+        if diagnostic.get("scope") == "capture_geometry"
+    ]
+
+    # A pinned record for some other derivative generation is ignored
+    # silently — it is not stale, it is simply not this display.
+    foreign_pin = copy.deepcopy(imported)
+    foreign_record = copy.deepcopy(pinned_record)
+    foreign_record["display_sha256"] = "ab" * 32
+    foreign_pin["assets"][0]["geometry"] = [foreign_record]
+    manifest_path.write_text(json.dumps(foreign_pin), encoding="utf-8")
     assert repository.list_spatial_annotations(ITEM_ID) == ()
 
 
@@ -1410,11 +1460,14 @@ def test_raster_grant_rejects_a_name_swap_after_projection(
     repository = _repository(root, capture_ids={})
     figure = repository.list_raster_artifacts(ITEM_ID)[0]
     assert figure.resource is not None
+    # The grant opens the target exactly once (it serves the verified
+    # descriptor instead of snapshotting a copy), so the swap must be
+    # caught at that single open.
     _swap_to_external_hardlink(
         monkeypatch,
         target=figure_path,
         external=external,
-        on_open=2,
+        on_open=1,
     )
 
     assert (
@@ -1705,9 +1758,15 @@ def test_opaque_resolver_rejects_stale_and_cross_item_grants(tmp_path):
 
     resolved = repository.resolve_raster_resource(ITEM_ID, resource)
     assert resolved is not None
-    display_path.write_bytes(_jpeg_bytes((1, 2, 3), (9, 12)))
+    # The grant serves a descriptor pinned to the identity-checked inode
+    # rather than a private snapshot copy, so read it before perturbing the
+    # source file. Post-grant isolation from in-place writers was the copy's
+    # side effect and is deliberately traded for not streaming every image
+    # twice; managed stores replace files by rename, which never mutates a
+    # granted descriptor's bytes.
     assert resolved.stream.read() == display
     resolved.stream.close()
+    display_path.write_bytes(_jpeg_bytes((1, 2, 3), (9, 12)))
     assert repository.resolve_raster_resource(ITEM_ID, resource) is None
 
 
