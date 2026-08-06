@@ -11,6 +11,10 @@
     ...require("./keymap"),
     ...require("./artifact-overlay"),
     ...require("./classification-controls"),
+    // image-editor-state supplies TOOLS; without it the Node tests resolve
+    // initialTool to undefined and exercise a different default tool than
+    // the browser bundle does.
+    ...require("./image-editor-state"),
     ...require("./image-editor"),
     ...require("./image-adjust-tool"),
     ...require("./preset-panel"),
@@ -531,7 +535,11 @@
               : null;
       let imageRendererOptions = {
         invokeCommand,
-        initialTool: deps.TOOLS && deps.TOOLS.PERSPECTIVE,
+        // Select, not Perspective: the perspective/image-adjust surfaces
+        // deliberately mute overlay pointer events (classification.css), so
+        // opening in one of those tools left region boxes hover- and
+        // click-dead until the user discovered the tool switcher.
+        initialTool: deps.TOOLS && deps.TOOLS.SELECT,
         hasSelection: () => Boolean(
           this.state.selection.artifactId || this.state.selection.annotationId),
         clearSelection: () => this.clearResourceSelection(),
@@ -660,6 +668,12 @@
           this.classificationEventEligible(event, command, context),
         resolveLinkedArtifact: (_target, detail = {}) =>
           this.resolveLinkedArtifact(detail.linkedKey),
+        transformContract: (target) =>
+          this.classificationTransformContract(target),
+        serializeTransformCommand: (value) =>
+          typeof deps.serializeCorrectionTransformCommand === "function"
+            ? deps.serializeCorrectionTransformCommand(value)
+            : null,
         refreshTarget: (target, detail) =>
           this.refreshClassificationTarget(target, detail),
         promoteSoftTarget: (target) => this.promoteClassificationTarget(target),
@@ -1510,6 +1524,28 @@
       }
     }
 
+    classificationTransformContract(target) {
+      const resource = this.state && this.state.resource;
+      const correction = resource && resource.correction;
+      if (!correction || !correction.artifact_id) return null;
+      // Extraction crops the image currently open in the editor; accept the
+      // request only when the hovered region is linked to that image (or
+      // carries no links at all — legacy rows — in which case the open
+      // resource is the only sensible source).
+      const links = [];
+      const many = target &&
+        (target.linkedArtifactIds || target.linked_artifact_ids);
+      if (Array.isArray(many)) links.push(...many.map(String));
+      const single = target &&
+        (target.linkedArtifactId || target.linked_artifact_id);
+      if (single != null) links.push(String(single));
+      if (links.length &&
+          !links.includes(String(correction.artifact_id))) {
+        return null;
+      }
+      return correction;
+    }
+
     categoryInventoryRefresh(_target, detail = {}) {
       const command = detail && detail.command || {};
       const undo = detail && detail.undo || {};
@@ -2036,7 +2072,12 @@
       if (this.destroyed) return;
       const workbenches = this.desktop && this.desktop.workbenches;
       if (!workbenches) {
-        this.setStatus("Browser preview — no desktop workbench context");
+        // Browser preview (no Electron bridge): a context may arrive via
+        // the URL hash — #context=<url-encoded JSON> — validated by the
+        // same normalizeWorkbenchContext gate the bridge path uses.
+        if (!this.applyContextFromLocationHash()) {
+          this.setStatus("Browser preview — no desktop workbench context");
+        }
         return;
       }
       const startingGeneration = this.contextGeneration;
@@ -2068,6 +2109,23 @@
         this.setStatus("The workbench context is invalid", true);
         return false;
       }
+    }
+
+    applyContextFromLocationHash() {
+      const location = this.windowRef && this.windowRef.location;
+      const hash = location && typeof location.hash === "string"
+        ? location.hash : "";
+      const match = /[#&]context=([^&]+)/.exec(hash);
+      if (!match) return false;
+      let value = null;
+      try {
+        value = JSON.parse(decodeURIComponent(match[1]));
+      } catch (error) {
+        return false;
+      }
+      if (!this.applyContextSafely(value)) return false;
+      this.contextGeneration += 1;
+      return true;
     }
 
     applyContext(value) {

@@ -675,9 +675,18 @@
     return isObject(groupStates) ? groupStates[groupId] || {} : {};
   }
 
-  function buildArtifactTreeRows(groupStates, expandedGroups) {
+  function artifactArchived(item) {
+    const assertions = item && item.metadataAssertions;
+    if (!Array.isArray(assertions)) return false;
+    return assertions.some((assertion) =>
+      assertion && assertion.name === "archived" && Boolean(assertion.value));
+  }
+
+  function buildArtifactTreeRows(groupStates, expandedGroups, revealedArchives) {
     const expanded = expandedGroups instanceof Set
       ? expandedGroups : new Set(expandedGroups || []);
+    const revealed = revealedArchives instanceof Set
+      ? revealedArchives : new Set(revealedArchives || []);
     const rows = [];
     for (const group of ARTIFACT_GROUPS) {
       const state = stateForGroup(groupStates, group.id);
@@ -694,7 +703,14 @@
         error: state.error || null,
       }));
       if (!expanded.has(group.id)) continue;
+      // Archived artifacts stay stored and linked but leave the working
+      // set: they render only behind a per-group reveal row.
+      const archivedItems = [];
       for (const item of items) {
+        if (artifactArchived(item)) {
+          archivedItems.push(item);
+          continue;
+        }
         rows.push(Object.freeze({
           key: item.key,
           type: "item",
@@ -703,6 +719,31 @@
           level: 2,
           item,
         }));
+      }
+      if (archivedItems.length) {
+        rows.push(Object.freeze({
+          key: `archived:${group.id}`,
+          type: "archived",
+          group: group.id,
+          label: revealed.has(group.id)
+            ? `Hide archived (${archivedItems.length})`
+            : `Archived (${archivedItems.length})`,
+          level: 2,
+          revealed: revealed.has(group.id),
+        }));
+        if (revealed.has(group.id)) {
+          for (const item of archivedItems) {
+            rows.push(Object.freeze({
+              key: item.key,
+              type: "item",
+              group: group.id,
+              label: item.label,
+              level: 2,
+              item,
+              archived: true,
+            }));
+          }
+        }
       }
       if (state.loading && items.length === 0) {
         rows.push(Object.freeze({
@@ -789,6 +830,7 @@
     DEFAULT_ROW_HEIGHT,
     MAX_PAGE_ITEMS,
     boundedJson,
+    artifactArchived,
     buildArtifactTreeRows,
     buildLinkIndex,
     classifyArtifactGroup,

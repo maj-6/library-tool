@@ -437,3 +437,59 @@ test("virtual tree window stays bounded and always mounts the active descendant"
   assert.equal(windowed.totalHeight, 280_000);
   assert.ok(windowed.paddingTop > 0);
 });
+
+test("archived artifacts hide behind a per-group reveal row", () => {
+  const active = { key: "artifact:keep-1", label: "Front cover" };
+  const archived = {
+    key: "artifact:price-1",
+    label: "Price marking",
+    metadataAssertions: [
+      { name: "archived", value: true, origin: "manual", revision: "m-r1" },
+    ],
+  };
+  const states = new Map([
+    ["source-images", {
+      items: [active, archived],
+      loaded: true,
+      loading: false,
+      nextCursor: null,
+      error: null,
+    }],
+  ]);
+  const hidden = buildArtifactTreeRows(states, new Set(["source-images"]));
+  assert.ok(hidden.some((row) => row.key === "artifact:keep-1"));
+  assert.ok(!hidden.some((row) => row.key === "artifact:price-1"),
+    "archived rows stay out of the working set by default");
+  const toggle = hidden.find((row) => row.key === "archived:source-images");
+  assert.ok(toggle);
+  assert.equal(toggle.type, "archived");
+  assert.match(toggle.label, /Archived \(1\)/);
+
+  const revealed = buildArtifactTreeRows(
+    states, new Set(["source-images"]), new Set(["source-images"]));
+  const archivedRow = revealed.find((row) => row.key === "artifact:price-1");
+  assert.ok(archivedRow, "revealing shows the archived artifact again");
+  assert.equal(archivedRow.archived, true);
+  assert.match(
+    revealed.find((row) => row.key === "archived:source-images").label,
+    /Hide archived \(1\)/,
+  );
+  // A cleared or false assertion keeps the artifact in the working set.
+  const restored = buildArtifactTreeRows(
+    new Map([["source-images", {
+      items: [{
+        ...archived,
+        metadataAssertions: [
+          { name: "archived", value: false, origin: "manual", revision: "m-r2" },
+        ],
+      }],
+      loaded: true,
+      loading: false,
+      nextCursor: null,
+      error: null,
+    }]]),
+    new Set(["source-images"]),
+  );
+  assert.ok(restored.some((row) => row.key === "artifact:price-1"));
+  assert.ok(!restored.some((row) => row.key === "archived:source-images"));
+});
