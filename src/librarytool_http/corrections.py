@@ -2377,6 +2377,165 @@ def _validate_corrections_workspace(
         )
 
 
+def _index_capture_policy(
+    item: ItemView,
+    lazy_capture_index_for_item: Callable[[str], bool] | None,
+) -> bool:
+    """Decide whether one item is projected from bounded capture hints."""
+
+    if lazy_capture_index_for_item is None:
+        return False
+    try:
+        use_hints = lazy_capture_index_for_item(item.item_id)
+    except EngineError:
+        raise
+    except Exception as exc:
+        raise RepositoryError(
+            "the Corrections capture hint policy is unavailable",
+            code="corrections_index_authority_unavailable",
+            details={
+                "item_id": item.item_id,
+                "cause_type": type(exc).__name__,
+            },
+            retryable=True,
+        ) from exc
+    if not isinstance(use_hints, bool):
+        raise RepositoryError(
+            "the Corrections capture hint policy returned invalid state",
+            code="invalid_corrections_index_projection",
+            details={"item_id": item.item_id},
+        )
+    return use_hints
+
+
+def _index_review_state(
+    item: ItemView,
+    *,
+    reviews: Any,
+    use_hints: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve one item's review without reading a single capture.
+
+    Separating this from the capture projection is what lets a caller build the
+    whole-collection view — which needs review state for its attention list and
+    its ordering — without paying for capture hints it will not show.
+    """
+
+    if use_hints:
+        return "clear", {
+            "revision": _collection_revision(
+                "review-index-",
+                ({"item_id": item.item_id, "item_revision": item.revision},),
+            ),
+            "state": "clear",
+            "reason": "",
+            "history_count": 0,
+            "latest_event": None,
+        }
+    review = reviews.get_review(item.item_id)
+    if not isinstance(review, CorrectionReviewSnapshot):
+        raise RepositoryError(
+            "the correction service returned an invalid review",
+            code="invalid_correction_review",
+            details={"item_id": item.item_id},
+        )
+    return review.state.value, _index_review_summary(review)
+
+
+def _corrections_index_book(
+    item: ItemView,
+    *,
+    rasters: Any,
+    use_hints: bool,
+    review_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one book row, including everything derived from its captures.
+
+    This is the expensive half. It is a function so that a caller wanting only
+    a handful of rows can reach it directly instead of projecting the whole
+    library.
+    """
+
+    item_kind = item.kind.casefold()
+    if use_hints:
+        list_hints = getattr(rasters, "list_capture_index_hints", None)
+        if not callable(list_hints):
+            raise RepositoryError(
+                "the Corrections capture hint service is unavailable",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item.item_id},
+            )
+        captures, diagnostic_scopes = _capture_hint_rows(
+            item.item_id,
+            list_hints(item.item_id),
+        )
+        inventory_issues_list: list[str] = []
+        if "capture_geometry" in diagnostic_scopes:
+            inventory_issues_list.append(
+                "Captured image geometry is incomplete"
+            )
+        if "mistral_layout" in diagnostic_scopes:
+            inventory_issues_list.append(
+                "Mistral artifact layout is unavailable"
+            )
+        if "mistral_figure" in diagnostic_scopes:
+            inventory_issues_list.append(
+                "Mistral image artifacts are incomplete"
+            )
+        if _item_has_capture_inventory(item) and not captures:
+            import_state = "missing"
+            inventory_issues = (
+                "Captured image manifest is missing",
+                *inventory_issues_list,
+            )
+        else:
+            import_state = _book_import_state(captures)
+            if (
+                diagnostic_scopes
+                & {"capture_geometry", "capture_rendition"}
+                and import_state not in {"missing", "unavailable"}
+            ):
+                import_state = "partial"
+            if diagnostic_scopes & {"mistral_layout", "mistral_figure"}:
+                import_state = "partial" if captures else "unavailable"
+            inventory_issues = tuple(inventory_issues_list)
+    else:
+        captures, import_state, inventory_issues = (
+            _index_capture_inventory(rasters, item)
+        )
+    without_revision = {
+        "id": item.item_id,
+        "kind": item_kind,
+        "title": item.title,
+        "import_state": import_state,
+        "issues": _book_issues(
+            item,
+            captures,
+            inventory_issues=inventory_issues,
+        ),
+        "review": review_summary,
+        "captures": captures,
+        "latest_imported_at": _latest_imported_at(captures),
+    }
+    return {
+        "id": item.item_id,
+        "revision": _collection_revision(
+            "crb-",
+            (
+                {
+                    "item_revision": item.revision,
+                    **without_revision,
+                },
+            ),
+        ),
+        **{
+            key: value
+            for key, value in without_revision.items()
+            if key != "id"
+        },
+    }
+
+
 def _corrections_index_projection(
     engine_for_request: Callable[[], LibraryEngine],
     item_service_for_request: Callable[[], ItemQueryService] | None = None,
@@ -2404,95 +2563,22 @@ def _corrections_index_projection(
         item_kind = item.kind.casefold()
         if item_kind not in {"book", "capture"}:
             continue
-        use_hints = False
-        if lazy_capture_index_for_item is not None:
-            try:
-                use_hints = lazy_capture_index_for_item(item.item_id)
-            except EngineError:
-                raise
-            except Exception as exc:
-                raise RepositoryError(
-                    "the Corrections capture hint policy is unavailable",
-                    code="corrections_index_authority_unavailable",
-                    details={
-                        "item_id": item.item_id,
-                        "cause_type": type(exc).__name__,
-                    },
-                    retryable=True,
-                ) from exc
-            if not isinstance(use_hints, bool):
-                raise RepositoryError(
-                    "the Corrections capture hint policy returned invalid state",
-                    code="invalid_corrections_index_projection",
-                    details={"item_id": item.item_id},
-                )
-        if use_hints:
-            list_hints = getattr(rasters, "list_capture_index_hints", None)
-            if not callable(list_hints):
-                raise RepositoryError(
-                    "the Corrections capture hint service is unavailable",
-                    code="invalid_corrections_index_projection",
-                    details={"item_id": item.item_id},
-                )
-            captures, diagnostic_scopes = _capture_hint_rows(
-                item.item_id,
-                list_hints(item.item_id),
-            )
-            inventory_issues_list: list[str] = []
-            if "capture_geometry" in diagnostic_scopes:
-                inventory_issues_list.append(
-                    "Captured image geometry is incomplete"
-                )
-            if "mistral_layout" in diagnostic_scopes:
-                inventory_issues_list.append(
-                    "Mistral artifact layout is unavailable"
-                )
-            if "mistral_figure" in diagnostic_scopes:
-                inventory_issues_list.append(
-                    "Mistral image artifacts are incomplete"
-                )
-            if _item_has_capture_inventory(item) and not captures:
-                import_state = "missing"
-                inventory_issues = (
-                    "Captured image manifest is missing",
-                    *inventory_issues_list,
-                )
-            else:
-                import_state = _book_import_state(captures)
-                if (
-                    diagnostic_scopes
-                    & {"capture_geometry", "capture_rendition"}
-                    and import_state not in {"missing", "unavailable"}
-                ):
-                    import_state = "partial"
-                if diagnostic_scopes & {"mistral_layout", "mistral_figure"}:
-                    import_state = "partial" if captures else "unavailable"
-                inventory_issues = tuple(inventory_issues_list)
-            review_summary = {
-                "revision": _collection_revision(
-                    "review-index-",
-                    ({"item_id": item.item_id, "item_revision": item.revision},),
-                ),
-                "state": "clear",
-                "reason": "",
-                "history_count": 0,
-                "latest_event": None,
-            }
-            review_state = "clear"
-        else:
-            review = reviews.get_review(item.item_id)
-            if not isinstance(review, CorrectionReviewSnapshot):
-                raise RepositoryError(
-                    "the correction service returned an invalid review",
-                    code="invalid_correction_review",
-                    details={"item_id": item.item_id},
-                )
-            captures, import_state, inventory_issues = (
-                _index_capture_inventory(rasters, item)
-            )
-            review_summary = _index_review_summary(review)
-            review_state = review.state.value
-        capture_count += len(captures)
+        use_hints = _index_capture_policy(item, lazy_capture_index_for_item)
+        # Review before captures, in both branches. The reconciled branch
+        # already read the review first, and the hint branch synthesises one
+        # without touching the filesystem, so error precedence is unchanged.
+        review_state, review_summary = _index_review_state(
+            item,
+            reviews=reviews,
+            use_hints=use_hints,
+        )
+        book = _corrections_index_book(
+            item,
+            rasters=rasters,
+            use_hints=use_hints,
+            review_summary=review_summary,
+        )
+        capture_count += len(book["captures"])
         if capture_count > CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT:
             raise _invalid_index_projection(
                 "the Corrections index contains too many captures",
@@ -2503,37 +2589,6 @@ def _corrections_index_projection(
                     )
                 },
             )
-        without_revision = {
-            "id": item.item_id,
-            "kind": item_kind,
-            "title": item.title,
-            "import_state": import_state,
-            "issues": _book_issues(
-                item,
-                captures,
-                inventory_issues=inventory_issues,
-            ),
-            "review": review_summary,
-            "captures": captures,
-            "latest_imported_at": _latest_imported_at(captures),
-        }
-        book = {
-            "id": item.item_id,
-            "revision": _collection_revision(
-                "crb-",
-                (
-                    {
-                        "item_revision": item.revision,
-                        **without_revision,
-                    },
-                ),
-            ),
-            **{
-                key: value
-                for key, value in without_revision.items()
-                if key != "id"
-            },
-        }
         projected_bytes += _index_encoded_size(book) + 1
         if projected_bytes > CORRECTIONS_INDEX_MAX_BYTES:
             raise _invalid_index_projection(
