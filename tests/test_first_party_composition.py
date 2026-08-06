@@ -159,6 +159,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.corrections.reocr": "1.0.0",
         "library.text-layers": "1.0.0",
         "library.secrets": "1.0.0",
+        "library.processing-presets": "1.0.0",
         "library.providers": "1.0.0",
         "replica.core": "1.0.0",
         "translation.core": "2.0.0",

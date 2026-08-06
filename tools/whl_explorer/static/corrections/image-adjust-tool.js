@@ -578,6 +578,35 @@
       };
     }
 
+    buildPresetPanel(documentRef, controller) {
+      const factory = this.options.createPresetPanel;
+      const port = this.options.presets;
+      if (typeof factory !== "function" || !port) return null;
+      try {
+        return factory({
+          presets: port,
+          documentRef,
+          getCurrentRecipe: () => ({
+            adjustment: this.getAdjustment({ tool: TOOLS.IMAGE_ADJUST }),
+            operations: [],
+          }),
+          onApply: (preset) => {
+            if (preset.adjustment) {
+              this.setBrightness(preset.adjustment.brightness_percent);
+            }
+            if (typeof this.options.onPresetApplied === "function") {
+              this.options.onPresetApplied(preset, controller);
+            }
+          },
+          onBatchApply: typeof this.options.onPresetBatchApply === "function"
+            ? (preset) => this.options.onPresetBatchApply(preset, controller)
+            : null,
+        });
+      } catch (error) {
+        return null;
+      }
+    }
+
     mount(controller, resource) {
       if (this.destroyed) throw new Error("image adjust tool is destroyed");
       if (!controller || !controller.canvas || !controller.surface ||
@@ -674,6 +703,14 @@
         thresholdStatus,
         jobStatus,
       );
+      // Presets are optional: without a configured port the panel simply is not
+      // built, so a host that has not wired the preset service still mounts.
+      const presetPanel = this.buildPresetPanel(documentRef, controller);
+      if (presetPanel) {
+        panel.append(presetPanel.node);
+        removers.push(() => presetPanel.destroy());
+        Promise.resolve(presetPanel.refresh()).catch(() => {});
+      }
       controller.inspector.append(panel);
 
       const previewCanvas = element(

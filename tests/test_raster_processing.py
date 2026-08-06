@@ -19,6 +19,7 @@ from librarytool.processing.raster import (
     apply_manual_binary_adjust,
     apply_perspective_transform,
     page_boundary_proposal_from_pixel_quad,
+    validate_normalized_polygon,
     validate_normalized_quad,
 )
 
@@ -430,3 +431,113 @@ def test_partial_manual_contrast_is_not_the_existing_color_normalization_contrac
 def test_invalid_source_is_an_input_error() -> None:
     with pytest.raises(RasterInputError, match="cannot be decoded"):
         apply_perspective_transform(b"not an image", FULL_FRAME)
+
+
+TRIANGLE = ((0.1, 0.1), (0.9, 0.2), (0.5, 0.9))
+
+
+def test_mask_polygon_accepts_concave_shapes_and_any_winding() -> None:
+    concave = ((0.0, 0.0), (1.0, 0.0), (0.5, 0.4), (1.0, 1.0), (0.0, 1.0))
+    assert validate_normalized_polygon(concave) == concave
+    # A quad would be rejected for counter-clockwise winding; a mask must not be.
+    reversed_winding = tuple(reversed(TRIANGLE))
+    assert validate_normalized_polygon(reversed_winding) == reversed_winding
+
+
+@pytest.mark.parametrize(
+    ("polygon", "message"),
+    [
+        ((), "at least 3 points"),
+        (((0.0, 0.0), (1.0, 1.0)), "at least 3 points"),
+        (tuple((index / 1000.0, 0.5) for index in range(600)), "exceeds"),
+        (((0.0, 0.0), (0.0, 0.0), (1.0, 1.0)), "must be distinct"),
+        (((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)), "self-intersect"),
+        (((0.0, 0.0), (0.001, 0.0), (0.0, 0.001)), "area is too small"),
+        (((0.0, 0.0), (1.0, 0.0), (1.5, 1.0)), "normalized bounds"),
+        (((0.0, 0.0), (1.0, 0.0), (float("nan"), 1.0)), "must be finite"),
+    ],
+)
+def test_mask_polygon_rejects_degenerate_geometry(polygon, message: str) -> None:
+    with pytest.raises(RasterInputError, match=message):
+        validate_normalized_polygon(polygon)
+
+
+def test_unmasked_transform_keeps_one_rendition_for_display_and_ocr() -> None:
+    result = apply_perspective_transform(_png(_gradient(width=16, height=16)), FULL_FRAME)
+
+    assert result.masked is False
+    assert result.ocr_ready_png == result.output_png
+    assert result.ocr_ready_sha256 == result.output_sha256
+    with Image.open(io.BytesIO(result.output_png)) as opened:
+        assert opened.mode == "RGB"
+
+
+def test_mask_makes_outside_pixels_transparent_for_display_and_white_for_ocr() -> None:
+    source = Image.new("RGB", (64, 64), (10, 20, 30))
+    result = apply_perspective_transform(
+        _png(source),
+        FULL_FRAME,
+        mask_polygon=TRIANGLE,
+    )
+
+    assert result.masked is True
+    assert result.ocr_ready_png != result.output_png
+    with Image.open(io.BytesIO(result.output_png)) as display:
+        assert display.mode == "RGBA"
+        assert display.getpixel((0, 0))[3] == 0
+        assert display.getpixel((32, 32)) == (10, 20, 30, 255)
+    with Image.open(io.BytesIO(result.ocr_ready_png)) as ocr_ready:
+        # OCR engines treat alpha inconsistently, so this rendition is flattened.
+        assert ocr_ready.mode == "RGB"
+        assert ocr_ready.getpixel((0, 0)) == (255, 255, 255)
+        assert ocr_ready.getpixel((32, 32)) == (10, 20, 30)
+
+
+def test_mask_composes_with_a_manual_binary_adjustment() -> None:
+    result = apply_perspective_transform(
+        _png(_gradient(width=64, height=64)),
+        FULL_FRAME,
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=0),
+        mask_polygon=TRIANGLE,
+    )
+
+    with Image.open(io.BytesIO(result.output_png)) as display:
+        assert display.mode == "RGBA"
+        assert display.getpixel((0, 0))[3] == 0
+        assert display.getpixel((32, 32))[3] == 255
+        assert set(display.split()[0].tobytes()) <= {0, 255}
+    with Image.open(io.BytesIO(result.ocr_ready_png)) as ocr_ready:
+        assert ocr_ready.mode == "L"
+
+
+def test_masked_render_is_deterministic_and_published_in_the_manifest() -> None:
+    source = _png(_gradient(width=48, height=48))
+    first = apply_perspective_transform(source, FULL_FRAME, mask_polygon=TRIANGLE)
+    second = apply_perspective_transform(source, FULL_FRAME, mask_polygon=TRIANGLE)
+
+    assert first.output_sha256 == second.output_sha256
+    assert first.ocr_ready_sha256 == second.ocr_ready_sha256
+    manifest = first.transform_manifest
+    assert manifest["mask_polygon"] == [list(point) for point in TRIANGLE]
+    assert "composites on opaque white" in manifest["mask_rule"]
+    assert manifest["ocr_ready_output"]["sha256"] == first.ocr_ready_sha256
+
+
+def test_unmasked_manifest_records_no_mask() -> None:
+    manifest = apply_perspective_transform(
+        _png(_gradient(width=16, height=16)),
+        FULL_FRAME,
+    ).transform_manifest
+
+    assert manifest["mask_polygon"] is None
+    assert manifest["mask_rule"] is None
+
+
+def test_mask_that_misses_the_output_is_an_input_error() -> None:
+    # A valid polygon that lies entirely outside the rectified quad.
+    with pytest.raises(RasterInputError, match="does not cover any pixel"):
+        apply_perspective_transform(
+            _png(_gradient(width=32, height=32)),
+            ((0.0, 0.0), (0.2, 0.0), (0.2, 0.2), (0.0, 0.2)),
+            mask_polygon=((0.8, 0.8), (0.99, 0.8), (0.99, 0.99)),
+        )

@@ -6,10 +6,12 @@ choose Flask as a transport opt in explicitly.
 
 from .providers import create_provider_discovery_blueprint
 from .corrections import create_corrections_blueprint
+from .processing_presets import create_processing_preset_blueprint
 from .text_layers import create_text_layer_blueprint
 
 __all__ = [
     "create_corrections_blueprint",
     "create_provider_discovery_blueprint",
+    "create_processing_preset_blueprint",
     "create_text_layer_blueprint",
 ]

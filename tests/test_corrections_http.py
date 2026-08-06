@@ -2590,3 +2590,63 @@ def test_reocr_queue_rejects_missing_headers_and_invalid_targets():
         "correction_reocr_executor_unavailable"
     )
     assert jobs.list() == []
+
+
+def test_transform_queue_accepts_a_mask_polygon_and_rejects_unknown_fields():
+    artifact = _raster("image-a")
+    jobs = JobManager(checkpoint_interval=0)
+    transforms = CorrectionTransformService(jobs)
+
+    client = _app(
+        _Engine(
+            _RasterProjector((artifact,)),
+            _SpatialProjector(()),
+            transforms=transforms,
+        ),
+        transform_submitter=lambda service, command, queued: None,
+    ).test_client()
+    mask = [[0.1, 0.1], [0.9, 0.2], [0.5, 0.9]]
+    command = _transform_command(artifact)
+    path = "/api/v1/items/book-1/raster-artifacts/image-a/transforms"
+    headers = {
+        "Idempotency-Key": command.operation_id,
+        "If-Artifact-Match": f'"{artifact.revision}"',
+    }
+
+    accepted = client.post(
+        path,
+        json=dict(command.as_dict(), mask_polygon=mask),
+        headers=headers,
+    )
+
+    assert accepted.status_code == 202
+    assert accepted.get_json()["job"]["input_revisions"]["transform"][
+        "mask_polygon"
+    ] == mask
+
+    # The optional key widens the envelope by exactly the documented fields.
+    unknown = client.post(
+        path,
+        json=dict(command.as_dict(), sharpen=True),
+        headers={
+            "Idempotency-Key": "transform-op-2",
+            "If-Artifact-Match": f'"{artifact.revision}"',
+        },
+    )
+    assert unknown.status_code == 400
+    assert unknown.get_json()["code"] == "invalid_correction_mutation_envelope"
+
+    degenerate = client.post(
+        path,
+        json=dict(
+            command.as_dict(),
+            operation_id="transform-op-3",
+            mask_polygon=[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        ),
+        headers={
+            "Idempotency-Key": "transform-op-3",
+            "If-Artifact-Match": f'"{artifact.revision}"',
+        },
+    )
+    assert degenerate.status_code == 400
+    assert degenerate.get_json()["code"] == "invalid_correction_mask_polygon"

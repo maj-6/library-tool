@@ -36,6 +36,10 @@ from .corrections_artifact_repository import (
     ResolvedRasterResource,
 )
 from .job_history import FilesystemJobHistoryRepository
+from .processing_preset_store import (
+    PROCESSING_PRESET_RELATIVE,
+    FilesystemProcessingPresetStore,
+)
 from .item_command_repository import FilesystemItemCommandRepository
 from .item_lifecycle_repository import (
     EMPTY_MANAGED_TREE_REVISION,
@@ -100,6 +104,8 @@ __all__ = [
     "FilesystemInterchangeRepository",
     "FilesystemOpenLibRepository",
     "FilesystemJobHistoryRepository",
+    "FilesystemProcessingPresetStore",
+    "PROCESSING_PRESET_RELATIVE",
     "ManualEntryItemCodec",
     "FilesystemReplicaRepository",
     "FilesystemRepresentationCommandRepository",

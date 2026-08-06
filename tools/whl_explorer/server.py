@@ -121,6 +121,7 @@ from librarytool.adapters.windows.secret_store import (  # noqa: E402
 from librarytool_http import (  # noqa: E402
     create_corrections_blueprint,
     create_provider_discovery_blueprint,
+    create_processing_preset_blueprint,
     create_text_layer_blueprint,
 )
 from librarytool.composition.filesystem import (  # noqa: E402
@@ -296,6 +297,9 @@ app.register_blueprint(
     create_provider_discovery_blueprint(lambda: _library_engine())
 )
 app.register_blueprint(create_text_layer_blueprint(lambda: _library_engine()))
+app.register_blueprint(
+    create_processing_preset_blueprint(lambda: _library_engine())
+)
 app.register_blueprint(
     create_corrections_blueprint(
         lambda: _library_engine(),
@@ -2078,6 +2082,9 @@ def corrections_workbench():
         corrections_image_adjust_css_v=_asset_v(
             "corrections/image-adjust-tool.css"
         ),
+        corrections_preset_panel_css_v=_asset_v(
+            "corrections/preset-panel.css"
+        ),
         editor_registry_v=_asset_v("corrections/editor-registry.js"),
         ui_profile_v=_asset_v("corrections/ui-profile.js"),
         layout_controller_v=_asset_v("corrections/layout-controller.js"),
@@ -2105,6 +2112,9 @@ def corrections_workbench():
         image_editor_state_v=_asset_v("corrections/image-editor-state.js"),
         corrections_image_adjust_v=_asset_v(
             "corrections/image-adjust-tool.js"
+        ),
+        corrections_preset_panel_v=_asset_v(
+            "corrections/preset-panel.js"
         ),
         ocr_proposals_v=_asset_v("corrections/ocr-proposals.js"),
         ch_panel_v=_asset_v("corrections/ch-panel.js"),

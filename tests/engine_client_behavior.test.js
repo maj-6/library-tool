@@ -358,10 +358,15 @@ function correctionTransformQueueResult(command, overrides = {}) {
         source_revision: command.source_revision,
         source_sha256: command.source_sha256,
         operation_id: command.operation_id,
+        // Mirrors CorrectionTransformService._job_record: the optional mask is
+        // projected only when the command actually carries one.
         transform: {
           quad: command.quad.map((point) => [...point]),
           adjustment: command.adjustment,
           rerun_ocr: command.rerun_ocr,
+          ...(command.mask_polygon
+            ? { mask_polygon: command.mask_polygon.map((point) => [...point]) }
+            : {}),
         },
       },
       outputs: [],
@@ -5906,4 +5911,41 @@ this.createBuild = createBuild;`, context);
   assert.ok(calls.every((args) =>
     !Object.hasOwn(args.item.metadata, "extra") &&
     !Object.hasOwn(args.item.metadata, "pdf_file")));
+});
+
+
+test("transform commands accept an optional mask polygon and still reject unknown fields", async () => {
+  const mask = [[0.1, 0.1], [0.9, 0.2], [0.5, 0.9]];
+  const masked = correctionTransformCommand({ mask_polygon: mask });
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push(JSON.parse(init.body));
+      return response(202, correctionTransformQueueResult(masked));
+    },
+  });
+
+  await client.corrections.queueTransform({ command: masked });
+  assert.deepEqual(calls[0].mask_polygon, mask);
+
+  // A mask-less command must stay exactly eleven keys: the engine hashes this
+  // document, so an added null would move every stored command_sha256.
+  const plain = correctionTransformCommand();
+  assert.equal(Object.prototype.hasOwnProperty.call(plain, "mask_polygon"), false);
+
+  for (const [command, reason] of [
+    [correctionTransformCommand({ sharpen: true }), "an unknown field"],
+    [correctionTransformCommand({ mask_polygon: [[0.1, 0.1], [0.9, 0.2]] }),
+      "a two-point polygon"],
+    [correctionTransformCommand({ mask_polygon: [[0.1, 0.1], [0.9, 0.2], [2, 9]] }),
+      "an out-of-bounds point"],
+    [correctionTransformCommand({ mask_polygon: "triangle" }), "a non-array mask"],
+  ]) {
+    await assert.rejects(
+      () => new EngineClient({ transport: async () => response(202, {}) })
+        .corrections.queueTransform({ command }),
+      /canonical correction transform command/,
+      reason,
+    );
+  }
 });

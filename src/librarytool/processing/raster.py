@@ -20,12 +20,20 @@ from typing import Any, Iterable, Sequence
 
 from PIL import Image, ImageOps, UnidentifiedImageError, __version__ as PILLOW_VERSION
 
+from .operations import ProcessingOperation, apply_operations
+
 
 EXIF_ORIENTED_NORMALIZED = "exif_oriented_normalized"
 POINT_ORDER = ("top_left", "top_right", "bottom_right", "bottom_left")
 KERNEL_ALGORITHM_VERSION = "1.0.0"
 MIN_NORMALIZED_QUAD_AREA = 0.0001
 MIN_NORMALIZED_EDGE_LENGTH = 0.001
+MIN_NORMALIZED_POLYGON_AREA = 0.0001
+MIN_NORMALIZED_POLYGON_POINTS = 3
+# Freehand tracing can emit a point per pointer sample. The editor simplifies
+# before submitting; this bound keeps the O(n^2) self-intersection test and the
+# canonical JSON command bounded no matter what a client sends.
+MAX_NORMALIZED_POLYGON_POINTS = 512
 _GEOMETRY_EPSILON = 1e-12
 
 NormalizedPoint = tuple[float, float]
@@ -35,6 +43,7 @@ NormalizedQuad = tuple[
     NormalizedPoint,
     NormalizedPoint,
 ]
+NormalizedPolygon = tuple[NormalizedPoint, ...]
 Matrix3 = tuple[
     tuple[float, float, float],
     tuple[float, float, float],
@@ -168,6 +177,100 @@ def validate_normalized_quad(
     ):
         raise RasterInputError("quad edge is too short")
     return (points[0], points[1], points[2], points[3])
+
+
+def _polygon_signed_area(points: Sequence[NormalizedPoint]) -> float:
+    count = len(points)
+    return 0.5 * sum(
+        points[index][0] * points[(index + 1) % count][1]
+        - points[(index + 1) % count][0] * points[index][1]
+        for index in range(count)
+    )
+
+
+def validate_normalized_polygon(
+    polygon: Iterable[Iterable[float]],
+    *,
+    min_area: float = MIN_NORMALIZED_POLYGON_AREA,
+) -> NormalizedPolygon:
+    """Validate a simple normalized polygon used as a transparency mask.
+
+    The contract matches :func:`validate_normalized_quad` wherever it can:
+    finite coordinates inside the unit square, distinct vertices, no
+    self-intersection, and a minimum enclosed area.  Two quad rules are
+    deliberately *not* imposed, because a mask is a different kind of object
+    from a page boundary: a traced or freehand selection is usually concave, and
+    its first vertex is wherever the reviewer started drawing rather than a
+    labelled top-left corner.  Winding is therefore free and vertices are never
+    silently reordered — vertex identity stays part of the wire contract.
+    """
+
+    if not _is_number(min_area) or not math.isfinite(float(min_area)) or min_area <= 0:
+        raise ValueError("min_area must be a positive finite number")
+    try:
+        raw_points = tuple(tuple(point) for point in polygon)
+    except TypeError as exc:
+        raise RasterInputError("mask polygon must contain coordinate pairs") from exc
+    if len(raw_points) < MIN_NORMALIZED_POLYGON_POINTS:
+        raise RasterInputError(
+            "mask polygon must contain at least "
+            f"{MIN_NORMALIZED_POLYGON_POINTS} points"
+        )
+    if len(raw_points) > MAX_NORMALIZED_POLYGON_POINTS:
+        raise RasterInputError(
+            "mask polygon exceeds "
+            f"{MAX_NORMALIZED_POLYGON_POINTS} points; simplify the selection"
+        )
+
+    points: list[NormalizedPoint] = []
+    for index, point in enumerate(raw_points):
+        if len(point) != 2:
+            raise RasterInputError(
+                f"mask polygon point {index} must contain exactly x and y"
+            )
+        x, y = point
+        if not _is_number(x) or not _is_number(y):
+            raise RasterInputError(
+                f"mask polygon point {index} coordinates must be numbers"
+            )
+        x_float, y_float = float(x), float(y)
+        if not math.isfinite(x_float) or not math.isfinite(y_float):
+            raise RasterInputError(
+                f"mask polygon point {index} coordinates must be finite"
+            )
+        if not 0.0 <= x_float <= 1.0 or not 0.0 <= y_float <= 1.0:
+            raise RasterInputError(
+                f"mask polygon point {index} must be within normalized bounds [0, 1]"
+            )
+        points.append((x_float, y_float))
+
+    for index, point in enumerate(points):
+        for other in points[index + 1 :]:
+            if math.dist(point, other) <= _GEOMETRY_EPSILON:
+                raise RasterInputError("mask polygon vertices must be distinct")
+
+    count = len(points)
+    for index in range(count):
+        start, end = points[index], points[(index + 1) % count]
+        for other in range(index + 1, count):
+            # Edges that share a vertex always "intersect" at that vertex, so
+            # only genuinely disjoint edge pairs are meaningful here.
+            if other == index or (other + 1) % count == index or other == (index + 1) % count:
+                continue
+            if _segments_intersect(
+                start,
+                end,
+                points[other],
+                points[(other + 1) % count],
+            ):
+                raise RasterInputError("mask polygon must not self-intersect")
+
+    if abs(_polygon_signed_area(points)) < float(min_area):
+        raise RasterInputError(
+            "mask polygon area is too small; normalized area must be at least "
+            f"{float(min_area):g}"
+        )
+    return tuple(points)
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +706,24 @@ class PerspectiveTransformResult:
     output_sha256: str
     source_to_output_homography: tuple[float, ...]
     _manifest_json: bytes
+    # An unmasked transform keeps one set of bytes for both renditions, so the
+    # display and OCR-ready outputs continue to share a checksum exactly as they
+    # did before masking existed. A mask makes them genuinely different images:
+    # the display rendition carries alpha and the OCR-ready one is flattened.
+    ocr_ready_png: bytes | None = None
+    ocr_ready_sha256: str = ""
+    masked: bool = False
+
+    def __post_init__(self) -> None:
+        if self.ocr_ready_png is None:
+            object.__setattr__(self, "ocr_ready_png", self.output_png)
+            object.__setattr__(self, "ocr_ready_sha256", self.output_sha256)
+        elif not self.ocr_ready_sha256:
+            object.__setattr__(
+                self,
+                "ocr_ready_sha256",
+                hashlib.sha256(self.ocr_ready_png).hexdigest(),
+            )
 
     @property
     def output_bytes(self) -> bytes:
@@ -629,6 +750,51 @@ class PerspectiveTransformResult:
     @property
     def output_hashes(self) -> dict[str, str]:
         return {"source": self.source_sha256, "output": self.output_sha256}
+
+
+def _mask_alpha(
+    polygon: NormalizedPolygon,
+    homography: Matrix3,
+    width: int,
+    height: int,
+) -> Image.Image:
+    """Rasterize a normalized source polygon into an output-space alpha band.
+
+    The polygon travels through the same homography as the quad, so a mask
+    drawn over the source lands exactly where the reviewer drew it on the
+    rectified output.  Filling is hard-edged on purpose: an antialiased edge
+    would make the published bytes depend on Pillow's rasterizer version, and
+    these bytes are content-addressed.
+    """
+
+    from PIL import ImageDraw
+
+    pixels: list[tuple[float, float]] = []
+    for x, y in polygon:
+        denominator = homography[2][0] * x + homography[2][1] * y + homography[2][2]
+        if not math.isfinite(denominator) or abs(denominator) <= _GEOMETRY_EPSILON:
+            raise RasterInputError(
+                "mask polygon crosses the perspective horizon of this quad"
+            )
+        mapped_x = (
+            homography[0][0] * x + homography[0][1] * y + homography[0][2]
+        ) / denominator
+        mapped_y = (
+            homography[1][0] * x + homography[1][1] * y + homography[1][2]
+        ) / denominator
+        if not math.isfinite(mapped_x) or not math.isfinite(mapped_y):
+            raise RasterInputError(
+                "mask polygon maps to a non-finite output coordinate"
+            )
+        pixels.append((mapped_x * (width - 1), mapped_y * (height - 1)))
+
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).polygon(pixels, fill=255, outline=255)
+    if not mask.getbbox():
+        raise RasterInputError(
+            "mask polygon does not cover any pixel of the corrected output"
+        )
+    return mask
 
 
 def apply_manual_binary_adjust(
@@ -890,6 +1056,8 @@ def apply_perspective_transform(
     *,
     source_revision: str | None = None,
     adjustment: ManualBinaryAdjustRecipe | None = None,
+    operations: Sequence["ProcessingOperation"] | None = None,
+    mask_polygon: Iterable[Iterable[float]] | None = None,
     limits: RasterLimits | None = None,
 ) -> PerspectiveTransformResult:
     """Rectify an explicit normalized quad into a new lossless PNG.
@@ -898,13 +1066,33 @@ def apply_perspective_transform(
     opposite source edges, plus one pixel for inclusive endpoints, then scaled
     down (never up) to ``limits``.  The source buffer is copied before decode
     and is never written or returned as a mutable object.
+
+    ``operations`` is an ordered pipeline from
+    :mod:`librarytool.processing.operations`.  It runs on the rectified image
+    before ``adjustment``, because those operations enhance a continuous-tone
+    picture while the manual binary adjustment is a terminal grayscale or
+    threshold step that would discard the colour they work on.
+
+    ``mask_polygon`` is an optional normalized source-space polygon.  When
+    given, pixels outside it become transparent in :attr:`output_png` and white
+    in :attr:`ocr_ready_png`; OCR engines read alpha inconsistently, so the
+    OCR-ready rendition is always flattened.  Masking is last so it is never
+    disturbed by an operation that widens or flattens the image mode.
     """
 
     if not isinstance(source_bytes, (bytes, bytearray, memoryview)):
         raise TypeError("source_bytes must be bytes-like")
     validated_quad = validate_normalized_quad(quad)
+    validated_polygon = (
+        None if mask_polygon is None else validate_normalized_polygon(mask_polygon)
+    )
     if adjustment is not None and not isinstance(adjustment, ManualBinaryAdjustRecipe):
         raise TypeError("adjustment must be a ManualBinaryAdjustRecipe or None")
+    selected_operations = tuple(operations or ())
+    if any(
+        not isinstance(value, ProcessingOperation) for value in selected_operations
+    ):
+        raise TypeError("operations must contain ProcessingOperation values")
     selected_limits = limits or RasterLimits()
     if not isinstance(selected_limits, RasterLimits):
         raise TypeError("limits must be RasterLimits or None")
@@ -964,10 +1152,33 @@ def apply_perspective_transform(
         resample=Image.Resampling.BICUBIC,
         fillcolor=(255, 255, 255),
     )
+    if selected_operations:
+        transformed = apply_operations(transformed, selected_operations)
     if adjustment is not None:
         transformed = apply_manual_binary_adjust(transformed, adjustment)
 
-    output_png = _encode_png(transformed)
+    ocr_ready_png: bytes | None = None
+    ocr_ready_sha256 = ""
+    if validated_polygon is None:
+        output_png = _encode_png(transformed)
+    else:
+        alpha = _mask_alpha(
+            validated_polygon,
+            normalized_forward,
+            output_width,
+            output_height,
+        )
+        # The adjustment leaves an "L" image; masking has to widen it rather
+        # than drop the adjustment's work.
+        masked = transformed.convert("RGBA")
+        masked.putalpha(alpha)
+        output_png = _encode_png(masked)
+        white = Image.new("RGBA", masked.size, (255, 255, 255, 255))
+        flattened = Image.alpha_composite(white, masked)
+        ocr_ready_png = _encode_png(
+            flattened.convert("L" if transformed.mode == "L" else "RGB")
+        )
+        ocr_ready_sha256 = hashlib.sha256(ocr_ready_png).hexdigest()
     output_sha256 = hashlib.sha256(output_png).hexdigest()
     stable_homography = tuple(value for row in normalized_forward for value in row)
     manifest: dict[str, Any] = {
@@ -1000,10 +1211,28 @@ def apply_perspective_transform(
         ),
         "resampling": "pillow_bicubic",
         "adjustment": None if adjustment is None else adjustment.as_dict(),
+        "operations": [value.as_dict() for value in selected_operations],
+        "operation_order": "applied_in_listed_order_before_adjustment",
+        "mask_polygon": (
+            None
+            if validated_polygon is None
+            else [[x, y] for x, y in validated_polygon]
+        ),
+        "mask_rule": (
+            None
+            if validated_polygon is None
+            else "hard_edged_even_odd_fill; display keeps alpha, "
+            "ocr_ready composites on opaque white"
+        ),
         "output": {
             "media_type": "image/png",
             "sha256": output_sha256,
             "bytes": len(output_png),
+        },
+        "ocr_ready_output": {
+            "media_type": "image/png",
+            "sha256": ocr_ready_sha256 or output_sha256,
+            "bytes": len(ocr_ready_png if ocr_ready_png is not None else output_png),
         },
         "limits": {
             "max_output_edge_px": selected_limits.max_output_edge_px,
@@ -1022,4 +1251,7 @@ def apply_perspective_transform(
         output_sha256=output_sha256,
         source_to_output_homography=stable_homography,
         _manifest_json=manifest_json,
+        ocr_ready_png=ocr_ready_png,
+        ocr_ready_sha256=ocr_ready_sha256,
+        masked=validated_polygon is not None,
     )

@@ -1,0 +1,80 @@
+/* Presets sit inside the Image Adjust panel, so they borrow its frame and stay
+   visually subordinate to it rather than competing for attention. */
+.preset-panel {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0.5rem 0.55rem 0.55rem;
+  border: var(--border-w, 1px) solid var(--corrections-border, #3b463b);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--face) 55%, transparent);
+}
+
+.preset-panel legend {
+  padding-inline: 0.25rem;
+  font-size: 0.78rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+.preset-row {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-inline-size: 0;
+}
+
+.preset-chooser,
+.preset-name {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+}
+
+.preset-category {
+  flex: 0 0 auto;
+  inline-size: 7rem;
+}
+
+.preset-row button {
+  flex: 0 0 auto;
+  padding-inline: 0.5rem;
+  white-space: nowrap;
+}
+
+.preset-delete {
+  inline-size: 1.8rem;
+  padding-inline: 0;
+}
+
+.preset-panel :is(select, input, button)[disabled] {
+  opacity: 0.45;
+}
+
+/* A thin rule and small type, not a badge: this is incidental feedback. */
+.preset-status {
+  margin: 0;
+  padding-block-start: 0.3rem;
+  border-block-start: var(--border-w, 1px) solid
+    color-mix(in srgb, var(--corrections-border, #3b463b) 60%, transparent);
+  font-size: 0.76rem;
+  line-height: 1.35;
+  opacity: 0.82;
+  min-block-size: 1.05rem;
+}
+
+.preset-status[data-preset-status="error"] {
+  color: var(--corrections-danger, #ff7770);
+  opacity: 1;
+}
+
+.preset-undo {
+  justify-self: start;
+  padding-inline: 0.5rem;
+  font-size: 0.76rem;
+}
+
+.preset-undo[hidden] {
+  display: none;
+}

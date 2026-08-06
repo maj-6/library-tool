@@ -14,6 +14,8 @@
     TRANSFORM_COMMAND_ID,
     canQueuePerspectiveShortcut,
     canQueueTransform,
+    FREEHAND_MIN_STEP,
+    POLYGON_CLOSE_DISTANCE,
     clientToNormalized,
     createImageEditorState,
     isFormControlTarget,
@@ -29,6 +31,7 @@
     Object.freeze({ id: TOOLS.SELECT, label: "Select", shortcut: "" }),
     Object.freeze({ id: TOOLS.PERSPECTIVE, label: "Perspective", shortcut: "" }),
     Object.freeze({ id: TOOLS.IMAGE_ADJUST, label: "Image Adjust", shortcut: "" }),
+    Object.freeze({ id: TOOLS.POLYGON, label: "Mask", shortcut: "" }),
   ]);
   const CORNER_CODES = Object.freeze(["TL", "TR", "BR", "BL"]);
   let rendererSequence = 0;
@@ -217,8 +220,42 @@
       context.fillStyle = "#f5f7ef";
       contextMethod(context, "fillText", CORNER_CODES[index], labelX, labelY);
     }
+    drawMaskOverlay(context, state, rect);
     contextMethod(context, "restore");
     return true;
+  }
+
+  function drawMaskOverlay(context, state, rect) {
+    const draft = state.maskDraft;
+    const committed = state.maskPolygon;
+    const ring = draft || committed;
+    if (!ring || !ring.length) return;
+    const points = ring.map(([x, y]) => [x * rect.width, y * rect.height]);
+    contextMethod(context, "save");
+    context.lineWidth = 2;
+    // Cyan reads as a different kind of object from the green/amber page
+    // boundary, so a mask is never mistaken for a quad edit.
+    context.strokeStyle = draft ? "#7fd6e8" : "#4fb6cc";
+    context.fillStyle = "rgba(79, 182, 204, 0.14)";
+    contextMethod(context, "setLineDash", draft ? [6, 4] : []);
+    contextMethod(context, "beginPath");
+    contextMethod(context, "moveTo", points[0][0], points[0][1]);
+    for (let index = 1; index < points.length; index += 1) {
+      contextMethod(context, "lineTo", points[index][0], points[index][1]);
+    }
+    if (!draft) contextMethod(context, "closePath");
+    if (!draft || points.length > 2) contextMethod(context, "fill");
+    contextMethod(context, "stroke");
+    contextMethod(context, "setLineDash", []);
+    if (draft && !state.maskFreehand) {
+      for (const [x, y] of points) {
+        contextMethod(context, "beginPath");
+        contextMethod(context, "arc", x, y, 3.5, 0, Math.PI * 2);
+        context.fillStyle = "#7fd6e8";
+        contextMethod(context, "fill");
+      }
+    }
+    contextMethod(context, "restore");
   }
 
   function createPerspectiveImageRenderer(options = {}) {
@@ -268,6 +305,8 @@
         hasSelection: true,
       });
       const numericInvalid = new Set();
+      let maskPointerId = null;
+      let maskDragged = false;
 
       const surface = element(documentRef, "section", "perspective-editor");
       surface.tabIndex = 0;
@@ -553,7 +592,73 @@
         }
       }
 
+      function maskPointFor(event) {
+        return clientToNormalized(event, canvas.getBoundingClientRect(), {
+          clamp: true,
+        });
+      }
+
+      function handleMaskPointerDown(event) {
+        let point;
+        try { point = maskPointFor(event); } catch (error) { return; }
+        if (typeof canvas.focus === "function") {
+          try { canvas.focus({ preventScroll: true }); } catch (error) { canvas.focus(); }
+        }
+        if (state.maskDraft && !state.maskFreehand) {
+          // Clicking back onto the first vertex is how a click-placed ring is
+          // closed; anywhere else just adds another vertex.
+          const first = state.maskDraft[0];
+          const closing = state.maskDraft.length >= 3 && Math.hypot(
+            point[0] - first[0], point[1] - first[1],
+          ) <= POLYGON_CLOSE_DISTANCE;
+          dispatch(closing ? { type: "MASK_COMMIT" } : { type: "MASK_EXTEND", point });
+        } else {
+          // A drag traces freehand; a click places vertices. Which one this is
+          // only becomes known on the first move, so the draft starts in
+          // click mode and is promoted by handleMaskPointerMove.
+          dispatch({ type: "MASK_BEGIN", point, freehand: false });
+        }
+        if (event.pointerId != null &&
+            typeof canvas.setPointerCapture === "function") {
+          try { canvas.setPointerCapture(event.pointerId); } catch (error) {}
+        }
+        maskPointerId = event.pointerId == null ? null : event.pointerId;
+        maskDragged = false;
+        if (typeof event.preventDefault === "function") event.preventDefault();
+      }
+
+      function handleMaskPointerMove(event) {
+        if (!state.maskDraft || maskPointerId === null ||
+            event.pointerId !== maskPointerId) return;
+        let point;
+        try { point = maskPointFor(event); } catch (error) { return; }
+        if (!maskDragged) {
+          const first = state.maskDraft[state.maskDraft.length - 1];
+          if (Math.hypot(point[0] - first[0], point[1] - first[1]) < FREEHAND_MIN_STEP) {
+            return;
+          }
+          maskDragged = true;
+          dispatch({ type: "MASK_BEGIN", point: state.maskDraft[0], freehand: true });
+        }
+        dispatch({ type: "MASK_EXTEND", point });
+        if (typeof event.preventDefault === "function") event.preventDefault();
+      }
+
+      function handleMaskPointerUp(event) {
+        if (maskPointerId === null || event.pointerId !== maskPointerId) return;
+        if (maskDragged) dispatch({ type: "MASK_COMMIT" });
+        maskPointerId = null;
+        maskDragged = false;
+        releasePointer(event);
+        if (typeof event.preventDefault === "function") event.preventDefault();
+      }
+
       function handlePointerDown(event) {
+        if (state.tool === TOOLS.POLYGON) {
+          if (event.button != null && event.button !== 0) return;
+          handleMaskPointerDown(event);
+          return;
+        }
         if (state.tool !== TOOLS.PERSPECTIVE || state.gesture ||
             (event.button != null && event.button !== 0)) return;
         let cornerIndex;
@@ -583,6 +688,10 @@
       }
 
       function handlePointerMove(event) {
+        if (state.tool === TOOLS.POLYGON) {
+          handleMaskPointerMove(event);
+          return;
+        }
         if (!pointerMatches(event)) return;
         let point;
         try { point = coordinateForEvent(event); } catch (error) { return; }
@@ -591,6 +700,10 @@
       }
 
       function handlePointerUp(event) {
+        if (state.tool === TOOLS.POLYGON) {
+          handleMaskPointerUp(event);
+          return;
+        }
         if (!pointerMatches(event)) return;
         let point = null;
         try { point = coordinateForEvent(event); } catch (error) {}
@@ -635,6 +748,7 @@
               adjustment,
               rerunOcr,
               operationId: operationId(),
+              maskPolygon: state.maskPolygon,
             });
           } catch (error) {
             if (typeof options.onCommandError === "function") {
@@ -672,6 +786,19 @@
       }
 
       function handleKeyDown(event) {
+        // An in-progress ring owns Escape and Enter before anything else, so a
+        // half-drawn mask is never left behind by the editor-wide handlers.
+        if (state.maskDraft && (event.key === "Escape" || event.key === "Enter")) {
+          if (modalOpen()) return;
+          dispatch({
+            type: event.key === "Enter" ? "MASK_COMMIT" : "MASK_CANCEL",
+          });
+          maskPointerId = null;
+          maskDragged = false;
+          if (typeof event.preventDefault === "function") event.preventDefault();
+          if (typeof event.stopPropagation === "function") event.stopPropagation();
+          return;
+        }
         if (event.key === "Escape") {
           if (modalOpen()) return;
           const resolution = resolveEscape(state, hostHasSelection());

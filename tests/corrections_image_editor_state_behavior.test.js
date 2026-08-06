@@ -18,7 +18,10 @@ const {
   reduceImageEditorState,
   resolveEscape,
   resolveInitialQuad,
+  PROCESSING_ALGORITHMS,
+  normalizeProcessingOperations,
   serializeCorrectionTransformCommand,
+  validateMaskPolygon,
   validatePerspectiveQuad,
 } = require("../tools/whl_explorer/static/corrections/image-editor-state");
 
@@ -416,4 +419,154 @@ test("retryable queue state retains the exact command while definitive failure r
   assert.equal(state.submission.status, "failed");
   assert.equal(state.submission.command, null);
   assert.equal(canQueueTransform(state, pins()), true);
+});
+
+
+const TRIANGLE_MASK = [[0.1, 0.1], [0.9, 0.2], [0.5, 0.9]];
+
+
+test("a mask-less command omits mask_polygon so its engine fingerprint cannot move", () => {
+  const command = serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: false,
+    operationId: "correction-op-1",
+  });
+
+  assert.equal(Object.prototype.hasOwnProperty.call(command, "mask_polygon"), false);
+  assert.deepEqual(Object.keys(command), [
+    "schema", "version", "item_id", "artifact_id", "artifact_revision",
+    "source_revision", "source_sha256", "quad", "adjustment", "rerun_ocr",
+    "operation_id",
+  ]);
+  // An explicit null is the same request as no mask at all, and must not
+  // change the document the engine hashes.
+  assert.deepEqual(serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: false,
+    operationId: "correction-op-1",
+    maskPolygon: null,
+  }), command);
+});
+
+
+test("a mask polygon is carried through serialization as normalized points", () => {
+  const command = serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: false,
+    operationId: "correction-op-1",
+    maskPolygon: TRIANGLE_MASK,
+  });
+
+  assert.deepEqual(command.mask_polygon, TRIANGLE_MASK);
+  assert.equal(Object.keys(command).length, 12);
+});
+
+
+test("mask polygons accept concave shapes and any winding but reject bad geometry", () => {
+  const concave = [[0, 0], [1, 0], [0.5, 0.4], [1, 1], [0, 1]];
+  assert.equal(validateMaskPolygon(concave).valid, true);
+  // A quad would fail for counter-clockwise winding; a traced mask must not.
+  assert.equal(validateMaskPolygon(TRIANGLE_MASK.slice().reverse()).valid, true);
+
+  for (const [polygon, code, reason] of [
+    [[[0, 0], [1, 1]], "polygon-point-count", "two points"],
+    [Array.from({ length: 600 }, (_, i) => [i / 1000, 0.5]),
+      "polygon-point-limit", "over the point ceiling"],
+    [[[0, 0], [0, 0], [1, 1]], "polygon-duplicate-vertices", "duplicate vertices"],
+    [[[0, 0], [1, 0], [0, 1], [1, 1]], "polygon-self-intersection", "a bowtie"],
+    [[[0, 0], [0.001, 0], [0, 0.001]], "polygon-area", "a degenerate sliver"],
+    [[[0, 0], [1, 0], [1.5, 1]], "polygon-coordinate-bounds", "out-of-bounds points"],
+    [[[0, 0], [1, 0], [NaN, 1]], "polygon-coordinate-finite", "a non-finite point"],
+  ]) {
+    const result = validateMaskPolygon(polygon);
+    assert.equal(result.valid, false, reason);
+    assert.equal(result.code, code, reason);
+  }
+});
+
+
+test("serialization refuses a mask the engine would reject", () => {
+  assert.throws(() => serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: false,
+    operationId: "correction-op-1",
+    maskPolygon: [[0, 0], [1, 0], [0, 1], [1, 1]],
+  }), /self-intersect/);
+});
+
+
+function gammaOperation(overrides = {}) {
+  return {
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "gamma-v1",
+    rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+    gamma_hundredths: 120,
+    ...overrides,
+  };
+}
+
+
+test("processing operations serialize only when carried and stay integer-valued", () => {
+  const base = {
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: false,
+    operationId: "correction-op-1",
+  };
+
+  const plain = serializeCorrectionTransformCommand(base);
+  assert.equal(Object.prototype.hasOwnProperty.call(plain, "operations"), false);
+
+  const withOperations = serializeCorrectionTransformCommand({
+    ...base,
+    operations: [gammaOperation()],
+  });
+  assert.deepEqual(withOperations.operations, [gammaOperation()]);
+
+  assert.deepEqual(PROCESSING_ALGORITHMS, [
+    "channel-gain-v1", "contrast-v1", "gamma-v1", "kernel-sharpen-v1",
+    "unsharp-mask-v1", "white-balance-v1",
+  ]);
+});
+
+
+test("processing operations reject anything the engine would reject", () => {
+  for (const [operations, pattern, reason] of [
+    [[], /at least one operation/, "an empty pipeline"],
+    [[gammaOperation({ algorithm: "sepia-v1" })],
+      /unsupported processing algorithm/, "an unknown algorithm"],
+    [[gammaOperation({ gamma_hundredths: 5 })],
+      /from 10 through 1000/, "an out-of-range value"],
+    [[gammaOperation({ gamma_hundredths: 1.5 })],
+      /must be an integer/, "a non-integer value"],
+    [[gammaOperation({ extra: 1 })], /must match gamma-v1 exactly/, "an extra key"],
+    [[gammaOperation({ rule: "" })], /unsupported processing operation schema/,
+      "a missing rule"],
+    [Array.from({ length: 17 }, () => gammaOperation()),
+      /at most 16 entries/, "an oversized pipeline"],
+  ]) {
+    assert.throws(() => normalizeProcessingOperations(operations), pattern, reason);
+  }
+
+  // gray_world measures the image, so it cannot also carry manual dials.
+  assert.throws(() => normalizeProcessingOperations([{
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "white-balance-v1",
+    rule: "per-channel gain",
+    mode: "gray_world",
+    strength_percent: 100,
+    temperature: 20,
+    tint: 0,
+  }]), /does not take temperature or tint/);
 });

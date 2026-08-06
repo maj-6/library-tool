@@ -37,6 +37,7 @@ from .providers import ProviderDiscoveryService
 from .raster_artifacts import RasterArtifactProjectorPort
 from .replica import ReplicaApplicationService
 from .representation_commands import RepresentationCommandService
+from .processing_presets import ProcessingPresetService
 from .secret_store import SecretStoreService
 from .spatial_annotations import SpatialAnnotationProjectorPort
 from .text_layer_aggregate import TextLayerAggregateService
@@ -483,6 +484,9 @@ SPATIAL_ANNOTATION_QUERY_SERVICE: ServiceKey[SpatialAnnotationProjectorPort] = (
 SECRET_STORE_SERVICE: ServiceKey[SecretStoreService] = ServiceKey(
     "library.secrets"
 )
+PROCESSING_PRESET_SERVICE: ServiceKey[ProcessingPresetService] = ServiceKey(
+    "library.processing-presets"
+)
 ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
     "library.items.commands"
 )
@@ -740,6 +744,7 @@ __all__ = [
     "RASTER_ARTIFACT_QUERY_SERVICE",
     "REPLICA_SERVICE",
     "REPRESENTATION_COMMAND_SERVICE",
+    "PROCESSING_PRESET_SERVICE",
     "SECRET_STORE_SERVICE",
     "SPATIAL_ANNOTATION_QUERY_SERVICE",
     "ServiceBinding",

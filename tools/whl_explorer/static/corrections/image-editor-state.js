@@ -9,7 +9,16 @@
     SELECT: "select",
     PERSPECTIVE: "perspective",
     IMAGE_ADJUST: "image-adjust",
+    POLYGON: "polygon",
   });
+  // Freehand tracing emits a point per pointer sample. Points closer together
+  // than this (in normalized units) are dropped as the stroke is drawn, which
+  // keeps the committed polygon inside the engine's 512-point ceiling without
+  // needing a second simplification pass.
+  const FREEHAND_MIN_STEP = 0.004;
+  // Clicking within this distance of the first vertex closes the ring, which is
+  // the usual way a reviewer finishes a click-to-place polygon.
+  const POLYGON_CLOSE_DISTANCE = 0.02;
   const TOOL_IDS = new Set(Object.values(TOOLS));
   const POINT_ORDER = Object.freeze([
     "top_left", "top_right", "bottom_right", "bottom_left",
@@ -32,6 +41,9 @@
   const GEOMETRY_EPSILON = 1e-12;
   const MIN_NORMALIZED_QUAD_AREA = 0.0001;
   const MIN_NORMALIZED_EDGE_LENGTH = 0.001;
+  const MIN_NORMALIZED_POLYGON_AREA = 0.0001;
+  const MIN_MASK_POLYGON_POINTS = 3;
+  const MAX_MASK_POLYGON_POINTS = 512;
   const HISTORY_LIMIT = 100;
   const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
   const SHA256_RE = /^[0-9a-fA-F]{64}$/;
@@ -142,6 +154,118 @@
         points[next][0] * points[index][1];
     }
     return 0.5 * area;
+  }
+
+  function polygonSignedArea(points) {
+    let area = 0;
+    for (let index = 0; index < points.length; index += 1) {
+      const next = (index + 1) % points.length;
+      area += points[index][0] * points[next][1] -
+        points[next][0] * points[index][1];
+    }
+    return 0.5 * area;
+  }
+
+  // Mirrors validate_normalized_polygon in librarytool/processing/raster.py.
+  // A mask is not a page boundary: any vertex count from three up is allowed,
+  // concave shapes are expected, and winding is free — only simplicity, bounds
+  // and a minimum area are enforced.
+  function validateMaskPolygon(polygon, options = {}) {
+    const minArea = options.minArea == null
+      ? MIN_NORMALIZED_POLYGON_AREA : options.minArea;
+    if (typeof minArea !== "number" || !Number.isFinite(minArea) || minArea <= 0) {
+      throw new TypeError("minArea must be a positive finite number");
+    }
+    if (!Array.isArray(polygon) || polygon.length < MIN_MASK_POLYGON_POINTS) {
+      return validationResult(
+        "polygon-point-count",
+        `Mask polygon must contain at least ${MIN_MASK_POLYGON_POINTS} points.`,
+      );
+    }
+    if (polygon.length > MAX_MASK_POLYGON_POINTS) {
+      return validationResult(
+        "polygon-point-limit",
+        `Mask polygon must contain at most ${MAX_MASK_POLYGON_POINTS} points.`,
+      );
+    }
+
+    const points = [];
+    for (let index = 0; index < polygon.length; index += 1) {
+      const point = polygon[index];
+      if (!Array.isArray(point) || point.length !== 2) {
+        return validationResult(
+          "polygon-point-arity",
+          `Mask polygon point ${index + 1} must contain exactly X and Y.`,
+          [index],
+        );
+      }
+      const [x, y] = point;
+      if (typeof x !== "number" || typeof y !== "number" ||
+          !Number.isFinite(x) || !Number.isFinite(y)) {
+        return validationResult(
+          "polygon-coordinate-finite",
+          `Mask polygon point ${index + 1} coordinates must be finite numbers.`,
+          [index],
+        );
+      }
+      if (x < 0 || x > 1 || y < 0 || y > 1) {
+        return validationResult(
+          "polygon-coordinate-bounds",
+          `Mask polygon point ${index + 1} must be within normalized bounds from 0 to 1.`,
+          [index],
+        );
+      }
+      points.push([x, y]);
+    }
+
+    for (let index = 0; index < points.length; index += 1) {
+      for (let other = index + 1; other < points.length; other += 1) {
+        if (Math.hypot(
+          points[index][0] - points[other][0],
+          points[index][1] - points[other][1],
+        ) <= GEOMETRY_EPSILON) {
+          return validationResult(
+            "polygon-duplicate-vertices",
+            "Mask polygon vertices must be distinct.",
+            [index, other],
+          );
+        }
+      }
+    }
+
+    const count = points.length;
+    for (let index = 0; index < count; index += 1) {
+      const next = (index + 1) % count;
+      for (let other = index + 1; other < count; other += 1) {
+        const otherNext = (other + 1) % count;
+        // Edges sharing a vertex always meet there; only disjoint pairs matter.
+        if (other === next || otherNext === index) continue;
+        if (segmentsIntersect(
+          points[index], points[next], points[other], points[otherNext],
+        )) {
+          return validationResult(
+            "polygon-self-intersection",
+            "Mask polygon must not self-intersect.",
+            [index, other],
+          );
+        }
+      }
+    }
+
+    if (Math.abs(polygonSignedArea(points)) < minArea) {
+      return validationResult(
+        "polygon-area",
+        "Mask polygon encloses too little area.",
+      );
+    }
+    return Object.freeze({
+      valid: true,
+      code: "",
+      message: "",
+      cornerIndices: Object.freeze([]),
+      errors: Object.freeze([]),
+      polygon: points.map((point) => [point[0], point[1]]),
+    });
   }
 
   function validatePerspectiveQuad(quad, options = {}) {
@@ -383,7 +507,51 @@
       validation: validatePerspectiveQuad(initial.quad),
       submission: idleSubmission(),
       selectionPresent: options.hasSelection === true,
+      // null means "no mask", which is different from an empty in-progress
+      // ring. Only maskPolygon reaches the wire; maskDraft is never submitted.
+      maskPolygon: null,
+      maskDraft: null,
+      maskFreehand: false,
     };
+  }
+
+
+  function cloneMask(polygon) {
+    return polygon ? polygon.map((point) => [point[0], point[1]]) : null;
+  }
+
+
+  function historyEntry(state) {
+    return {
+      quad: cloneQuad(state.quad),
+      quadSource: cloneSource(state.quadSource),
+      maskPolygon: cloneMask(state.maskPolygon),
+    };
+  }
+
+
+  function restoreHistory(state, target) {
+    const quad = cloneQuad(target.quad);
+    return {
+      quad,
+      quadSource: cloneSource(target.quadSource),
+      // Entries written before masking existed carry no maskPolygon; treating
+      // that as "no mask" keeps an older undo stack usable.
+      maskPolygon: cloneMask(target.maskPolygon || null),
+      validation: validatePerspectiveQuad(quad),
+    };
+  }
+
+
+  function normalizedPoint(point) {
+    if (!Array.isArray(point) || point.length !== 2 ||
+        point.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+      throw new TypeError("point must contain two finite numbers");
+    }
+    return [
+      Math.max(0, Math.min(1, point[0])),
+      Math.max(0, Math.min(1, point[1])),
+    ];
   }
 
   function editedSource(source) {
@@ -505,6 +673,7 @@
         const undoStack = trimHistory(state.undoStack.concat([{
           quad: cloneQuad(state.gesture.beforeQuad),
           quadSource: cloneSource(state.gesture.beforeQuadSource),
+          maskPolygon: cloneMask(state.maskPolygon),
         }]));
         return {
           ...state,
@@ -517,36 +686,80 @@
       case "CANCEL_GESTURE":
         return cancelGesture(state);
       case "UNDO": {
-        if (state.gesture || !state.undoStack.length) return state;
+        if (state.gesture || state.maskDraft || !state.undoStack.length) return state;
         const target = state.undoStack[state.undoStack.length - 1];
-        const quad = cloneQuad(target.quad);
         return {
           ...state,
-          quad,
-          quadSource: cloneSource(target.quadSource),
+          ...restoreHistory(state, target),
           undoStack: state.undoStack.slice(0, -1),
-          redoStack: trimHistory(state.redoStack.concat([{
-            quad: cloneQuad(state.quad),
-            quadSource: cloneSource(state.quadSource),
-          }])),
-          validation: validatePerspectiveQuad(quad),
+          redoStack: trimHistory(state.redoStack.concat([historyEntry(state)])),
           submission: resetSubmissionAfterEdit(state),
         };
       }
       case "REDO": {
-        if (state.gesture || !state.redoStack.length) return state;
+        if (state.gesture || state.maskDraft || !state.redoStack.length) return state;
         const target = state.redoStack[state.redoStack.length - 1];
-        const quad = cloneQuad(target.quad);
         return {
           ...state,
-          quad,
-          quadSource: cloneSource(target.quadSource),
+          ...restoreHistory(state, target),
           redoStack: state.redoStack.slice(0, -1),
-          undoStack: trimHistory(state.undoStack.concat([{
-            quad: cloneQuad(state.quad),
-            quadSource: cloneSource(state.quadSource),
-          }])),
-          validation: validatePerspectiveQuad(quad),
+          undoStack: trimHistory(state.undoStack.concat([historyEntry(state)])),
+          submission: resetSubmissionAfterEdit(state),
+        };
+      }
+      case "MASK_BEGIN": {
+        if (state.tool !== TOOLS.POLYGON) return state;
+        return {
+          ...state,
+          maskDraft: [normalizedPoint(action.point)],
+          maskFreehand: action.freehand === true,
+        };
+      }
+      case "MASK_EXTEND": {
+        if (!state.maskDraft) return state;
+        const point = normalizedPoint(action.point);
+        const last = state.maskDraft[state.maskDraft.length - 1];
+        if (state.maskFreehand &&
+            Math.hypot(point[0] - last[0], point[1] - last[1]) < FREEHAND_MIN_STEP) {
+          return state;
+        }
+        if (state.maskDraft.length >= MAX_MASK_POLYGON_POINTS) return state;
+        return { ...state, maskDraft: state.maskDraft.concat([point]) };
+      }
+      case "MASK_COMMIT": {
+        if (!state.maskDraft) return state;
+        const validation = validateMaskPolygon(state.maskDraft);
+        if (!validation.valid) {
+          // A traced ring that does not close cleanly is discarded rather than
+          // half-kept: a mask the engine would reject must never look applied.
+          return { ...state, maskDraft: null, maskFreehand: false };
+        }
+        return {
+          ...state,
+          maskPolygon: validation.polygon,
+          maskDraft: null,
+          maskFreehand: false,
+          undoStack: trimHistory(state.undoStack.concat([historyEntry(state)])),
+          redoStack: [],
+          submission: resetSubmissionAfterEdit(state),
+        };
+      }
+      case "MASK_CANCEL":
+        if (!state.maskDraft) return state;
+        return { ...state, maskDraft: null, maskFreehand: false };
+      case "MASK_CLEAR": {
+        if (state.maskPolygon === null && !state.maskDraft) return state;
+        const cleared = {
+          ...state,
+          maskDraft: null,
+          maskFreehand: false,
+          maskPolygon: null,
+        };
+        if (state.maskPolygon === null) return cleared;
+        return {
+          ...cleared,
+          undoStack: trimHistory(state.undoStack.concat([historyEntry(state)])),
+          redoStack: [],
           submission: resetSubmissionAfterEdit(state),
         };
       }
@@ -772,6 +985,98 @@
       MANUAL_ADJUSTMENT_FIELDS.map((field) => [field, adjustment[field]]));
   }
 
+  // Mirrors librarytool/processing/operations.py. Parameters are integers on
+  // purpose: a float would have to serialize identically in Python and
+  // JavaScript canonical JSON, and the two disagree on exponent formatting.
+  const PROCESSING_OPERATION_SCHEMA = "org.whl.raster.processing-operation";
+  const PROCESSING_OPERATION_VERSION = 1;
+  const MAX_OPERATIONS_PER_RECIPE = 16;
+  const PROCESSING_OPERATION_PARAMETERS = Object.freeze({
+    "unsharp-mask-v1": Object.freeze({
+      radius_tenths: [1, 500],
+      amount_percent: [0, 500],
+      threshold: [0, 255],
+    }),
+    "kernel-sharpen-v1": Object.freeze({ strength_percent: [0, 100] }),
+    "gamma-v1": Object.freeze({ gamma_hundredths: [10, 1000] }),
+    "contrast-v1": Object.freeze({ contrast_percent: [-100, 100] }),
+    "channel-gain-v1": Object.freeze({
+      red_percent: [0, 400],
+      green_percent: [0, 400],
+      blue_percent: [0, 400],
+    }),
+    "white-balance-v1": Object.freeze({
+      mode: null,
+      strength_percent: [0, 100],
+      temperature: [-100, 100],
+      tint: [-100, 100],
+    }),
+  });
+  const PROCESSING_ALGORITHMS = Object.freeze(
+    Object.keys(PROCESSING_OPERATION_PARAMETERS).sort(),
+  );
+
+  function normalizeProcessingOperation(operation) {
+    if (!isPlainObject(operation)) {
+      throw new TypeError("a processing operation must be an object");
+    }
+    const bounds = Object.prototype.hasOwnProperty.call(
+      PROCESSING_OPERATION_PARAMETERS, operation.algorithm,
+    ) ? PROCESSING_OPERATION_PARAMETERS[operation.algorithm] : null;
+    if (!bounds) {
+      throw new TypeError(
+        `unsupported processing algorithm: ${String(operation.algorithm)}`);
+    }
+    const names = Object.keys(bounds);
+    const expected = ["schema", "version", "algorithm", "rule", ...names];
+    if (Object.keys(operation).length !== expected.length ||
+        expected.some((key) =>
+          !Object.prototype.hasOwnProperty.call(operation, key))) {
+      throw new TypeError(
+        `processing operation fields must match ${operation.algorithm} exactly`);
+    }
+    if (operation.schema !== PROCESSING_OPERATION_SCHEMA ||
+        operation.version !== PROCESSING_OPERATION_VERSION ||
+        typeof operation.rule !== "string" || !operation.rule) {
+      throw new TypeError("unsupported processing operation schema");
+    }
+    if (operation.algorithm === "white-balance-v1") {
+      if (operation.mode !== "gray_world" && operation.mode !== "manual") {
+        throw new TypeError("white balance mode must be gray_world or manual");
+      }
+      if (operation.mode === "gray_world" &&
+          (operation.temperature !== 0 || operation.tint !== 0)) {
+        throw new TypeError(
+          "gray_world white balance does not take temperature or tint");
+      }
+    }
+    for (const name of names) {
+      if (name === "mode") continue;
+      const [minimum, maximum] = bounds[name];
+      const value = operation[name];
+      if (!Number.isInteger(value) || value < minimum || value > maximum) {
+        throw new TypeError(
+          `${name} must be an integer from ${minimum} through ${maximum}`);
+      }
+    }
+    return Object.fromEntries(expected.map((key) => [key, operation[key]]));
+  }
+
+  function normalizeProcessingOperations(operations) {
+    if (!Array.isArray(operations)) {
+      throw new TypeError("operations must be an array");
+    }
+    if (operations.length === 0) {
+      throw new TypeError(
+        "operations must contain at least one operation or be absent");
+    }
+    if (operations.length > MAX_OPERATIONS_PER_RECIPE) {
+      throw new TypeError(
+        `operations must contain at most ${MAX_OPERATIONS_PER_RECIPE} entries`);
+    }
+    return operations.map((value) => normalizeProcessingOperation(value));
+  }
+
   function serializeCorrectionTransformCommand(options = {}) {
     const pins = normalizeSourcePins(options.pins);
     const validation = validatePerspectiveQuad(options.quad);
@@ -796,6 +1101,22 @@
       rerun_ocr: options.rerunOcr,
       operation_id: portableIdentifier(options.operationId, "operation_id"),
     };
+    // The engine fingerprints this exact document, so the key is emitted only
+    // when a mask is actually carried — a mask-less command has to keep the
+    // bytes it had before masking existed. See _COMMAND_OPTIONAL_FIELDS in
+    // librarytool/engine/correction_transforms.py.
+    if (options.maskPolygon != null) {
+      const mask = validateMaskPolygon(options.maskPolygon);
+      if (!mask.valid) {
+        const error = new TypeError(mask.message);
+        error.code = mask.code;
+        throw error;
+      }
+      command.mask_polygon = mask.polygon;
+    }
+    if (options.operations != null) {
+      command.operations = normalizeProcessingOperations(options.operations);
+    }
     return command;
   }
 
@@ -924,6 +1245,15 @@
     FULL_FRAME_QUAD,
     GEOMETRY_EPSILON,
     HISTORY_LIMIT,
+    FREEHAND_MIN_STEP,
+    MAX_MASK_POLYGON_POINTS,
+    MAX_OPERATIONS_PER_RECIPE,
+    POLYGON_CLOSE_DISTANCE,
+    MIN_MASK_POLYGON_POINTS,
+    PROCESSING_ALGORITHMS,
+    PROCESSING_OPERATION_PARAMETERS,
+    PROCESSING_OPERATION_SCHEMA,
+    PROCESSING_OPERATION_VERSION,
     MIN_NORMALIZED_EDGE_LENGTH,
     MIN_NORMALIZED_QUAD_AREA,
     POINT_LABELS,
@@ -942,6 +1272,8 @@
     isFormControlTarget,
     nearestCornerIndex,
     normalizeManualAdjustment,
+    normalizeProcessingOperation,
+    normalizeProcessingOperations,
     normalizeSourcePins,
     normalizedToClient,
     reduceImageEditorState,
@@ -949,6 +1281,7 @@
     resolveInitialQuad,
     serializeCorrectionTransformCommand,
     sourcePinsValid,
+    validateMaskPolygon,
     validatePerspectiveQuad,
     visibleModal,
   };
