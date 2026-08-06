@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 TIMEOUT = 30.0
 CAPTURE_PHOTO_MAX_BYTES = 32 * 1024 * 1024
-CAPTURE_DISCOVERY_PAGE_SIZE = 50
+CAPTURE_DISCOVERY_PAGE_SIZE = 1000
 CAPTURE_DISCOVERY_MAX_ROWS = 10_000
 CAPTURE_LIB_ASSOCIATION_SCHEMA = "org.whl.capture-lib-association"
 CAPTURE_LIB_ASSOCIATION_VERSION = 1
@@ -317,7 +317,12 @@ def list_pending_captures(
     """List the complete capture import queue in bounded, stable pages.
 
     ``limit`` remains an optional total-result cap for diagnostic callers.  A
-    normal desktop sync omits it and therefore no longer stops after 50 books.
+    normal desktop sync omits it and therefore no longer stops after 50 rows.
+    ``page_size`` only bounds each HTTP response.  Discovery continues until
+    Supabase returns an empty page, rather than assuming a short page means the
+    end: a project's Data API row limit may be lower than our requested page
+    size (for example, 50 rows).  A high safety boundary prevents an invalid
+    or non-advancing server response from growing memory without bound.
     Rows previously marked ``error`` are deliberately retried: older desktop
     versions classified every HTTP 400/404 as a vanished photo even when the
     object remained intact.  Import and acknowledgement remain idempotent.
@@ -377,10 +382,9 @@ def list_pending_captures(
                 "capture rows before retrying"
             )
         offset += len(rows)
-        if (
-            len(rows) < request_limit
-            or (limit is not None and len(out) >= limit)
-        ):
+        # A server-side max-rows setting may make every non-final response
+        # shorter than request_limit.  Only an empty page proves exhaustion.
+        if not rows or (limit is not None and len(out) >= limit):
             return out
 
 

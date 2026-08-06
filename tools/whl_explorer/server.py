@@ -25653,26 +25653,75 @@ def _target_open_review(target: dict) -> dict | None:
 
 
 def _combine_review_reasons(desktop_reason: str, phone_reason: str) -> str:
-    """Preserve simultaneous desktop/phone reasons without duplicate growth.
+    """Preserve a bounded summary of simultaneous desktop/phone reasons.
 
-    The shared database column is capped at 1000 characters.  Refuse an
-    unrepresentable merge instead of silently truncating either person's note.
+    The shared database column is capped at 1000 characters.  A long note from
+    either side must not strand the entire capture-sync run, so retain both
+    source labels and share the available space between the two notes.  Short
+    notes keep their full text and leave the remaining space to the other side.
     """
     desktop_reason = str(desktop_reason or "").strip()
     phone_reason = str(phone_reason or "").strip()
     if not desktop_reason:
-        return phone_reason
+        return _ellipsize_review_reason(phone_reason, 1000)
     if not phone_reason or phone_reason == desktop_reason:
-        return desktop_reason
-    phone_line = f"Phone: {phone_reason}"
-    if phone_line in desktop_reason.splitlines():
-        return desktop_reason
-    prefix = desktop_reason if desktop_reason.startswith("Desktop: ") \
-        else f"Desktop: {desktop_reason}"
-    combined = f"{prefix}\n{phone_line}"
-    if len(combined) > 1000:
-        raise ValueError("combined desktop and phone review reasons exceed 1000 characters")
-    return combined
+        return _ellipsize_review_reason(desktop_reason, 1000)
+    desktop_text, prior_phone_text = _split_combined_review_reason(desktop_reason)
+    if (prior_phone_text is not None and
+            _review_reasons_equivalent(prior_phone_text, phone_reason)):
+        return _ellipsize_review_reason(desktop_reason, 1000)
+    if prior_phone_text is not None:
+        # Replace a changed phone portion rather than nesting another Phone:
+        # line into an already combined reason on every round trip.
+        desktop_reason = desktop_text
+    desktop_label = "Desktop: "
+    phone_label = "\nPhone: "
+    text_budget = 1000 - len(desktop_label) - len(phone_label)
+    desktop_budget = min(len(desktop_reason), (text_budget + 1) // 2)
+    phone_budget = min(len(phone_reason), text_budget - desktop_budget)
+    remaining = text_budget - desktop_budget - phone_budget
+    if remaining:
+        desktop_extra = min(len(desktop_reason) - desktop_budget, remaining)
+        desktop_budget += desktop_extra
+        remaining -= desktop_extra
+        phone_budget += min(len(phone_reason) - phone_budget, remaining)
+    return (
+        f"{desktop_label}"
+        f"{_ellipsize_review_reason(desktop_reason, desktop_budget)}"
+        f"{phone_label}{_ellipsize_review_reason(phone_reason, phone_budget)}"
+    )
+
+
+def _ellipsize_review_reason(value: str, limit: int) -> str:
+    """Fit review text to a character limit and make any omission visible."""
+    value = str(value or "").strip()
+    if len(value) <= limit:
+        return value
+    if limit <= 0:
+        return ""
+    if limit == 1:
+        return "…"
+    return value[:limit - 1].rstrip() + "…"
+
+
+def _split_combined_review_reason(value: str) -> tuple[str, str | None]:
+    """Return source portions for a reason previously combined by this host."""
+    value = str(value or "").strip()
+    desktop_label = "Desktop: "
+    phone_label = "\nPhone: "
+    if not value.startswith(desktop_label) or phone_label not in value:
+        return value, None
+    desktop, phone = value[len(desktop_label):].split(phone_label, 1)
+    return desktop.strip(), phone.strip()
+
+
+def _review_reasons_equivalent(stored: str, incoming: str) -> bool:
+    """Treat a visibly truncated stored source as its original on replay."""
+    stored = str(stored or "").strip()
+    incoming = str(incoming or "").strip()
+    return stored == incoming or (
+        stored.endswith("…") and incoming.startswith(stored[:-1])
+    )
 
 
 def _attention_merge(current: str, incoming: dict,

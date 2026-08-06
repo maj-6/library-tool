@@ -1126,6 +1126,57 @@ def test_phone_review_merge_is_additive_idempotent_and_preserves_thread(
     assert saved_reviews["review-1"] == existing
 
 
+def test_phone_review_merge_bounds_long_reasons_without_blocking_sync(
+        monkeypatch, data_root):
+    root = data_root / "capture-review-long-reasons"
+    root.mkdir(exist_ok=True)
+    manual_path = root / "manual.json"
+    reviews_path = root / "reviews.json"
+    state_path = root / "capture-sync.json"
+    monkeypatch.setattr(lib, "MANUAL_ENTRIES_PATH", manual_path)
+    monkeypatch.setattr(server, "REVIEWS_PATH", reviews_path)
+    monkeypatch.setattr(server, "CAPTURE_PHONE_SYNC_STATE_PATH", state_path)
+    desktop_reason = "D" * 1000
+    phone_reason = "P" * 1000
+    lib.save_json(manual_path, {"manual-1": {
+        "id": "manual-1", "title": "Herbal", "capture_id": CAPTURE_ID,
+        "attention": desktop_reason,
+    }})
+    cloud = {
+        "capture_id": CAPTURE_ID, "revision": 1,
+        "updated_at": "2026-07-22T12:00:00Z",
+        "needs_attention": True, "attention_reason": phone_reason,
+        "needs_review": False, "review_id": "", "status": "",
+    }
+    writes = []
+    monkeypatch.setattr(supabase_sync, "list_capture_ids",
+                        lambda _cfg, _ids: [CAPTURE_ID])
+    monkeypatch.setattr(supabase_sync, "list_capture_reviews",
+                        lambda _cfg, _ids: [deepcopy(cloud)])
+
+    def write(_cfg, desired, expected):
+        writes.append((deepcopy(desired), expected))
+        return {
+            **desired, "revision": 2,
+            "updated_at": "2026-07-22T12:01:00Z",
+        }
+
+    monkeypatch.setattr(supabase_sync, "write_capture_review", write)
+
+    result = server._sync_capture_reviews(OWNER_CFG, CAPTURE_CFG)
+
+    assert result["errors"] == []
+    assert result["merged"] == 1
+    assert result["pushed"] == 1
+    reason = writes[0][0]["attention_reason"]
+    assert len(reason) == 1000
+    assert reason.startswith("Desktop: D")
+    assert "…\nPhone: P" in reason
+    assert reason.endswith("…")
+    assert lib.load_json(manual_path, {})["manual-1"]["attention"] == reason
+    assert server._combine_review_reasons(reason, phone_reason) == reason
+
+
 def test_build_attention_cas_race_never_clobbers_newer_desktop_reason(monkeypatch):
     views = iter([
         SimpleNamespace(

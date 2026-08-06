@@ -23,7 +23,9 @@ def test_capture_discovery_pages_past_fifty_and_recovers_error_rows(monkeypatch)
         paths.append(path)
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
         offset = int(query["offset"][0])
-        page = int(query["limit"][0])
+        # Reproduce a Data API configured to return at most 50 rows even when
+        # the client asks for a larger page.
+        page = min(int(query["limit"][0]), 50)
         return source[offset:offset + page]
 
     monkeypatch.setattr(supabase_sync, "_rest", rest)
@@ -32,7 +34,12 @@ def test_capture_discovery_pages_past_fifty_and_recovers_error_rows(monkeypatch)
 
     assert rows == source
     assert [urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["offset"][0]
-            for path in paths] == ["0", "50", "100"]
+            for path in paths] == ["0", "50", "100", "123"]
+    assert all(
+        urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["limit"][0]
+        == "1000"
+        for path in paths
+    )
     assert all("status=in.(pending,error)" in path for path in paths)
     assert all("order=created_at.asc,id.asc" in path for path in paths)
 
@@ -51,7 +58,7 @@ def test_capture_discovery_retains_explicit_total_limit(monkeypatch):
     monkeypatch.setattr(supabase_sync, "_rest", rest)
 
     rows = supabase_sync.list_pending_captures(
-        {}, limit=75, include_errors=False,
+        {}, limit=75, page_size=50, include_errors=False,
     )
 
     assert rows == source[:75]
@@ -59,6 +66,41 @@ def test_capture_discovery_retains_explicit_total_limit(monkeypatch):
         (0, 50), (50, 25),
     ]
     assert all("status=eq.pending" in path for _offset, _page, path in requested)
+
+
+def test_capture_discovery_pages_past_thousand_rows(monkeypatch):
+    source = [{"id": f"capture-{index:04d}"} for index in range(1_205)]
+    requests = []
+
+    def rest(_cfg, _method, path):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        offset = int(query["offset"][0])
+        page = int(query["limit"][0])
+        requests.append((offset, page))
+        return source[offset:offset + page]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    rows = supabase_sync.list_pending_captures({})
+
+    assert rows == source
+    assert requests == [(0, 1000), (1000, 1000), (1205, 1000)]
+
+
+def test_capture_discovery_reports_default_safety_boundary(monkeypatch):
+    total = 10_005
+
+    def rest(_cfg, _method, path):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        offset = int(query["offset"][0])
+        page = int(query["limit"][0])
+        stop = min(offset + page, total)
+        return [{"id": f"capture-{index:05d}"} for index in range(offset, stop)]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    with pytest.raises(supabase_sync.SyncError, match="10000-row safety limit"):
+        supabase_sync.list_pending_captures({})
 
 
 def test_capture_discovery_fails_clearly_past_high_safety_bound(monkeypatch):
