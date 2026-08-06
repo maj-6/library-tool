@@ -125,6 +125,7 @@ CORRECTION_OCR_PROPOSAL_LIST_SCHEMA = (
     "librarytool.correction-ocr-proposals/1"
 )
 CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/2"
+CORRECTIONS_INDEX_PROBE_SCHEMA = "librarytool.corrections-index-probe/1"
 CORRECTIONS_INDEX_BOOK_LIMIT = 100_000
 CORRECTIONS_INDEX_CAPTURE_LIMIT = 100_000
 CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT = 250_000
@@ -2571,6 +2572,7 @@ def _corrections_index(
     item_service_for_request: Callable[[], ItemQueryService] | None = None,
     index_context_for_request: Callable[[], Any] | None = None,
     lazy_capture_index_for_item: Callable[[str], bool] | None = None,
+    index_revision_observer: Callable[[str], None] | None = None,
 ) -> Response:
     _validate_corrections_workspace(workspace_id_for_request)
     operation_context = (
@@ -2579,11 +2581,54 @@ def _corrections_index(
         else index_context_for_request()
     )
     with operation_context:
-        return _corrections_index_projection(
+        response = _corrections_index_projection(
             engine_for_request,
             item_service_for_request,
             lazy_capture_index_for_item,
         )
+        if index_revision_observer is not None:
+            # The composition remembers which inputs produced this revision so
+            # the probe below can report it without projecting again.
+            index_revision_observer(_response_revision(response))
+        return response
+
+
+def _response_revision(response: Response) -> str:
+    tag = getattr(response, "get_etag", None)
+    if not callable(tag):
+        return ""
+    value = tag()[0]
+    return value if isinstance(value, str) else ""
+
+
+def _corrections_index_probe(
+    workspace_id_for_request: Callable[[], str],
+    probe_for_request: Callable[[], Mapping[str, Any]],
+) -> Response:
+    """Report the index revision without projecting the index.
+
+    The Corrections editor polls for changes far more often than it needs the
+    books themselves, and answering that poll by rebuilding the whole index
+    kept the sidecar busy for as long as a reviewer had the window open.
+    """
+
+    _validate_corrections_workspace(workspace_id_for_request)
+    probe = probe_for_request()
+    revision = probe.get("revision") if isinstance(probe, Mapping) else None
+    if not isinstance(revision, str) or not revision:
+        raise RepositoryError(
+            "the Corrections index revision is unavailable",
+            code="corrections_index_probe_unavailable",
+            retryable=True,
+        )
+    return _conditional_json(
+        {
+            "ok": True,
+            "schema": CORRECTIONS_INDEX_PROBE_SCHEMA,
+            "revision": revision,
+        },
+        revision,
+    )
 
 
 def _document_query_value(
@@ -3192,6 +3237,12 @@ def create_corrections_blueprint(
     correction_lazy_capture_index_for_item: (
         Callable[[str], bool] | None
     ) = None,
+    correction_index_probe_for_request: (
+        Callable[[], Mapping[str, Any]] | None
+    ) = None,
+    correction_index_revision_observer: (
+        Callable[[str], None] | None
+    ) = None,
     correction_transform_submitter: Callable[
         [
             CorrectionTransformService,
@@ -3271,6 +3322,20 @@ def create_corrections_blueprint(
             "correction_workspace_id_for_request must be callable or None"
         )
     if (
+        correction_index_probe_for_request is not None
+        and not callable(correction_index_probe_for_request)
+    ):
+        raise TypeError(
+            "correction_index_probe_for_request must be callable or None"
+        )
+    if (
+        correction_index_revision_observer is not None
+        and not callable(correction_index_revision_observer)
+    ):
+        raise TypeError(
+            "correction_index_revision_observer must be callable or None"
+        )
+    if (
         correction_lazy_capture_index_for_item is not None
         and not callable(correction_lazy_capture_index_for_item)
     ):
@@ -3336,9 +3401,21 @@ def create_corrections_blueprint(
                 correction_item_service_for_request,
                 correction_index_context_for_request,
                 correction_lazy_capture_index_for_item,
+                correction_index_revision_observer,
             )
         except EngineError as error:
             return _error_response(error)
+
+    if correction_index_probe_for_request is not None:
+        @blueprint.get("/api/v1/corrections/index/probe")
+        def get_corrections_index_probe():
+            try:
+                return _corrections_index_probe(
+                    workspace_id_for_request,
+                    correction_index_probe_for_request,
+                )
+            except EngineError as error:
+                return _error_response(error)
 
     @blueprint.get("/api/v1/items/<item_id>/raster-artifacts")
     def list_raster_artifacts(item_id: str):

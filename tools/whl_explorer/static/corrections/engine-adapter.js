@@ -957,6 +957,32 @@
         }
       }
 
+      // Reading the whole index to compare one revision string made the
+      // sidecar rebuild a thousand-book projection every couple of seconds for
+      // as long as the window stayed open, and everything the reviewer did
+      // queued behind it. The probe reports the same revision without
+      // projecting anything. Older sidecars do not serve it, so fall back
+      // once and stay on the index for the life of the port.
+      let probeSupported = typeof corrections.indexProbe === "function";
+
+      async function readRevision(subscription, signal) {
+        if (probeSupported) {
+          try {
+            return await corrections.indexProbe({
+              workspaceId: subscription.workspaceId,
+              signal,
+            });
+          } catch (error) {
+            if (signal && signal.aborted) throw error;
+            probeSupported = false;
+          }
+        }
+        return corrections.index({
+          workspaceId: subscription.workspaceId,
+          signal,
+        });
+      }
+
       async function poll(subscription) {
         if (subscription.closed || subscription.inflight ||
             !lifecycleActive()) return;
@@ -965,10 +991,10 @@
         const inflight = { controller };
         subscription.inflight = inflight;
         try {
-          const index = await corrections.index({
-            workspaceId: subscription.workspaceId,
-            signal: controller && controller.signal,
-          });
+          const index = await readRevision(
+            subscription,
+            controller && controller.signal,
+          );
           if (subscription.closed || subscription.inflight !== inflight ||
               !lifecycleActive() ||
               (controller && controller.signal.aborted) ||

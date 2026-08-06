@@ -2400,3 +2400,105 @@ test("production books port bounds unique zero-progress history cursors",
     );
     assert.equal(pageCalls, 1);
   });
+
+test("index polling asks the probe for the revision instead of the whole index",
+  async () => {
+    const scheduler = manualScheduler();
+    let indexCalls = 0;
+    let probeCalls = 0;
+    let revision = "index-r1";
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          indexCalls += 1;
+          return correctionsIndex(revision);
+        },
+        async indexProbe() {
+          probeCalls += 1;
+          return {
+            schema: "librarytool.corrections-index-probe/1",
+            revision,
+          };
+        },
+        async getReview() {
+          throw new Error("not expected");
+        },
+        async listReviewHistory() {
+          throw new Error("not expected");
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...scheduler, intervalMs: 250 },
+    });
+    const store = new CorrectionsIndexStore({ api: ports.books });
+
+    await store.openWorkspace("workspace-1");
+    assert.equal(store.status, "ready");
+    const afterOpen = indexCalls;
+
+    // Nothing changed: the poll must settle without projecting the index.
+    for (let round = 0; round < 3; round += 1) {
+      nextScheduled(scheduler).callback();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(probeCalls >= 3, "each poll consults the probe");
+    assert.equal(indexCalls, afterOpen,
+      "an unchanged revision never rebuilds the index");
+
+    // A new revision must still reach the store.
+    revision = "index-r2";
+    nextScheduled(scheduler).callback();
+    for (let attempt = 0;
+      attempt < 10 && store.index.revision !== "index-r2";
+      attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(store.index.revision, "index-r2",
+      "a changed revision is loaded from the authoritative index");
+    assert.ok(indexCalls > afterOpen, "the change triggers one real load");
+    store.destroy();
+  });
+
+test("index polling falls back to the index when the probe is unavailable",
+  async () => {
+    const scheduler = manualScheduler();
+    let indexCalls = 0;
+    let probeCalls = 0;
+    const { engineClient } = engineHarness({
+      corrections: {
+        async index() {
+          indexCalls += 1;
+          return correctionsIndex("index-r1");
+        },
+        async indexProbe() {
+          probeCalls += 1;
+          throw new Error("this sidecar does not serve the probe");
+        },
+        async getReview() {
+          throw new Error("not expected");
+        },
+        async listReviewHistory() {
+          throw new Error("not expected");
+        },
+      },
+    });
+    const ports = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...scheduler, intervalMs: 250 },
+    });
+    const store = new CorrectionsIndexStore({ api: ports.books });
+
+    await store.openWorkspace("workspace-1");
+    const afterOpen = indexCalls;
+    for (let round = 0; round < 3; round += 1) {
+      nextScheduled(scheduler).callback();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(store.status, "ready");
+    assert.equal(probeCalls, 1,
+      "the probe is attempted once, then abandoned for the port's lifetime");
+    assert.ok(indexCalls > afterOpen,
+      "polling continues against the index once the probe is abandoned");
+    store.destroy();
+  });

@@ -2829,3 +2829,86 @@ def test_production_bridge_preserves_not_found_semantics(
     assert collection.get_json()["code"] == "item_not_found"
     assert mutation.status_code == 404
     assert mutation.get_json()["code"] == "item_not_found"
+
+
+def test_index_probe_reports_the_revision_without_projecting_the_index(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import librarytool_http.corrections as http_corrections
+    import server
+
+    projections = []
+    real_projection = http_corrections._corrections_index_projection
+
+    def counted_projection(*args, **kwargs):
+        projections.append(1)
+        return real_projection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        http_corrections,
+        "_corrections_index_projection",
+        counted_projection,
+    )
+
+    index = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert index.status_code == 200
+    revision = index.get_json()["revision"]
+    assert revision.startswith("cri-")
+    assert len(projections) == 1
+
+    for _ in range(3):
+        probe = client.get(
+            "/api/v1/corrections/index/probe?workspace_id=local-library"
+        )
+        assert probe.status_code == 200
+        body = probe.get_json()
+        assert body == {
+            "ok": True,
+            "schema": "librarytool.corrections-index-probe/1",
+            "revision": revision,
+        }
+    # The editor polls this every two seconds; it must never rebuild the index.
+    assert len(projections) == 1
+
+    # A changed store is reported immediately, and cannot be mistaken for a
+    # revision, so a client that compares the two reloads exactly once.
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {"probe-build": {"id": "probe-build", "title": "Probe build"}},
+        )
+    changed = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"]
+    assert changed != revision
+    assert not changed.startswith("cri-")
+    assert len(projections) == 1
+
+    reloaded = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert reloaded.status_code == 200
+    assert len(projections) == 2
+    settled = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"]
+    assert settled == reloaded.get_json()["revision"]
+
+
+def test_index_probe_rejects_a_foreign_workspace(client, corrections_workspace):
+    del corrections_workspace
+
+    missing = client.get("/api/v1/corrections/index/probe")
+    other = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=someone-else"
+    )
+
+    assert missing.status_code == 400
+    assert missing.get_json()["code"] == "invalid_corrections_workspace"
+    assert other.status_code == 409
+    assert other.get_json()["code"] == "corrections_workspace_mismatch"

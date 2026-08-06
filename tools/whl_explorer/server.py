@@ -105,6 +105,7 @@ from librarytool.adapters.filesystem.item_lifecycle_repository import (  # noqa:
 )
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
+    publication_generation,
 )
 from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
     WhlCatalogueItemCodec,
@@ -303,7 +304,13 @@ app.register_blueprint(
             lambda: _ensure_engine_session().raster_resource_resolver
         ),
         correction_index_context_for_request=(
-            lambda: _corrections_index_authority_context()
+            lambda: _corrections_index_recording_context()
+        ),
+        correction_index_probe_for_request=(
+            lambda: _corrections_index_probe()
+        ),
+        correction_index_revision_observer=(
+            lambda revision: _corrections_index_observed(revision)
         ),
         correction_item_service_for_request=(
             lambda: _corrections_item_engine()
@@ -6195,6 +6202,88 @@ def _corrections_targets_fingerprint() -> tuple:
 # sidecar rebuilds it forever while a reviewer works. Only ever read and
 # written while holding the build and manual locks.
 _corrections_targets_cache: dict = {"fingerprint": None, "targets": None}
+
+
+# The revision the index last reported, and the input identity it was built
+# from. Lets the probe answer "still the same" without projecting 1008 books.
+_corrections_index_revision_cache: dict = {"token": None, "revision": None}
+_corrections_index_building = threading.local()
+
+
+def _corrections_index_token() -> str:
+    """Identify everything the Corrections index body is derived from.
+
+    Two parts, because the body has two kinds of input. The catalogue stores,
+    association sidecars, and legacy identity files are named files, so they
+    are stat'ed. Everything else the projection reads — per-item artifacts,
+    reviews, transforms — is published through the engine's write set, so a
+    count of published mutations stands in for all of it. The count is
+    deliberately coarse: any engine write at all changes the token, and the
+    only cost of that is an index rebuild the client would have done anyway.
+    """
+
+    encoded = repr((
+        _corrections_targets_fingerprint(),
+        publication_generation(),
+    )).encode("utf-8", "surrogatepass")
+    return "cix-" + hashlib.sha256(encoded).hexdigest()
+
+
+def _corrections_index_probe_revision() -> str:
+    """Report the index revision without building the index.
+
+    Returns the real revision while the inputs are untouched. Otherwise it
+    returns the input token itself, which cannot collide with a revision —
+    those are prefixed ``cri-`` — so a client comparing it against what it
+    last saw reloads exactly once and then settles on the rebuilt revision.
+    """
+
+    token = _corrections_index_token()
+    cached = _corrections_index_revision_cache
+    if cached["token"] == token and cached["revision"]:
+        return str(cached["revision"])
+    return token
+
+
+def _corrections_index_probe() -> dict:
+    """Answer the editor's poll without taking the workspace lease.
+
+    Deliberately lock-free: a probe that queued behind an index build would
+    reintroduce the stall it exists to remove. It only stats files and reads a
+    counter, so the worst a concurrent write can do is produce a token for a
+    moment that never quite existed — which reports "changed", and the client
+    refreshes. It cannot report "unchanged" for a state that has moved.
+    """
+
+    return {"revision": _corrections_index_probe_revision()}
+
+
+@contextlib.contextmanager
+def _corrections_index_recording_context():
+    """Run one index build and remember which inputs produced its revision."""
+
+    token = _corrections_index_token()
+    _corrections_index_building.revision = None
+    try:
+        with _corrections_index_authority_context():
+            yield
+        revision = getattr(_corrections_index_building, "revision", None)
+    finally:
+        _corrections_index_building.revision = None
+    # Publish the pair only if nothing moved across the whole build. Otherwise
+    # the next probe reports a token instead and the client refreshes once.
+    if revision and _corrections_index_token() == token:
+        _corrections_index_revision_cache["revision"] = revision
+        _corrections_index_revision_cache["token"] = token
+    else:
+        _corrections_index_revision_cache["token"] = None
+
+
+def _corrections_index_observed(revision: str) -> None:
+    """Receive the revision the index route just produced."""
+
+    if isinstance(revision, str) and revision:
+        _corrections_index_building.revision = revision
 
 
 def _corrections_targets_cache_clear() -> None:

@@ -416,6 +416,7 @@ class RecoverableWriteSet:
         *,
         forward: bool,
     ) -> None:
+        _note_publication()
         source = self._target(str(move["source"]), allow_directory=True)
         destination = self._target(
             str(move["destination"]), allow_directory=True
@@ -540,6 +541,7 @@ class RecoverableWriteSet:
         target: Path,
         description: Mapping[str, Any],
     ) -> None:
+        _note_publication()
         self._target(target.relative_to(self.root).as_posix())
         if bool(description.get("exists")):
             blob_name = description.get("blob")
@@ -1815,6 +1817,36 @@ def _rename_tree_no_replace(source: Path, destination: Path) -> None:
 _REPARSE_POINT_ATTRIBUTE = int(
     getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 )
+
+_publication_lock = threading.Lock()
+_publication_generation = 0
+
+
+def _note_publication() -> None:
+    """Count one published filesystem mutation.
+
+    Commit, rollback, and recovery all reach the filesystem through the two
+    publish primitives, so counting there covers every engine write however it
+    arose. Readers use this to tell "nothing has been written since" cheaply,
+    without restating which files a given projection depends on.
+    """
+
+    global _publication_generation
+    with _publication_lock:
+        _publication_generation += 1
+
+
+def publication_generation() -> int:
+    """Return the current publication count.
+
+    Only ever compared for equality with a previously sampled value. It counts
+    attempts rather than successes, so it is deliberately conservative: a
+    rolled-back transaction still advances it, and a reader that concludes
+    "something may have changed" merely does the work it would have done
+    anyway.
+    """
+
+    return _publication_generation
 
 
 def _is_redirecting_path(path: Path) -> bool:
