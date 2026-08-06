@@ -982,7 +982,7 @@ class ScopedCaptureLibAssociationPublisher:
                     code="capture_cloud_association_conflict",
                     retryable=False,
                 )
-        if status not in {"pending", "imported"}:
+        if status not in {"pending", "error", "imported"}:
             raise _capture_lib_publisher_error(
                 "capture cloud publication target is not importable",
                 code="capture_cloud_target_not_importable",
@@ -995,9 +995,10 @@ class ScopedCaptureLibAssociationPublisher:
                 capture_id,
                 desired,
                 expected_revision=remote["revision"],
-                # A legacy imported/null row keeps its terminal status while the
-                # association is filled in. Pending rows transition atomically.
-                mark_imported=status == "pending",
+                # A legacy imported/null row keeps its terminal status while
+                # the association is filled in. Pending rows and error rows
+                # left by older desktop transport failures recover atomically.
+                mark_imported=status in {"pending", "error"},
             )
         except SyncError as exc:
             raise _capture_lib_publisher_error(

@@ -1203,6 +1203,19 @@
         ? options.captureRenderBatch : 12;
       this.captureRenderLimits = new Map();
       this.captureRenderRevision = 0;
+      const view = this.documentRef && this.documentRef.defaultView;
+      const Observer = options.IntersectionObserver ||
+        view && view.IntersectionObserver ||
+        (typeof IntersectionObserver === "function" ? IntersectionObserver : null);
+      this.thumbnailObserverFactory =
+        typeof options.thumbnailObserverFactory === "function"
+          ? options.thumbnailObserverFactory
+          : Observer
+            ? (callback, observerOptions) =>
+                new Observer(callback, observerOptions)
+            : null;
+      this.thumbnailObserver = null;
+      this.pendingThumbnails = new Map();
       this.renderedIndex = null;
       this.renderedStatus = "";
       this.renderedError = null;
@@ -1216,7 +1229,135 @@
       this.listeners = [];
       this.rowListeners = [];
       this.hotCapture = false;
+      this.deferSelectedThumbnail = false;
       this.mounted = false;
+    }
+
+    resetThumbnailHydration(list = null) {
+      if (this.thumbnailObserver &&
+          typeof this.thumbnailObserver.disconnect === "function") {
+        this.thumbnailObserver.disconnect();
+      }
+      this.thumbnailObserver = null;
+      this.pendingThumbnails.clear();
+      if (!list || !this.thumbnailObserverFactory) return;
+      try {
+        // The list grows to fit every rendered row; its parent .pane-body is
+        // the actual scrollport. Using the list itself as the observer root
+        // would make every off-screen descendant intersect immediately.
+        const observerRoot = list.parentNode || null;
+        const observer = this.thumbnailObserverFactory((entries) => {
+          for (const entry of Array.from(entries || [])) {
+            if (!entry || (!entry.isIntersecting && !(entry.intersectionRatio > 0))) {
+              continue;
+            }
+            this.hydrateCaptureThumbnail(entry.target);
+          }
+        }, {
+          root: observerRoot,
+          rootMargin: "192px 0px",
+          threshold: 0.01,
+        });
+        if (observer && typeof observer.observe === "function") {
+          this.thumbnailObserver = observer;
+        }
+      } catch (error) {
+        // IntersectionObserver is a performance enhancement. A broken or
+        // partially implemented observer must retain the eager fallback.
+        this.thumbnailObserver = null;
+      }
+    }
+
+    hydrateCaptureThumbnail(button, options = {}) {
+      const pending = this.pendingThumbnails.get(button);
+      if (!pending) return false;
+      if (options.priority === "high") pending.image.fetchPriority = "high";
+      if (pending.started) return true;
+      pending.started = true;
+      if (this.thumbnailObserver &&
+          typeof this.thumbnailObserver.unobserve === "function") {
+        try {
+          this.thumbnailObserver.unobserve(button);
+        } catch (error) {
+          // The image can still hydrate after an observer tears itself down.
+        }
+      }
+      if (pending.image.fetchPriority !== "high") {
+        pending.image.fetchPriority = "low";
+      }
+      pending.image.src = pending.url;
+      if (button && button.dataset) button.dataset.thumbnailState = "loading";
+      return true;
+    }
+
+    settleCaptureThumbnail(button, pending, loaded) {
+      if (this.pendingThumbnails.get(button) !== pending) return;
+      this.pendingThumbnails.delete(button);
+      if (loaded) {
+        pending.image.hidden = false;
+        if (pending.placeholder && pending.placeholder.parentNode &&
+            typeof pending.placeholder.parentNode.removeChild === "function") {
+          pending.placeholder.parentNode.removeChild(pending.placeholder);
+        }
+        if (button && button.dataset) button.dataset.thumbnailState = "loaded";
+        return;
+      }
+      pending.image.hidden = true;
+      if (pending.placeholder) {
+        pending.placeholder.textContent = "Image unavailable";
+        pending.placeholder.className =
+          "capture-thumbnail capture-thumbnail-placeholder is-error";
+        setAttribute(pending.placeholder, "aria-hidden", "false");
+      }
+      if (button && button.dataset) button.dataset.thumbnailState = "error";
+    }
+
+    appendCaptureThumbnail(button, capture, state, selected = false) {
+      if (!capture.thumbnail) {
+        const placeholder = element(this.documentRef, "span",
+          "capture-thumbnail capture-thumbnail-placeholder", state);
+        setAttribute(placeholder, "aria-hidden", "true");
+        button.append(placeholder);
+        return;
+      }
+      const image = element(this.documentRef, "img", "capture-thumbnail");
+      image.alt = capture.thumbnail.alt;
+      // Native lazy loading is a second line of defence for browsers that
+      // schedule a request between src assignment and observer teardown.
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.hidden = true;
+      if (capture.thumbnail.width) image.width = capture.thumbnail.width;
+      if (capture.thumbnail.height) image.height = capture.thumbnail.height;
+      const placeholder = element(this.documentRef, "span",
+        "capture-thumbnail capture-thumbnail-placeholder is-loading", "");
+      setAttribute(placeholder, "aria-hidden", "true");
+      button.append(placeholder, image);
+      if (button.dataset) button.dataset.thumbnailState = "pending";
+      const pending = {
+        image,
+        placeholder,
+        url: capture.thumbnail.url,
+        started: false,
+      };
+      this.pendingThumbnails.set(button, pending);
+      this.listenRow(image, "load", () =>
+        this.settleCaptureThumbnail(button, pending, true));
+      this.listenRow(image, "error", () =>
+        this.settleCaptureThumbnail(button, pending, false));
+      if (selected) {
+        this.hydrateCaptureThumbnail(button, { priority: "high" });
+        return;
+      }
+      if (!this.thumbnailObserver) {
+        this.hydrateCaptureThumbnail(button);
+        return;
+      }
+      try {
+        this.thumbnailObserver.observe(button);
+      } catch (error) {
+        this.hydrateCaptureThumbnail(button);
+      }
     }
 
     listen(target, type, handler) {
@@ -1527,6 +1668,9 @@
             ? selection.artifactId === dataset.artifactId
             : !selection.artifactId && !selection.annotationId);
         setAttribute(button, "aria-pressed", selected ? "true" : "false");
+        if (selected && dataset.artifactId && !this.deferSelectedThumbnail) {
+          this.hydrateCaptureThumbnail(button, { priority: "high" });
+        }
       }
     }
 
@@ -1610,6 +1754,7 @@
       this.renderedCaptureRevision = this.captureRenderRevision;
       this.pendingStepFocus = null;
       for (const remove of this.rowListeners.splice(0)) remove();
+      this.resetThumbnailHydration(list);
       // Replacing rows under a stationary pointer fires no pointerleave, so
       // an active hover contribution must be withdrawn before its row goes.
       if (this.hotCapture) {
@@ -1805,21 +1950,7 @@
           button.dataset.category = capture.effective_category;
           button.dataset.resourceState = capture.resource_state;
         }
-        if (capture.thumbnail) {
-          const image = element(this.documentRef, "img", "capture-thumbnail");
-          image.src = capture.thumbnail.url;
-          image.alt = capture.thumbnail.alt;
-          image.loading = "lazy";
-          image.decoding = "async";
-          if (capture.thumbnail.width) image.width = capture.thumbnail.width;
-          if (capture.thumbnail.height) image.height = capture.thumbnail.height;
-          button.append(image);
-        } else {
-          const placeholder = element(this.documentRef, "span",
-            "capture-thumbnail capture-thumbnail-placeholder", state);
-          setAttribute(placeholder, "aria-hidden", "true");
-          button.append(placeholder);
-        }
+        this.appendCaptureThumbnail(button, capture, state, captureSelected);
         const chip = element(this.documentRef, "span", "capture-category");
         const icon = element(this.documentRef, "span", "capture-category-icon",
           category.icon);
@@ -1830,6 +1961,7 @@
           element(this.documentRef, "span", "capture-state", state),
         );
         this.listenRow(button, "pointerenter", () => {
+          this.hydrateCaptureThumbnail(button);
           this.hotCapture = true;
           this.onHotTarget(commandTarget, { element: button, source: "books" });
         });
@@ -1837,14 +1969,16 @@
           this.hotCapture = false;
           this.onHotTarget(null, { element: button, source: "books" });
         });
-        this.listenRow(button, "focus", () =>
+        this.listenRow(button, "focus", () => {
+          this.hydrateCaptureThumbnail(button);
           this.onSelectionTarget(commandTarget, {
             element: button,
             focused: true,
             source: "books",
             navigationHint,
             address,
-          }));
+          });
+        });
         this.listenRow(button, "blur", () => {
           const selection = this.store.snapshot().selection;
           const selectedTarget = this.commandTargetForSelection(selection);
@@ -1870,11 +2004,19 @@
             navigationHint,
             address,
           });
-          this.navigate(
-            address,
-            "image",
-            captureNavigationPreview(book, capture),
-          );
+          this.deferSelectedThumbnail = true;
+          try {
+            this.navigate(
+              address,
+              "image",
+              captureNavigationPreview(book, capture),
+            );
+          } finally {
+            this.deferSelectedThumbnail = false;
+          }
+          // Navigation publishes the selected address first so authoritative
+          // detail work is never queued behind a thumbnail request.
+          this.hydrateCaptureThumbnail(button, { priority: "high" });
         });
         item.append(button);
         captures.append(item);
@@ -1934,6 +2076,7 @@
     destroy() {
       if (typeof this.unsubscribe === "function") this.unsubscribe();
       this.unsubscribe = null;
+      this.resetThumbnailHydration();
       for (const remove of this.listeners.splice(0)) remove();
       for (const remove of this.rowListeners.splice(0)) remove();
       this.mounted = false;

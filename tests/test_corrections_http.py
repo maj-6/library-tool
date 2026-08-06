@@ -289,6 +289,7 @@ def _app(
     actor_id_for_request=None,
     workspace_id_for_request=None,
     item_service_for_request=None,
+    lazy_capture_index_for_item=None,
 ):
     app = Flask(__name__)
     app.register_blueprint(
@@ -298,6 +299,9 @@ def _app(
                 None if resolver is None else lambda: resolver
             ),
             correction_item_service_for_request=item_service_for_request,
+            correction_lazy_capture_index_for_item=(
+                lazy_capture_index_for_item
+            ),
             correction_actor_id_for_request=actor_id_for_request,
             correction_workspace_id_for_request=workspace_id_for_request,
             correction_transform_submitter=transform_submitter,
@@ -1456,6 +1460,79 @@ def test_corrections_index_can_use_a_dedicated_item_projection(tmp_path):
         (item["id"], item["kind"])
         for item in response.get_json()["books"]
     ] == [("capture-stable-id", "capture")]
+
+
+def test_lazy_index_returns_capture_shell_before_preview_bytes_are_resolved():
+    content = b"\x89PNG\r\n\x1a\nlazy-preview"
+    digest = hashlib.sha256(content).hexdigest()
+
+    class HintOnlyRasterProjector:
+        def list_capture_index_hints(self, item_id):
+            assert item_id == "book-1"
+            return ({
+                "artifact_id": "capture:asset-1:display",
+                "revision": "index:capture-asset-1-r1",
+                "capture_order": 0,
+                "label": "Front cover",
+                "representation_id": "capture:book-1",
+                "canvas_id": "capture:asset-1",
+                "effective_category": "cover",
+                "resource_state": "available",
+                "import_state": "ready",
+                "freshness": "current",
+                "imported_at": "2026-08-05T12:00:00Z",
+            },)
+
+        def list_raster_artifacts(self, _item_id):
+            pytest.fail("lazy capture index hydrated authoritative detail")
+
+        def get_raster_artifact(self, _key):
+            pytest.fail("lazy capture index hydrated an artifact")
+
+    class PreviewResolver:
+        def __init__(self):
+            self.calls = []
+
+        def resolve_capture_preview(self, item_id, artifact_id):
+            self.calls.append((item_id, artifact_id))
+            return _Resolved(
+                io.BytesIO(content),
+                "image/png",
+                digest,
+                len(content),
+                f"bytes:{digest}",
+            )
+
+    resolver = PreviewResolver()
+    reviews = _ReviewService(_review_with_history(0, "review-clear-r1"))
+    engine = _Engine(
+        HintOnlyRasterProjector(),
+        _SpatialProjector(()),
+        corrections=reviews,
+        items=_ItemService((_book_item(),)),
+    )
+    client = _app(
+        engine,
+        resolver,
+        lazy_capture_index_for_item=lambda item_id: item_id == "book-1",
+    ).test_client()
+
+    index = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert index.status_code == 200, index.get_json()
+    capture = index.get_json()["books"][0]["captures"][0]
+    assert capture["artifact_id"] == "capture:asset-1:display"
+    assert capture["revision"].startswith("index:")
+    assert capture["thumbnail"]["url"].endswith("/preview")
+    assert resolver.calls == []
+    assert reviews.calls == []
+
+    preview = client.get(capture["thumbnail"]["url"])
+    assert preview.status_code == 200
+    assert preview.data == content
+    assert resolver.calls == [("book-1", "capture:asset-1:display")]
 
 
 def test_corrections_index_includes_books_and_capture_entries_only():

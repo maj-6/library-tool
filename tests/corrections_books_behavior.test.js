@@ -143,6 +143,14 @@ class MiniNode {
     this.children = [];
     this.append(...nodes);
   }
+  removeChild(node) {
+    const index = this.children.indexOf(node);
+    if (index >= 0) {
+      this.children.splice(index, 1);
+      node.parentNode = null;
+    }
+    return node;
+  }
   contains(node) {
     if (node === this) return true;
     return this.children.some((child) => child.contains(node));
@@ -213,6 +221,37 @@ function miniHarness() {
     querySelector(selector) { return nodes.get(selector) || null; },
   };
   return { body, count, documentRef, filter, list, root };
+}
+
+
+function thumbnailObserverHarness() {
+  const instances = [];
+  return {
+    instances,
+    factory(callback, options) {
+      const instance = {
+        callback,
+        options,
+        observed: new Set(),
+        unobserved: [],
+        disconnected: false,
+        observe(node) { this.observed.add(node); },
+        unobserve(node) {
+          this.observed.delete(node);
+          this.unobserved.push(node);
+        },
+        disconnect() {
+          this.disconnected = true;
+          this.observed.clear();
+        },
+        intersect(node) {
+          callback([{ target: node, isIntersecting: true, intersectionRatio: 1 }]);
+        },
+      };
+      instances.push(instance);
+      return instance;
+    },
+  };
 }
 
 
@@ -765,6 +804,155 @@ test("Books panel bounds book and capture DOM while retaining deep selections",
     assert.equal(harness.documentRef.activeElement.dataset.artifactId,
       "capture-many-24",
     "the last capture page focuses its first newly revealed capture");
+    controller.destroy();
+  });
+
+
+test("Books panel paints capture placeholders before visibility-driven thumbnails",
+  async () => {
+    const observers = thumbnailObserverHarness();
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      thumbnailObserverFactory: observers.factory.bind(observers),
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const thumbnailButtons = descendants(harness.list, "button")
+      .filter((button) => button.dataset.thumbnailState === "pending");
+    assert.equal(thumbnailButtons.length, 2);
+    for (const button of thumbnailButtons) {
+      const image = descendants(button, "img")[0];
+      assert.equal(image.hidden, true);
+      assert.equal(image.src, undefined,
+        "painting a capture row does not start its image request");
+    }
+    const observer = observers.instances.at(-1);
+    assert.equal(observer.options.root, harness.body,
+      "the observer is rooted at the scrolling pane, not the expanding list");
+    assert.equal(observer.observed.size, 2);
+
+    const visible = thumbnailButtons[0];
+    observer.callback([{
+      target: visible,
+      isIntersecting: false,
+      intersectionRatio: 0,
+    }]);
+    assert.equal(descendants(visible, "img")[0].src, undefined,
+      "off-screen observer entries do not begin requests");
+    observer.intersect(visible);
+    const visibleImage = descendants(visible, "img")[0];
+    assert.equal(visibleImage.src,
+      "/api/v1/resources/thumb-cover");
+    assert.equal(visibleImage.hidden, true);
+    assert.equal(visible.dataset.thumbnailState, "loading");
+    assert.equal(descendants(visible, "span").some((node) =>
+      node.className.includes("capture-thumbnail-placeholder")), true,
+    "the placeholder remains until the image has actually loaded");
+    visibleImage.emit("load");
+    assert.equal(visibleImage.hidden, false);
+    assert.equal(visible.dataset.thumbnailState, "loaded");
+    assert.equal(descendants(visible, "span").some((node) =>
+      node.className.includes("capture-thumbnail-placeholder")), false);
+
+    const focused = thumbnailButtons[1];
+    focused.focus();
+    const failedImage = descendants(focused, "img")[0];
+    assert.equal(failedImage.src,
+      "/api/v1/resources/thumb-legacy",
+    "keyboard focus hydrates without waiting for an observer callback");
+    failedImage.emit("error");
+    assert.equal(failedImage.hidden, true);
+    assert.equal(focused.dataset.thumbnailState, "error");
+    assert.equal(descendants(focused, "span").find((node) =>
+      node.className.includes("capture-thumbnail-placeholder")).textContent,
+    "Image unavailable");
+    assert.equal(observer.observed.size, 0);
+
+    controller.destroy();
+    assert.equal(observer.disconnected, true);
+    assert.equal(controller.pendingThumbnails.size, 0);
+  });
+
+
+test("Books thumbnails fall back safely when observation is unavailable",
+  async () => {
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      thumbnailObserverFactory() {
+        throw new Error("observer unavailable");
+      },
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const images = descendants(harness.list, "img");
+    assert.deepEqual(images.map((image) => image.src), [
+      "/api/v1/resources/thumb-cover",
+      "/api/v1/resources/thumb-legacy",
+    ]);
+    assert.equal(images.every((image) => image.hidden), true,
+      "eager fallback still waits for load before revealing images");
+    images[0].emit("load");
+    assert.equal(images[0].hidden, false);
+    controller.destroy();
+  });
+
+
+test("selected captures hydrate eagerly without delaying click navigation",
+  async () => {
+    const observers = thumbnailObserverHarness();
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const navigationImages = [];
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      thumbnailObserverFactory: observers.factory.bind(observers),
+      onNavigate(_address, _metadata) {
+        const selected = descendants(harness.list, "button").find((button) =>
+          button.getAttribute("aria-pressed") === "true" &&
+          button.dataset.artifactId);
+        navigationImages.push(selected && descendants(selected, "img")[0].src);
+      },
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const captureButton = (artifactId) => descendants(harness.list, "button")
+      .find((button) => button.dataset.artifactId === artifactId);
+    store.setSelection({
+      itemId: "book-herbarium",
+      representationId: "scan-herbarium",
+      canvasId: "canvas-cover",
+      artifactId: "capture-cover",
+      annotationId: null,
+    }, { ownedByFeature: true });
+    const externallySelected = captureButton("capture-cover");
+    assert.equal(descendants(externallySelected, "img")[0].src,
+      "/api/v1/resources/thumb-cover");
+    assert.equal(descendants(externallySelected, "img")[0].fetchPriority, "high");
+
+    const clicked = captureButton("capture-legacy");
+    assert.equal(descendants(clicked, "img")[0].src, undefined);
+    clicked.emit("click");
+    assert.deepEqual(navigationImages, [undefined],
+      "authoritative selection navigation is dispatched before the thumbnail");
+    assert.equal(descendants(clicked, "img")[0].src,
+      "/api/v1/resources/thumb-legacy");
+    assert.equal(descendants(clicked, "img")[0].fetchPriority, "high");
     controller.destroy();
   });
 

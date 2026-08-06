@@ -24768,7 +24768,11 @@ def _publish_cloud_capture_state(
             return accepted
         except sbase.SyncError as exc:
             last_error = exc
-            if attempt:
+            # The lower transport already retries HTTP failures. Only replay
+            # the complete publication when no response was received (or the
+            # accepted response could not be recorded locally); a structured
+            # HTTP response is a definitive outcome for this attempt.
+            if attempt or _capture_cloud_http_status(exc) is not None:
                 raise
     raise last_error  # pragma: no cover - the bounded loop always raises/returns
 
@@ -25179,7 +25183,7 @@ def _reconcile_cloud_capture_associations(
                     capture_cfg,
                     remote,
                     local,
-                    mark_imported=remote["status"] == "pending",
+                    mark_imported=remote["status"] in {"pending", "error"},
                 )
                 published += 1
             except Exception as exc:
@@ -25232,6 +25236,9 @@ def _reconcile_cloud_capture_associations(
 
 
 def _capture_cloud_http_status(exc: Exception) -> int | None:
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int) and 100 <= status <= 599:
+        return status
     match = re.match(r"HTTP ([0-9]{3})\b", str(exc))
     return int(match.group(1)) if match else None
 

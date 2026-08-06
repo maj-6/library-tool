@@ -104,6 +104,9 @@ any failure.
   the protected owner
   credential, a locally sealed capture must remain remotely `pending` until a
   later retry can atomically publish `status=imported` plus the association.
+  A legacy `error` row left by an older desktop transport failure is likewise
+  recoverable: reconciliation publishes its verified association and changes
+  it to `imported` in the same compare-and-set transaction.
   A Mistral API key (Settings → Credentials) is
   needed only for captures the phone didn't pre-OCR; it syncs through
   `profile_secrets`, so a key entered on either device follows the
