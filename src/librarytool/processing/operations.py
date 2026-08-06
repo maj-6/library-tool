@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, ClassVar, Mapping, Sequence
 
 from PIL import Image, ImageFilter
 
@@ -95,7 +95,11 @@ def _apply_channel_lookups(
 class ProcessingOperation:
     """Base class for a self-describing, deterministic image operation."""
 
-    algorithm: str = ""
+    # The algorithm is a type discriminator, not recipe input.  Keeping it out
+    # of dataclass-generated initializers prevents a caller from constructing,
+    # for example, a GammaOperation that serializes as an unsharp mask and can
+    # no longer be parsed from its own wire document.
+    algorithm: ClassVar[str] = ""
 
     def parameters(self) -> dict[str, Any]:  # pragma: no cover - interface
         raise NotImplementedError
@@ -128,7 +132,7 @@ class UnsharpMaskOperation(ProcessingOperation):
     radius_tenths: int = 10
     amount_percent: int = 150
     threshold: int = 3
-    algorithm: str = "unsharp-mask-v1"
+    algorithm: ClassVar[str] = "unsharp-mask-v1"
 
     def __post_init__(self) -> None:
         _bounded_integer(self.radius_tenths, name="radius_tenths", minimum=1, maximum=500)
@@ -176,7 +180,7 @@ class KernelSharpenOperation(ProcessingOperation):
     """
 
     strength_percent: int = 50
-    algorithm: str = "kernel-sharpen-v1"
+    algorithm: ClassVar[str] = "kernel-sharpen-v1"
 
     def __post_init__(self) -> None:
         _bounded_integer(
@@ -217,7 +221,7 @@ class GammaOperation(ProcessingOperation):
     """
 
     gamma_hundredths: int = 100
-    algorithm: str = "gamma-v1"
+    algorithm: ClassVar[str] = "gamma-v1"
 
     def __post_init__(self) -> None:
         _bounded_integer(
@@ -255,7 +259,7 @@ class ContrastOperation(ProcessingOperation):
     """Linear contrast around mid-grey, and the inverse toward flat grey."""
 
     contrast_percent: int = 0
-    algorithm: str = "contrast-v1"
+    algorithm: ClassVar[str] = "contrast-v1"
 
     def __post_init__(self) -> None:
         _bounded_integer(
@@ -294,7 +298,7 @@ class ChannelGainOperation(ProcessingOperation):
     red_percent: int = 100
     green_percent: int = 100
     blue_percent: int = 100
-    algorithm: str = "channel-gain-v1"
+    algorithm: ClassVar[str] = "channel-gain-v1"
 
     def __post_init__(self) -> None:
         for name in ("red_percent", "green_percent", "blue_percent"):
@@ -341,7 +345,7 @@ class WhiteBalanceOperation(ProcessingOperation):
     strength_percent: int = 100
     temperature: int = 0
     tint: int = 0
-    algorithm: str = "white-balance-v1"
+    algorithm: ClassVar[str] = "white-balance-v1"
 
     def __post_init__(self) -> None:
         if self.mode not in {"gray_world", "manual"}:
@@ -440,6 +444,14 @@ def operation_from_dict(payload: Mapping[str, Any]) -> ProcessingOperation:
 
     if not isinstance(payload, Mapping):
         raise ProcessingOperationError("a processing operation must be an object")
+    fixed = frozenset({"schema", "version", "algorithm", "rule"})
+    payload_fields = frozenset(payload)
+    missing_fixed = sorted(fixed - payload_fields)
+    if missing_fixed:
+        raise ProcessingOperationError(
+            "processing operation is missing required fields: "
+            + ", ".join(missing_fixed)
+        )
     version = payload.get("version")
     if (
         payload.get("schema") != PROCESSING_OPERATION_SCHEMA
@@ -454,10 +466,9 @@ def operation_from_dict(payload: Mapping[str, Any]) -> ProcessingOperation:
         raise ProcessingOperationError(
             f"unsupported processing algorithm: {algorithm!r}"
         )
-    fixed = {"schema", "version", "algorithm", "rule"}
     parameter_names = frozenset(operation_type().parameters())
-    unknown = sorted(set(payload) - fixed - parameter_names)
-    missing = sorted(parameter_names - set(payload))
+    unknown = sorted(payload_fields - fixed - parameter_names)
+    missing = sorted(parameter_names - payload_fields)
     if unknown or missing:
         raise ProcessingOperationError(
             f"processing operation fields must match {algorithm} exactly"
@@ -480,6 +491,36 @@ def operation_from_dict(payload: Mapping[str, Any]) -> ProcessingOperation:
             f"processing operation is not a canonical {algorithm} recipe"
         )
     return operation
+
+
+def validate_processing_operation(value: object) -> ProcessingOperation:
+    """Return a supported operation whose object and wire forms agree.
+
+    Processing recipes are a closed vocabulary.  Checking only the base class
+    admits ``ProcessingOperation()`` and third-party subclasses that can render
+    one algorithm while claiming another in their serialized discriminator.
+    Exact registered types plus a canonical round trip keep domain objects from
+    writing documents that their own readers reject.
+    """
+
+    if not isinstance(value, ProcessingOperation):
+        raise ProcessingOperationError(
+            "operation must be a supported ProcessingOperation value"
+        )
+    algorithm = getattr(value, "algorithm", None)
+    operation_type = (
+        _OPERATION_TYPES.get(algorithm) if isinstance(algorithm, str) else None
+    )
+    if operation_type is not type(value):
+        raise ProcessingOperationError(
+            "operation must use one canonical supported algorithm type"
+        )
+    canonical = operation_from_dict(value.as_dict())
+    if canonical != value:
+        raise ProcessingOperationError(
+            "operation object does not match its canonical wire recipe"
+        )
+    return value
 
 
 def operations_from_list(
@@ -537,4 +578,5 @@ __all__ = [
     "apply_operations",
     "operation_from_dict",
     "operations_from_list",
+    "validate_processing_operation",
 ]

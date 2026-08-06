@@ -51,6 +51,14 @@ def _preset_without(field: str, **overrides: Any) -> dict[str, Any]:
     }
 
 
+def _operation_without(field: str) -> dict[str, Any]:
+    return {
+        name: value
+        for name, value in GammaOperation(gamma_hundredths=120).as_dict().items()
+        if name != field
+    }
+
+
 def _binary_preset(**overrides: Any) -> dict[str, Any]:
     return _preset(
         preset_id="spine-binary",
@@ -132,6 +140,23 @@ def test_processing_preset_listing_is_versioned_and_conditional(tmp_path) -> Non
     assert cached.status_code == 304
 
 
+def test_oversized_stored_collection_is_a_repository_error_not_request_413(
+    tmp_path,
+) -> None:
+    path = tmp_path / "workspace" / "processing_presets.json"
+    path.parent.mkdir(parents=True)
+    # The filesystem adapter's persisted-document ceiling is 4 MiB. This is
+    # repository state read by a GET, not an oversized request entity.
+    path.write_bytes(b" " * (4 * 1024 * 1024 + 1))
+
+    response = _client(tmp_path).get(COLLECTION_URL)
+
+    assert response.status_code == 500
+    assert response.is_json
+    assert response.get_json()["code"] == "processing_preset_document_too_large"
+    assert response.get_json()["ok"] is False
+
+
 def test_creating_a_processing_preset_returns_its_document_and_revision(
     tmp_path,
 ) -> None:
@@ -148,9 +173,18 @@ def test_creating_a_processing_preset_returns_its_document_and_revision(
     assert body["preset"]["revision"] == response.headers["X-Preset-Revision"]
     assert response.headers["Cache-Control"] == "no-store"
 
-    duplicate = client.put(PRESET_URL, json={"preset": _preset()})
-    assert duplicate.status_code == 409
-    assert duplicate.get_json()["code"] == "processing_preset_exists"
+    replay = client.put(PRESET_URL, json={"preset": _preset()})
+    assert replay.status_code == 200
+    assert replay.headers["X-Preset-Revision"] == response.headers[
+        "X-Preset-Revision"
+    ]
+
+    conflicting = client.put(
+        PRESET_URL,
+        json={"preset": _preset(name="Different cover recipe")},
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.get_json()["code"] == "processing_preset_exists"
 
 
 @pytest.mark.parametrize(
@@ -173,6 +207,10 @@ def test_creating_a_processing_preset_returns_its_document_and_revision(
         ({"preset": _preset(name="   ")}, "invalid_processing_preset"),
         ({"preset": _preset(operations=[])}, "invalid_processing_preset"),
         (
+            {"preset": _preset(operations=[_operation_without("rule")])},
+            "invalid_processing_preset",
+        ),
+        (
             {"preset": _preset(operations=[GammaOperation().as_dict() | {"rule": "x"}])},
             "invalid_processing_preset",
         ),
@@ -187,6 +225,28 @@ def test_processing_preset_mutations_reject_malformed_documents(
 
     assert response.status_code == 400
     assert response.get_json()["code"] == code
+
+
+def test_processing_preset_mutation_rejects_an_unpaired_name_surrogate(
+    tmp_path,
+) -> None:
+    client = _client(tmp_path)
+    document = json.dumps(
+        {"preset": _preset(name="Cover\ud800clean")},
+        ensure_ascii=True,
+    ).encode("ascii")
+
+    response = client.put(
+        PRESET_URL,
+        data=document,
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert response.is_json
+    assert response.get_json()["code"] == "invalid_processing_preset"
+    assert response.get_json()["details"] == {"field": "name"}
+    assert client.get(COLLECTION_URL).get_json()["presets"] == []
 
 
 def test_updating_a_processing_preset_requires_a_strong_revision(tmp_path) -> None:
@@ -225,6 +285,16 @@ def test_updating_a_processing_preset_requires_a_strong_revision(tmp_path) -> No
     assert accepted.get_json()["schema"] == "librarytool.processing-preset/1"
     assert accepted.get_json()["preset"]["name"] == "Cover clean-up v2"
     assert accepted.headers["X-Preset-Revision"] != revision
+
+    replay = client.post(
+        PRESET_URL,
+        json=renamed,
+        headers={"If-Preset-Match": f'"{revision}"'},
+    )
+    assert replay.status_code == 200
+    assert replay.headers["X-Preset-Revision"] == accepted.headers[
+        "X-Preset-Revision"
+    ]
     assert [
         (row["name"], row["revision"])
         for row in client.get(COLLECTION_URL).get_json()["presets"]
@@ -260,8 +330,31 @@ def test_deleting_a_processing_preset_requires_a_strong_revision(tmp_path) -> No
     assert deleted.headers["Cache-Control"] == "no-store"
     assert client.get(COLLECTION_URL).get_json()["presets"] == []
 
+    replay = client.delete(
+        PRESET_URL,
+        headers={"If-Preset-Match": f'"{revision}"'},
+    )
+    assert replay.status_code == 200
 
-def test_a_missing_processing_preset_is_reported_as_not_found(tmp_path) -> None:
+    recreated = client.put(
+        PRESET_URL,
+        json={"preset": _preset(name="Recreated cover")},
+    )
+    assert recreated.status_code == 200
+    protected = client.delete(
+        PRESET_URL,
+        headers={"If-Preset-Match": f'"{revision}"'},
+    )
+    assert protected.status_code == 409
+    assert protected.get_json()["code"] == "processing_preset_stale"
+    assert client.get(COLLECTION_URL).get_json()["presets"][0]["name"] == (
+        "Recreated cover"
+    )
+
+
+def test_updating_a_missing_preset_is_not_found_and_delete_is_idempotent(
+    tmp_path,
+) -> None:
     client = _client(tmp_path)
     _create(client)
     absent_url = f"{COLLECTION_URL}/never-saved"
@@ -274,10 +367,10 @@ def test_a_missing_processing_preset_is_reported_as_not_found(tmp_path) -> None:
     )
     deleted = client.delete(absent_url, headers=match)
 
-    assert updated.status_code == deleted.status_code == 404
+    assert updated.status_code == 404
     assert updated.get_json()["code"] == "processing_preset_not_found"
-    assert deleted.get_json()["code"] == "processing_preset_not_found"
-    assert deleted.get_json()["details"] == {"preset_id": "never-saved"}
+    assert deleted.status_code == 200
+    assert deleted.get_json()["preset_id"] == "never-saved"
     assert [
         row["preset_id"] for row in client.get(COLLECTION_URL).get_json()["presets"]
     ] == [PRESET_ID]

@@ -14,6 +14,7 @@
 
   const PRESET_SCHEMA = "org.whl.processing-preset";
   const PRESET_VERSION = 1;
+  const MAX_PRESET_NAME_LENGTH = 120;
   const CATEGORY_LABELS = Object.freeze([
     Object.freeze({ id: "", label: "No category" }),
     Object.freeze({ id: "cover", label: "Cover" }),
@@ -60,16 +61,36 @@
     // recipe is a bare manual adjustment hands one over on every save.
     const wanted = operations == null ||
       (Array.isArray(operations) && operations.length === 0) ? null : operations;
+    const normalizedName = String(name).trim();
+    let nameLength = 0;
+    let nameIsScalarText = true;
+    for (const character of normalizedName) {
+      const codePoint = character.codePointAt(0);
+      if (codePoint >= 0xD800 && codePoint <= 0xDFFF ||
+          codePoint < 32 || codePoint === 127) {
+        nameIsScalarText = false;
+        break;
+      }
+      nameLength += 1;
+    }
     const recipe = {
       schema: PRESET_SCHEMA,
       version: PRESET_VERSION,
       preset_id: presetId,
-      name: String(name).trim(),
+      name: normalizedName,
       category: CATEGORY_IDS.has(category) ? category : "",
       operations: wanted === null ? [] : normalizeProcessingOperations(wanted),
       adjustment: normalizeManualAdjustment(adjustment),
     };
     if (!recipe.name) throw new TypeError("a preset needs a name");
+    if (!nameIsScalarText) {
+      throw new TypeError("a preset name must contain valid Unicode text");
+    }
+    if (nameLength > MAX_PRESET_NAME_LENGTH) {
+      throw new TypeError(
+        `a preset name must contain at most ${MAX_PRESET_NAME_LENGTH} characters`,
+      );
+    }
     if (!recipe.operations.length && recipe.adjustment === null) {
       throw new TypeError("a preset must carry an adjustment or an operation");
     }
@@ -118,7 +139,10 @@
     const saveRow = element(documentRef, "div", "preset-row");
     const nameInput = element(documentRef, "input", "preset-name");
     nameInput.setAttribute("type", "text");
-    nameInput.setAttribute("maxlength", "120");
+    // HTML maxlength counts UTF-16 code units. A Unicode scalar value may use
+    // two, so leave room for 120 astral characters and enforce the scalar-value
+    // limit in buildPreset above.
+    nameInput.setAttribute("maxlength", String(MAX_PRESET_NAME_LENGTH * 2));
     nameInput.setAttribute("placeholder", "Save current as…");
     nameInput.setAttribute("aria-label", "New preset name");
     const categorySelect = element(documentRef, "select", "preset-category");

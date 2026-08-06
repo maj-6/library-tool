@@ -541,3 +541,131 @@ def test_mask_that_misses_the_output_is_an_input_error() -> None:
             ((0.0, 0.0), (0.2, 0.0), (0.2, 0.2), (0.0, 0.2)),
             mask_polygon=((0.8, 0.8), (0.99, 0.8), (0.99, 0.99)),
         )
+
+
+def test_full_frame_mask_survives_a_homography_horizon_outside_the_quad() -> None:
+    source = _png(Image.new("RGB", (101, 101), (10, 20, 30)))
+    quad = ((0.2, 0.5), (0.8, 0.1), (0.9, 0.9), (0.1, 0.9))
+
+    result = apply_perspective_transform(
+        source,
+        quad,
+        mask_polygon=FULL_FRAME,
+    )
+
+    with Image.open(io.BytesIO(result.output_png)) as display:
+        assert display.mode == "RGBA"
+        assert display.getchannel("A").getextrema() == (255, 255)
+
+
+@pytest.mark.parametrize("reverse_winding", [False, True])
+def test_mask_matching_an_inset_quad_keeps_every_output_pixel_opaque(
+    reverse_winding: bool,
+) -> None:
+    source = _png(Image.new("RGB", (101, 83), (10, 20, 30)))
+    quad = ((0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8))
+    mask = tuple(reversed(quad)) if reverse_winding else quad
+
+    result = apply_perspective_transform(source, quad, mask_polygon=mask)
+
+    assert (result.output_width, result.output_height) == (61, 50)
+    with Image.open(io.BytesIO(result.output_png)) as display:
+        alpha = display.getchannel("A")
+        assert alpha.getextrema() == (255, 255)
+        assert alpha.getbbox() == (0, 0, result.output_width, result.output_height)
+
+
+def test_full_frame_mask_stays_opaque_when_a_corner_sample_crosses_the_horizon() -> None:
+    source = _png(Image.new("RGB", (101, 83), (10, 20, 30)))
+    quad = (
+        (0.05064191215836986, 0.46099802478727103),
+        (0.8922157594810325, 0.23448466796301604),
+        (0.6183788845234273, 0.7816473094228646),
+        (0.2959660086659233, 0.6015545776531998),
+    )
+
+    result = apply_perspective_transform(source, quad, mask_polygon=FULL_FRAME)
+
+    with Image.open(io.BytesIO(result.output_png)) as display:
+        assert display.getchannel("A").getextrema() == (255, 255)
+
+
+def test_full_frame_mask_is_opaque_for_seeded_valid_projective_quads() -> None:
+    source = _png(Image.new("RGB", (101, 83), (10, 20, 30)))
+    rng = random.Random(41821)
+    checked = 0
+    for _index in range(250):
+        top_y = rng.uniform(0.0, 0.55)
+        bottom_y = rng.uniform(max(top_y + 0.05, 0.4), 1.0)
+        top_left = (rng.uniform(0.0, 0.45), top_y)
+        top_right = (
+            rng.uniform(max(top_left[0] + 0.05, 0.5), 1.0),
+            rng.uniform(0.0, 0.55),
+        )
+        bottom_right = (rng.uniform(0.5, 1.0), bottom_y)
+        bottom_left = (
+            rng.uniform(0.0, min(bottom_right[0] - 0.05, 0.45)),
+            rng.uniform(max(top_y + 0.05, 0.4), 1.0),
+        )
+        quad = (top_left, top_right, bottom_right, bottom_left)
+        try:
+            validate_normalized_quad(quad)
+        except RasterInputError:
+            continue
+
+        result = apply_perspective_transform(
+            source,
+            quad,
+            mask_polygon=FULL_FRAME,
+        )
+        with Image.open(io.BytesIO(result.output_png)) as display:
+            assert display.getchannel("A").getextrema() == (255, 255)
+        checked += 1
+
+    assert checked >= 100
+
+
+def test_mask_coordinates_follow_the_exif_oriented_source() -> None:
+    image = Image.new("RGB", (40, 20), (10, 20, 30))
+    exif = Image.Exif()
+    exif[274] = 6
+    encoded = io.BytesIO()
+    image.save(encoded, format="PNG", exif=exif)
+    left_half = ((0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0))
+
+    result = apply_perspective_transform(
+        encoded.getvalue(),
+        FULL_FRAME,
+        mask_polygon=left_half,
+    )
+
+    assert (result.source_width, result.source_height) == (20, 40)
+    with Image.open(io.BytesIO(result.output_png)) as display:
+        alpha = display.getchannel("A")
+        assert alpha.getpixel((0, 0)) == 255
+        assert alpha.getpixel((result.output_width - 1, 0)) == 0
+        assert alpha.getpixel((0, result.output_height - 1)) == 255
+        assert alpha.getpixel(
+            (result.output_width - 1, result.output_height - 1)
+        ) == 0
+
+
+def test_mask_edge_is_sampled_in_source_space_for_projective_crop() -> None:
+    source = _png(Image.new("RGB", (101, 101), (10, 20, 30)))
+    quad = ((0.2, 0.5), (0.8, 0.1), (0.9, 0.9), (0.1, 0.9))
+    left_half = ((0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0))
+
+    result = apply_perspective_transform(
+        source,
+        quad,
+        mask_polygon=left_half,
+    )
+
+    with Image.open(io.BytesIO(result.output_png)) as display:
+        alpha = display.getchannel("A")
+        assert alpha.getpixel((0, 0)) == 255
+        assert alpha.getpixel((result.output_width - 1, 0)) == 0
+        assert alpha.getpixel((0, result.output_height - 1)) == 255
+        assert alpha.getpixel(
+            (result.output_width - 1, result.output_height - 1)
+        ) == 0

@@ -58,6 +58,7 @@ from librarytool.engine.spatial_annotations import (
     SpatialRoleAssignment,
     SpatialSourceRef,
 )
+from librarytool.processing.operations import ProcessingOperation
 from librarytool.processing.raster import ManualBinaryAdjustRecipe
 
 
@@ -161,6 +162,14 @@ def _command(source: CorrectionSourceSnapshot | None = None, **changes) -> Corre
     }
     values.update(changes)
     return CorrectionTransformCommand(**values)
+
+
+def test_transform_command_rejects_the_noncanonical_operation_base() -> None:
+    with pytest.raises(ValidationError) as raised:
+        _command(operations=(ProcessingOperation(),))
+
+    assert raised.value.code == "invalid_correction_operations"
+    assert raised.value.details == {"field": "operations"}
 
 
 class MemoryStore:

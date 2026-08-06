@@ -261,6 +261,12 @@ function transformJob(command, overrides = {}) {
         quad: command.quad.map((point) => [...point]),
         adjustment: { ...command.adjustment },
         rerun_ocr: command.rerun_ocr,
+        ...(Object.hasOwn(command, "mask_polygon") ? {
+          mask_polygon: command.mask_polygon.map((point) => [...point]),
+        } : {}),
+        ...(Object.hasOwn(command, "operations") ? {
+          operations: command.operations.map((operation) => ({ ...operation })),
+        } : {}),
       },
     },
     outputs: [],
@@ -958,6 +964,47 @@ test("transform commands bridge the image editor to EngineClient", async () => {
   await assert.rejects(
     ports.invokeCommand("corrections.transform.unknown", { command }),
     (error) => error.code === "capability-unavailable",
+  );
+});
+
+
+test("transform job validation mirrors optional mask and operation fields", () => {
+  const operation = {
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "gamma-v1",
+    rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+    gamma_hundredths: 120,
+  };
+  const command = transformCommand({
+    mask_polygon: [[0.1, 0.1], [0.9, 0.1], [0.8, 0.9]],
+    operations: [operation],
+  });
+  const job = transformJob(command);
+
+  const accepted = correctionTransformJob(job, command, job.id);
+
+  assert.deepEqual(
+    accepted.input_revisions.transform.mask_polygon,
+    command.mask_polygon,
+  );
+  assert.deepEqual(
+    accepted.input_revisions.transform.operations,
+    command.operations,
+  );
+
+  const unknown = transformJob(command);
+  unknown.input_revisions.transform.future_recipe = true;
+  assert.throws(
+    () => correctionTransformJob(unknown, command, unknown.id),
+    (error) => error.code === "invalid-transform-job-result",
+  );
+
+  const mismatched = transformJob(command);
+  mismatched.input_revisions.transform.operations[0].gamma_hundredths = 121;
+  assert.throws(
+    () => correctionTransformJob(mismatched, command, mismatched.id),
+    (error) => error.code === "invalid-transform-job-result",
   );
 });
 

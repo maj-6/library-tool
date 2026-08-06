@@ -754,42 +754,88 @@ class PerspectiveTransformResult:
 
 def _mask_alpha(
     polygon: NormalizedPolygon,
-    homography: Matrix3,
-    width: int,
-    height: int,
+    output_pixel_to_source_pixel: Matrix3,
+    source_width: int,
+    source_height: int,
+    output_width: int,
+    output_height: int,
 ) -> Image.Image:
-    """Rasterize a normalized source polygon into an output-space alpha band.
+    """Rasterize a normalized source polygon and rectify its alpha band.
 
-    The polygon travels through the same homography as the quad, so a mask
-    drawn over the source lands exactly where the reviewer drew it on the
-    rectified output.  Filling is hard-edged on purpose: an antialiased edge
-    would make the published bytes depend on Pillow's rasterizer version, and
-    these bytes are content-addressed.
+    A mask may validly extend beyond the selected quad.  Forward-projecting
+    that polygon is not generally possible because it can cross the projective
+    horizon even though every output pixel maps to an ordinary point inside the
+    quad.  Rasterizing in source space and applying the same inverse mapping as
+    the image avoids that singularity and naturally clips the mask to the
+    corrected output.
+
+    Filling and sampling are hard-edged on purpose: antialiasing would make the
+    published bytes depend on Pillow's rasterizer version, and these bytes are
+    content-addressed.
     """
 
     from PIL import ImageDraw
 
-    pixels: list[tuple[float, float]] = []
-    for x, y in polygon:
-        denominator = homography[2][0] * x + homography[2][1] * y + homography[2][2]
-        if not math.isfinite(denominator) or abs(denominator) <= _GEOMETRY_EPSILON:
-            raise RasterInputError(
-                "mask polygon crosses the perspective horizon of this quad"
-            )
-        mapped_x = (
-            homography[0][0] * x + homography[0][1] * y + homography[0][2]
-        ) / denominator
-        mapped_y = (
-            homography[1][0] * x + homography[1][1] * y + homography[1][2]
-        ) / denominator
-        if not math.isfinite(mapped_x) or not math.isfinite(mapped_y):
-            raise RasterInputError(
-                "mask polygon maps to a non-finite output coordinate"
-            )
-        pixels.append((mapped_x * (width - 1), mapped_y * (height - 1)))
-
-    mask = Image.new("L", (width, height), 0)
-    ImageDraw.Draw(mask).polygon(pixels, fill=255, outline=255)
+    # One replicated edge pixel protects the closed normalized source bounds
+    # from tiny floating-point excursions at output corners.  The canonical
+    # homography can otherwise map a corner to, for example, width - 1 + 1e-13
+    # and make Pillow use the transparent fill outside the source mask.
+    padded_width = source_width + 2
+    padded_height = source_height + 2
+    source_pixels = [
+        (x * (source_width - 1) + 1.0, y * (source_height - 1) + 1.0)
+        for x, y in polygon
+    ]
+    source_mask = Image.new("L", (padded_width, padded_height), 0)
+    ImageDraw.Draw(source_mask).polygon(source_pixels, fill=255, outline=255)
+    source_mask.paste(source_mask.crop((1, 1, source_width + 1, 2)), (1, 0))
+    source_mask.paste(
+        source_mask.crop(
+            (1, source_height, source_width + 1, source_height + 1)
+        ),
+        (1, source_height + 1),
+    )
+    source_mask.paste(source_mask.crop((1, 0, 2, padded_height)), (0, 0))
+    source_mask.paste(
+        source_mask.crop(
+            (source_width, 0, source_width + 1, padded_height)
+        ),
+        (source_width + 1, 0),
+    )
+    # A polygon that covers every decoded source pixel is the identity alpha
+    # mask.  Return it directly instead of sending it through Pillow's
+    # perspective sampler.  Pillow evaluates near pixel centres, so for a
+    # strongly projective but valid quad an edge sample can cross the
+    # homography horizon even though the corresponding integer output corner
+    # maps inside the source.  No finite padding can cover that excursion.
+    if source_mask.getextrema() == (255, 255):
+        return Image.new("L", (output_width, output_height), 255)
+    source_translation: Matrix3 = (
+        (1.0, 0.0, 1.0),
+        (0.0, 1.0, 1.0),
+        (0.0, 0.0, 1.0),
+    )
+    output_pixel_to_mask_pixel = _matrix_multiply(
+        source_translation,
+        output_pixel_to_source_pixel,
+    )
+    inverse_coefficients = (
+        output_pixel_to_mask_pixel[0][0],
+        output_pixel_to_mask_pixel[0][1],
+        output_pixel_to_mask_pixel[0][2],
+        output_pixel_to_mask_pixel[1][0],
+        output_pixel_to_mask_pixel[1][1],
+        output_pixel_to_mask_pixel[1][2],
+        output_pixel_to_mask_pixel[2][0],
+        output_pixel_to_mask_pixel[2][1],
+    )
+    mask = source_mask.transform(
+        (output_width, output_height),
+        Image.Transform.PERSPECTIVE,
+        inverse_coefficients,
+        resample=Image.Resampling.NEAREST,
+        fillcolor=0,
+    )
     if not mask.getbbox():
         raise RasterInputError(
             "mask polygon does not cover any pixel of the corrected output"
@@ -1162,12 +1208,27 @@ def apply_perspective_transform(
     if validated_polygon is None:
         output_png = _encode_png(transformed)
     else:
-        alpha = _mask_alpha(
-            validated_polygon,
-            normalized_forward,
-            output_width,
-            output_height,
-        )
+        if len(validated_polygon) == 4 and frozenset(
+            validated_polygon
+        ) == frozenset(validated_quad):
+            # The selected quad is, by definition, the complete rectified
+            # output. Rasterizing its boundary in source space is not an
+            # identity operation: ImageDraw quantizes polygon edges while
+            # Pillow's inverse transform samples nearest pixel centres, which
+            # can drop the final row or column for a fractional endpoint.
+            # Preserve the semantic identity directly, regardless of the mask
+            # ring's starting vertex or winding, without expanding a genuinely
+            # partial mask.
+            alpha = Image.new("L", (output_width, output_height), 255)
+        else:
+            alpha = _mask_alpha(
+                validated_polygon,
+                output_pixel_to_source_pixel,
+                source_width,
+                source_height,
+                output_width,
+                output_height,
+            )
         # The adjustment leaves an "L" image; masking has to widen it rather
         # than drop the adjustment's work.
         masked = transformed.convert("RGBA")

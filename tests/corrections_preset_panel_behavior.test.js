@@ -197,6 +197,7 @@ test("an empty workspace shows a disabled chooser reading no saved presets", asy
   assert.equal(harness.deleteButton.disabled, true);
   assert.equal(harness.batchButton.textContent, "All · —");
   assert.equal(harness.undoButton.hidden, true);
+  assert.equal(harness.nameInput.getAttribute("maxlength"), "240");
   assert.deepEqual(harness.panel.getPresets(), []);
 });
 
@@ -306,6 +307,29 @@ test("buildPreset rejects a blank name", () => {
       adjustment: adjustment(),
       operations: null,
     }), /a preset needs a name/, JSON.stringify(name));
+  }
+});
+
+
+test("preset names are bounded by Unicode scalar values", () => {
+  const longestName = "\u{1F33F}".repeat(120);
+  const longest = buildPreset({
+    presetId: "herbs",
+    name: longestName,
+    category: "cover",
+    adjustment: adjustment(),
+    operations: null,
+  });
+
+  assert.equal(longest.name, longestName);
+  for (const name of ["\u{1F33F}".repeat(121), "Cover\ud800clean"]) {
+    assert.throws(() => buildPreset({
+      presetId: "herbs",
+      name,
+      category: "cover",
+      adjustment: adjustment(),
+      operations: null,
+    }), /preset name/, JSON.stringify(name));
   }
 });
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
+import librarytool.adapters.filesystem.processing_preset_store as preset_store_module
 from librarytool.adapters.filesystem import FilesystemProcessingPresetStore
 from librarytool.adapters.filesystem.processing_preset_store import (
     PROCESSING_PRESET_RELATIVE,
@@ -27,7 +29,11 @@ from librarytool.engine.processing_presets import (
     ProcessingPresetStorePort,
 )
 from librarytool.engine.raster_artifacts import IMAGE_CATEGORIES
-from librarytool.processing.operations import GammaOperation
+from librarytool.processing.operations import (
+    MAX_OPERATIONS_PER_RECIPE,
+    GammaOperation,
+    ProcessingOperation,
+)
 from librarytool.processing.raster import ManualBinaryAdjustRecipe
 
 
@@ -112,6 +118,9 @@ def test_a_processing_preset_trims_the_space_around_its_display_name() -> None:
     assert padded == _preset()
     longest = "x" * MAX_PRESET_NAME_LENGTH
     assert _preset(name=longest).name == longest
+    longest_astral = "\U0001f33f" * MAX_PRESET_NAME_LENGTH
+    assert _preset(name=longest_astral).name == longest_astral
+    assert len(_preset(name=longest_astral).revision) == 64
 
 
 @pytest.mark.parametrize(
@@ -126,6 +135,12 @@ def test_a_processing_preset_trims_the_space_around_its_display_name() -> None:
         pytest.param(
             {"name": "x" * (MAX_PRESET_NAME_LENGTH + 1)}, "name", id="name-too-long"
         ),
+        pytest.param(
+            {"name": "\U0001f33f" * (MAX_PRESET_NAME_LENGTH + 1)},
+            "name",
+            id="astral-name-too-long",
+        ),
+        pytest.param({"name": "Cover\ud800clean"}, "name", id="name-surrogate"),
         pytest.param({"name": 12}, "name", id="name-not-a-string"),
         pytest.param({"name": "Cover\nclean"}, "name", id="name-newline"),
         pytest.param({"name": "Cover\x7fclean"}, "name", id="name-delete-character"),
@@ -136,6 +151,20 @@ def test_a_processing_preset_trims_the_space_around_its_display_name() -> None:
             {"operations": ({"algorithm": "gamma-v1"},)},
             "operations",
             id="operation-is-a-mapping",
+        ),
+        pytest.param(
+            {"operations": (ProcessingOperation(),)},
+            "operations",
+            id="abstract-base-operation",
+        ),
+        pytest.param(
+            {
+                "operations": tuple(
+                    _operation() for _index in range(MAX_OPERATIONS_PER_RECIPE + 1)
+                )
+            },
+            "operations",
+            id="too-many-operations",
         ),
         pytest.param(
             {"operations": (), "adjustment": {"contrast_percent": 80}},
@@ -360,9 +389,77 @@ def test_the_store_creates_lists_updates_and_deletes_presets(tmp_path) -> None:
     assert store.list_presets() == (renamed,)
 
 
+def test_a_reader_waits_for_an_atomic_write_before_opening_the_document(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = _store(tmp_path)
+    created = store.create_preset(_preset())
+    desired = _preset(name="Cover scrub")
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    reader_at_lock = threading.Event()
+    reader_finished = threading.Event()
+    errors: list[BaseException] = []
+    results: list[tuple[ProcessingPreset, ...]] = []
+    original_write = store._write_bytes
+    original_lock = preset_store_module.lock_stream
+
+    def slow_write(payload: bytes) -> None:
+        writer_entered.set()
+        if not release_writer.wait(timeout=5):
+            raise TimeoutError("test reader did not release the preset writer")
+        original_write(payload)
+
+    def observed_lock(stream, *, blocking: bool, path=None) -> None:
+        if threading.current_thread().name == "preset-reader":
+            assert blocking is True
+            reader_at_lock.set()
+        original_lock(stream, blocking=blocking, path=path)
+
+    def update() -> None:
+        try:
+            store.update_preset(desired, created.revision)
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    def read() -> None:
+        try:
+            results.append(store.list_presets())
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+        finally:
+            reader_finished.set()
+
+    monkeypatch.setattr(store, "_write_bytes", slow_write)
+    monkeypatch.setattr(preset_store_module, "lock_stream", observed_lock)
+    writer = threading.Thread(target=update, name="preset-writer")
+    reader = threading.Thread(target=read, name="preset-reader")
+    try:
+        writer.start()
+        assert writer_entered.wait(timeout=5)
+        reader.start()
+        assert reader_at_lock.wait(timeout=5)
+        assert not reader_finished.is_set()
+    finally:
+        release_writer.set()
+        writer.join(timeout=5)
+        reader.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reader.is_alive()
+    assert errors == []
+    assert results == [(desired,)]
+
+
 def test_creating_a_duplicate_preset_identifier_conflicts(tmp_path) -> None:
     store = _store(tmp_path)
-    store.create_preset(_preset())
+    created = store.create_preset(_preset())
+
+    replay = store.create_preset(_preset())
+
+    assert replay == created
+    assert replay.revision == created.revision
 
     with pytest.raises(ConflictError) as raised:
         store.create_preset(_preset(name="Cover scrub"))
@@ -389,21 +486,45 @@ def test_a_stale_revision_conflicts_instead_of_overwriting(tmp_path, mutation) -
     assert store.list_presets() == (current,)
 
 
-@pytest.mark.parametrize("mutation", ["update", "delete"])
-def test_mutating_an_unknown_preset_is_not_found(tmp_path, mutation) -> None:
+def test_replaying_an_update_that_is_already_current_succeeds(tmp_path) -> None:
+    store = _store(tmp_path)
+    created = store.create_preset(_preset())
+    desired = _preset(name="Cover scrub")
+    current = store.update_preset(desired, created.revision)
+
+    replay = store.update_preset(desired, created.revision)
+
+    assert replay == current
+    assert store.list_presets() == (current,)
+
+
+def test_updating_an_unknown_preset_is_not_found(tmp_path) -> None:
     store = _store(tmp_path)
     known = store.create_preset(_preset())
     absent = _preset(preset_id="spine-scrub", category="spine")
 
     with pytest.raises(NotFoundError) as raised:
-        if mutation == "update":
-            store.update_preset(absent, known.revision)
-        else:
-            store.delete_preset(absent.preset_id, known.revision)
+        store.update_preset(absent, known.revision)
 
     assert raised.value.code == "processing_preset_not_found"
     assert raised.value.details == {"preset_id": "spine-scrub"}
     assert store.list_presets() == (known,)
+
+
+def test_delete_replays_succeed_but_a_recreated_preset_keeps_its_cas(tmp_path) -> None:
+    store = _store(tmp_path)
+    created = store.create_preset(_preset())
+
+    store.delete_preset(created.preset_id, created.revision)
+    store.delete_preset(created.preset_id, created.revision)
+    assert store.list_presets() == ()
+
+    recreated = store.create_preset(_preset(name="Recreated cover"))
+    with pytest.raises(ConflictError) as raised:
+        store.delete_preset(created.preset_id, created.revision)
+
+    assert raised.value.code == "processing_preset_stale"
+    assert store.list_presets() == (recreated,)
 
 
 def test_the_store_refuses_more_than_the_workspace_preset_limit(tmp_path) -> None:
@@ -517,6 +638,11 @@ def test_stored_presets_survive_a_reopen(tmp_path) -> None:
             _stored(presets=[{**_preset().as_dict(), "category": "endpaper"}]),
             "invalid_processing_preset_storage",
             id="invalid-stored-preset",
+        ),
+        pytest.param(
+            _stored(presets=[{**_preset().as_dict(), "name": "Cover\ud800clean"}]),
+            "invalid_processing_preset_storage",
+            id="surrogate-in-stored-name",
         ),
         pytest.param(
             '{"schema": "librarytool.processing-presets", "version": 1,'

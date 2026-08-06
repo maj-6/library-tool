@@ -30,6 +30,7 @@ from librarytool.processing.operations import (
     ProcessingOperation,
     ProcessingOperationError,
     operations_from_list,
+    validate_processing_operation,
 )
 from librarytool.processing.raster import (
     ManualBinaryAdjustRecipe,
@@ -271,12 +272,6 @@ class CorrectionTransformCommand:
                 field_name="adjustment",
             )
         operations = tuple(self.operations)
-        if any(not isinstance(value, ProcessingOperation) for value in operations):
-            raise _validation(
-                "operations must contain ProcessingOperation values",
-                code="invalid_correction_operations",
-                field_name="operations",
-            )
         if len(operations) > MAX_OPERATIONS_PER_RECIPE:
             raise _validation(
                 "operations must contain at most "
@@ -284,6 +279,15 @@ class CorrectionTransformCommand:
                 code="invalid_correction_operations",
                 field_name="operations",
             )
+        try:
+            for value in operations:
+                validate_processing_operation(value)
+        except ProcessingOperationError as exc:
+            raise _validation(
+                str(exc),
+                code="invalid_correction_operations",
+                field_name="operations",
+            ) from exc
         object.__setattr__(self, "operations", operations)
         if not isinstance(self.rerun_ocr, bool):
             raise _validation(

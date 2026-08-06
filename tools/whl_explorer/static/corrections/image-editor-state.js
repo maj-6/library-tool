@@ -512,6 +512,12 @@
       maskPolygon: null,
       maskDraft: null,
       maskFreehand: false,
+      // Processing operations are editor-domain state rather than tool-local
+      // state: a preset may carry operations without a manual adjustment, and
+      // the exact recipe must survive until the transform is serialized.
+      operations: options.operations == null ||
+          Array.isArray(options.operations) && options.operations.length === 0
+        ? [] : normalizeProcessingOperations(options.operations),
     };
   }
 
@@ -619,7 +625,13 @@
       case "SET_TOOL": {
         if (!TOOL_IDS.has(action.tool)) throw new TypeError("unknown image editor tool");
         const settled = state.gesture ? cancelGesture(state) : state;
-        return { ...settled, tool: action.tool };
+        return {
+          ...settled,
+          tool: action.tool,
+          maskDraft: action.tool === TOOLS.POLYGON ? settled.maskDraft : null,
+          maskFreehand: action.tool === TOOLS.POLYGON
+            ? settled.maskFreehand : false,
+        };
       }
       case "SELECT_CORNER": {
         if (action.cornerIndex !== null &&
@@ -760,6 +772,16 @@
           ...cleared,
           undoStack: trimHistory(state.undoStack.concat([historyEntry(state)])),
           redoStack: [],
+          submission: resetSubmissionAfterEdit(state),
+        };
+      }
+      case "SET_PROCESSING_OPERATIONS": {
+        const operations = action.operations == null ||
+            Array.isArray(action.operations) && action.operations.length === 0
+          ? [] : normalizeProcessingOperations(action.operations);
+        return {
+          ...state,
+          operations,
           submission: resetSubmissionAfterEdit(state),
         };
       }

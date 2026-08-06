@@ -1551,6 +1551,12 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
     jobs: {
       get() {},
     },
+    processingPresets: {
+      list() {},
+      create() {},
+      update() {},
+      remove() {},
+    },
   };
   const standalone = correctionsRuntimePorts({ engineClient }, null);
   assert.equal(typeof standalone.artifacts.catalog.list, "function");
@@ -1562,6 +1568,7 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
   assert.equal(typeof standalone.books.reopenReview, "function");
   assert.equal(typeof standalone.books.subscribe, "function");
   assert.equal(typeof standalone.transforms.subscribeResults, "function");
+  assert.equal(typeof standalone.processingPresets.list, "function");
   assert.equal(standalone.books.trustedActor, true);
 
   const desktopCorrections = { artifacts: { catalog: { list() {} } } };
@@ -1571,6 +1578,796 @@ test("standalone runtime uses engine artifact ports while desktop remains prefer
     "the authenticated desktop bridge remains authoritative when present",
   );
   assert.equal(correctionsRuntimePorts({}, null), null);
+});
+
+
+test("standalone shell mounts presets from the production EngineClient port", async () => {
+  const operation = {
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "gamma-v1",
+    rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+    gamma_hundredths: 120,
+  };
+  const preset = {
+    schema: "org.whl.processing-preset",
+    version: 1,
+    preset_id: "gamma-only",
+    name: "Gamma only",
+    category: "cover",
+    operations: [operation],
+    adjustment: null,
+    revision: "a".repeat(64),
+  };
+  const calls = [];
+  const response = (status, body) => ({
+    status,
+    ok: status >= 200 && status < 300,
+    json: async () => body,
+  });
+  const engineClient = new EngineClient({
+    baseUrl: "/api",
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      if (init.method === "GET" && url === "/api/v1/processing-presets") {
+        return response(200, {
+          ok: true,
+          schema: "librarytool.processing-presets/1",
+          presets: [preset],
+          revision: "preset-list-r1",
+        });
+      }
+      throw new Error(`unexpected transport: ${init.method} ${url}`);
+    },
+  });
+  const documentRef = fakeDocument();
+  const windowRef = {
+    engineClient,
+    localStorage: new MemoryStorage(),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  documentRef.defaultView = windowRef;
+  documentRef.querySelector = () => null;
+  const rootElement = new FakeNode("div", documentRef);
+  const shell = new CorrectionsShell({
+    root: rootElement,
+    documentRef,
+    windowRef,
+    layoutController: {
+      getState: () => ({ ...DEFAULT_LAYOUT }),
+      replaceState() {},
+      destroy() {},
+    },
+    features: false,
+    booksFeature: false,
+    artifactsFeature: false,
+    itemProperties: false,
+    ocrProposalsFeature: false,
+    chPanelFeature: false,
+  });
+  const container = new FakeNode("div", documentRef);
+  shell.editorRegistry.setResource({
+    id: "capture-7",
+    kind: "captured-image",
+    media_type: "image/jpeg",
+    url: "/api/v1/items/book-1/raster-artifacts/capture-7/resource",
+    correction: {
+      item_id: "book-1",
+      artifact_id: "capture-7",
+      artifact_revision: "artifact-r3",
+      source_revision: "source-r17",
+      source_sha256: "b".repeat(64),
+      proposal: null,
+    },
+  });
+  shell.editorRegistry.render(container);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const panel = container.querySelector(".preset-panel");
+  assert.ok(panel, "the shell-created image tool mounts the preset panel");
+  assert.equal(calls[0].url, "/api/v1/processing-presets");
+  const chooser = panel.querySelector(".preset-chooser");
+  chooser.value = "gamma-only";
+  chooser.emit("change");
+  panel.querySelector(".preset-apply").emit("click");
+
+  const controller = shell.imageAdjustTool.mountRecord.controller;
+  assert.equal(controller.getState().tool, "image-adjust",
+    "Apply activates the tool whose recipe will be queued");
+  assert.deepEqual(controller.getState().operations, [operation]);
+  assert.equal(shell.imageAdjustTool.getAdjustment({
+    state: controller.getState(),
+  }), null, "an operations-only preset stays operations-only");
+  shell.destroy();
+});
+
+
+test("mask drafts own classification keys and editor replacement releases them", () => {
+  const documentRef = fakeDocument();
+  const windowRef = {
+    localStorage: new MemoryStorage(),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  documentRef.defaultView = windowRef;
+  const rootElement = new FakeNode("div", documentRef);
+  const owners = [];
+  const shell = new CorrectionsShell({
+    root: rootElement,
+    documentRef,
+    windowRef,
+    classificationController: {
+      setCanvasOwner(owner) { owners.push(owner); },
+      destroy() {},
+    },
+    layoutController: {
+      getState: () => ({ ...DEFAULT_LAYOUT }),
+      replaceState() {},
+      destroy() {},
+    },
+    features: false,
+    booksFeature: false,
+    artifactsFeature: false,
+    itemProperties: false,
+    ocrProposalsFeature: false,
+    chPanelFeature: false,
+  });
+  const container = new FakeNode("div", documentRef);
+  shell.editorRegistry.setResource({
+    id: "capture-mask",
+    kind: "captured-image",
+    media_type: "image/jpeg",
+    url: "/capture-mask.jpg",
+    correction: {
+      item_id: "book-1",
+      artifact_id: "capture-mask",
+      artifact_revision: "artifact-r1",
+      source_revision: "source-r1",
+      source_sha256: "a".repeat(64),
+      proposal: null,
+    },
+  });
+  shell.editorRegistry.render(container);
+  const canvas = container.querySelector("[data-classification-canvas]");
+  canvas.getBoundingClientRect = () => ({
+    left: 0, top: 0, width: 400, height: 400,
+  });
+  canvas.setPointerCapture = () => {};
+  container.querySelector("[data-image-tool='polygon']").emit("click");
+  canvas.emit("pointerdown", {
+    pointerId: 7,
+    button: 0,
+    clientX: 40,
+    clientY: 40,
+  });
+
+  assert.deepEqual(owners.at(-1), {
+    active: true,
+    tool: "polygon",
+    ownsKeyboard: true,
+  });
+
+  shell.editorRegistry.setResource({
+    id: "metadata-note",
+    kind: "unknown",
+    media_type: "application/octet-stream",
+  });
+  shell.editorRegistry.render(container);
+  assert.equal(owners.at(-1), null,
+    "disposing the drafted image editor clears canvas ownership");
+  shell.destroy();
+});
+
+
+test("batch presets hydrate every category target before building unique commands", async () => {
+  const operation = {
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "gamma-v1",
+    rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+    gamma_hundredths: 120,
+  };
+  const preset = {
+    preset_id: "cover-gamma",
+    category: "cover",
+    operations: [operation],
+    adjustment: null,
+    revision: "a".repeat(64),
+  };
+  const captures = [
+    { artifact_id: "cover-1", effective_category: "cover" },
+  ];
+  const index = {
+    revision: "index-r2",
+    books: [{ id: "book-1", captures }],
+  };
+  const pages = new Map([
+    [null, {
+      revision: "source-inventory-r3",
+      items: [
+        { key: { artifact_id: "cover-1" } },
+        { key: { artifact_id: "pdf-scan-2" }, kind: "scan-page" },
+      ],
+      nextCursor: "source-page-2",
+    }],
+    ["source-page-2", {
+      revision: "source-inventory-r3",
+      items: [
+        { key: { artifact_id: "pdf-scan-2" }, kind: "scan-page" },
+        { key: { artifact_id: "summary-spine-detail-cover" } },
+        { key: { artifact_id: "summary-cover-detail-spine" } },
+      ],
+      nextCursor: null,
+    }],
+  ]);
+  const hydrated = [];
+  const listed = [];
+  const invoked = [];
+  let refreshes = 0;
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    booksFeature: {
+      store: {
+        snapshot: () => ({
+          status: "ready",
+          workspaceId: "workspace-1",
+          index,
+        }),
+      },
+      async refresh(reason) {
+        assert.equal(reason, "preset-batch");
+        refreshes += 1;
+        return index;
+      },
+    },
+    engineCorrections: {
+      artifacts: {
+        catalog: {
+          async list(args) {
+            listed.push(args);
+            return pages.get(args.cursor);
+          },
+          async get({ context: targetContext, key }) {
+            const artifactId = key.slice("artifact:".length);
+            hydrated.push({ artifactId, targetContext });
+            const sequence = {
+              "cover-1": 1,
+              "pdf-scan-2": 2,
+              "summary-spine-detail-cover": 3,
+              "summary-cover-detail-spine": 4,
+            }[artifactId];
+            const sourceRevision = `source-r${sequence}`;
+            return {
+              id: artifactId,
+              resource_state: "available",
+              effective_category: artifactId === "summary-cover-detail-spine"
+                ? "spine" : "cover",
+              correction: {
+                item_id: "book-1",
+                artifact_id: artifactId,
+                artifact_revision: `artifact-r${sequence}`,
+                source_revision: sourceRevision,
+                source_sha256: String(sequence).repeat(64),
+                proposal: {
+                  schema: "org.whl.page-boundary-proposal",
+                  version: 1,
+                  coordinate_space: "exif_oriented_normalized",
+                  point_order: ["top_left", "top_right", "bottom_right", "bottom_left"],
+                  quad: [[0.1 * sequence, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]],
+                  confidence: 0.9,
+                  detector: "batch-test",
+                  detector_version: "1",
+                  source_revision: sourceRevision,
+                },
+              },
+            };
+          },
+        },
+      },
+    },
+    async invokeCommand(commandId, payload) {
+      invoked.push({ commandId, payload });
+      return { job_id: `job-${invoked.length}` };
+    },
+    presetBatchOperationIdFactory: ({ sequence }) => `preset:batch-${sequence}`,
+    presetBatchSequence: 0,
+    presetBatchRetryCommands: new Map(),
+    presetBatchRuns: new Map(),
+    contextGeneration: 7,
+    destroyed: false,
+    state: {
+      context: context({
+        canvas_id: "page-9",
+        artifact_id: "cover-1",
+      }),
+      selection: { itemId: "book-1" },
+    },
+    windowRef: null,
+  });
+
+  const outcome = await shell.batchApplyProcessingPreset(preset, {
+    resource: {
+      correction: {
+        item_id: "book-1",
+        artifact_id: "cover-1",
+        artifact_revision: "artifact-editor-r1",
+        source_revision: "source-editor-r1",
+        source_sha256: "e".repeat(64),
+      },
+    },
+  });
+
+  assert.deepEqual(outcome, { queued: 3, failed: 0 });
+  assert.equal(refreshes, 1);
+  assert.deepEqual(listed.map((entry) => entry.cursor), [null, "source-page-2"]);
+  assert.ok(listed.every((entry) =>
+    entry.group === "source-images" && entry.limit === 100 &&
+    entry.context.item_id === "book-1" &&
+    !Object.hasOwn(entry.context, "representation_id") &&
+    !Object.hasOwn(entry.context, "canvas_id") &&
+    !Object.hasOwn(entry.context, "artifact_id")),
+  "the catalog is paged with a book-scoped invocation context");
+  assert.deepEqual(hydrated.map((entry) => entry.artifactId), [
+    "cover-1",
+    "pdf-scan-2",
+    "summary-spine-detail-cover",
+    "summary-cover-detail-spine",
+  ]);
+  assert.ok(hydrated.every((entry) => entry.targetContext.item_id === "book-1"));
+  assert.deepEqual(invoked.map((entry) => entry.commandId), [
+    "corrections.transform.queue",
+    "corrections.transform.queue",
+    "corrections.transform.queue",
+  ]);
+  assert.deepEqual(invoked.map((entry) => entry.payload.command.operation_id), [
+    "preset:batch-1", "preset:batch-2", "preset:batch-3",
+  ]);
+  assert.deepEqual(invoked.map((entry) => entry.payload.command.artifact_id), [
+    "cover-1", "pdf-scan-2", "summary-spine-detail-cover",
+  ]);
+  assert.deepEqual(invoked.map((entry) => entry.payload.command.artifact_revision), [
+    "artifact-r1", "artifact-r2", "artifact-r3",
+  ]);
+  assert.deepEqual(invoked[0].payload.command.quad,
+    [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]);
+  assert.deepEqual(invoked[1].payload.command.quad,
+    [[0.2, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]);
+  assert.equal(invoked[1].payload.resource.id, "pdf-scan-2",
+    "a source PDF scan absent from phone capture hints is included");
+  assert.ok(invoked.every((entry) =>
+    entry.payload.trigger === "preset-batch" &&
+    entry.payload.command.adjustment === null));
+});
+
+
+function singleTargetBatchHarness(options = {}) {
+  const artifactId = options.artifactId || "cover-1";
+  const index = {
+    revision: "index-r1",
+    books: [{ id: "book-1", captures: [] }],
+  };
+  let snapshot = {
+    status: "ready",
+    workspaceId: "workspace-1",
+    index,
+  };
+  const calls = { refresh: [], list: [], get: [], invoke: [] };
+  const shell = Object.create(CorrectionsShell.prototype);
+  const resource = (revision = "1") => ({
+    id: artifactId,
+    resource_state: "available",
+    effective_category: "cover",
+    correction: {
+      item_id: "book-1",
+      artifact_id: artifactId,
+      artifact_revision: `artifact-r${revision}`,
+      source_revision: `source-r${revision}`,
+      source_sha256: String(revision).repeat(64),
+      proposal: null,
+    },
+  });
+  Object.assign(shell, {
+    booksFeature: {
+      store: { snapshot: () => snapshot },
+      async refresh(reason) {
+        calls.refresh.push(reason);
+        const result = options.refresh
+          ? await options.refresh({ index, shell, snapshot }) : index;
+        snapshot = result ? {
+          status: "ready",
+          workspaceId: "workspace-1",
+          index: result,
+        } : { ...snapshot, status: "error" };
+        return result;
+      },
+    },
+    engineCorrections: { artifacts: { catalog: {
+      async list(args) {
+        calls.list.push(args);
+        return options.list ? options.list(args, calls.list.length) : {
+          revision: "source-inventory-r1",
+          items: [{ key: { artifact_id: artifactId } }],
+          nextCursor: null,
+        };
+      },
+      async get(args) {
+        calls.get.push(args);
+        return options.get
+          ? options.get(args, calls.get.length) : resource("1");
+      },
+    } } },
+    async invokeCommand(commandId, payload) {
+      calls.invoke.push({ commandId, payload });
+      return options.invoke
+        ? options.invoke({ commandId, payload }, calls.invoke.length)
+        : { job_id: `job-${calls.invoke.length}` };
+    },
+    presetBatchOperationIdFactory: ({ sequence }) =>
+      `preset:retry-${sequence}`,
+    presetBatchSequence: 0,
+    presetBatchRetryCommands: new Map(),
+    presetBatchRuns: new Map(),
+    contextGeneration: 3,
+    destroyed: false,
+    state: {
+      context: context({ artifact_id: artifactId }),
+      selection: { itemId: "book-1" },
+    },
+    windowRef: null,
+  });
+  const controller = {
+    resource: { correction: {
+      item_id: "book-1",
+      artifact_id: artifactId,
+      artifact_revision: "artifact-editor-r1",
+      source_revision: "source-editor-r1",
+      source_sha256: "e".repeat(64),
+    } },
+  };
+  const preset = {
+    schema: "org.whl.processing-preset",
+    version: 1,
+    preset_id: "cover-gamma",
+    name: "Cover gamma",
+    category: "cover",
+    operations: [{
+      schema: "org.whl.raster.processing-operation",
+      version: 1,
+      algorithm: "gamma-v1",
+      rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+      gamma_hundredths: 120,
+    }],
+    adjustment: null,
+    revision: "a".repeat(64),
+  };
+  return { calls, controller, index, preset, resource, shell };
+}
+
+
+test("batch refresh failure rejects stale inventory before catalog reads", async () => {
+  const harness = singleTargetBatchHarness({ refresh: async () => null });
+  await assert.rejects(
+    harness.shell.batchApplyProcessingPreset(
+      harness.preset, harness.controller),
+    /latest book inventory could not be loaded/i,
+  );
+  assert.deepEqual(harness.calls.refresh, ["preset-batch"]);
+  assert.equal(harness.calls.list.length, 0);
+  assert.equal(harness.calls.invoke.length, 0);
+});
+
+
+test("batch catalog paging fails closed on unstable or non-progressing pages", async () => {
+  for (const scenario of ["revision", "cursor", "empty"]) {
+    const harness = singleTargetBatchHarness({
+      list(_args, attempt) {
+        if (scenario === "empty") {
+          return {
+            revision: "source-r1",
+            items: [],
+            nextCursor: "next",
+          };
+        }
+        return attempt === 1 ? {
+          revision: "source-r1",
+          items: [{ key: { artifact_id: "cover-1" } }],
+          nextCursor: "next",
+        } : {
+          revision: scenario === "revision" ? "source-r2" : "source-r1",
+          items: [{ key: { artifact_id: "cover-1" } }],
+          nextCursor: scenario === "cursor" ? "next" : null,
+        };
+      },
+    });
+    await assert.rejects(
+      harness.shell.batchApplyProcessingPreset(
+        harness.preset, harness.controller),
+      scenario === "revision" ? /inventory changed/i
+        : scenario === "cursor" ? /invalid cursor/i
+          : /empty continuation page/i,
+      scenario,
+    );
+    assert.equal(harness.calls.invoke.length, 0, scenario);
+  }
+});
+
+
+test("batch binds editor book before refresh and cancels selection drift", async () => {
+  const mismatch = singleTargetBatchHarness();
+  mismatch.controller.resource.correction.item_id = "book-2";
+  await assert.rejects(
+    mismatch.shell.batchApplyProcessingPreset(
+      mismatch.preset, mismatch.controller),
+    /different book/i,
+  );
+  assert.equal(mismatch.calls.refresh.length, 0,
+    "editor/selection mismatch fails synchronously before any refresh");
+
+  const drift = singleTargetBatchHarness({
+    refresh: async ({ index, shell }) => {
+      shell.state.selection.itemId = "book-2";
+      return index;
+    },
+  });
+  await assert.rejects(
+    drift.shell.batchApplyProcessingPreset(drift.preset, drift.controller),
+    (error) => error && error.code === "preset-batch-context-changed",
+  );
+  assert.equal(drift.calls.list.length, 0);
+  assert.equal(drift.calls.invoke.length, 0);
+});
+
+
+test("concurrent remounted batch calls share one in-flight mutation", async () => {
+  let releaseQueue;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const queued = new Promise((resolve) => { releaseQueue = resolve; });
+  const harness = singleTargetBatchHarness({
+    invoke() {
+      markStarted();
+      return queued;
+    },
+  });
+
+  const first = harness.shell.batchApplyProcessingPreset(
+    harness.preset, harness.controller);
+  await started;
+  const remountedController = { resource: harness.controller.resource };
+  const second = harness.shell.batchApplyProcessingPreset(
+    harness.preset, remountedController);
+  assert.equal(harness.calls.refresh.length, 1);
+  assert.equal(harness.calls.get.length, 1);
+  assert.equal(harness.calls.invoke.length, 1);
+
+  releaseQueue({ job_id: "job-one-batch" });
+  assert.deepEqual(await first, { queued: 1, failed: 0 });
+  assert.deepEqual(await second, { queued: 1, failed: 0 });
+  assert.equal(harness.calls.invoke.length, 1);
+});
+
+
+test("context drift after one target prevents every later mutation", async () => {
+  const harness = singleTargetBatchHarness({
+    list() {
+      return {
+        revision: "source-inventory-r1",
+        items: [
+          { key: { artifact_id: "cover-1" } },
+          { key: { artifact_id: "cover-2" } },
+        ],
+        nextCursor: null,
+      };
+    },
+    get({ key }) {
+      const artifactId = key.slice("artifact:".length);
+      const detail = harness.resource(artifactId.endsWith("1") ? "1" : "2");
+      detail.id = artifactId;
+      detail.correction.artifact_id = artifactId;
+      return detail;
+    },
+    invoke() {
+      harness.shell.state.selection.itemId = "book-2";
+      return { job_id: "job-first-only" };
+    },
+  });
+
+  await assert.rejects(
+    harness.shell.batchApplyProcessingPreset(
+      harness.preset, harness.controller),
+    (error) => error && error.code === "preset-batch-context-changed",
+  );
+  assert.equal(harness.calls.get.length, 1);
+  assert.equal(harness.calls.invoke.length, 1,
+    "the second source image is never mutated after selection drift");
+});
+
+
+test("ambiguous batch retry replays the exact command without rehydrating", async () => {
+  const harness = singleTargetBatchHarness({
+    get(_args, attempt) {
+      return attempt === 1
+        ? harness.resource("1") : harness.resource("2");
+    },
+    invoke(_call, attempt) {
+      if (attempt === 1) {
+        const error = new Error("response lost");
+        error.retryable = true;
+        throw error;
+      }
+      return { job_id: "job-replayed" };
+    },
+  });
+
+  assert.deepEqual(await harness.shell.batchApplyProcessingPreset(
+    harness.preset, harness.controller), { queued: 0, failed: 1 });
+  assert.deepEqual(await harness.shell.batchApplyProcessingPreset(
+    harness.preset, harness.controller), { queued: 1, failed: 0 });
+
+  assert.equal(harness.calls.get.length, 1,
+    "retry uses the cached authoritative resource even if new pins would differ");
+  assert.equal(harness.calls.invoke.length, 2);
+  assert.equal(
+    harness.calls.invoke[0].payload.command,
+    harness.calls.invoke[1].payload.command,
+    "the exact serialized command object is replayed",
+  );
+  assert.equal(
+    harness.calls.invoke[0].payload.resource,
+    harness.calls.invoke[1].payload.resource,
+    "the authoritative resource bound to the uncertain command is replayed",
+  );
+  assert.equal(harness.calls.invoke[0].payload.command.operation_id,
+    "preset:retry-1");
+  assert.equal(harness.calls.invoke[1].payload.command.operation_id,
+    "preset:retry-1");
+  assert.equal(harness.shell.presetBatchRetryCommands.size, 0);
+});
+
+
+test("a truncated 202 batch response replays through EngineClient with one command",
+  async () => {
+    const harness = singleTargetBatchHarness();
+    const adapterCommands = [];
+    const wireCommands = [];
+    let attempt = 0;
+    const engineClient = new EngineClient({
+      baseUrl: "/api",
+      transport: async (url, init) => {
+        assert.match(url, /\/v1\/items\/book-1\/raster-artifacts\/cover-1\/transforms$/);
+        assert.equal(init.method, "POST");
+        const command = JSON.parse(init.body);
+        wireCommands.push(command);
+        attempt += 1;
+        if (attempt === 1) {
+          return {
+            ok: true,
+            status: 202,
+            json: async () => {
+              throw new SyntaxError("truncated queue receipt");
+            },
+          };
+        }
+        const jobId = "correction-transform-batch-replay";
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            schema: "librarytool.correction-transform-queue-receipt/1",
+            replayed: true,
+            operation_id: command.operation_id,
+            job_id: jobId,
+            job: {
+              id: jobId,
+              kind: "correction.transform",
+              state: "queued",
+              subject: {
+                item_id: command.item_id,
+                source_id: command.artifact_id,
+              },
+              progress: {
+                completed: 0,
+                total: 6,
+                unit: "phase",
+                phase: "queued",
+              },
+              cancellable: true,
+              revision: 1,
+              created_at: "2026-08-06T12:00:00+00:00",
+              updated_at: "2026-08-06T12:00:00+00:00",
+              finished_at: "",
+              note: "",
+              error: null,
+              input_revisions: {
+                artifact_id: command.artifact_id,
+                artifact_revision: command.artifact_revision,
+                source_revision: command.source_revision,
+                source_sha256: command.source_sha256,
+                operation_id: command.operation_id,
+                transform: {
+                  quad: command.quad,
+                  adjustment: command.adjustment,
+                  rerun_ocr: command.rerun_ocr,
+                  ...(command.mask_polygon
+                    ? { mask_polygon: command.mask_polygon }
+                    : {}),
+                  ...(command.operations
+                    ? { operations: command.operations }
+                    : {}),
+                },
+              },
+              outputs: [],
+            },
+          }),
+        };
+      },
+    });
+    const runtime = correctionsRuntimePorts({ engineClient }, null);
+    const invokeCommand = runtime.invokeCommand;
+    harness.shell.invokeCommand = (commandId, payload) => {
+      adapterCommands.push(payload.command);
+      return invokeCommand(commandId, payload);
+    };
+
+    assert.deepEqual(await harness.shell.batchApplyProcessingPreset(
+      harness.preset, harness.controller), { queued: 0, failed: 1 });
+    assert.equal(harness.shell.presetBatchRetryCommands.size, 1);
+    assert.deepEqual(await harness.shell.batchApplyProcessingPreset(
+      harness.preset, harness.controller), { queued: 1, failed: 0 });
+
+    assert.equal(harness.calls.get.length, 1,
+      "the ambiguous response keeps the authoritative hydration cached");
+    assert.equal(adapterCommands.length, 2);
+    assert.equal(adapterCommands[0], adapterCommands[1],
+      "the shell replays the same cached command object");
+    assert.deepEqual(wireCommands[0], wireCommands[1]);
+    assert.equal(wireCommands[0].operation_id, "preset:retry-1");
+    assert.equal(harness.shell.presetBatchRetryCommands.size, 0);
+  });
+
+
+test("definitive batch failure discards retry state and mints a later id", async () => {
+  const harness = singleTargetBatchHarness({
+    invoke(_call, attempt) {
+      if (attempt === 1) {
+        const error = new Error("invalid request");
+        error.retryable = false;
+        throw error;
+      }
+      return { job_id: "job-new-command" };
+    },
+  });
+
+  assert.deepEqual(await harness.shell.batchApplyProcessingPreset(
+    harness.preset, harness.controller), { queued: 0, failed: 1 });
+  assert.deepEqual(await harness.shell.batchApplyProcessingPreset(
+    harness.preset, harness.controller), { queued: 1, failed: 0 });
+  assert.equal(harness.calls.get.length, 2);
+  assert.deepEqual(harness.calls.invoke.map((entry) =>
+    entry.payload.command.operation_id), ["preset:retry-1", "preset:retry-2"]);
+  assert.notEqual(harness.calls.invoke[0].payload.command,
+    harness.calls.invoke[1].payload.command);
+});
+
+
+test("batch fingerprint accepts the full sixteen-operation preset contract", async () => {
+  const harness = singleTargetBatchHarness();
+  harness.preset.operations = Array.from({ length: 16 }, () => ({
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "white-balance-v1",
+    rule: "gray_world_or_manual_channel_balance_v1",
+    mode: "gray_world",
+    strength_percent: 100,
+    temperature: 0,
+    tint: 0,
+  }));
+
+  assert.deepEqual(await harness.shell.batchApplyProcessingPreset(
+    harness.preset, harness.controller), { queued: 1, failed: 0 });
+  assert.equal(harness.calls.invoke[0].payload.command.operations.length, 16);
 });
 
 test("standalone shell resolves reviews through the real engine client adapter",

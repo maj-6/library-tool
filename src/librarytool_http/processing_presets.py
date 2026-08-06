@@ -42,10 +42,7 @@ _MUTATION_FIELDS = frozenset({"preset"})
 
 
 def _error_status(error: EngineError) -> int:
-    if error.code in {
-        "processing_preset_mutation_too_large",
-        "processing_preset_document_too_large",
-    }:
+    if error.code == "processing_preset_mutation_too_large":
         return 413
     if isinstance(error, NotFoundError):
         return 404

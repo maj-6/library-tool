@@ -502,6 +502,22 @@ test("mask drafts only begin under the polygon tool and tool ids stay closed", (
 });
 
 
+test("leaving Mask cancels only the open draft and preserves the committed mask", () => {
+  const committed = commitMask(traceMask(maskState(), TRIANGLE_MASK));
+  const drafting = traceMask(committed, [
+    [0.2, 0.2], [0.8, 0.2], [0.5, 0.8],
+  ], true);
+
+  const perspective = reduceImageEditorState(drafting, {
+    type: "SET_TOOL", tool: TOOLS.PERSPECTIVE,
+  });
+
+  assert.equal(perspective.maskDraft, null);
+  assert.equal(perspective.maskFreehand, false);
+  assert.deepEqual(perspective.maskPolygon, TRIANGLE_MASK);
+});
+
+
 test("a committed mask serializes as mask_polygon and no mask leaves the command untouched", () => {
   const base = {
     pins: pins(),
@@ -549,6 +565,10 @@ test("the toolbar offers a mask tool that switches the editor into polygon mode"
   maskButton.emit("click");
   assert.equal(controller.getState().tool, TOOLS.POLYGON);
   assert.equal(maskButton.getAttribute("aria-pressed"), "true");
+  assert.match(
+    byClass(container, "perspective-tool-instruction")[0].textContent,
+    /click to place vertices or drag to trace/i,
+  );
   dispose();
 });
 
@@ -587,6 +607,50 @@ test("a freehand drag on the canvas commits a mask polygon", () => {
   assert.ok(canvas.drawCalls.some(([name, x, y]) =>
     name === "moveTo" && x === 40 && y === 40),
   "the mask ring is drawn in canvas space");
+  dispose();
+});
+
+
+test("pointer cancellation and lost capture discard the draft and release ownership", () => {
+  for (const eventType of ["pointercancel", "lostpointercapture"]) {
+    const { controller, dispose } = maskHarness();
+    const canvas = controller.canvas;
+    canvas.emit("pointerdown", {
+      pointerId: 4, button: 0, clientX: 40, clientY: 40,
+    });
+    canvas.emit("pointermove", { pointerId: 4, clientX: 360, clientY: 40 });
+    assert.equal(controller.getState().maskFreehand, true, eventType);
+
+    canvas.emit(eventType, { pointerId: 4 });
+    assert.equal(controller.getState().maskDraft, null, eventType);
+    assert.equal(controller.getState().maskFreehand, false, eventType);
+    assert.equal(canvas.hasPointerCapture(4), false, eventType);
+
+    canvas.emit("pointerdown", {
+      pointerId: 5, button: 0, clientX: 80, clientY: 80,
+    });
+    assert.deepEqual(controller.getState().maskDraft, [[0.2, 0.2]],
+      `${eventType} releases local pointer ownership`);
+    dispose();
+  }
+});
+
+
+test("a secondary pointer cannot replace the pointer that owns a mask trace", () => {
+  const { controller, dispose } = maskHarness();
+  const canvas = controller.canvas;
+  canvas.emit("pointerdown", {
+    pointerId: 1, button: 0, clientX: 40, clientY: 40,
+  });
+  canvas.emit("pointerdown", {
+    pointerId: 2, button: 0, clientX: 320, clientY: 320,
+  });
+
+  assert.deepEqual(controller.getState().maskDraft, [[0.1, 0.1]]);
+  assert.equal(canvas.hasPointerCapture(1), true);
+  assert.equal(canvas.hasPointerCapture(2), false);
+  canvas.emit("pointermove", { pointerId: 1, clientX: 360, clientY: 40 });
+  assert.equal(controller.getState().maskFreehand, true);
   dispose();
 });
 

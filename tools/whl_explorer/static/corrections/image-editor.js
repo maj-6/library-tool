@@ -103,6 +103,26 @@
     };
   }
 
+  function serializeProcessingPresetCommand({ resource, preset, operationId } = {}) {
+    if (!isPlainObject(preset) || !Array.isArray(preset.operations)) {
+      throw new TypeError("a canonical processing preset is required");
+    }
+    const contract = correctionResourceContract(resource);
+    const initial = createImageEditorState({
+      proposal: contract.proposal,
+      sourceRevision: contract.pins && contract.pins.source_revision,
+      hasSelection: true,
+    });
+    return serializeCorrectionTransformCommand({
+      pins: contract.pins,
+      quad: initial.quad,
+      adjustment: preset.adjustment,
+      operations: preset.operations.length ? preset.operations : null,
+      rerunOcr: false,
+      operationId,
+    });
+  }
+
   function defaultOperationId(windowRef, sequence) {
     const cryptoRef = windowRef && windowRef.crypto;
     if (cryptoRef && typeof cryptoRef.randomUUID === "function") {
@@ -489,7 +509,7 @@
       }
 
       function queueAllowed() {
-        if (!state || state.gesture || !state.validation.valid ||
+        if (!state || state.gesture || state.maskDraft || !state.validation.valid ||
             !sourcePinsValid(contract.pins) ||
             ["submitting", "queued", "complete"].includes(
               state.submission && state.submission.status,
@@ -505,6 +525,9 @@
         }
         if (state.tool === TOOLS.IMAGE_ADJUST) {
           return "Image Adjust mode. Adjustment controls can be supplied by a registered tool extension.";
+        }
+        if (state.tool === TOOLS.POLYGON) {
+          return "Mask mode. Click to place vertices or drag to trace; click the first vertex or press Enter to close.";
         }
         return "Select mode. Choose Perspective to edit the four-corner boundary.";
       }
@@ -561,6 +584,13 @@
 
       function dispatch(action) {
         if (destroyed) return state;
+        if (action && action.type === "SET_TOOL" &&
+            action.tool !== TOOLS.POLYGON && maskPointerId !== null) {
+          const pointerId = maskPointerId;
+          maskPointerId = null;
+          maskDragged = false;
+          releasePointer({ pointerId });
+        }
         state = reduceImageEditorState(state, action);
         update();
         return state;
@@ -655,7 +685,8 @@
 
       function handlePointerDown(event) {
         if (state.tool === TOOLS.POLYGON) {
-          if (event.button != null && event.button !== 0) return;
+          if (maskPointerId !== null ||
+              event.button != null && event.button !== 0) return;
           handleMaskPointerDown(event);
           return;
         }
@@ -714,6 +745,14 @@
       }
 
       function handlePointerCancel(event) {
+        if (maskPointerId !== null && event.pointerId === maskPointerId) {
+          if (state.maskDraft) dispatch({ type: "MASK_CANCEL" });
+          maskPointerId = null;
+          maskDragged = false;
+          releasePointer(event);
+          if (typeof event.preventDefault === "function") event.preventDefault();
+          return;
+        }
         if (!pointerMatches(event)) return;
         dispatch({ type: "CANCEL_GESTURE" });
         releasePointer(event);
@@ -746,6 +785,7 @@
               pins: contract.pins,
               quad: state.quad,
               adjustment,
+              operations: state.operations.length ? state.operations : null,
               rerunOcr,
               operationId: operationId(),
               maskPolygon: state.maskPolygon,
@@ -969,6 +1009,9 @@
         for (const remove of removers.splice(0)) remove();
         if (typeof mountCleanup === "function") mountCleanup();
         mountCleanup = null;
+        if (typeof options.onStateChange === "function") {
+          options.onStateChange(null, resource);
+        }
       };
       dispose.controller = controller;
       return dispose;
@@ -981,5 +1024,6 @@
     createPerspectiveImageRenderer,
     drawPerspectiveOverlay,
     safeRasterUrl,
+    serializeProcessingPresetCommand,
   };
 });

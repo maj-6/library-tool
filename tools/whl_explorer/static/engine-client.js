@@ -1935,10 +1935,27 @@
   const IMAGE_CATEGORIES = [
     "title_page", "cover", "spine", "content_specimen", "other",
   ];
+  const MAX_PROCESSING_PRESET_NAME_LENGTH = 120;
   const PROCESSING_PRESET_FIELDS = [
     "schema", "version", "preset_id", "name", "category", "operations",
     "adjustment",
   ];
+
+  function isProcessingPresetName(value) {
+    if (typeof value !== "string") return false;
+    let length = 0;
+    for (const character of value) {
+      const codePoint = character.codePointAt(0);
+      // String iteration combines valid surrogate pairs but yields an unpaired
+      // surrogate on its own. Count the former as one Unicode scalar value and
+      // reject the latter, matching Python's UTF-8 persistence boundary.
+      if (codePoint >= 0xD800 && codePoint <= 0xDFFF) return false;
+      if (codePoint < 32 || codePoint === 127) return false;
+      length += 1;
+      if (length > MAX_PROCESSING_PRESET_NAME_LENGTH) return false;
+    }
+    return length > 0;
+  }
 
   // A stored preset always reports its derived revision; a preset being sent
   // for the first time has not got one yet.
@@ -1953,8 +1970,7 @@
     return value.schema === "org.whl.processing-preset" &&
       value.version === 1 && Number.isSafeInteger(value.version) &&
       isPortableIdentifier(value.preset_id) &&
-      typeof value.name === "string" && value.name.length > 0 &&
-      value.name.length <= 120 &&
+      isProcessingPresetName(value.name) &&
       typeof value.category === "string" &&
       (value.category === "" || IMAGE_CATEGORIES.includes(value.category)) &&
       Array.isArray(value.operations) &&
@@ -2175,6 +2191,7 @@
       this.retryable = options.retryable != null
         ? !!options.retryable
         : this.status === 0 || this.status === 429 || this.status >= 500;
+      this.ambiguous = options.ambiguous === true;
       this.method = options.method || "";
       this.url = options.url || "";
       this.body = options.body == null ? null : options.body;
@@ -2412,11 +2429,18 @@
         body = await response.json();
       } catch (cause) {
         if (responseOk && options.allowEmpty) return { ok: true };
+        // A caller may opt in only when it retains the exact idempotent
+        // mutation command for replay. A successful status with an unreadable
+        // body cannot tell that caller whether the server committed, whereas a
+        // malformed GET remains a definitive read failure.
+        const ambiguous = responseOk &&
+          options.ambiguousOnSuccessJsonFailure === true;
         throw new EngineClientError(responseOk
           ? "Engine returned an invalid JSON response"
           : `Engine request failed (${status || "no status"})`, {
           status, code: responseOk ? "invalid-response" : fallbackCode(status),
-          retryable: status === 429 || status >= 500,
+          retryable: ambiguous || status === 429 || status >= 500,
+          ambiguous,
           method, url, body: null, cause,
         });
       }
@@ -3935,6 +3959,7 @@
         signal,
         cache: "no-store",
         includeStatus: true,
+        ambiguousOnSuccessJsonFailure: true,
       });
       const expectedStatus = body && body.replayed === true ? 200 : 202;
       if (status !== expectedStatus || !hasExactKeys(body, [

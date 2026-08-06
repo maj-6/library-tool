@@ -12,12 +12,14 @@ from librarytool.processing.operations import (
     ContrastOperation,
     GammaOperation,
     KernelSharpenOperation,
+    ProcessingOperation,
     ProcessingOperationError,
     UnsharpMaskOperation,
     WhiteBalanceOperation,
     apply_operations,
     operation_from_dict,
     operations_from_list,
+    validate_processing_operation,
 )
 from librarytool.processing.raster import apply_perspective_transform
 
@@ -56,6 +58,19 @@ def _every_operation() -> tuple:
 def test_every_published_algorithm_has_an_operation() -> None:
     covered = {operation.algorithm for operation in _every_operation()}
     assert covered == set(PROCESSING_ALGORITHMS)
+
+
+@pytest.mark.parametrize("operation", _every_operation(), ids=lambda o: o.algorithm)
+def test_algorithm_discriminators_are_not_caller_overridable(operation) -> None:
+    operation_type = type(operation)
+
+    with pytest.raises(TypeError, match="algorithm"):
+        operation_type(algorithm="another-operation-v1")
+
+
+def test_the_base_operation_is_not_a_canonical_recipe() -> None:
+    with pytest.raises(ProcessingOperationError, match="canonical supported"):
+        validate_processing_operation(ProcessingOperation())
 
 
 @pytest.mark.parametrize("operation", _every_operation(), ids=lambda o: o.algorithm)
@@ -189,6 +204,32 @@ def test_wire_documents_must_be_canonical() -> None:
     # two spellings of one operation produce two command fingerprints.
     with pytest.raises(ProcessingOperationError, match="not a canonical"):
         operation_from_dict(dict(payload, rule="anything else"))
+
+
+@pytest.mark.parametrize(
+    ("operation", "field"),
+    [
+        (operation, field)
+        for operation in _every_operation()
+        for field in (
+            "schema",
+            "version",
+            "algorithm",
+            "rule",
+            *operation.parameters(),
+        )
+    ],
+    ids=lambda value: value.algorithm if hasattr(value, "algorithm") else value,
+)
+def test_wire_documents_require_every_fixed_and_algorithm_field(
+    operation,
+    field: str,
+) -> None:
+    payload = operation.as_dict()
+    del payload[field]
+
+    with pytest.raises(ProcessingOperationError):
+        operation_from_dict(payload)
 
 
 def test_operation_lists_are_bounded_and_non_empty() -> None:

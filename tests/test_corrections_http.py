@@ -78,6 +78,7 @@ from librarytool.engine.spatial_annotations import (
     SpatialAnnotationView,
     SpatialSourceRef,
 )
+from librarytool.processing.operations import GammaOperation
 import librarytool_http.corrections as corrections_http
 from librarytool_http.corrections import create_corrections_blueprint
 
@@ -2650,3 +2651,33 @@ def test_transform_queue_accepts_a_mask_polygon_and_rejects_unknown_fields():
     )
     assert degenerate.status_code == 400
     assert degenerate.get_json()["code"] == "invalid_correction_mask_polygon"
+
+
+def test_transform_queue_rejects_an_operation_missing_its_canonical_rule():
+    artifact = _raster("image-a")
+    jobs = JobManager(checkpoint_interval=0)
+    command = _transform_command(artifact)
+    operation = GammaOperation(gamma_hundredths=120).as_dict()
+    del operation["rule"]
+    client = _app(
+        _Engine(
+            _RasterProjector((artifact,)),
+            _SpatialProjector(()),
+            transforms=CorrectionTransformService(jobs),
+        ),
+        transform_submitter=lambda *_args: None,
+    ).test_client()
+
+    response = client.post(
+        "/api/v1/items/book-1/raster-artifacts/image-a/transforms",
+        json=dict(command.as_dict(), operations=[operation]),
+        headers={
+            "Idempotency-Key": command.operation_id,
+            "If-Artifact-Match": f'"{artifact.revision}"',
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_correction_operations"
+    assert response.get_json()["details"] == {"field": "operations"}
+    assert jobs.list() == []

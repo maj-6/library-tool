@@ -24,9 +24,11 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from librarytool.processing.operations import (
+    MAX_OPERATIONS_PER_RECIPE,
     ProcessingOperation,
     ProcessingOperationError,
     operations_from_list,
+    validate_processing_operation,
 )
 from librarytool.processing.raster import ManualBinaryAdjustRecipe
 
@@ -110,7 +112,17 @@ class ProcessingPreset:
         if not name or len(name) > MAX_PRESET_NAME_LENGTH:
             raise _validation(
                 "name must be a non-empty string of at most "
-                f"{MAX_PRESET_NAME_LENGTH} characters",
+                f"{MAX_PRESET_NAME_LENGTH} Unicode scalar values",
+                field_name="name",
+            )
+        # Python strings can contain an unpaired UTF-16 surrogate decoded from
+        # an escaped JSON string.  Such a value is not a Unicode scalar value
+        # and cannot be encoded by the store's strict UTF-8 writer.  Reject it
+        # at the domain boundary so malformed input receives a validation
+        # response instead of escaping later as UnicodeEncodeError.
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in name):
+            raise _validation(
+                "name must contain only Unicode scalar values",
                 field_name="name",
             )
         if any(ord(character) < 32 or ord(character) == 127 for character in name):
@@ -120,11 +132,17 @@ class ProcessingPreset:
             )
         object.__setattr__(self, "name", name)
         operations = tuple(self.operations)
-        if any(not isinstance(value, ProcessingOperation) for value in operations):
+        if len(operations) > MAX_OPERATIONS_PER_RECIPE:
             raise _validation(
-                "operations must contain ProcessingOperation values",
+                "operations must contain at most "
+                f"{MAX_OPERATIONS_PER_RECIPE} entries",
                 field_name="operations",
             )
+        try:
+            for value in operations:
+                validate_processing_operation(value)
+        except ProcessingOperationError as exc:
+            raise _validation(str(exc), field_name="operations") from exc
         object.__setattr__(self, "operations", operations)
         if self.adjustment is not None and not isinstance(
             self.adjustment,
@@ -156,7 +174,9 @@ class ProcessingPreset:
 
         Deriving it from the content rather than a counter keeps the store
         stateless: any reader can recompute a preset's revision without having
-        seen its history.
+        seen its history.  It is a strong representation validator, not an
+        incarnation identifier: deleting and later recreating byte-identical
+        content deliberately produces the same revision.
         """
 
         return hashlib.sha256(_canonical_json(self.as_dict())).hexdigest()

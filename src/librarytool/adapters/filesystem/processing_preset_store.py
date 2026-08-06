@@ -75,12 +75,32 @@ class FilesystemProcessingPresetStore:
     # -- public port ----------------------------------------------------
 
     def list_presets(self) -> tuple[ProcessingPreset, ...]:
-        return self._read()
+        # Windows does not permit os.replace while a reader has the destination
+        # open, and the descriptor/name identity check on POSIX must not race an
+        # atomic replacement either. Reads therefore share the mutation lock.
+        # A read waits for the tiny write critical section instead of surfacing
+        # an avoidable transient conflict to the workbench.
+        with self._locked(blocking=True):
+            return self._read()
 
     def create_preset(self, preset: ProcessingPreset) -> ProcessingPreset:
         with self._locked():
             presets = self._read()
-            if any(value.preset_id == preset.preset_id for value in presets):
+            existing = next(
+                (
+                    value
+                    for value in presets
+                    if value.preset_id == preset.preset_id
+                ),
+                None,
+            )
+            if existing is not None:
+                # PUT is acknowledgement-safe: if the first response was lost,
+                # repeating the exact desired representation reports the state
+                # that is already durable. A different representation with the
+                # same identity remains a genuine create conflict.
+                if existing == preset:
+                    return existing
                 raise preset_conflict(
                     preset.preset_id,
                     code="processing_preset_exists",
@@ -108,6 +128,11 @@ class FilesystemProcessingPresetStore:
             index = self._index_of(presets, preset.preset_id)
             current = presets[index]
             if current.revision != expected_revision:
+                # A committed update followed by a lost response is already in
+                # the requested state. Treat that retry as success without
+                # weakening CAS for a different desired representation.
+                if current == preset:
+                    return current
                 raise preset_conflict(
                     preset.preset_id,
                     code="processing_preset_stale",
@@ -120,7 +145,19 @@ class FilesystemProcessingPresetStore:
     def delete_preset(self, preset_id: str, expected_revision: str) -> None:
         with self._locked():
             presets = self._read()
-            index = self._index_of(presets, preset_id)
+            index = next(
+                (
+                    index
+                    for index, value in enumerate(presets)
+                    if value.preset_id == preset_id
+                ),
+                None,
+            )
+            # DELETE is idempotent. An absent identity is already in the
+            # requested state; if it has been recreated, the live record below
+            # still has to match the caller's revision before it can be removed.
+            if index is None:
+                return
             if presets[index].revision != expected_revision:
                 raise preset_conflict(
                     preset_id,
@@ -142,7 +179,7 @@ class FilesystemProcessingPresetStore:
         raise preset_not_found(preset_id)
 
     @contextmanager
-    def _locked(self):
+    def _locked(self, *, blocking: bool = False):
         self._path.parent.mkdir(parents=True, exist_ok=True)
         try:
             stream = open_lock_file(self._lock_path)
@@ -155,10 +192,15 @@ class FilesystemProcessingPresetStore:
             ) from exc
         try:
             try:
-                # Non-blocking: preset edits are interactive, so a caller
-                # deserves an immediate retryable conflict rather than a
-                # request that hangs behind another editor.
-                lock_stream(stream, blocking=False, path=self._lock_path)
+                # Mutations remain non-blocking: preset edits are interactive,
+                # so a competing editor receives an immediate retryable
+                # conflict. Reads opt into blocking for the short critical
+                # section so Windows never has an open reader during replace.
+                lock_stream(
+                    stream,
+                    blocking=blocking,
+                    path=self._lock_path,
+                )
             except OSError as exc:
                 raise _repository_error(
                     "another editor is changing the processing presets",
