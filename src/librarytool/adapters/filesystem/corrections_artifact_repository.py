@@ -2173,7 +2173,6 @@ class FilesystemCorrectionsArtifactRepository(
             ) from exc
         try:
             named_root = root.lstat()
-            resolved_root = root.resolve(strict=True)
         except OSError as exc:
             raise _repository_error(
                 "a Corrections store root cannot be inspected",
@@ -2195,6 +2194,18 @@ class FilesystemCorrectionsArtifactRepository(
         directory_snapshots: list[_AuthorityDirectorySnapshot] = []
         current = root
         for index, part in enumerate(relative.parts):
+            if part in {"", ".", ".."}:
+                # Rejecting traversal outright is what lets the containment
+                # proof below be lexical: with no ".." and no redirecting
+                # component, a path that is under the root by name is under it
+                # in fact. Resolving every path to prove the same thing walked
+                # the whole chain per call, thousands of times per index.
+                raise _repository_error(
+                    "a Corrections store path escapes the workspace",
+                    code="unsafe_corrections_store_path",
+                    item_id=item_id,
+                    section=section,
+                )
             current /= part
             if _is_redirecting_path(current):
                 raise _repository_error(
@@ -2230,15 +2241,6 @@ class FilesystemCorrectionsArtifactRepository(
             directory_snapshots.append(
                 _AuthorityDirectorySnapshot(current, named_directory)
             )
-        try:
-            path.resolve(strict=False).relative_to(resolved_root)
-        except (OSError, ValueError) as exc:
-            raise _repository_error(
-                "a Corrections store path escapes the workspace",
-                code="unsafe_corrections_store_path",
-                item_id=item_id,
-                section=section,
-            ) from exc
         return _AuthoritySnapshot(
             root,
             named_root,

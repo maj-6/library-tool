@@ -2290,3 +2290,52 @@ def test_missing_item_is_an_explicit_engine_error(tmp_path, method):
     with pytest.raises(NotFoundError) as caught:
         getattr(repository, method)("missing")
     assert getattr(caught.value, "code", "") == "item_not_found"
+
+
+def test_traversal_in_a_store_path_is_rejected_by_name(tmp_path):
+    """Containment is proved lexically, so ".." must be refused outright.
+
+    The authority walk used to resolve every path to catch traversal, which
+    meant a full realpath of the chain on each of thousands of calls per
+    Corrections index. Rejecting the segment is both cheaper and stricter, so
+    it has to be exercised directly.
+    """
+
+    root = tmp_path / "library"
+    _write_layout(root, _layout("ab" * 32))
+    repository = _repository(root, capture_ids={})
+    entries = root / "entries"
+    secret = tmp_path / "outside.json"
+    secret.write_text(json.dumps({"leaked": True}), encoding="utf-8")
+
+    escaping = entries / ITEM_ID / ".." / ".." / ".." / "outside.json"
+    assert escaping.exists(), "the traversal target must really be reachable"
+
+    with pytest.raises(RepositoryError) as caught:
+        repository._assert_safe_path(
+            escaping,
+            item_id=ITEM_ID,
+            section="entry",
+        )
+
+    assert caught.value.code == "unsafe_corrections_store_path"
+
+    # pathlib drops "." while building the path, so it never reaches the walk
+    # and cannot be asserted here; ".." survives precisely because collapsing
+    # it would require resolving symlinks.
+    assert ".." in (entries / ITEM_ID / ".." / "x").parts
+    assert "." not in (entries / ITEM_ID / "." / "x").parts
+
+    # An ordinary path under the root still yields an authority snapshot.
+    layout = entries / ITEM_ID / "ocr" / "layout.json"
+    authority = repository._assert_safe_path(
+        layout,
+        item_id=ITEM_ID,
+        section="entry",
+    )
+    assert layout.is_relative_to(authority.root)
+    assert [snapshot.path for snapshot in authority.directories] == [
+        entries,
+        entries / ITEM_ID,
+        entries / ITEM_ID / "ocr",
+    ]
