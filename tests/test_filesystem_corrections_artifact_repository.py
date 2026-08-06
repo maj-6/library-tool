@@ -2407,8 +2407,10 @@ def test_capture_authority_is_revalidated_for_every_asset_in_a_burst(
 ):
     """Pinning one directory must not stop ancestors being rechecked.
 
-    A capture directory swapped for a junction after the pin is taken must not
-    let an asset outside the authority be observed as AVAILABLE.
+    A capture directory swapped for a redirect after any pin is taken must not
+    let an asset outside the authority be observed as AVAILABLE. Uses a
+    junction on Windows and a symlink elsewhere: both are what
+    `_is_redirecting_path` exists to catch.
     """
 
     import subprocess
@@ -2416,6 +2418,17 @@ def test_capture_authority_is_revalidated_for_every_asset_in_a_burst(
     from librarytool.adapters.filesystem import (
         corrections_artifact_repository as module,
     )
+
+    def _redirect(link, target):
+        if os.name == "nt":
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        else:
+            os.symlink(str(target), str(link), target_is_directory=True)
 
     directory, _manifest = _capture_with_manifest(tmp_path)
     outside = tmp_path / "outside"
@@ -2436,12 +2449,7 @@ def test_capture_authority_is_revalidated_for_every_asset_in_a_burst(
         if not swapped["done"]:
             swapped["done"] = True
             os.rename(directory, directory.with_name(directory.name + ".stash"))
-            subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(directory), str(outside)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            _redirect(directory, outside)
         return result
 
     module.FilesystemCorrectionsArtifactRepository._capture_manifest_records = (
