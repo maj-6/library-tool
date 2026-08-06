@@ -580,9 +580,27 @@ def test_corrections_index_resolves_capture_authority_once_per_capture(
     )
 
     assert second.status_code == 200
-    assert len(second.get_json()["books"]) == len(capture_ids)
-    # A fresh request gets a fresh bulk snapshot; nothing is cached globally.
+    assert second.get_json()["books"] == first.get_json()["books"]
+    # The editor polls this endpoint every two seconds. While every input is
+    # byte-for-byte intact the snapshot is reused rather than rebuilt.
+    assert inspected == list(capture_ids)
+
+    # The guarantee that matters is not "never cached" but "never stale": a
+    # changed store must be observed on the very next request.
+    builds["bulk-capture-1"]["title"] = "Bulk capture 1 renamed"
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, builds)
+
+    third = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert third.status_code == 200
     assert inspected == [*capture_ids, *capture_ids]
+    assert any(
+        book["title"] == "Bulk capture 1 renamed"
+        for book in third.get_json()["books"]
+    )
 
 
 def test_capture_only_transform_loads_and_queues_without_native_text_layers(
@@ -1397,6 +1415,8 @@ def test_capture_fallback_is_deterministic_and_uncaptured_manual_is_omitted(
         "_corrections_association",
         lambda _value: persisted_association,
     )
+    # Replacing the resolver changes an input the store fingerprint cannot see.
+    server._corrections_targets_cache_clear()
     associated_snapshot = server._corrections_item_snapshot()
     assert list(associated_snapshot) == [BOOK_ID]
     assert associated_snapshot[BOOK_ID]["metadata"][
@@ -1536,6 +1556,8 @@ def test_manual_storage_alias_is_private_and_invalid_unicode_fails_closed(
         return real_load_json(path, default)
 
     monkeypatch.setattr(server.lib, "load_json", invalid_unicode_snapshot)
+    # Replacing the loader changes an input the store fingerprint cannot see.
+    server._corrections_targets_cache_clear()
     with pytest.raises(server.EngineRepositoryError) as invalid:
         server._corrections_item_snapshot()
     assert invalid.value.code == "invalid_corrections_target_snapshot"

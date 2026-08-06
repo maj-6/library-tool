@@ -38,6 +38,11 @@ def _initialize_imported_server_engine():
     server = sys.modules.get("server")
     if server is not None:
         server._ensure_engine_session()
+        # Each test builds its own workspace; none may inherit a resolved
+        # Corrections snapshot from the last one.
+        clear = getattr(server, "_corrections_targets_cache_clear", None)
+        if callable(clear):
+            clear()
 
 
 @pytest.fixture(scope="session")
