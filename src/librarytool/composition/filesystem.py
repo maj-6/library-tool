@@ -779,6 +779,28 @@ class _CorrectionProjectionUnion:
             )
         return tuple(sorted(values, key=lambda value: value.key.artifact_id))
 
+    def list_capture_import_marks(
+        self,
+        item_ids: Sequence[str],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Delegate capture counts and import stamps to the authority adapter."""
+
+        marks = getattr(self._base, "list_capture_import_marks", None)
+        if not callable(marks):
+            return ()
+        with self._read_context():
+            values = marks(item_ids)
+        if (
+            isinstance(values, (str, bytes))
+            or not isinstance(values, Sequence)
+            or any(not isinstance(value, Mapping) for value in values)
+        ):
+            raise RepositoryError(
+                "the correction capture index returned invalid marks",
+                code="invalid_corrections_index_projection",
+            )
+        return tuple(values)
+
     def list_capture_index_hints(
         self,
         item_id: str,

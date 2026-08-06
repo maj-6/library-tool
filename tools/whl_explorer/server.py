@@ -313,6 +313,11 @@ app.register_blueprint(
         correction_index_probe_for_request=(
             lambda: _corrections_index_probe()
         ),
+        # The bare authority context. The details route serves one window, so
+        # its hash must never reach the slot the two-second poll compares.
+        correction_index_read_context_for_request=(
+            lambda: _corrections_index_authority_context()
+        ),
         correction_index_revision_observer=(
             lambda revision: _corrections_index_observed(revision)
         ),

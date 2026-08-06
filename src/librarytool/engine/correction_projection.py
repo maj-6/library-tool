@@ -592,6 +592,32 @@ class CorrectionProjectionService(
             metadata_assertions=correction.metadata_assertions,
         )
 
+    def list_capture_import_marks(
+        self,
+        item_ids: Sequence[str],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Expose each item's capture count and import stamp, nothing more.
+
+        Like the hints below, these bypass correction overlay reconciliation
+        and are for navigation only. They exist so a host can order and filter
+        a whole library without reading a capture row per book.
+        """
+
+        marks = getattr(self._raster_artifacts, "list_capture_import_marks", None)
+        if not callable(marks):
+            return ()
+        values = marks(item_ids)
+        if (
+            isinstance(values, (str, bytes))
+            or not isinstance(values, Sequence)
+            or any(not isinstance(value, Mapping) for value in values)
+        ):
+            raise RepositoryError(
+                "the capture index returned invalid import marks",
+                code="invalid_corrections_index_projection",
+            )
+        return tuple(values)
+
     def list_capture_index_hints(
         self,
         item_id: str,

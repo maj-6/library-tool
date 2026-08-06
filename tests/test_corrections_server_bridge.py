@@ -2912,3 +2912,195 @@ def test_index_probe_rejects_a_foreign_workspace(client, corrections_workspace):
     assert missing.get_json()["code"] == "invalid_corrections_workspace"
     assert other.status_code == 409
     assert other.get_json()["code"] == "corrections_workspace_mismatch"
+
+
+def _detail_request(item_ids):
+    return json.dumps({
+        "schema": "librarytool.corrections-index-detail-request/1",
+        "item_ids": list(item_ids),
+    })
+
+
+def test_index_summary_agrees_with_the_index_on_every_free_field(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+
+    full = client.get("/api/v1/corrections/index?workspace_id=local-library")
+    summary = client.get(
+        "/api/v1/corrections/index/summary?workspace_id=local-library"
+    )
+
+    assert full.status_code == 200
+    assert summary.status_code == 200
+    body = summary.get_json()
+    assert body["schema"] == "librarytool.corrections-index-summary/1"
+    assert body["revision"].startswith("cri1-")
+    # The summary carries the whole collection, never a window: the shell
+    # orders, filters and steps through every book locally.
+    assert [book["id"] for book in body["books"]] == [
+        book["id"] for book in full.get_json()["books"]
+    ]
+    # Attention drives the shell's primary sort, so it must be identical.
+    assert body["attention"] == full.get_json()["attention"]
+    for lean, rich in zip(body["books"], full.get_json()["books"], strict=True):
+        assert set(lean) == {"id", "revision", "kind", "title", "review"}
+        assert lean["revision"].startswith("crs-")
+        for field in ("id", "kind", "title", "review"):
+            assert lean[field] == rich[field]
+
+
+def test_index_details_return_rows_identical_to_the_index(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+
+    full = client.get("/api/v1/corrections/index?workspace_id=local-library")
+    books = full.get_json()["books"]
+    wanted = [book["id"] for book in books]
+
+    response = client.post(
+        "/api/v1/corrections/index/details?workspace_id=local-library",
+        data=_detail_request(wanted),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["schema"] == "librarytool.corrections-index-detail/1"
+    assert body["missing"] == []
+    # The whole point: a detail row is what the index would have inlined.
+    assert body["books"] == books
+
+
+def test_index_details_report_an_unknown_id_instead_of_failing(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+
+    known = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    ).get_json()["books"][0]["id"]
+    gone = "b-99999999999999999999999999999999"
+
+    response = client.post(
+        "/api/v1/corrections/index/details?workspace_id=local-library",
+        data=_detail_request([known, gone]),
+        content_type="application/json",
+    )
+
+    # A book deleted underneath the window must not break the window.
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["missing"] == [gone]
+    assert [book["id"] for book in body["books"]] == [known]
+
+
+def test_index_details_reject_a_malformed_request(client, corrections_workspace):
+    del corrections_workspace
+    url = "/api/v1/corrections/index/details?workspace_id=local-library"
+
+    empty = client.post(url, data=_detail_request([]),
+                        content_type="application/json")
+    duplicated = client.post(
+        url,
+        data=_detail_request(["b-1111", "b-1111"]),
+        content_type="application/json",
+    )
+    unknown_schema = client.post(
+        url,
+        data=json.dumps({"schema": "nope/1", "item_ids": ["b-1111"]}),
+        content_type="application/json",
+    )
+
+    for response in (empty, duplicated, unknown_schema):
+        assert response.status_code == 400
+        assert response.get_json()["code"] == (
+            "invalid_corrections_index_detail_request"
+        )
+
+
+def test_index_details_do_not_disturb_the_poll(client, corrections_workspace):
+    del corrections_workspace
+    import server
+
+    client.get("/api/v1/corrections/index?workspace_id=local-library")
+    settled = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"]
+    known = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    ).get_json()["books"][0]["id"]
+
+    client.post(
+        "/api/v1/corrections/index/details?workspace_id=local-library",
+        data=_detail_request([known]),
+        content_type="application/json",
+    )
+
+    # A per-window hash reaching the poll's slot would make every client
+    # refetch the whole index after any detail read.
+    assert client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"] == settled
+    assert server._corrections_index_revision_cache["revision"] == settled
+
+
+def test_capture_marks_agree_with_the_index_for_every_book(
+    client,
+    corrections_workspace,
+):
+    """The Captures view orders and filters on these two numbers alone.
+
+    If either drifts from what the index reports, books silently change
+    position or vanish from that view, so this asserts equality per book
+    rather than merely that the route answers.
+    """
+
+    del corrections_workspace
+
+    full = client.get("/api/v1/corrections/index?workspace_id=local-library")
+    marks = client.get(
+        "/api/v1/corrections/index/capture-marks?workspace_id=local-library"
+    )
+
+    assert full.status_code == 200
+    assert marks.status_code == 200
+    body = marks.get_json()
+    assert body["schema"] == "librarytool.corrections-capture-marks/1"
+    assert body["revision"].startswith("crm-")
+    assert [mark["item_id"] for mark in body["marks"]] == sorted(
+        mark["item_id"] for mark in body["marks"]
+    )
+
+    books = {book["id"]: book for book in full.get_json()["books"]}
+    # A mark exists for exactly the books the index shows captures for.
+    assert {mark["item_id"] for mark in body["marks"]} == {
+        item_id for item_id, book in books.items() if book["captures"]
+    }
+    for mark in body["marks"]:
+        book = books[mark["item_id"]]
+        assert mark["capture_count"] == len(book["captures"])
+        assert mark["latest_imported_at"] == book["latest_imported_at"]
+
+
+def test_capture_marks_do_not_disturb_the_poll(client, corrections_workspace):
+    del corrections_workspace
+    import server
+
+    client.get("/api/v1/corrections/index?workspace_id=local-library")
+    settled = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"]
+
+    client.get(
+        "/api/v1/corrections/index/capture-marks?workspace_id=local-library"
+    )
+
+    assert client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"] == settled
+    assert server._corrections_index_revision_cache["revision"] == settled
