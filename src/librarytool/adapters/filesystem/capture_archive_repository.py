@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
 import os
 import stat
+import threading
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -37,6 +40,9 @@ from .recoverable_write_set import (
 
 
 _ASSOCIATION_ROOT = PurePosixPath(".engine/capture-lib/associations")
+# One pinned read-only view per thread, for the span of one index build. The
+# sidecar serves requests on many threads, so this must never be global.
+_pinned_identity_view = threading.local()
 _RECEIPT_ROOT = PurePosixPath(".engine/receipts/capture-lib")
 _ARCHIVE_ROOT = PurePosixPath(".engine/capture-lib/objects")
 _MAX_DOCUMENT_BYTES = 128 * 1024
@@ -134,6 +140,11 @@ def _repository_failure(
 class FilesystemCaptureArchiveRepository:
     """Publish archive bytes, association sidecar, and receipt atomically."""
 
+    # Set only by :meth:`pinned_association_identities` for the span of one
+    # batch. ``None`` everywhere else, so every other caller keeps proving the
+    # full authority chain on each individual read.
+    _pinned_authority: _AuthoritySnapshot | None = None
+
     def __init__(
         self,
         write_set: RecoverableWriteSet,
@@ -156,14 +167,17 @@ class FilesystemCaptureArchiveRepository:
                 ) from exc
 
     @classmethod
-    def inspect_association(
+    def _read_only_view(
         cls,
         workspace_root: str | Path,
-        capture_id: str,
-    ) -> CaptureArchiveAssociation | None:
-        """Verify one association without creating locks or workspace files."""
+    ) -> "FilesystemCaptureArchiveRepository | None":
+        """Bind one verified workspace root without locks or workspace files.
 
-        capture_book_id(capture_id)
+        Returns ``None`` when the root is simply absent, which every caller
+        reads as "no association", and raises when the root exists but cannot
+        be trusted.
+        """
+
         configured = Path(workspace_root)
         if not os.path.lexists(configured):
             return None
@@ -184,6 +198,20 @@ class FilesystemCaptureArchiveRepository:
             ) from exc
         repository = cls.__new__(cls)
         repository._write_set = _ReadOnlyWorkspaceRoot(root)
+        return repository
+
+    @classmethod
+    def inspect_association(
+        cls,
+        workspace_root: str | Path,
+        capture_id: str,
+    ) -> CaptureArchiveAssociation | None:
+        """Verify one association without creating locks or workspace files."""
+
+        capture_book_id(capture_id)
+        repository = cls._read_only_view(workspace_root)
+        if repository is None:
+            return None
         association = repository._read_association(capture_id)
         if association is not None:
             repository._validate_archive(association)
@@ -207,27 +235,73 @@ class FilesystemCaptureArchiveRepository:
         """
 
         capture_book_id(capture_id)
-        configured = Path(workspace_root)
-        if not os.path.lexists(configured):
+        pinned = getattr(_pinned_identity_view, "view", None)
+        if pinned is not None and pinned[0] == Path(workspace_root):
+            repository = pinned[1]
+            if repository is None:
+                return None
+            return repository._read_association(capture_id)
+        repository = cls._read_only_view(workspace_root)
+        if repository is None:
             return None
-        try:
-            info = configured.lstat()
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or _is_redirecting_path(configured)
-            ):
-                raise ValueError("workspace root is redirecting or invalid")
-            root = configured.resolve(strict=True)
-        except (OSError, ValueError) as exc:
-            raise _repository_failure(
-                "the capture archive workspace cannot be inspected read-only",
-                code="invalid_capture_archive_storage",
-                cause=exc,
-                retryable=True,
-            ) from exc
-        repository = cls.__new__(cls)
-        repository._write_set = _ReadOnlyWorkspaceRoot(root)
         return repository._read_association(capture_id)
+
+    @classmethod
+    @contextlib.contextmanager
+    def pinned_association_identities(
+        cls,
+        workspace_root: str | Path,
+    ) -> Iterator[None]:
+        """Read many authoritative associations under one authority proof.
+
+        Every association sidecar lives in the same fixed directory, so
+        :meth:`inspect_association_identity` re-proves an identical
+        root-to-parent chain once per capture — five ``realpath`` walks and
+        roughly a hundred stat syscalls each. Building a Corrections index
+        over a thousand captures did that a thousand times while holding the
+        workspace lease, starving every other request.
+
+        This proves the shared chain once and then reads each leaf, keeping
+        every per-file guarantee: the leaf is still checked for redirects and
+        for being an unshared regular file, still read through the guarded
+        descriptor chain in ``_open_authorized_descriptor`` — which reopens
+        and revalidates each ancestor against the pinned inode, and rejects a
+        junction or symlink that appeared since, on *every* read — and still
+        parsed under the canonical-JSON, schema, and capture-identity checks.
+
+        Trust-model change, deliberate and narrow: the pinned ancestor inodes
+        are sampled once per batch instead of once per capture, so the window
+        for noticing that a legitimate ancestor was *replaced* widens from one
+        read to one index build. Detection itself is not lost — a replaced,
+        removed, or newly redirecting ancestor still fails the batch closed at
+        the next read — and containment is unaffected, because it is proved
+        from opened handles rather than from the pinned snapshot.
+
+        :meth:`inspect_association_identity` stays the only read seam, so
+        callers and their stubs are unaffected; it simply reuses this view
+        when one is pinned for the same root on this thread.
+        """
+
+        repository = cls._read_only_view(workspace_root)
+        if repository is not None:
+            # Every sidecar shares this directory, so any name inside it pins
+            # the same chain; the leaf itself is still proved per read.
+            repository._pinned_authority = repository._authority_snapshot(
+                repository._target(_ASSOCIATION_ROOT / "pin.json"),
+                artifact="capture_archive_association",
+            )
+        missing = object()
+        previous = getattr(_pinned_identity_view, "view", missing)
+        _pinned_identity_view.view = (Path(workspace_root), repository)
+        try:
+            yield
+        finally:
+            if repository is not None:
+                repository._pinned_authority = None
+            if previous is missing:
+                del _pinned_identity_view.view
+            else:
+                _pinned_identity_view.view = previous
 
     def replay(
         self,
@@ -899,6 +973,10 @@ class FilesystemCaptureArchiveRepository:
         artifact: str,
     ) -> _AuthoritySnapshot:
         target = self._safe_target(path, artifact=artifact)
+        if self._pinned_ancestor_depth(target):
+            # Proved once for this batch; ``_open_authorized_descriptor``
+            # revalidates each pinned inode again on every read below.
+            return self._pinned_authority
         root = self._write_set.root
         relative = target.relative_to(root)
         try:
@@ -958,6 +1036,22 @@ class FilesystemCaptureArchiveRepository:
             ) from exc
         return _AuthoritySnapshot(root, named_root, tuple(directories))
 
+    def _pinned_ancestor_depth(self, target: Path) -> int:
+        """Count ancestors a pinned batch already proved for this target.
+
+        Zero unless :meth:`pinned_association_identities` pinned a chain and
+        ``target`` sits directly inside it, so an unpinned read — and any read
+        of some other artifact — still walks every component itself.
+        """
+
+        pinned = self._pinned_authority
+        if pinned is None or not pinned.directories:
+            return 0
+        verified = pinned.directories[-1].path
+        if target.parent != verified:
+            return 0
+        return len(verified.relative_to(self._write_set.root).parts)
+
     def _safe_target(self, path: Path, *, artifact: str) -> Path:
         target = Path(path)
         try:
@@ -968,8 +1062,11 @@ class FilesystemCaptureArchiveRepository:
                 code="invalid_capture_archive_storage",
                 details={"artifact": artifact},
             ) from exc
+        # The guarded descriptor chain reproves every pinned ancestor on each
+        # open, so re-walking them here only repeats work already done.
+        pinned_depth = self._pinned_ancestor_depth(target)
         current = self._write_set.root
-        for part in relative.parts:
+        for depth, part in enumerate(relative.parts):
             if part in {"", ".", ".."}:
                 raise RepositoryError(
                     f"{artifact} has an unsafe storage target",
@@ -977,6 +1074,8 @@ class FilesystemCaptureArchiveRepository:
                     details={"artifact": artifact},
                 )
             current = current / part
+            if depth < pinned_depth:
+                continue
             if _is_redirecting_path(current):
                 raise RepositoryError(
                     f"{artifact} redirects through a filesystem link",

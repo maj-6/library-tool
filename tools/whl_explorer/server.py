@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -5981,6 +5981,39 @@ def _corrections_association(
         ) from exc
 
 
+@contextlib.contextmanager
+def _corrections_pinned_associations(capture_ids: Sequence[str]):
+    """Prove the association directory chain once for a whole index build.
+
+    Only identity-only reads qualify: an archive-verifying read reopens each
+    ``.lib`` object anyway, so it has nothing to gain and keeps its own
+    per-capture proof.
+    """
+
+    identity_only = getattr(
+        _corrections_authority_context,
+        "association_identity_only",
+        False,
+    )
+    if not identity_only or not capture_ids:
+        yield
+        return
+    try:
+        pinned = FilesystemCaptureArchiveRepository.pinned_association_identities(
+            Path(BUILDS_PATH).parent,
+        )
+    except EngineError:
+        raise
+    except Exception as exc:
+        raise _corrections_target_error(
+            "the capture archive association could not be inspected",
+            code="corrections_target_repository_unavailable",
+            cause_type=type(exc).__name__,
+        ) from exc
+    with pinned:
+        yield
+
+
 def _corrections_identity_claims(raw: Mapping) -> tuple[tuple[str, object], ...]:
     claims: list[tuple[str, object]] = [
         ("capture_book_id", raw.get("capture_book_id")),
@@ -6203,46 +6236,47 @@ def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
             )
 
     capture_authorities: dict[str, tuple[str, str, str]] = {}
-    for capture_id in capture_ids:
-        manual_values = manual_by_capture.get(capture_id, ())
-        build_values = build_by_capture.get(capture_id, ())
-        source = (manual_values or build_values)[0][1]
-        try:
-            discovered_identities = (
-                capture_lib_compat.discover_capture_build_identities(
-                    dict(build_values),
-                    ENTRIES_DIR,
-                    capture_id,
+    with _corrections_pinned_associations(capture_ids):
+        for capture_id in capture_ids:
+            manual_values = manual_by_capture.get(capture_id, ())
+            build_values = build_by_capture.get(capture_id, ())
+            source = (manual_values or build_values)[0][1]
+            try:
+                discovered_identities = (
+                    capture_lib_compat.discover_capture_build_identities(
+                        dict(build_values),
+                        ENTRIES_DIR,
+                        capture_id,
+                    )
+                    if build_values
+                    else {}
                 )
-                if build_values
-                else {}
-            )
-        except (OSError, TypeError, UnicodeError, ValueError) as exc:
-            raise _corrections_target_error(
-                "a capture's build identities could not be inspected",
-                code="invalid_corrections_target_snapshot",
-                capture_id=capture_id,
-                cause_type=type(exc).__name__,
-            ) from exc
-        authority = _corrections_capture_authority(
-            capture_id,
-            source,
-            discovered_identities=discovered_identities,
-        )
-        capture_authorities[capture_id] = authority
-        canonical_id = authority[0]
-        for storage_kind, values in (
-            ("manual", manual_by_capture.get(capture_id, ())),
-            ("build", build_by_capture.get(capture_id, ())),
-        ):
-            for storage_id, raw in values:
-                _corrections_validate_identity_claims(
-                    raw,
-                    canonical_id=canonical_id,
+            except (OSError, TypeError, UnicodeError, ValueError) as exc:
+                raise _corrections_target_error(
+                    "a capture's build identities could not be inspected",
+                    code="invalid_corrections_target_snapshot",
                     capture_id=capture_id,
-                    storage_kind=storage_kind,
-                    storage_id=storage_id,
-                )
+                    cause_type=type(exc).__name__,
+                ) from exc
+            authority = _corrections_capture_authority(
+                capture_id,
+                source,
+                discovered_identities=discovered_identities,
+            )
+            capture_authorities[capture_id] = authority
+            canonical_id = authority[0]
+            for storage_kind, values in (
+                ("manual", manual_by_capture.get(capture_id, ())),
+                ("build", build_by_capture.get(capture_id, ())),
+            ):
+                for storage_id, raw in values:
+                    _corrections_validate_identity_claims(
+                        raw,
+                        canonical_id=canonical_id,
+                        capture_id=capture_id,
+                        storage_kind=storage_kind,
+                        storage_id=storage_id,
+                    )
 
     targets: list[_CorrectionsTarget] = []
 

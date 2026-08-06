@@ -13,6 +13,7 @@ as a side effect of inspection.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -388,9 +389,16 @@ def _windows_path_is_below(candidate: str, authority_root: str) -> bool:
     return value[: len(root)] == root
 
 
-def _windows_descriptor_path(descriptor: int) -> str:
+@functools.lru_cache(maxsize=1)
+def _kernel32() -> Any:
+    """Bind kernel32 once.
+
+    Every authority proof calls into kernel32 a dozen times or more, and
+    rebuilding the ``WinDLL`` wrapper per call showed up as measurable load
+    while building a Corrections index over a thousand captures.
+    """
+
     import ctypes
-    import msvcrt
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -402,6 +410,29 @@ def _windows_descriptor_path(descriptor: int) -> str:
         wintypes.DWORD,
     )
     get_final_path.restype = wintypes.DWORD
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    return kernel32
+
+
+def _windows_descriptor_path(descriptor: int) -> str:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get_final_path = _kernel32().GetFinalPathNameByHandleW
     handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
     capacity = 32_768
     buffer = ctypes.create_unicode_buffer(capacity)
@@ -421,21 +452,9 @@ def _windows_open_directory_guard(path: Path) -> int:
     open_existing = 3
     flag_backup_semantics = 0x02000000
     flag_open_reparse_point = 0x00200000
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _kernel32()
     create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
     close_handle = kernel32.CloseHandle
-    close_handle.argtypes = (wintypes.HANDLE,)
-    close_handle.restype = wintypes.BOOL
     handle = create_file(
         str(path),
         file_read_attributes,
