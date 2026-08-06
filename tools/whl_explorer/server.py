@@ -105,6 +105,7 @@ from librarytool.adapters.filesystem.item_lifecycle_repository import (  # noqa:
 )
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
+    publication_generation,
 )
 from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
     WhlCatalogueItemCodec,
@@ -307,7 +308,13 @@ app.register_blueprint(
             lambda: _ensure_engine_session().raster_resource_resolver
         ),
         correction_index_context_for_request=(
-            lambda: _corrections_index_authority_context()
+            lambda: _corrections_index_recording_context()
+        ),
+        correction_index_probe_for_request=(
+            lambda: _corrections_index_probe()
+        ),
+        correction_index_revision_observer=(
+            lambda revision: _corrections_index_observed(revision)
         ),
         correction_item_service_for_request=(
             lambda: _corrections_item_engine()
@@ -5966,17 +5973,14 @@ def _corrections_build_storage_id(value) -> str:
 
 def _corrections_association(
         capture_id: str) -> CaptureArchiveAssociation | None:
+    # The only consumer of this is _corrections_capture_authority, and it reads
+    # exactly two fields off the result: book_id and state. Re-hashing every
+    # capture's .lib payload to obtain them cost about four seconds a request
+    # on a thousand-capture library — the archive bytes were verified and then
+    # discarded unread. Operations that actually consume archive bytes still go
+    # through inspect_association or get, which verify the payload in full.
     try:
-        inspect = (
-            FilesystemCaptureArchiveRepository.inspect_association_identity
-            if getattr(
-                _corrections_authority_context,
-                "association_identity_only",
-                False,
-            )
-            else FilesystemCaptureArchiveRepository.inspect_association
-        )
-        return inspect(
+        return FilesystemCaptureArchiveRepository.inspect_association_identity(
             Path(BUILDS_PATH).parent,
             capture_id,
         )
@@ -5993,19 +5997,13 @@ def _corrections_association(
 
 @contextlib.contextmanager
 def _corrections_pinned_associations(capture_ids: Sequence[str]):
-    """Prove the association directory chain once for a whole index build.
+    """Prove the association directory chain once per snapshot resolution.
 
-    Only identity-only reads qualify: an archive-verifying read reopens each
-    ``.lib`` object anyway, so it has nothing to gain and keeps its own
-    per-capture proof.
+    Every resolution reads every capture's association, so every one of them
+    benefits; the sidecars all live in the same directory.
     """
 
-    identity_only = getattr(
-        _corrections_authority_context,
-        "association_identity_only",
-        False,
-    )
-    if not identity_only or not capture_ids:
+    if not capture_ids:
         yield
         return
     try:
@@ -6141,6 +6139,208 @@ def _corrections_target_metadata(
     if canonical_id.startswith("b-"):
         metadata["canonical_book_id"] = canonical_id
     return metadata
+
+
+def _corrections_store_identity(path) -> tuple:
+    """Identify one input file precisely enough to notice any rewrite."""
+
+    try:
+        info = os.stat(path)
+    except OSError:
+        return ()
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_size),
+        int(getattr(info, "st_mtime_ns", 0)),
+        int(getattr(info, "st_ctime_ns", 0)),
+    )
+
+
+def _corrections_targets_fingerprint() -> tuple:
+    """Fingerprint every input `_resolve_corrections_targets_locked` reads.
+
+    That is: the two catalogue stores, every association sidecar, and the
+    per-build legacy identity files consulted when a capture has no
+    association. Anything that could change the resolved snapshot changes
+    this tuple, so a match means the cached snapshot still matches disk.
+    Cheaper than the rebuild by two orders of magnitude — the whole point —
+    but it is a stat of each input, not a timestamp heuristic.
+    """
+
+    associations = Path(BUILDS_PATH).parent / ".engine" / "capture-lib" / (
+        "associations"
+    )
+    try:
+        sidecars = tuple(sorted(os.listdir(associations)))
+    except OSError:
+        sidecars = ()
+    entries_root = Path(ENTRIES_DIR)
+    try:
+        legacy_identities = tuple(sorted(
+            name for name in os.listdir(entries_root)
+            if not name.startswith(".")
+        ))
+    except OSError:
+        legacy_identities = ()
+    return (
+        # The store paths themselves, so a snapshot can never survive a
+        # DATA_ROOT switch.
+        str(BUILDS_PATH),
+        str(lib.MANUAL_ENTRIES_PATH),
+        str(entries_root),
+        _corrections_store_identity(BUILDS_PATH),
+        _corrections_store_identity(lib.MANUAL_ENTRIES_PATH),
+        tuple(
+            (name, _corrections_store_identity(associations / name))
+            for name in sidecars
+        ),
+        tuple(
+            (
+                name,
+                _corrections_store_identity(
+                    entries_root / name / "ocr" / "lib-id.json"
+                ),
+            )
+            for name in legacy_identities
+        ),
+    )
+
+
+# Rebuilding this snapshot costs seconds on a large library, and the
+# Corrections editor polls the index every two seconds, so without this the
+# sidecar rebuilds it forever while a reviewer works. Only ever read and
+# written while holding the build and manual locks.
+_corrections_targets_cache: dict = {"fingerprint": None, "targets": None}
+
+
+# The revision the index last reported, and the input identity it was built
+# from. Lets the probe answer "still the same" without projecting 1008 books.
+_corrections_index_revision_cache: dict = {"token": None, "revision": None}
+_corrections_index_building = threading.local()
+
+
+def _corrections_index_token() -> str:
+    """Identify everything the Corrections index body is derived from.
+
+    Two parts, because the body has two kinds of input. The catalogue stores,
+    association sidecars, and legacy identity files are named files, so they
+    are stat'ed. Everything else the projection reads — per-item artifacts,
+    reviews, transforms — is published through the engine's write set, so a
+    count of published mutations stands in for all of it. The count is
+    deliberately coarse: any engine write at all changes the token, and the
+    only cost of that is an index rebuild the client would have done anyway.
+    """
+
+    encoded = repr((
+        _corrections_targets_fingerprint(),
+        publication_generation(),
+    )).encode("utf-8", "surrogatepass")
+    return "cix-" + hashlib.sha256(encoded).hexdigest()
+
+
+def _corrections_index_probe_revision() -> str:
+    """Report the index revision without building the index.
+
+    Returns the real revision while the inputs are untouched. Otherwise it
+    returns the input token itself, which cannot collide with a revision —
+    those are prefixed ``cri-`` — so a client comparing it against what it
+    last saw reloads exactly once and then settles on the rebuilt revision.
+    """
+
+    token = _corrections_index_token()
+    cached = _corrections_index_revision_cache
+    if cached["token"] == token and cached["revision"]:
+        return str(cached["revision"])
+    return token
+
+
+def _corrections_index_probe() -> dict:
+    """Answer the editor's poll without taking the workspace lease.
+
+    Deliberately lock-free: a probe that queued behind an index build would
+    reintroduce the stall it exists to remove. It only stats files and reads a
+    counter, so the worst a concurrent write can do is produce a token for a
+    moment that never quite existed — which reports "changed", and the client
+    refreshes. It cannot report "unchanged" for a state that has moved.
+    """
+
+    return {"revision": _corrections_index_probe_revision()}
+
+
+@contextlib.contextmanager
+def _corrections_index_recording_context():
+    """Run one index build and remember which inputs produced its revision."""
+
+    token = _corrections_index_token()
+    _corrections_index_building.revision = None
+    try:
+        with _corrections_index_authority_context():
+            yield
+        revision = getattr(_corrections_index_building, "revision", None)
+    finally:
+        _corrections_index_building.revision = None
+    # Publish the pair only if nothing moved across the whole build. Otherwise
+    # the next probe reports a token instead and the client refreshes once.
+    if revision and _corrections_index_token() == token:
+        _corrections_index_revision_cache["revision"] = revision
+        _corrections_index_revision_cache["token"] = token
+    else:
+        _corrections_index_revision_cache["token"] = None
+
+
+def _corrections_index_observed(revision: str) -> None:
+    """Receive the revision the index route just produced."""
+
+    if isinstance(revision, str) and revision:
+        _corrections_index_building.revision = revision
+
+
+def _corrections_targets_cache_clear() -> None:
+    """Drop the snapshot. Tests that replace an internal resolver need this.
+
+    The snapshot is a pure function of the fingerprinted files, so nothing in
+    production has to call it — but a test that monkeypatches, say,
+    `_corrections_association` has changed an input the fingerprint cannot
+    see, and must say so.
+    """
+
+    _corrections_targets_cache["fingerprint"] = None
+    _corrections_targets_cache["targets"] = None
+
+
+def _resolve_corrections_targets() -> dict[str, _CorrectionsTarget]:
+    """Reuse the resolved snapshot while its inputs are byte-for-byte intact.
+
+    The snapshot is derived solely from the fingerprinted files, so an exact
+    fingerprint match means rebuilding would reproduce it exactly. The editor
+    polls the index every two seconds and every per-item read resolves the
+    same snapshot, so without this the sidecar rebuilds it continuously while
+    a reviewer works.
+    """
+
+    try:
+        fingerprint = _corrections_targets_fingerprint()
+    except OSError:
+        fingerprint = None
+    if fingerprint is not None:
+        cached = _corrections_targets_cache
+        if cached["targets"] is not None and cached["fingerprint"] == (
+            fingerprint
+        ):
+            return cached["targets"]
+    targets = _resolve_corrections_targets_locked()
+    if fingerprint is not None and _corrections_targets_fingerprint() == (
+        fingerprint
+    ):
+        # Only publish when nothing moved underneath the rebuild; otherwise
+        # the next request re-reads rather than trusting a torn snapshot.
+        _corrections_targets_cache["fingerprint"] = fingerprint
+        _corrections_targets_cache["targets"] = targets
+    else:
+        _corrections_targets_cache["fingerprint"] = None
+        _corrections_targets_cache["targets"] = None
+    return targets
 
 
 def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
@@ -6592,7 +6792,7 @@ def _corrections_workspace_locks():
         return
     with _engine_workspace_locks(""):
         with _manual_lock:
-            targets = _resolve_corrections_targets_locked()
+            targets = _resolve_corrections_targets()
             _corrections_authority_context.targets = targets
             try:
                 yield
@@ -6602,24 +6802,16 @@ def _corrections_workspace_locks():
 
 @contextlib.contextmanager
 def _corrections_index_authority_context():
-    """Share one capture authority snapshot across the whole index read."""
+    """Share one capture authority snapshot across the whole index read.
 
-    missing = object()
-    previous = getattr(
-        _corrections_authority_context,
-        "association_identity_only",
-        missing,
-    )
-    _corrections_authority_context.association_identity_only = True
-    try:
-        with _ensure_engine_session().write_set.workspace_lease():
-            with _corrections_workspace_locks():
-                yield
-    finally:
-        if previous is missing:
-            del _corrections_authority_context.association_identity_only
-        else:
-            _corrections_authority_context.association_identity_only = previous
+    Capture authority is resolved from association identity alone on every
+    path now, so this no longer has to opt the index out of hashing archive
+    payloads; it exists to hold the lease across the whole read.
+    """
+
+    with _ensure_engine_session().write_set.workspace_lease():
+        with _corrections_workspace_locks():
+            yield
 
 
 @contextlib.contextmanager
@@ -29073,6 +29265,16 @@ if __name__ == "__main__":
     # The getters stay lazy, so an early submission just loads inline as before.
     def _warm_slow_indexes():
         time.sleep(6)
+        # Resolving the Corrections authority snapshot is the slowest thing
+        # between a reviewer and their first book, and every later read reuses
+        # it while the catalogue stores are untouched. Warm it first, and never
+        # let a cold-start failure here take down startup — the next request
+        # resolves it inline and reports the real error.
+        try:
+            with _corrections_workspace_locks():
+                pass
+        except Exception:
+            log.debug("corrections snapshot warm failed", exc_info=True)
         checks.get_renewals()
         checks.get_whl_catalog()
         _drives()

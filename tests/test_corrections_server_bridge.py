@@ -580,9 +580,27 @@ def test_corrections_index_resolves_capture_authority_once_per_capture(
     )
 
     assert second.status_code == 200
-    assert len(second.get_json()["books"]) == len(capture_ids)
-    # A fresh request gets a fresh bulk snapshot; nothing is cached globally.
+    assert second.get_json()["books"] == first.get_json()["books"]
+    # The editor polls this endpoint every two seconds. While every input is
+    # byte-for-byte intact the snapshot is reused rather than rebuilt.
+    assert inspected == list(capture_ids)
+
+    # The guarantee that matters is not "never cached" but "never stale": a
+    # changed store must be observed on the very next request.
+    builds["bulk-capture-1"]["title"] = "Bulk capture 1 renamed"
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, builds)
+
+    third = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+
+    assert third.status_code == 200
     assert inspected == [*capture_ids, *capture_ids]
+    assert any(
+        book["title"] == "Bulk capture 1 renamed"
+        for book in third.get_json()["books"]
+    )
 
 
 def test_capture_only_transform_loads_and_queues_without_native_text_layers(
@@ -1397,6 +1415,8 @@ def test_capture_fallback_is_deterministic_and_uncaptured_manual_is_omitted(
         "_corrections_association",
         lambda _value: persisted_association,
     )
+    # Replacing the resolver changes an input the store fingerprint cannot see.
+    server._corrections_targets_cache_clear()
     associated_snapshot = server._corrections_item_snapshot()
     assert list(associated_snapshot) == [BOOK_ID]
     assert associated_snapshot[BOOK_ID]["metadata"][
@@ -1536,6 +1556,8 @@ def test_manual_storage_alias_is_private_and_invalid_unicode_fails_closed(
         return real_load_json(path, default)
 
     monkeypatch.setattr(server.lib, "load_json", invalid_unicode_snapshot)
+    # Replacing the loader changes an input the store fingerprint cannot see.
+    server._corrections_targets_cache_clear()
     with pytest.raises(server.EngineRepositoryError) as invalid:
         server._corrections_item_snapshot()
     assert invalid.value.code == "invalid_corrections_target_snapshot"
@@ -2807,3 +2829,86 @@ def test_production_bridge_preserves_not_found_semantics(
     assert collection.get_json()["code"] == "item_not_found"
     assert mutation.status_code == 404
     assert mutation.get_json()["code"] == "item_not_found"
+
+
+def test_index_probe_reports_the_revision_without_projecting_the_index(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import librarytool_http.corrections as http_corrections
+    import server
+
+    projections = []
+    real_projection = http_corrections._corrections_index_projection
+
+    def counted_projection(*args, **kwargs):
+        projections.append(1)
+        return real_projection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        http_corrections,
+        "_corrections_index_projection",
+        counted_projection,
+    )
+
+    index = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert index.status_code == 200
+    revision = index.get_json()["revision"]
+    assert revision.startswith("cri-")
+    assert len(projections) == 1
+
+    for _ in range(3):
+        probe = client.get(
+            "/api/v1/corrections/index/probe?workspace_id=local-library"
+        )
+        assert probe.status_code == 200
+        body = probe.get_json()
+        assert body == {
+            "ok": True,
+            "schema": "librarytool.corrections-index-probe/1",
+            "revision": revision,
+        }
+    # The editor polls this every two seconds; it must never rebuild the index.
+    assert len(projections) == 1
+
+    # A changed store is reported immediately, and cannot be mistaken for a
+    # revision, so a client that compares the two reloads exactly once.
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {"probe-build": {"id": "probe-build", "title": "Probe build"}},
+        )
+    changed = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"]
+    assert changed != revision
+    assert not changed.startswith("cri-")
+    assert len(projections) == 1
+
+    reloaded = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert reloaded.status_code == 200
+    assert len(projections) == 2
+    settled = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"]
+    assert settled == reloaded.get_json()["revision"]
+
+
+def test_index_probe_rejects_a_foreign_workspace(client, corrections_workspace):
+    del corrections_workspace
+
+    missing = client.get("/api/v1/corrections/index/probe")
+    other = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=someone-else"
+    )
+
+    assert missing.status_code == 400
+    assert missing.get_json()["code"] == "invalid_corrections_workspace"
+    assert other.status_code == 409
+    assert other.get_json()["code"] == "corrections_workspace_mismatch"

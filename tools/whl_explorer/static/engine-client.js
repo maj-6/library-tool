@@ -2273,6 +2273,8 @@
       this.corrections = Object.freeze({
         index: (args) =>
           this._correctionsIndex(args),
+        indexProbe: (args) =>
+          this._correctionsIndexProbe(args),
         assignImageCategory: (args) =>
           this._correctionAssignImageCategory(args),
         clearImageCategory: (args) =>
@@ -3613,6 +3615,29 @@
             "GET", path, body, undefined, status);
         }
         return index;
+      });
+    }
+
+    _correctionsIndexProbe({ workspaceId, signal } = {}) {
+      const workspace = portableIdentifier(workspaceId, "workspaceId");
+      const path = "/v1/corrections/index/probe";
+      return this._requestJson("GET", path, {
+        query: { workspace_id: workspace },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "revision",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.corrections-index-probe/1" ||
+            typeof body.revision !== "string" || !body.revision ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid Corrections index probe",
+            "GET", path, body, undefined, status);
+        }
+        return { schema: body.schema, revision: body.revision };
       });
     }
 
