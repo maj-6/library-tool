@@ -380,7 +380,7 @@ def test_datalab_normalizes_all_documented_output_shapes(monkeypatch, shape):
     assert seen["headers"]["Prefer"].startswith("wait=")
     import json as _json
     body = _json.loads(seen["body"].decode("utf-8"))
-    assert body["input"]["image"].startswith("data:image/jpeg;base64,")
+    assert body["input"]["file"].startswith("data:image/jpeg;base64,")
 
     assert result["engine"] == "datalab-ocr"
     assert result["model"] == "datalab-to/ocr"
