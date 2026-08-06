@@ -2195,11 +2195,24 @@ class FilesystemCorrectionsArtifactRepository(
         current = root
         for index, part in enumerate(relative.parts):
             if part in {"", ".", ".."}:
-                # Rejecting traversal outright is what lets the containment
-                # proof below be lexical: with no ".." and no redirecting
-                # component, a path that is under the root by name is under it
-                # in fact. Resolving every path to prove the same thing walked
-                # the whole chain per call, thousands of times per index.
+                # Traversal is refused by name, as the sibling stores do in
+                # their own _safe_target. Do NOT read this walk as a complete
+                # containment proof: `relative_to` above compares
+                # case-insensitively on Windows, so a sibling directory that
+                # differs only by case — or by a character that lowercases onto
+                # one, such as U+212A KELVIN SIGN against "k" — satisfies it
+                # while being a different directory on disk. Resolving the path
+                # here did not close that either, because it canonicalises and
+                # then compares the same way.
+                #
+                # What actually proves containment is the guarded descriptor
+                # chain in _open_verified_regular: it compares
+                # GetFinalPathNameByHandle output case-exactly, per read. Every
+                # caller that opens a file goes through it. The two that do not
+                # — _managed_directory below, and _capture_index_resource_state
+                # — are safe only because the identity resolvers upstream feed
+                # a single regex-validated ASCII component. Loosen one of those
+                # and this walk will not save you.
                 raise _repository_error(
                     "a Corrections store path escapes the workspace",
                     code="unsafe_corrections_store_path",
