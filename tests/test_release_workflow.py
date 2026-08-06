@@ -267,6 +267,30 @@ def test_publication_is_atomic_and_registration_follows_publication():
     )
 
 
+def test_downloads_credential_is_required_before_github_publication():
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+    credential_step = publish[
+        publish.index("      - name: Require Downloads registrar credential")
+        : publish.index("      - name: GitHub Release")
+    ]
+    registration_step = publish[
+        publish.index("      - name: Register on the Downloads page") :
+    ]
+
+    secret_expression = (
+        "${{ secrets.SUPABASE_RELEASE_SECRET_KEY || "
+        "secrets.SUPABASE_SERVICE_ROLE_KEY }}"
+    )
+    assert secret_expression in credential_step
+    assert "::error::No Supabase release registrar credential is configured." in (
+        credential_step
+    )
+    assert "exit 1" in credential_step
+    assert "python3 tools/release_publish.py --check-credentials" in credential_step
+    assert secret_expression in registration_step
+    assert "exit 0" not in registration_step
+
+
 def test_desktop_job_requires_the_complete_updater_artifact_set():
     desktop = _job("desktop", "publish")
 

@@ -20,9 +20,9 @@ Where the file itself lives is a separate question, hence two modes:
   them (the page shows blanks, nothing breaks).
 
 Credentials: set SUPABASE_URL / SUPABASE_KEY in the environment. Writing
-`releases` needs the service_role key — RLS leaves anon read-only — and the
-role is read out of the JWT up front so a wrong key fails with a sentence
-instead of a PostgREST 401.
+`releases` needs a modern secret key or the legacy service_role key — RLS
+leaves public keys read-only — and the credential kind is checked up front so
+a wrong key fails with a sentence instead of a PostgREST 401.
 """
 from __future__ import annotations
 
@@ -53,13 +53,37 @@ def config() -> dict:
 
 
 def key_role(key: str) -> str:
-    """service_role or anon, read straight out of the JWT (no verification)."""
+    """Identify modern opaque keys or read a legacy JWT role without verification."""
+    if key.startswith("sb_secret_"):
+        return "secret"
+    if key.startswith("sb_publishable_"):
+        return "publishable"
     try:
         payload = key.split(".")[1]
         payload += "=" * (-len(payload) % 4)
         return json.loads(base64.urlsafe_b64decode(payload)).get("role", "?")
     except Exception:
         return "?"
+
+
+def is_server_credential(key: str) -> bool:
+    """Return whether the key is allowed to perform owner-side release writes."""
+    return key_role(key) in {"secret", "service_role"}
+
+
+def require_server_credential(cfg: dict) -> None:
+    """Reject public, malformed, or user-scoped credentials before any write."""
+    role = key_role(cfg["key"])
+    if not is_server_credential(cfg["key"]):
+        sys.exit(f"the key's role is {role!r}; writing `releases` needs the "
+                 "Supabase secret key or legacy service_role key "
+                 "(public keys are read-only by RLS design).")
+
+
+def check_server_credential(cfg: dict) -> None:
+    """Validate the registrar key against Supabase without changing data."""
+    require_server_credential(cfg)
+    sb._rest(cfg, "GET", "releases?select=id&limit=1")
 
 
 def ensure_bucket(cfg: dict) -> None:
@@ -80,16 +104,29 @@ def ensure_bucket(cfg: dict) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("artifact", nargs="?", help="file to upload and/or hash")
-    ap.add_argument("--platform", required=True, choices=PLATFORMS)
-    ap.add_argument("--version", required=True)
+    ap.add_argument("--platform", choices=PLATFORMS)
+    ap.add_argument("--version")
     ap.add_argument("--channel", default="stable")
     ap.add_argument("--notes", default="")
     ap.add_argument("--url", default="",
                     help="register this URL instead of uploading to the bucket")
     ap.add_argument("--sha256", default="", help="with --url and no local file")
     ap.add_argument("--bytes", type=int, default=0, help="with --url and no local file")
+    ap.add_argument(
+        "--check-credentials",
+        action="store_true",
+        help="verify the configured server credential without changing data",
+    )
     args = ap.parse_args()
 
+    if args.check_credentials:
+        check_server_credential(config())
+        print("Supabase release registrar credential is valid")
+        return
+    if not args.platform:
+        ap.error("--platform is required when publishing")
+    if not args.version:
+        ap.error("--version is required when publishing")
     if not args.artifact and not args.url:
         ap.error("nothing to publish: give a file, a --url, or both")
 
@@ -103,10 +140,7 @@ def main() -> None:
         sha256, size = hashlib.sha256(data).hexdigest(), len(data)
 
     cfg = config()
-    role = key_role(cfg["key"])
-    if role != "service_role":
-        sys.exit(f"the key's role is {role!r}; writing `releases` needs the "
-                 "service_role key (anon is read-only by RLS design).")
+    require_server_credential(cfg)
 
     url = args.url
     if not url:

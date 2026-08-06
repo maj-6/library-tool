@@ -172,7 +172,8 @@ and the artifacts are inspectable, nothing is published.
 |---|---|---|
 | `SUPABASE_URL` | variable | baked into the APK; **required for tagged Android builds** because the app has no in-app project fallback |
 | `SUPABASE_ANON_KEY` | variable | public anon key baked into the APK; **required for tagged Android builds** |
-| `SUPABASE_SERVICE_ROLE_KEY` | secret | writes to `releases` (anon is read-only by RLS). Without it the GitHub Release still publishes; register the row through a trusted administrative path. |
+| `SUPABASE_RELEASE_SECRET_KEY` | secret | preferred dedicated `sb_secret_…` key for writing release rows. A tagged publish fails before creating the GitHub Release when neither registrar credential is available. |
+| `SUPABASE_SERVICE_ROLE_KEY` | secret | legacy service-role JWT fallback while migrating to `SUPABASE_RELEASE_SECRET_KEY`; never bundle either server credential into an app. |
 | `ANDROID_KEYSTORE_B64` | secret | **required to publish Android on a tag.** base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
 | `ANDROID_KEYSTORE_PASSWORD` | secret | its password |
 | `ANDROID_KEY_ALIAS` | secret | `bookcapture` |
@@ -224,8 +225,9 @@ So treat it as unrecoverable-if-lost and back it up accordingly:
 ## By hand (no CI)
 
 `tools/release_publish.py` does the registration half on its own. Set
-`SUPABASE_URL` and the service-role `SUPABASE_KEY` in the environment; the
-standalone publisher never reads desktop UI state or its protected secrets:
+`SUPABASE_URL` and a modern secret-key (preferred) or legacy service-role
+`SUPABASE_KEY` in the environment; the standalone publisher never reads
+desktop UI state or its protected secrets:
 
 ```
 # upload a local file to the public `releases` bucket and register it

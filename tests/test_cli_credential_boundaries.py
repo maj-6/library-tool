@@ -1,6 +1,7 @@
 """Standalone tools must not recover credentials from desktop UI state."""
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -59,6 +60,56 @@ def _message(exc: pytest.ExceptionInfo[SystemExit], *env_names: str) -> str:
     assert "client_state" not in message
     assert "Settings" not in message
     return message
+
+
+def _jwt(role: str) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"role": role}, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
+@pytest.mark.parametrize(
+    ("key", "role", "allowed"),
+    [
+        ("sb_secret_release_registrar", "secret", True),
+        ("sb_publishable_public_client", "publishable", False),
+        (_jwt("service_role"), "service_role", True),
+        (_jwt("anon"), "anon", False),
+        ("not-a-key", "?", False),
+    ],
+)
+def test_release_publisher_accepts_only_server_credentials(
+    key: str, role: str, allowed: bool
+):
+    assert release_publish.key_role(key) == role
+    assert release_publish.is_server_credential(key) is allowed
+
+
+def test_release_publisher_credential_check_is_read_only(monkeypatch, capsys):
+    monkeypatch.setenv("SUPABASE_URL", "https://operator.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "sb_secret_release_registrar")
+    calls = []
+
+    def rest(cfg, method, path):
+        calls.append((cfg, method, path))
+
+    monkeypatch.setattr(release_publish.sb, "_rest", rest)
+    monkeypatch.setattr(
+        "sys.argv", ["release_publish.py", "--check-credentials"]
+    )
+
+    release_publish.main()
+
+    assert calls == [(
+        {
+            "url": "https://operator.supabase.co",
+            "key": "sb_secret_release_registrar",
+        },
+        "GET",
+        "releases?select=id&limit=1",
+    )]
+    assert "credential is valid" in capsys.readouterr().out
 
 
 def test_supabase_clis_ignore_poisoned_client_state(poisoned_client_state):
