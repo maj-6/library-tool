@@ -752,6 +752,49 @@ class PerspectiveTransformResult:
         return {"source": self.source_sha256, "output": self.output_sha256}
 
 
+def _mask_crop_box(alpha: Image.Image) -> tuple[int, int, int, int]:
+    """Return the tight opaque box of a mask, widened to a renderable size.
+
+    An extracted figure whose polygon covers a sliver would otherwise become a
+    one-pixel strip that no downstream consumer can use, so the box is grown
+    (staying inside the frame) until both edges are at least two pixels.
+    """
+
+    box = alpha.getbbox()
+    if box is None:
+        raise RasterInputError(
+            "mask polygon does not cover any pixel of the corrected output"
+        )
+    left, upper, right, lower = box
+    width, height = alpha.size
+    if right - left < 2:
+        left = max(0, min(left, width - 2))
+        right = left + 2
+    if lower - upper < 2:
+        upper = max(0, min(upper, height - 2))
+        lower = upper + 2
+    return left, upper, right, lower
+
+
+def _crop_normalizer(
+    box: tuple[int, int, int, int],
+    output_width: int,
+    output_height: int,
+) -> Matrix3:
+    """Map old output-normalized coordinates onto a cropped output frame."""
+
+    left, upper, right, lower = box
+    cropped_width = right - left
+    cropped_height = lower - upper
+    horizontal = float(output_width - 1) / float(max(cropped_width - 1, 1))
+    vertical = float(output_height - 1) / float(max(cropped_height - 1, 1))
+    return (
+        (horizontal, 0.0, -float(left) / float(max(cropped_width - 1, 1))),
+        (0.0, vertical, -float(upper) / float(max(cropped_height - 1, 1))),
+        (0.0, 0.0, 1.0),
+    )
+
+
 def _mask_alpha(
     polygon: NormalizedPolygon,
     output_pixel_to_source_pixel: Matrix3,
@@ -1104,6 +1147,7 @@ def apply_perspective_transform(
     adjustment: ManualBinaryAdjustRecipe | None = None,
     operations: Sequence["ProcessingOperation"] | None = None,
     mask_polygon: Iterable[Iterable[float]] | None = None,
+    crop_to_mask: bool = False,
     limits: RasterLimits | None = None,
 ) -> PerspectiveTransformResult:
     """Rectify an explicit normalized quad into a new lossless PNG.
@@ -1132,6 +1176,11 @@ def apply_perspective_transform(
     validated_polygon = (
         None if mask_polygon is None else validate_normalized_polygon(mask_polygon)
     )
+    if not isinstance(crop_to_mask, bool):
+        raise TypeError("crop_to_mask must be a boolean")
+    if crop_to_mask and validated_polygon is None:
+        raise RasterInputError("crop_to_mask requires a mask polygon")
+    crop_box: tuple[int, int, int, int] | None = None
     if adjustment is not None and not isinstance(adjustment, ManualBinaryAdjustRecipe):
         raise TypeError("adjustment must be a ManualBinaryAdjustRecipe or None")
     selected_operations = tuple(operations or ())
@@ -1233,6 +1282,28 @@ def apply_perspective_transform(
         # than drop the adjustment's work.
         masked = transformed.convert("RGBA")
         masked.putalpha(alpha)
+        if crop_to_mask:
+            box = _mask_crop_box(alpha)
+            masked = masked.crop(box)
+            crop_box = box
+            # Cropping moves the output origin, so the published homography has
+            # to absorb it. Every consumer maps source-normalized coordinates
+            # through this one matrix; leaving it describing the uncropped frame
+            # would silently misplace annotations on the extracted figure.
+            normalized_forward = _canonical_matrix(
+                _normalize_matrix(
+                    _matrix_multiply(
+                        _crop_normalizer(
+                            box,
+                            output_width,
+                            output_height,
+                        ),
+                        normalized_forward,
+                    )
+                )
+            )
+            output_width = masked.width
+            output_height = masked.height
         output_png = _encode_png(masked)
         white = Image.new("RGBA", masked.size, (255, 255, 255, 255))
         flattened = Image.alpha_composite(white, masked)
@@ -1278,6 +1349,12 @@ def apply_perspective_transform(
             None
             if validated_polygon is None
             else [[x, y] for x, y in validated_polygon]
+        ),
+        "mask_crop_box": None if crop_box is None else list(crop_box),
+        "mask_crop_rule": (
+            None
+            if crop_box is None
+            else "tight_alpha_bbox_widened_to_2px; homography composed with the crop"
         ),
         "mask_rule": (
             None

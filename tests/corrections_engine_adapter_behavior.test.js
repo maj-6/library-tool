@@ -2447,3 +2447,198 @@ test("production books port bounds unique zero-progress history cursors",
     );
     assert.equal(pageCalls, 1);
   });
+
+
+function extractionCommand(overrides = {}) {
+  return transformCommand({
+    rerun_ocr: false,
+    mask_polygon: [[0.2, 0.2], [0.8, 0.2], [0.8, 0.7], [0.2, 0.7]],
+    extract: true,
+    extract_category: "title_page",
+    operation_id: "extract-op-1",
+    ...overrides,
+  });
+}
+
+
+// The engine mirrors the extraction keys into input_revisions.transform only
+// when the command carries them, exactly as it does for mask_polygon.
+function extractionJob(command, overrides = {}) {
+  const job = transformJob(command, overrides);
+  job.input_revisions.transform = {
+    ...job.input_revisions.transform,
+    ...(command.extract === true ? { extract: true } : {}),
+    ...(command.extract_category
+      ? { extract_category: command.extract_category }
+      : {}),
+  };
+  return job;
+}
+
+
+function extractionOutputs() {
+  return [
+    {
+      kind: "extracted-figure",
+      ref: "result-extracted-figure-1",
+      partial: false,
+    },
+    {
+      kind: "transform-manifest",
+      ref: "result-transform-manifest-1",
+      partial: false,
+    },
+  ];
+}
+
+
+function terminalOverrides(outputs) {
+  return {
+    state: "done",
+    progress: { completed: 6, total: 6, unit: "phase", phase: "complete" },
+    cancellable: false,
+    revision: 4,
+    updated_at: "2026-08-05T12:00:02Z",
+    finished_at: "2026-08-05T12:00:02Z",
+    note: "correction complete",
+    outputs,
+  };
+}
+
+
+test("an extraction publication validates and surfaces its figure artifact", () => {
+  const command = extractionCommand();
+  const job = extractionJob(command, terminalOverrides(extractionOutputs()));
+
+  const normalized = correctionTransformJob(job, command, job.id);
+
+  assert.equal(normalized.input_revisions.transform.extract, true);
+  assert.equal(
+    normalized.input_revisions.transform.extract_category,
+    "title_page",
+  );
+
+  const result = correctionTransformTerminalResult(normalized, command);
+
+  assert.equal(result.terminal_state, "done");
+  assert.deepEqual(result.image_commit.outputs, [
+    { kind: "extracted-figure", artifact_id: "result-extracted-figure-1" },
+    { kind: "transform-manifest", artifact_id: "result-transform-manifest-1" },
+  ]);
+  assert.equal(result.ocr_followup.state, "not_requested");
+  assert.equal(result.ocr_followup.source, null);
+  assert.equal(result.failure, null);
+
+  // The extraction profile stays complete: its manifest alone is a torn commit.
+  const torn = extractionJob(
+    command,
+    terminalOverrides(
+      extractionOutputs().filter(
+        (output) => output.kind !== "extracted-figure",
+      ),
+    ),
+  );
+  assert.throws(
+    () => correctionTransformTerminalResult(
+      correctionTransformJob(torn, command, torn.id),
+      command,
+    ),
+    (error) => error.code === "invalid-transform-job-result" &&
+      /incomplete image commit/.test(error.message),
+  );
+});
+
+
+test("a correction publication still requires all four image kinds", () => {
+  const command = transformCommand({ rerun_ocr: false });
+  const complete = transformJob(command, terminalOverrides(transformOutputs()));
+
+  const result = correctionTransformTerminalResult(
+    correctionTransformJob(complete, command, complete.id),
+    command,
+  );
+
+  assert.deepEqual(
+    result.image_commit.outputs.map((output) => output.kind),
+    ["corrected-display", "ocr-ready", "thumbnail", "transform-manifest"],
+  );
+
+  // A command that never declared an extraction cannot publish one.
+  const extracted = transformJob(
+    command,
+    terminalOverrides(extractionOutputs()),
+  );
+  assert.throws(
+    () => correctionTransformTerminalResult(
+      correctionTransformJob(extracted, command, extracted.id),
+      command,
+    ),
+    (error) => error.code === "invalid-transform-job-result" &&
+      /incomplete image commit/.test(error.message),
+  );
+});
+
+
+test("a correction publication missing its display rendition is rejected", () => {
+  const command = transformCommand({ rerun_ocr: false });
+  const torn = transformJob(
+    command,
+    terminalOverrides(
+      transformOutputs().filter(
+        (output) => output.kind !== "corrected-display",
+      ),
+    ),
+  );
+
+  assert.throws(
+    () => correctionTransformTerminalResult(
+      correctionTransformJob(torn, command, torn.id),
+      command,
+    ),
+    (error) => error.code === "invalid-transform-job-result" &&
+      /incomplete image commit/.test(error.message),
+  );
+
+  const empty = transformJob(command, terminalOverrides([]));
+  assert.throws(
+    () => correctionTransformTerminalResult(
+      correctionTransformJob(empty, command, empty.id),
+      command,
+    ),
+    (error) => error.code === "invalid-transform-job-result" &&
+      /no image outputs/.test(error.message),
+  );
+});
+
+
+test("extraction command keys are validated the way the engine emits them", () => {
+  const rejected = [
+    // Never emitted false: an absent extraction omits the key entirely.
+    extractionCommand({ extract: false }),
+    // An extraction is a masked region, and it owns no OCR-ready rendition.
+    extractionCommand({ mask_polygon: undefined }),
+    extractionCommand({ rerun_ocr: true }),
+    extractionCommand({ extract_category: "frontispiece" }),
+    transformCommand({ rerun_ocr: false, extract_category: "cover" }),
+  ];
+  for (const command of rejected) {
+    if (command.mask_polygon === undefined) delete command.mask_polygon;
+    const job = extractionJob(command, terminalOverrides(extractionOutputs()));
+    assert.throws(
+      () => correctionTransformJob(job, command, job.id),
+      (error) => error.code === "invalid-transform-job-result",
+    );
+  }
+
+  // The mirrored projection must carry the declared keys.
+  const command = extractionCommand();
+  const unmirrored = transformJob(
+    command,
+    terminalOverrides(extractionOutputs()),
+  );
+  assert.throws(
+    () => correctionTransformJob(unmirrored, command, unmirrored.id),
+    (error) => error.code === "invalid-transform-job-result" &&
+      /input revisions are invalid/.test(error.message),
+  );
+});

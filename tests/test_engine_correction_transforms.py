@@ -1522,3 +1522,105 @@ def test_operations_change_the_rendered_outputs() -> None:
     assert plain.output("corrected-display").content_sha256 != (
         processed.output("corrected-display").content_sha256
     )
+
+
+EXTRACT_MASK = ((0.2, 0.2), (0.8, 0.3), (0.5, 0.8))
+
+
+def _extract(source: CorrectionSourceSnapshot | None = None, **changes):
+    values = {"extract": True, "mask_polygon": EXTRACT_MASK, "rerun_ocr": False}
+    values.update(changes)
+    return _command(source, **values)
+
+
+def test_an_extraction_publishes_a_single_figure_and_its_manifest() -> None:
+    from librarytool.engine.correction_transforms import EXTRACTION_OUTPUT_KINDS
+
+    source = _source()
+    draft = _build_commit_draft(_extract(source), source, thumbnail_max_edge=64)
+
+    assert tuple(value.kind for value in draft.outputs) == EXTRACTION_OUTPUT_KINDS
+    with Image.open(io.BytesIO(draft.output("extracted-figure").content)) as figure:
+        assert figure.mode == "RGBA"
+        # Cropped to the mask rather than published at page size.
+        assert figure.width < source.artifact.dimensions.width
+
+
+def test_a_correction_still_publishes_all_four_outputs() -> None:
+    source = _source()
+    draft = _build_commit_draft(_command(source), source, thumbnail_max_edge=64)
+
+    assert tuple(value.kind for value in draft.outputs) == CORRECTION_OUTPUT_KINDS
+
+
+def test_an_extraction_does_not_carry_page_annotations_onto_the_crop() -> None:
+    source = _source()
+    correction = _build_commit_draft(_command(source), source, thumbnail_max_edge=64)
+    extraction = _build_commit_draft(_extract(source), source, thumbnail_max_edge=64)
+
+    assert correction.mapped_annotations
+    assert extraction.mapped_annotations == ()
+    assert extraction.dropped_annotation_ids == ()
+
+
+def test_an_extraction_manifest_records_a_non_inheriting_lineage_relation() -> None:
+    source = _source()
+    extraction = json.loads(
+        _build_commit_draft(
+            _extract(source, extract_category="cover"),
+            source,
+            thumbnail_max_edge=64,
+        ).output("transform-manifest").content
+    )
+    correction = json.loads(
+        _build_commit_draft(
+            _command(source),
+            source,
+            thumbnail_max_edge=64,
+        ).output("transform-manifest").content
+    )
+
+    # "cropped_from" is deliberately outside _CATEGORY_LINEAGE_RELATIONS: a figure
+    # must not inherit the category of the page it was cut out of, or an
+    # INHERITED assignment would outrank the figure's own.
+    from librarytool.engine.correction_projection import _CATEGORY_LINEAGE_RELATIONS
+
+    assert extraction["lineage_relation"] == "cropped_from"
+    assert extraction["lineage_relation"] not in _CATEGORY_LINEAGE_RELATIONS
+    assert correction["lineage_relation"] == "processed_from"
+    assert correction["lineage_relation"] in _CATEGORY_LINEAGE_RELATIONS
+    assert extraction["extract_category"] == "cover"
+    assert extraction["output_profile"] == ["extracted-figure", "transform-manifest"]
+
+
+def test_extraction_commands_are_validated_at_the_boundary() -> None:
+    source = _source()
+
+    with pytest.raises(ValidationError, match="requires a mask polygon"):
+        _command(source, extract=True)
+    with pytest.raises(ValidationError, match="cannot request an OCR follow-up"):
+        _extract(source, rerun_ocr=True)
+    with pytest.raises(ValidationError, match="canonical image vocabulary"):
+        _extract(source, extract_category="frontispiece")
+    with pytest.raises(ValidationError, match="extract_category requires extract"):
+        _command(source, extract_category="cover")
+
+
+def test_extract_rides_the_optional_wire_slot_without_moving_old_fingerprints() -> None:
+    source = _source()
+    plain = _command(source)
+    extraction = _extract(source, extract_category="spine")
+
+    assert "extract" not in plain.as_dict()
+    assert "extract_category" not in plain.as_dict()
+    assert extraction.as_dict()["extract"] is True
+    assert extraction.as_dict()["extract_category"] == "spine"
+    assert CorrectionTransformCommand.from_dict(extraction.as_dict()) == extraction
+    assert extraction.fingerprint != plain.fingerprint
+
+    projected = CorrectionTransformService._job_record(extraction, "job-1")
+    assert projected["input_revisions"]["transform"]["extract"] is True
+    assert projected["input_revisions"]["transform"]["extract_category"] == "spine"
+    assert "extract" not in CorrectionTransformService._job_record(
+        plain, "job-2"
+    )["input_revisions"]["transform"]

@@ -1815,7 +1815,7 @@
   // features existed. See _COMMAND_OPTIONAL_FIELDS in
   // librarytool/engine/correction_transforms.py for the full rationale.
   const CORRECTION_TRANSFORM_COMMAND_OPTIONAL_FIELDS = [
-    "mask_polygon", "operations",
+    "mask_polygon", "operations", "extract", "extract_category",
   ];
   const CORRECTION_TRANSFORM_COMMAND_ALLOWED_FIELDS = [
     ...CORRECTION_TRANSFORM_COMMAND_FIELDS,
@@ -1980,6 +1980,30 @@
       (value.operations.length > 0 || value.adjustment !== null);
   }
 
+  // `extract` is emitted only when it is true — a false would change the
+  // canonical document of every command that does not extract, and therefore
+  // its fingerprint. A carried `"extract": false` is thus a document the engine
+  // could never have produced, so it is malformed rather than merely redundant.
+  function isCorrectionExtract(value) {
+    return value === undefined || value === true;
+  }
+
+  function isCorrectionExtractCategory(value) {
+    return value === undefined ||
+      (typeof value === "string" && IMAGE_CATEGORIES.includes(value));
+  }
+
+  // Mirrors CorrectionTransformCommand.__post_init__: an extraction crops one
+  // region, so it needs the polygon that bounds it and has no OCR-ready
+  // rendition for a follow-up to pin, and a category only means anything when
+  // there is an extracted figure to categorize.
+  function isCorrectionExtraction(value) {
+    const extracts = value.extract === true;
+    if (Object.hasOwn(value, "extract_category") && !extracts) return false;
+    if (!extracts) return true;
+    return value.mask_polygon !== undefined && value.rerun_ocr !== true;
+  }
+
   function isCorrectionTransformCommand(value) {
     return hasAllowedKeys(
       value,
@@ -1988,6 +2012,9 @@
     ) &&
       isCorrectionMaskPolygon(value.mask_polygon) &&
       isCorrectionOperations(value.operations) &&
+      isCorrectionExtract(value.extract) &&
+      isCorrectionExtractCategory(value.extract_category) &&
+      isCorrectionExtraction(value) &&
       value.schema === "org.whl.correction-transform-command" &&
       value.version === 1 && Number.isSafeInteger(value.version) &&
       isPortableIdentifier(value.item_id) &&
@@ -2033,9 +2060,18 @@
   function isCorrectionTransformInput(value, command) {
     if (!hasAllowedKeys(
       value,
-      ["quad", "adjustment", "rerun_ocr", "mask_polygon", "operations"],
+      [
+        "quad", "adjustment", "rerun_ocr", "mask_polygon", "operations",
+        "extract", "extract_category",
+      ],
       ["quad", "adjustment", "rerun_ocr"],
     ) ||
+        !isCorrectionExtract(value.extract) ||
+        !isCorrectionExtractCategory(value.extract_category) ||
+        // The projection is omitted-unless-carried on both sides, so an absent
+        // key must stay absent and a carried one must match the command.
+        value.extract !== command.extract ||
+        value.extract_category !== command.extract_category ||
         !sameCorrectionOperations(value.operations, command.operations) ||
         value.rerun_ocr !== command.rerun_ocr ||
         !Array.isArray(value.quad) ||
@@ -2102,6 +2138,11 @@
         (!isObject(value.error) || typeof value.error.code !== "string" ||
           typeof value.error.message !== "string" ||
           typeof value.error.retryable !== "boolean")) return false;
+    // Output kinds stay deliberately open here. Which profile a job publishes
+    // is the command's business — correction renditions or a single extracted
+    // figure (see OUTPUT_PROFILES in correction_transforms.py) — and a done job
+    // may carry an appended `ocr-proposal` beyond either profile. The client
+    // guards the envelope; completeness is the engine's invariant.
     return value.outputs.every((output) =>
       hasExactKeys(output, ["kind", "ref", "partial"]) &&
       isPortableIdentifier(output.kind) &&

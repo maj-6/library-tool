@@ -669,3 +669,87 @@ def test_mask_edge_is_sampled_in_source_space_for_projective_crop() -> None:
         assert alpha.getpixel(
             (result.output_width - 1, result.output_height - 1)
         ) == 0
+
+
+def test_crop_to_mask_trims_the_output_to_its_polygon() -> None:
+    source = _png(Image.new("RGB", (200, 200), (10, 20, 30)))
+
+    full = apply_perspective_transform(source, FULL_FRAME, mask_polygon=TRIANGLE)
+    cropped = apply_perspective_transform(
+        source,
+        FULL_FRAME,
+        mask_polygon=TRIANGLE,
+        crop_to_mask=True,
+    )
+
+    manifest = cropped.transform_manifest
+    with Image.open(io.BytesIO(full.output_png)) as uncropped_image:
+        with Image.open(io.BytesIO(cropped.output_png)) as cropped_image:
+            assert cropped_image.width < uncropped_image.width
+            assert cropped_image.height < uncropped_image.height
+            assert cropped_image.mode == "RGBA"
+            assert manifest["output_dimensions"] == list(cropped_image.size)
+    with Image.open(io.BytesIO(cropped.ocr_ready_png)) as ocr_ready:
+        assert list(ocr_ready.size) == manifest["output_dimensions"]
+    left, upper, right, lower = manifest["mask_crop_box"]
+    assert [right - left, lower - upper] == manifest["output_dimensions"]
+    assert "homography composed with the crop" in manifest["mask_crop_rule"]
+
+
+def test_cropping_composes_the_crop_into_the_published_homography() -> None:
+    """Consumers map annotations through this one matrix.
+
+    If the crop were applied to the pixels but not to the homography, every
+    mapped annotation would land at its uncropped position on a smaller image.
+    """
+
+    source = _png(_gradient(width=128, height=128))
+    cropped = apply_perspective_transform(
+        source,
+        FULL_FRAME,
+        mask_polygon=TRIANGLE,
+        crop_to_mask=True,
+    )
+
+    matrix = cropped.source_to_output_homography
+    centroid_x = sum(point[0] for point in TRIANGLE) / 3.0
+    centroid_y = sum(point[1] for point in TRIANGLE) / 3.0
+    denominator = matrix[6] * centroid_x + matrix[7] * centroid_y + matrix[8]
+    mapped_x = (
+        matrix[0] * centroid_x + matrix[1] * centroid_y + matrix[2]
+    ) / denominator
+    mapped_y = (
+        matrix[3] * centroid_x + matrix[4] * centroid_y + matrix[5]
+    ) / denominator
+
+    assert 0.0 <= mapped_x <= 1.0
+    assert 0.0 <= mapped_y <= 1.0
+
+
+def test_cropping_is_deterministic_and_off_by_default() -> None:
+    source = _png(_gradient(width=64, height=64))
+
+    first = apply_perspective_transform(
+        source, FULL_FRAME, mask_polygon=TRIANGLE, crop_to_mask=True
+    )
+    second = apply_perspective_transform(
+        source, FULL_FRAME, mask_polygon=TRIANGLE, crop_to_mask=True
+    )
+    assert first.output_sha256 == second.output_sha256
+
+    default = apply_perspective_transform(source, FULL_FRAME, mask_polygon=TRIANGLE)
+    assert default.transform_manifest["mask_crop_box"] is None
+    assert apply_perspective_transform(
+        source, FULL_FRAME
+    ).transform_manifest["mask_crop_rule"] is None
+
+
+def test_cropping_requires_a_mask_and_rejects_a_non_boolean() -> None:
+    source = _png(_gradient(width=32, height=32))
+
+    with pytest.raises(RasterInputError, match="requires a mask polygon"):
+        apply_perspective_transform(source, FULL_FRAME, crop_to_mask=True)
+    with pytest.raises(TypeError, match="crop_to_mask must be a boolean"):
+        apply_perspective_transform(
+            source, FULL_FRAME, mask_polygon=TRIANGLE, crop_to_mask="yes"
+        )

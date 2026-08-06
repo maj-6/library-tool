@@ -358,14 +358,19 @@ function correctionTransformQueueResult(command, overrides = {}) {
         source_revision: command.source_revision,
         source_sha256: command.source_sha256,
         operation_id: command.operation_id,
-        // Mirrors CorrectionTransformService._job_record: the optional mask is
-        // projected only when the command actually carries one.
+        // Mirrors CorrectionTransformService._job_record: the optional mask,
+        // extraction flag, and category are projected only when the command
+        // actually carries them.
         transform: {
           quad: command.quad.map((point) => [...point]),
           adjustment: command.adjustment,
           rerun_ocr: command.rerun_ocr,
           ...(command.mask_polygon
             ? { mask_polygon: command.mask_polygon.map((point) => [...point]) }
+            : {}),
+          ...(command.extract ? { extract: true } : {}),
+          ...(command.extract_category
+            ? { extract_category: command.extract_category }
             : {}),
         },
       },
@@ -6049,4 +6054,138 @@ test("processing preset names use Unicode scalar limits across the transport", a
       JSON.stringify(name),
     );
   }
+});
+
+
+const EXTRACTION_MASK = [[0.1, 0.1], [0.9, 0.2], [0.9, 0.8], [0.2, 0.7]];
+
+function extractionCommand(overrides = {}) {
+  return correctionTransformCommand({
+    mask_polygon: EXTRACTION_MASK,
+    extract: true,
+    extract_category: "title_page",
+    ...overrides,
+  });
+}
+
+test("an extraction command reaches the wire carrying extract and its category", async () => {
+  const command = extractionCommand();
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push(JSON.parse(init.body));
+      return response(202, correctionTransformQueueResult(command));
+    },
+  });
+
+  const result = await client.corrections.queueTransform({ command });
+
+  assert.equal(result.job.kind, "correction.transform");
+  assert.equal(calls[0].extract, true);
+  assert.equal(calls[0].extract_category, "title_page");
+  assert.deepEqual(calls[0].mask_polygon, EXTRACTION_MASK);
+  // An extraction publishes the extracted-figure profile, not the four
+  // correction renditions; the client guards the envelope, not the profile.
+  const published = correctionTransformQueueResult(command);
+  published.job.outputs = [
+    { kind: "extracted-figure", ref: "figure-1", partial: false },
+    { kind: "transform-manifest", ref: "manifest-1", partial: false },
+  ];
+  const publishing = new EngineClient({
+    transport: async () => response(202, published),
+  });
+  const publishedResult = await publishing.corrections.queueTransform({
+    command,
+  });
+  assert.deepEqual(publishedResult.job.outputs.map((value) => value.kind), [
+    "extracted-figure", "transform-manifest",
+  ]);
+});
+
+test("a command carrying neither extraction key keeps its eleven canonical keys", () => {
+  const plain = correctionTransformCommand();
+  assert.equal(Object.keys(plain).length, 11);
+  for (const key of ["extract", "extract_category"]) {
+    assert.equal(Object.prototype.hasOwnProperty.call(plain, key), false, key);
+  }
+});
+
+test("malformed extraction commands never reach the wire", async () => {
+  for (const [command, reason] of [
+    [extractionCommand({ mask_polygon: undefined }), "a mask-less extraction"],
+    [extractionCommand({ rerun_ocr: true }), "an OCR follow-up on a crop"],
+    [extractionCommand({ extract: false }), "an emitted false extract"],
+    [correctionTransformCommand({ extract: false }), "a bare false extract"],
+    [extractionCommand({ extract_category: "frontispiece" }),
+      "a category outside the image vocabulary"],
+    [extractionCommand({ extract_category: 3 }), "a non-string category"],
+    [correctionTransformCommand({ extract_category: "cover" }),
+      "a category without an extraction"],
+  ]) {
+    let transports = 0;
+    const client = new EngineClient({
+      transport: async () => {
+        transports += 1;
+        return response(202, {});
+      },
+    });
+    await assert.rejects(
+      () => client.corrections.queueTransform({ command }),
+      /canonical correction transform command/,
+      reason,
+    );
+    assert.equal(transports, 0, reason);
+  }
+
+  // `mask_polygon: undefined` must be absent rather than carried as undefined,
+  // or the rejection above would be proving the wrong thing.
+  const maskless = extractionCommand({ mask_polygon: undefined });
+  assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(maskless)),
+    "mask_polygon"), false);
+});
+
+test("an extraction receipt must project the extraction it was queued with", async () => {
+  const command = extractionCommand();
+  const bodies = [
+    (body) => {
+      delete body.job.input_revisions.transform.extract;
+      delete body.job.input_revisions.transform.extract_category;
+    },
+    (body) => {
+      body.job.input_revisions.transform.extract = false;
+    },
+    (body) => {
+      body.job.input_revisions.transform.extract_category = "spine";
+    },
+  ];
+  for (const mutate of bodies) {
+    const client = new EngineClient({
+      transport: async () => {
+        const body = correctionTransformQueueResult(command);
+        mutate(body);
+        return response(202, body);
+      },
+    });
+    await assert.rejects(
+      client.corrections.queueTransform({ command }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  }
+
+  // The mirror runs the other way too: a plain command's job must not gain an
+  // extraction projection the command never carried.
+  const plain = correctionTransformCommand();
+  const inflated = new EngineClient({
+    transport: async () => {
+      const body = correctionTransformQueueResult(plain);
+      body.job.input_revisions.transform.extract = true;
+      return response(202, body);
+    },
+  });
+  await assert.rejects(
+    inflated.corrections.queueTransform({ command: plain }),
+    (error) => error instanceof EngineClientError &&
+      error.code === "invalid-response",
+  );
 });

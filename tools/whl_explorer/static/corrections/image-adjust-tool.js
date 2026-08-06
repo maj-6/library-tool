@@ -37,6 +37,19 @@
   const COMMITTED_OUTPUT_KINDS = new Set([
     "corrected-display", "ocr-ready", "thumbnail", "transform-manifest",
   ]);
+  // An extraction publishes its own complete profile. Mirrors
+  // EXTRACTION_OUTPUT_KINDS in librarytool/engine/correction_transforms.py.
+  const EXTRACTION_OUTPUT_KINDS = new Set([
+    "extracted-figure", "transform-manifest",
+  ]);
+
+  // A publication is complete against the profile its command declared, which
+  // is not always the four correction renditions.
+  function committedOutputKinds(result) {
+    const command = result && result.command;
+    const extract = command && command.extract === true;
+    return extract ? EXTRACTION_OUTPUT_KINDS : COMMITTED_OUTPUT_KINDS;
+  }
   // Standalone re-OCR targets a committed transform output; the raster view
   // advertises that lineage through extensions.correction_transform.
   const REOCR_SOURCE_KINDS = new Set(["corrected-display", "ocr-ready"]);
@@ -390,11 +403,12 @@
   function committedOperation(result) {
     if (!isPlainObject(result) || result.cancelled_before_commit === true ||
         !isPlainObject(result.image_commit)) return "";
+    const expectedKinds = committedOutputKinds(result);
     const outer = operationIdentifier(result.operation_id);
     const inner = operationIdentifier(result.image_commit.operation_id);
     if (!outer || !inner || outer !== inner ||
         !Array.isArray(result.image_commit.outputs) ||
-        result.image_commit.outputs.length !== COMMITTED_OUTPUT_KINDS.size) {
+        result.image_commit.outputs.length !== expectedKinds.size) {
       return "";
     }
     const kinds = new Set();
@@ -405,12 +419,12 @@
       const artifactId = output && typeof output.artifact_id === "string" &&
         PORTABLE_IDENTIFIER_RE.test(output.artifact_id)
         ? output.artifact_id : "";
-      if (!COMMITTED_OUTPUT_KINDS.has(kind) || kinds.has(kind) ||
+      if (!expectedKinds.has(kind) || kinds.has(kind) ||
           !artifactId || artifactIds.has(artifactId)) return "";
       kinds.add(kind);
       artifactIds.add(artifactId);
     }
-    if (kinds.size !== COMMITTED_OUTPUT_KINDS.size) return "";
+    if (kinds.size !== expectedKinds.size) return "";
     return outer;
   }
 

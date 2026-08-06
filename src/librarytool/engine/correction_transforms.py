@@ -50,6 +50,7 @@ from .jobs import (
     JobView,
 )
 from .raster_artifacts import (
+    IMAGE_CATEGORIES,
     ArtifactProvenance,
     AssignmentOrigin,
     CaptionAssertion,
@@ -79,6 +80,31 @@ CORRECTION_OUTPUT_KINDS = (
     "thumbnail",
     "transform-manifest",
 )
+# Extracting a region publishes one figure, not a page's corrected renditions:
+# there is no separate OCR-ready or thumbnail rendition of a crop worth pinning.
+EXTRACTION_OUTPUT_KINDS = (
+    "extracted-figure",
+    "transform-manifest",
+)
+# The invariant a publication must satisfy is "one complete, ordered profile",
+# which is what it always meant — "exactly four" was only ever true because
+# there was one profile. CORRECTION_OUTPUT_KINDS stays a byte-identical literal
+# so every receipt already on disk keeps validating against it unchanged.
+OUTPUT_PROFILES = frozenset({CORRECTION_OUTPUT_KINDS, EXTRACTION_OUTPUT_KINDS})
+_ALL_OUTPUT_KINDS = frozenset(CORRECTION_OUTPUT_KINDS) | frozenset(
+    EXTRACTION_OUTPUT_KINDS
+)
+
+
+def output_profile_for(extract: bool) -> tuple[str, ...]:
+    """Return the ordered output profile a command publishes.
+
+    Order matters beyond tidiness: the store derives each output's artifact
+    identity while mutating a shared reservation set, so every loop that walks a
+    publication has to walk it in the order the result was built.
+    """
+
+    return EXTRACTION_OUTPUT_KINDS if extract else CORRECTION_OUTPUT_KINDS
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _COMMAND_FIELDS = frozenset(
@@ -121,7 +147,9 @@ _COMMAND_FIELDS = frozenset(
 # set is now "every required key, plus any subset of the known optional keys"
 # instead of one frozen set. The store already validates several documents this
 # way (see `_RASTER_SOURCE_FIELDS` vs `_RASTER_CANVAS_SOURCE_FIELDS`).
-_COMMAND_OPTIONAL_FIELDS = frozenset({"mask_polygon", "operations"})
+_COMMAND_OPTIONAL_FIELDS = frozenset(
+    {"mask_polygon", "operations", "extract", "extract_category"}
+)
 _COMMAND_KNOWN_FIELDS = _COMMAND_FIELDS | _COMMAND_OPTIONAL_FIELDS
 _MANUAL_ADJUSTMENT_FIELDS = frozenset(
     {
@@ -220,6 +248,8 @@ class CorrectionTransformCommand:
     rerun_ocr: bool = False
     mask_polygon: tuple[tuple[float, float], ...] | None = None
     operations: tuple[ProcessingOperation, ...] = ()
+    extract: bool = False
+    extract_category: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "item_id", _identifier(self.item_id, "item_id"))
@@ -289,9 +319,41 @@ class CorrectionTransformCommand:
                 field_name="operations",
             ) from exc
         object.__setattr__(self, "operations", operations)
+        if not isinstance(self.extract, bool):
+            raise _validation(
+                "extract must be boolean",
+                code="invalid_correction_transform",
+                field_name="extract",
+            )
+        if self.extract_category and not self.extract:
+            raise _validation(
+                "extract_category requires extract",
+                code="invalid_correction_transform",
+                field_name="extract_category",
+            )
+        if self.extract_category and self.extract_category not in IMAGE_CATEGORIES:
+            raise _validation(
+                "extract_category is not in the canonical image vocabulary",
+                code="invalid_correction_transform",
+                field_name="extract_category",
+            )
+        if self.extract and self.mask_polygon is None:
+            raise _validation(
+                "an extraction requires a mask polygon",
+                code="invalid_correction_transform",
+                field_name="extract",
+            )
         if not isinstance(self.rerun_ocr, bool):
             raise _validation(
                 "rerun_ocr must be boolean",
+                code="invalid_correction_transform",
+                field_name="rerun_ocr",
+            )
+        if self.extract and self.rerun_ocr:
+            # An extraction profile has no ocr-ready output, so an OCR
+            # follow-up would have nothing to pin its outcome to.
+            raise _validation(
+                "an extraction cannot request an OCR follow-up",
                 code="invalid_correction_transform",
                 field_name="rerun_ocr",
             )
@@ -330,6 +392,10 @@ class CorrectionTransformCommand:
             payload["mask_polygon"] = [[x, y] for x, y in self.mask_polygon]
         if self.operations:
             payload["operations"] = [value.as_dict() for value in self.operations]
+        if self.extract:
+            payload["extract"] = True
+        if self.extract_category:
+            payload["extract_category"] = self.extract_category
         return payload
 
     @property
@@ -487,6 +553,8 @@ class CorrectionTransformCommand:
                 rerun_ocr=payload["rerun_ocr"],
                 mask_polygon=mask_polygon,
                 operations=operations,
+                extract=payload.get("extract", False),
+                extract_category=payload.get("extract_category", ""),
             )
         except KeyError as exc:
             raise _validation(
@@ -752,7 +820,7 @@ class CorrectionOutputDraft:
     content_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.kind not in CORRECTION_OUTPUT_KINDS:
+        if self.kind not in _ALL_OUTPUT_KINDS:
             raise ValueError(f"unsupported correction output kind: {self.kind}")
         if not isinstance(self.media_type, str) or "/" not in self.media_type:
             raise ValueError("media_type must be a MIME type")
@@ -820,10 +888,10 @@ class CorrectionTransformCommitDraft:
         if not isinstance(self.human_assertions, CorrectionHumanAssertions):
             raise TypeError("human_assertions must be CorrectionHumanAssertions")
         kinds = tuple(value.kind for value in outputs)
-        if len(kinds) != len(CORRECTION_OUTPUT_KINDS) or set(kinds) != set(
-            CORRECTION_OUTPUT_KINDS
-        ):
-            raise ValueError("commit draft must contain each correction output exactly once")
+        if kinds not in OUTPUT_PROFILES:
+            raise ValueError(
+                "commit draft outputs must form one complete output profile"
+            )
 
     def output(self, kind: str) -> CorrectionOutputDraft:
         return next(value for value in self.outputs if value.kind == kind)
@@ -837,7 +905,7 @@ class CommittedCorrectionOutput:
     content_sha256: str
 
     def __post_init__(self) -> None:
-        if self.kind not in CORRECTION_OUTPUT_KINDS:
+        if self.kind not in _ALL_OUTPUT_KINDS:
             raise ValueError(f"unsupported correction output kind: {self.kind}")
         object.__setattr__(
             self,
@@ -882,10 +950,10 @@ class CorrectionTransformCommitResult:
             )
         object.__setattr__(self, "outputs", outputs)
         kinds = tuple(value.kind for value in outputs)
-        if len(kinds) != len(CORRECTION_OUTPUT_KINDS) or set(kinds) != set(
-            CORRECTION_OUTPUT_KINDS
-        ):
-            raise ValueError("commit result must contain each correction output exactly once")
+        if kinds not in OUTPUT_PROFILES:
+            raise ValueError(
+                "commit result outputs must form one complete output profile"
+            )
 
     def output(self, kind: str) -> CommittedCorrectionOutput:
         return next(value for value in self.outputs if value.kind == kind)
@@ -1288,6 +1356,10 @@ class CorrectionTransformService:
             transform["operations"] = [
                 value.as_dict() for value in command.operations
             ]
+        if command.extract:
+            transform["extract"] = True
+        if command.extract_category:
+            transform["extract_category"] = command.extract_category
         return {
             "id": job_id,
             "kind": CORRECTION_TRANSFORM_JOB_KIND,
@@ -1863,11 +1935,18 @@ def _build_commit_draft(
         adjustment=command.adjustment,
         operations=command.operations,
         mask_polygon=command.mask_polygon,
+        crop_to_mask=command.extract,
     )
-    mapped, dropped = _map_annotations(
-        source,
-        transformed.source_to_output_homography,
-    )
+    if command.extract:
+        # Page-level annotations describe the page, not the crop taken out of
+        # it. Carrying them onto every figure would assert regions that were
+        # never reviewed in the figure's own coordinate frame.
+        mapped, dropped = (), ()
+    else:
+        mapped, dropped = _map_annotations(
+            source,
+            transformed.source_to_output_homography,
+        )
     human = CorrectionHumanAssertions.from_source(source)
     provenance = ArtifactProvenance(
         origin="transform",
@@ -1906,6 +1985,18 @@ def _build_commit_draft(
         thumbnail_dimensions,
         provenance,
     )
+    figure = CorrectionOutputDraft(
+        "extracted-figure",
+        "image/png",
+        transformed.output_png,
+        display_dimensions,
+        provenance,
+    )
+    image_outputs = (
+        (figure,)
+        if command.extract
+        else (display, ocr_ready, thumbnail_draft)
+    )
     correction_manifest = {
         "schema": "org.whl.correction-transform",
         "version": 1,
@@ -1913,11 +2004,7 @@ def _build_commit_draft(
         "command": command.as_dict(),
         "dependent_revision_pins": source.dependent_revision_pins,
         "raster_transform": transformed.transform_manifest,
-        "outputs": [
-            display.as_dict(),
-            ocr_ready.as_dict(),
-            thumbnail_draft.as_dict(),
-        ],
+        "outputs": [value.as_dict() for value in image_outputs],
         "annotation_mapping": {
             "mapped": len(mapped),
             "dropped_annotation_ids": list(dropped),
@@ -1932,6 +2019,13 @@ def _build_commit_draft(
         },
         "rerun_ocr": command.rerun_ocr,
         "ocr_publication_policy": "machine-proposal-only",
+        "output_profile": list(output_profile_for(command.extract)),
+        "extract_category": command.extract_category,
+        # A figure cut from a page is not the page. Publishing a relation that
+        # is outside _CATEGORY_LINEAGE_RELATIONS keeps the provenance link while
+        # stopping the source page's category from propagating onto the crop and
+        # outranking whatever the figure is actually assigned.
+        "lineage_relation": "cropped_from" if command.extract else "processed_from",
     }
     manifest = CorrectionOutputDraft(
         "transform-manifest",
@@ -1943,7 +2037,7 @@ def _build_commit_draft(
     return CorrectionTransformCommitDraft(
         command,
         source,
-        (display, ocr_ready, thumbnail_draft, manifest),
+        (*image_outputs, manifest),
         mapped,
         dropped,
         human,

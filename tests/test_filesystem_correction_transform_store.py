@@ -34,6 +34,7 @@ from librarytool.engine.correction_transforms import (
 from librarytool.engine.errors import ConflictError, RepositoryError
 from librarytool.engine.raster_artifacts import (
     ArtifactFreshness,
+    AssignmentOrigin,
     CaptionAssertion,
     CategoryAssignment,
     RasterArtifactKey,
@@ -1409,3 +1410,80 @@ def test_write_set_errors_are_translated_by_the_store(
     assert type(raised.value) is RepositoryError
     assert raised.value.code == "sentinel_write_set_failure"
     assert raised.value.details["cause_type"] == "WriteSetError"
+
+
+EXTRACT_MASK = ((0.2, 0.2), (0.8, 0.3), (0.5, 0.8))
+
+
+def test_store_publishes_an_extracted_figure_and_replays_it(tmp_path: Path) -> None:
+    source = _source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    command = _command(
+        source,
+        extract=True,
+        mask_polygon=EXTRACT_MASK,
+        extract_category="cover",
+        rerun_ocr=False,
+    )
+
+    result = store.commit_transform(_draft(source, command))
+
+    assert tuple(value.kind for value in result.outputs) == (
+        "extracted-figure",
+        "transform-manifest",
+    )
+    figure = result.output("extracted-figure")
+    assert figure.artifact_id != command.artifact_id
+
+    # The publication must survive a fresh reader, which recomputes the command
+    # fingerprint and every derived artifact identity from what is on disk.
+    replayed = _store(tmp_path, authority).find_committed_transform(command)
+    assert replayed is not None
+    assert replayed.command == command
+    assert replayed.result.output("extracted-figure").artifact_id == figure.artifact_id
+
+
+def test_an_extracted_figure_projects_with_non_inheriting_lineage(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    command = _command(
+        source,
+        extract=True,
+        mask_polygon=EXTRACT_MASK,
+        extract_category="cover",
+        rerun_ocr=False,
+    )
+    store.commit_transform(_draft(source, command))
+
+    projected = _store(tmp_path, authority).list_raster_artifacts(
+        source.artifact.key.item_id
+    )
+    figure = next(
+        value for value in projected if value.kind == "extracted-figure"
+    )
+
+    assert figure.lineage[0].artifact_id == command.artifact_id
+    assert figure.lineage[0].relation == "cropped_from"
+    # The reviewer named the category as part of the extraction, so it is the
+    # figure's own manual assertion rather than something inherited from the page.
+    assert [value.category for value in figure.category_assignments] == ["cover"]
+    assert figure.category_assignments[0].origin is AssignmentOrigin.MANUAL
+
+
+def test_a_correction_publication_still_projects_processed_from(tmp_path: Path) -> None:
+    source = _source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(_draft(source))
+
+    projected = _store(tmp_path, authority).list_raster_artifacts(
+        source.artifact.key.item_id
+    )
+    display = next(value for value in projected if value.kind == "corrected-image")
+
+    assert display.lineage[0].relation == "processed_from"
+    assert display.category_assignments == ()

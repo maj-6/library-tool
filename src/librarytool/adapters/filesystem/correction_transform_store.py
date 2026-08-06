@@ -29,7 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, ContextManager, Protocol, TypeAlias, runtime_checkable
 
 from ...engine.correction_transforms import (
-    CORRECTION_OUTPUT_KINDS,
+    OUTPUT_PROFILES,
     CommittedCorrectionOutput,
     CommittedCorrectionTransform,
     CorrectionHumanAssertions,
@@ -38,6 +38,7 @@ from ...engine.correction_transforms import (
     CorrectionTransformCommitDraft,
     CorrectionTransformCommitResult,
     CorrectionTransformDependencyPins,
+    output_profile_for,
 )
 from ...engine.errors import (
     ConflictError,
@@ -48,7 +49,9 @@ from ...engine.errors import (
 from ...engine.raster_artifacts import (
     ArtifactFreshness,
     ArtifactProvenance,
+    AssignmentOrigin,
     CaptionAssertion,
+    CategoryAssignment,
     RasterArtifactKey,
     RasterArtifactView,
     RasterDimensions,
@@ -127,6 +130,9 @@ _PROJECTED_RASTER_OUTPUTS = {
     "corrected-display": ("corrected-image", "Corrected display", "display"),
     "ocr-ready": ("processed-source", "OCR-ready image", "ocr"),
     "thumbnail": ("processed-image", "Correction thumbnail", "thumbnail"),
+    # "extracted-figure" is the public kind _RASTER_GROUP_KINDS files under the
+    # extracted-figures tree group, on both the server and the client.
+    "extracted-figure": ("extracted-figure", "Extracted figure", "figure"),
 }
 _RECEIPT_FIELDS = frozenset(
     {
@@ -428,7 +434,7 @@ def _commit_result_for(
 ) -> CorrectionTransformCommitResult:
     reserved = {draft.command.artifact_id.casefold()}
     outputs: list[CommittedCorrectionOutput] = []
-    for kind in CORRECTION_OUTPUT_KINDS:
+    for kind in output_profile_for(draft.command.extract):
         output = draft.output(kind)
         artifact_id = _output_identity(
             draft.command.fingerprint,
@@ -932,6 +938,19 @@ class FilesystemCorrectionTransformStore:
                     extensions["corrections_ui"] = {
                         "annotation_frame": "canvas",
                     }
+                # A reviewer who names the category as part of the extraction is
+                # asserting it, so it is published as MANUAL and carried on the
+                # figure itself rather than inherited from the page.
+                category_assignments: tuple[CategoryAssignment, ...] = ()
+                if command.extract_category and committed.kind == "extracted-figure":
+                    category_assignments = (
+                        CategoryAssignment(
+                            command.extract_category,
+                            AssignmentOrigin.MANUAL,
+                            committed.artifact_revision,
+                            provenance=provenance,
+                        ),
+                    )
                 view = RasterArtifactView(
                     key=RasterArtifactKey(item_id, committed.artifact_id),
                     revision=committed.artifact_revision,
@@ -951,9 +970,19 @@ class FilesystemCorrectionTransformStore:
                         RasterLineageRef(
                             command.artifact_id,
                             command.artifact_revision,
-                            "processed_from",
+                            # A figure cut out of a page is not the page.
+                            # "cropped_from" is deliberately absent from
+                            # _CATEGORY_LINEAGE_RELATIONS, so the crop keeps its
+                            # provenance link without inheriting the source
+                            # page's category — an INHERITED category would
+                            # outrank whatever the figure is actually assigned,
+                            # including a machine suggestion.
+                            "cropped_from"
+                            if command.extract
+                            else "processed_from",
                         ),
                     ),
+                    category_assignments=category_assignments,
                     provenance=provenance,
                     extensions=extensions,
                 )
@@ -1831,6 +1860,10 @@ class FilesystemCorrectionTransformStore:
             raise ValueError(
                 "mapped correction annotations require a source canvas"
             )
+        if not raw_values:
+            # Nothing to project, and the lookup below would raise for an
+            # extraction profile, which publishes no corrected-display output.
+            return ()
         target = result.output("corrected-display")
         source_for_target = (
             SpatialSourceRef(
@@ -2213,7 +2246,7 @@ class FilesystemCorrectionTransformStore:
         )
 
         targets: list[tuple[Path, bytes, str]] = []
-        for kind in CORRECTION_OUTPUT_KINDS:
+        for kind in output_profile_for(draft.command.extract):
             output = draft.output(kind)
             if len(output.content) > _MAX_OUTPUT_BYTES:
                 raise _repository_error(
@@ -2390,7 +2423,7 @@ class FilesystemCorrectionTransformStore:
         result: CorrectionTransformCommitResult,
     ) -> dict[str, Any]:
         outputs: list[dict[str, Any]] = []
-        for kind in CORRECTION_OUTPUT_KINDS:
+        for kind in output_profile_for(draft.command.extract):
             staged = draft.output(kind)
             committed = result.output(kind)
             outputs.append(
@@ -2500,7 +2533,7 @@ class FilesystemCorrectionTransformStore:
             )
             for value in result_raw["outputs"]
         )
-        if tuple(output.kind for output in outputs) != CORRECTION_OUTPUT_KINDS:
+        if tuple(output.kind for output in outputs) not in OUTPUT_PROFILES:
             raise ValueError(f"{artifact} output order is invalid")
         return CorrectionTransformCommitResult(operation_id, outputs)
 

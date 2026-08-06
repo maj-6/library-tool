@@ -30,8 +30,32 @@
     const CORRECTION_IMAGE_OUTPUT_KINDS = Object.freeze([
       "corrected-display", "ocr-ready", "thumbnail", "transform-manifest",
     ]);
-    const CORRECTION_JOB_OUTPUT_KINDS =
-      new Set([...CORRECTION_IMAGE_OUTPUT_KINDS, "ocr-proposal"]);
+    // An extraction publishes one figure, not a page's three renditions: there
+    // is no ocr-ready or thumbnail rendition of a crop worth pinning. Mirrors
+    // EXTRACTION_OUTPUT_KINDS in librarytool.engine.correction_transforms, and
+    // the order matters — the engine derives output identities in profile
+    // order, so every walk over a publication must follow the same order.
+    const EXTRACTION_IMAGE_OUTPUT_KINDS = Object.freeze([
+      "extracted-figure", "transform-manifest",
+    ]);
+    const CORRECTION_IMAGE_CATEGORIES = new Set([
+      "title_page", "cover", "spine", "content_specimen", "other",
+    ]);
+    const CORRECTION_JOB_OUTPUT_KINDS = new Set([
+      ...CORRECTION_IMAGE_OUTPUT_KINDS,
+      ...EXTRACTION_IMAGE_OUTPUT_KINDS,
+      "ocr-proposal",
+    ]);
+
+    // The invariant a publication satisfies is "one complete, ordered profile",
+    // which is what "exactly four" always meant back when there was only one
+    // profile. Which profile applies is declared by the command, so every
+    // completeness test reads it from here rather than from a fixed constant.
+    function correctionImageOutputKinds(command) {
+      return isPlainObject(command) && command.extract === true
+        ? EXTRACTION_IMAGE_OUTPUT_KINDS
+        : CORRECTION_IMAGE_OUTPUT_KINDS;
+    }
     // Standalone re-OCR shares the "correction.ocr-followup" job kind with
     // the transform rider; the operation namespace is what tells the tracked
     // command apart, so the rider's whitelist and guards stay untouched.
@@ -402,6 +426,18 @@
           typeof command.rerun_ocr !== "boolean") {
         throw invalidTransformResult("the tracked correction command is invalid");
       }
+      // The extraction keys are additive-optional on the wire: the engine emits
+      // them only when carried, so a command that declares them must declare
+      // them the way the engine would round-trip them.
+      if ((Object.hasOwn(command, "extract") &&
+            (command.extract !== true ||
+              !Array.isArray(command.mask_polygon) ||
+              command.rerun_ocr === true)) ||
+          (Object.hasOwn(command, "extract_category") &&
+            (command.extract !== true ||
+              !CORRECTION_IMAGE_CATEGORIES.has(command.extract_category)))) {
+        throw invalidTransformResult("the tracked correction command is invalid");
+      }
       if (!hasExactKeys(value, [
         "id", "kind", "state", "subject", "progress", "cancellable",
         "revision", "created_at", "updated_at", "finished_at", "note", "error",
@@ -438,7 +474,9 @@
       const inputs = value.input_revisions;
       const inputKeys = Object.keys(inputs);
       const transformKeys = ["quad", "adjustment", "rerun_ocr"];
-      for (const field of ["mask_polygon", "operations"]) {
+      for (const field of [
+        "mask_polygon", "operations", "extract", "extract_category",
+      ]) {
         if (Object.hasOwn(command, field)) transformKeys.push(field);
       }
       const allowedInputKeys = new Set([
@@ -468,6 +506,13 @@
             !sameJsonValue(
               inputs.transform.operations,
               command.operations,
+            )) ||
+          (Object.hasOwn(command, "extract") &&
+            !sameJsonValue(inputs.transform.extract, command.extract)) ||
+          (Object.hasOwn(command, "extract_category") &&
+            !sameJsonValue(
+              inputs.transform.extract_category,
+              command.extract_category,
             )) ||
           (Object.hasOwn(inputs, "command_sha256") &&
             (typeof inputs.command_sha256 !== "string" ||
@@ -632,11 +677,12 @@
         }
         byKind.set(output.kind, output);
       }
-      const presentImageKinds = CORRECTION_IMAGE_OUTPUT_KINDS.filter(
+      const imageOutputKinds = correctionImageOutputKinds(command);
+      const presentImageKinds = imageOutputKinds.filter(
         (kind) => byKind.has(kind),
       );
       const imageCommitted =
-        presentImageKinds.length === CORRECTION_IMAGE_OUTPUT_KINDS.length;
+        presentImageKinds.length === imageOutputKinds.length;
       if (presentImageKinds.length > 0 && !imageCommitted) {
         throw invalidTransformResult(
           "the correction transform job has an incomplete image commit",
@@ -647,7 +693,7 @@
           "a completed correction transform has no image outputs",
         );
       }
-      if (imageCommitted && CORRECTION_IMAGE_OUTPUT_KINDS.some(
+      if (imageCommitted && imageOutputKinds.some(
         (kind) => byKind.get(kind).partial === true,
       )) {
         throw invalidTransformResult(
@@ -666,10 +712,13 @@
         );
       }
 
-      const ocrSource = imageCommitted
+      // An extraction profile has no ocr-ready rendition, which is also why the
+      // engine forbids pairing extract with an OCR follow-up.
+      const ocrReady = byKind.get("ocr-ready") || null;
+      const ocrSource = imageCommitted && ocrReady
         ? {
             kind: "ocr-ready",
-            artifact_id: byKind.get("ocr-ready").ref,
+            artifact_id: ocrReady.ref,
           }
         : null;
       let ocrFollowup = {
@@ -748,7 +797,7 @@
           ? Object.freeze({
               operation_id: command.operation_id,
               outputs: Object.freeze(
-                CORRECTION_IMAGE_OUTPUT_KINDS.map((kind) => Object.freeze({
+                imageOutputKinds.map((kind) => Object.freeze({
                   kind,
                   artifact_id: byKind.get(kind).ref,
                 })),

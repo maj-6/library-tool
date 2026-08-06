@@ -164,7 +164,9 @@ _TRANSFORM_COMMAND_FIELDS = frozenset(
 # Mirrors _COMMAND_OPTIONAL_FIELDS in librarytool.engine.correction_transforms;
 # see the schema-evolution note there for why these are additive rather than a
 # version bump.
-_TRANSFORM_COMMAND_OPTIONAL_FIELDS = frozenset({"mask_polygon", "operations"})
+_TRANSFORM_COMMAND_OPTIONAL_FIELDS = frozenset(
+    {"mask_polygon", "operations", "extract", "extract_category"}
+)
 _RASTER_GROUP_KINDS = {
     "source-images": frozenset(
         {"capture", "captured-image", "page-image", "scan", "source-image"}
