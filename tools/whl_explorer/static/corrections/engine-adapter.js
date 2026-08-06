@@ -437,6 +437,10 @@
       }
       const inputs = value.input_revisions;
       const inputKeys = Object.keys(inputs);
+      const transformKeys = ["quad", "adjustment", "rerun_ocr"];
+      for (const field of ["mask_polygon", "operations"]) {
+        if (Object.hasOwn(command, field)) transformKeys.push(field);
+      }
       const allowedInputKeys = new Set([
         "artifact_id", "artifact_revision", "source_revision", "source_sha256",
         "operation_id", "command_sha256", "dependent_assertions", "transform",
@@ -448,16 +452,23 @@
           inputs.source_sha256 !== command.source_sha256 ||
           inputs.operation_id !== command.operation_id ||
           !Object.hasOwn(inputs, "transform") ||
-          !hasExactKeys(
-              inputs.transform,
-              ["quad", "adjustment", "rerun_ocr"],
-            ) ||
+          !hasExactKeys(inputs.transform, transformKeys) ||
               !sameJsonValue(inputs.transform.quad, command.quad) ||
               !sameJsonValue(
                 inputs.transform.adjustment,
                 command.adjustment,
               ) ||
               inputs.transform.rerun_ocr !== command.rerun_ocr ||
+          (Object.hasOwn(command, "mask_polygon") &&
+            !sameJsonValue(
+              inputs.transform.mask_polygon,
+              command.mask_polygon,
+            )) ||
+          (Object.hasOwn(command, "operations") &&
+            !sameJsonValue(
+              inputs.transform.operations,
+              command.operations,
+            )) ||
           (Object.hasOwn(inputs, "command_sha256") &&
             (typeof inputs.command_sha256 !== "string" ||
               !/^[0-9a-f]{64}$/.test(inputs.command_sha256)))) {
@@ -1599,6 +1610,12 @@
       const commands = correctionCommandPort(client, transformPolling);
       const reviews = correctionReviewPort(client);
       const books = correctionBooksPort(client, indexPolling);
+      const processingPresets = client.processingPresets &&
+          typeof client.processingPresets.list === "function" &&
+          typeof client.processingPresets.create === "function" &&
+          typeof client.processingPresets.update === "function" &&
+          typeof client.processingPresets.remove === "function"
+        ? client.processingPresets : null;
       const ocrProposals = correctionOcrProposalPort(
         client, transformPolling, commands);
 
@@ -1823,6 +1840,7 @@
         artifacts,
         ...(books ? { books } : {}),
         ...(reviews ? { reviews } : {}),
+        ...(processingPresets ? { processingPresets } : {}),
         ...(ocrProposals ? { ocrProposals } : {}),
         ...(invokeCommand ? { invokeCommand } : {}),
         ...(transformPolling ? {

@@ -358,10 +358,15 @@ function correctionTransformQueueResult(command, overrides = {}) {
         source_revision: command.source_revision,
         source_sha256: command.source_sha256,
         operation_id: command.operation_id,
+        // Mirrors CorrectionTransformService._job_record: the optional mask is
+        // projected only when the command actually carries one.
         transform: {
           quad: command.quad.map((point) => [...point]),
           adjustment: command.adjustment,
           rerun_ocr: command.rerun_ocr,
+          ...(command.mask_polygon
+            ? { mask_polygon: command.mask_polygon.map((point) => [...point]) }
+            : {}),
         },
       },
       outputs: [],
@@ -2250,6 +2255,33 @@ test("correction transforms own their canonical queue transport", async () => {
   ]]);
 });
 
+test("a successful transform response with unreadable JSON is ambiguous",
+  async () => {
+    const command = correctionTransformCommand();
+    const client = new EngineClient({
+      transport: async () => ({
+        ok: true,
+        status: 202,
+        json: async () => {
+          throw new SyntaxError("truncated queue receipt");
+        },
+      }),
+    });
+
+    await assert.rejects(
+      client.corrections.queueTransform({ command }),
+      (error) => {
+        assert.ok(error instanceof EngineClientError);
+        assert.equal(error.code, "invalid-response");
+        assert.equal(error.status, 202);
+        assert.equal(error.method, "POST");
+        assert.equal(error.retryable, true);
+        assert.equal(error.ambiguous, true);
+        return true;
+      },
+    );
+  });
+
 test("correction OCR proposals use an opaque item-scoped read resource",
   async () => {
     const calls = [];
@@ -4024,8 +4056,15 @@ test("malformed and network responses are normalized as EngineClientError", asyn
   });
   await assert.rejects(
     malformed.pdf.info({ path: "book.pdf" }),
-    (error) => error instanceof EngineClientError &&
-      error.code === "invalid-response" && error.status === 200);
+    (error) => {
+      assert.ok(error instanceof EngineClientError);
+      assert.equal(error.code, "invalid-response");
+      assert.equal(error.status, 200);
+      assert.equal(error.retryable, false,
+        "a malformed successful read is not an ambiguous mutation");
+      assert.equal(error.ambiguous, false);
+      return true;
+    });
 
   const offline = new EngineClient({
     transport: async () => { throw new Error("offline"); },
@@ -5906,4 +5945,108 @@ this.createBuild = createBuild;`, context);
   assert.ok(calls.every((args) =>
     !Object.hasOwn(args.item.metadata, "extra") &&
     !Object.hasOwn(args.item.metadata, "pdf_file")));
+});
+
+
+test("transform commands accept an optional mask polygon and still reject unknown fields", async () => {
+  const mask = [[0.1, 0.1], [0.9, 0.2], [0.5, 0.9]];
+  const masked = correctionTransformCommand({ mask_polygon: mask });
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push(JSON.parse(init.body));
+      return response(202, correctionTransformQueueResult(masked));
+    },
+  });
+
+  await client.corrections.queueTransform({ command: masked });
+  assert.deepEqual(calls[0].mask_polygon, mask);
+
+  // A mask-less command must stay exactly eleven keys: the engine hashes this
+  // document, so an added null would move every stored command_sha256.
+  const plain = correctionTransformCommand();
+  assert.equal(Object.prototype.hasOwnProperty.call(plain, "mask_polygon"), false);
+
+  for (const [command, reason] of [
+    [correctionTransformCommand({ sharpen: true }), "an unknown field"],
+    [correctionTransformCommand({ mask_polygon: [[0.1, 0.1], [0.9, 0.2]] }),
+      "a two-point polygon"],
+    [correctionTransformCommand({ mask_polygon: [[0.1, 0.1], [0.9, 0.2], [2, 9]] }),
+      "an out-of-bounds point"],
+    [correctionTransformCommand({ mask_polygon: "triangle" }), "a non-array mask"],
+  ]) {
+    await assert.rejects(
+      () => new EngineClient({ transport: async () => response(202, {}) })
+        .corrections.queueTransform({ command }),
+      /canonical correction transform command/,
+      reason,
+    );
+  }
+});
+
+
+test("processing preset names use Unicode scalar limits across the transport", async () => {
+  const longestName = "\u{1F33F}".repeat(120);
+  const writable = {
+    schema: "org.whl.processing-preset",
+    version: 1,
+    preset_id: "herb-name",
+    name: longestName,
+    category: "",
+    operations: [{
+      schema: "org.whl.raster.processing-operation",
+      version: 1,
+      algorithm: "gamma-v1",
+      rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+      gamma_hundredths: 120,
+    }],
+    adjustment: null,
+  };
+  const stored = { ...writable, revision: "a".repeat(64) };
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      if (init.method === "GET") {
+        return response(200, {
+          ok: true,
+          schema: "librarytool.processing-presets/1",
+          presets: [stored],
+          revision: `ppc-${"b".repeat(64)}`,
+        });
+      }
+      return response(200, {
+        ok: true,
+        schema: "librarytool.processing-preset/1",
+        preset: stored,
+      });
+    },
+  });
+
+  const listed = await client.processingPresets.list();
+  assert.equal(listed.presets[0].name, longestName);
+  await client.processingPresets.create({ preset: writable });
+  assert.equal(JSON.parse(calls[1].init.body).preset.name, longestName);
+
+  for (const name of ["\u{1F33F}".repeat(121), "Cover\ud800clean"]) {
+    const malformed = { ...writable, name };
+    await assert.rejects(
+      () => client.processingPresets.create({ preset: malformed }),
+      /canonical processing preset/,
+      JSON.stringify(name),
+    );
+    const invalidList = new EngineClient({
+      transport: async () => response(200, {
+        ok: true,
+        schema: "librarytool.processing-presets/1",
+        presets: [{ ...malformed, revision: "c".repeat(64) }],
+        revision: `ppc-${"d".repeat(64)}`,
+      }),
+    });
+    await assert.rejects(
+      () => invalidList.processingPresets.list(),
+      /invalid processing preset list/i,
+      JSON.stringify(name),
+    );
+  }
 });

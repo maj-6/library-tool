@@ -25,10 +25,18 @@ from typing import Any, ContextManager, Protocol, runtime_checkable
 
 from PIL import Image
 
+from librarytool.processing.operations import (
+    MAX_OPERATIONS_PER_RECIPE,
+    ProcessingOperation,
+    ProcessingOperationError,
+    operations_from_list,
+    validate_processing_operation,
+)
 from librarytool.processing.raster import (
     ManualBinaryAdjustRecipe,
     RasterInputError,
     apply_perspective_transform,
+    validate_normalized_polygon,
     validate_normalized_quad,
 )
 
@@ -88,6 +96,33 @@ _COMMAND_FIELDS = frozenset(
         "operation_id",
     }
 )
+# --- wire-schema evolution: additive-optional, NOT a version bump -----------
+#
+# Both the polygon mask and the extended processing vocabulary reach the worker
+# through this one command, so they share a single schema decision.
+#
+# A version bump was rejected, and so was the obvious "always emit the new key,
+# null when absent". Either one rewrites the canonical JSON of a command that
+# carries neither feature, and this command is content-addressed: `fingerprint`
+# is a SHA-256 over `as_dict()`. That digest is not incidental — it is stored as
+# `command_sha256` in every idempotency receipt and item pointer, it is compared
+# against a freshly parsed command by the filesystem store, and it seeds the
+# published output artifact identities. Adding `"mask_polygon":null` to an
+# existing mask-less command changes its digest, so every already-committed
+# transform on disk would fail its receipt binding and become unreplayable.
+#
+# Optional-and-omitted keeps one logical correction mapped to exactly one
+# canonical document for all time. That matters beyond migration safety: an old
+# and a new client submitting the same mask-less correction under one operation
+# ID still agree on the fingerprint, where a version bump would make them
+# collide as an operation conflict.
+#
+# Strictness is preserved. Unknown keys are still rejected outright; the field
+# set is now "every required key, plus any subset of the known optional keys"
+# instead of one frozen set. The store already validates several documents this
+# way (see `_RASTER_SOURCE_FIELDS` vs `_RASTER_CANVAS_SOURCE_FIELDS`).
+_COMMAND_OPTIONAL_FIELDS = frozenset({"mask_polygon", "operations"})
+_COMMAND_KNOWN_FIELDS = _COMMAND_FIELDS | _COMMAND_OPTIONAL_FIELDS
 _MANUAL_ADJUSTMENT_FIELDS = frozenset(
     {
         "schema",
@@ -183,6 +218,8 @@ class CorrectionTransformCommand:
     operation_id: str
     adjustment: ManualBinaryAdjustRecipe | None = None
     rerun_ocr: bool = False
+    mask_polygon: tuple[tuple[float, float], ...] | None = None
+    operations: tuple[ProcessingOperation, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "item_id", _identifier(self.item_id, "item_id"))
@@ -215,6 +252,16 @@ class CorrectionTransformCommand:
                 field_name="quad",
             ) from exc
         object.__setattr__(self, "quad", quad)
+        if self.mask_polygon is not None:
+            try:
+                mask_polygon = validate_normalized_polygon(self.mask_polygon)
+            except RasterInputError as exc:
+                raise _validation(
+                    str(exc),
+                    code="invalid_correction_mask_polygon",
+                    field_name="mask_polygon",
+                ) from exc
+            object.__setattr__(self, "mask_polygon", mask_polygon)
         if self.adjustment is not None and not isinstance(
             self.adjustment,
             ManualBinaryAdjustRecipe,
@@ -224,6 +271,24 @@ class CorrectionTransformCommand:
                 code="invalid_correction_transform",
                 field_name="adjustment",
             )
+        operations = tuple(self.operations)
+        if len(operations) > MAX_OPERATIONS_PER_RECIPE:
+            raise _validation(
+                "operations must contain at most "
+                f"{MAX_OPERATIONS_PER_RECIPE} entries",
+                code="invalid_correction_operations",
+                field_name="operations",
+            )
+        try:
+            for value in operations:
+                validate_processing_operation(value)
+        except ProcessingOperationError as exc:
+            raise _validation(
+                str(exc),
+                code="invalid_correction_operations",
+                field_name="operations",
+            ) from exc
+        object.__setattr__(self, "operations", operations)
         if not isinstance(self.rerun_ocr, bool):
             raise _validation(
                 "rerun_ocr must be boolean",
@@ -241,7 +306,7 @@ class CorrectionTransformCommand:
         return RasterArtifactKey(self.item_id, self.artifact_id)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema": CORRECTION_TRANSFORM_SCHEMA,
             "version": CORRECTION_TRANSFORM_VERSION,
             "item_id": self.item_id,
@@ -256,6 +321,16 @@ class CorrectionTransformCommand:
             "rerun_ocr": self.rerun_ocr,
             "operation_id": self.operation_id,
         }
+        # Optional keys are emitted only when carried. See the note on
+        # _COMMAND_OPTIONAL_FIELDS: a command without these features must keep
+        # the exact bytes — and therefore the exact fingerprint — it had before
+        # they existed. Serialization stays deterministic because the value
+        # fully determines the key set.
+        if self.mask_polygon is not None:
+            payload["mask_polygon"] = [[x, y] for x, y in self.mask_polygon]
+        if self.operations:
+            payload["operations"] = [value.as_dict() for value in self.operations]
+        return payload
 
     @property
     def serialized(self) -> bytes:
@@ -274,14 +349,16 @@ class CorrectionTransformCommand:
                 field_name="command",
             )
         payload_fields = frozenset(payload)
-        if payload_fields != _COMMAND_FIELDS:
+        if not _COMMAND_FIELDS <= payload_fields <= _COMMAND_KNOWN_FIELDS:
             raise ValidationError(
                 "correction transform command fields must match its schema exactly",
                 code="invalid_correction_transform",
                 details={
                     "field": "command",
                     "missing": sorted(_COMMAND_FIELDS - payload_fields),
-                    "unknown": sorted(str(value) for value in payload_fields - _COMMAND_FIELDS),
+                    "unknown": sorted(
+                        str(value) for value in payload_fields - _COMMAND_KNOWN_FIELDS
+                    ),
                 },
             )
         version = payload.get("version")
@@ -366,6 +443,37 @@ class CorrectionTransformCommand:
                         "mismatched": mismatched_adjustment_fields,
                     },
                 )
+        mask_payload = payload.get("mask_polygon")
+        mask_polygon = None
+        if mask_payload is not None:
+            if isinstance(mask_payload, (str, bytes)) or not isinstance(
+                mask_payload,
+                Sequence,
+            ):
+                raise _validation(
+                    "mask_polygon must be a sequence of coordinate pairs or null",
+                    code="invalid_correction_mask_polygon",
+                    field_name="mask_polygon",
+                )
+            try:
+                mask_polygon = tuple(tuple(point) for point in mask_payload)
+            except TypeError as exc:
+                raise _validation(
+                    "mask_polygon must contain coordinate pairs",
+                    code="invalid_correction_mask_polygon",
+                    field_name="mask_polygon",
+                ) from exc
+        operations_payload = payload.get("operations")
+        operations: tuple[ProcessingOperation, ...] = ()
+        if operations_payload is not None:
+            try:
+                operations = operations_from_list(operations_payload)
+            except ProcessingOperationError as exc:
+                raise _validation(
+                    str(exc),
+                    code="invalid_correction_operations",
+                    field_name="operations",
+                ) from exc
         try:
             return cls(
                 item_id=payload["item_id"],
@@ -377,6 +485,8 @@ class CorrectionTransformCommand:
                 operation_id=payload["operation_id"],
                 adjustment=adjustment,
                 rerun_ocr=payload["rerun_ocr"],
+                mask_polygon=mask_polygon,
+                operations=operations,
             )
         except KeyError as exc:
             raise _validation(
@@ -1159,6 +1269,25 @@ class CorrectionTransformService:
         command: CorrectionTransformCommand,
         job_id: str,
     ) -> MutableMapping[str, Any]:
+        # Mirrors as_dict: optional transform inputs appear only when carried,
+        # so a job queued before these features keeps its previous projection.
+        transform: dict[str, Any] = {
+            "quad": [[x, y] for x, y in command.quad],
+            "adjustment": (
+                command.adjustment.as_dict()
+                if command.adjustment is not None
+                else None
+            ),
+            "rerun_ocr": command.rerun_ocr,
+        }
+        if command.mask_polygon is not None:
+            transform["mask_polygon"] = [
+                [x, y] for x, y in command.mask_polygon
+            ]
+        if command.operations:
+            transform["operations"] = [
+                value.as_dict() for value in command.operations
+            ]
         return {
             "id": job_id,
             "kind": CORRECTION_TRANSFORM_JOB_KIND,
@@ -1178,15 +1307,7 @@ class CorrectionTransformService:
                 "source_sha256": command.source_sha256,
                 "operation_id": command.operation_id,
                 "command_sha256": command.fingerprint,
-                "transform": {
-                    "quad": [[x, y] for x, y in command.quad],
-                    "adjustment": (
-                        command.adjustment.as_dict()
-                        if command.adjustment is not None
-                        else None
-                    ),
-                    "rerun_ocr": command.rerun_ocr,
-                },
+                "transform": transform,
             },
             # The submitted command remains process-private. Every value
             # required to validate and retry after restart is also present in
@@ -1740,6 +1861,8 @@ def _build_commit_draft(
         command.quad,
         source_revision=command.source_revision,
         adjustment=command.adjustment,
+        operations=command.operations,
+        mask_polygon=command.mask_polygon,
     )
     mapped, dropped = _map_annotations(
         source,
@@ -1766,10 +1889,13 @@ def _build_commit_draft(
         display_dimensions,
         provenance,
     )
+    # Without a mask these are the same bytes and therefore the same checksum,
+    # exactly as before. A mask makes them diverge: display keeps alpha, OCR-ready
+    # is flattened onto white because OCR engines treat alpha inconsistently.
     ocr_ready = CorrectionOutputDraft(
         "ocr-ready",
         "image/png",
-        transformed.output_png,
+        transformed.ocr_ready_png,
         display_dimensions,
         provenance,
     )

@@ -37,6 +37,7 @@ from librarytool.engine.correction_transforms import (
     OcrFollowupOutcomePort,
     OcrFollowupPort,
     OcrFollowupState,
+    _build_commit_draft,
 )
 from librarytool.engine.errors import ConflictError, ValidationError
 from librarytool.engine.jobs import JobManager, JobOutput, JobProgress, JobState
@@ -57,6 +58,7 @@ from librarytool.engine.spatial_annotations import (
     SpatialRoleAssignment,
     SpatialSourceRef,
 )
+from librarytool.processing.operations import ProcessingOperation
 from librarytool.processing.raster import ManualBinaryAdjustRecipe
 
 
@@ -160,6 +162,14 @@ def _command(source: CorrectionSourceSnapshot | None = None, **changes) -> Corre
     }
     values.update(changes)
     return CorrectionTransformCommand(**values)
+
+
+def test_transform_command_rejects_the_noncanonical_operation_base() -> None:
+    with pytest.raises(ValidationError) as raised:
+        _command(operations=(ProcessingOperation(),))
+
+    assert raised.value.code == "invalid_correction_operations"
+    assert raised.value.details == {"field": "operations"}
 
 
 class MemoryStore:
@@ -1348,3 +1358,167 @@ def test_ports_remain_runtime_checkable_and_framework_neutral() -> None:
     assert isinstance(OutcomeRecorder(), OcrFollowupOutcomePort)
     assert isinstance(SuccessfulOcr(), OcrFollowupPort)
     assert isinstance(ObservingHooks(), CorrectionTransformHooksPort)
+
+
+TRIANGLE_MASK = ((0.1, 0.1), (0.9, 0.2), (0.5, 0.9))
+
+
+def test_mask_less_command_keeps_the_wire_document_it_had_before_masking() -> None:
+    """The whole additive-optional decision rests on this digest not moving.
+
+    ``fingerprint`` is stored as ``command_sha256`` in every idempotency
+    receipt and item pointer and seeds the published output artifact
+    identities, so a mask-less command has to serialize to exactly the bytes it
+    did before ``mask_polygon`` existed.  The literal below was computed against
+    the pre-feature encoder; if a future change makes it move, every
+    already-committed transform on disk stops replaying.
+    """
+
+    command = CorrectionTransformCommand(
+        item_id="item-1",
+        artifact_id="art-1",
+        artifact_revision="r1",
+        source_revision="sr1",
+        source_sha256="a" * 64,
+        quad=FULL_FRAME,
+        operation_id="op-1",
+    )
+
+    assert "mask_polygon" not in command.as_dict()
+    assert command.fingerprint == (
+        "9c8a5cf8541c5fb82e4cddfd1ce854c80724bd946a664b7fab76067c3c680b8b"
+    )
+
+
+def test_mask_polygon_round_trips_and_changes_the_fingerprint() -> None:
+    plain = _command()
+    masked = _command(mask_polygon=TRIANGLE_MASK)
+
+    assert masked.as_dict()["mask_polygon"] == [list(p) for p in TRIANGLE_MASK]
+    assert CorrectionTransformCommand.from_dict(masked.as_dict()) == masked
+    assert CorrectionTransformCommand.from_dict(plain.as_dict()) == plain
+    assert masked.fingerprint != plain.fingerprint
+
+
+def test_from_dict_accepts_an_absent_mask_and_still_rejects_unknown_fields() -> None:
+    payload = dict(_command().as_dict())
+    assert CorrectionTransformCommand.from_dict(payload).mask_polygon is None
+
+    explicit_null = dict(payload, mask_polygon=None)
+    assert CorrectionTransformCommand.from_dict(explicit_null).mask_polygon is None
+
+    with pytest.raises(ValidationError) as unknown:
+        CorrectionTransformCommand.from_dict(dict(payload, sharpen=True))
+    assert unknown.value.details["unknown"] == ["sharpen"]
+
+    incomplete = dict(payload)
+    incomplete.pop("quad")
+    with pytest.raises(ValidationError) as missing:
+        CorrectionTransformCommand.from_dict(incomplete)
+    assert missing.value.details["missing"] == ["quad"]
+
+
+@pytest.mark.parametrize(
+    "polygon",
+    [
+        ((0.0, 0.0), (1.0, 1.0)),
+        ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)),
+        ((0.0, 0.0), (0.001, 0.0), (0.0, 0.001)),
+        "not-a-polygon",
+    ],
+)
+def test_invalid_mask_polygons_are_rejected_at_the_command_boundary(polygon) -> None:
+    with pytest.raises(ValidationError) as error:
+        _command(mask_polygon=polygon)
+    assert error.value.code == "invalid_correction_mask_polygon"
+
+
+def test_masked_draft_publishes_distinct_display_and_ocr_renditions() -> None:
+    source = _source()
+    plain = _build_commit_draft(
+        _command(source),
+        source,
+        thumbnail_max_edge=64,
+    )
+    masked = _build_commit_draft(
+        _command(source, mask_polygon=TRIANGLE_MASK),
+        source,
+        thumbnail_max_edge=64,
+    )
+
+    # Without a mask the two renditions are the same bytes, exactly as before.
+    assert plain.output("corrected-display").content_sha256 == (
+        plain.output("ocr-ready").content_sha256
+    )
+    # With one they genuinely differ: alpha for display, flattened for OCR.
+    assert masked.output("corrected-display").content_sha256 != (
+        masked.output("ocr-ready").content_sha256
+    )
+    with Image.open(io.BytesIO(masked.output("corrected-display").content)) as display:
+        assert display.mode == "RGBA"
+    with Image.open(io.BytesIO(masked.output("ocr-ready").content)) as ocr_ready:
+        assert ocr_ready.mode != "RGBA"
+    with Image.open(io.BytesIO(masked.output("thumbnail").content)) as thumbnail:
+        assert thumbnail.mode == "RGBA"
+
+
+def test_queued_job_projects_the_mask_only_when_one_is_carried() -> None:
+    plain = CorrectionTransformService._job_record(_command(), "job-1")
+    masked = CorrectionTransformService._job_record(
+        _command(mask_polygon=TRIANGLE_MASK),
+        "job-2",
+    )
+
+    assert "mask_polygon" not in plain["input_revisions"]["transform"]
+    assert masked["input_revisions"]["transform"]["mask_polygon"] == [
+        list(point) for point in TRIANGLE_MASK
+    ]
+
+
+def test_operations_ride_the_same_optional_wire_slot_as_the_mask() -> None:
+    from librarytool.processing.operations import GammaOperation
+
+    plain = _command()
+    processed = _command(operations=(GammaOperation(gamma_hundredths=140),))
+
+    assert "operations" not in plain.as_dict()
+    assert processed.as_dict()["operations"][0]["algorithm"] == "gamma-v1"
+    assert CorrectionTransformCommand.from_dict(processed.as_dict()) == processed
+    assert processed.fingerprint != plain.fingerprint
+
+    projected = CorrectionTransformService._job_record(processed, "job-1")
+    assert projected["input_revisions"]["transform"]["operations"][0][
+        "algorithm"
+    ] == "gamma-v1"
+    assert "operations" not in CorrectionTransformService._job_record(
+        plain, "job-2"
+    )["input_revisions"]["transform"]
+
+
+def test_invalid_operations_are_rejected_at_the_command_boundary() -> None:
+    payload = dict(_command().as_dict())
+
+    with pytest.raises(ValidationError) as error:
+        CorrectionTransformCommand.from_dict(
+            dict(payload, operations=[{"schema": "org.whl.other"}])
+        )
+    assert error.value.code == "invalid_correction_operations"
+
+    with pytest.raises(ValidationError, match="at least one"):
+        CorrectionTransformCommand.from_dict(dict(payload, operations=[]))
+
+
+def test_operations_change_the_rendered_outputs() -> None:
+    from librarytool.processing.operations import GammaOperation
+
+    source = _source()
+    plain = _build_commit_draft(_command(source), source, thumbnail_max_edge=64)
+    processed = _build_commit_draft(
+        _command(source, operations=(GammaOperation(gamma_hundredths=220),)),
+        source,
+        thumbnail_max_edge=64,
+    )
+
+    assert plain.output("corrected-display").content_sha256 != (
+        processed.output("corrected-display").content_sha256
+    )

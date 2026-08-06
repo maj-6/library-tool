@@ -431,6 +431,8 @@
       this.options = options;
       this.profile = normalizeImageAdjustProfile(options.profile);
       this.brightness = this.profile.lastAppliedBrightness;
+      this.contrast = DEFAULT_CONTRAST;
+      this.adjustmentEnabled = true;
       this.rerunOcr = options.rerunOcr === true;
       this.reocrCapability = options.reocrCapability === true;
       this.reocrBusy = false;
@@ -459,6 +461,7 @@
       const activeDraft = Boolean(state && state.tool === TOOLS.IMAGE_ADJUST);
       if (!activeDraft) {
         this.brightness = this.profile.lastAppliedBrightness;
+        this.contrast = DEFAULT_CONTRAST;
         if (record && !record.disposed) this.refreshMount(false, state);
       }
       return this.serializeProfile();
@@ -474,7 +477,8 @@
       return {
         active: Boolean(editorState && editorState.tool === TOOLS.IMAGE_ADJUST),
         brightness: this.brightness,
-        contrast: DEFAULT_CONTRAST,
+        adjustmentEnabled: this.adjustmentEnabled,
+        contrast: this.contrast,
         rememberedBrightness: this.profile.lastAppliedBrightness,
         rerunOcr: this.rerunOcr,
         reocrCapability: this.reocrCapability,
@@ -498,10 +502,33 @@
 
     setBrightness(value, detail = {}) {
       const brightness = clampBrightness(value);
-      if (brightness === this.brightness) return brightness;
+      const enabled = detail.activate !== false;
+      const changed = brightness !== this.brightness ||
+        enabled && !this.adjustmentEnabled;
       this.brightness = brightness;
-      this.refreshMount(detail.announce !== false);
+      if (enabled) this.adjustmentEnabled = true;
+      if (changed) this.refreshMount(detail.announce !== false);
       return brightness;
+    }
+
+    setAdjustment(value, detail = {}) {
+      const adjustment = normalizeManualAdjustment(value);
+      if (adjustment === null) {
+        const changed = this.adjustmentEnabled ||
+          this.contrast !== DEFAULT_CONTRAST;
+        this.adjustmentEnabled = false;
+        this.contrast = DEFAULT_CONTRAST;
+        if (changed) this.refreshMount(detail.announce !== false);
+        return null;
+      }
+      const changed = !this.adjustmentEnabled ||
+        adjustment.brightness_percent !== this.brightness ||
+        adjustment.contrast_percent !== this.contrast;
+      this.brightness = adjustment.brightness_percent;
+      this.contrast = adjustment.contrast_percent;
+      this.adjustmentEnabled = true;
+      if (changed) this.refreshMount(detail.announce !== false);
+      return createManualBinaryAdjustment(this.brightness, this.contrast);
     }
 
     setRerunOcr(value) {
@@ -517,8 +544,8 @@
     }
 
     getAdjustment(context = {}) {
-      return this.ownsTransform(context)
-        ? createManualBinaryAdjustment(this.brightness)
+      return this.adjustmentEnabled && this.ownsTransform(context)
+        ? createManualBinaryAdjustment(this.brightness, this.contrast)
         : null;
     }
 
@@ -578,6 +605,53 @@
       };
     }
 
+    buildPresetPanel(documentRef, controller) {
+      const factory = this.options.createPresetPanel;
+      const port = this.options.presets;
+      if (typeof factory !== "function" || !port) return null;
+      try {
+        return factory({
+          presets: port,
+          documentRef,
+          getCurrentRecipe: () => ({
+            adjustment: this.adjustmentEnabled
+              ? createManualBinaryAdjustment(
+                this.brightness, this.contrast) : null,
+            operations: (() => {
+              const state = controller.getState();
+              return Array.isArray(state.operations) ? state.operations : [];
+            })(),
+          }),
+          onApply: (preset) => {
+            controller.dispatch({
+              type: "SET_TOOL",
+              tool: TOOLS.IMAGE_ADJUST,
+            });
+            if (preset.adjustment) {
+              this.setAdjustment(preset.adjustment, {
+                announce: false,
+              });
+            } else {
+              this.setAdjustment(null, { announce: false });
+            }
+            controller.dispatch({
+              type: "SET_PROCESSING_OPERATIONS",
+              operations: preset.operations,
+            });
+            this.refreshMount(false);
+            if (typeof this.options.onPresetApplied === "function") {
+              this.options.onPresetApplied(preset, controller);
+            }
+          },
+          onBatchApply: typeof this.options.onPresetBatchApply === "function"
+            ? (preset) => this.options.onPresetBatchApply(preset, controller)
+            : null,
+        });
+      } catch (error) {
+        return null;
+      }
+    }
+
     mount(controller, resource) {
       if (this.destroyed) throw new Error("image adjust tool is destroyed");
       if (!controller || !controller.canvas || !controller.surface ||
@@ -589,6 +663,8 @@
       }
       if (this.mountRecord) this.unmount(this.mountRecord);
       this.brightness = this.profile.lastAppliedBrightness;
+      this.contrast = DEFAULT_CONTRAST;
+      this.adjustmentEnabled = true;
       const documentRef = controller.surface.ownerDocument ||
         controller.canvas.ownerDocument;
       if (!documentRef || typeof documentRef.createElement !== "function") {
@@ -674,6 +750,14 @@
         thresholdStatus,
         jobStatus,
       );
+      // Presets are optional: without a configured port the panel simply is not
+      // built, so a host that has not wired the preset service still mounts.
+      const presetPanel = this.buildPresetPanel(documentRef, controller);
+      if (presetPanel) {
+        panel.append(presetPanel.node);
+        removers.push(() => presetPanel.destroy());
+        Promise.resolve(presetPanel.refresh()).catch(() => {});
+      }
       controller.inspector.append(panel);
 
       const previewCanvas = element(
@@ -697,6 +781,7 @@
         documentRef,
         panel,
         activeTool,
+        contrastOutput,
         brightnessInput,
         ocrInput,
         reocrRow,
@@ -813,6 +898,7 @@
         : "Image Adjust inactive";
       record.brightnessInput.disabled = !active;
       record.brightnessInput.value = String(this.brightness);
+      record.contrastOutput.textContent = String(this.contrast);
       record.ocrInput.checked = this.rerunOcr;
       if (record.reocrRow) {
         const available = this.reocrCapability &&
@@ -821,10 +907,16 @@
         record.reocrButton.disabled = !available || this.reocrBusy;
       }
       const threshold = thresholdForBrightness(this.brightness);
-      record.thresholdStatus.textContent =
-        `Contrast 100 · brightness ${this.brightness} · binary threshold ${threshold}`;
-      record.previewCanvas.hidden = !active;
-      record.previewCanvas.setAttribute("aria-hidden", String(!active));
+      const operationCount = Array.isArray(state.operations)
+        ? state.operations.length : 0;
+      record.thresholdStatus.textContent = this.adjustmentEnabled
+        ? `Contrast ${this.contrast} · brightness ${this.brightness} ` +
+          `· binary threshold ${threshold}`
+        : `Manual binary adjustment off · ${operationCount} processing ` +
+          `operation${operationCount === 1 ? "" : "s"}`;
+      const previewVisible = active && this.adjustmentEnabled;
+      record.previewCanvas.hidden = !previewVisible;
+      record.previewCanvas.setAttribute("aria-hidden", String(!previewVisible));
       record.controller.canvas.setAttribute(
         "aria-label",
         active
@@ -835,14 +927,16 @@
         record.jobStatus.textContent =
           `Brightness ${this.brightness}; binary threshold ${threshold}.`;
       }
-      if (active) this.schedulePreview(record);
+      if (previewVisible) this.schedulePreview(record);
     }
 
     schedulePreview(record = this.mountRecord) {
       if (!record || record.disposed ||
-          record.controller.getState().tool !== TOOLS.IMAGE_ADJUST) return;
+          record.controller.getState().tool !== TOOLS.IMAGE_ADJUST ||
+          !this.adjustmentEnabled) return;
       const generation = ++record.previewGeneration;
-      const adjustment = createManualBinaryAdjustment(this.brightness);
+      const adjustment = createManualBinaryAdjustment(
+        this.brightness, this.contrast);
       const render = typeof this.options.previewAdapter === "function"
         ? this.options.previewAdapter
         : renderBinaryCanvasPreview;

@@ -42,7 +42,9 @@ from ..adapters.filesystem import (
     FilesystemItemLifecycleRepository,
     FilesystemItemLifecycleReservationRepository,
     FilesystemItemQueryRepository,
+    PROCESSING_PRESET_RELATIVE,
     FilesystemOpenLibRepository,
+    FilesystemProcessingPresetStore,
     FilesystemReplicaRepository,
     FilesystemRepresentationCommandRepository,
     FilesystemTextLayerAggregateRepository,
@@ -113,6 +115,7 @@ from ..engine.providers import (
     SecretStatusProbe,
 )
 from ..engine.replica import ReplicaApplicationService
+from ..engine.processing_presets import ProcessingPresetService
 from ..engine.secret_store import (
     SecretStoreRepositoryPort,
     SecretStoreService,
@@ -140,6 +143,7 @@ from ..engine.runtime import (
     RASTER_ARTIFACT_QUERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    PROCESSING_PRESET_SERVICE,
     SECRET_STORE_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
@@ -952,6 +956,7 @@ class FilesystemServiceGraph:
     canvas_preparation: CanvasPreparationService | None = None
     text_layer_aggregate: TextLayerAggregateService | None = None
     secret_store: SecretStoreService | None = None
+    processing_presets: ProcessingPresetService | None = None
     provider_discovery: ProviderDiscoveryService | None = None
     correction_commands: CorrectionService | None = None
     correction_transforms: CorrectionTransformService | None = None
@@ -989,6 +994,13 @@ class FilesystemServiceGraph:
             SecretStoreService,
         ):
             raise TypeError("secret_store must be a SecretStoreService or None")
+        if self.processing_presets is not None and not isinstance(
+            self.processing_presets,
+            ProcessingPresetService,
+        ):
+            raise TypeError(
+                "processing_presets must be a ProcessingPresetService or None"
+            )
         if self.provider_discovery is not None and not isinstance(
             self.provider_discovery,
             ProviderDiscoveryService,
@@ -1068,6 +1080,7 @@ class FilesystemServiceGraph:
             (TEXT_LAYER_SERVICE, self.text_layers),
             (TEXT_LAYER_AGGREGATE_SERVICE, self.text_layer_aggregate),
             (SECRET_STORE_SERVICE, self.secret_store),
+            (PROCESSING_PRESET_SERVICE, self.processing_presets),
             (PROVIDER_DISCOVERY_SERVICE, self.provider_discovery),
             (CORRECTION_CAPTION_SERVICE, self.correction_commands),
             (CORRECTION_METADATA_SERVICE, self.correction_commands),
@@ -1449,6 +1462,31 @@ def compose_filesystem_engine(
         else SecretStoreService(secrets.repository)
     )
 
+    # Presets are workspace-scoped user configuration with a fixed location, so
+    # unlike the catalogue and entries they need no host-supplied path. They
+    # still go through the shared containment gate and overlap checks: a
+    # workspace path is never trusted just because composition chose it.
+    processing_presets_path = resolve_workspace_path(
+        resources.write_set.root,
+        Path(PROCESSING_PRESET_RELATIVE),
+        artifact="processing_presets",
+        directory=False,
+    )
+    for other_path, other_artifact in (
+        (catalogue_path, "catalogue"),
+        (entries_path, "entries"),
+    ):
+        if workspace_paths_overlap(processing_presets_path, other_path):
+            raise RepositoryError(
+                "the processing presets and "
+                f"{other_artifact} locations cannot overlap",
+                code="unsafe_filesystem_engine_path",
+                details={"artifact": "processing_presets"},
+            )
+    processing_presets = ProcessingPresetService(
+        FilesystemProcessingPresetStore(processing_presets_path)
+    )
+
     items = ItemQueryService(
         FilesystemItemQueryRepository(
             catalogue.load_snapshot,
@@ -1591,6 +1629,7 @@ def compose_filesystem_engine(
         canvas_preparation=canvas_preparation,
         text_layer_aggregate=native_text_layers,
         secret_store=secret_store,
+        processing_presets=processing_presets,
         provider_discovery=(None if providers is None else providers.service),
         correction_commands=correction_commands,
         correction_transforms=correction_transforms,

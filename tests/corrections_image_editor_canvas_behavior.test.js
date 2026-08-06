@@ -13,6 +13,7 @@ const {
   correctionResourceContract,
   createPerspectiveImageRenderer,
   safeRasterUrl,
+  serializeProcessingPresetCommand,
 } = require("../tools/whl_explorer/static/corrections/image-editor");
 
 
@@ -236,6 +237,17 @@ function fixtureResource(overrides = {}) {
 }
 
 
+function gammaOperation() {
+  return {
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "gamma-v1",
+    rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+    gamma_hundredths: 120,
+  };
+}
+
+
 function renderHarness(options = {}, resource = fixtureResource()) {
   FakeResizeObserver.instances.length = 0;
   const documentRef = new FakeDocument();
@@ -330,6 +342,40 @@ test("renderer exposes strict resource pins, safe raster URLs, and accessible nu
   assert.match(controller.canvas.getAttribute("aria-label"), /four-corner/i);
   assert.ok(controller.canvas.drawCalls.some(([name]) => name === "fillText"));
   dispose();
+});
+
+
+test("preset command serialization derives fresh pins and quad from its target resource", () => {
+  const target = fixtureResource({
+    id: "capture-9",
+    correction: {
+      item_id: "book-2",
+      artifact_id: "capture-9",
+      artifact_revision: "artifact-r9",
+      source_revision: "source-r29",
+      source_sha256: "b".repeat(64),
+      proposal: fixtureProposal({
+        source_revision: "source-r29",
+        quad: [[0.1, 0.1], [0.8, 0.08], [0.9, 0.9], [0.12, 0.88]],
+      }),
+    },
+  });
+  const command = serializeProcessingPresetCommand({
+    resource: target,
+    preset: {
+      operations: [gammaOperation()],
+      adjustment: null,
+    },
+    operationId: "preset:target-9",
+  });
+
+  assert.equal(command.item_id, "book-2");
+  assert.equal(command.artifact_id, "capture-9");
+  assert.equal(command.artifact_revision, "artifact-r9");
+  assert.equal(command.source_revision, "source-r29");
+  assert.deepEqual(command.quad, target.correction.proposal.quad);
+  assert.equal(command.adjustment, null);
+  assert.deepEqual(command.operations, [gammaOperation()]);
 });
 
 
@@ -497,6 +543,34 @@ test("toolbar and focused Space use one command path and retry the exact idempot
   });
   assert.equal(formSpace.defaultPrevented, false);
   assert.equal(invocations.length, 2);
+  dispose();
+});
+
+
+test("processing operations in editor state reach the queued transform command", async () => {
+  const invocations = [];
+  const { container, controller, dispose } = renderHarness({
+    initialTool: TOOLS.IMAGE_ADJUST,
+    canQueue: () => true,
+    getAdjustment: () => null,
+    invokeCommand: async (commandId, payload) => {
+      invocations.push({ commandId, payload });
+      return { job_id: "correction-transform-job-preset" };
+    },
+    createOperationId: () => "correction-op-preset",
+  });
+  controller.dispatch({
+    type: "SET_PROCESSING_OPERATIONS",
+    operations: [gammaOperation()],
+  });
+
+  byClass(container, "perspective-queue-button")[0].emit("click");
+  await nextTurn();
+
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].payload.command.adjustment, null);
+  assert.deepEqual(invocations[0].payload.command.operations, [gammaOperation()]);
+  assert.deepEqual(controller.getState().operations, [gammaOperation()]);
   dispose();
 });
 

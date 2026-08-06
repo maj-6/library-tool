@@ -45,6 +45,7 @@ from ..engine.runtime import (
     RASTER_ARTIFACT_QUERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    PROCESSING_PRESET_SERVICE,
     SECRET_STORE_SERVICE,
     SPATIAL_ANNOTATION_QUERY_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
@@ -249,6 +250,14 @@ FIRST_PARTY_MODULE_MANIFESTS = (
         provides=(
             CapabilityRef("library.secrets.status"),
             CapabilityRef("library.secrets.mutate"),
+        ),
+    ),
+    ModuleManifest(
+        "library.processing-presets",
+        "1.0.0",
+        provides=(
+            CapabilityRef("library.processing-presets.read"),
+            CapabilityRef("library.processing-presets.mutate"),
         ),
     ),
     ModuleManifest(
@@ -630,6 +639,20 @@ def first_party_module_contributions(
                         SECRET_STORE_SERVICE,
                         graph.secret_store,
                         modules["library.secrets"].provides,
+                    ),
+                ),
+            )
+        )
+
+    if graph.processing_presets is not None:
+        contributions.append(
+            ModuleContribution(
+                modules["library.processing-presets"],
+                bindings=(
+                    ServiceBinding(
+                        PROCESSING_PRESET_SERVICE,
+                        graph.processing_presets,
+                        modules["library.processing-presets"].provides,
                     ),
                 ),
             )

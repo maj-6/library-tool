@@ -161,6 +161,10 @@ _TRANSFORM_COMMAND_FIELDS = frozenset(
         "operation_id",
     }
 )
+# Mirrors _COMMAND_OPTIONAL_FIELDS in librarytool.engine.correction_transforms;
+# see the schema-evolution note there for why these are additive rather than a
+# version bump.
+_TRANSFORM_COMMAND_OPTIONAL_FIELDS = frozenset({"mask_polygon", "operations"})
 _RASTER_GROUP_KINDS = {
     "source-images": frozenset(
         {"capture", "captured-image", "page-image", "scan", "source-image"}
@@ -567,7 +571,11 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
-def _mutation_document(fields: frozenset[str]) -> Mapping[str, Any]:
+def _mutation_document(
+    fields: frozenset[str],
+    *,
+    optional: frozenset[str] = frozenset(),
+) -> Mapping[str, Any]:
     length = request.content_length
     if length is not None and length > CORRECTION_MUTATION_MAX_BYTES:
         raise ValidationError(
@@ -609,11 +617,15 @@ def _mutation_document(fields: frozenset[str]) -> Mapping[str, Any]:
             code="invalid_correction_mutation_document",
             details={"cause_type": type(error).__name__},
         ) from error
-    if not isinstance(value, Mapping) or set(value) != fields:
+    # Every key is still allowlisted; `optional` only lets a caller accept a
+    # documented additive field without loosening anything else.
+    if not isinstance(value, Mapping) or not (
+        fields <= set(value) <= (fields | optional)
+    ):
         raise ValidationError(
             "the correction mutation fields do not match the schema",
             code="invalid_correction_mutation_envelope",
-            details={"fields": sorted(fields)},
+            details={"fields": sorted(fields), "optional": sorted(optional)},
         )
     return value
 
@@ -1285,7 +1297,10 @@ def _queue_transform(
     operation_id = _operation_id()
     expected_revision = _strong_revision("If-Artifact-Match")
     command = CorrectionTransformCommand.from_dict(
-        _mutation_document(_TRANSFORM_COMMAND_FIELDS)
+        _mutation_document(
+            _TRANSFORM_COMMAND_FIELDS,
+            optional=_TRANSFORM_COMMAND_OPTIONAL_FIELDS,
+        )
     )
     mismatched = []
     if command.item_id != item_id:

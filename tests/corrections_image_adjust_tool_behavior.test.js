@@ -35,6 +35,9 @@ const {
   FakeNode,
   fakeDocument,
 } = require("./fixtures/corrections_fake_dom");
+const {
+  createPresetPanel,
+} = require("../tools/whl_explorer/static/corrections/preset-panel");
 
 const parityFixture = JSON.parse(fs.readFileSync(path.join(
   __dirname,
@@ -104,6 +107,17 @@ function command(operationId, brightness, rerunOcr = false) {
     rerunOcr,
     operationId,
   });
+}
+
+
+function gammaOperation() {
+  return {
+    schema: "org.whl.raster.processing-operation",
+    version: 1,
+    algorithm: "gamma-v1",
+    rule: "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+    gamma_hundredths: 120,
+  };
 }
 
 
@@ -642,6 +656,94 @@ test("mounted UI exposes controls, A enters mode, and wheel direction clamps", (
   cleanup();
   assert.equal(byClass(inspector, "image-adjust-panel").length, 0);
   assert.equal(canvas.getAttribute("aria-label"), null);
+});
+
+
+test("preset Apply activates Image Adjust and preserves exact recipe semantics", async () => {
+  const operationsOnly = {
+    preset_id: "gamma-only",
+    name: "Gamma only",
+    category: "cover",
+    operations: [gammaOperation()],
+    adjustment: null,
+    revision: "preset-r1",
+  };
+  const adjustmentOnly = {
+    preset_id: "binary-only",
+    name: "Binary only",
+    category: "cover",
+    operations: [],
+    adjustment: createManualBinaryAdjustment(35, 25),
+    revision: "preset-r2",
+  };
+  const rows = [operationsOnly, adjustmentOnly];
+  const created = [];
+  const presets = {
+    async list() { return { presets: rows.slice() }; },
+    async create({ preset }) {
+      created.push(preset);
+      rows.push({ ...preset, revision: `preset-new-${created.length}` });
+      return { preset: rows.at(-1) };
+    },
+    async remove() { return { removed: true }; },
+  };
+  const harness = mountedHarness({ createPresetPanel, presets });
+  await new Promise((resolve) => setImmediate(resolve));
+  const panel = byClass(harness.inspector, "preset-panel")[0];
+  const chooser = byClass(panel, "preset-chooser")[0];
+  const applyButton = byClass(panel, "preset-apply")[0];
+
+  chooser.value = "gamma-only";
+  chooser.emit("change");
+  applyButton.emit("click");
+  assert.equal(harness.controller.getState().tool, TOOLS.IMAGE_ADJUST);
+  assert.equal(harness.tool.getState().adjustmentEnabled, false);
+  assert.equal(harness.tool.getAdjustment({
+    state: harness.controller.getState(),
+  }), null);
+  assert.deepEqual(harness.controller.getState().operations, [gammaOperation()]);
+
+  byClass(panel, "preset-name")[0].value = "Gamma copy";
+  byClass(panel, "preset-save")[0].emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created[0].adjustment, null,
+    "saving does not invent the manual-binary adjustment");
+  assert.deepEqual(created[0].operations, [gammaOperation()]);
+
+  chooser.value = "binary-only";
+  chooser.emit("change");
+  applyButton.emit("click");
+  assert.equal(harness.tool.getState().adjustmentEnabled, true);
+  assert.equal(harness.tool.getState().brightness, 35);
+  assert.equal(harness.tool.getState().contrast, 25);
+  assert.deepEqual(harness.tool.getAdjustment({
+    state: harness.controller.getState(),
+  }), adjustmentOnly.adjustment);
+  assert.deepEqual(harness.previewCalls.at(-1), adjustmentOnly.adjustment,
+    "the exact non-default contrast reaches the preview adapter");
+  assert.deepEqual(harness.controller.getState().operations, [],
+    "an adjustment-only preset clears operations from the prior recipe");
+
+  const serialized = serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: harness.controller.getState().quad,
+    adjustment: composeImageAdjustRendererOptions(harness.tool)
+      .getAdjustment({ state: harness.controller.getState() }),
+    rerunOcr: false,
+    operationId: "preset-adjustment-25",
+  });
+  assert.deepEqual(serialized.adjustment, adjustmentOnly.adjustment,
+    "the exact non-default contrast reaches the queue command");
+
+  byClass(panel, "preset-name")[0].value = "Binary copy";
+  byClass(panel, "preset-save")[0].emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(created[1].adjustment, adjustmentOnly.adjustment,
+    "saving the current recipe preserves every canonical adjustment field");
+  assert.deepEqual(created[1].operations, []);
+  harness.cleanup();
 });
 
 

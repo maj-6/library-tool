@@ -1809,6 +1809,46 @@
     "source_revision", "source_sha256", "quad", "adjustment", "rerun_ocr",
     "operation_id",
   ];
+  // Additive-optional, deliberately not a schema version bump. The engine
+  // fingerprints the command document, so a mask-less command must keep the
+  // exact key set — and therefore the exact digest — it had before these
+  // features existed. See _COMMAND_OPTIONAL_FIELDS in
+  // librarytool/engine/correction_transforms.py for the full rationale.
+  const CORRECTION_TRANSFORM_COMMAND_OPTIONAL_FIELDS = [
+    "mask_polygon", "operations",
+  ];
+  const CORRECTION_TRANSFORM_COMMAND_ALLOWED_FIELDS = [
+    ...CORRECTION_TRANSFORM_COMMAND_FIELDS,
+    ...CORRECTION_TRANSFORM_COMMAND_OPTIONAL_FIELDS,
+  ];
+  // Mirrors librarytool/processing/operations.py. Every wire parameter is an
+  // integer: a float would have to survive Python and JavaScript canonical
+  // JSON identically, and the two disagree on exponent formatting.
+  const CORRECTION_OPERATION_PARAMETERS = {
+    "unsharp-mask-v1": {
+      radius_tenths: [1, 500],
+      amount_percent: [0, 500],
+      threshold: [0, 255],
+    },
+    "kernel-sharpen-v1": { strength_percent: [0, 100] },
+    "gamma-v1": { gamma_hundredths: [10, 1000] },
+    "contrast-v1": { contrast_percent: [-100, 100] },
+    "channel-gain-v1": {
+      red_percent: [0, 400],
+      green_percent: [0, 400],
+      blue_percent: [0, 400],
+    },
+    "white-balance-v1": {
+      // `mode` is an enum, not a range; null marks it as checked separately.
+      mode: null,
+      strength_percent: [0, 100],
+      temperature: [-100, 100],
+      tint: [-100, 100],
+    },
+  };
+  const MAX_OPERATIONS_PER_RECIPE = 16;
+  const MIN_MASK_POLYGON_POINTS = 3;
+  const MAX_MASK_POLYGON_POINTS = 512;
   const CORRECTION_ADJUSTMENT_FIELDS = [
     "schema", "version", "algorithm", "contrast_percent",
     "brightness_percent", "threshold", "threshold_rule", "comparison",
@@ -1841,8 +1881,113 @@
       value.comparison === "grayscale_value > threshold";
   }
 
+  function isNormalizedPoint(point) {
+    return Array.isArray(point) && point.length === 2 &&
+      point.every((coordinate) =>
+        typeof coordinate === "number" && Number.isFinite(coordinate) &&
+        coordinate >= 0 && coordinate <= 1);
+  }
+
+  // Geometry (convexity, self-intersection, area) is the engine's call; the
+  // client only guards shape and bounds so a malformed payload never reaches
+  // the wire looking well formed.
+  function isCorrectionMaskPolygon(value) {
+    if (value === undefined) return true;
+    return Array.isArray(value) &&
+      value.length >= MIN_MASK_POLYGON_POINTS &&
+      value.length <= MAX_MASK_POLYGON_POINTS &&
+      value.every((point) => isNormalizedPoint(point));
+  }
+
+  function isCorrectionOperation(value) {
+    if (!isObject(value)) return false;
+    const bounds = Object.prototype.hasOwnProperty.call(
+      CORRECTION_OPERATION_PARAMETERS, value.algorithm,
+    ) ? CORRECTION_OPERATION_PARAMETERS[value.algorithm] : null;
+    if (!bounds) return false;
+    const names = Object.keys(bounds);
+    if (!hasExactKeys(value, [
+      "schema", "version", "algorithm", "rule", ...names,
+    ])) return false;
+    if (value.schema !== "org.whl.raster.processing-operation" ||
+        value.version !== 1 || !Number.isSafeInteger(value.version) ||
+        typeof value.rule !== "string" || !value.rule) return false;
+    if (value.algorithm === "white-balance-v1") {
+      if (value.mode !== "gray_world" && value.mode !== "manual") return false;
+      if (value.mode === "gray_world" &&
+          (value.temperature !== 0 || value.tint !== 0)) return false;
+    }
+    return names.every((name) => {
+      if (name === "mode") return true;
+      const [minimum, maximum] = bounds[name];
+      return Number.isSafeInteger(value[name]) &&
+        value[name] >= minimum && value[name] <= maximum;
+    });
+  }
+
+  function isCorrectionOperations(value) {
+    if (value === undefined) return true;
+    return Array.isArray(value) && value.length > 0 &&
+      value.length <= MAX_OPERATIONS_PER_RECIPE &&
+      value.every((operation) => isCorrectionOperation(operation));
+  }
+
+  const IMAGE_CATEGORIES = [
+    "title_page", "cover", "spine", "content_specimen", "other",
+  ];
+  const MAX_PROCESSING_PRESET_NAME_LENGTH = 120;
+  const PROCESSING_PRESET_FIELDS = [
+    "schema", "version", "preset_id", "name", "category", "operations",
+    "adjustment",
+  ];
+
+  function isProcessingPresetName(value) {
+    if (typeof value !== "string") return false;
+    let length = 0;
+    for (const character of value) {
+      const codePoint = character.codePointAt(0);
+      // String iteration combines valid surrogate pairs but yields an unpaired
+      // surrogate on its own. Count the former as one Unicode scalar value and
+      // reject the latter, matching Python's UTF-8 persistence boundary.
+      if (codePoint >= 0xD800 && codePoint <= 0xDFFF) return false;
+      if (codePoint < 32 || codePoint === 127) return false;
+      length += 1;
+      if (length > MAX_PROCESSING_PRESET_NAME_LENGTH) return false;
+    }
+    return length > 0;
+  }
+
+  // A stored preset always reports its derived revision; a preset being sent
+  // for the first time has not got one yet.
+  function isProcessingPreset(value, { requireRevision = true } = {}) {
+    const fields = requireRevision
+      ? [...PROCESSING_PRESET_FIELDS, "revision"]
+      : PROCESSING_PRESET_FIELDS;
+    if (!hasExactKeys(value, fields)) return false;
+    if (requireRevision &&
+        (typeof value.revision !== "string" ||
+          !/^[0-9a-f]{64}$/.test(value.revision))) return false;
+    return value.schema === "org.whl.processing-preset" &&
+      value.version === 1 && Number.isSafeInteger(value.version) &&
+      isPortableIdentifier(value.preset_id) &&
+      isProcessingPresetName(value.name) &&
+      typeof value.category === "string" &&
+      (value.category === "" || IMAGE_CATEGORIES.includes(value.category)) &&
+      Array.isArray(value.operations) &&
+      value.operations.length <= MAX_OPERATIONS_PER_RECIPE &&
+      value.operations.every((operation) => isCorrectionOperation(operation)) &&
+      isCorrectionAdjustment(value.adjustment) &&
+      (value.operations.length > 0 || value.adjustment !== null);
+  }
+
   function isCorrectionTransformCommand(value) {
-    return hasExactKeys(value, CORRECTION_TRANSFORM_COMMAND_FIELDS) &&
+    return hasAllowedKeys(
+      value,
+      CORRECTION_TRANSFORM_COMMAND_ALLOWED_FIELDS,
+      CORRECTION_TRANSFORM_COMMAND_FIELDS,
+    ) &&
+      isCorrectionMaskPolygon(value.mask_polygon) &&
+      isCorrectionOperations(value.operations) &&
       value.schema === "org.whl.correction-transform-command" &&
       value.version === 1 && Number.isSafeInteger(value.version) &&
       isPortableIdentifier(value.item_id) &&
@@ -1862,8 +2007,36 @@
       isPortableIdentifier(value.operation_id);
   }
 
+  function sameNormalizedPolygon(actual, expected) {
+    if (expected === undefined || expected === null) {
+      return actual === undefined;
+    }
+    return Array.isArray(actual) && actual.length === expected.length &&
+      actual.every((point, index) =>
+        Array.isArray(point) && point.length === 2 &&
+        point[0] === expected[index][0] && point[1] === expected[index][1]);
+  }
+
+  function sameCorrectionOperations(actual, expected) {
+    if (expected === undefined || expected === null) {
+      return actual === undefined;
+    }
+    return Array.isArray(actual) && actual.length === expected.length &&
+      actual.every((operation, index) => {
+        const want = expected[index];
+        const keys = Object.keys(want);
+        return isObject(operation) && hasExactKeys(operation, keys) &&
+          keys.every((key) => operation[key] === want[key]);
+      });
+  }
+
   function isCorrectionTransformInput(value, command) {
-    if (!hasExactKeys(value, ["quad", "adjustment", "rerun_ocr"]) ||
+    if (!hasAllowedKeys(
+      value,
+      ["quad", "adjustment", "rerun_ocr", "mask_polygon", "operations"],
+      ["quad", "adjustment", "rerun_ocr"],
+    ) ||
+        !sameCorrectionOperations(value.operations, command.operations) ||
         value.rerun_ocr !== command.rerun_ocr ||
         !Array.isArray(value.quad) ||
         value.quad.length !== command.quad.length ||
@@ -1872,6 +2045,7 @@
           point.length === 2 &&
           point[0] === command.quad[index][0] &&
           point[1] === command.quad[index][1]) ||
+        !sameNormalizedPolygon(value.mask_polygon, command.mask_polygon) ||
         !isCorrectionAdjustment(value.adjustment)) return false;
     if (value.adjustment === null || command.adjustment === null) {
       return value.adjustment === command.adjustment;
@@ -2017,6 +2191,7 @@
       this.retryable = options.retryable != null
         ? !!options.retryable
         : this.status === 0 || this.status === 429 || this.status >= 500;
+      this.ambiguous = options.ambiguous === true;
       this.method = options.method || "";
       this.url = options.url || "";
       this.body = options.body == null ? null : options.body;
@@ -2144,6 +2319,12 @@
         replace: (args) => this._secretReplace(args),
         clear: (args) => this._secretClear(args),
       });
+      this.processingPresets = Object.freeze({
+        list: (args) => this._processingPresetList(args),
+        create: (args) => this._processingPresetWrite("create", args),
+        update: (args) => this._processingPresetWrite("update", args),
+        remove: (args) => this._processingPresetRemove(args),
+      });
       this.capabilities = (args) => this._capabilities(args);
       this.providers = Object.freeze({
         discover: (args) => this._providersDiscover(args),
@@ -2248,11 +2429,18 @@
         body = await response.json();
       } catch (cause) {
         if (responseOk && options.allowEmpty) return { ok: true };
+        // A caller may opt in only when it retains the exact idempotent
+        // mutation command for replay. A successful status with an unreadable
+        // body cannot tell that caller whether the server committed, whereas a
+        // malformed GET remains a definitive read failure.
+        const ambiguous = responseOk &&
+          options.ambiguousOnSuccessJsonFailure === true;
         throw new EngineClientError(responseOk
           ? "Engine returned an invalid JSON response"
           : `Engine request failed (${status || "no status"})`, {
           status, code: responseOk ? "invalid-response" : fallbackCode(status),
-          retryable: status === 429 || status >= 500,
+          retryable: ambiguous || status === 429 || status >= 500,
+          ambiguous,
           method, url, body: null, cause,
         });
       }
@@ -2417,6 +2605,82 @@
         }
         return body;
       });
+    }
+
+    async _processingPresetList({ signal } = {}) {
+      const path = "/v1/processing-presets";
+      const { body, status } = await this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      });
+      if (status !== 200 || !hasExactKeys(body, [
+        "ok", "schema", "presets", "revision",
+      ]) || body.ok !== true ||
+          body.schema !== "librarytool.processing-presets/1" ||
+          typeof body.revision !== "string" || !body.revision ||
+          !Array.isArray(body.presets) ||
+          !body.presets.every((value) => isProcessingPreset(value)) ||
+          new Set(body.presets.map((value) => value.preset_id)).size !==
+            body.presets.length) {
+        this._invalidResponse(
+          "Engine returned an invalid processing preset list",
+          "GET", path, null, undefined, status);
+      }
+      return body;
+    }
+
+    async _processingPresetWrite(action, { preset, revision, signal } = {}) {
+      if (!isProcessingPreset(preset, { requireRevision: false })) {
+        throw new TypeError("preset must be a canonical processing preset");
+      }
+      const path = `/v1/processing-presets/${encodePart(preset.preset_id)}`;
+      const headers = {};
+      if (action === "update") {
+        headers["If-Preset-Match"] = quoteRevision(revision, "revision");
+      }
+      const { body, status } = await this._requestJson(
+        action === "create" ? "PUT" : "POST",
+        path,
+        {
+          headers,
+          body: { preset },
+          signal,
+          cache: "no-store",
+          includeStatus: true,
+        },
+      );
+      if (status !== 200 || !hasExactKeys(body, ["ok", "schema", "preset"]) ||
+          body.ok !== true ||
+          body.schema !== "librarytool.processing-preset/1" ||
+          !isProcessingPreset(body.preset) ||
+          body.preset.preset_id !== preset.preset_id) {
+        this._invalidResponse(
+          "Engine returned an invalid processing preset receipt",
+          action === "create" ? "PUT" : "POST",
+          path, null, undefined, status);
+      }
+      return body;
+    }
+
+    async _processingPresetRemove({ presetId, revision, signal } = {}) {
+      const path = `/v1/processing-presets/${encodePart(
+        portableIdentifier(presetId, "presetId"),
+      )}`;
+      const { body, status } = await this._requestJson("DELETE", path, {
+        headers: { "If-Preset-Match": quoteRevision(revision, "revision") },
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      });
+      if (status !== 200 ||
+          !hasExactKeys(body, ["ok", "schema", "preset_id"]) ||
+          body.ok !== true ||
+          body.schema !== "librarytool.processing-preset-deleted/1" ||
+          body.preset_id !== presetId) {
+        this._invalidResponse(
+          "Engine returned an invalid processing preset deletion",
+          "DELETE", path, null, undefined, status);
+      }
+      return body;
     }
 
     async _secretsList({ signal } = {}) {
@@ -3695,6 +3959,7 @@
         signal,
         cache: "no-store",
         includeStatus: true,
+        ambiguousOnSuccessJsonFailure: true,
       });
       const expectedStatus = body && body.replayed === true ? 200 : 202;
       if (status !== expectedStatus || !hasExactKeys(body, [

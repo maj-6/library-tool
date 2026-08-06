@@ -13,6 +13,7 @@
     ...require("./classification-controls"),
     ...require("./image-editor"),
     ...require("./image-adjust-tool"),
+    ...require("./preset-panel"),
     ...require("./ocr-proposals"),
     ...require("./ch-panel"),
   } : root.LibraryToolCorrections;
@@ -64,6 +65,11 @@
   ]);
   const BOOKS_NAVIGATION_IDS = new Set(
     BOOKS_NAVIGATION_COMMANDS.map((command) => command.id));
+  const PRESET_BATCH_PAGE_LIMIT = 100;
+  const PRESET_BATCH_MAX_PAGES = 64;
+  const PRESET_BATCH_MAX_TARGETS = 4096;
+  const PRESET_BATCH_RETRY_LIMIT = 4096;
+  const PRESET_BATCH_CONTEXT_CHANGED = "preset-batch-context-changed";
 
   function isPlainObject(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -168,6 +174,15 @@
 
   function clone(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
+  }
+
+  function processingPresetFingerprint(preset) {
+    const revision = preset && preset.revision;
+    if (typeof revision !== "string" || !/^[0-9a-f]{64}$/.test(revision)) {
+      throw new TypeError(
+        "batch apply requires a content-revisioned processing preset");
+    }
+    return revision;
   }
 
   function emptySelection() {
@@ -423,6 +438,13 @@
       const desktopCorrections = this.desktop && this.desktop.corrections || null;
       this.engineCorrections = correctionsRuntimePorts(
         this.windowRef, desktopCorrections, this.documentRef);
+      this.processingPresets = Object.prototype.hasOwnProperty.call(
+        options, "processingPresets",
+      ) ? options.processingPresets
+        : desktopCorrections && desktopCorrections.processingPresets ||
+          this.engineCorrections && this.engineCorrections.processingPresets ||
+          this.windowRef && this.windowRef.engineClient &&
+            this.windowRef.engineClient.processingPresets || null;
       this.booksApi = options.booksApi || desktopCorrections ||
         this.engineCorrections && this.engineCorrections.books || null;
       this.artifactPorts = options.artifactPorts ||
@@ -437,14 +459,40 @@
             ? this.engineCorrections.invokeCommand.bind(
               this.engineCorrections)
             : null;
+      this.invokeCommand = invokeCommand;
+      this.presetBatchOperationIdFactory =
+        typeof options.presetBatchOperationIdFactory === "function"
+          ? options.presetBatchOperationIdFactory : null;
+      this.presetBatchSequence = 0;
+      this.presetBatchRetryCommands = new Map();
+      this.presetBatchRuns = new Map();
       const imageAdjustOptions = isPlainObject(options.imageAdjustOptions)
         ? options.imageAdjustOptions : {};
+      const presetPanelFactory = typeof imageAdjustOptions.createPresetPanel === "function"
+        ? imageAdjustOptions.createPresetPanel : deps.createPresetPanel;
+      const presetPort = Object.prototype.hasOwnProperty.call(
+        imageAdjustOptions, "presets",
+      ) ? imageAdjustOptions.presets : this.processingPresets;
+      const internalBatchHandler = invokeCommand && this.engineCorrections &&
+          this.engineCorrections.artifacts &&
+          this.engineCorrections.artifacts.catalog &&
+          typeof this.engineCorrections.artifacts.catalog.list === "function" &&
+          typeof this.engineCorrections.artifacts.catalog.get === "function"
+        ? (preset, controller) =>
+            this.batchApplyProcessingPreset(preset, controller)
+        : null;
+      const presetBatchHandler =
+        typeof imageAdjustOptions.onPresetBatchApply === "function"
+          ? imageAdjustOptions.onPresetBatchApply : internalBatchHandler;
       this.imageAdjustTool = options.imageAdjustTool ||
         typeof deps.createImageAdjustTool === "function" &&
           deps.createImageAdjustTool({
             requestReocr: (request, detail) =>
               this.queueStandaloneReocr(request, detail),
             ...imageAdjustOptions,
+            createPresetPanel: presetPanelFactory,
+            presets: presetPort,
+            onPresetBatchApply: presetBatchHandler,
             profile: null,
             onProfileChange: (value, detail) => {
               if (typeof imageAdjustOptions.onProfileChange === "function") {
@@ -490,8 +538,8 @@
         onCommandError: (error) => this.setStatus(
           error && error.message || "The transform could not be queued", true),
         onQueueResult: (_result, command) => this.setStatus(
-          command && command.adjustment
-            ? "Image adjustment queued"
+          command && (command.adjustment || command.operations)
+            ? "Image processing queued"
             : "Perspective transform queued"),
         onStateChange: (state) => {
           if (!this.classificationController ||
@@ -499,7 +547,7 @@
             return;
           }
           this.classificationController.setCanvasOwner(
-            state && state.gesture
+            state && (state.gesture || state.maskDraft)
               ? {
                 active: true,
                 tool: state.tool,
@@ -1052,6 +1100,372 @@
       this.setStatus(receipt.replayed === true
         ? "Re-OCR already queued" : "Re-OCR queued");
       return receipt;
+    }
+
+    nextPresetBatchOperationId(preset, capture) {
+      this.presetBatchSequence += 1;
+      if (this.presetBatchOperationIdFactory) {
+        return this.presetBatchOperationIdFactory({
+          preset,
+          capture,
+          sequence: this.presetBatchSequence,
+        });
+      }
+      const cryptoRef = this.windowRef && this.windowRef.crypto;
+      if (cryptoRef && typeof cryptoRef.randomUUID === "function") {
+        return `preset:${cryptoRef.randomUUID()}`;
+      }
+      return `preset:${Date.now().toString(36)}:` +
+        this.presetBatchSequence.toString(36);
+    }
+
+    presetBatchContextError(message =
+      "The Corrections context changed; the preset batch was cancelled") {
+      const error = new Error(message);
+      error.code = PRESET_BATCH_CONTEXT_CHANGED;
+      return error;
+    }
+
+    createPresetBatchBinding(preset, controller) {
+      if (!preset || typeof preset.category !== "string" || !preset.category) {
+        throw new TypeError("Batch apply requires a categorized processing preset");
+      }
+      if (!controller || !controller.resource ||
+          typeof deps.correctionResourceContract !== "function") {
+        throw new Error("Batch apply requires the active image editor");
+      }
+      const editorContract = deps.correctionResourceContract(
+        controller.resource);
+      const editorPins = editorContract && editorContract.pins;
+      const editorItemId = editorPins && editorPins.item_id;
+      if (!editorItemId || typeof editorPins.artifact_id !== "string" ||
+          !editorPins.artifact_id ||
+          typeof editorPins.artifact_revision !== "string" ||
+          !editorPins.artifact_revision ||
+          typeof editorPins.source_revision !== "string" ||
+          !editorPins.source_revision ||
+          typeof editorPins.source_sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/.test(editorPins.source_sha256)) {
+        throw new Error("The active image has no authoritative source pins");
+      }
+      const state = this.state;
+      const itemId = state && state.selection && state.selection.itemId;
+      if (!itemId) {
+        throw new Error("Select a book before applying a preset in batch");
+      }
+      if (itemId !== editorItemId) {
+        throw this.presetBatchContextError(
+          "The active image belongs to a different book; nothing was queued");
+      }
+      const context = normalizeWorkbenchContext(state && state.context);
+      const contextSignature = JSON.stringify(context);
+      const presetFingerprint = processingPresetFingerprint(preset);
+      // Catalog enumeration is deliberately book-scoped. Carrying the
+      // selected representation/canvas would make the engine return only a
+      // slice of source-images and break the panel's "All" promise.
+      const catalogContext = {
+        ...context,
+        itemId,
+        item_id: itemId,
+        workspaceId: context.workspace_id,
+      };
+      for (const field of [
+        "representation_id", "canvas_id", "artifact_id", "annotation_id",
+        "resource_revision", "representationId", "canvasId", "artifactId",
+        "annotationId", "resourceRevision",
+      ]) delete catalogContext[field];
+      const generation = Number.isSafeInteger(this.contextGeneration)
+        ? this.contextGeneration : null;
+      const runKey = JSON.stringify({
+        workspace_id: context.workspace_id,
+        item_id: itemId,
+        context: contextSignature,
+        preset: presetFingerprint,
+      });
+      return Object.freeze({
+        catalogContext: Object.freeze(catalogContext),
+        contextGeneration: generation,
+        contextSignature,
+        editorArtifactId: editorPins.artifact_id,
+        itemId,
+        presetFingerprint,
+        runKey,
+        workspaceId: context.workspace_id,
+      });
+    }
+
+    assertPresetBatchBinding(binding) {
+      if (this.destroyed) throw this.presetBatchContextError(
+        "The Corrections window closed; the preset batch was cancelled");
+      const state = this.state;
+      const itemId = state && state.selection && state.selection.itemId;
+      let signature = "";
+      try {
+        signature = JSON.stringify(normalizeWorkbenchContext(
+          state && state.context));
+      } catch (error) {
+        throw this.presetBatchContextError();
+      }
+      if (itemId !== binding.itemId || signature !== binding.contextSignature ||
+          binding.contextGeneration !== null &&
+            this.contextGeneration !== binding.contextGeneration) {
+        throw this.presetBatchContextError();
+      }
+      const store = this.booksFeature && this.booksFeature.store;
+      const snapshot = store && typeof store.snapshot === "function"
+        ? store.snapshot() : null;
+      if (snapshot && snapshot.workspaceId != null &&
+          snapshot.workspaceId !== binding.workspaceId) {
+        throw this.presetBatchContextError(
+          "The Corrections workspace changed; the preset batch was cancelled");
+      }
+      return snapshot;
+    }
+
+    async freshPresetBatchIndex(binding) {
+      const feature = this.booksFeature;
+      if (!feature || !feature.store ||
+          typeof feature.store.snapshot !== "function" ||
+          typeof feature.refresh !== "function") {
+        throw new Error("The current book inventory is unavailable");
+      }
+      const refreshed = await feature.refresh("preset-batch");
+      this.assertPresetBatchBinding(binding);
+      const snapshot = feature.store.snapshot();
+      const books = snapshot && snapshot.index && snapshot.index.books;
+      const freshRevision = refreshed && refreshed.revision;
+      const snapshotRevision = snapshot && snapshot.index &&
+        snapshot.index.revision;
+      if (!refreshed || !snapshot || snapshot.status !== "ready" ||
+          snapshot.workspaceId !== binding.workspaceId ||
+          !snapshot.index || !Array.isArray(books) ||
+          freshRevision && snapshotRevision !== freshRevision) {
+        throw new Error(
+          "The latest book inventory could not be loaded; nothing was queued");
+      }
+      if (!books.some((candidate) => candidate.id === binding.itemId)) {
+        throw this.presetBatchContextError(
+          "The selected book changed; the preset batch was cancelled");
+      }
+      return snapshot.index;
+    }
+
+    presetBatchArtifactId(value) {
+      const key = value && value.key;
+      const id = value && (
+        value.artifact_id || value.artifactId || value.id ||
+        key && (key.artifact_id || key.artifactId)
+      );
+      return contextIdentifier(id, "preset batch artifact id", true);
+    }
+
+    async listPresetBatchTargets(binding) {
+      const catalog = this.engineCorrections.artifacts.catalog;
+      const targets = [];
+      const artifactIds = new Set();
+      const cursors = new Set();
+      let cursor = null;
+      let inventoryRevision = "";
+      for (let pageNumber = 0;
+        pageNumber < PRESET_BATCH_MAX_PAGES;
+        pageNumber += 1) {
+        this.assertPresetBatchBinding(binding);
+        const page = await catalog.list({
+          context: binding.catalogContext,
+          group: "source-images",
+          cursor,
+          limit: PRESET_BATCH_PAGE_LIMIT,
+        });
+        this.assertPresetBatchBinding(binding);
+        if (!isPlainObject(page) || !Array.isArray(page.items) ||
+            page.items.length > PRESET_BATCH_PAGE_LIMIT) {
+          throw new Error("The source image inventory returned an invalid page");
+        }
+        const pageRevision = typeof page.revision === "string"
+          ? page.revision : "";
+        if (pageRevision) {
+          if (inventoryRevision && pageRevision !== inventoryRevision) {
+            throw new Error(
+              "The source image inventory changed while it was being read");
+          }
+          inventoryRevision = pageRevision;
+        }
+        for (const target of page.items) {
+          const artifactId = this.presetBatchArtifactId(target);
+          if (artifactIds.has(artifactId)) continue;
+          if (targets.length >= PRESET_BATCH_MAX_TARGETS) {
+            throw new Error("The source image inventory is too large for batch apply");
+          }
+          artifactIds.add(artifactId);
+          targets.push(Object.freeze({ artifactId, target }));
+        }
+        const next = page.nextCursor != null
+          ? page.nextCursor : page.next_cursor;
+        if (next == null || next === "") return Object.freeze(targets);
+        if (typeof next !== "string" || next.length > 1024 ||
+            /[\u0000-\u001f]/.test(next) || cursors.has(next) || next === cursor) {
+          throw new Error("The source image inventory returned an invalid cursor");
+        }
+        if (!page.items.length) {
+          throw new Error(
+            "The source image inventory returned an empty continuation page");
+        }
+        cursors.add(next);
+        cursor = next;
+      }
+      throw new Error("The source image inventory exceeded its page limit");
+    }
+
+    presetBatchResource(value) {
+      return value && (value.item || value.artifact || value.detail || value);
+    }
+
+    presetBatchResourceCategory(resource) {
+      const summary = resource && resource.summary;
+      const value = resource && (
+        resource.effective_category || resource.effectiveCategory
+      ) || summary && (
+        summary.effective_category || summary.effectiveCategory
+      );
+      return typeof value === "string" ? value : "";
+    }
+
+    presetBatchResourceAvailable(resource) {
+      const summary = resource && resource.summary;
+      const value = resource && (
+        resource.resource_state || resource.resourceState
+      ) || summary && (
+        summary.resource_state || summary.resourceState
+      );
+      const correction = resource && resource.correction ||
+        summary && summary.correction;
+      return value === "available" && Boolean(correction);
+    }
+
+    presetBatchRetryKey(binding, artifactId) {
+      return JSON.stringify({
+        artifact_id: artifactId,
+        item_id: binding.itemId,
+        preset: binding.presetFingerprint,
+        workspace_id: binding.workspaceId,
+      });
+    }
+
+    presetBatchRetryCache() {
+      if (!(this.presetBatchRetryCommands instanceof Map)) {
+        this.presetBatchRetryCommands = new Map();
+      }
+      return this.presetBatchRetryCommands;
+    }
+
+    async runProcessingPresetBatch(preset, binding) {
+      const catalog = this.engineCorrections &&
+        this.engineCorrections.artifacts &&
+        this.engineCorrections.artifacts.catalog;
+      if (!this.invokeCommand || !catalog ||
+          typeof catalog.list !== "function" ||
+          typeof catalog.get !== "function" ||
+          typeof deps.correctionResourceContract !== "function" ||
+          typeof deps.serializeProcessingPresetCommand !== "function") {
+        throw new Error("Batch image processing is unavailable in this window");
+      }
+
+      await this.freshPresetBatchIndex(binding);
+      const targets = await this.listPresetBatchTargets(binding);
+      let queued = 0;
+      let failed = 0;
+      const operationIds = new Set();
+      const retryCommands = this.presetBatchRetryCache();
+      for (const { artifactId, target } of targets) {
+        this.assertPresetBatchBinding(binding);
+        const retryKey = this.presetBatchRetryKey(binding, artifactId);
+        let entry = retryCommands.get(retryKey) || null;
+        try {
+          if (!entry) {
+            let resource;
+            try {
+              resource = this.presetBatchResource(await catalog.get({
+                context: binding.catalogContext,
+                key: `artifact:${artifactId}`,
+              }));
+              this.assertPresetBatchBinding(binding);
+            } catch (error) {
+              if (error && error.code === PRESET_BATCH_CONTEXT_CHANGED) {
+                throw error;
+              }
+              failed += 1;
+              continue;
+            }
+            if (this.presetBatchResourceCategory(resource) !== preset.category) {
+              continue;
+            }
+            if (!this.presetBatchResourceAvailable(resource)) {
+              failed += 1;
+              continue;
+            }
+            if (retryCommands.size >= PRESET_BATCH_RETRY_LIMIT) {
+              throw new Error(
+                "Too many uncertain preset commands are awaiting retry");
+            }
+            const operationId = this.nextPresetBatchOperationId(
+              preset, target);
+            const command = deps.serializeProcessingPresetCommand({
+              resource,
+              preset,
+              operationId,
+            });
+            entry = Object.freeze({
+              artifactId,
+              command,
+              resource,
+            });
+            retryCommands.set(retryKey, entry);
+          }
+          const command = entry.command;
+          if (operationIds.has(command.operation_id)) {
+            throw new Error("Batch operation identifiers must be unique");
+          }
+          operationIds.add(command.operation_id);
+          try {
+            await this.invokeCommand("corrections.transform.queue", {
+              command,
+              trigger: "preset-batch",
+              resource: entry.resource,
+            });
+            retryCommands.delete(retryKey);
+            queued += 1;
+          } catch (error) {
+            if (!(error && (error.retryable === true ||
+                error.ambiguous === true))) {
+              retryCommands.delete(retryKey);
+            }
+            failed += 1;
+          }
+          this.assertPresetBatchBinding(binding);
+        } catch (error) {
+          if (error && error.code === PRESET_BATCH_CONTEXT_CHANGED) throw error;
+          failed += 1;
+        }
+      }
+      return Object.freeze({ queued, failed });
+    }
+
+    async batchApplyProcessingPreset(preset, controller) {
+      const binding = this.createPresetBatchBinding(preset, controller);
+      if (!(this.presetBatchRuns instanceof Map)) {
+        this.presetBatchRuns = new Map();
+      }
+      const current = this.presetBatchRuns.get(binding.runKey);
+      if (current) return current;
+      const run = this.runProcessingPresetBatch(preset, binding);
+      this.presetBatchRuns.set(binding.runKey, run);
+      try {
+        return await run;
+      } finally {
+        if (this.presetBatchRuns.get(binding.runKey) === run) {
+          this.presetBatchRuns.delete(binding.runKey);
+        }
+      }
     }
 
     selectArtifactItem(item) {
@@ -1971,6 +2385,10 @@
       this.itemProperties = null;
       this.ocrProposalsFeature = null;
       this.chPanelFeature = null;
+      if (this.presetBatchRetryCommands) {
+        this.presetBatchRetryCommands.clear();
+      }
+      if (this.presetBatchRuns) this.presetBatchRuns.clear();
       if (this.selectionListeners) this.selectionListeners.clear();
       if (this.editorRegistry && typeof this.editorRegistry.destroy === "function") {
         this.editorRegistry.destroy();

@@ -19,6 +19,8 @@
         href="{{ url_for('static', filename='corrections/classification.css') }}?v={{ corrections_classification_css_v }}" />
   <link rel="stylesheet"
         href="{{ url_for('static', filename='corrections/image-adjust-tool.css') }}?v={{ corrections_image_adjust_css_v }}" />
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='corrections/preset-panel.css') }}?v={{ corrections_preset_panel_css_v }}" />
 </head>
 <body data-theme="sage">
   <a class="skip-link" href="#corrections-editor">Skip to editor</a>
@@ -259,6 +261,7 @@
   <script src="{{ url_for('static', filename='corrections/classification-controls.js') }}?v={{ corrections_classification_controls_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-editor-state.js') }}?v={{ image_editor_state_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-adjust-tool.js') }}?v={{ corrections_image_adjust_v }}"></script>
+  <script src="{{ url_for('static', filename='corrections/preset-panel.js') }}?v={{ corrections_preset_panel_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/ocr-proposals.js') }}?v={{ ocr_proposals_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/ch-panel.js') }}?v={{ ch_panel_v }}"></script>
   <script src="{{ url_for('static', filename='corrections/image-editor.js') }}?v={{ corrections_image_editor_v }}"></script>
