@@ -137,6 +137,7 @@ CORRECTIONS_INDEX_DETAIL_REQUEST_SCHEMA = (
     "librarytool.corrections-index-detail-request/1"
 )
 CORRECTIONS_INDEX_DETAIL_ITEM_LIMIT = 256
+CORRECTIONS_CAPTURE_MARKS_SCHEMA = "librarytool.corrections-capture-marks/1"
 CORRECTIONS_INDEX_BOOK_LIMIT = 100_000
 CORRECTIONS_INDEX_CAPTURE_LIMIT = 100_000
 CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT = 250_000
@@ -2761,6 +2762,84 @@ def _corrections_index_projection(
     return _conditional_json(body, revision)
 
 
+def _corrections_capture_marks_projection(
+    engine_for_request: Callable[[], LibraryEngine],
+    item_service_for_request: Callable[[], ItemQueryService] | None = None,
+    lazy_capture_index_for_item: Callable[[str], bool] | None = None,
+) -> Response:
+    """Report each book's capture count and import stamp, and nothing else.
+
+    These are the two capture-derived facts the whole list needs — one decides
+    membership of the Captures view, one orders it — as against the capture
+    rows, which only the drawn window needs. Reading them stops at the manifest
+    parse, so it skips the per-asset work that dominates the full read.
+    """
+
+    rasters = _raster_service(engine_for_request)
+    list_marks = getattr(rasters, "list_capture_import_marks", None)
+    if not callable(list_marks):
+        raise RepositoryError(
+            "the Corrections capture mark service is unavailable",
+            code="invalid_corrections_index_projection",
+            retryable=True,
+        )
+    item_service = (
+        _item_service(engine_for_request)
+        if item_service_for_request is None
+        else item_service_for_request()
+    )
+    if not callable(getattr(item_service, "list_items", None)):
+        raise RepositoryError(
+            "the Corrections item query is unavailable",
+            code="corrections_item_query_unavailable",
+            retryable=True,
+        )
+    policy: dict[str, bool] = {}
+    for item in _validated_items(item_service.list_items()):
+        if item.kind.casefold() not in {"book", "capture"}:
+            continue
+        policy[item.item_id] = _index_capture_policy(
+            item,
+            lazy_capture_index_for_item,
+        )
+    marks: list[dict[str, Any]] = []
+    for mark in list_marks(tuple(policy)):
+        item_id = mark.get("item_id")
+        if item_id not in policy:
+            continue
+        count = mark.get("capture_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            continue
+        imported_at = mark.get("imported_at")
+        # The hint path blanks a legacy manifest's stamp and the reconciled
+        # path keeps it, so the suppression belongs here, where the policy for
+        # this item is known. Getting it wrong would quietly move legacy books
+        # to the untimed tail of the Captures view.
+        if policy[item_id] and mark.get("legacy"):
+            imported_at = ""
+        marks.append({
+            "item_id": item_id,
+            "capture_count": count,
+            "latest_imported_at": (
+                imported_at if isinstance(imported_at, str) else ""
+            ),
+        })
+    marks.sort(key=lambda value: value["item_id"])
+    revision = _collection_revision("crm-", ({"marks": marks},))
+    body = {
+        "ok": True,
+        "schema": CORRECTIONS_CAPTURE_MARKS_SCHEMA,
+        "revision": revision,
+        "marks": marks,
+    }
+    if _index_encoded_size(body) > CORRECTIONS_INDEX_MAX_BYTES:
+        raise _invalid_index_projection(
+            "the Corrections index exceeds its serialized size budget",
+            details={"maximum_bytes": CORRECTIONS_INDEX_MAX_BYTES},
+        )
+    return _conditional_json(body, revision)
+
+
 def _corrections_index_details_projection(
     engine_for_request: Callable[[], LibraryEngine],
     item_ids: Sequence[str],
@@ -3755,6 +3834,24 @@ def create_corrections_blueprint(
         except EngineError as error:
             return _error_response(error)
 
+    @blueprint.get("/api/v1/corrections/index/capture-marks")
+    def get_corrections_capture_marks():
+        try:
+            _validate_corrections_workspace(workspace_id_for_request)
+            operation_context = (
+                nullcontext()
+                if correction_index_read_context_for_request is None
+                else correction_index_read_context_for_request()
+            )
+            with operation_context:
+                return _corrections_capture_marks_projection(
+                    engine_for_request,
+                    correction_item_service_for_request,
+                    correction_lazy_capture_index_for_item,
+                )
+        except EngineError as error:
+            return _error_response(error)
+
     @blueprint.post("/api/v1/corrections/index/details")
     def post_corrections_index_details():
         try:
@@ -4088,5 +4185,6 @@ __all__ = [
     "CORRECTIONS_INDEX_DETAIL_SCHEMA",
     "CORRECTIONS_INDEX_DETAIL_REQUEST_SCHEMA",
     "CORRECTIONS_INDEX_DETAIL_ITEM_LIMIT",
+    "CORRECTIONS_CAPTURE_MARKS_SCHEMA",
     "create_corrections_blueprint",
 ]

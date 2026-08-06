@@ -3047,3 +3047,60 @@ def test_index_details_do_not_disturb_the_poll(client, corrections_workspace):
         "/api/v1/corrections/index/probe?workspace_id=local-library"
     ).get_json()["revision"] == settled
     assert server._corrections_index_revision_cache["revision"] == settled
+
+
+def test_capture_marks_agree_with_the_index_for_every_book(
+    client,
+    corrections_workspace,
+):
+    """The Captures view orders and filters on these two numbers alone.
+
+    If either drifts from what the index reports, books silently change
+    position or vanish from that view, so this asserts equality per book
+    rather than merely that the route answers.
+    """
+
+    del corrections_workspace
+
+    full = client.get("/api/v1/corrections/index?workspace_id=local-library")
+    marks = client.get(
+        "/api/v1/corrections/index/capture-marks?workspace_id=local-library"
+    )
+
+    assert full.status_code == 200
+    assert marks.status_code == 200
+    body = marks.get_json()
+    assert body["schema"] == "librarytool.corrections-capture-marks/1"
+    assert body["revision"].startswith("crm-")
+    assert [mark["item_id"] for mark in body["marks"]] == sorted(
+        mark["item_id"] for mark in body["marks"]
+    )
+
+    books = {book["id"]: book for book in full.get_json()["books"]}
+    # A mark exists for exactly the books the index shows captures for.
+    assert {mark["item_id"] for mark in body["marks"]} == {
+        item_id for item_id, book in books.items() if book["captures"]
+    }
+    for mark in body["marks"]:
+        book = books[mark["item_id"]]
+        assert mark["capture_count"] == len(book["captures"])
+        assert mark["latest_imported_at"] == book["latest_imported_at"]
+
+
+def test_capture_marks_do_not_disturb_the_poll(client, corrections_workspace):
+    del corrections_workspace
+    import server
+
+    client.get("/api/v1/corrections/index?workspace_id=local-library")
+    settled = client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"]
+
+    client.get(
+        "/api/v1/corrections/index/capture-marks?workspace_id=local-library"
+    )
+
+    assert client.get(
+        "/api/v1/corrections/index/probe?workspace_id=local-library"
+    ).get_json()["revision"] == settled
+    assert server._corrections_index_revision_cache["revision"] == settled

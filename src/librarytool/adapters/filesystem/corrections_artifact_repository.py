@@ -1026,6 +1026,108 @@ class FilesystemCorrectionsArtifactRepository(
             raise TypeError("key must be RasterArtifactKey")
         return self._project_raster_key(key, capture_only=True)
 
+    def list_capture_import_marks(
+        self,
+        item_ids: Sequence[str],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Report how many captures each item has and when they were imported.
+
+        The Corrections list needs those two facts for every book — one to
+        decide membership of the Captures view, one to order it — but needs the
+        capture rows themselves only for the handful of rows it draws. This
+        stops right after the manifest is parsed, so it does none of the
+        per-asset filesystem work that makes the full hint read expensive.
+
+        One workspace lease and one lock for the whole walk: taking them per
+        item would cost more than the reads. Deliberately uncached — the
+        identity a cache would key on is not a content identity, and the two
+        staleness regressions in the test suite exist because that was tried.
+        """
+
+        marks: list[Mapping[str, Any]] = []
+        with self._write_set.workspace_lease():
+            with self._lock_context_for():
+                for raw_item_id in item_ids:
+                    item = _identifier(
+                        raw_item_id,
+                        item_id=str(raw_item_id or ""),
+                        field="item_id",
+                    )
+                    if not self._live_item_exists(item):
+                        continue
+                    capture_id = self._live_capture_id(item)
+                    if not capture_id:
+                        continue
+                    marks.append(
+                        self._capture_import_mark(item, capture_id)
+                    )
+        return tuple(marks)
+
+    def _capture_import_mark(
+        self,
+        item_id: str,
+        capture_id: str,
+    ) -> Mapping[str, Any]:
+        """Summarise one capture directory without touching its assets."""
+
+        # A manifest that cannot be read still means one capture the list must
+        # show, matching the single synthetic row the index projects for it.
+        unavailable = {
+            "item_id": item_id,
+            "capture_count": 1,
+            "imported_at": "",
+            "legacy": False,
+        }
+        try:
+            directory = self._managed_directory(
+                self._capture_directory_for,
+                capture_id,
+                item_id=item_id,
+                section="capture",
+                authority_root=self._capture_authority_root,
+            )
+            manifest = self._read_json(
+                directory / PHOTO_ASSETS_NAME,
+                item_id=item_id,
+                section="capture",
+                maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
+            )
+            if manifest is None:
+                manifest = self._legacy_capture_manifest(
+                    item_id,
+                    capture_id=capture_id,
+                    directory=directory,
+                )
+            if manifest is None:
+                return unavailable
+            records, _representation_revision, legacy = (
+                self._capture_manifest_records(
+                    item_id,
+                    capture_id,
+                    manifest,
+                )
+            )
+        except RepositoryError as error:
+            if not self._recoverable_capture_manifest_error(error):
+                raise
+            return unavailable
+        imported_at = ""
+        desktop_import = manifest.get("desktop_import")
+        if isinstance(desktop_import, Mapping):
+            imported_at = _public_text(
+                desktop_import.get("imported_at"),
+                maximum=64,
+            ).strip()
+        return {
+            "item_id": item_id,
+            "capture_count": len(records),
+            "imported_at": imported_at,
+            # Reported, not applied. Whether a legacy manifest's timestamp is
+            # suppressed depends on which path the index would have taken for
+            # this item, and only the caller knows that.
+            "legacy": legacy,
+        }
+
     def list_capture_index_hints(
         self,
         item_id: str,
