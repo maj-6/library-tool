@@ -1014,3 +1014,146 @@ def test_archive_envelope_is_bound_to_the_association_book_identity(tmp_path):
                 "relation": "derived-from",
             }
         ]
+
+
+def _associate(root: Path, capture_ids: tuple[str, ...]) -> dict:
+    """Persist one association per capture and return them by capture id."""
+
+    service, _repository, _materializer = _service(root)
+    associations = {}
+    for index, capture_id in enumerate(capture_ids, start=1):
+        source = _source(capture_id=capture_id)
+        associations[capture_id] = service.associate(
+            AssociateCaptureArchiveCommand(source, f"operation-pin-{index}")
+        ).receipt.association
+    return associations
+
+
+def _make_junction(link: Path, target: Path) -> bool:
+    """Create a Windows junction, reporting whether the platform allowed it."""
+
+    import subprocess
+
+    if os.name != "nt":
+        return False
+    return subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+    ).returncode == 0
+
+
+def test_pinned_identity_reads_match_unpinned_reads(tmp_path):
+    capture_ids = ("capture-1", "capture-2", "capture-3")
+    expected = _associate(tmp_path, capture_ids)
+
+    unpinned = {
+        capture_id: FilesystemCaptureArchiveRepository
+        .inspect_association_identity(tmp_path, capture_id)
+        for capture_id in capture_ids
+    }
+    with FilesystemCaptureArchiveRepository.pinned_association_identities(
+        tmp_path
+    ):
+        pinned = {
+            capture_id: FilesystemCaptureArchiveRepository
+            .inspect_association_identity(tmp_path, capture_id)
+            for capture_id in capture_ids
+        }
+        absent = FilesystemCaptureArchiveRepository.\
+            inspect_association_identity(tmp_path, "capture-absent")
+
+    assert unpinned == expected
+    assert pinned == expected
+    assert absent is None
+
+
+def test_pinned_identity_read_rejects_redirecting_sidecar(tmp_path):
+    capture_ids = ("capture-1", "capture-2")
+    _associate(tmp_path, capture_ids)
+    sidecars = sorted(
+        tmp_path.glob(".engine/capture-lib/associations/*.json")
+    )
+    outside = tmp_path.parent / "outside.json"
+    outside.write_text(sidecars[-1].read_text(encoding="utf-8"), "utf-8")
+    victim = sidecars[-1]
+    victim.unlink()
+    try:
+        victim.symlink_to(outside)
+    except (NotImplementedError, OSError):
+        pytest.skip("this platform does not allow creating symlinks")
+
+    with FilesystemCaptureArchiveRepository.pinned_association_identities(
+        tmp_path
+    ):
+        with pytest.raises(RepositoryError) as rejected:
+            for capture_id in capture_ids:
+                FilesystemCaptureArchiveRepository.\
+                    inspect_association_identity(tmp_path, capture_id)
+
+    assert rejected.value.code == "invalid_capture_archive_storage"
+
+
+def test_pinned_identity_read_rejects_ancestor_redirected_mid_batch(tmp_path):
+    """A junction that appears after the pin must still fail the batch closed.
+
+    This is the invariant the pin narrows: ancestor inodes are sampled once
+    per batch, so the guarantee has to come from the guarded descriptor chain
+    revalidating them on every read rather than from the snapshot itself.
+    """
+
+    capture_ids = ("capture-1", "capture-2")
+    _associate(tmp_path, capture_ids)
+    associations = tmp_path / ".engine" / "capture-lib" / "associations"
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    for sidecar in associations.iterdir():
+        (decoy / sidecar.name).write_bytes(sidecar.read_bytes())
+
+    with FilesystemCaptureArchiveRepository.pinned_association_identities(
+        tmp_path
+    ):
+        assert FilesystemCaptureArchiveRepository.\
+            inspect_association_identity(tmp_path, capture_ids[0]) is not None
+
+        # Swap the pinned parent for a junction, after the pin was taken.
+        for sidecar in list(associations.iterdir()):
+            sidecar.unlink()
+        associations.rmdir()
+        if not _make_junction(associations, decoy):
+            pytest.skip("this platform does not allow creating junctions")
+
+        with pytest.raises(RepositoryError) as rejected:
+            FilesystemCaptureArchiveRepository.inspect_association_identity(
+                tmp_path,
+                capture_ids[1],
+            )
+
+    assert rejected.value.code == "invalid_capture_archive_storage"
+
+
+def test_pinned_identity_view_is_scoped_to_its_root_and_released(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    expected_first = _associate(first, ("capture-1",))
+    expected_second = _associate(second, ("capture-1",))
+
+    with FilesystemCaptureArchiveRepository.pinned_association_identities(
+        first
+    ):
+        # A different root must not be served from the pinned view.
+        assert FilesystemCaptureArchiveRepository.\
+            inspect_association_identity(second, "capture-1") == (
+                expected_second["capture-1"]
+            )
+        assert FilesystemCaptureArchiveRepository.\
+            inspect_association_identity(first, "capture-1") == (
+                expected_first["capture-1"]
+            )
+
+    assert FilesystemCaptureArchiveRepository.inspect_association_identity(
+        first,
+        "capture-1",
+    ) == expected_first["capture-1"]

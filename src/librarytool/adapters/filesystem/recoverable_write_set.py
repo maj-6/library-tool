@@ -1812,22 +1812,33 @@ def _rename_tree_no_replace(source: Path, destination: Path) -> None:
     raise OSError(error_number, os.strerror(error_number), str(destination))
 
 
-def _is_redirecting_path(path: Path) -> bool:
-    """Detect symlinks, Windows junctions, and other reparse redirects."""
+_REPARSE_POINT_ATTRIBUTE = int(
+    getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+)
 
-    if path.is_symlink():
+
+def _is_redirecting_path(path: Path) -> bool:
+    """Detect symlinks, Windows junctions, and other reparse redirects.
+
+    A single ``lstat`` answers every question this asks: ``S_ISLNK`` marks a
+    symlink, and ``FILE_ATTRIBUTE_REPARSE_POINT`` marks a junction or any
+    other Windows reparse redirect. Asking through ``is_symlink`` /
+    ``is_junction`` / ``lexists`` / ``lstat`` instead costs four stat
+    syscalls, and the authority walks call this once per path component per
+    read — tens of thousands of times to build one Corrections index.
+    """
+
+    try:
+        info = os.lstat(path)
+    except (OSError, ValueError):
+        # Missing, unreadable, or unrepresentable: it redirects nowhere.
+        return False
+    if stat.S_ISLNK(info.st_mode):
         return True
-    is_junction = getattr(path, "is_junction", None)
-    if callable(is_junction) and is_junction():
-        return True
-    if os.name == "nt" and os.path.lexists(path):
-        try:
-            attributes = int(getattr(path.lstat(), "st_file_attributes", 0))
-        except OSError:
-            return False
-        reparse = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-        return bool(reparse and attributes & reparse)
-    return False
+    if os.name != "nt" or not _REPARSE_POINT_ATTRIBUTE:
+        return False
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    return bool(attributes & _REPARSE_POINT_ATTRIBUTE)
 
 
 def _same_snapshot(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
