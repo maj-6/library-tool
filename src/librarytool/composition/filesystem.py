@@ -62,6 +62,10 @@ from ..engine.correction_projection import (
     CorrectionProjectionService,
     reconcile_correction_aggregates,
 )
+from ..engine.correction_category import (
+    CorrectionCategoryProviderPort,
+    CorrectionCategorySuggestionService,
+)
 from ..engine.correction_ocr import (
     CORRECTION_OCR_MAX_SOURCE_BYTES,
     CORRECTION_REOCR_OPERATION_PREFIX,
@@ -469,6 +473,7 @@ class CorrectionsBindings:
     entry_directory_for: CorrectionsEntryDirectory | None = None
     job_start_context_for: ItemLockFactory | None = None
     ocr_provider: CorrectionOcrProviderPort | None = None
+    category_provider: CorrectionCategoryProviderPort | None = None
     text_layer_item_id_for: CorrectionsTextLayerItemIdentity | None = None
 
     def __post_init__(self) -> None:
@@ -515,6 +520,14 @@ class CorrectionsBindings:
         ):
             raise TypeError(
                 "ocr_provider must implement CorrectionOcrProviderPort or be None"
+            )
+        if self.category_provider is not None and not isinstance(
+            self.category_provider,
+            CorrectionCategoryProviderPort,
+        ):
+            raise TypeError(
+                "category_provider must implement "
+                "CorrectionCategoryProviderPort or be None"
             )
 
 
@@ -722,6 +735,30 @@ class _ReentrantContextFactory:
                 yield
             finally:
                 self._state.depth = 0
+
+
+class _CommittedFigureReader:
+    """Read the exact committed figure bytes a classifier is allowed to see."""
+
+    def __init__(
+        self,
+        read_committed_bytes: Callable[[str, str, Any], bytes | None],
+    ) -> None:
+        self._read_committed_bytes = read_committed_bytes
+
+    def read_figure(self, request) -> bytes:
+        content = self._read_committed_bytes(
+            request.item_id,
+            request.operation_id,
+            request.source,
+        )
+        if content is None:
+            raise RepositoryError(
+                "the committed extracted figure is unavailable",
+                code="correction_category_figure_unavailable",
+                details={"operation_id": request.operation_id},
+            )
+        return content
 
 
 class _CorrectionProjectionUnion:
@@ -1413,10 +1450,18 @@ def compose_filesystem_engine(
                 correction_ocr,
                 correction_projection,
             )
+        correction_category = None
+        if corrections.category_provider is not None:
+            correction_category = CorrectionCategorySuggestionService(
+                _CommittedFigureReader(correction_ocr_source_bytes_for),
+                corrections.category_provider,
+            )
         correction_transform_worker = CorrectionTransformWorker(
             resources.jobs,
             correction_transform_store,
             ocr=correction_ocr,
+            category_suggestions=correction_category,
+            category_outcomes=correction_transform_store,
         )
         correction_transforms = CorrectionTransformService(
             resources.jobs,

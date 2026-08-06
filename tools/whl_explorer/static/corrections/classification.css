@@ -372,6 +372,16 @@
   background: color-mix(in srgb, var(--focus, #ffd166) 24%, transparent);
 }
 
+.corrections-artifact-overlay-region[data-extraction] .corrections-artifact-overlay-shape {
+  border-style: dashed;
+  cursor: default;
+}
+
+.corrections-artifact-overlay-region[data-extraction="queueing"]
+  .corrections-artifact-overlay-shape {
+  opacity: 0.6;
+}
+
 .corrections-artifact-overlay-code {
   position: absolute;
   z-index: 2;

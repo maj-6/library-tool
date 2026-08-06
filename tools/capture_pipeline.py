@@ -55,6 +55,9 @@ MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 MISTRAL_CHAT_URL = "https://api.mistral.ai/v1/chat/completions"
 OCR_MODEL = "mistral-ocr-latest"
 EXTRACT_MODEL = "mistral-small-latest"
+# Must be a vision-capable chat model: classify_image_category sends the image
+# itself, not OCR text.
+CLASSIFY_MODEL = "mistral-small-latest"
 MISTRAL_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 STANDARD_WIDTH = 1600     # px; preserves title-page readability
@@ -339,6 +342,130 @@ def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> 
     except json.JSONDecodeError:
         return empty_bibliography()
     return normalize_bibliography(obj)
+
+
+# --- 6. image category classification ----------------------------------------------
+
+# The canonical image vocabulary, minus "other". "other" is already the DEFAULT
+# effective category of an uncategorized image, so answering it asserts nothing;
+# it is folded into abstention rather than written as a guess.
+SUGGESTIBLE_CATEGORIES = ("title_page", "cover", "spine", "content_specimen")
+CLASSIFY_MIN_CONFIDENCE = 0.75
+
+_CLASSIFY_PROMPT = """You are looking at ONE image cut out of a photographed book. \
+Say which part of the book it shows, or say that you cannot tell.
+
+Return a single JSON object with exactly these keys:
+  "category"   - one of "title_page", "cover", "spine", "content_specimen",
+                 or "" when you cannot tell
+  "confidence" - your confidence in that category as a number from 0 to 1
+  "abstain"    - true when the image is unreadable, ambiguous, or shows
+                 something outside the four categories; false otherwise
+
+  title_page       - the formal title page or its copyright/verso page: the
+                     title, author and imprint set as a page.
+  cover            - the outer board, dust jacket or wrapper, seen face-on.
+  spine            - the narrow bound edge, with the title usually running
+                     along its length.
+  content_specimen - a sample of the book's interior: body text, a plate, a
+                     map, an illustration, a table.
+
+Abstain rather than guess. An endpaper, bookplate, dealer's ticket, price tag,
+library stamp, blank leaf, hand, ruler, colour card, or a crop too small or too
+blurred to read is NOT one of the four categories: set "abstain" to true and
+"category" to "". Do not describe what a book page usually looks like — judge
+only what is in this image. Output ONLY the JSON object.
+"""
+
+
+def abstained_category() -> dict:
+    """The one shape that means "no suggestion": written nowhere."""
+    return {"category": "", "confidence": 0.0}
+
+
+def _chat_image_url(img_bytes: bytes) -> str:
+    mime = "image/png" if img_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def classify_image_payload(img_bytes: bytes, *, model: str | None = None) -> dict:
+    """The chat-completions request body for one image.
+
+    The chat endpoint takes the image as an `image_url` content part inside a
+    user message; the OCR endpoint's top-level `document` object is a different
+    shape and this endpoint rejects it.
+    """
+    return {
+        "model": str(model or CLASSIFY_MODEL).strip() or CLASSIFY_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _CLASSIFY_PROMPT},
+                {"type": "image_url", "image_url": _chat_image_url(img_bytes)},
+            ],
+        }],
+    }
+
+
+def normalize_category_suggestion(
+        obj,
+        *,
+        minimum_confidence: float = CLASSIFY_MIN_CONFIDENCE,
+) -> dict:
+    """Coerce a model's JSON reply to {"category", "confidence"}, or abstain.
+
+    Every uncertain path abstains: this is the same guard `has_readable_ocr`
+    applies to extraction, where a 52-character placeholder read produced a
+    confident, entirely invented record. A category the reviewer never asked for
+    is only worth publishing when the model actually recognised something.
+    """
+    if not isinstance(obj, dict) or obj.get("abstain"):
+        return abstained_category()
+    category = str(obj.get("category") or "").strip()
+    if category not in SUGGESTIBLE_CATEGORIES:
+        return abstained_category()
+    confidence = obj.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return abstained_category()
+    confidence = float(confidence)
+    if not 0.0 <= confidence <= 1.0 or confidence < float(minimum_confidence):
+        return abstained_category()
+    return {"category": category, "confidence": confidence}
+
+
+def classify_image_category(
+        img_bytes: bytes,
+        api_key: str,
+        timeout: float = 60.0,
+        *,
+        model: str | None = None,
+        minimum_confidence: float = CLASSIFY_MIN_CONFIDENCE,
+) -> dict:
+    """One image -> {"category", "confidence"} via a Mistral vision chat call.
+
+    An empty category is an abstention, which callers must publish as nothing.
+    """
+    if not img_bytes:
+        return abstained_category()
+    data = _mistral_post(
+        MISTRAL_CHAT_URL,
+        classify_image_payload(img_bytes, model=model),
+        api_key,
+        timeout,
+    )
+    raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    if isinstance(raw, list):        # some models return content as parts
+        raw = "".join(part.get("text") or "" for part in raw
+                      if isinstance(part, dict))
+    raw = re.sub(r"^```(?:json)?|```$", "", str(raw).strip(), flags=re.M).strip()
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return abstained_category()
+    return normalize_category_suggestion(obj, minimum_confidence=minimum_confidence)
 
 
 # --- the whole chain ---------------------------------------------------------------

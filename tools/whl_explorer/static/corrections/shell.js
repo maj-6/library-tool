@@ -606,6 +606,8 @@
         initialState: profile.layout,
         onChange: () => this.persistProfile(),
       });
+      this.artifactOverlay = null;
+      this.overlayResource = null;
       this.classificationController = options.classificationController === false
         ? null
         : options.classificationController ||
@@ -663,6 +665,12 @@
         refreshTarget: (target, detail) =>
           this.refreshClassificationTarget(target, detail),
         promoteSoftTarget: (target) => this.promoteClassificationTarget(target),
+        serializeExtractionCommand: deps.serializeRegionExtractionCommand,
+        getExtractionResource: () => this.overlayResource,
+        getExtractionGeometry: (target) => this.artifactOverlay &&
+          typeof this.artifactOverlay.orientedRegionPolygon === "function"
+          ? this.artifactOverlay.orientedRegionPolygon(targetKey(target)) : null,
+        onExtractionState: (detail) => this.publishRegionExtractionState(detail),
         onChanged: (_result, detail) => detail && detail.refreshAttempted
           ? null : this.refreshClassificationTarget(detail && detail.target, detail),
         onConflict: (error) => this.setStatus(
@@ -1639,10 +1647,24 @@
             this.demoteClassificationFocus();
           }
         },
+        // A machine box is activated to be cropped out, not merely selected;
+        // an extraction that is not offered leaves the ordinary selection.
         onActivate: (target) => {
+          const extraction = this.classificationController &&
+            typeof this.classificationController.extractRegion === "function"
+            ? this.classificationController.extractRegion(target) : null;
+          if (extraction) {
+            void extraction.catch((error) => this.setStatus(
+              error && error.message || "The region could not be extracted",
+              true,
+            ));
+            return;
+          }
           void this.promoteClassificationTarget(target);
         },
       }).mount();
+      this.overlayResource = resource;
+      this.artifactOverlay = overlay;
       const sync = () => {
         const sourceWidth = Number(
           dimensions.width || dimensions.pixel_width ||
@@ -1673,6 +1695,8 @@
       sync();
       return () => {
         controller.image.removeEventListener("load", sync);
+        if (this.artifactOverlay === overlay) this.artifactOverlay = null;
+        if (this.overlayResource === resource) this.overlayResource = null;
         overlay.destroy();
         // The overlay releases its own soft target on destroy; this covers
         // hot targets that reached the controller from any other surface the
@@ -1682,6 +1706,19 @@
           this.classificationController.setHotTarget(null);
         }
       };
+    }
+
+    publishRegionExtractionState(detail = {}) {
+      const overlay = this.artifactOverlay;
+      if (overlay && typeof overlay.setExtractionState === "function") {
+        overlay.setExtractionState(detail.key, detail.status);
+      }
+      if (detail.status === "queued") {
+        this.setStatus(detail.jobId
+          ? `Region extraction queued as ${detail.jobId}`
+          : "Region extraction queued");
+      }
+      return detail.status || "";
     }
 
     demoteClassificationFocus() {

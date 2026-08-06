@@ -30,6 +30,8 @@ from typing import Any, ContextManager, Protocol, TypeAlias, runtime_checkable
 
 from ...engine.correction_transforms import (
     OUTPUT_PROFILES,
+    CategorySuggestionOutcome,
+    CategorySuggestionState,
     CommittedCorrectionOutput,
     CommittedCorrectionTransform,
     CorrectionHumanAssertions,
@@ -110,6 +112,10 @@ CORRECTION_TRANSFORM_ITEM_POINTER_SCHEMA = (
 CORRECTION_TRANSFORM_ITEM_POINTER_VERSION = 1
 _ITEM_INDEX_MARKER_SCHEMA = "librarytool.correction-transform-item-index"
 _ITEM_INDEX_MARKER_VERSION = 1
+CORRECTION_CATEGORY_SUGGESTION_SCHEMA = (
+    "librarytool.correction-category-suggestion"
+)
+CORRECTION_CATEGORY_SUGGESTION_VERSION = 1
 
 _OBJECT_ROOT = PurePosixPath(".engine/correction-transforms/objects")
 _PUBLICATION_ROOT = PurePosixPath(".engine/correction-transforms/publications")
@@ -117,9 +123,16 @@ _ITEM_POINTER_ROOT = PurePosixPath(".engine/correction-transforms/by-item")
 _ITEM_INDEX_MARKER = PurePosixPath(
     ".engine/correction-transforms/item-index-v1.json"
 )
+# A post-commit machine outcome, so it is a sidecar beside the publication
+# rather than part of it: the publication is immutable and already durable by
+# the time a classifier answers.
+_CATEGORY_SUGGESTION_ROOT = PurePosixPath(
+    ".engine/correction-transforms/category-suggestions"
+)
 _RECEIPT_ROOT = PurePosixPath(".engine/receipts/correction-transforms")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RECEIPT_BYTES = 1024 * 1024
+_MAX_CATEGORY_SUGGESTION_BYTES = 64 * 1024
 _MAX_ITEM_POINTER_BYTES = 64 * 1024
 _MAX_PUBLICATION_BYTES = 128 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
@@ -155,6 +168,22 @@ _ITEM_POINTER_FIELDS = frozenset(
     }
 )
 _ITEM_INDEX_MARKER_FIELDS = frozenset({"schema", "version"})
+_CATEGORY_SUGGESTION_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "operation_id",
+        "state",
+        "category",
+        "confidence",
+        "provider_id",
+        "model",
+        "source",
+        "publication_policy",
+    }
+)
+_CATEGORY_SUGGESTION_POLICY = "machine-suggestion-only"
+_CATEGORY_SUGGESTION_RECIPE_REVISION = "correction-category-suggestion-v1"
 _RESULT_FIELDS = frozenset({"operation_id", "outputs"})
 _COMMITTED_OUTPUT_FIELDS = frozenset(
     {"kind", "artifact_id", "artifact_revision", "content_sha256"}
@@ -307,6 +336,17 @@ class _ItemPublicationPointer:
     operation_id: str
     command_sha256: str
     publication_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredCategorySuggestion:
+    """One durable suggestion, already pinned to the figure it describes."""
+
+    source: CommittedCorrectionOutput
+    category: str
+    confidence: float
+    provider_id: str
+    model: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,6 +626,180 @@ class FilesystemCorrectionTransformStore:
                 cause=exc,
                 retryable=True,
             ) from exc
+
+    def record_category_suggestion(
+        self,
+        operation_id: str,
+        outcome: CategorySuggestionOutcome,
+    ) -> None:
+        """Publish one machine category outcome beside its committed figure.
+
+        This runs after the transform's own transaction has committed, so it
+        never touches the publication: a failure here loses the suggestion, not
+        the figure.
+        """
+
+        if not isinstance(outcome, CategorySuggestionOutcome):
+            raise TypeError("outcome must be a CategorySuggestionOutcome")
+        if outcome.state is CategorySuggestionState.NOT_REQUESTED:
+            return
+        operation_id = str(operation_id)
+        payload = _canonical_json(
+            {
+                "schema": CORRECTION_CATEGORY_SUGGESTION_SCHEMA,
+                "version": CORRECTION_CATEGORY_SUGGESTION_VERSION,
+                "operation_id": operation_id,
+                "state": outcome.state.value,
+                "category": outcome.category,
+                "confidence": outcome.confidence,
+                "provider_id": outcome.provider_id,
+                "model": outcome.model,
+                "source": outcome.source.as_dict(),
+                "publication_policy": _CATEGORY_SUGGESTION_POLICY,
+            },
+            artifact="correction_category_suggestion",
+        )
+        if len(payload) > _MAX_CATEGORY_SUGGESTION_BYTES:
+            raise _repository_error(
+                "the correction category suggestion is too large",
+                code="invalid_correction_transform_document",
+                artifact="correction_category_suggestion",
+            )
+        path = self._category_suggestion_path(operation_id)
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    if self._path_exists(
+                        path,
+                        artifact="correction_category_suggestion",
+                    ):
+                        existing, _digest, _size = self._read_regular(
+                            path,
+                            maximum=_MAX_CATEGORY_SUGGESTION_BYTES,
+                            artifact="correction_category_suggestion",
+                            collect=True,
+                        )
+                        if existing == payload:
+                            return
+                        raise ConflictError(
+                            "a different category suggestion is already "
+                            "recorded for this operation",
+                            code="correction_category_suggestion_conflict",
+                            details={"operation_id": operation_id},
+                        )
+                    transaction = self._write_set.begin(
+                        operation_id=(
+                            f"correction-category:{_digest_text(operation_id)}"
+                        ),
+                        scope="correction-category-suggestion",
+                        metadata={
+                            "operation_id": operation_id,
+                            "state": outcome.state.value,
+                        },
+                    )
+                    transaction.stage_write(self._relative(path), payload)
+                    transaction.commit()
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction category suggestion could not be recorded",
+                code=exc.code,
+                artifact="correction_category_suggestion",
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction category suggestion could not be recorded",
+                code="correction_transform_transaction_failed",
+                artifact="correction_category_suggestion",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
+    def _category_suggestion_locked(
+        self,
+        operation_id: str,
+    ) -> _StoredCategorySuggestion | None:
+        """Read one durable suggestion, or None when there is nothing to apply.
+
+        Only the ``suggested`` state produces a value.  Every other recorded
+        state exists to explain why the figure carries no machine category.
+        """
+
+        path = self._category_suggestion_path(operation_id)
+        if not self._path_exists(
+            path,
+            artifact="correction_category_suggestion",
+        ):
+            return None
+        raw = self._read_json(
+            path,
+            maximum=_MAX_CATEGORY_SUGGESTION_BYTES,
+            artifact="correction_category_suggestion",
+        )
+        try:
+            document = _strict_object(
+                raw,
+                fields=_CATEGORY_SUGGESTION_FIELDS,
+                artifact="correction_category_suggestion",
+            )
+            if (
+                document["schema"] != CORRECTION_CATEGORY_SUGGESTION_SCHEMA
+                or type(document["version"]) is not int
+                or document["version"] != CORRECTION_CATEGORY_SUGGESTION_VERSION
+                or document["operation_id"] != operation_id
+                or document["publication_policy"]
+                != _CATEGORY_SUGGESTION_POLICY
+                or not isinstance(document["state"], str)
+            ):
+                raise ValueError("category suggestion envelope is invalid")
+            source = CommittedCorrectionOutput(
+                **_strict_object(
+                    document["source"],
+                    fields=_COMMITTED_OUTPUT_FIELDS,
+                    artifact="correction_category_suggestion_source",
+                )
+            )
+            if source.kind != "extracted-figure":
+                raise ValueError("category suggestion source is not a figure")
+            state = CategorySuggestionState(document["state"])
+            if state is CategorySuggestionState.NOT_REQUESTED:
+                raise ValueError("a recorded category suggestion cannot be absent")
+            if state is not CategorySuggestionState.SUGGESTED:
+                return None
+            confidence = document["confidence"]
+            if isinstance(confidence, bool) or not isinstance(
+                confidence,
+                (int, float),
+            ):
+                raise ValueError("category suggestion confidence is invalid")
+            # Reconstructing the outcome re-applies the vocabulary and the
+            # confidence floor, so a hand-edited sidecar cannot promote itself
+            # past the guard the classifier had to clear.
+            outcome = CategorySuggestionOutcome(
+                state,
+                source=source,
+                category=document["category"],
+                confidence=float(confidence),
+                provider_id=document["provider_id"],
+                model=document["model"],
+            )
+        except (EngineError, KeyError, TypeError, ValueError) as exc:
+            raise _repository_error(
+                "the correction category suggestion is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_category_suggestion",
+                cause=exc,
+            ) from exc
+        return _StoredCategorySuggestion(
+            outcome.source,
+            outcome.category,
+            outcome.confidence,
+            outcome.provider_id,
+            outcome.model,
+        )
 
     def find_committed_transform(
         self,
@@ -882,6 +1096,14 @@ class FilesystemCorrectionTransformStore:
         for pointer in self._projection_item_pointers_locked(item_id):
             command, result, publication = self._validated_publication(pointer)
             source_scope = self._raster_source_from_publication(publication)
+            # A reviewer-named category is the human's own assertion, and the
+            # worker never asks a classifier about one, so only an extraction
+            # that named nothing can have a suggestion to read.
+            suggestion = (
+                self._category_suggestion_locked(command.operation_id)
+                if command.extract and not command.extract_category
+                else None
+            )
             for committed, raw_output in zip(
                 result.outputs,
                 publication["outputs"],
@@ -949,6 +1171,32 @@ class FilesystemCorrectionTransformStore:
                             AssignmentOrigin.MANUAL,
                             committed.artifact_revision,
                             provenance=provenance,
+                        ),
+                    )
+                elif (
+                    committed.kind == "extracted-figure"
+                    and suggestion is not None
+                    and suggestion.source == committed
+                ):
+                    # A machine can only reach SUGGESTED, the weakest origin:
+                    # any manual or inherited assignment outranks it, and the
+                    # reviewer branch above has already claimed the slot when
+                    # a human named the category.
+                    category_assignments = (
+                        CategoryAssignment(
+                            suggestion.category,
+                            AssignmentOrigin.SUGGESTED,
+                            committed.artifact_revision,
+                            confidence=suggestion.confidence,
+                            provenance=ArtifactProvenance(
+                                origin="machine",
+                                provider_id=suggestion.provider_id,
+                                model=suggestion.model,
+                                recipe_revision=(
+                                    _CATEGORY_SUGGESTION_RECIPE_REVISION
+                                ),
+                                operation_id=command.operation_id,
+                            ),
                         ),
                     )
                 view = RasterArtifactView(
@@ -3086,6 +3334,11 @@ class FilesystemCorrectionTransformStore:
             / f"{_digest_text(operation_id)}.json"
         )
 
+    def _category_suggestion_path(self, operation_id: str) -> Path:
+        return self._target(
+            _CATEGORY_SUGGESTION_ROOT / f"{_digest_text(operation_id)}.json"
+        )
+
     def _receipt_path(self, operation_id: str) -> Path:
         return self._target(_RECEIPT_ROOT / f"{_digest_text(operation_id)}.json")
 
@@ -3097,6 +3350,8 @@ class FilesystemCorrectionTransformStore:
 
 
 __all__ = [
+    "CORRECTION_CATEGORY_SUGGESTION_SCHEMA",
+    "CORRECTION_CATEGORY_SUGGESTION_VERSION",
     "CORRECTION_TRANSFORM_ITEM_POINTER_SCHEMA",
     "CORRECTION_TRANSFORM_ITEM_POINTER_VERSION",
     "CORRECTION_TRANSFORM_PUBLICATION_SCHEMA",

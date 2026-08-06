@@ -118,6 +118,14 @@
       }),
     ]);
 
+    const CATEGORY_ASSIGN_ACTION = "category.assign";
+    const TRANSFORM_QUEUE_COMMAND_ID = "corrections.transform.queue";
+    const EXTRACTION_STATES = Object.freeze({
+      QUEUEING: "queueing",
+      QUEUED: "queued",
+      EXTRACTED: "extracted",
+    });
+
     const PORTABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
     const MODIFIER_ORDER = Object.freeze(["ctrl", "alt", "shift", "meta"]);
     const MODIFIER_LABELS = Object.freeze({
@@ -767,9 +775,142 @@
       return false;
     }
 
+    // Only this session's own in-flight state is knowable from the region.
+    // A region's linked_artifact_ids point at the page image it sits on — the
+    // engine puts that link on EVERY layout region — so treating any link as
+    // proof of extraction marks every real box as already cropped and makes the
+    // trigger inert. Durable de-duplication is not this guard's job: it comes
+    // from the deterministic operation id below, which makes re-extracting the
+    // same region replay the original publication instead of minting a second
+    // figure.
+    function regionExtractionCommitted(target) {
+      return ["extracted", "queueing", "queued"].includes(text(read(
+        target, "extractionState", "extraction_state",
+      ), 32).toLowerCase());
+    }
+
+    // Same region, same crop, same operation — so a reload and a second click
+    // replay the first publication rather than publishing an unreconciled twin.
+    function regionExtractionOperationId(target, resource) {
+      const parts = [
+        text(read(resource, "itemId", "item_id"), 128),
+        text(read(resource, "artifactId", "artifact_id"), 128),
+        text(targetKey(target), 128),
+      ].join(":");
+      const sanitized = parts.replace(/[^A-Za-z0-9._:-]+/g, "-");
+      return `extract:${sanitized}`.slice(0, 128);
+    }
+
+    class RegionExtractionExecutor {
+      constructor(options = {}) {
+        this.port = options.port || options.commands || null;
+        this.commandId = text(options.extractionCommandId, 128) ||
+          TRANSFORM_QUEUE_COMMAND_ID;
+        this.serializeCommand =
+          typeof options.serializeExtractionCommand === "function"
+            ? options.serializeExtractionCommand : null;
+        this.getResource = typeof options.getExtractionResource === "function"
+          ? options.getExtractionResource : () => null;
+        this.getGeometry = typeof options.getExtractionGeometry === "function"
+          ? options.getExtractionGeometry : () => null;
+        this.operationIdFactory = typeof options.operationIdFactory === "function"
+          ? options.operationIdFactory : defaultOperationId;
+        this.onState = typeof options.onExtractionState === "function"
+          ? options.onExtractionState : () => {};
+        this.onStatus = typeof options.onStatus === "function"
+          ? options.onStatus : () => {};
+        this.states = new Map();
+      }
+
+      supported() {
+        return Boolean(this.serializeCommand && this.port && (
+          typeof this.port.queueTransform === "function" ||
+          typeof this.port.invoke === "function"
+        ));
+      }
+
+      stateFor(target) {
+        if (regionExtractionCommitted(target)) return EXTRACTION_STATES.EXTRACTED;
+        return this.states.get(targetKey(target)) || "";
+      }
+
+      available(target) {
+        return Boolean(
+          this.supported() && annotationTarget(target) && targetKey(target) &&
+          !this.stateFor(target),
+        );
+      }
+
+      publishState(target, status, detail = {}) {
+        const key = targetKey(target);
+        if (status) this.states.set(key, status);
+        else this.states.delete(key);
+        this.onState(Object.freeze({ key, target, status, ...detail }));
+        return status;
+      }
+
+      forget(target) {
+        return this.publishState(target, "");
+      }
+
+      invoke(payload) {
+        if (typeof this.port.queueTransform === "function") {
+          return this.port.queueTransform(payload);
+        }
+        return this.port.invoke(this.commandId, payload);
+      }
+
+      async queue(target, options = {}) {
+        if (!this.available(target)) {
+          const committed = this.stateFor(target);
+          throw new CorrectionCommandError(
+            committed
+              ? "That region has already been extracted"
+              : "This region cannot be extracted",
+            committed ? "region_extraction_repeated" : "region_extraction_unavailable",
+          );
+        }
+        const category = text(options.category, 64);
+        const resource = options.resource || this.getResource(target, options) || null;
+        const command = this.serializeCommand(Object.freeze({
+          resource,
+          // The mask has to be in the command's own oriented space; whoever
+          // rendered the box is the only one who knows the orientation it was
+          // drawn under, so its ring wins over the target's raw selector.
+          region: options.geometry || this.getGeometry(target, options) || target,
+          category,
+          // Deliberately not the random per-invocation id the other executors
+          // use: an extraction is idempotent on its region, so its identity is
+          // derived from what is being cropped rather than from when.
+          operationId: regionExtractionOperationId(target, resource),
+        }));
+        this.publishState(target, EXTRACTION_STATES.QUEUEING, { command });
+        try {
+          const result = await this.invoke(Object.freeze({
+            command,
+            trigger: text(options.trigger, 64) || "region-extract",
+            resource,
+            signal: options.signal,
+          }));
+          this.publishState(target, EXTRACTION_STATES.QUEUED, {
+            command,
+            jobId: text(read(result, "job_id", "jobId"), 256),
+          });
+          this.onStatus(category
+            ? `Extracting region as ${category.replace(/_/g, " ")}`
+            : "Extracting region", false);
+          return result;
+        } catch (error) {
+          this.publishState(target, "", { command, error });
+          throw error;
+        }
+      }
+    }
+
     class ClassificationCommandExecutor {
       constructor(options = {}) {
         this.port = options.port || options.commands || null;
+        this.extraction = options.extraction || null;
         this.history = options.history || null;
         this.operationIdFactory = typeof options.operationIdFactory === "function"
           ? options.operationIdFactory : defaultOperationId;
@@ -783,7 +924,21 @@
         this.busy = new Set();
       }
 
+      // A hovered machine box is a crop instruction, not a page
+      // classification: the same hotkey extracts that region and asserts the
+      // reviewer's category on the figure the extraction publishes. With
+      // nothing hovered there is no candidate and the ordinary page
+      // assignment runs untouched.
+      extractionCandidate(context, command) {
+        if (!this.extraction || !command ||
+            command.action !== CATEGORY_ASSIGN_ACTION ||
+            typeof this.extraction.available !== "function") return null;
+        const soft = candidateValue(context, "softTarget", "hotTarget");
+        return soft && this.extraction.available(soft) ? soft : null;
+      }
+
       available(context, command) {
+        if (this.extractionCandidate(context, command)) return true;
         if (!portSupportsCommand(this.port, command)) return false;
         const resolved = resolveClassificationTarget(context, command);
         return !!resolved;
@@ -850,6 +1005,14 @@
       }
 
       async execute(context, command) {
+        const extractable = this.extractionCandidate(context, command);
+        if (extractable) {
+          return this.extraction.queue(extractable, {
+            category: command.value,
+            trigger: "category-hotkey",
+            signal: context.signal,
+          });
+        }
         const initial = resolveClassificationTarget(context, command);
         if (!initial) {
           throw new CorrectionCommandError(
@@ -1095,15 +1258,23 @@
       if (!registry || typeof registry.register !== "function") {
         throw new TypeError("a correction command registry is required");
       }
+      const extraction = options.extraction === false ? null
+        : options.extraction || new RegionExtractionExecutor(options);
       const executor = options.executor instanceof ClassificationCommandExecutor
-        ? options.executor : new ClassificationCommandExecutor(options);
+        ? options.executor
+        : new ClassificationCommandExecutor({ ...options, extraction });
       const commands = DEFAULT_COMMAND_DEFINITIONS.map((definition) =>
         registry.register({
           ...definition,
           available: (context, command) => executor.available(context, command),
           execute: (context, command) => executor.execute(context, command),
         }));
-      return Object.freeze({ registry, executor, commands: Object.freeze(commands) });
+      return Object.freeze({
+        registry,
+        executor,
+        extraction,
+        commands: Object.freeze(commands),
+      });
     }
 
     function bindCommandControl(registry, commandId, control, options = {}) {
@@ -1147,10 +1318,12 @@
       CLASSIFICATION_COMMAND_IDS: COMMAND_IDS,
       CLASSIFICATION_TARGET_KINDS: TARGET_KINDS,
       DEFAULT_CLASSIFICATION_COMMANDS: DEFAULT_COMMAND_DEFINITIONS,
+      REGION_EXTRACTION_STATES: EXTRACTION_STATES,
       CorrectionCommandError,
       KeyBindingConflictError,
       CorrectionCommandRegistry,
       ClassificationCommandExecutor,
+      RegionExtractionExecutor,
       ariaKeyBinding,
       bindCommandControl,
       classificationTargetName,

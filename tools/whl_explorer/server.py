@@ -175,6 +175,11 @@ from librarytool.engine.correction_transforms import (  # noqa: E402
     CorrectionTransformService,
     QueuedCorrectionTransform,
 )
+from librarytool.engine.correction_category import (  # noqa: E402
+    CorrectionCategoryPrediction,
+    CorrectionCategoryProviderSelection,
+    CorrectionCategoryUnavailable,
+)
 from librarytool.engine.correction_ocr import (  # noqa: E402
     CorrectionOcrProviderSelection,
     CorrectionOcrRecognition,
@@ -6795,6 +6800,7 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             lock_context_for=_corrections_workspace_locks,
             job_start_context_for=_correction_transform_job_start_guard,
             ocr_provider=_EngineCorrectionOcrProvider(),
+            category_provider=_EngineCorrectionCategoryProvider(),
         ),
         workspace_lock_context_for=_engine_workspace_locks,
         recovery_lock_context=_engine_recovery_locks,
@@ -13346,6 +13352,70 @@ class _EngineCorrectionOcrProvider:
             selection.model,
             payload,
             selection.options,
+        )
+
+
+_CATEGORY_PROVIDER_ID = "mistral"
+_CATEGORY_DEFAULT_MODEL = "mistral-small-latest"
+
+
+class _EngineCorrectionCategoryProvider:
+    """Ask Mistral what an extracted figure shows; never assert the answer."""
+
+    def select_provider(self) -> CorrectionCategoryProviderSelection:
+        model = str(
+            getattr(capture, "CLASSIFY_MODEL", _CATEGORY_DEFAULT_MODEL)
+        ).strip() or _CATEGORY_DEFAULT_MODEL
+        return CorrectionCategoryProviderSelection(_CATEGORY_PROVIDER_ID, model)
+
+    def classify(
+        self,
+        selection: CorrectionCategoryProviderSelection,
+        content: bytes,
+        hooks: CorrectionTransformHooksPort,
+    ) -> CorrectionCategoryPrediction:
+        if not isinstance(selection, CorrectionCategoryProviderSelection):
+            raise TypeError(
+                "selection must be a CorrectionCategoryProviderSelection"
+            )
+        if selection.provider_id != _CATEGORY_PROVIDER_ID:
+            raise RuntimeError(
+                f"unsupported category service: {selection.provider_id}"
+            )
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("the extracted figure must be non-empty bytes")
+        if hooks.is_cancelled():
+            raise CorrectionTransformCancelled
+        # Mistral Studio bills several services against one key, so the vision
+        # chat call leases the same credential the OCR service already uses.
+        with _ocr_execution_cfg(_CATEGORY_PROVIDER_ID, {}) as execution_cfg:
+            api_key = str(execution_cfg.get("mistral_key") or "")
+            if not api_key:
+                # No credential means no call is made at all: the figure is
+                # published without a suggestion instead of the job reporting
+                # an error for something the workspace never opted into.
+                raise CorrectionCategoryUnavailable(
+                    "the Mistral API key is not configured"
+                )
+            suggestion = capture.classify_image_category(
+                content,
+                api_key,
+                model=selection.model,
+            )
+        if hooks.is_cancelled():
+            raise CorrectionTransformCancelled
+        if not isinstance(suggestion, Mapping):
+            raise ValueError("the category provider returned an invalid answer")
+        category = str(suggestion.get("category") or "")
+        confidence = suggestion.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(
+            confidence,
+            (int, float),
+        ):
+            confidence = None
+        return CorrectionCategoryPrediction(
+            category,
+            None if confidence is None else float(confidence),
         )
 
 

@@ -395,6 +395,7 @@
         };
         this.hotKey = "";
         this.focusedKey = "";
+        this.extractionStates = new Map();
         this.layer = null;
         this.observer = null;
         this.rendering = false;
@@ -493,6 +494,37 @@
         }
       }
 
+      // Region selectors are normalized in whatever space they were declared
+      // in, while a transform command's mask is always EXIF-oriented. Only the
+      // overlay knows which orientation it resolved for this view, so it is
+      // the one surface that can hand a caller a mask-ready ring.
+      orientedRegionPolygon(key) {
+        const wanted = text(key, 520);
+        const region = this.regions.find((candidate) => candidate.key === wanted);
+        if (!region) return null;
+        return region.points.map((point) => {
+          const oriented = orientNormalizedPoint(point, this.view.orientation);
+          return [oriented.x, oriented.y];
+        });
+      }
+
+      // Extraction state outlives a re-render, so it is held here and stamped
+      // back onto the marker the same way hot and focused are — a reviewer who
+      // has already sent a box off to be cropped must be able to see that.
+      setExtractionState(key, status) {
+        const overlayKeyValue = text(key, 520);
+        if (!overlayKeyValue) return "";
+        const value = text(status, 32);
+        if (value) this.extractionStates.set(overlayKeyValue, value);
+        else this.extractionStates.delete(overlayKeyValue);
+        this.updateTargetStates();
+        return value;
+      }
+
+      extractionState(key) {
+        return this.extractionStates.get(text(key, 520)) || "";
+      }
+
       marker(key) {
         if (!this.layer || typeof this.layer.querySelectorAll !== "function") return null;
         return Array.from(this.layer.querySelectorAll("[data-overlay-key]"))
@@ -503,6 +535,9 @@
         if (!this.layer || typeof this.layer.querySelectorAll !== "function") return;
         for (const node of this.layer.querySelectorAll("[data-overlay-key]")) {
           const key = node.dataset && node.dataset.overlayKey;
+          const extraction = this.extractionStates.get(key) || "";
+          if (extraction) node.dataset.extraction = extraction;
+          else delete node.dataset.extraction;
           if (key === this.hotKey) node.dataset.hot = "true";
           else delete node.dataset.hot;
           if (key === this.focusedKey) {
@@ -634,6 +669,7 @@
         this.layer = null;
         this.rawRegions = Object.freeze([]);
         this.regions = Object.freeze([]);
+        this.extractionStates.clear();
       }
     }
 

@@ -44,6 +44,10 @@
   const MIN_NORMALIZED_POLYGON_AREA = 0.0001;
   const MIN_MASK_POLYGON_POINTS = 3;
   const MAX_MASK_POLYGON_POINTS = 512;
+  // Mirrors IMAGE_CATEGORIES in librarytool/engine/raster_artifacts.py.
+  const IMAGE_CATEGORIES = Object.freeze([
+    "content_specimen", "cover", "other", "spine", "title_page",
+  ]);
   const HISTORY_LIMIT = 100;
   const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
   const SHA256_RE = /^[0-9a-fA-F]{64}$/;
@@ -266,6 +270,53 @@
       errors: Object.freeze([]),
       polygon: points.map((point) => [point[0], point[1]]),
     });
+  }
+
+  function boundingBoxEdges(box) {
+    const source = box && (box.selector || box.polygon) || box;
+    const points = Array.isArray(source) ? source
+      : Array.isArray(source && source.points) ? source.points : null;
+    if (points) {
+      const xs = [];
+      const ys = [];
+      for (const point of points) {
+        const x = Array.isArray(point) ? point[0] : point && point.x;
+        const y = Array.isArray(point) ? point[1] : point && point.y;
+        if (typeof x !== "number" || typeof y !== "number" ||
+            !Number.isFinite(x) || !Number.isFinite(y)) return null;
+        xs.push(x);
+        ys.push(y);
+      }
+      if (!xs.length) return null;
+      return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+    }
+    if (!isPlainObject(source)) return null;
+    const edges = source.width != null || source.height != null
+      ? [source.x, source.y, Number(source.x) + Number(source.width),
+        Number(source.y) + Number(source.height)]
+      : [source.left, source.top, source.right, source.bottom];
+    return edges.every((value) =>
+      typeof value === "number" && Number.isFinite(value)) ? edges : null;
+  }
+
+  // A machine bounding box reaches the reviewer as a rectangle, but the wire
+  // carries only polygons, so the box is expanded to its four corners and put
+  // through the same ring validation a traced mask gets: a zero-width or
+  // hairline box has to be refused here rather than at the engine. Coordinates
+  // are consumed in the command's own normalized space; a caller holding
+  // unoriented geometry orients it before calling.
+  function maskPolygonFromBoundingBox(box, options = {}) {
+    const edges = boundingBoxEdges(box);
+    if (!edges) {
+      return validationResult(
+        "polygon-box-bounds",
+        "A region box must carry finite normalized bounds.",
+      );
+    }
+    const [left, top, right, bottom] = edges;
+    return validateMaskPolygon([
+      [left, top], [right, top], [right, bottom], [left, bottom],
+    ], options);
   }
 
   function validatePerspectiveQuad(quad, options = {}) {
@@ -1139,6 +1190,30 @@
     if (options.operations != null) {
       command.operations = normalizeProcessingOperations(options.operations);
     }
+    if (options.extract != null && typeof options.extract !== "boolean") {
+      throw new TypeError("extract must be boolean");
+    }
+    if (options.extract === true) {
+      if (command.mask_polygon === undefined) {
+        throw new TypeError("an extraction requires a mask polygon");
+      }
+      if (command.rerun_ocr) {
+        throw new TypeError("an extraction cannot request an OCR follow-up");
+      }
+      command.extract = true;
+    }
+    const extractCategory = options.extractCategory == null
+      ? "" : String(options.extractCategory);
+    if (extractCategory) {
+      if (options.extract !== true) {
+        throw new TypeError("extract_category requires extract");
+      }
+      if (!IMAGE_CATEGORIES.includes(extractCategory)) {
+        throw new TypeError(
+          "extract_category is not in the canonical image vocabulary");
+      }
+      command.extract_category = extractCategory;
+    }
     return command;
   }
 
@@ -1268,6 +1343,7 @@
     GEOMETRY_EPSILON,
     HISTORY_LIMIT,
     FREEHAND_MIN_STEP,
+    IMAGE_CATEGORIES,
     MAX_MASK_POLYGON_POINTS,
     MAX_OPERATIONS_PER_RECIPE,
     POLYGON_CLOSE_DISTANCE,
@@ -1292,6 +1368,7 @@
     containedImageRect,
     createImageEditorState,
     isFormControlTarget,
+    maskPolygonFromBoundingBox,
     nearestCornerIndex,
     normalizeManualAdjustment,
     normalizeProcessingOperation,

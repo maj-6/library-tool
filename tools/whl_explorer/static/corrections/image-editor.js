@@ -19,6 +19,7 @@
     clientToNormalized,
     createImageEditorState,
     isFormControlTarget,
+    maskPolygonFromBoundingBox,
     nearestCornerIndex,
     reduceImageEditorState,
     resolveEscape,
@@ -120,6 +121,38 @@
       operations: preset.operations.length ? preset.operations : null,
       rerunOcr: false,
       operationId,
+    });
+  }
+
+  // A region extraction is an ordinary correction of the whole page — same
+  // quad, no adjustment — narrowed to the box by its mask. The category is
+  // carried only when the reviewer named one; an unnamed extraction is left
+  // for the classifier to suggest, which it can only do while the figure
+  // carries no assignment of its own.
+  function serializeRegionExtractionCommand(
+    { resource, region, category, operationId } = {},
+  ) {
+    const mask = maskPolygonFromBoundingBox(region);
+    if (!mask.valid) {
+      const error = new TypeError(mask.message);
+      error.code = mask.code;
+      throw error;
+    }
+    const contract = correctionResourceContract(resource);
+    const initial = createImageEditorState({
+      proposal: contract.proposal,
+      sourceRevision: contract.pins && contract.pins.source_revision,
+      hasSelection: true,
+    });
+    return serializeCorrectionTransformCommand({
+      pins: contract.pins,
+      quad: initial.quad,
+      adjustment: null,
+      rerunOcr: false,
+      operationId,
+      maskPolygon: mask.polygon,
+      extract: true,
+      extractCategory: category || "",
     });
   }
 
@@ -1025,5 +1058,6 @@
     drawPerspectiveOverlay,
     safeRasterUrl,
     serializeProcessingPresetCommand,
+    serializeRegionExtractionCommand,
   };
 });

@@ -1196,6 +1196,156 @@ class OcrFollowupOutcomePort(Protocol):
     ) -> None: ...
 
 
+# --- category suggestion: a second, weaker machine outcome ------------------
+#
+# Same shape as the OCR follow-up and for the same reason: it runs after the
+# image commit and cannot reach back into it. It is weaker still because it
+# writes an assignment rather than a free-standing proposal document, so the
+# vocabulary is narrowed here and the floor is enforced by the outcome type
+# itself, not by whichever adapter happens to call it.
+CATEGORY_SUGGESTION_MIN_CONFIDENCE = 0.75
+# "other" is the default effective category of an uncategorized image, so a
+# machine that answers "other" has proposed nothing while still occupying the
+# artifact's only suggestion slot.
+SUGGESTIBLE_IMAGE_CATEGORIES = frozenset(IMAGE_CATEGORIES - {"other"})
+
+
+class CategorySuggestionState(str, Enum):
+    NOT_REQUESTED = "not_requested"
+    SUGGESTED = "suggested"
+    ABSTAINED = "abstained"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class CategorySuggestionRequest:
+    operation_id: str
+    item_id: str
+    source: CommittedCorrectionOutput
+
+    def __post_init__(self) -> None:
+        if self.source.kind != "extracted-figure":
+            raise ValueError(
+                "category suggestion source must be the committed extracted figure"
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "item_id": self.item_id,
+            "source": self.source.as_dict(),
+            "publication_policy": "machine-suggestion-only",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CategorySuggestionOutcome:
+    state: CategorySuggestionState | str
+    source: CommittedCorrectionOutput | None = None
+    category: str = ""
+    confidence: float | None = None
+    provider_id: str = ""
+    model: str = ""
+    failure: JobFailure | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            state = CategorySuggestionState(self.state)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid category suggestion state") from exc
+        object.__setattr__(self, "state", state)
+        if state is CategorySuggestionState.NOT_REQUESTED:
+            if (
+                self.source is not None
+                or self.category
+                or self.confidence is not None
+                or self.provider_id
+                or self.model
+                or self.failure is not None
+            ):
+                raise ValueError(
+                    "not-requested category outcome cannot contain result data"
+                )
+        elif not isinstance(self.source, CommittedCorrectionOutput):
+            raise ValueError(
+                "category outcome must pin its committed extracted figure"
+            )
+        elif self.source.kind != "extracted-figure":
+            raise ValueError("category outcome source must be an extracted figure")
+        if state is CategorySuggestionState.SUGGESTED:
+            if self.category not in SUGGESTIBLE_IMAGE_CATEGORIES:
+                raise ValueError(
+                    "a suggested category must be a proposable image category"
+                )
+            confidence = self.confidence
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not math.isfinite(float(confidence))
+                or not (
+                    CATEGORY_SUGGESTION_MIN_CONFIDENCE
+                    <= float(confidence)
+                    <= 1.0
+                )
+            ):
+                raise ValueError(
+                    "a suggested category must clear the confidence floor"
+                )
+            object.__setattr__(self, "confidence", float(confidence))
+            _identifier(self.provider_id, "provider_id")
+            if self.failure is not None:
+                raise ValueError(
+                    "a successful category outcome cannot contain a failure"
+                )
+        elif self.category or self.confidence is not None:
+            raise ValueError(
+                "only suggested category outcomes may carry a category"
+            )
+        if not isinstance(self.model, str) or len(self.model) > 512:
+            raise ValueError("model must be a bounded string")
+        if state is CategorySuggestionState.FAILED and not isinstance(
+            self.failure,
+            JobFailure,
+        ):
+            raise ValueError("failed category outcome requires JobFailure")
+        if state is not CategorySuggestionState.FAILED and self.failure is not None:
+            raise ValueError("only failed category outcomes may contain JobFailure")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "source": self.source.as_dict() if self.source else None,
+            "category": self.category,
+            "confidence": self.confidence,
+            "provider_id": self.provider_id,
+            "model": self.model,
+            "failure": self.failure.as_dict() if self.failure else None,
+        }
+
+
+@runtime_checkable
+class CategorySuggestionPort(Protocol):
+    """Propose one category; never assert a human's classification."""
+
+    def suggest_category(
+        self,
+        request: CategorySuggestionRequest,
+        hooks: CorrectionTransformHooksPort,
+    ) -> CategorySuggestionOutcome: ...
+
+
+@runtime_checkable
+class CategorySuggestionOutcomePort(Protocol):
+    """Persist the category outcome separately from the committed figure."""
+
+    def record_category_suggestion(
+        self,
+        operation_id: str,
+        outcome: CategorySuggestionOutcome,
+    ) -> None: ...
+
+
 @runtime_checkable
 class CorrectionTransformExecutorPort(Protocol):
     """Execute one command already registered by the transform service."""
@@ -1736,6 +1886,11 @@ class CorrectionTransformRunResult:
     image_commit: CorrectionTransformCommitResult | None
     ocr_followup: OcrFollowupOutcome
     cancelled_before_commit: bool = False
+    category_suggestion: CategorySuggestionOutcome = field(
+        default_factory=lambda: CategorySuggestionOutcome(
+            CategorySuggestionState.NOT_REQUESTED
+        )
+    )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1744,6 +1899,7 @@ class CorrectionTransformRunResult:
             "image_commit": self.image_commit.as_dict() if self.image_commit else None,
             "ocr_followup": self.ocr_followup.as_dict(),
             "cancelled_before_commit": self.cancelled_before_commit,
+            "category_suggestion": self.category_suggestion.as_dict(),
         }
 
 
@@ -2054,6 +2210,8 @@ class CorrectionTransformWorker:
         *,
         ocr: OcrFollowupPort | None = None,
         ocr_outcomes: OcrFollowupOutcomePort | None = None,
+        category_suggestions: CategorySuggestionPort | None = None,
+        category_outcomes: CategorySuggestionOutcomePort | None = None,
         thumbnail_max_edge: int = 512,
     ) -> None:
         if not isinstance(thumbnail_max_edge, int) or thumbnail_max_edge < 16:
@@ -2062,6 +2220,8 @@ class CorrectionTransformWorker:
         self._store = store
         self._ocr = ocr
         self._ocr_outcomes = ocr_outcomes
+        self._category_suggestions = category_suggestions
+        self._category_outcomes = category_outcomes
         self._thumbnail_max_edge = thumbnail_max_edge
 
     def run(
@@ -2183,23 +2343,62 @@ class CorrectionTransformWorker:
             except Exception as exc:  # the image commit is intentionally final
                 recorder_failure = exc
 
+        category = self._run_category_suggestion(command, commit, combined_hooks)
+        category_recorder_failure: Exception | None = None
+        if (
+            category.state is not CategorySuggestionState.NOT_REQUESTED
+            and self._category_outcomes is not None
+        ):
+            try:
+                self._category_outcomes.record_category_suggestion(
+                    command.operation_id,
+                    category,
+                )
+            except Exception as exc:  # the image commit is intentionally final
+                category_recorder_failure = exc
+
         if outcome.state is OcrFollowupState.SUCCEEDED:
             job_outputs.append(JobOutput("ocr-proposal", outcome.proposal_ref).as_dict())
-        has_followup_error = outcome.state in {
-            OcrFollowupState.FAILED,
-            OcrFollowupState.CANCELLED,
-        } or recorder_failure is not None
+        if category.state is CategorySuggestionState.SUGGESTED:
+            job_outputs.append(
+                JobOutput("category-suggestion", category.category).as_dict()
+            )
+        has_followup_error = (
+            outcome.state
+            in {
+                OcrFollowupState.FAILED,
+                OcrFollowupState.CANCELLED,
+            }
+            or category.state
+            in {
+                CategorySuggestionState.FAILED,
+                CategorySuggestionState.CANCELLED,
+            }
+            or recorder_failure is not None
+            or category_recorder_failure is not None
+        )
         note = "correction complete"
         if outcome.state is OcrFollowupState.FAILED:
             note = "image committed; OCR follow-up failed"
         elif outcome.state is OcrFollowupState.CANCELLED:
             note = "image committed; OCR follow-up cancelled"
+        elif category.state is CategorySuggestionState.FAILED:
+            note = "image committed; category suggestion failed"
+        elif category.state is CategorySuggestionState.CANCELLED:
+            note = "image committed; category suggestion cancelled"
         if recorder_failure is not None:
             note = "image committed; OCR outcome recording failed"
+        elif category_recorder_failure is not None:
+            note = "image committed; category suggestion recording failed"
         followup_failure = self._followup_failure(
             outcome,
             recorder_failure=recorder_failure,
         )
+        if followup_failure is None:
+            followup_failure = self._category_failure(
+                category,
+                recorder_failure=category_recorder_failure,
+            )
         self._jobs.transition(
             record,
             "done (with errors)" if has_followup_error else "done",
@@ -2225,7 +2424,102 @@ class CorrectionTransformWorker:
             command.operation_id,
             commit,
             outcome,
+            category_suggestion=category,
         )
+
+    def _run_category_suggestion(
+        self,
+        command: CorrectionTransformCommand,
+        commit: CorrectionTransformCommitResult,
+        hooks: CorrectionTransformHooksPort,
+    ) -> CategorySuggestionOutcome:
+        # A reviewer who named the category asserted it. Nothing may ask a model
+        # to weigh in on a human assertion, and a correction has no figure to
+        # classify in the first place.
+        if not command.extract or command.extract_category:
+            return CategorySuggestionOutcome(CategorySuggestionState.NOT_REQUESTED)
+        if self._category_suggestions is None:
+            return CategorySuggestionOutcome(CategorySuggestionState.NOT_REQUESTED)
+        source = commit.output("extracted-figure")
+        if hooks.is_cancelled():
+            return CategorySuggestionOutcome(
+                CategorySuggestionState.CANCELLED,
+                source=source,
+            )
+        try:
+            hooks.report_progress(JobProgress(5, 6, "phase", "category-suggestion"))
+            outcome = self._category_suggestions.suggest_category(
+                CategorySuggestionRequest(
+                    command.operation_id,
+                    command.item_id,
+                    source,
+                ),
+                hooks,
+            )
+            if not isinstance(outcome, CategorySuggestionOutcome):
+                raise TypeError("category suggestion port returned an invalid outcome")
+            if outcome.state is CategorySuggestionState.NOT_REQUESTED:
+                raise ValueError(
+                    "a requested category suggestion cannot return not_requested"
+                )
+            if outcome.source != source:
+                raise ValueError(
+                    "category suggestion outcome does not pin the committed figure"
+                )
+            return outcome
+        except CorrectionTransformCancelled:
+            return CategorySuggestionOutcome(
+                CategorySuggestionState.CANCELLED,
+                source=source,
+            )
+        except EngineError as exc:
+            return CategorySuggestionOutcome(
+                CategorySuggestionState.FAILED,
+                source=source,
+                failure=JobFailure(
+                    exc.code,
+                    exc.message,
+                    retryable=exc.retryable,
+                    details=exc.details,
+                ),
+            )
+        except Exception as exc:
+            log.exception("correction category suggestion port failed")
+            return CategorySuggestionOutcome(
+                CategorySuggestionState.FAILED,
+                source=source,
+                failure=JobFailure(
+                    "category_suggestion_failed",
+                    "category suggestion failed",
+                    retryable=False,
+                    details={"exception": type(exc).__name__},
+                ),
+            )
+
+    @staticmethod
+    def _category_failure(
+        outcome: CategorySuggestionOutcome,
+        *,
+        recorder_failure: Exception | None,
+    ) -> JobFailure | None:
+        if recorder_failure is not None:
+            return JobFailure(
+                "category_suggestion_recording_failed",
+                "the extracted figure was committed, but its category "
+                "suggestion could not be recorded",
+                retryable=True,
+                details={"exception": type(recorder_failure).__name__},
+            )
+        if outcome.state is CategorySuggestionState.FAILED:
+            return outcome.failure
+        if outcome.state is CategorySuggestionState.CANCELLED:
+            return JobFailure(
+                "category_suggestion_cancelled",
+                "the extracted figure was committed; category suggestion "
+                "was cancelled",
+                retryable=False,
+            )
+        return None
 
     def _run_ocr_followup(
         self,
@@ -2389,8 +2683,15 @@ class CorrectionTransformWorker:
 
 
 __all__ = [
+    "CATEGORY_SUGGESTION_MIN_CONFIDENCE",
     "CORRECTION_OUTPUT_KINDS",
     "CORRECTION_TRANSFORM_JOB_KIND",
+    "SUGGESTIBLE_IMAGE_CATEGORIES",
+    "CategorySuggestionOutcome",
+    "CategorySuggestionOutcomePort",
+    "CategorySuggestionPort",
+    "CategorySuggestionRequest",
+    "CategorySuggestionState",
     "CommittedCorrectionOutput",
     "CommittedCorrectionTransform",
     "CorrectionHumanAssertions",

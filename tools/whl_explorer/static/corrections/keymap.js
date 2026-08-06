@@ -253,8 +253,15 @@
           onChanged: options.onChanged,
           onConflict: options.onConflict,
           onStatus: options.onStatus,
+          extraction: options.extraction,
+          extractionCommandId: options.extractionCommandId,
+          serializeExtractionCommand: options.serializeExtractionCommand,
+          getExtractionResource: options.getExtractionResource,
+          getExtractionGeometry: options.getExtractionGeometry,
+          onExtractionState: options.onExtractionState,
         });
         this.executor = registered.executor;
+        this.extraction = registered.extraction;
         this.keymap = options.keymap || new ScopedCorrectionKeymap({
           scope: this.scope,
           documentRef: this.documentRef,
@@ -404,6 +411,18 @@
           commandId,
           { ...this.commandContext(options.source || "api"), ...options.context },
         );
+      }
+
+      // Null — not a rejection — when the target is not an extractable box, so
+      // an ordinary region click still falls through to selection.
+      extractRegion(target, options = {}) {
+        if (!this.extraction ||
+            typeof this.extraction.available !== "function" ||
+            !this.extraction.available(target)) return null;
+        return this.extraction.queue(target, {
+          trigger: "region-click",
+          ...options,
+        });
       }
 
       bindControl(commandId, control, options = {}) {
