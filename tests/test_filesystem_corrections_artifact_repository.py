@@ -2339,3 +2339,120 @@ def test_traversal_in_a_store_path_is_rejected_by_name(tmp_path):
         entries / ITEM_ID,
         entries / ITEM_ID / "ocr",
     ]
+
+
+def _canonical_manifest_bytes(manifest) -> bytes:
+    return json.dumps(
+        manifest,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _capture_with_manifest(root):
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    original = _jpeg_bytes((10, 20, 30), (2, 2))
+    display = _jpeg_bytes((40, 50, 60), (2, 2))
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    (directory / "original_asset-1.jpg").write_bytes(original)
+    manifest = _photo_manifest(original, display)
+    (directory / "photo_assets.json").write_bytes(_canonical_manifest_bytes(manifest))
+    return directory, manifest
+
+
+def test_capture_manifest_rewritten_in_place_is_not_served_stale(
+    tmp_path,
+):
+    """`_stable_stat_identity` must not be the only thing standing between a
+    changed manifest and a cached hint.
+
+    On Windows ``st_ctime`` is CREATION time, so the identity tuple reduces to
+    (dev, ino, mode, nlink, size, mtime). An in-place rewrite keeps the inode,
+    'cover' and 'spine' are both five bytes so the canonical payload keeps its
+    size, and mtime is trivially held (os.utime here; a same-tick write, a
+    coarse-granularity volume such as exFAT/SMB, or any mtime-preserving
+    restore does it without cooperation).
+    """
+
+    directory, manifest = _capture_with_manifest(tmp_path)
+    path = directory / "photo_assets.json"
+    repository = _repository(tmp_path)
+
+    before = repository.list_capture_index_hints(ITEM_ID)
+    assert [hint["effective_category"] for hint in before] == ["cover"]
+
+    stat_before = os.lstat(path)
+    changed = json.loads(json.dumps(manifest))
+    changed["assets"][0]["role"]["manual_override"] = "spine"
+    payload = _canonical_manifest_bytes(changed)
+    assert len(payload) == stat_before.st_size
+
+    with open(path, "r+b") as handle:      # in place: inode preserved
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+
+    after = repository.list_capture_index_hints(ITEM_ID)
+    assert [hint["effective_category"] for hint in after] == ["spine"]
+    assert after != before
+
+
+def test_capture_authority_is_revalidated_for_every_asset_in_a_burst(
+    tmp_path,
+):
+    """Pinning one directory must not stop ancestors being rechecked.
+
+    A capture directory swapped for a junction after the pin is taken must not
+    let an asset outside the authority be observed as AVAILABLE.
+    """
+
+    import subprocess
+
+    from librarytool.adapters.filesystem import (
+        corrections_artifact_repository as module,
+    )
+
+    directory, _manifest = _capture_with_manifest(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for name in ("orig_1.jpg", "photo_1.jpg", "original_asset-1.jpg"):
+        (outside / name).write_bytes(_jpeg_bytes((1, 2, 3), (64, 64)))
+
+    repository = _repository(tmp_path)
+    repository.list_capture_index_hints(ITEM_ID)
+
+    original = (
+        module.FilesystemCorrectionsArtifactRepository._capture_manifest_records
+    )
+    swapped = {"done": False}
+
+    def hooked(self, item_id, capture_id, manifest):
+        result = original(self, item_id, capture_id, manifest)
+        if not swapped["done"]:
+            swapped["done"] = True
+            os.rename(directory, directory.with_name(directory.name + ".stash"))
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(directory), str(outside)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        return result
+
+    module.FilesystemCorrectionsArtifactRepository._capture_manifest_records = (
+        hooked
+    )
+    getattr(module, "_capture_index_hints_cache", {}).clear()
+    getattr(module, "_capture_manifests", {}).clear()
+    try:
+        hints = repository.list_capture_index_hints(ITEM_ID)
+    finally:
+        module.FilesystemCorrectionsArtifactRepository._capture_manifest_records = (
+            original
+        )
+    assert all(hint["resource_state"] != "available" for hint in hints)
