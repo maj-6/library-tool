@@ -695,6 +695,13 @@ def _normalize_datalab_output(
         output, *, fallback_size: tuple[int, int] | None = None,
 ) -> tuple[str, list[dict]]:
     pages = _datalab_pages(output)
+    # Live-verified 2026-08-06: the default prediction returns
+    # {"text": ..., "pages": None} — plain text with no line geometry
+    # unless a geometry option is enabled. Honor that shape rather than
+    # reporting an empty result.
+    if not pages and isinstance(output, dict) and isinstance(
+            output.get("text"), str):
+        return output["text"], []
     regions: list[dict] = []
     page_texts: list[str] = []
     for page_index, page in enumerate(pages):
@@ -764,7 +771,9 @@ def _run_datalab(image_bytes: bytes, secrets: Mapping[str, str],
     deadline = time.monotonic() + max(1.0, float(timeout))
     prediction = _http_json(
         engine_id, DATALAB_CREATE_URL, method="POST",
-        body=json.dumps({"input": {"image": data_uri}}).encode("utf-8"),
+        # Live-verified 2026-08-06: the model rejects "image" with a 422; its
+        # required input field is "file".
+        body=json.dumps({"input": {"file": data_uri}}).encode("utf-8"),
         headers={
             **auth,
             "Content-Type": "application/json",
