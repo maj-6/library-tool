@@ -694,6 +694,49 @@ def test_cloud_acknowledgement_exact_retry_precedes_photo_cleanup(monkeypatch):
     )
 
 
+def test_cloud_acknowledgement_does_not_retry_definitive_http_conflict(
+        monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a7878787-7878-4787-8787-787878787878"
+    server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="cloud",
+    )
+    association = server._capture_archive_association(capture_id)
+    publications = []
+
+    def reject(*args, **kwargs):
+        publications.append((args, kwargs))
+        raise server.sbase.SyncError(
+            "capture archive publication revision or status changed",
+            http_status=409,
+            error_code="WHL_CAP_CONFLICT",
+            service="rest",
+            method="POST",
+            resource="rpc/prepare_capture_lib_association",
+        )
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        reject,
+    )
+
+    with pytest.raises(server.sbase.SyncError) as failure:
+        server._publish_cloud_capture_acknowledgement(
+            {"url": "cloud", "key": "service"},
+            {"url": "cloud", "key": "user"},
+            {"id": capture_id, "lib_association_revision": 0},
+            association,
+        )
+
+    assert failure.value.http_status == 409
+    assert len(publications) == 1
+
+
 def test_cloud_ack_replays_when_local_receipt_save_fails_after_rpc_commit(
         monkeypatch):
     _prepare_capture(monkeypatch)
@@ -1314,6 +1357,52 @@ def test_imported_null_remote_state_bootstraps_without_changing_status(
     assert publications == []
 
 
+def test_error_null_remote_state_recovers_to_imported(monkeypatch):
+    _prepare_capture(monkeypatch)
+    capture_id = "a1616161-1616-4616-8616-161616161616"
+    server.ingest_capture(
+        _capture(capture_id),
+        [_jpeg(capture_id)],
+        "",
+        ["photo_1.jpg"],
+        transport="cloud",
+    )
+    current = server._capture_archive_association(capture_id)
+    owner_cfg = {"url": "cloud", "key": "service"}
+    capture_cfg = {"url": "cloud", "key": "user"}
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_association_states",
+        lambda _cfg, _ids, chunk=40: [
+            _scoped_cloud_association(capture_id, status="error")
+        ],
+    )
+    publications = []
+
+    def publish(*args, **kwargs):
+        publications.append((args, kwargs))
+        return _accepted_cloud_association(current, 1)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_lib_association",
+        publish,
+    )
+
+    result = server._reconcile_cloud_capture_associations(
+        owner_cfg,
+        capture_cfg,
+        capture_ids=[capture_id],
+    )
+
+    assert result["published"] == 1
+    assert result["errors"] == []
+    assert publications[0][1] == {
+        "expected_revision": 0,
+        "mark_imported": True,
+    }
+
+
 def test_offline_backfill_is_published_by_next_explicit_cloud_sync(
         monkeypatch):
     """The documented operator workflow crosses the real reconciliation path."""
@@ -1505,7 +1594,7 @@ def test_terminal_stale_conflicts_converge_rebase_or_quarantine(
 
     def rebase_publish(*args, **kwargs):
         attempts.append(kwargs["expected_revision"])
-        if len(attempts) <= 2:
+        if len(attempts) == 1:
             raise server.sbase.SyncError(
                 "HTTP 409 on POST rpc: revision changed"
             )
@@ -1532,7 +1621,7 @@ def test_terminal_stale_conflicts_converge_rebase_or_quarantine(
         capture_cfg,
     )
     assert rebased == {"pushed": 1, "pending": 0, "errors": []}
-    assert attempts == [1, 1, 3]
+    assert attempts == [1, 3]
 
     deleted_id = "a1919191-1919-4919-8919-191919191919"
     _deleted_current, _deleted_stale = seed(deleted_id)
@@ -1566,7 +1655,7 @@ def test_terminal_stale_conflicts_converge_rebase_or_quarantine(
 
     assert quarantined == {"pushed": 0, "pending": 0, "errors": []}
     assert repeated == {"pushed": 0, "pending": 0, "errors": []}
-    assert calls == 2
+    assert calls == 1
     state = server._capture_cloud_association_state()
     assert deleted_id not in state["pending"]
     assert deleted_id not in state["shadows"]
@@ -1639,7 +1728,7 @@ def test_authorization_quarantine_is_not_requeued_until_facts_change(
     assert reconciled["observed"] == 1
     assert reconciled["errors"] == []
     assert repeated == {"pushed": 0, "pending": 0, "errors": []}
-    assert calls == 2
+    assert calls == 1
     state = server._capture_cloud_association_state()
     assert state["pending"] == {}
     assert state["shadows"][capture_id] == {
@@ -1724,7 +1813,6 @@ def test_missing_capability_rpc_preserves_visible_predecessor_until_rollout(
 
     assert recovered == {"pushed": 1, "pending": 0, "errors": []}
     assert [call[1]["expected_revision"] for call in publications] == [
-        1,
         1,
         1,
     ]

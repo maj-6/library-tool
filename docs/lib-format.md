@@ -603,6 +603,8 @@ repository README (or pass the three explicit path options).
 
 The second step is idempotent. If publication is interrupted, another Cloud
 Sync re-inspects the verified local association and the exact remote revision.
+Legacy cloud rows left in `error` without an association are recoverable by
+the same atomic publication; terminal non-importable statuses are unchanged.
 Non-UUID LAN/local-only capture identities are excluded from cloud discovery,
 and a UUID absent from the signed-in user's RLS results is not published. This
 is the packaged operator path; the offline command never needs a service key

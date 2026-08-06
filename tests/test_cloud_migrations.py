@@ -67,6 +67,12 @@ CAPTURE_LIB_IMPORT_TRANSITION_GUARD = SQL[
 CAPTURE_LIB_IMPORT_TRANSITION_GUARD_FLAT = " ".join(
     CAPTURE_LIB_IMPORT_TRANSITION_GUARD.split()
 )
+CAPTURE_ERROR_ACKNOWLEDGEMENT = SQL[
+    "025_capture_error_acknowledgement"
+]
+CAPTURE_ERROR_ACKNOWLEDGEMENT_FLAT = " ".join(
+    CAPTURE_ERROR_ACKNOWLEDGEMENT.split()
+)
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -813,6 +819,172 @@ def test_capture_lib_import_transition_guard_reasserts_rls_and_rpc_only_writes()
     assert (
         "grant update ( device, status, photos, note, contributor, ocr, meta ) "
         "on public.captures to authenticated, service_role;"
+    ) in migration
+
+
+# --- 025: retry legacy capture errors through the atomic acknowledgement ------
+
+def _capture_lib_rpc_definition(sql: str, name: str, alter: str) -> str:
+    start = sql.index(f"create or replace function public.{name}(")
+    end = sql.index(alter, start)
+    without_comments = re.sub(r"--[^\n]*", "", sql[start:end])
+    return re.sub(r"\s+", "", without_comments)
+
+
+def test_capture_error_ack_changes_only_the_two_importable_status_checks():
+    old_prepare = _capture_lib_rpc_definition(
+        CAPTURE_LIB_ASSOCIATION_RPC,
+        "prepare_capture_lib_association",
+        "alter function public.prepare_capture_lib_association(",
+    ).replace(
+        "and(notp_mark_importedorlocked_status='pending')",
+        "and(notp_mark_importedorlocked_statusin('pending','error'))",
+    )
+    new_prepare = _capture_lib_rpc_definition(
+        CAPTURE_ERROR_ACKNOWLEDGEMENT,
+        "prepare_capture_lib_association",
+        "alter function public.prepare_capture_lib_association(",
+    )
+    old_publish = _capture_lib_rpc_definition(
+        CAPTURE_LIB_ASSOCIATION_RPC,
+        "publish_capture_lib_association",
+        "alter function public.publish_capture_lib_association(text)",
+    ).replace(
+        "ifcapability.mark_importedandlocked_status<>'pending'then",
+        "ifcapability.mark_importedandlocked_statusnotin('pending','error')then",
+    )
+    new_publish = _capture_lib_rpc_definition(
+        CAPTURE_ERROR_ACKNOWLEDGEMENT,
+        "publish_capture_lib_association",
+        "alter function public.publish_capture_lib_association(text)",
+    )
+
+    assert new_prepare == old_prepare
+    assert new_publish == old_publish
+
+
+def test_capture_error_ack_replaces_both_rpc_halves_without_rewriting_rows():
+    migration = CAPTURE_ERROR_ACKNOWLEDGEMENT_FLAT
+    assert migration.count(
+        "create or replace function public.prepare_capture_lib_association("
+    ) == 1
+    assert migration.count(
+        "create or replace function public.publish_capture_lib_association("
+    ) == 1
+    assert "update public.captures set status" not in migration
+    assert "notify pgrst, 'reload schema';" in migration
+
+
+def test_capture_error_ack_prepare_preserves_scope_and_expands_only_importable_status():
+    migration = CAPTURE_ERROR_ACKNOWLEDGEMENT_FLAT
+    function = migration.split(
+        "create or replace function public.prepare_capture_lib_association(",
+        1,
+    )[1].split(
+        "alter function public.prepare_capture_lib_association(",
+        1,
+    )[0]
+    assert "security definer" in function
+    assert "set search_path = ''" in function
+    assert "caller_id uuid := auth.uid();" in function
+    assert "private.assert_capture_lib_association_v1(" in function
+    capture_lock = function.index(
+        "where capture_row.id = p_capture_id for update;"
+    )
+    capability_lock = function.index(
+        "order by capability.token_hash for update"
+    )
+    grant_lock = function.index(
+        "grant_row.contributor_id = locked_owner for key share;"
+    )
+    assert capture_lock < capability_lock < grant_lock
+    assert "locked_owner is distinct from caller_id" in function
+    assert "grant_row.ingester_id = caller_id" in function
+    assert "locked_revision = p_expected_revision" in function
+    assert "locked_status in ('pending', 'error')" in function
+    assert "locked_status = 'imported'" in function
+    assert "'void'" not in function
+    assert "'processing'" not in function
+    assert "token_capability.association is distinct from p_association" in \
+        function
+    assert "capture archive publication revision or status changed" in function
+
+
+def test_capture_error_ack_consumer_rechecks_scope_and_updates_atomically():
+    migration = CAPTURE_ERROR_ACKNOWLEDGEMENT_FLAT
+    function = migration.split(
+        "create or replace function public.publish_capture_lib_association(",
+        1,
+    )[1].split(
+        "alter function public.publish_capture_lib_association(text)",
+        1,
+    )[0]
+    assert "security definer" in function
+    assert "set search_path = ''" in function
+    hint = function.index(
+        "select publication.capture_id into hinted_capture_id"
+    )
+    capture_lock = function.index(
+        "where capture_row.id = hinted_capture_id for update;"
+    )
+    capability_lock = function.index(
+        "and publication.capture_id = hinted_capture_id for update;"
+    )
+    grant_lock = function.index(
+        "grant_row.contributor_id = locked_owner for key share;"
+    )
+    assert hint < capture_lock < capability_lock < grant_lock
+    assert "capability.authorization_expires_at <= clock_timestamp()" in \
+        function
+    assert "capability.association_digest is distinct from" in function
+    assert "private.assert_capture_lib_association_v1(" in function
+    assert "grant_row.ingester_id = capability.actor_id" in function
+    assert "locked_revision <> capability.expected_revision" in function
+    assert "locked_status not in ('pending', 'error')" in function
+    assert "'void'" not in function
+    assert "'processing'" not in function
+    update = function.split("update public.captures as capture_row", 1)[1].split(
+        "returning", 1,
+    )[0]
+    assert "lib_association = capability.association" in update
+    assert "when capability.mark_imported then 'imported'" in update
+    assert "capture archive changed after capability consumption" in function
+    assert "replay_expires_at = consumed_at_value + interval '7 days'" in \
+        function
+
+
+def test_capture_error_ack_reasserts_rpc_roles_and_direct_write_boundary():
+    migration = CAPTURE_ERROR_ACKNOWLEDGEMENT_FLAT
+    assert (
+        "alter function public.prepare_capture_lib_association( text, uuid, "
+        "jsonb, bigint, boolean ) owner to postgres;"
+    ) in migration
+    assert (
+        "revoke all on function public.prepare_capture_lib_association( text, "
+        "uuid, jsonb, bigint, boolean ) from public, anon, authenticated, "
+        "service_role;"
+    ) in migration
+    assert (
+        "grant execute on function public.prepare_capture_lib_association( "
+        "text, uuid, jsonb, bigint, boolean ) to authenticated;"
+    ) in migration
+    assert (
+        "alter function public.publish_capture_lib_association(text) "
+        "owner to postgres;"
+    ) in migration
+    assert (
+        "revoke all on function public.publish_capture_lib_association(text) "
+        "from public, anon, authenticated, service_role;"
+    ) in migration
+    assert (
+        "grant execute on function public.publish_capture_lib_association(text) "
+        "to service_role;"
+    ) in migration
+    assert "alter table public.captures enable row level security;" in migration
+    assert (
+        "revoke update ( lib_association, lib_association_revision, "
+        "lib_association_updated_at ) on public.captures from authenticated, "
+        "service_role;"
     ) in migration
 
 

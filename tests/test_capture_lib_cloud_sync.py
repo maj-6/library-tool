@@ -613,7 +613,11 @@ def test_capture_association_states_fail_closed_on_malformed_rows(
         supabase_sync.list_capture_association_states({}, [CAPTURE_ID])
 
 
-def test_scoped_publisher_atomically_imports_pending_null_row(monkeypatch):
+@pytest.mark.parametrize("status", ["pending", "error"])
+def test_scoped_publisher_atomically_imports_recoverable_null_row(
+    monkeypatch,
+    status,
+):
     stable_capability(monkeypatch)
     service_cfg, scope_cfg = publish_configs()
     calls = []
@@ -623,7 +627,7 @@ def test_scoped_publisher_atomically_imports_pending_null_row(monkeypatch):
         if method == "GET":
             return [{
                 "id": CAPTURE_ID,
-                "status": "pending",
+                "status": status,
                 "lib_association": None,
                 "lib_association_revision": 0,
                 "lib_association_updated_at": None,
@@ -647,6 +651,35 @@ def test_scoped_publisher_atomically_imports_pending_null_row(monkeypatch):
     assert calls[2][2] == "rpc/publish_capture_lib_association"
     assert calls[1][3]["p_expected_revision"] == 0
     assert calls[1][3]["p_mark_imported"] is True
+
+
+def test_scoped_publisher_rejects_non_importable_null_row(monkeypatch):
+    stable_capability(monkeypatch)
+    service_cfg, scope_cfg = publish_configs()
+    calls = []
+
+    def rest(*_args, **_kwargs):
+        calls.append(True)
+        return [{
+            "id": CAPTURE_ID,
+            "status": "void",
+            "lib_association": None,
+            "lib_association_revision": 0,
+            "lib_association_updated_at": None,
+        }]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+    publisher = supabase_sync.ScopedCaptureLibAssociationPublisher(
+        service_cfg,
+        scope_cfg,
+    )
+
+    with pytest.raises(RepositoryError) as failure:
+        publisher.publish(SimpleNamespace(as_dict=lambda: association()))
+
+    assert failure.value.code == "capture_cloud_target_not_importable"
+    assert failure.value.retryable is False
+    assert calls == [True]
 
 
 def test_scoped_publisher_fills_legacy_imported_null_without_status_race(
