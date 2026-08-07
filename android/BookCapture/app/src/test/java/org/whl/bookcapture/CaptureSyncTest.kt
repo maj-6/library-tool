@@ -3,8 +3,10 @@ package org.whl.bookcapture
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 import java.io.File
 
 class CaptureSyncTest {
@@ -397,8 +399,12 @@ class CaptureSyncTest {
     fun explicitUploadQueuesReviewSyncOnlyAfterTheCloudCaptureRowExists() {
         val upload = File("src/main/java/org/whl/bookcapture/UploadWorker.kt").readText()
         val cloudDelivery = upload.indexOf("val delivery = uploadEntry(client, dir, prepared)")
+        val membershipSync = upload.indexOf(
+            "syncInspectMembershipAfterCaptureInsert(ctx, client, dir, uploadOwner)",
+            cloudDelivery,
+        )
         val localCommit = upload.indexOf(
-            "markUploaded(ctx, dir, delivery, syncRequestId)",
+            "markUploaded(ctx, dir, delivery, syncRequestId, uploadOwner)",
             cloudDelivery,
         )
         val reviewSync = upload.indexOf(
@@ -407,8 +413,14 @@ class CaptureSyncTest {
         )
 
         assertTrue(cloudDelivery >= 0)
-        assertTrue(localCommit > cloudDelivery)
+        assertTrue(membershipSync > cloudDelivery)
+        assertTrue(localCommit > membershipSync)
         assertTrue(reviewSync > localCommit)
+        assertTrue(upload.contains("var membership = stored.memberships[dir.name] ?: return"))
+        assertTrue(upload.contains("InspectBookMemberships.compareAndSet("))
+        assertTrue(upload.contains("membership.copy(cloudOwnerId = owner)"))
+        assertFalse(upload.contains("val owner = Prefs.userId(ctx)"))
+        assertTrue(upload.contains("client.mutateCaptureCollection("))
     }
 
     @Test
@@ -430,10 +442,65 @@ class CaptureSyncTest {
         assertTrue(accounted > enqueue)
         assertTrue(metadataWorker.contains("operation.result.get()"))
         assertTrue(upload.contains("val pendingReviewSync = CaptureMetadataStore.hasPendingReviewSync(dir)"))
-        assertTrue(upload.contains("markDelivered(ctx, dir, delivery, \"pending\", syncRequestId, \"cloud\")"))
+        assertTrue(upload.contains("cloudOwnerId: String,"))
+        assertTrue(upload.contains("cloudOwnerId = cloudOwnerId,"))
         assertTrue(upload.contains("markDelivered(ctx, dir, delivery, \"imported\", syncRequestId, \"lan\")"))
         assertTrue(metadataWorker.contains("entry.deliveryTransport == \"lan\""))
         assertTrue(metadataWorker.contains("entry.deliveryTransport == \"cloud\""))
+    }
+
+    @Test
+    fun cloudDeliveryStampRequiresTheFrozenOwnerToMatchTheCaptureCreator() {
+        val ownerA = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        val manifest = JSONObject()
+            .put("creator", JSONObject()
+                .put("kind", Prefs.CREATOR_ACCOUNT)
+                .put("id", ownerA.uppercase()))
+
+        val stamped = stampDeliveryManifest(
+            manifest = manifest,
+            uploadedAt = 123L,
+            cloudStatus = "pending",
+            syncRequestId = "request-1",
+            deliveryTransport = "cloud",
+            cloudOwnerId = ownerA,
+        )
+
+        assertEquals(ownerA, stamped.getString(CLOUD_OWNER_MANIFEST_KEY))
+        assertEquals(ownerA, cloudOwnerIdFromDeliveryManifest(stamped))
+        assertThrows(IllegalArgumentException::class.java) {
+            stampDeliveryManifest(
+                manifest = JSONObject()
+                    .put("creator", JSONObject()
+                        .put("kind", Prefs.CREATOR_ACCOUNT)
+                        .put("id", ownerA)),
+                uploadedAt = 124L,
+                cloudStatus = "pending",
+                syncRequestId = "request-2",
+                deliveryTransport = "cloud",
+                cloudOwnerId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            )
+        }
+    }
+
+    @Test
+    fun lanDeliveryStampCannotRetainACloudOwner() {
+        val manifest = JSONObject()
+            .put(CLOUD_OWNER_MANIFEST_KEY, "stale-owner")
+            .put("creator", JSONObject()
+                .put("kind", Prefs.CREATOR_ACCOUNT)
+                .put("id", "stale-owner"))
+
+        val stamped = stampDeliveryManifest(
+            manifest = manifest,
+            uploadedAt = 123L,
+            cloudStatus = "imported",
+            syncRequestId = "request-1",
+            deliveryTransport = "lan",
+        )
+
+        assertFalse(stamped.has(CLOUD_OWNER_MANIFEST_KEY))
+        assertEquals("", cloudOwnerIdFromDeliveryManifest(stamped))
     }
 
     @Test

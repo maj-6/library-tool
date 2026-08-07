@@ -33,6 +33,8 @@ class CollectionInventoryTest {
         uploaded: Boolean = true,
         createdAt: Long = 200L,
         dir: File = Files.createTempDirectory("inventory-entry").toFile(),
+        deliveryTransport: String = "cloud",
+        cloudOwnerId: String = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
     ) = Entries.Entry(
         id = id,
         dir = dir,
@@ -45,6 +47,8 @@ class CollectionInventoryTest {
             .put("author", "Current author")
             .put("year", "2026"),
         cloudStatus = "imported",
+        deliveryTransport = deliveryTransport,
+        cloudOwnerId = cloudOwnerId,
         processing = Entries.ProcessingState(
             status = Entries.ProcessingStatus.COMPLETE,
             stage = Entries.ProcessingStage.COMPLETE,
@@ -73,6 +77,8 @@ class CollectionInventoryTest {
         assertFalse(row.has("id"))
         assertEquals("Fungi", row.getString("collection_name"))
         assertEquals(3, row.getInt("photo_count"))
+        assertEquals("", row.getString("delivery_transport"))
+        assertEquals("", row.getString("cloud_owner_id"))
         assertEquals(
             mapOf(original.entryId to original),
             collectionInventoryStoreFromJson(encoded).summaries,
@@ -113,12 +119,17 @@ class CollectionInventoryTest {
     fun malformedOrUnknownSchemasAreNotWritableStores() {
         val invalid = listOf(
             "{}",
-            """{"version":2,"entries":{}}""",
+            """{"version":4,"entries":{}}""",
             """{"version":1,"entries":[]}""",
             """{"version":1,"entries":{"e":{"collection_id":4}}}""",
             """{"version":1,"entries":{"e":{
                 "collection_id":"c","collection_name":"Fungi","title":"t",
                 "author":"a","year":"y","photo_count":-1,"created_at":1
+            }}}""",
+            """{"version":3,"entries":{"e":{
+                "collection_id":"c","collection_name":"Fungi","title":"t",
+                "author":"a","year":"y","photo_count":1,"created_at":1,
+                "delivery_transport":"lan","cloud_owner_id":"account-a"
             }}}""",
         )
 
@@ -126,7 +137,7 @@ class CollectionInventoryTest {
     }
 
     @Test
-    fun versionZeroArrayMigratesToKeyedVersionOneOnNextRecord() {
+    fun versionZeroArrayMigratesToTheCurrentKeyedVersionOnNextRecord() {
         val target = File(tempDir(), COLLECTION_INVENTORY_FILE)
         target.writeText(
             """{"version":0,"entries":[{
@@ -142,8 +153,109 @@ class CollectionInventoryTest {
         assertTrue(CollectionInventory.recordFinalized(target, listOf(entry("new"))))
 
         val migrated = JSONObject(target.readText())
-        assertEquals(1, migrated.getInt("version"))
+        assertEquals(COLLECTION_INVENTORY_VERSION, migrated.getInt("version"))
         assertEquals(setOf("legacy", "new"), migrated.getJSONObject("entries").keys().asSequence().toSet())
+        assertEquals(
+            "",
+            readCollectionInventoryStore(target).summaries.getValue("legacy").deliveryTransport,
+        )
+        assertEquals(
+            "",
+            readCollectionInventoryStore(target).summaries.getValue("legacy").cloudOwnerId,
+        )
+    }
+
+    @Test
+    fun versionOneKeyedRowsRemainReadableWithUnknownDeliveryTransport() {
+        val legacy = """{"version":1,"entries":{"legacy":{
+            "collection_id":"old-c","collection_name":"Old crate",
+            "title":"Old book","author":"A","year":"1901",
+            "photo_count":1,"created_at":10
+        }}}""".trimIndent()
+
+        val parsed = collectionInventoryStoreFromJson(legacy)
+
+        assertTrue(parsed.valid)
+        assertEquals("", parsed.summaries.getValue("legacy").deliveryTransport)
+        assertEquals("", parsed.summaries.getValue("legacy").cloudOwnerId)
+        assertEquals(1, parsed.sourceVersion)
+    }
+
+    @Test
+    fun versionTwoCloudRowsRemainReadableWithUnknownOwner() {
+        val legacy = """{"version":2,"entries":{"legacy":{
+            "collection_id":"old-c","collection_name":"Old crate",
+            "title":"Old book","author":"A","year":"1901",
+            "photo_count":1,"created_at":10,"delivery_transport":"cloud"
+        }}}""".trimIndent()
+
+        val parsed = collectionInventoryStoreFromJson(legacy)
+
+        assertTrue(parsed.valid)
+        assertEquals("cloud", parsed.summaries.getValue("legacy").deliveryTransport)
+        assertEquals("", parsed.summaries.getValue("legacy").cloudOwnerId)
+        assertEquals(2, parsed.sourceVersion)
+    }
+
+    @Test
+    fun cloudDeliveryOwnerUsesLegacyCreatorAndFailsClosedOnConflict() {
+        val ownerA = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        val manifest = JSONObject()
+            .put("delivery_transport", "cloud")
+            .put("creator", JSONObject()
+                .put("kind", Prefs.CREATOR_ACCOUNT)
+                .put("id", ownerA))
+
+        assertEquals(ownerA, cloudOwnerIdFromDeliveryManifest(manifest))
+        assertEquals(
+            ownerA,
+            cloudOwnerIdFromDeliveryManifest(
+                JSONObject(manifest.toString()).put(
+                    CLOUD_OWNER_MANIFEST_KEY,
+                    ownerA.uppercase(),
+                ),
+            ),
+        )
+        assertEquals(
+            "",
+            cloudOwnerIdFromDeliveryManifest(
+                JSONObject(manifest.toString()).put(
+                    CLOUD_OWNER_MANIFEST_KEY,
+                    "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+                ),
+            ),
+        )
+        assertEquals(
+            "",
+            cloudOwnerIdFromDeliveryManifest(
+                JSONObject(manifest.toString()).put("delivery_transport", "lan"),
+            ),
+        )
+    }
+
+    @Test
+    fun versionThreeOwnersAreUuidCheckedAndCanonicalized() {
+        val uppercaseOwner = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+        val encoded = collectionInventoryStoreToJson(
+            CollectionInventoryStore(
+                mapOf("entry-1" to summary("entry-1").copy(
+                    deliveryTransport = "cloud",
+                    cloudOwnerId = uppercaseOwner,
+                )),
+            ),
+        )
+
+        val row = JSONObject(encoded).getJSONObject("entries").getJSONObject("entry-1")
+        assertEquals(uppercaseOwner.lowercase(), row.getString("cloud_owner_id"))
+        assertEquals(
+            uppercaseOwner.lowercase(),
+            collectionInventoryStoreFromJson(encoded).summaries.getValue("entry-1").cloudOwnerId,
+        )
+        assertFalse(
+            collectionInventoryStoreFromJson(
+                encoded.replace(uppercaseOwner.lowercase(), "not-a-uuid"),
+            ).valid,
+        )
     }
 
     @Test
@@ -161,6 +273,11 @@ class CollectionInventoryTest {
         assertEquals("Current author", winning.summary.author)
         assertEquals("Current fungi name", winning.summary.collectionName)
         assertEquals(2, winning.summary.photoCount)
+        assertEquals("cloud", winning.summary.deliveryTransport)
+        assertEquals(
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            winning.summary.cloudOwnerId,
+        )
         assertNull(merged.last().current)
     }
 
@@ -175,6 +292,11 @@ class CollectionInventoryTest {
 
         val row = JSONObject(target.readText()).getJSONObject("entries").getJSONObject("sent-entry")
         assertEquals(2, row.getInt("photo_count"))
+        assertEquals("cloud", row.getString("delivery_transport"))
+        assertEquals(
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            row.getString("cloud_owner_id"),
+        )
         assertFalse(row.has("photos"))
         assertFalse(target.readText().contains(originalPhoto.absolutePath))
         assertEquals(

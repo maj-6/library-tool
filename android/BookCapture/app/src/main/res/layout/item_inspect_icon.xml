@@ -3,19 +3,19 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_margin="3dp"
-    android:background="@drawable/whl_panel"
+    android:background="@drawable/whl_inspect_panel"
     android:gravity="center_horizontal"
-    android:minHeight="122dp"
+    android:minHeight="116dp"
     android:orientation="vertical"
-    android:padding="7dp">
+    android:padding="6dp">
 
     <ImageView
         android:id="@+id/inspectThumb"
-        android:layout_width="54dp"
-        android:layout_height="74dp"
+        android:layout_width="50dp"
+        android:layout_height="68dp"
         android:background="@color/whl_face_sh"
-        android:contentDescription="@string/detail_photos"
         android:foreground="@drawable/whl_thumbnail_frame"
+        android:importantForAccessibility="no"
         android:scaleType="centerCrop"
         android:src="@drawable/ic_app_mark" />
 
@@ -26,7 +26,9 @@
         android:layout_marginTop="5dp"
         android:ellipsize="end"
         android:gravity="center"
-        android:maxLines="2"
+        android:includeFontPadding="false"
+        android:lineSpacingMultiplier="0.94"
+        android:lines="2"
         android:textColor="@color/whl_ink"
         android:textSize="11sp" />
 
@@ -37,7 +39,8 @@
         android:ellipsize="end"
         android:fontFamily="monospace"
         android:gravity="center"
-        android:maxLines="1"
+        android:includeFontPadding="false"
+        android:lines="1"
         android:textColor="@color/whl_ink_dim"
-        android:textSize="11sp" />
+        android:textSize="10sp" />
 </LinearLayout>

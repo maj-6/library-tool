@@ -3,6 +3,25 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.12 — 2026-08-06
+
+Android version code: `43`.
+
+### Additions
+
+- Long-press a book in **Inspect** to begin a selection, tap more books to add
+  them, then move the selection to another collection or delete it. Selection
+  survives screen rotation, and the capture currently in progress is protected.
+- **Content** is now a compact text row with a cover-color swatch, title,
+  author, and year instead of cover and action icons.
+
+### Other Changes
+
+- **Icons** gives every book the same footprint, while **Tiles** uses smaller
+  covers, tighter line spacing, and less vertical padding.
+- Moves and deletes are retained for retry through interrupted uploads, account
+  changes, collection merges, and failed local cleanup.
+
 ## 0.5.2-alpha.11 — 2026-08-03
 
 Android version code: `42`.

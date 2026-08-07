@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.11` (version code 42) is the Android
+Library Tool Capture `0.5.2-alpha.12` (version code 43) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -110,6 +110,15 @@ a box does not change the collection used by the next capture. Inspect retains
 only a small bibliographic summary when old delivered scan media is cleared, so
 the list remains useful without defeating the app's storage limit; cleared
 photos and their local detail view are not retained.
+
+Long-pressing a book starts a multi-selection. Selected books can be moved to
+another collection or removed from their current collection; any local page
+photos are also deleted after removal, while an already imported Library Tool
+record remains. Moves change current organization without rewriting the frozen
+capture-time collection provenance. Cloud-backed membership is owner-scoped;
+after migration `026_capture_collection_state.sql` is applied, offline changes
+resume under the original authenticated account when it is online. Local-only
+books remain editable offline.
 
 ## Voice commands and notes
 

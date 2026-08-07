@@ -226,6 +226,27 @@ internal fun findCollectionByTagId(
     return null
 }
 
+/** Follow only explicit merge aliases to a live current collection id. */
+internal fun resolvedLiveCollectionId(
+    collectionId: String,
+    collections: List<BookCollection>,
+): String? {
+    if (collectionId.isEmpty()) return null
+    val byId = collections.associateBy { it.id }
+    val visited = mutableSetOf<String>()
+    var cursor = collectionId
+    while (visited.add(cursor)) {
+        val row = byId[cursor] ?: return null
+        val survivor = row.mergedInto
+        if (survivor != null) {
+            cursor = survivor
+        } else {
+            return row.id.takeIf { !row.deleted }
+        }
+    }
+    return null
+}
+
 /**
  * Every collection id whose captures belong to [liveId]: the live id itself plus
  * every merge loser that resolves to it through the authoritative chain.

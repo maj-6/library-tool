@@ -8,6 +8,35 @@ import java.nio.file.StandardCopyOption
 import java.util.UUID
 
 /**
+ * Resolve the account that actually received a cloud delivery.
+ *
+ * New manifests carry an explicit [CLOUD_OWNER_MANIFEST_KEY] written only
+ * after the upload owner has matched the capture's frozen account creator.
+ * Older cloud manifests predate that stamp, so their account creator is the
+ * only trustworthy local owner marker. An explicit mismatch or malformed
+ * value fails closed instead of adopting whichever account is signed in now.
+ */
+internal fun cloudOwnerIdFromDeliveryManifest(manifest: JSONObject?): String {
+    if (manifest?.opt("delivery_transport") != "cloud") return ""
+    val creator = manifest.optJSONObject("creator") ?: return ""
+    if (creator.opt("kind") != Prefs.CREATOR_ACCOUNT) return ""
+    val creatorId = (creator.opt("id") as? String)
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf(SAFE_CAPTURE_SYNC_ID::matches)
+        ?: return ""
+    if (!manifest.has(CLOUD_OWNER_MANIFEST_KEY)) return creatorId
+    val stampedOwner = (manifest.opt(CLOUD_OWNER_MANIFEST_KEY) as? String)
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf(SAFE_CAPTURE_SYNC_ID::matches)
+        ?: return ""
+    return creatorId.takeIf { it == stampedOwner }.orEmpty()
+}
+
+internal const val CLOUD_OWNER_MANIFEST_KEY = "cloud_owner_id"
+
+/**
  * The on-disk life of an entry, read side. Folders move through:
  *
  *   filesDir/queue/<id>/   photo_N.jpg              open (no manifest yet)
@@ -117,6 +146,8 @@ object Entries {
         val meta: JSONObject?,          // null until extraction lands
         val cloudStatus: String,        // "", "pending", "imported", "void"
         val deliveryTransport: String = "", // "cloud" / "lan" for sent captures
+        /** Verified cloud account at delivery; empty for LAN/legacy-unknown. */
+        val cloudOwnerId: String = "",
         val processing: ProcessingState,
         val processingRecorded: Boolean,
         val provenance: CaptureProvenance? = null,  // null for pre-collections captures
@@ -460,6 +491,7 @@ object Entries {
                 lastError = "",
                 updatedAt = 0L,
             )
+        val deliveryTransport = manifest?.optString("delivery_transport") ?: ""
         return Entry(
             id = dir.name,
             dir = dir,
@@ -471,7 +503,8 @@ object Entries {
             photoCount = photos.size,
             meta = meta,
             cloudStatus = manifest?.optString("cloud_status") ?: "",
-            deliveryTransport = manifest?.optString("delivery_transport") ?: "",
+            deliveryTransport = deliveryTransport,
+            cloudOwnerId = cloudOwnerIdFromDeliveryManifest(manifest),
             processing = processing,
             processingRecorded = recorded,
             // The sidecar, not the manifest: it exists from the first photo, so

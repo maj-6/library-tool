@@ -4,10 +4,13 @@ import android.app.Activity
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
 import android.text.method.LinkMovementMethod
 import android.view.LayoutInflater
+import android.view.Menu
+import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
@@ -23,6 +26,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.view.ActionMode
 import androidx.core.text.HtmlCompat
 import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
@@ -48,6 +52,89 @@ import java.io.File
 import java.util.UUID
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.roundToInt
+
+internal const val INSPECT_MEMBERSHIP_ISOLATION_MAX_ATTEMPTS = 32
+
+internal data class InspectMembershipIsolationResult(
+    val acceptedIds: Set<String>,
+    val failedIds: Set<String>,
+)
+
+/**
+ * Isolate a bad capture in an otherwise atomic membership batch.
+ *
+ * The server deliberately rejects the complete request when any id is missing
+ * or belongs to another account. Successful halves are committed immediately;
+ * failed singleton (or budget-exhausted) halves stay in the durable outbox for
+ * a later retry. The attempt budget bounds a broken or universally stale batch.
+ */
+internal fun isolateInspectMembershipMutation(
+    captureIds: List<String>,
+    maximumAttempts: Int = INSPECT_MEMBERSHIP_ISOLATION_MAX_ATTEMPTS,
+    shouldBisect: (Exception) -> Boolean,
+    mutate: (List<String>) -> Set<String>,
+    onAccepted: (Set<String>) -> Unit,
+): InspectMembershipIsolationResult {
+    require(captureIds.isNotEmpty()) { "capture ids are required" }
+    require(captureIds.size <= CAPTURE_COLLECTION_MUTATION_MAX_IDS) {
+        "capture batch is too large"
+    }
+    require(captureIds.all(String::isNotBlank) && captureIds.distinct().size == captureIds.size) {
+        "capture ids must be non-blank and unique"
+    }
+    require(maximumAttempts in 1..INSPECT_MEMBERSHIP_ISOLATION_MAX_ATTEMPTS) {
+        "invalid membership isolation attempt budget"
+    }
+
+    val accepted = linkedSetOf<String>()
+    val failed = linkedSetOf<String>()
+    var attempts = 0
+
+    fun attempt(batch: List<String>) {
+        if (attempts >= maximumAttempts) {
+            failed += batch
+            return
+        }
+        attempts += 1
+        val response = try {
+            mutate(batch)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (!shouldBisect(e)) {
+                failed += batch
+                return
+            }
+            null
+        }
+
+        if (response == batch.toSet()) {
+            // Cache/outbox failures are not server batch failures. Propagate them
+            // so an accepted mutation remains safely retryable and idempotent.
+            onAccepted(response)
+            accepted += batch
+            return
+        }
+        if (batch.size == 1) {
+            failed += batch.single()
+            return
+        }
+        val midpoint = batch.size / 2
+        attempt(batch.subList(0, midpoint))
+        attempt(batch.subList(midpoint, batch.size))
+    }
+
+    attempt(captureIds)
+    return InspectMembershipIsolationResult(accepted, failed)
+}
+
+internal fun shouldBisectInspectMembershipFailure(error: Exception): Boolean = when (error) {
+    is SupabaseClient.InvalidResponse,
+    is IllegalArgumentException -> true
+    is SupabaseClient.HttpException ->
+        error.code in 400..499 && error.code !in setOf(401, 408, 429)
+    else -> false
+}
 
 /**
  * The landing screen. Launching the app opens HERE, not the camera: a list of
@@ -77,13 +164,17 @@ class HomeActivity : AppCompatActivity() {
         val item: CollectionInventoryItem,
         val titleLabel: String,
         val statusLabel: String?,
+        val cloudBacked: Boolean = false,
+        /** Trustworthy owner evidence, never inferred from a later session. */
+        val cloudOwnerId: String = "",
     )
 
     private data class ThumbnailRequest(
-        val image: ImageView,
         val entry: Entries.Entry,
         val maxWidth: Int,
         val maxHeight: Int,
+        val image: ImageView? = null,
+        val swatch: View? = null,
     )
 
     private data class InspectSnapshot(
@@ -98,6 +189,12 @@ class HomeActivity : AppCompatActivity() {
          * of a listing that failed or never ran.
          */
         val cloudListedCollections: Set<String>,
+    )
+
+    private data class InspectMutationOutcome(
+        val appliedCount: Int,
+        val localCleanupFailures: Int,
+        val cloudPending: Boolean,
     )
 
     private data class CollectionListSnapshot(
@@ -133,7 +230,8 @@ class HomeActivity : AppCompatActivity() {
     private var inspectJob: Job? = null
     /** Owner-scoped boxes already listed from the cloud this freshness
      * generation; failures are re-armed for the next visit. */
-    private val remoteBoxFetches = RemoteCollectionFetchTracker()
+    private val remoteBoxFetches: RemoteCollectionFetchTracker
+        get() = REMOTE_BOX_FETCHES
     private var workerRefreshJob: Job? = null
     private var pendingWorkerContentRefresh = false
     private var pendingCollectionRefresh = false
@@ -143,6 +241,13 @@ class HomeActivity : AppCompatActivity() {
     private var inspectedCollectionId: String? = null
     private var inspectVisibleBookLimit = INSPECT_BOOK_PAGE_SIZE
     private var inspectViewMode = InspectViewMode.TILES
+    private var inspectSelection = InspectSelectionState()
+    private val inspectBookViews = linkedMapOf<String, View>()
+    private var inspectRenderedItems = emptyMap<String, InspectBookSnapshot>()
+    private var inspectRenderedCollections = emptyList<BookCollection>()
+    private var inspectRenderedCollectionPaths = emptyMap<String, String>()
+    private var inspectActionMode: ActionMode? = null
+    private var inspectMutationInFlight = false
     private var reportedTagConflict = ""
     private val expandedScanGroups = linkedSetOf<String>()
     private var scanGroupsInitialized = false
@@ -213,6 +318,14 @@ class HomeActivity : AppCompatActivity() {
             ?.let(CaptureSyncPhase::fromStoredValue)
         savedInstanceState?.getStringArrayList(STATE_EXPANDED_SCAN_GROUPS)
             ?.let(expandedScanGroups::addAll)
+        savedInstanceState?.getStringArrayList(STATE_INSPECT_SELECTED_IDS)?.let { restored ->
+            inspectSelection = InspectSelectionState(
+                restored.asSequence()
+                    .filter { it.isNotBlank() }
+                    .take(CAPTURE_COLLECTION_MUTATION_MAX_IDS)
+                    .toCollection(linkedSetOf()),
+            )
+        }
 
         binding.tabScans.setOnClickListener { showTab(HomeTab.SCANS) }
         binding.tabCollections.setOnClickListener { showTab(HomeTab.COLLECTIONS) }
@@ -288,6 +401,10 @@ class HomeActivity : AppCompatActivity() {
         outState.putBoolean(STATE_TAB_COLLECTIONS, activeTab == HomeTab.COLLECTIONS)
         outState.putString(STATE_INSPECTED_COLLECTION, inspectedCollectionId)
         outState.putString(STATE_INSPECT_VIEW_MODE, inspectViewMode.wireValue)
+        outState.putStringArrayList(
+            STATE_INSPECT_SELECTED_IDS,
+            ArrayList(inspectSelection.selectedIds),
+        )
         outState.putBoolean(STATE_SCAN_GROUPS_INITIALIZED, scanGroupsInitialized)
         outState.putString(STATE_SYNC_FEEDBACK_REQUEST, syncFeedbackRequestId)
         outState.putString(STATE_SYNC_FEEDBACK_PHASE, syncFeedbackPhase?.storedValue)
@@ -306,6 +423,11 @@ class HomeActivity : AppCompatActivity() {
         // new upload batch is created only by the Sync captures button.
         UploadWorker.kick(this)
         ProcessWorker.enqueue(this)
+        // A delete tombstone is committed before its media cleanup begins. If
+        // the prior Activity/process stopped in that gap, finish it now.
+        lifecycleScope.launch(Dispatchers.IO) {
+            retryPendingInspectBookCleanup(this@HomeActivity)
+        }
         // alpha.5 could cancel the tail of a bulk reprocess chain while
         // leaving its per-capture hold files behind. Rebuild that chain off
         // the UI thread so an app update can release an already-stalled sync.
@@ -484,6 +606,9 @@ class HomeActivity : AppCompatActivity() {
     // --- tabs ----------------------------------------------------------------
 
     private fun showTab(tab: HomeTab) {
+        if (tab != HomeTab.INSPECT && activeTab == HomeTab.INSPECT) {
+            clearInspectSelection()
+        }
         activeTab = tab
         if (tab != HomeTab.SCANS) {
             cancelScanListLoading()
@@ -1152,28 +1277,6 @@ class HomeActivity : AppCompatActivity() {
 
     // --- inspect -------------------------------------------------------------
 
-    /** Follow only explicit merge aliases. A normal deleted collection remains
-     * historical and does not silently become a different physical box. */
-    private fun resolvedLiveCollectionId(
-        collectionId: String,
-        records: List<BookCollection>,
-    ): String? {
-        if (collectionId.isEmpty()) return null
-        val byId = records.associateBy { it.id }
-        val visited = mutableSetOf<String>()
-        var cursor = collectionId
-        while (visited.add(cursor)) {
-            val row = byId[cursor] ?: return null
-            val merged = row.mergedInto
-            if (merged != null) {
-                cursor = merged
-                continue
-            }
-            return row.id.takeIf { !row.deleted }
-        }
-        return null
-    }
-
     private fun refreshInspect() {
         resetThumbnailLoading()
         cancelInspectLoading()
@@ -1186,21 +1289,60 @@ class HomeActivity : AppCompatActivity() {
                 val collections = records
                     .filter { !it.deleted && it.mergedInto == null }
                     .sortedBy { (paths[it.id] ?: it.name).lowercase() }
-                // Local rows first so mergeCollectionBookItems keeps them over
-                // their cloud twins, then the cached cloud listing so a box lists
-                // books this handset never had (or has since pruned).
+                val cachedOwner = Prefs.userId(this@HomeActivity)
+                val cachedBoxes = RemoteCollectionBooks
+                    .read(this@HomeActivity, cachedOwner)
+                    .byCollection
+                loadContext.ensureActive()
+                // The cache is keyed by the box that was queried, but a later
+                // move deliberately leaves the capture's immutable provenance
+                // behind. Resolve each capture once by its newest membership
+                // revision and group by the effective collection inside the row,
+                // never by that stale outer cache key.
+                val remoteBooksById = linkedMapOf<String, RemoteCollectionBook>()
+                cachedBoxes.values.flatten().forEach { book ->
+                    loadContext.ensureActive()
+                    val existing = remoteBooksById[book.captureId]
+                    val replace = existing == null ||
+                        book.membershipRevision > existing.membershipRevision ||
+                        (book.membershipRevision == existing.membershipRevision &&
+                            book.removed && !existing.removed)
+                    if (replace) remoteBooksById[book.captureId] = book
+                }
+                val storedMemberships = InspectBookMemberships.read(this@HomeActivity)
+                val localMemberships = storedMemberships.memberships.takeIf {
+                    storedMemberships.valid
+                }.orEmpty()
+
+                fun effectiveMembership(
+                    captureId: String,
+                    originalCollectionId: String,
+                ): Pair<String, Boolean> {
+                    val local = localMemberships[captureId]
+                    if (local != null) return local.collectionId to local.removed
+                    val remote = remoteBooksById[captureId]
+                    if (remote != null) return remote.collectionId to remote.removed
+                    return originalCollectionId to false
+                }
+
+                // Local rows are routed through mutable membership before their
+                // frozen scan provenance. They are still added first so the merge
+                // below keeps live photos/status over a cloud summary twin.
                 val localRows = CollectionInventory.items(this@HomeActivity)
                     .also { loadContext.ensureActive() }
                     .mapNotNull { item ->
                         loadContext.ensureActive()
-                        val collectionId = resolvedLiveCollectionId(
+                        val (effectiveId, removed) = effectiveMembership(
+                            item.summary.entryId,
                             item.summary.collectionId,
+                        )
+                        if (removed) return@mapNotNull null
+                        val collectionId = resolvedLiveCollectionId(
+                            effectiveId,
                             records,
                         ) ?: return@mapNotNull null
                         collectionId to item
                     }
-                val cachedBoxes = RemoteCollectionBooks.read(this@HomeActivity).byCollection
-                loadContext.ensureActive()
                 // "We asked the cloud about THIS box" is only true for a key that
                 // is still live. A key that has since merged away was a query for
                 // the LOSER's captures; the survivor has its own that were never
@@ -1209,13 +1351,18 @@ class HomeActivity : AppCompatActivity() {
                 val cloudListed = cachedBoxes.keys.filterTo(mutableSetOf()) {
                     resolvedLiveCollectionId(it, records) == it
                 }
-                val remoteRows = cachedBoxes.flatMap { (cachedCollectionId, books) ->
+                val remoteRows = remoteBooksById.values.mapNotNull { book ->
                     loadContext.ensureActive()
+                    val (effectiveId, removed) = effectiveMembership(
+                        book.captureId,
+                        book.collectionId,
+                    )
+                    if (removed) return@mapNotNull null
                     val collectionId = resolvedLiveCollectionId(
-                        cachedCollectionId,
+                        effectiveId,
                         records,
-                    ) ?: return@flatMap emptyList()
-                    books.map { collectionId to it.toInventoryItem() }
+                    ) ?: return@mapNotNull null
+                    collectionId to book.toInventoryItem()
                 }
                 val itemsByCollection = (localRows + remoteRows)
                     .groupBy({ it.first }, { it.second })
@@ -1229,6 +1376,15 @@ class HomeActivity : AppCompatActivity() {
                                 },
                                 statusLabel = item.current?.let {
                                     Entries.statusLabel(this@HomeActivity, it)
+                                },
+                                cloudBacked = item.summary.entryId in remoteBooksById ||
+                                    item.summary.deliveryTransport == "cloud" ||
+                                    item.current?.deliveryTransport == "cloud",
+                                cloudOwnerId = when {
+                                    item.summary.entryId in remoteBooksById -> cachedOwner
+                                    item.current?.cloudOwnerId?.isNotEmpty() == true ->
+                                        item.current.cloudOwnerId
+                                    else -> item.summary.cloudOwnerId
                                 },
                             )
                         }.sortedWith(
@@ -1282,8 +1438,13 @@ class HomeActivity : AppCompatActivity() {
         )
         binding.inspectCollectionChips.removeAllViews()
         binding.inspectBooks.removeAllViews()
+        inspectBookViews.clear()
+        inspectRenderedCollections = collections
+        inspectRenderedCollectionPaths = paths
 
         if (collections.isEmpty()) {
+            clearInspectSelection()
+            inspectRenderedItems = emptyMap()
             inspectedCollectionId = null
             inspectVisibleBookLimit = INSPECT_BOOK_PAGE_SIZE
             binding.inspectSelectionHeader.visibility = View.GONE
@@ -1342,6 +1503,7 @@ class HomeActivity : AppCompatActivity() {
                 getColor(if (isSelected) R.color.whl_row_checked else R.color.whl_face_hi),
             )
             chip.setOnClickListener {
+                clearInspectSelection()
                 inspectedCollectionId = collection.id
                 refreshInspect()
             }
@@ -1362,6 +1524,22 @@ class HomeActivity : AppCompatActivity() {
 
         val selectedName = paths[selected.id] ?: selected.name
         val selectedItems = snapshot.itemsByCollection[selected.id].orEmpty()
+        inspectRenderedItems = selectedItems.associateBy { it.item.summary.entryId }
+        inspectSelection = inspectSelection.reconcile(inspectRenderedItems.keys)
+        val furthestSelected = selectedItems.indexOfLast {
+            inspectSelection.isSelected(it.item.summary.entryId)
+        }
+        if (furthestSelected >= inspectVisibleBookLimit) {
+            inspectVisibleBookLimit = minOf(
+                selectedItems.size,
+                ((furthestSelected / INSPECT_BOOK_PAGE_SIZE) + 1) * INSPECT_BOOK_PAGE_SIZE,
+            )
+        }
+        if (!inspectSelection.active) {
+            inspectActionMode?.finish()
+        } else {
+            ensureInspectActionMode()
+        }
         binding.inspectSelectionHeader.visibility = View.VISIBLE
         binding.inspectCollectionName.text = selectedName
         val selectedBookCount = resources.getQuantityString(
@@ -1382,6 +1560,7 @@ class HomeActivity : AppCompatActivity() {
         )
 
         if (selectedItems.isEmpty()) {
+            clearInspectSelection()
             binding.inspectEmpty.visibility = View.VISIBLE
             // Three distinct truths, and only the last one may say the cloud is
             // empty: signed out (cannot ask), asked-but-no-answer (offline or the
@@ -1443,20 +1622,34 @@ class HomeActivity : AppCompatActivity() {
             }
             chunk.forEach { item ->
                 val view = inflater.inflate(inspectViewMode.layout, row, false)
+                val inflatedParams = view.layoutParams
+                val requestedHeight = inflatedParams?.height
+                    ?: ViewGroup.LayoutParams.WRAP_CONTENT
                 view.layoutParams = LinearLayout.LayoutParams(
                     0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    requestedHeight,
                     1f,
-                )
+                ).apply {
+                    (inflatedParams as? ViewGroup.MarginLayoutParams)?.let { margins ->
+                        setMargins(
+                            margins.leftMargin,
+                            margins.topMargin,
+                            margins.rightMargin,
+                            margins.bottomMargin,
+                        )
+                    }
+                }
                 bindInspectBook(view, item, thumbnails)
                 RemoteUiCatalog.apply(view)
                 row.addView(view)
+                inspectBookViews[item.item.summary.entryId] = view
             }
             repeat(inspectViewMode.columns - chunk.size) {
                 row.addView(Space(this), LinearLayout.LayoutParams(0, 1, 1f))
             }
             binding.inspectBooks.addView(row)
         }
+        updateInspectSelectionUi()
         startThumbnailLoading(thumbnails, HomeTab.INSPECT)
     }
 
@@ -1467,8 +1660,11 @@ class HomeActivity : AppCompatActivity() {
     ) {
         val item = snapshot.item
         val summary = item.summary
-        view.findViewById<TextView>(R.id.inspectTitle).text =
-            snapshot.titleLabel
+        view.findViewById<TextView>(R.id.inspectTitle).text = snapshot.titleLabel
+        view.findViewById<TextView>(R.id.inspectAuthor)?.text =
+            summary.author.ifEmpty { getString(R.string.inspect_content_missing) }
+        view.findViewById<TextView>(R.id.inspectYear)?.text =
+            summary.year.ifEmpty { getString(R.string.inspect_content_missing) }
         val details = mutableListOf<String>()
         summary.author.takeIf { it.isNotEmpty() }?.let(details::add)
         summary.year.takeIf { it.isNotEmpty() }?.let(details::add)
@@ -1486,16 +1682,20 @@ class HomeActivity : AppCompatActivity() {
                 else -> getString(R.string.inspect_book_archived)
             }
         }
-        view.findViewById<TextView>(R.id.inspectSubtitle).text =
+        view.findViewById<TextView>(R.id.inspectSubtitle)?.text =
             details.joinToString(" \u00b7 ")
         item.current?.let { entry ->
             val image = view.findViewById<ImageView>(R.id.inspectThumb)
-            thumbnails += ThumbnailRequest(
-                image = image,
-                entry = entry,
-                maxWidth = 384,
-                maxHeight = 512,
-            )
+            val swatch = view.findViewById<View>(R.id.inspectCoverSwatch)
+            if (image != null || swatch != null) {
+                thumbnails += ThumbnailRequest(
+                    entry = entry,
+                    maxWidth = if (swatch != null) 48 else 384,
+                    maxHeight = if (swatch != null) 64 else 512,
+                    image = image,
+                    swatch = swatch,
+                )
+            }
         }
         val open = {
             if (item.current != null) openEntryDetails(summary.entryId)
@@ -1506,10 +1706,459 @@ class HomeActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG,
             ).show()
         }
-        view.setOnClickListener { open() }
-        view.findViewById<View>(R.id.inspectOpen)?.apply {
-            visibility = if (item.current == null) View.INVISIBLE else View.VISIBLE
-            setOnClickListener { open() }
+        val entryId = summary.entryId
+        view.contentDescription = listOf(
+            snapshot.titleLabel,
+            details.joinToString(" \u00b7 "),
+        ).filter(String::isNotEmpty).joinToString(", ")
+        view.setOnClickListener {
+            if (inspectActionMode != null) toggleInspectSelection(entryId) else open()
+        }
+        view.setOnLongClickListener {
+            selectInspectBook(entryId)
+            true
+        }
+        ViewCompat.replaceAccessibilityAction(
+            view,
+            AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_LONG_CLICK,
+            getString(R.string.inspect_select_book),
+        ) { _, _ ->
+            selectInspectBook(entryId)
+            true
+        }
+    }
+
+    private val inspectActionModeCallback = object : ActionMode.Callback {
+        override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+            menu.add(Menu.NONE, MENU_INSPECT_MOVE, 0, R.string.inspect_selection_move)
+                .setIcon(R.drawable.ic_collections)
+                .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            menu.add(Menu.NONE, MENU_INSPECT_DELETE, 1, R.string.inspect_selection_delete)
+                .setIcon(R.drawable.ic_delete)
+                .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            return true
+        }
+
+        override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean {
+            menu.findItem(MENU_INSPECT_MOVE)?.isEnabled = !inspectMutationInFlight
+            menu.findItem(MENU_INSPECT_DELETE)?.isEnabled = !inspectMutationInFlight
+            return true
+        }
+
+        override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean = when (item.itemId) {
+            MENU_INSPECT_MOVE -> {
+                showInspectMoveDialog()
+                true
+            }
+            MENU_INSPECT_DELETE -> {
+                showInspectDeleteConfirmation()
+                true
+            }
+            else -> false
+        }
+
+        override fun onDestroyActionMode(mode: ActionMode) {
+            if (inspectActionMode === mode) inspectActionMode = null
+            inspectSelection = inspectSelection.clear()
+            updateInspectSelectionUi()
+        }
+    }
+
+    private fun ensureInspectActionMode() {
+        if (!inspectSelection.active || inspectActionMode != null || isFinishing) return
+        inspectActionMode = startSupportActionMode(inspectActionModeCallback)
+        updateInspectSelectionUi()
+    }
+
+    private fun selectInspectBook(entryId: String) {
+        if (inspectMutationInFlight) return
+        if (entryId !in inspectRenderedItems) return
+        if (!inspectSelection.isSelected(entryId) &&
+            inspectSelection.size >= CAPTURE_COLLECTION_MUTATION_MAX_IDS
+        ) {
+            Toast.makeText(this, R.string.inspect_selection_limit, Toast.LENGTH_LONG).show()
+            return
+        }
+        val updated = inspectSelection.addFromLongPress(entryId)
+        val changed = updated != inspectSelection
+        inspectSelection = updated
+        ensureInspectActionMode()
+        updateInspectSelectionUi()
+        if (changed) {
+            binding.inspectBooks.announceForAccessibility(
+                resources.getQuantityString(
+                    R.plurals.inspect_selection_count,
+                    inspectSelection.size,
+                    inspectSelection.size,
+                ),
+            )
+        }
+    }
+
+    private fun toggleInspectSelection(entryId: String) {
+        if (inspectMutationInFlight) return
+        if (entryId !in inspectRenderedItems) return
+        if (!inspectSelection.isSelected(entryId) &&
+            inspectSelection.size >= CAPTURE_COLLECTION_MUTATION_MAX_IDS
+        ) {
+            Toast.makeText(this, R.string.inspect_selection_limit, Toast.LENGTH_LONG).show()
+            return
+        }
+        inspectSelection = inspectSelection.toggleFromTap(entryId)
+        if (!inspectSelection.active) {
+            inspectActionMode?.finish()
+        } else {
+            ensureInspectActionMode()
+            updateInspectSelectionUi()
+        }
+    }
+
+    private fun clearInspectSelection() {
+        val mode = inspectActionMode
+        if (mode != null) {
+            mode.finish()
+        } else if (inspectSelection.active) {
+            inspectSelection = inspectSelection.clear()
+            updateInspectSelectionUi()
+        }
+    }
+
+    private fun updateInspectSelectionUi() {
+        inspectBookViews.forEach { (entryId, view) ->
+            val selected = inspectSelection.isSelected(entryId)
+            view.isActivated = selected
+            ViewCompat.setStateDescription(
+                view,
+                getString(R.string.selection_selected_state).takeIf { selected },
+            )
+        }
+        inspectActionMode?.apply {
+            title = resources.getQuantityString(
+                R.plurals.inspect_selection_count,
+                inspectSelection.size,
+                inspectSelection.size,
+            )
+            invalidate()
+        }
+    }
+
+    private fun showInspectMoveDialog() {
+        if (inspectMutationInFlight || !inspectSelection.active) return
+        val destinations = inspectRenderedCollections.filter { it.id != inspectedCollectionId }
+        if (destinations.isEmpty()) {
+            Toast.makeText(this, R.string.inspect_selection_no_destination, Toast.LENGTH_LONG).show()
+            return
+        }
+        val labels = destinations.map {
+            inspectRenderedCollectionPaths[it.id] ?: it.name
+        }.toTypedArray()
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.inspect_selection_move_title)
+            .setItems(labels) { _, index ->
+                mutateInspectSelection(destinations[index], removed = false)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        dialog.show()
+        RemoteUiCatalog.apply(dialog)
+    }
+
+    private fun showInspectDeleteConfirmation() {
+        if (inspectMutationInFlight || !inspectSelection.active) return
+        val count = inspectSelection.size
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.inspect_selection_delete_title)
+            .setMessage(
+                resources.getQuantityString(
+                    R.plurals.inspect_selection_delete_message,
+                    count,
+                    count,
+                ),
+            )
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.inspect_selection_delete) { _, _ ->
+                mutateInspectSelection(destination = null, removed = true)
+            }
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(getColor(R.color.whl_red))
+        }
+        dialog.show()
+        RemoteUiCatalog.apply(dialog)
+    }
+
+    private fun mutateInspectSelection(
+        destination: BookCollection?,
+        removed: Boolean,
+    ) {
+        if (inspectMutationInFlight || !inspectSelection.active) return
+        val selected = inspectSelection.selectedIds.mapNotNull(inspectRenderedItems::get)
+        if (selected.isEmpty()) return
+        val activeCaptureId = Prefs.currentEntryId(this)
+        if (selected.any { it.item.summary.entryId == activeCaptureId }) {
+            Toast.makeText(this, R.string.inspect_selection_active_capture, Toast.LENGTH_LONG).show()
+            return
+        }
+        val targetCollectionId = destination?.id ?: inspectedCollectionId.orEmpty()
+        if (targetCollectionId.isEmpty()) return
+
+        inspectMutationInFlight = true
+        inspectActionMode?.invalidate()
+        // No listing that started before this action may acknowledge or cache an
+        // older membership after the mutation lands.
+        remoteBoxFetches.rearm(Prefs.userId(this))
+        lifecycleScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                INSPECT_MEMBERSHIP_MUTATION_MUTEX.withLock {
+                    try {
+                        val liveTargetCollectionId = resolvedLiveCollectionId(
+                            targetCollectionId,
+                            Collections.allRecords(this@HomeActivity),
+                        ) ?: throw IllegalStateException("destination collection is no longer live")
+                        val selectedIds = selected.map { it.item.summary.entryId }
+                        val existingMemberships = InspectBookMemberships
+                            .read(this@HomeActivity)
+                        check(existingMemberships.valid) {
+                            "membership intents could not be read"
+                        }
+                        val activeCloudSyncTargets = Prefs
+                            .activeCaptureSyncRecord(this@HomeActivity)
+                            ?.takeIf { record ->
+                                if (record.resolvedTransport.isNotEmpty()) {
+                                    record.resolvedTransport == "cloud"
+                                } else {
+                                    record.transportMode != "lan"
+                                }
+                            }
+                            ?.targetIds
+                            .orEmpty()
+
+                        val cloudCandidates = mutableListOf<InspectCloudMutationCandidate>()
+                        selected.forEach { snapshot ->
+                            val id = snapshot.item.summary.entryId
+                            EntryOperationLocks.withLock(id) {
+                                val storedEntry = Entries.findIncludingArchive(
+                                    this@HomeActivity,
+                                    id,
+                                )
+                                val currentEntry = snapshot.item.current
+                                val cloudBacked = snapshot.cloudBacked || snapshot.item.remote ||
+                                    currentEntry?.let {
+                                        isCloudMetadataEntry(this@HomeActivity, it)
+                                    } == true || storedEntry?.let {
+                                        isCloudMetadataEntry(this@HomeActivity, it)
+                                    } == true
+                                val transports = listOf(
+                                    snapshot.item.summary.deliveryTransport,
+                                    currentEntry?.deliveryTransport.orEmpty(),
+                                    storedEntry?.deliveryTransport.orEmpty(),
+                                ).filter(String::isNotEmpty).toSet()
+                                val localEntries = listOfNotNull(currentEntry, storedEntry)
+                                    .distinctBy { it.dir.absolutePath }
+                                val knownLan = "lan" in transports && "cloud" !in transports
+                                val couldBeInterruptedCloudInsert = id in activeCloudSyncTargets
+                                cloudCandidates += InspectCloudMutationCandidate(
+                                    captureId = id,
+                                    cloudBacked = cloudBacked,
+                                    ownerProbeEligible = !knownLan && (
+                                        cloudBacked ||
+                                            localEntries.isEmpty() ||
+                                            localEntries.any { it.uploaded } ||
+                                            couldBeInterruptedCloudInsert
+                                        ),
+                                    ownerEvidence = listOf(
+                                        snapshot.cloudOwnerId,
+                                        snapshot.item.summary.cloudOwnerId,
+                                        currentEntry?.cloudOwnerId.orEmpty(),
+                                        storedEntry?.cloudOwnerId.orEmpty(),
+                                        existingMemberships.memberships[id]
+                                            ?.cloudOwnerId
+                                            .orEmpty(),
+                                    ),
+                                )
+                            }
+                        }
+
+                        val cloudPlan = planInspectCloudMutation(cloudCandidates)
+                        // Validate every durable owner before making the local
+                        // action visible. The complete move/tombstone then lands
+                        // in one write, so failures never leave a half-delete.
+                        check(InspectBookMemberships.setMembership(
+                            this@HomeActivity,
+                            selectedIds,
+                            liveTargetCollectionId,
+                            removed,
+                            cleanupPending = removed,
+                        )) { "membership intent could not be saved" }
+                        var cleanupFailures = 0
+                        if (removed) {
+                            selectedIds.forEach { captureId ->
+                                when (Entries.deleteLocalSafely(
+                                    this@HomeActivity,
+                                    captureId,
+                                    allowUploaded = true,
+                                )) {
+                                    Entries.DeleteResult.DELETED,
+                                    Entries.DeleteResult.MISSING ->
+                                        InspectBookMemberships.markCleanupComplete(
+                                            this@HomeActivity,
+                                            setOf(captureId),
+                                        )
+                                    Entries.DeleteResult.ACTIVE_CAPTURE,
+                                    Entries.DeleteResult.ALREADY_UPLOADED,
+                                    Entries.DeleteResult.DELETE_FAILED -> cleanupFailures += 1
+                                }
+                            }
+                        }
+                        var cloudPersistencePending = false
+                        cloudPlan.captureIdsByOwner.forEach { (owner, captureIds) ->
+                            if (!InspectBookMemberships.markCloud(
+                                    this@HomeActivity,
+                                    captureIds,
+                                    owner,
+                                )
+                            ) {
+                                cloudPersistencePending = true
+                            }
+                            remoteBoxFetches.rearm(owner)
+                        }
+
+                        val mutationOwner = Prefs.userId(this@HomeActivity)
+                            .trim()
+                            .lowercase()
+                        val canMutateCloud = Prefs.configured(this@HomeActivity) &&
+                            Auth.signedIn(this@HomeActivity) &&
+                            SAFE_CAPTURE_SYNC_ID.matches(mutationOwner)
+                        val client = if (canMutateCloud) {
+                            SupabaseClient(this@HomeActivity, mutationOwner)
+                        } else {
+                            null
+                        }
+                        val resolvedCloudIds = cloudPlan.captureIdsByOwner[mutationOwner]
+                            .orEmpty()
+                            .toMutableSet()
+                        val unresolvedCloudIds = cloudPlan.unresolvedCloudCaptureIds
+                            .toMutableSet()
+
+                        // Legacy inventory rows and an upload interrupted after
+                        // remote insert have no durable owner stamp. An RLS-scoped
+                        // existence lookup may prove the current owner; absence
+                        // never licenses adopting that account.
+                        if (client != null && cloudPlan.probeCaptureIds.isNotEmpty()) {
+                            try {
+                                val discovered = client.captureImportStates(
+                                    cloudPlan.probeCaptureIds.toList(),
+                                ).keys
+                                if (discovered.isNotEmpty()) {
+                                    if (!InspectBookMemberships.markCloud(
+                                            this@HomeActivity,
+                                            discovered,
+                                            mutationOwner,
+                                        )
+                                    ) {
+                                        cloudPersistencePending = true
+                                    }
+                                    resolvedCloudIds += discovered
+                                    unresolvedCloudIds -= discovered
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                // The staged intent remains durable. A later box
+                                // listing or UploadWorker will prove its owner.
+                            }
+                        }
+
+                        var cloudPending = cloudPersistencePending ||
+                            unresolvedCloudIds.isNotEmpty() ||
+                            cloudPlan.captureIdsByOwner.any { (owner) ->
+                                owner != mutationOwner || !canMutateCloud
+                            }
+                        if (resolvedCloudIds.isNotEmpty()) {
+                            if (client == null) {
+                                cloudPending = true
+                            } else {
+                                val isolated = isolateInspectMembershipMutation(
+                                    captureIds = resolvedCloudIds.toList(),
+                                    shouldBisect = ::shouldBisectInspectMembershipFailure,
+                                    mutate = { batch ->
+                                        client.mutateCaptureCollection(
+                                            captureIds = batch,
+                                            collectionId = liveTargetCollectionId,
+                                            removed = removed,
+                                        )
+                                    },
+                                    onAccepted = { accepted ->
+                                        if (!RemoteCollectionBooks.applyMembershipMutation(
+                                                this@HomeActivity,
+                                                accepted,
+                                                liveTargetCollectionId,
+                                                removed,
+                                                mutationOwner,
+                                            )
+                                        ) {
+                                            cloudPending = true
+                                        }
+                                    },
+                                )
+                                if (isolated.failedIds.isNotEmpty()) cloudPending = true
+                            }
+                        }
+
+                        Result.success(
+                            InspectMutationOutcome(
+                                appliedCount = selected.size,
+                                localCleanupFailures = cleanupFailures,
+                                cloudPending = cloudPending,
+                            ),
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Result.failure(e)
+                    }
+                }
+            }
+            inspectMutationInFlight = false
+            inspectActionMode?.invalidate()
+            val mutation = outcome.getOrNull()
+            if (mutation == null) {
+                Toast.makeText(
+                    this@HomeActivity,
+                    R.string.inspect_selection_failed,
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@launch
+            }
+
+            val warnings = buildList {
+                if (mutation.localCleanupFailures > 0) add(resources.getQuantityString(
+                    R.plurals.inspect_selection_cleanup_failed,
+                    mutation.localCleanupFailures,
+                    mutation.localCleanupFailures,
+                ))
+                if (mutation.cloudPending) add(
+                    getString(R.string.inspect_selection_cloud_pending),
+                )
+            }
+            val message = warnings.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+                ?: resources.getQuantityString(
+                    if (removed) R.plurals.inspect_selection_deleted
+                    else R.plurals.inspect_selection_moved,
+                    mutation.appliedCount,
+                    mutation.appliedCount,
+                )
+            Toast.makeText(
+                this@HomeActivity,
+                message,
+                if (warnings.isNotEmpty()) {
+                    Toast.LENGTH_LONG
+                } else {
+                    Toast.LENGTH_SHORT
+                },
+            ).show()
+            clearInspectSelection()
+            refreshInspect()
         }
     }
 
@@ -1850,13 +2499,16 @@ class HomeActivity : AppCompatActivity() {
                     }
                     val readyBitmap = decodedBitmap ?: continue
                     withContext(Dispatchers.Main) {
+                        val target = request.image ?: request.swatch ?: return@withContext
                         if (activeTab != requiredTab ||
-                            !request.image.isAttachedToWindow ||
+                            !target.isAttachedToWindow ||
                             !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
                         ) return@withContext
-                        request.image.alpha = if (cleanupPending) .82f else 1f
-                        setDynamicThumbnail(request.image, readyBitmap)
-                        decodedBitmap = null
+                        request.image?.let { image ->
+                            image.alpha = if (cleanupPending) .82f else 1f
+                            setDynamicThumbnail(image, readyBitmap)
+                            decodedBitmap = null
+                        } ?: request.swatch?.setBackgroundColor(averageCoverColor(readyBitmap))
                     }
                 } finally {
                     decodedBitmap?.takeIf { !it.isRecycled }?.recycle()
@@ -1871,6 +2523,42 @@ class HomeActivity : AppCompatActivity() {
         dynamicThumbnailBitmaps.put(image, bitmap)
             ?.takeIf { previous -> previous !== bitmap && !previous.isRecycled }
             ?.recycle()
+    }
+
+    /** A small, evenly sampled mean is sufficient for the Content row's cover
+     * hint. Transparent pixels and nearly white scanner margins are ignored so
+     * the swatch follows the actual binding more often than the page edge. */
+    private fun averageCoverColor(bitmap: Bitmap): Int {
+        var red = 0L
+        var green = 0L
+        var blue = 0L
+        var samples = 0L
+        val stepX = (bitmap.width / 8).coerceAtLeast(1)
+        val stepY = (bitmap.height / 10).coerceAtLeast(1)
+        var y = stepY / 2
+        while (y < bitmap.height) {
+            var x = stepX / 2
+            while (x < bitmap.width) {
+                val pixel = bitmap.getPixel(x, y)
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+                if (Color.alpha(pixel) >= 128 && !(r > 242 && g > 242 && b > 242)) {
+                    red += r
+                    green += g
+                    blue += b
+                    samples += 1
+                }
+                x += stepX
+            }
+            y += stepY
+        }
+        if (samples == 0L) return getColor(R.color.whl_face_sh2)
+        return Color.rgb(
+            (red / samples).toInt(),
+            (green / samples).toInt(),
+            (blue / samples).toInt(),
+        )
     }
 
     private fun resetThumbnailLoading() {
@@ -1914,6 +2602,7 @@ class HomeActivity : AppCompatActivity() {
      */
     private fun ensureRemoteBoxListing(collectionId: String) {
         if (collectionId.isEmpty()) return
+        if (inspectMutationInFlight) return
         if (!Prefs.configured(this) || !Auth.signedIn(this)) return
         val owner = Prefs.userId(this)
         if (owner.isEmpty()) return
@@ -1934,7 +2623,133 @@ class HomeActivity : AppCompatActivity() {
                         // for the whole closure or the old label's books vanish.
                         val closure = collectionMergeClosure(records, collectionId)
                         val client = SupabaseClient(this@HomeActivity, owner)
-                        val books = client.capturesForCollections(closure)
+                        var books = client.capturesForCollections(closure)
+
+                        // A local membership overlay is also the durable outbox
+                        // for a move/delete made offline or while an upload was
+                        // between remote insert and local commit. Reconcile any
+                        // returned cloud row before acknowledging the snapshot.
+                        val isolatedRetryFailures = linkedSetOf<String>()
+                        val reconciledPending = INSPECT_MEMBERSHIP_MUTATION_MUTEX.withLock {
+                            if (!remoteBoxFetches.isCurrent(ticket)) {
+                                throw CancellationException("stale collection listing")
+                            }
+                            // Re-read only after winning the same process-wide
+                            // mutation order as the UI. A newer move can therefore
+                            // never be overwritten by an older listing's retry.
+                            val pendingMemberships = InspectBookMemberships
+                                .read(this@HomeActivity)
+                                .takeIf { it.valid }
+                                ?.memberships
+                                .orEmpty()
+                            val fetchedById = books.associateBy { it.captureId }
+                            val cachedById = RemoteCollectionBooks
+                                .read(this@HomeActivity, owner)
+                                .byCollection.values
+                                .flatten()
+                                .groupBy { it.captureId }
+                                .mapValues { (_, copies) ->
+                                    copies.maxBy { it.membershipRevision }
+                                }
+                            val pendingGroups = linkedMapOf<
+                                Pair<String, Boolean>,
+                                MutableList<String>,
+                            >()
+                            pendingMemberships.forEach { (captureId, pending) ->
+                                val authoritative = fetchedById[captureId]
+                                val reference = authoritative ?: cachedById[captureId]
+                                if (pending.cloudOwnerId.isNotEmpty() &&
+                                    pending.cloudOwnerId != owner
+                                ) {
+                                    return@forEach
+                                }
+                                if (reference == null && pending.cloudOwnerId != owner) {
+                                    return@forEach
+                                }
+                                val requestedId = pending.collectionId.ifEmpty {
+                                    reference?.collectionId ?: return@forEach
+                                }
+                                val targetId = resolvedLiveCollectionId(requestedId, records)
+                                if (targetId == null) {
+                                    // A tombstone remains authoritative even if
+                                    // its former box was deleted. Keep it until a
+                                    // live destination can be resolved for the RPC.
+                                    if (pending.removed) return@forEach
+                                    check(InspectBookMemberships.clear(
+                                        this@HomeActivity,
+                                        setOf(captureId),
+                                    ))
+                                    return@forEach
+                                }
+                                if (authoritative != null &&
+                                    targetId == authoritative.collectionId &&
+                                    pending.removed == authoritative.removed
+                                ) {
+                                    return@forEach
+                                }
+                                if (targetId != pending.collectionId) {
+                                    when (InspectBookMemberships.compareAndSet(
+                                        this@HomeActivity,
+                                        captureId,
+                                        pending,
+                                        pending.copy(collectionId = targetId),
+                                    )) {
+                                        InspectMembershipCompareResult.UPDATED -> Unit
+                                        InspectMembershipCompareResult.CHANGED -> return@forEach
+                                        InspectMembershipCompareResult.FAILED ->
+                                            error("merged membership intent could not be saved")
+                                    }
+                                }
+                                pendingGroups
+                                    .getOrPut(targetId to pending.removed) { mutableListOf() }
+                                    .add(captureId)
+                            }
+                            var acceptedPendingMutation = false
+                            pendingGroups.forEach { (state, captureIds) ->
+                                captureIds.chunked(CAPTURE_COLLECTION_MUTATION_MAX_IDS)
+                                    .forEach { batch ->
+                                        val isolated = isolateInspectMembershipMutation(
+                                            captureIds = batch,
+                                            shouldBisect = ::shouldBisectInspectMembershipFailure,
+                                            mutate = { isolatedBatch ->
+                                                if (!remoteBoxFetches.isCurrent(ticket)) {
+                                                    throw CancellationException(
+                                                        "stale membership retry",
+                                                    )
+                                                }
+                                                client.mutateCaptureCollection(
+                                                    captureIds = isolatedBatch,
+                                                    collectionId = state.first,
+                                                    removed = state.second,
+                                                )
+                                            },
+                                            onAccepted = { accepted ->
+                                                check(RemoteCollectionBooks.applyMembershipMutation(
+                                                    this@HomeActivity,
+                                                    accepted,
+                                                    state.first,
+                                                    state.second,
+                                                    owner,
+                                                )) { "accepted membership cache could not be saved" }
+                                            },
+                                        )
+                                        if (isolated.acceptedIds.isNotEmpty()) {
+                                            acceptedPendingMutation = true
+                                        }
+                                        isolatedRetryFailures += isolated.failedIds
+                                    }
+                            }
+                            acceptedPendingMutation
+                        }
+                        if (reconciledPending) {
+                            // Read once more from the committed server state so
+                            // cache revisions and overlay acknowledgements are
+                            // authoritative, not locally manufactured guesses.
+                            if (!remoteBoxFetches.isCurrent(ticket)) {
+                                return@withContext false
+                            }
+                            books = client.capturesForCollections(closure)
+                        }
                         // Most captures carry no title of their own (extraction
                         // needs an API key), so fill the blanks from the desktop's
                         // curated projection. Failing that lookup must not lose the
@@ -1950,10 +2765,15 @@ class HomeActivity : AppCompatActivity() {
                         } catch (_: Exception) {
                             books
                         }
-                        RemoteCollectionBooks.record(
+                        // HttpURLConnection is blocking and may return after the
+                        // Activity was rotated/stopped. Cancellation must win
+                        // before the shared cache or membership overlay changes.
+                        currentCoroutineContext().ensureActive()
+                        val recordResult = RemoteCollectionBooks.recordAuthoritative(
                             this@HomeActivity,
                             collectionId,
                             enriched,
+                            queriedCollectionIds = closure,
                             owner = owner,
                             discardCollectionIds = records.asSequence()
                                 .filter { it.deleted || it.mergedInto != null }
@@ -1964,6 +2784,24 @@ class HomeActivity : AppCompatActivity() {
                                     Prefs.userId(this@HomeActivity) == owner
                             },
                         )
+                        val overlayAcknowledged = if (recordResult == null) {
+                            false
+                        } else if ((recordResult.acknowledgedCaptureIds -
+                                isolatedRetryFailures).isEmpty()
+                        ) {
+                            true
+                        } else {
+                            // This owner-scoped response is authoritative. Local
+                            // overlays exist only to bridge the RPC/cache window;
+                            // once a fresh listing includes a capture, its server
+                            // membership wins (including changes from a different
+                            // signed-in device).
+                            InspectBookMemberships.clear(
+                                this@HomeActivity,
+                                recordResult.acknowledgedCaptureIds - isolatedRetryFailures,
+                            )
+                        }
+                        recordResult != null && overlayAcknowledged
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: Exception) {
@@ -2428,12 +3266,16 @@ class HomeActivity : AppCompatActivity() {
         const val STATE_TAB_COLLECTIONS = "tab_collections"
         const val STATE_INSPECTED_COLLECTION = "inspected_collection"
         const val STATE_INSPECT_VIEW_MODE = "inspect_view_mode"
+        const val STATE_INSPECT_SELECTED_IDS = "inspect_selected_ids"
         const val STATE_SCAN_GROUPS_INITIALIZED = "scan_groups_initialized"
         const val STATE_EXPANDED_SCAN_GROUPS = "expanded_scan_groups"
         const val STATE_SYNC_FEEDBACK_REQUEST = "sync_feedback_request"
         const val STATE_SYNC_FEEDBACK_PHASE = "sync_feedback_phase"
         const val WORK_REFRESH_COALESCE_MS = 200L
         const val INSPECT_BOOK_PAGE_SIZE = 48
+        const val MENU_INSPECT_MOVE = 10_201
+        const val MENU_INSPECT_DELETE = 10_202
+        val REMOTE_BOX_FETCHES = RemoteCollectionFetchTracker()
         val SNAPSHOT_LOAD_MUTEX = Mutex()
         val THUMBNAIL_LOAD_MUTEX = Mutex()
     }

@@ -44,17 +44,23 @@ class RemoteCollectionBooksTest {
     private fun captureRow(
         id: String,
         collectionId: String? = boxA,
+        originalCollectionId: String? = collectionId,
         title: String = "Materia Medica",
         photos: Int = 3,
         createdAt: String = "2026-07-20T11:59:45.048996+00:00",
         owner: String = owner1,
+        removed: Boolean = false,
+        membershipRevision: Long = 0L,
     ): JSONObject = JSONObject()
         .put("id", id)
         .put("created_by", owner)
         .put("created_at", createdAt)
-        .put("photos", JSONArray(List(photos) { "dev/$id/photo_$it.jpg" }))
+        .put(CAPTURE_ORIGINAL_COLLECTION_ID_FIELD, originalCollectionId ?: JSONObject.NULL)
         .put(CAPTURE_COLLECTION_ID_FIELD, collectionId ?: JSONObject.NULL)
         .put(CAPTURE_COLLECTION_NAME_FIELD, "Blue crate")
+        .put(CAPTURE_COLLECTION_PHOTO_COUNT_FIELD, photos)
+        .put(CAPTURE_COLLECTION_REMOVED_FIELD, removed)
+        .put(CAPTURE_COLLECTION_REVISION_FIELD, membershipRevision)
         .put("title", if (title.isEmpty()) JSONObject.NULL else title)
         .put("author", if (title.isEmpty()) JSONObject.NULL else "Boerhaave, H.")
         .put("year", if (title.isEmpty()) JSONObject.NULL else "1741")
@@ -74,7 +80,10 @@ class RemoteCollectionBooksTest {
     private fun remoteBook(id: String, collectionId: String = boxA) =
         RemoteCollectionBook(
             captureId = id,
+            originalCollectionId = collectionId,
             collectionId = collectionId,
+            removed = false,
+            membershipRevision = 0L,
             collectionName = "Blue crate",
             title = "Materia Medica",
             author = "Boerhaave, H.",
@@ -83,13 +92,27 @@ class RemoteCollectionBooksTest {
             createdAt = 100L,
         )
 
+    private fun mutationRow(
+        id: String,
+        collectionId: String = boxB,
+        removed: Boolean = false,
+        revision: Long = 1L,
+    ) = JSONObject()
+        .put("capture_id", id)
+        .put("collection_id", collectionId)
+        .put("removed", removed)
+        .put("membership_revision", revision)
+
     // --- capture row parsing ---------------------------------------------------
 
     @Test
     fun readsProvenanceAndPhotoCountFromACaptureRow() {
         val book = remoteCollectionBookFromCaptureJson(captureRow("abcd1234"))
         assertEquals("abcd1234", book?.captureId)
+        assertEquals(boxA, book?.originalCollectionId)
         assertEquals(boxA, book?.collectionId)
+        assertFalse(book?.removed ?: true)
+        assertEquals(0L, book?.membershipRevision)
         assertEquals("Blue crate", book?.collectionName)
         assertEquals("Materia Medica", book?.title)
         assertEquals("Boerhaave, H.", book?.author)
@@ -127,12 +150,45 @@ class RemoteCollectionBooksTest {
     fun anAbsentProjectedColumnIsAlsoEmptyRatherThanNull() {
         val row = JSONObject()
             .put("id", "a")
+            .put(CAPTURE_ORIGINAL_COLLECTION_ID_FIELD, boxA)
             .put(CAPTURE_COLLECTION_ID_FIELD, boxA)
+            .put(CAPTURE_COLLECTION_PHOTO_COUNT_FIELD, 0)
+            .put(CAPTURE_COLLECTION_REMOVED_FIELD, false)
+            .put(CAPTURE_COLLECTION_REVISION_FIELD, 0L)
         val book = remoteCollectionBookFromCaptureJson(row)
         assertEquals("", book?.title)
         assertEquals("", book?.collectionName)
         assertEquals(0, book?.photoCount)
         assertEquals(0L, book?.createdAt)
+    }
+
+    @Test
+    fun preservesOriginalMembershipAndParsesMovedRemovalTombstones() {
+        val book = remoteCollectionBookFromCaptureJson(
+            captureRow(
+                capA,
+                collectionId = boxB,
+                originalCollectionId = boxA,
+                removed = true,
+                membershipRevision = 7L,
+            ),
+        )!!
+        assertEquals(boxA, book.originalCollectionId)
+        assertEquals(boxB, book.collectionId)
+        assertTrue(book.removed)
+        assertEquals(7L, book.membershipRevision)
+    }
+
+    @Test
+    fun rejectsMalformedMembershipState() {
+        val missingRemoval = JSONObject(captureRow(capA).toString()).apply {
+            remove(CAPTURE_COLLECTION_REMOVED_FIELD)
+        }
+        val fractionalRevision = JSONObject(captureRow(capA).toString()).apply {
+            put(CAPTURE_COLLECTION_REVISION_FIELD, 1.5)
+        }
+        assertNull(remoteCollectionBookFromCaptureJson(missingRemoval))
+        assertNull(remoteCollectionBookFromCaptureJson(fractionalRevision))
     }
 
     @Test
@@ -183,6 +239,25 @@ class RemoteCollectionBooksTest {
     }
 
     @Test
+    fun requestedOriginalBoxReceivesMovedTombstonesForCacheInvalidation() {
+        val books = collectRemoteCollectionBookPages(owner1, setOf(boxA)) { afterId ->
+            if (afterId != null) JSONArray()
+            else JSONArray().put(
+                captureRow(
+                    capA,
+                    collectionId = boxB,
+                    originalCollectionId = boxA,
+                    removed = true,
+                    membershipRevision = 2L,
+                ),
+            )
+        }
+        assertEquals(1, books.size)
+        assertEquals(boxB, books.single().collectionId)
+        assertTrue(books.single().removed)
+    }
+
+    @Test
     fun cloudCollectionPagesFailClosedOnForeignOrNonadvancingRows() {
         assertThrows(IOException::class.java) {
             collectRemoteCollectionBookPages(owner1, setOf(boxA)) {
@@ -206,26 +281,106 @@ class RemoteCollectionBooksTest {
     fun boxQueryPinsOwnerProjectionAndStableIdCursor() {
         val first = captureCollectionBooksPath(owner1, setOf(boxB, boxA))
         assertEquals(
-            "/rest/v1/captures?created_by=eq.$owner1" +
-                "&meta->>scan_collection_id=in.($boxA,$boxB)" +
-                "&select=id,created_by,created_at,photos" +
-                ",$CAPTURE_COLLECTION_ID_FIELD:meta->>scan_collection_id" +
-                ",$CAPTURE_COLLECTION_NAME_FIELD:meta->>scan_collection" +
-                ",title:meta->>title,author:meta->>author,year:meta->>year" +
+            "/rest/v1/capture_collection_inventory?created_by=eq.$owner1" +
+                "&or=($CAPTURE_ORIGINAL_COLLECTION_ID_FIELD.in.($boxA,$boxB)," +
+                "$CAPTURE_COLLECTION_ID_FIELD.in.($boxA,$boxB))" +
+                "&select=id,created_by,created_at" +
+                ",$CAPTURE_ORIGINAL_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_COLLECTION_NAME_FIELD" +
+                ",title,author,year" +
+                ",$CAPTURE_COLLECTION_PHOTO_COUNT_FIELD" +
+                ",$CAPTURE_COLLECTION_REMOVED_FIELD" +
+                ",$CAPTURE_COLLECTION_REVISION_FIELD" +
                 "&order=id.asc&limit=$REMOTE_COLLECTION_BOOKS_PAGE_SIZE",
             first,
         )
 
         val next = captureCollectionBooksPath(owner1, setOf(boxA), afterId = capA)
         assertEquals(
-            "/rest/v1/captures?created_by=eq.$owner1" +
-                "&meta->>scan_collection_id=in.($boxA)" +
-                "&select=id,created_by,created_at,photos" +
-                ",$CAPTURE_COLLECTION_ID_FIELD:meta->>scan_collection_id" +
-                ",$CAPTURE_COLLECTION_NAME_FIELD:meta->>scan_collection" +
-                ",title:meta->>title,author:meta->>author,year:meta->>year" +
+            "/rest/v1/capture_collection_inventory?created_by=eq.$owner1" +
+                "&or=($CAPTURE_ORIGINAL_COLLECTION_ID_FIELD.in.($boxA)," +
+                "$CAPTURE_COLLECTION_ID_FIELD.in.($boxA))" +
+                "&select=id,created_by,created_at" +
+                ",$CAPTURE_ORIGINAL_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_COLLECTION_NAME_FIELD" +
+                ",title,author,year" +
+                ",$CAPTURE_COLLECTION_PHOTO_COUNT_FIELD" +
+                ",$CAPTURE_COLLECTION_REMOVED_FIELD" +
+                ",$CAPTURE_COLLECTION_REVISION_FIELD" +
                 "&order=id.asc&limit=$REMOTE_COLLECTION_BOOKS_PAGE_SIZE&id=gt.$capA",
             next,
+        )
+        assertFalse(first.contains("removed=eq.false"))
+    }
+
+    @Test
+    fun membershipMutationBodyIsBoundedNormalizedAndRpcShaped() {
+        val body = captureCollectionMutationBody(
+            listOf(capZ.uppercase(), capA, capA),
+            boxB.uppercase(),
+            removed = true,
+        )
+        assertEquals(
+            listOf(capZ, capA),
+            body.getJSONArray("p_capture_ids").let { ids ->
+                (0 until ids.length()).map(ids::getString)
+            },
+        )
+        assertEquals(boxB, body.getString("p_collection_id"))
+        assertTrue(body.getBoolean("p_removed"))
+        assertThrows(IllegalArgumentException::class.java) {
+            captureCollectionMutationBody(listOf("not-a-uuid"), boxB, false)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            captureCollectionMutationBody(
+                (0..CAPTURE_COLLECTION_MUTATION_MAX_IDS).map { index ->
+                    "aaaaaaaa-0000-4000-8000-${index.toString().padStart(12, '0')}"
+                },
+                boxB,
+                false,
+            )
+        }
+    }
+
+    @Test
+    fun membershipMutationResponseMustRepresentTheCompleteRequestedSet() {
+        val expected = setOf(capA, capZ)
+        val complete = JSONArray()
+            .put(mutationRow(capA, removed = true, revision = 4L))
+            .put(mutationRow(capZ, removed = true, revision = 9L))
+        assertEquals(
+            expected,
+            captureCollectionMutationResultFromJson(complete, expected, boxB, true),
+        )
+        assertNull(
+            captureCollectionMutationResultFromJson(
+                JSONArray().put(mutationRow(capA, removed = true)),
+                expected,
+                boxB,
+                true,
+            ),
+        )
+        assertNull(
+            captureCollectionMutationResultFromJson(
+                JSONArray()
+                    .put(mutationRow(capA, removed = true))
+                    .put(mutationRow(capA, removed = true)),
+                expected,
+                boxB,
+                true,
+            ),
+        )
+        assertNull(
+            captureCollectionMutationResultFromJson(
+                JSONArray()
+                    .put(mutationRow(capA, removed = true))
+                    .put(mutationRow(capZ, collectionId = boxC, removed = true)),
+                expected,
+                boxB,
+                true,
+            ),
         )
     }
 
@@ -535,6 +690,165 @@ class RemoteCollectionBooksTest {
         assertTrue(store.valid)
         assertEquals(1, store.byCollection.getValue(boxA).size)
         assertEquals(remoteBook("one"), store.byCollection.getValue(boxA).single())
+    }
+
+    @Test
+    fun versionOneCacheMigratesToUnmodifiedOriginalMembership() {
+        val legacy = JSONObject()
+            .put("version", 1)
+            .put("owner", owner1)
+            .put(
+                "collections",
+                JSONObject().put(
+                    boxA,
+                    JSONArray().put(
+                        JSONObject()
+                            .put("capture_id", capA)
+                            .put("collection_name", "Blue crate")
+                            .put("title", "Materia Medica")
+                            .put("author", "Boerhaave, H.")
+                            .put("year", "1741")
+                            .put("photo_count", 3)
+                            .put("created_at", 100L),
+                    ),
+                ),
+            )
+        val book = remoteCollectionBooksStoreFromJson(legacy.toString())
+            .byCollection.getValue(boxA).single()
+        assertEquals(boxA, book.originalCollectionId)
+        assertEquals(boxA, book.collectionId)
+        assertFalse(book.removed)
+        assertEquals(0L, book.membershipRevision)
+    }
+
+    @Test
+    fun acceptedMembershipMutationUpdatesEveryCachedOccurrenceMonotonically() {
+        val target = tempFile()
+        RemoteCollectionBooks.record(target, owner1, boxA, listOf(remoteBook(capA)))
+        RemoteCollectionBooks.record(target, owner1, boxB, listOf(remoteBook(capA)))
+
+        assertTrue(
+            RemoteCollectionBooks.applyMembershipMutation(
+                target,
+                owner1,
+                setOf(capA),
+                boxC,
+                "Green crate",
+                removed = false,
+            ),
+        )
+        var copies = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.values.flatten()
+        assertEquals(2, copies.size)
+        assertTrue(copies.all { it.originalCollectionId == boxA })
+        assertTrue(copies.all { it.collectionId == boxC && !it.removed })
+        assertTrue(copies.all { it.membershipRevision == 1L })
+
+        // An idempotent retry mirrors the RPC and does not manufacture a newer
+        // revision than the server returned for the unchanged state.
+        RemoteCollectionBooks.applyMembershipMutation(
+            target, owner1, setOf(capA), boxC, "Green crate", removed = false,
+        )
+        copies = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.values.flatten()
+        assertTrue(copies.all { it.membershipRevision == 1L })
+
+        RemoteCollectionBooks.applyMembershipMutation(
+            target, owner1, setOf(capA), boxC, "Green crate", removed = true,
+        )
+        copies = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.values.flatten()
+        assertTrue(copies.all { it.removed && it.membershipRevision == 2L })
+    }
+
+    @Test
+    fun authoritativeEmptyEffectiveBoxSuppressesEveryStaleCopyUntilNewerStateArrives() {
+        val target = tempFile()
+        val movedToB = remoteBook(capA, boxA).copy(
+            collectionId = boxB,
+            membershipRevision = 1L,
+        )
+        RemoteCollectionBooks.record(target, owner1, boxA, listOf(movedToB))
+        RemoteCollectionBooks.record(target, owner1, boxB, listOf(movedToB))
+
+        val suppressed = RemoteCollectionBooks.recordAuthoritative(
+            target = target,
+            owner = owner1,
+            collectionId = boxB,
+            books = emptyList(),
+            queriedCollectionIds = setOf(boxB),
+        )
+
+        assertEquals(setOf(capA), suppressed?.acknowledgedCaptureIds)
+        var copies = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.values.flatten().filter { it.captureId == capA }
+        assertTrue(copies.isNotEmpty())
+        assertTrue(copies.all { it.removed && it.membershipRevision == 1L })
+
+        // A second empty refresh must retain the synthetic suppression row.
+        RemoteCollectionBooks.recordAuthoritative(
+            target = target,
+            owner = owner1,
+            collectionId = boxB,
+            books = emptyList(),
+            queriedCollectionIds = setOf(boxB),
+        )
+        copies = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.values.flatten().filter { it.captureId == capA }
+        assertTrue(copies.isNotEmpty())
+        assertTrue(copies.all { it.removed && it.membershipRevision == 1L })
+
+        val movedToC = movedToB.copy(
+            collectionId = boxC,
+            removed = false,
+            membershipRevision = 2L,
+        )
+        RemoteCollectionBooks.recordAuthoritative(
+            target = target,
+            owner = owner1,
+            collectionId = boxA,
+            books = listOf(movedToC),
+            queriedCollectionIds = setOf(boxA),
+        )
+        copies = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.values.flatten().filter { it.captureId == capA }
+        assertEquals(boxC, copies.maxBy { it.membershipRevision }.collectionId)
+        assertFalse(copies.maxBy { it.membershipRevision }.removed)
+    }
+
+    @Test
+    fun sourceRefreshKeepsALocallyAcceptedMoveThatAlreadyLeftItsQueryClosure() {
+        val target = tempFile()
+        val originallyA = remoteBook(capA, boxB).copy(
+            originalCollectionId = boxA,
+            collectionId = boxB,
+            membershipRevision = 1L,
+        )
+        RemoteCollectionBooks.record(target, owner1, boxB, listOf(originallyA))
+        assertTrue(
+            RemoteCollectionBooks.applyMembershipMutation(
+                target = target,
+                owner = owner1,
+                ids = setOf(capA),
+                collectionId = boxC,
+                collectionName = "Box C",
+                removed = false,
+            ),
+        )
+
+        RemoteCollectionBooks.recordAuthoritative(
+            target = target,
+            owner = owner1,
+            collectionId = boxB,
+            books = emptyList(),
+            queriedCollectionIds = setOf(boxB),
+        )
+
+        val retained = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.values.flatten().single { it.captureId == capA }
+        assertEquals(boxC, retained.collectionId)
+        assertFalse(retained.removed)
+        assertEquals(2L, retained.membershipRevision)
     }
 
     @Test

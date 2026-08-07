@@ -10,6 +10,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.math.BigDecimal
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
@@ -36,6 +37,8 @@ private val JPEG_MEDIA_TYPE = "image/jpeg".toMediaType()
  * [REMOTE_COLLECTION_BOOKS_PAGE_SIZE]-row page stays bounded independently of
  * the number of pages in the complete snapshot. */
 private const val CAPTURE_COLLECTION_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
+private const val CAPTURE_COLLECTION_MUTATION_RESPONSE_MAX_BYTES = 128 * 1024
+internal const val CAPTURE_COLLECTION_MUTATION_MAX_IDS = 500
 
 /** Collection ids reach a PostgREST `in.(...)` list unquoted, so restrict them to
  * bare uuid characters rather than trusting a synced value. */
@@ -160,13 +163,80 @@ internal fun captureCollectionBooksPath(
     }.orEmpty()
     val owner = URLEncoder.encode(ownerId.lowercase(), Charsets.UTF_8.name())
     val filter = ids.joinToString(",")
-    val select = "id,created_by,created_at,photos" +
-        ",$CAPTURE_COLLECTION_ID_FIELD:meta->>scan_collection_id" +
-        ",$CAPTURE_COLLECTION_NAME_FIELD:meta->>scan_collection" +
-        ",title:meta->>title,author:meta->>author,year:meta->>year"
-    return "/rest/v1/captures?created_by=eq.$owner" +
-        "&meta->>scan_collection_id=in.($filter)" +
+    val select = "id,created_by,created_at" +
+        ",$CAPTURE_ORIGINAL_COLLECTION_ID_FIELD" +
+        ",$CAPTURE_COLLECTION_ID_FIELD" +
+        ",$CAPTURE_COLLECTION_NAME_FIELD" +
+        ",title,author,year" +
+        ",$CAPTURE_COLLECTION_PHOTO_COUNT_FIELD" +
+        ",$CAPTURE_COLLECTION_REMOVED_FIELD" +
+        ",$CAPTURE_COLLECTION_REVISION_FIELD"
+    return "/rest/v1/capture_collection_inventory?created_by=eq.$owner" +
+        "&or=($CAPTURE_ORIGINAL_COLLECTION_ID_FIELD.in.($filter)," +
+        "$CAPTURE_COLLECTION_ID_FIELD.in.($filter))" +
         "&select=$select&order=id.asc&limit=$pageSize$cursor"
+}
+
+internal fun normalizedCaptureCollectionMutationIds(
+    captureIds: Collection<String>,
+): List<String> {
+    val normalized = captureIds.map { it.trim().lowercase() }
+    require(normalized.all(SAFE_CAPTURE_SYNC_ID::matches)) { "invalid capture id" }
+    val unique = normalized.distinct()
+    require(unique.size <= CAPTURE_COLLECTION_MUTATION_MAX_IDS) { "capture batch is too large" }
+    return unique
+}
+
+internal fun captureCollectionMutationBody(
+    captureIds: Collection<String>,
+    collectionId: String,
+    removed: Boolean,
+): JSONObject {
+    val ids = normalizedCaptureCollectionMutationIds(captureIds)
+    require(ids.isNotEmpty()) { "capture ids are required" }
+    val target = collectionId.trim().lowercase()
+    require(SAFE_COLLECTION_FILTER_ID.matches(target)) { "invalid collection id" }
+    return JSONObject()
+        .put("p_capture_ids", JSONArray(ids))
+        .put("p_collection_id", target)
+        .put("p_removed", removed)
+}
+
+/** Fail closed on a partial, duplicate, or different RPC representation. */
+internal fun captureCollectionMutationResultFromJson(
+    rows: JSONArray,
+    expectedCaptureIds: Set<String>,
+    expectedCollectionId: String,
+    expectedRemoved: Boolean,
+): Set<String>? {
+    val expected = expectedCaptureIds.mapTo(linkedSetOf()) { it.trim().lowercase() }
+    val target = expectedCollectionId.trim().lowercase()
+    if (expected.isEmpty() || rows.length() != expected.size ||
+        !SAFE_COLLECTION_FILTER_ID.matches(target)
+    ) return null
+    val accepted = linkedSetOf<String>()
+    for (index in 0 until rows.length()) {
+        val row = rows.optJSONObject(index) ?: return null
+        val captureId = (row.opt("capture_id") as? String)?.trim()?.lowercase()
+            ?: return null
+        val collectionId = (row.opt("collection_id") as? String)?.trim()?.lowercase()
+            ?: return null
+        val removed = row.opt("removed") as? Boolean ?: return null
+        val revision = (row.opt("membership_revision") as? Number)?.let { raw ->
+            try {
+                BigDecimal(raw.toString()).longValueExact()
+            } catch (_: ArithmeticException) {
+                null
+            } catch (_: NumberFormatException) {
+                null
+            }
+        } ?: return null
+        if (!SAFE_CAPTURE_SYNC_ID.matches(captureId) || captureId !in expected ||
+            collectionId != target || removed != expectedRemoved || revision < 1L ||
+            !accepted.add(captureId)
+        ) return null
+    }
+    return accepted.takeIf { it == expected }
 }
 
 internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
@@ -423,13 +493,53 @@ class SupabaseClient(
         captureImportStates(ids).mapValues { it.value.status }
 
     /**
+     * Atomically move or soft-remove this account's selected captures.
+     *
+     * The phone uses its ordinary user JWT and public project key. The RPC
+     * validates ownership for the complete batch before changing any row, and
+     * this client rejects a partial or out-of-scope response before callers
+     * update their local cache.
+     */
+    fun mutateCaptureCollection(
+        captureIds: Collection<String>,
+        collectionId: String,
+        removed: Boolean,
+    ): Set<String> {
+        val ids = normalizedCaptureCollectionMutationIds(captureIds)
+        if (ids.isEmpty()) return emptySet()
+        val target = collectionId.trim().lowercase()
+        val body = captureCollectionMutationBody(ids, target, removed)
+        val conn = open(
+            "POST",
+            "$baseUrl/rest/v1/rpc/mutate_capture_collection",
+            "application/json",
+        )
+        conn.doOutput = true
+        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+        val rows = try {
+            JSONArray(
+                finish(conn, CAPTURE_COLLECTION_MUTATION_RESPONSE_MAX_BYTES).ifEmpty { "[]" },
+            )
+        } catch (e: org.json.JSONException) {
+            throw InvalidResponse("invalid capture collection mutation response")
+        }
+        return captureCollectionMutationResultFromJson(
+            rows = rows,
+            expectedCaptureIds = ids.toSet(),
+            expectedCollectionId = target,
+            expectedRemoved = removed,
+        ) ?: throw InvalidResponse("incomplete capture collection mutation response")
+    }
+
+    /**
      * Every capture this account filed into any of [collectionIds] — the one read
      * that discovers captures this handset does NOT already hold locally, which is
      * what lets a scanned box list its books after a reinstall or on a second
      * phone.
      *
-     * Pass the whole merge closure (see [collectionMergeClosure]); `captures.meta`
-     * still carries a merge loser's uuid forever.
+     * Pass the whole merge closure (see [collectionMergeClosure]). The inventory
+     * query matches immutable provenance and effective membership and keeps
+     * tombstones so an older per-box cache can evict moved or removed rows.
      *
      * Capture RLS also admits rows from contributors assigned to this account
      * for desktop ingestion. The explicit owner predicate and response check

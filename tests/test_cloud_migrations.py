@@ -73,6 +73,8 @@ CAPTURE_ERROR_ACKNOWLEDGEMENT = SQL[
 CAPTURE_ERROR_ACKNOWLEDGEMENT_FLAT = " ".join(
     CAPTURE_ERROR_ACKNOWLEDGEMENT.split()
 )
+CAPTURE_COLLECTION_STATE = SQL["026_capture_collection_state"]
+CAPTURE_COLLECTION_STATE_FLAT = " ".join(CAPTURE_COLLECTION_STATE.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -988,6 +990,176 @@ def test_capture_error_ack_reasserts_rpc_roles_and_direct_write_boundary():
     ) in migration
 
 
+# --- 026: owner-scoped capture collection membership -----------------------------
+
+def test_capture_collection_state_schema_is_owner_read_only_and_indexed():
+    schema = cloud_setup.expected_schema(CAPTURE_COLLECTION_STATE)
+    assert schema["capture_collection_state"] == {
+        "capture_id", "owner_id", "collection_id", "removed", "revision",
+        "updated_at",
+    }
+    migration = CAPTURE_COLLECTION_STATE_FLAT
+    assert (
+        "create unique index if not exists captures_id_created_by_uidx on "
+        "public.captures (id, created_by);"
+    ) in migration
+    assert (
+        "foreign key (capture_id, owner_id) references "
+        "public.captures(id, created_by) on delete cascade deferrable "
+        "initially deferred"
+    ) in migration
+    assert (
+        "create index if not exists "
+        "capture_collection_state_owner_collection_idx on "
+        "public.capture_collection_state (owner_id, collection_id, capture_id);"
+    ) in migration
+    assert (
+        "create index if not exists capture_collection_state_collection_idx "
+        "on public.capture_collection_state (collection_id, capture_id);"
+    ) in migration
+    assert (
+        "create index if not exists captures_owner_scan_collection_idx on "
+        "public.captures (created_by, ((meta ->> 'scan_collection_id')), id);"
+    ) in migration
+
+    assert (
+        "alter table public.capture_collection_state enable row level security;"
+    ) in migration
+    revoke = (
+        "revoke all on public.capture_collection_state from public, anon, "
+        "authenticated;"
+    )
+    select_grant = (
+        "grant select on public.capture_collection_state to authenticated;"
+    )
+    assert revoke in migration
+    assert select_grant in migration
+    assert migration.index(revoke) < migration.index(select_grant)
+    assert not re.search(
+        r"grant\s+(?:insert|update|delete|all)[^;]*on\s+"
+        r"public\.capture_collection_state\s+to\s+authenticated",
+        migration,
+    )
+    assert (
+        "create policy capture_collection_state_select_owner on "
+        "public.capture_collection_state for select to authenticated using "
+        "( (select auth.uid()) is not null and owner_id = "
+        "(select auth.uid()) );"
+    ) in migration
+    assert "capture_collection_state" in cloud_setup.ANON_CANNOT
+
+
+def test_capture_collection_rpc_is_bounded_atomic_owner_only_and_idempotent():
+    function = CAPTURE_COLLECTION_STATE_FLAT.split(
+        "create or replace function public.mutate_capture_collection", 1,
+    )[1].split("create or replace view public.capture_collection_inventory", 1)[0]
+
+    assert "security definer" in function
+    assert "set search_path = ''" in function
+    assert "caller_id uuid := auth.uid();" in function
+    assert "if caller_id is null then" in function
+    assert "if requested_count < 1 or requested_count > 500 then" in function
+    assert "count(distinct requested.id)::integer" in function
+    assert "capture ids must be non-null and unique" in function
+    assert "c.id = p_collection_id and not c.deleted" in function
+    assert "and c.merged_into is null" in function
+    assert "for share;" in function
+
+    # The ordered validation loop finishes before the first write. Thus one
+    # missing/foreign capture aborts without a partial membership mutation.
+    lock_loop = function.index("for requested_capture_id in")
+    first_insert = function.index("insert into public.capture_collection_state")
+    assert lock_loop < first_insert
+    validation = function[lock_loop:first_insert]
+    assert "order by requested.id" in validation
+    assert "c.created_by = caller_id for update;" in validation
+    assert "capture is missing or is not owned by the caller" in validation
+
+    assert (
+        "on conflict on constraint capture_collection_state_pkey do update set"
+    ) in function
+    assert "state.collection_id is distinct from excluded.collection_id" in function
+    assert "state.removed is distinct from excluded.removed" in function
+    assert "then state.revision + 1 else state.revision" in function
+    assert "state.revision = 9223372036854775807" in function
+    assert "where state.owner_id = caller_id" in function
+    assert "and state.capture_id = any(p_capture_ids)" in function
+
+    migration = CAPTURE_COLLECTION_STATE_FLAT
+    signature = "public.mutate_capture_collection(uuid[], uuid, boolean)"
+    owner = f"alter function {signature} owner to postgres;"
+    revoke = (
+        f"revoke all on function {signature} from public, anon, authenticated, "
+        "service_role;"
+    )
+    grant = f"grant execute on function {signature} to authenticated;"
+    assert owner in migration
+    assert revoke in migration
+    assert grant in migration
+    assert migration.index(owner) < migration.index(revoke) < migration.index(grant)
+    assert not re.search(
+        rf"grant execute on function {re.escape(signature)} to "
+        r"(?:anon|service_role|public)",
+        migration,
+    )
+
+
+def test_capture_collection_inventory_preserves_provenance_and_tombstones():
+    migration = CAPTURE_COLLECTION_STATE_FLAT
+    view = migration.split(
+        "create or replace view public.capture_collection_inventory", 1,
+    )[1].split("notify pgrst", 1)[0]
+    assert "with (security_invoker = true) as" in view
+    assert (
+        "nullif(btrim(capture.meta ->> 'scan_collection_id'), '') as "
+        "original_collection_id"
+    ) in view
+    assert (
+        "coalesce( state.collection_id::text, nullif(btrim(capture.meta ->> "
+        "'scan_collection_id'), '') ) as collection_id"
+    ) in view
+    assert "coalesce(state.removed, false) as removed" in view
+    assert "coalesce(state.revision, 0::bigint) as membership_revision" in view
+    assert "when jsonb_typeof(capture.photos) = 'array'" in view
+    assert "then jsonb_array_length(capture.photos)::integer" in view
+    assert "else 0 end as photo_count" in view
+    assert "state.owner_id = capture.created_by" in view
+    assert not re.search(r"where\s+[^;]*state\.removed", view)
+
+    revoke = (
+        "revoke all on public.capture_collection_inventory from public, anon, "
+        "authenticated;"
+    )
+    grant = (
+        "grant select on public.capture_collection_inventory to authenticated, "
+        "service_role;"
+    )
+    assert revoke in migration
+    assert grant in migration
+    assert migration.index(revoke) < migration.index(grant)
+    assert "capture_collection_inventory" in cloud_setup.ANON_CANNOT
+    assert cloud_setup.VIEWS["capture_collection_inventory"] == [
+        "id", "created_by", "created_at", "original_collection_id",
+        "collection_id", "collection_name", "title", "author", "year",
+        "photo_count", "removed", "membership_revision",
+    ]
+
+
+def test_capture_collection_migration_is_rerun_safe_and_ledgers_last():
+    body = re.sub(r"--[^\n]*", "", CAPTURE_COLLECTION_STATE)
+    assert "create table if not exists public.capture_collection_state" in body
+    # Three ordinary indexes plus the separately asserted composite UNIQUE
+    # index on captures.
+    assert body.count("create index if not exists") == 3
+    assert "create or replace function public.mutate_capture_collection" in body
+    assert "create or replace view public.capture_collection_inventory" in body
+    assert "drop policy if exists capture_collection_state_select_owner" in body
+    assert CAPTURE_COLLECTION_STATE.strip().endswith(
+        "insert into schema_migrations (id) values "
+        "('026_capture_collection_state') on conflict do nothing;"
+    )
+
+
 # --- 009: shared collections ------------------------------------------------------
 
 def test_collections_migration_declares_offline_identity_and_tombstones():
@@ -1395,7 +1567,12 @@ def test_expected_schema_reads_the_real_migrations():
     assert sch["schema_migrations"] == {"id", "applied_at"}
     assert sch["profiles"] == {"id", "display_name", "created_at"}
     assert {"created_by", "contributor", "ocr", "meta"} <= sch["captures"]
+    assert sch["capture_collection_state"] == {
+        "capture_id", "owner_id", "collection_id", "removed", "revision",
+        "updated_at",
+    }
     assert "author_index" not in sch                 # views are not tables
+    assert "capture_collection_inventory" not in sch
     ident = re.compile(r"[a-z_][a-z0-9_]*")
     for table, cols in sch.items():
         assert ident.fullmatch(table)
@@ -1441,7 +1618,8 @@ def cloud_env(monkeypatch):
 def _live_definitions() -> dict[str, set[str]]:
     live = {t: set(c) for t, c in cloud_setup.expected_schema(
         "\n".join(SQL.values())).items()}
-    live["author_index"] = {"author", "work_count"}
+    for view, columns in cloud_setup.VIEWS.items():
+        live[view] = set(columns)
     return live
 
 

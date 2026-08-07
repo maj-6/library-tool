@@ -506,7 +506,7 @@ private fun isLanMetadataEntry(ctx: Context, entry: Entries.Entry): Boolean {
     ) != CloudUploadOwnership.ALLOWED
 }
 
-private fun isCloudMetadataEntry(ctx: Context, entry: Entries.Entry): Boolean {
+internal fun isCloudMetadataEntry(ctx: Context, entry: Entries.Entry): Boolean {
     if (!entry.uploaded || entry.deliveryTransport == "lan") return false
     if (entry.deliveryTransport == "cloud") return true
     return cloudUploadOwnership(

@@ -21,6 +21,10 @@ internal data class CollectionInventorySummary(
     val year: String,
     val photoCount: Int,
     val createdAt: Long,
+    /** How a finalized capture left this device: "cloud", "lan", or empty. */
+    val deliveryTransport: String = "",
+    /** Verified cloud account at delivery; empty means LAN or legacy-unknown. */
+    val cloudOwnerId: String = "",
 )
 
 /** One Inspect row. Only a still-current entry can carry live photo access. */
@@ -43,7 +47,7 @@ internal data class CollectionInventoryStore(
 )
 
 internal const val COLLECTION_INVENTORY_FILE = "collection_inventory.json"
-internal const val COLLECTION_INVENTORY_VERSION = 1
+internal const val COLLECTION_INVENTORY_VERSION = 3
 
 internal object CollectionInventory {
 
@@ -94,6 +98,8 @@ internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInvento
         year = entry.year,
         photoCount = entry.photoCount,
         createdAt = entry.createdAt,
+        deliveryTransport = entry.deliveryTransport,
+        cloudOwnerId = entry.cloudOwnerId.trim().lowercase(),
     )
 
 /**
@@ -132,7 +138,10 @@ internal fun collectionInventoryStoreToJson(store: CollectionInventoryStore): St
 
 /**
  * Version 0 was the pre-keyed prototype shape (an array with an `id` field).
- * Reading it in memory is safe; the next successful record writes version 1.
+ * Reading it in memory is safe; the next successful record writes the current
+ * version. Version 2 adds delivery transport. Version 3 adds the verified
+ * cloud owner so a photo-free row can never be submitted under another
+ * account merely because that account is signed in later.
  */
 internal fun collectionInventoryStoreFromJson(text: String): CollectionInventoryStore = try {
     val root = JSONObject(text)
@@ -150,7 +159,7 @@ internal fun collectionInventoryStoreFromJson(text: String): CollectionInventory
                 ?: throw IllegalArgumentException("entry must be an object")
             val entryId = requiredString(row, "id").trim()
             require(entryId.isNotEmpty() && entryId !in summaries) { "invalid entry id" }
-            summaries[entryId] = summaryFromJson(entryId, row)
+            summaries[entryId] = summaryFromJson(entryId, row, version.toInt())
         }
     } else {
         val entries = root.optJSONObject("entries")
@@ -159,7 +168,7 @@ internal fun collectionInventoryStoreFromJson(text: String): CollectionInventory
             require(entryId.isNotEmpty()) { "invalid entry id" }
             val row = entries.optJSONObject(entryId)
                 ?: throw IllegalArgumentException("entry must be an object")
-            summaries[entryId] = summaryFromJson(entryId, row)
+            summaries[entryId] = summaryFromJson(entryId, row, version.toInt())
         }
     }
     CollectionInventoryStore(summaries, sourceVersion = version.toInt())
@@ -191,8 +200,15 @@ internal fun saveCollectionInventoryStore(
     }
 }
 
-private fun summaryToJson(summary: CollectionInventorySummary): JSONObject =
-    JSONObject()
+private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
+    require(summary.deliveryTransport in setOf("", "cloud", "lan")) {
+        "invalid delivery transport"
+    }
+    val cloudOwnerId = normalizedInventoryCloudOwner(summary.cloudOwnerId)
+    require(summary.deliveryTransport == "cloud" || cloudOwnerId.isEmpty()) {
+        "non-cloud delivery cannot have a cloud owner"
+    }
+    return JSONObject()
         .put("collection_id", summary.collectionId)
         .put("collection_name", summary.collectionName)
         .put("title", summary.title)
@@ -200,15 +216,34 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject =
         .put("year", summary.year)
         .put("photo_count", summary.photoCount)
         .put("created_at", summary.createdAt)
+        .put("delivery_transport", summary.deliveryTransport)
+        .put("cloud_owner_id", cloudOwnerId)
+}
 
 private fun summaryFromJson(
     entryId: String,
     row: JSONObject,
+    version: Int,
 ): CollectionInventorySummary {
     val photoCount = requiredWholeNumber(row, "photo_count")
     require(photoCount in 0..Int.MAX_VALUE.toLong()) { "invalid photo count" }
     val createdAt = requiredWholeNumber(row, "created_at")
     require(createdAt >= 0L) { "invalid creation time" }
+    val deliveryTransport = if (version < 2) "" else requiredString(row, "delivery_transport")
+    require(deliveryTransport in setOf("", "cloud", "lan")) {
+        "invalid delivery transport"
+    }
+    val rawCloudOwnerId = if (version < 3) "" else requiredString(row, "cloud_owner_id")
+    require(rawCloudOwnerId == rawCloudOwnerId.trim()) {
+        "invalid cloud owner"
+    }
+    val cloudOwnerId = rawCloudOwnerId.lowercase()
+    require(cloudOwnerId.isEmpty() || SAFE_CAPTURE_SYNC_ID.matches(cloudOwnerId)) {
+        "invalid cloud owner"
+    }
+    require(deliveryTransport == "cloud" || cloudOwnerId.isEmpty()) {
+        "non-cloud delivery cannot have a cloud owner"
+    }
     return CollectionInventorySummary(
         entryId = entryId,
         collectionId = requiredString(row, "collection_id"),
@@ -218,7 +253,18 @@ private fun summaryFromJson(
         year = requiredString(row, "year"),
         photoCount = photoCount.toInt(),
         createdAt = createdAt,
+        deliveryTransport = deliveryTransport,
+        cloudOwnerId = cloudOwnerId,
     )
+}
+
+private fun normalizedInventoryCloudOwner(value: String): String {
+    require(value == value.trim()) { "invalid cloud owner" }
+    val normalized = value.lowercase()
+    require(normalized.isEmpty() || SAFE_CAPTURE_SYNC_ID.matches(normalized)) {
+        "invalid cloud owner"
+    }
+    return normalized
 }
 
 private fun requiredString(source: JSONObject, name: String): String =

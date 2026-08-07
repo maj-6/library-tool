@@ -116,6 +116,42 @@ internal data class ConfirmedDelivery(
     val captureLibConfirmation: CaptureLibConfirmation? = null,
 )
 
+/**
+ * Stamp the local delivery receipt without allowing account provenance to be
+ * inferred from mutable session preferences. The caller supplies the owner
+ * frozen in the sync request; cloud delivery accepts it only when it matches
+ * the account creator already sealed into the capture manifest.
+ */
+internal fun stampDeliveryManifest(
+    manifest: JSONObject,
+    uploadedAt: Long,
+    cloudStatus: String,
+    syncRequestId: String,
+    deliveryTransport: String,
+    cloudOwnerId: String = "",
+): JSONObject {
+    require(uploadedAt > 0L) { "delivery time is required" }
+    require(cloudStatus in setOf("pending", "imported")) { "invalid cloud status" }
+    require(syncRequestId.isNotBlank()) { "sync request id is required" }
+    require(deliveryTransport in setOf("cloud", "lan")) { "invalid delivery transport" }
+    val owner = cloudOwnerId.trim().lowercase()
+    manifest.put("delivery_transport", deliveryTransport)
+    if (deliveryTransport == "cloud") {
+        require(SAFE_CAPTURE_SYNC_ID.matches(owner)) { "cloud owner is required" }
+        manifest.put(CLOUD_OWNER_MANIFEST_KEY, owner)
+        require(cloudOwnerIdFromDeliveryManifest(manifest) == owner) {
+            "cloud owner does not match capture creator"
+        }
+    } else {
+        require(owner.isEmpty()) { "LAN delivery cannot have a cloud owner" }
+        manifest.remove(CLOUD_OWNER_MANIFEST_KEY)
+    }
+    return manifest
+        .put("uploaded_at", uploadedAt)
+        .put("cloud_status", cloudStatus)
+        .put("sync_request_id", syncRequestId)
+}
+
 /** Cloud work must be visible to WorkManager as network-bound. LAN and an
  * unresolved Auto request may need to run on unvalidated, local-only Wi-Fi. */
 internal fun captureUploadRequiresConnectedNetwork(record: CaptureSyncRecord?): Boolean =
@@ -1026,7 +1062,8 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 }
                 val pendingReviewSync = CaptureMetadataStore.hasPendingReviewSync(dir)
                 val delivery = uploadEntry(client, dir, prepared)
-                markUploaded(ctx, dir, delivery, syncRequestId)
+                syncInspectMembershipAfterCaptureInsert(ctx, client, dir, uploadOwner)
+                markUploaded(ctx, dir, delivery, syncRequestId, uploadOwner)
                 // The capture row now exists, so an attention/review edit made
                 // before this explicit sync can be pushed instead of racing
                 // the pre-upload metadata pass started by the same button.
@@ -1323,14 +1360,131 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         )
     }
 
+    /**
+     * A move in Inspect changes current organization, never the immutable
+     * capture-time provenance embedded in the upload payload. If that move was
+     * made while the capture was still local-only, apply its durable overlay as
+     * soon as the capture row exists. A failed RPC leaves the queue entry in
+     * place; the next idempotent upload retry can finish the membership update.
+     */
+    private fun syncInspectMembershipAfterCaptureInsert(
+        ctx: Context,
+        client: SupabaseClient,
+        dir: File,
+        uploadOwner: String,
+    ) {
+        val owner = uploadOwner.trim().lowercase()
+        if (!SAFE_CAPTURE_SYNC_ID.matches(owner)) {
+            throw IOException("capture collection owner is invalid")
+        }
+        repeat(8) {
+            val stored = InspectBookMemberships.read(ctx)
+            if (!stored.valid) {
+                throw IOException("capture collection outbox could not be read")
+            }
+            var membership = stored.memberships[dir.name] ?: return
+            if (membership.cloudOwnerId.isNotEmpty() &&
+                !membership.cloudOwnerId.equals(owner, ignoreCase = true)
+            ) {
+                throw IOException("capture collection outbox belongs to another account")
+            }
+            val requestedCollectionId = membership.collectionId.ifEmpty {
+                readProvenance(dir)?.collectionId.orEmpty()
+            }
+            val targetCollectionId = resolvedLiveCollectionId(
+                requestedCollectionId,
+                Collections.allRecords(ctx),
+            )
+            if (targetCollectionId == null) {
+                if (membership.removed) {
+                    // The destination is immaterial for a tombstone, but the
+                    // server RPC requires a live one. Retain the intent until a
+                    // merge/restoration makes it resolvable; clearing it would
+                    // let immutable capture provenance resurrect the book.
+                    throw IOException("deleted capture has no live collection")
+                }
+                when (InspectBookMemberships.compareAndSet(
+                    ctx,
+                    dir.name,
+                    membership,
+                    replacement = null,
+                )) {
+                    InspectMembershipCompareResult.UPDATED -> return
+                    InspectMembershipCompareResult.CHANGED -> return@repeat
+                    InspectMembershipCompareResult.FAILED ->
+                        throw IOException(
+                            "obsolete capture collection membership could not be cleared",
+                        )
+                }
+            }
+
+            if (membership.collectionId != targetCollectionId) {
+                val resolved = membership.copy(collectionId = targetCollectionId)
+                when (InspectBookMemberships.compareAndSet(
+                    ctx,
+                    dir.name,
+                    membership,
+                    resolved,
+                )) {
+                    InspectMembershipCompareResult.UPDATED -> membership = resolved
+                    InspectMembershipCompareResult.CHANGED -> return@repeat
+                    InspectMembershipCompareResult.FAILED ->
+                        throw IOException("merged capture collection membership could not be saved")
+                }
+            }
+
+            val owned = membership.copy(cloudOwnerId = owner)
+            if (owned != membership) {
+                when (InspectBookMemberships.compareAndSet(
+                    ctx,
+                    dir.name,
+                    membership,
+                    owned,
+                )) {
+                    InspectMembershipCompareResult.UPDATED -> membership = owned
+                    InspectMembershipCompareResult.CHANGED -> return@repeat
+                    InspectMembershipCompareResult.FAILED ->
+                        throw IOException("capture collection outbox owner could not be saved")
+                }
+            }
+
+            val accepted = client.mutateCaptureCollection(
+                captureIds = setOf(dir.name),
+                collectionId = targetCollectionId,
+                removed = membership.removed,
+            )
+            if (accepted != setOf(dir.name)) {
+                throw IOException("capture collection membership was not accepted")
+            }
+            val latest = InspectBookMemberships.read(ctx)
+            if (!latest.valid) {
+                throw IOException("capture collection outbox could not be verified")
+            }
+            val latestMembership = latest.memberships[dir.name]
+            if (latestMembership == null || latestMembership == membership) return
+            // A newer UI action won the compare-and-set race. Apply that intent
+            // before the upload can commit locally and leave it stranded.
+        }
+        throw IOException("capture collection membership changed too often")
+    }
+
     /** queue/<id> -> sent/<id>, stamped; the recent list's "uploaded". */
     private fun markUploaded(
         ctx: Context,
         dir: File,
         delivery: ConfirmedDelivery,
         syncRequestId: String,
+        cloudOwnerId: String,
     ) {
-        markDelivered(ctx, dir, delivery, "pending", syncRequestId, "cloud")
+        markDelivered(
+            ctx,
+            dir,
+            delivery,
+            "pending",
+            syncRequestId,
+            "cloud",
+            cloudOwnerId,
+        )
     }
 
     private fun markDelivered(
@@ -1340,6 +1494,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         cloudStatus: String,
         syncRequestId: String,
         deliveryTransport: String,
+        cloudOwnerId: String = "",
     ) {
         check(delivery.entryId == dir.name && delivery.photoCount > 0) {
             "delivery receipt does not match local entry"
@@ -1353,11 +1508,14 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 }
             }
             val manifestFile = File(dir, "manifest.json")
-            val manifest = JSONObject(manifestFile.readText())
-                .put("uploaded_at", System.currentTimeMillis())
-                .put("cloud_status", cloudStatus)
-                .put("sync_request_id", syncRequestId)
-                .put("delivery_transport", deliveryTransport)
+            val manifest = stampDeliveryManifest(
+                manifest = JSONObject(manifestFile.readText()),
+                uploadedAt = System.currentTimeMillis(),
+                cloudStatus = cloudStatus,
+                syncRequestId = syncRequestId,
+                deliveryTransport = deliveryTransport,
+                cloudOwnerId = cloudOwnerId,
+            )
             Entries.atomicWrite(manifestFile, manifest.toString())
             val target = File(Entries.sentRoot(ctx), dir.name)
             if (!dir.renameTo(target)) {

@@ -1,60 +1,58 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:background="@drawable/whl_row"
+    android:background="@drawable/whl_inspect_row"
     android:gravity="center_vertical"
-    android:minHeight="72dp"
+    android:minHeight="48dp"
     android:orientation="horizontal"
     android:paddingStart="8dp"
-    android:paddingTop="7dp"
-    android:paddingEnd="4dp"
-    android:paddingBottom="7dp">
+    android:paddingTop="4dp"
+    android:paddingEnd="8dp"
+    android:paddingBottom="4dp">
 
-    <ImageView
-        android:id="@+id/inspectThumb"
-        android:layout_width="42dp"
-        android:layout_height="56dp"
-        android:layout_marginEnd="10dp"
-        android:background="@color/whl_face_sh"
-        android:contentDescription="@string/detail_photos"
-        android:foreground="@drawable/whl_thumbnail_frame"
-        android:scaleType="centerCrop"
-        android:src="@drawable/ic_app_mark" />
+    <View
+        android:id="@+id/inspectCoverSwatch"
+        android:layout_width="8dp"
+        android:layout_height="26dp"
+        android:layout_marginEnd="8dp"
+        android:background="@color/whl_face_sh2"
+        android:importantForAccessibility="no" />
 
-    <LinearLayout
+    <TextView
+        android:id="@+id/inspectTitle"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_weight="1"
-        android:orientation="vertical">
+        android:layout_weight="2.2"
+        android:ellipsize="end"
+        android:includeFontPadding="false"
+        android:maxLines="1"
+        android:paddingEnd="8dp"
+        android:textColor="@color/whl_ink"
+        android:textSize="12sp" />
 
-        <TextView
-            android:id="@+id/inspectTitle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:ellipsize="end"
-            android:maxLines="1"
-            android:textColor="@color/whl_ink"
-            android:textSize="14sp" />
+    <TextView
+        android:id="@+id/inspectAuthor"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1.4"
+        android:ellipsize="end"
+        android:fontFamily="monospace"
+        android:includeFontPadding="false"
+        android:maxLines="1"
+        android:paddingEnd="6dp"
+        android:textColor="@color/whl_ink_dim"
+        android:textSize="10sp" />
 
-        <TextView
-            android:id="@+id/inspectSubtitle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="2dp"
-            android:ellipsize="end"
-            android:fontFamily="monospace"
-            android:maxLines="2"
-            android:textColor="@color/whl_ink_dim"
-            android:textSize="11sp" />
-    </LinearLayout>
-
-    <androidx.appcompat.widget.AppCompatImageButton
-        android:id="@+id/inspectOpen"
-        style="@style/WhlInlineIconButton"
-        android:layout_width="48dp"
-        android:layout_height="48dp"
-        android:contentDescription="@string/home_open_details"
-        app:srcCompat="@drawable/ic_chevron_right" />
+    <TextView
+        android:id="@+id/inspectYear"
+        android:layout_width="44dp"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:fontFamily="monospace"
+        android:gravity="end"
+        android:includeFontPadding="false"
+        android:maxLines="1"
+        android:textColor="@color/whl_ink_dim"
+        android:textSize="10sp" />
 </LinearLayout>

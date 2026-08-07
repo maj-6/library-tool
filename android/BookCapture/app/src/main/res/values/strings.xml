@@ -265,6 +265,37 @@
     <string name="inspect_mode_tiles">Tiles</string>
     <string name="inspect_mode_content">Content</string>
     <string name="inspect_mode_icons">Icons</string>
+    <string name="inspect_content_missing">&#8212;</string>
+    <string name="inspect_select_book">Select book</string>
+    <plurals name="inspect_selection_count">
+        <item quantity="one">%d selected</item>
+        <item quantity="other">%d selected</item>
+    </plurals>
+    <string name="inspect_selection_move">Move</string>
+    <string name="inspect_selection_delete">Delete</string>
+    <string name="inspect_selection_move_title">Move to collection</string>
+    <string name="inspect_selection_delete_title">Delete selected books?</string>
+    <plurals name="inspect_selection_delete_message">
+        <item quantity="one">This removes %d book from its collection and deletes any local page photos. An already imported Library Tool record remains.</item>
+        <item quantity="other">This removes %d books from their collections and deletes any local page photos. Already imported Library Tool records remain.</item>
+    </plurals>
+    <string name="inspect_selection_no_destination">There is no other collection to move these books to.</string>
+    <string name="inspect_selection_limit">You can update up to 500 books at once.</string>
+    <string name="inspect_selection_active_capture">Finish or discard the active capture before changing its collection.</string>
+    <string name="inspect_selection_cloud_pending">Updated on this device. The cloud copy is still pending and will retry when its original account next refreshes Inspect.</string>
+    <plurals name="inspect_selection_cleanup_failed">
+        <item quantity="one">The book was removed, but its local page photos could not be deleted.</item>
+        <item quantity="other">The books were removed, but local page photos for %d books could not be deleted.</item>
+    </plurals>
+    <plurals name="inspect_selection_moved">
+        <item quantity="one">Moved %d book.</item>
+        <item quantity="other">Moved %d books.</item>
+    </plurals>
+    <plurals name="inspect_selection_deleted">
+        <item quantity="one">Deleted %d book.</item>
+        <item quantity="other">Deleted %d books.</item>
+    </plurals>
+    <string name="inspect_selection_failed">The selected books could not all be updated. Refresh and try again.</string>
     <string name="inspect_empty_collections">Create a collection before inspecting a box.</string>
     <string name="inspect_empty_books">No books recorded in this box on this device. Sign in to list what the cloud holds for it.</string>
     <string name="inspect_empty_books_pending">No books recorded in this box on this device, and its cloud listing is not available yet.</string>

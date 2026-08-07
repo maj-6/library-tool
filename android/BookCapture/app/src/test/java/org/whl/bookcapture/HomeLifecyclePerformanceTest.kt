@@ -37,7 +37,7 @@ class HomeLifecyclePerformanceTest {
         assertTrue(releaseThumbnails.contains("dynamicThumbnailBitmaps.clear()"))
 
         assertTrue(source.contains("private fun setDynamicThumbnail(image: ImageView, bitmap: Bitmap)"))
-        assertTrue(source.contains("setDynamicThumbnail(request.image, readyBitmap)"))
+        assertTrue(source.contains("setDynamicThumbnail(image, readyBitmap)"))
     }
 
     @Test
@@ -93,7 +93,8 @@ class HomeLifecyclePerformanceTest {
         assertTrue(thumbnails.contains("loadContext.ensureActive()"))
         assertTrue(thumbnails.contains("THUMBNAIL_LOAD_MUTEX.withLock"))
         assertTrue(thumbnails.contains("request.entry.thumbnailDescriptor()"))
-        assertTrue(thumbnails.contains("!request.image.isAttachedToWindow"))
+        assertTrue(thumbnails.contains("val target = request.image ?: request.swatch"))
+        assertTrue(thumbnails.contains("!target.isAttachedToWindow"))
         assertTrue(thumbnails.contains("decodedBitmap?.takeIf { !it.isRecycled }?.recycle()"))
     }
 

@@ -81,38 +81,118 @@ class InspectResourceContractTest {
     }
 
     @Test
-    fun eachViewModeHasADistinctBookLayoutAndAccessibleDetails() {
-        val layouts = listOf(
-            "src/main/res/layout/item_inspect_tile.xml",
-            "src/main/res/layout/item_inspect_content.xml",
-            "src/main/res/layout/item_inspect_icon.xml",
-        ).map(::xml)
-
-        val signatures = mutableSetOf<String>()
-        layouts.forEach { layout ->
-            val thumbnail = elementById(layout, "inspectThumb")
-            assertEquals("ImageView", thumbnail.tagName)
-            assertTrue(thumbnail.getAttributeNS(androidNs, "contentDescription").isNotBlank())
-            assertNotNull(elementById(layout, "inspectTitle"))
-            assertNotNull(elementById(layout, "inspectSubtitle"))
-
-            val root = layout.documentElement
-            signatures += listOf(
-                root.getAttributeNS(androidNs, "orientation"),
-                root.getAttributeNS(androidNs, "minHeight"),
-                root.getAttributeNS(androidNs, "background"),
-            ).joinToString("|")
-        }
-        assertEquals("Tiles, Content, and Icons must remain visually distinct", 3, signatures.size)
-
-        val detail = elementById(layouts[1], "inspectOpen")
-        assertEquals("androidx.appcompat.widget.AppCompatImageButton", detail.tagName)
-        assertEquals("@string/home_open_details", detail.getAttributeNS(androidNs, "contentDescription"))
-
+    fun inspectLongPressBuildsAnAccessibleMoveDeleteSelection() {
         val source = source("HomeActivity")
-        assertTrue(source.contains("view.setOnClickListener { open() }"))
-        assertTrue(source.contains("view.findViewById<View>(R.id.inspectOpen)?.apply"))
-        assertTrue(source.contains("if (item.current != null) openEntryDetails(summary.entryId)"))
+        val binding = source.substringAfter("private fun bindInspectBook(")
+            .substringBefore("private val inspectActionModeCallback")
+        assertTrue(binding.contains("view.setOnLongClickListener"))
+        assertTrue(binding.contains("selectInspectBook(entryId)"))
+        assertTrue(binding.contains("if (inspectActionMode != null) toggleInspectSelection(entryId)"))
+        assertTrue(binding.contains("AccessibilityActionCompat.ACTION_LONG_CLICK"))
+        assertTrue(binding.contains("R.string.inspect_select_book"))
+
+        val actionMode = source.substringAfter("private val inspectActionModeCallback")
+            .substringBefore("private fun mutateInspectSelection(")
+        assertTrue(actionMode.contains("menu.add(Menu.NONE, MENU_INSPECT_MOVE"))
+        assertTrue(actionMode.contains("menu.add(Menu.NONE, MENU_INSPECT_DELETE"))
+        assertTrue(actionMode.contains("showInspectMoveDialog()"))
+        assertTrue(actionMode.contains("showInspectDeleteConfirmation()"))
+        assertTrue(actionMode.contains("startSupportActionMode(inspectActionModeCallback)"))
+        assertTrue(actionMode.contains("view.isActivated = selected"))
+        assertTrue(actionMode.contains("ViewCompat.setStateDescription("))
+        assertTrue(actionMode.contains("binding.inspectBooks.announceForAccessibility("))
+
+        assertTrue(source.contains("outState.putStringArrayList("))
+        assertTrue(source.contains("STATE_INSPECT_SELECTED_IDS"))
+    }
+
+    @Test
+    fun contentModeIsAnInlineTextTableWithOnlyADecorativeCoverSwatch() {
+        val layout = xml("src/main/res/layout/item_inspect_content.xml")
+        val root = layout.documentElement
+
+        assertEquals("horizontal", root.getAttributeNS(androidNs, "orientation"))
+        assertFalse(elements(layout, "*").any {
+            it.tagName == "ImageView" || it.tagName.endsWith("ImageButton")
+        })
+
+        val swatch = elementById(layout, "inspectCoverSwatch")
+        assertEquals("View", swatch.tagName)
+        assertEquals("8dp", swatch.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("26dp", swatch.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("no", swatch.getAttributeNS(androidNs, "importantForAccessibility"))
+        assertTrue(swatch.getAttributeNS(androidNs, "contentDescription").isEmpty())
+
+        listOf("inspectTitle", "inspectAuthor", "inspectYear").forEach { id ->
+            val field = elementById(layout, id)
+            assertEquals("TextView", field.tagName)
+            assertTrue("$id must be an inline cell", field.parentNode === root)
+            assertEquals("1", field.getAttributeNS(androidNs, "maxLines"))
+            assertEquals("end", field.getAttributeNS(androidNs, "ellipsize"))
+            assertEquals("false", field.getAttributeNS(androidNs, "includeFontPadding"))
+        }
+        assertEquals("0dp", elementById(layout, "inspectTitle")
+            .getAttributeNS(androidNs, "layout_width"))
+        assertTrue(elementById(layout, "inspectTitle")
+            .getAttributeNS(androidNs, "layout_weight").isNotEmpty())
+        assertEquals("0dp", elementById(layout, "inspectAuthor")
+            .getAttributeNS(androidNs, "layout_width"))
+        assertTrue(elementById(layout, "inspectAuthor")
+            .getAttributeNS(androidNs, "layout_weight").isNotEmpty())
+        assertEquals("44dp", elementById(layout, "inspectYear")
+            .getAttributeNS(androidNs, "layout_width"))
+    }
+
+    @Test
+    fun tileModeKeepsTheCompactBookMetrics() {
+        val layout = xml("src/main/res/layout/item_inspect_tile.xml")
+        val root = layout.documentElement
+        assertEquals("2dp", root.getAttributeNS(androidNs, "layout_margin"))
+        assertEquals("72dp", root.getAttributeNS(androidNs, "minHeight"))
+        assertEquals("4dp", root.getAttributeNS(androidNs, "paddingTop"))
+        assertEquals("4dp", root.getAttributeNS(androidNs, "paddingBottom"))
+
+        val thumbnail = elementById(layout, "inspectThumb")
+        assertEquals("ImageView", thumbnail.tagName)
+        assertEquals("42dp", thumbnail.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("58dp", thumbnail.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("6dp", thumbnail.getAttributeNS(androidNs, "layout_marginEnd"))
+        assertEquals("no", thumbnail.getAttributeNS(androidNs, "importantForAccessibility"))
+        assertTrue(thumbnail.getAttributeNS(androidNs, "contentDescription").isEmpty())
+
+        val title = elementById(layout, "inspectTitle")
+        val subtitle = elementById(layout, "inspectSubtitle")
+        listOf(title, subtitle).forEach { text ->
+            assertEquals("false", text.getAttributeNS(androidNs, "includeFontPadding"))
+            assertEquals("0.94", text.getAttributeNS(androidNs, "lineSpacingMultiplier"))
+        }
+        assertEquals("11sp", title.getAttributeNS(androidNs, "textSize"))
+        assertEquals("10sp", subtitle.getAttributeNS(androidNs, "textSize"))
+        assertEquals("1dp", subtitle.getAttributeNS(androidNs, "layout_marginTop"))
+    }
+
+    @Test
+    fun iconModeUsesNormalizedContentAndFixedTextSlots() {
+        val layout = xml("src/main/res/layout/item_inspect_icon.xml")
+        val root = layout.documentElement
+        assertEquals("wrap_content", root.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("116dp", root.getAttributeNS(androidNs, "minHeight"))
+
+        val thumbnail = elementById(layout, "inspectThumb")
+        assertEquals("ImageView", thumbnail.tagName)
+        assertEquals("50dp", thumbnail.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("68dp", thumbnail.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("no", thumbnail.getAttributeNS(androidNs, "importantForAccessibility"))
+        assertTrue(thumbnail.getAttributeNS(androidNs, "contentDescription").isEmpty())
+
+        val title = elementById(layout, "inspectTitle")
+        val subtitle = elementById(layout, "inspectSubtitle")
+        assertEquals("2", title.getAttributeNS(androidNs, "lines"))
+        assertEquals("1", subtitle.getAttributeNS(androidNs, "lines"))
+        assertEquals("false", title.getAttributeNS(androidNs, "includeFontPadding"))
+        assertEquals("false", subtitle.getAttributeNS(androidNs, "includeFontPadding"))
+        assertEquals("0.94", title.getAttributeNS(androidNs, "lineSpacingMultiplier"))
+        assertEquals("10sp", subtitle.getAttributeNS(androidNs, "textSize"))
     }
 
     @Test

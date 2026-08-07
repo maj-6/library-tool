@@ -34,7 +34,14 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "docs" / "cloud" / "migra
 # The expected tables and their columns come out of the migrations' DDL
 # (expected_schema below) — one source of truth. Views are few enough to
 # name by hand: view -> the columns its consumers select.
-VIEWS = {"author_index": ["author", "work_count"]}
+VIEWS = {
+    "author_index": ["author", "work_count"],
+    "capture_collection_inventory": [
+        "id", "created_by", "created_at", "original_collection_id",
+        "collection_id", "collection_name", "title", "author", "year",
+        "photo_count", "removed", "membership_revision",
+    ],
+}
 BUCKETS = {
     "captures": False,
     "capture-derivatives": False,
@@ -62,7 +69,8 @@ ANON_CAN = [
 ANON_CANNOT = [
     "profiles", "events", "captures", "photo_processing_jobs", "passages",
     "collections", "android_ui_publishers", "capture_book_metadata",
-    "capture_reviews", "capture_corrections",
+    "capture_reviews", "capture_corrections", "capture_collection_state",
+    "capture_collection_inventory",
 ]
 
 
@@ -104,7 +112,13 @@ _DROP_RE = re.compile(
     r"drop column (?:if exists )?(\w+)"
 )
 _IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*")
-_CONSTRAINTS = {"primary", "unique", "check", "foreign", "constraint", "like"}
+_CONSTRAINTS = {
+    "primary", "unique", "check", "foreign", "constraint", "like",
+    # Continuation lines in table-level foreign-key declarations are not
+    # columns. Keep the lightweight DDL reader honest without requiring every
+    # constraint to fit on one line.
+    "references", "deferrable",
+}
 
 
 def expected_schema(sql: str) -> dict[str, set[str]]:
