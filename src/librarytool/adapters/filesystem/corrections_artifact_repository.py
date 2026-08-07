@@ -3599,14 +3599,18 @@ class FilesystemCorrectionsArtifactRepository(
                     or bool(raw_geometry)
                 )
             )
+            # The projected display is the import derivative whenever a
+            # desktop import ran (display_ref/display_sha prefer the import
+            # row above), so geometry readiness must pin against the same
+            # bytes â€” not the phone's own display rendition, which the
+            # desktop derivation replaced.
             geometry_source_ready = (
                 display_observation.state is ResourceState.AVAILABLE
                 and (
                     not imported
                     or (
-                        bool(_sha256(display.get("sha256")))
-                        and display_observation.content_sha256
-                        == _sha256(display.get("sha256"))
+                        bool(display_sha)
+                        and display_observation.content_sha256 == display_sha
                     )
                 )
             )
@@ -3622,6 +3626,8 @@ class FilesystemCorrectionsArtifactRepository(
                     original=original,
                     display=display,
                     original_sha256=_sha256(original.get("sha256")),
+                    display_sha256=display_sha,
+                    imported=bool(imported),
                     display_dimensions=display_observation.dimensions,
                     source=SpatialSourceRef(
                         display_source.representation_id,
@@ -3711,6 +3717,8 @@ class FilesystemCorrectionsArtifactRepository(
         original: Mapping[str, Any],
         display: Mapping[str, Any],
         original_sha256: str,
+        display_sha256: str = "",
+        imported: bool = False,
         display_dimensions: RasterDimensions,
         source: SpatialSourceRef,
         display_artifact_id: str,
@@ -3763,11 +3771,101 @@ class FilesystemCorrectionsArtifactRepository(
                 _public_text(geometry.get("model"), maximum=120),
             )
         )
+        # Desktop-remapped records pin themselves to a display derivative by
+        # content hash; process them first so a phone-frame record that no
+        # longer describes the projected display can be skipped without a
+        # misleading staleness diagnostic.
+        geometries.sort(
+            key=lambda geometry: 0 if _sha256(
+                geometry.get("display_sha256")) else 1,
+        )
+        accepted_pinned = False
+        unprojected_phone_frame = False
         for geometry_index, geometry in enumerate(geometries):
             geometry_width = _non_negative_integer(geometry.get("width")) or 0
             geometry_height = _non_negative_integer(geometry.get("height")) or 0
             geometry_sha256 = _sha256(geometry.get("source_sha256"))
-            if (
+            record_display_sha = _sha256(geometry.get("display_sha256"))
+            if record_display_sha:
+                # Pinned to a specific derivative. A different hash means the
+                # record describes another rendition generation â€” not ours,
+                # and not an integrity problem.
+                if (
+                    not display_sha256
+                    or record_display_sha != display_sha256
+                ):
+                    continue
+                if (
+                    geometry.get("asset_id") != asset_id
+                    or geometry.get("coordinate_space")
+                    != "display_normalized"
+                    or (original_sha256 and geometry_sha256 != original_sha256)
+                    or (
+                        display_width
+                        and geometry_width
+                        and geometry_width != display_width
+                    )
+                    or (
+                        display_height
+                        and geometry_height
+                        and geometry_height != display_height
+                    )
+                    or geometry.get("orientation") != display_orientation
+                ):
+                    diagnostics.add("capture_geometry_stale")
+                    continue
+                accepted_pinned = True
+            elif imported:
+                # A phone-frame record describes the phone's own rendition.
+                # After a desktop import it projects only when the granted
+                # display provably IS that rendition (content hash match) â€”
+                # dimensions alone cannot distinguish a re-encode from a
+                # same-sized warp. Otherwise a desktop-pinned remap record
+                # owns this display; when none exists the geometry is real
+                # but unprojectable, which the unavailable diagnostic below
+                # reports.
+                if accepted_pinned:
+                    continue
+                if (
+                    not display_sha256
+                    or _sha256(display.get("sha256")) != display_sha256
+                ):
+                    unprojected_phone_frame = True
+                    continue
+                if (
+                    geometry.get("asset_id") != asset_id
+                    or geometry.get("coordinate_space")
+                    != "display_normalized"
+                    or _positive_integer(geometry.get("source_revision"))
+                    != original_revision
+                    or _positive_integer(geometry.get("display_revision"))
+                    != display_revision
+                    or (original_sha256 and geometry_sha256 != original_sha256)
+                    or (
+                        declared_display_width
+                        and geometry_width
+                        and geometry_width != declared_display_width
+                    )
+                    or (
+                        declared_display_height
+                        and geometry_height
+                        and geometry_height != declared_display_height
+                    )
+                    or (
+                        display_width
+                        and geometry_width
+                        and geometry_width != display_width
+                    )
+                    or (
+                        display_height
+                        and geometry_height
+                        and geometry_height != display_height
+                    )
+                    or geometry.get("orientation") != display_orientation
+                ):
+                    diagnostics.add("capture_geometry_stale")
+                    continue
+            elif (
                 geometry.get("asset_id") != asset_id
                 or geometry.get("coordinate_space") != "display_normalized"
                 or _positive_integer(geometry.get("source_revision"))
@@ -3951,6 +4049,12 @@ class FilesystemCorrectionsArtifactRepository(
                         extensions=extensions,
                     )
                 )
+        if unprojected_phone_frame and not values:
+            # Real phone geometry exists but no record describes the display
+            # actually granted (the desktop derivative). The remap backfill
+            # (tools/backfill_capture_geometry.py) or a re-import resolves
+            # this.
+            diagnostics.add("capture_geometry_unavailable")
         return tuple(values), tuple(sorted(diagnostics))
 
     def _capture_assignments(

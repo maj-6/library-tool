@@ -348,6 +348,110 @@ def process_photo(img_bytes: bytes) -> bytes:
     return standardize(perspective_correct(img_bytes))
 
 
+def process_photo_traced(img_bytes: bytes) -> tuple[bytes, dict]:
+    """``process_photo`` plus a trace of the exact transform it applied.
+
+    The trace lets callers carry phone OCR geometry across the derivation
+    (see ``librarytool.processing.capture_geometry``):
+
+      {"quad": [[x, y] * 4] | None,   # TL/TR/BR/BL warp quad, upright pixels
+       "source_size": (w, h),         # upright size the detector measured
+       "warp_size": (w, h) | None,    # warp output size before standardize
+       "exif_orientation": 1..8,      # EXIF tag of the input (informational)
+       "final_size": (w, h)}          # size of the returned JPEG
+
+    Every size and coordinate here lives in EXIF-UPRIGHT space, because
+    every stage of the derivation does: ``cv2.imdecode`` applies the EXIF
+    orientation itself (verified on OpenCV 5.0 — pass
+    ``IMREAD_IGNORE_ORIENTATION`` to get the stored grid instead), so the
+    detector's quad is already upright, and ``standardize`` reaches the
+    same frame through ``ImageOps.exif_transpose``. Coordinates therefore
+    need no orientation correction anywhere in the remap.
+
+    The returned bytes are byte-identical to ``process_photo``'s: the same
+    detector, warp kernel, and standardize encode run in the same order.
+    """
+    from librarytool.processing import capture_geometry as _capture_geometry
+
+    quad = find_page_quad(img_bytes)
+    warp_size = None
+    if quad is not None:
+        width, height = _capture_geometry.capture_warp_destination_size(quad)
+        # apply_capture_pixel_perspective_compat refuses tiny outputs and
+        # returns the original bytes; mirror that so the trace stays honest.
+        if width < 200 or height < 200:
+            quad, warp_size = None, None
+        else:
+            warp_size = (width, height)
+    # The bytes come from process_photo itself — the one seam tests and
+    # callers already own — so the trace can never describe a different
+    # derivation than the stored copy. Detection runs once more inside it;
+    # that only happens at import time.
+    final = process_photo(img_bytes)
+    if final == img_bytes:
+        # Identity output (a stubbed pipeline): no derivation happened, so
+        # the trace must not claim one.
+        quad, warp_size = None, None
+    from PIL import Image, ImageOps
+    with Image.open(io.BytesIO(final)) as image:
+        final_size = image.size
+    # exif_transpose, not the stored size: the quad above came from cv2,
+    # which already applied the EXIF orientation, so the frame the quad
+    # indexes is the upright one.
+    with Image.open(io.BytesIO(img_bytes)) as image:
+        source_size = ImageOps.exif_transpose(image).size
+    return final, {
+        "quad": None if quad is None else [
+            [float(x), float(y)] for x, y in
+            (quad.tolist() if hasattr(quad, "tolist") else quad)
+        ],
+        "source_size": source_size,
+        "warp_size": warp_size,
+        "exif_orientation": _capture_geometry.jpeg_exif_orientation(img_bytes),
+        "final_size": final_size,
+    }
+
+
+def remap_phone_geometry_for_import(
+        asset_geometry: list, trace: dict, derivative_sha256: str) -> list:
+    """Desktop-pinned geometry records for one imported asset, or [].
+
+    ``asset_geometry`` is the phone contract's per-asset geometry list;
+    ``trace`` comes from ``process_photo_traced``.  Records that already
+    carry a ``display_sha256`` pin are phone-frame-independent and are never
+    duplicated.
+    """
+    from librarytool.processing import capture_geometry as _capture_geometry
+
+    results = []
+    final_width, final_height = trace["final_size"]
+    for geometry in asset_geometry or []:
+        if not isinstance(geometry, dict) or geometry.get("display_sha256"):
+            continue
+        regions = geometry.get("regions")
+        if not isinstance(regions, list) or not regions:
+            continue
+        try:
+            remapped, _dropped = _capture_geometry.remap_phone_regions(
+                regions,
+                source_size=trace.get("source_size") or (0, 0),
+                quad=trace.get("quad"),
+                warp_size=trace.get("warp_size"),
+            )
+            if not remapped:
+                continue
+            results.append(_capture_geometry.desktop_display_geometry_record(
+                geometry,
+                regions=remapped,
+                display_width=final_width,
+                display_height=final_height,
+                display_sha256=derivative_sha256,
+            ))
+        except (ValueError, TypeError, KeyError):
+            continue
+    return results
+
+
 def process_capture(photo_bytes_list: list[bytes], api_key: str) -> dict:
     """All photos of one capture -> processed copies + extracted bibliography.
 
@@ -356,17 +460,19 @@ def process_capture(photo_bytes_list: list[bytes], api_key: str) -> dict:
     reported, not raised — the photos still import so nothing is lost.
     """
     photos: list[bytes] = []
+    traces: list[dict | None] = []
     texts: list[str] = []
     errors: list[str] = []
     if not api_key:
         errors.append("OCR skipped (no Mistral API key configured)")
     for i, raw in enumerate(photo_bytes_list, 1):
         try:
-            processed = process_photo(raw)
+            processed, trace = process_photo_traced(raw)
         except Exception as exc:
-            processed = raw
+            processed, trace = raw, None
             errors.append(f"photo {i}: processing failed ({type(exc).__name__})")
         photos.append(processed)
+        traces.append(trace)
         if not api_key:
             continue
         # one retry: a transient 429/5xx/network blip must not permanently
@@ -398,7 +504,7 @@ def process_capture(photo_bytes_list: list[bytes], api_key: str) -> dict:
             fields = got
         except Exception as exc:
             errors.append(f"extraction failed ({type(exc).__name__}: {exc})")
-    return {"photos": photos, "ocr_text": ocr_text,
+    return {"photos": photos, "photo_traces": traces, "ocr_text": ocr_text,
             "fields": fields, "extra": extra, "errors": errors}
 
 

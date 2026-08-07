@@ -298,6 +298,7 @@
           Array.isArray(options.initialExpandedGroups)
             ? options.initialExpandedGroups : []);
         this.expandedGroups = new Set(this.initialExpanded);
+        this.revealedArchives = new Set();
         this.groupStates = new Map(deps.ARTIFACT_GROUPS.map((group) =>
           [group.id, emptyGroupState()]));
         this.items = new Map();
@@ -422,12 +423,16 @@
         this.abortSelectionWork();
         this.context = context;
         this.expandedGroups = new Set(this.initialExpanded);
+        this.revealedArchives = new Set();
         this.resetGroups();
         this.activeKey = "";
         this.selectedKey = "";
         this.hotKey = "";
         this.relatedKeys.clear();
-        this.detailCache.clear();
+        // The detail cache survives book switches on purpose: entries are
+        // keyed by item, key, and revision, so returning to a reviewed book
+        // reuses its details instead of refetching them. refresh() still
+        // drops the cache when the index revision moves.
         this.detailInflight.clear();
         this.publishResource(null);
         this.emitSelection(null);
@@ -589,8 +594,15 @@
         }
       }
 
+      // Cache keys carry the owning item id: the cache now outlives a single
+      // book context, and bare artifact keys could collide across books.
+      detailCacheKey(itemId, key, revision) {
+        return `${itemId}|${key}@${revision}`;
+      }
+
       cacheDetail(detail) {
-        const cacheKey = `${detail.key}@${detail.revision}`;
+        const cacheKey = this.detailCacheKey(
+          detail.itemId, detail.key, detail.revision);
         if (this.detailCache.has(cacheKey)) this.detailCache.delete(cacheKey);
         this.detailCache.set(cacheKey, detail);
         while (this.detailCache.size > DETAIL_CACHE_LIMIT) {
@@ -602,7 +614,8 @@
         if (!this.context || !key) return null;
         const summary = this.items.get(key);
         const revision = summary && summary.revision || "";
-        const cacheKey = `${key}@${revision}`;
+        const cacheKey = this.detailCacheKey(
+          summary && summary.itemId || this.context.itemId, key, revision);
         if (!options.force && this.detailCache.has(cacheKey)) {
           return this.detailCache.get(cacheKey);
         }
@@ -681,7 +694,14 @@
         this.activeKey = row.key;
         if (row.type === "group") await this.toggleGroup(row.group);
         else if (row.type === "more") await this.loadGroup(row.group);
+        else if (row.type === "archived") this.toggleArchived(row.group);
         else if (row.type === "item") await this.select(row.key, { focus: true });
+        this.render();
+      }
+
+      toggleArchived(group) {
+        if (this.revealedArchives.has(group)) this.revealedArchives.delete(group);
+        else this.revealedArchives.add(group);
         this.render();
       }
 
@@ -778,6 +798,7 @@
           event.preventDefault();
           if (row.type === "group") await this.toggleGroup(row.group);
           else if (row.type === "more") await this.loadGroup(row.group);
+          else if (row.type === "archived") this.toggleArchived(row.group);
           else if (row.type === "item") await this.select(row.key);
         }
       }
@@ -847,6 +868,14 @@
           node.setAttribute("aria-selected", String(row.key === this.selectedKey));
           if (this.relatedKeys.has(row.key)) node.dataset.linked = "true";
           if (row.key === this.hotKey) node.dataset.hot = "true";
+          if (row.archived) node.dataset.archived = "true";
+        }
+        if (row.type === "archived") {
+          node.setAttribute("aria-expanded", String(row.revealed === true));
+          node.setAttribute(
+            "aria-label",
+            `${row.label} — kept for audit, hidden from the working set`,
+          );
         }
         if (row.key === this.activeKey) node.dataset.active = "true";
 
@@ -880,7 +909,8 @@
 
       render() {
         if (!this.documentRef || this.destroyed) return;
-        this.rows = deps.buildArtifactTreeRows(this.groupStates, this.expandedGroups);
+        this.rows = deps.buildArtifactTreeRows(
+          this.groupStates, this.expandedGroups, this.revealedArchives);
         if (this.activeKey && !this.rows.some((row) => row.key === this.activeKey &&
             !row.disabled)) this.activeKey = "";
         if (!this.activeKey) {

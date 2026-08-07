@@ -66,6 +66,31 @@
   cursor: not-allowed;
 }
 
+/* Archived artifacts leave the working set but stay one reveal away. The
+   toggle row and revealed items stay deliberately quiet — thin, muted,
+   no pill treatment. */
+.artifact-tree-archived {
+  color: var(--ink-muted, #b4bdb2);
+  font-style: italic;
+}
+
+.artifact-tree-archived::before {
+  width: 10px;
+  flex: 0 0 10px;
+  color: var(--ink-faint, #778076);
+  content: "\203A";
+  font-size: 13px;
+}
+
+.artifact-tree-archived[aria-expanded="true"]::before {
+  transform: rotate(90deg);
+}
+
+.artifact-tree-row[data-archived="true"] {
+  border-left: 2px solid var(--ink-faint, #778076);
+  opacity: 0.62;
+}
+
 .artifact-tree-group::before {
   width: 10px;
   flex: 0 0 10px;
@@ -320,8 +345,8 @@
   border: 1px solid var(--line, #3e493f);
   border-radius: 3px;
   outline: 0;
-  background: #101411;
-  color: var(--ink, #edf1eb);
+  background: var(--input-bg);
+  color: var(--input-ink);
   font: 11px/1.45 inherit;
 }
 
@@ -355,15 +380,15 @@
 }
 
 .item-metadata-message.is-replayed {
-  border-color: #86a9d6;
+  border-color: var(--accent-strong, #86a9d6);
   background: rgb(67 91 126 / 22%);
-  color: #d5e2f3;
+  color: var(--ink);
 }
 
 .item-metadata-message.property-error {
-  border-color: #d98370;
+  border-color: var(--danger, #d98370);
   background: rgb(136 73 61 / 22%);
-  color: #f2d2cb;
+  color: var(--error-text, #f2d2cb);
 }
 
 .item-metadata-retry {
@@ -371,8 +396,8 @@
   padding: 5px 8px;
   border: 1px solid var(--line, #3e493f);
   border-radius: 3px;
-  background: #222a23;
-  color: var(--ink, #edf1eb);
+  background: var(--face-hi);
+  color: var(--ink);
   font: inherit;
 }
 

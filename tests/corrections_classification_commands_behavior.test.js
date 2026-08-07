@@ -121,6 +121,8 @@ function harness(options = {}) {
     port,
     history: options.history,
     resolveLinkedArtifact: options.resolveLinkedArtifact,
+    transformContract: options.transformContract,
+    serializeTransformCommand: options.serializeTransformCommand,
     refreshTarget: options.refreshTarget,
     promoteSoftTarget: options.promoteSoftTarget,
     onTarget: options.onTarget,
@@ -619,7 +621,7 @@ test("manuscript, stamp, and damage assign their open-vocabulary region roles", 
       ["Mark region as damage", "DMG", "d"],
     ],
   );
-  assert.equal(controller.registry.list().length, 9,
+  assert.equal(controller.registry.list().length, 11,
     "the new default bindings register without a KeyBindingConflictError");
 
   for (const key of ["n", "p", "d"]) {
@@ -752,4 +754,320 @@ test("#235 modules install in dependency order through the browser namespace", (
     exported.CLASSIFICATION_COMMAND_IDS.marginalia,
     "corrections.role.marginalia",
   );
+});
+
+
+test("regionExtractQuad pads and orders the region bounding box", () => {
+  const {
+    regionExtractQuad,
+  } = require("../tools/whl_explorer/static/corrections/commands");
+  const quad = regionExtractQuad({
+    selector: {
+      coordinate_space: "display_normalized",
+      points: [
+        { x: 0.2, y: 0.3 },
+        { x: 0.4, y: 0.3 },
+        { x: 0.4, y: 0.35 },
+        { x: 0.2, y: 0.35 },
+      ],
+    },
+  });
+  const expected = [
+    [0.18, 0.28],
+    [0.42, 0.28],
+    [0.42, 0.37],
+    [0.18, 0.37],
+  ];
+  quad.forEach((point, index) => {
+    assert.ok(Math.abs(point[0] - expected[index][0]) < 1e-9);
+    assert.ok(Math.abs(point[1] - expected[index][1]) < 1e-9);
+  });
+  // A hairline region still yields a quad above the engine's minimum
+  // extent, and edges clamp inside the unit square.
+  const hairline = regionExtractQuad({
+    polygon: [[0, 0], [0.0005, 0], [0.0005, 0.0004]],
+  });
+  assert.ok(hairline);
+  assert.ok(hairline[1][0] - hairline[0][0] >= 0.004);
+  assert.ok(hairline[3][1] - hairline[0][1] >= 0.004);
+  for (const [x, y] of hairline) {
+    assert.ok(x >= 0 && x <= 1 && y >= 0 && y <= 1);
+  }
+  assert.equal(regionExtractQuad({ selector: { points: [] } }), null);
+  assert.equal(regionExtractQuad({}), null);
+});
+
+
+test("x extracts the hovered region through the transform queue", async () => {
+  const {
+    serializeCorrectionTransformCommand,
+  } = require("../tools/whl_explorer/static/corrections/image-editor-state");
+  const statuses = [];
+  const pins = {
+    item_id: "book-1",
+    artifact_id: "figure-1",
+    artifact_revision: "artifact:r1",
+    source_revision: "bytes:r1",
+    source_sha256: "ab".repeat(32),
+  };
+  const calls = [];
+  const port = {
+    async queueTransform({ command }) {
+      calls.push(command);
+      return {
+        operation_id: command.operation_id,
+        job: { state: "queued" },
+      };
+    },
+    async assignRegionRole() {
+      throw new Error("extraction must not use the role endpoint");
+    },
+  };
+  const { controller } = harness({
+    port,
+    transformContract: (target) => {
+      assert.equal(target.id, "region-1");
+      return pins;
+    },
+    serializeTransformCommand: serializeCorrectionTransformCommand,
+    onError(error) {
+      throw error;
+    },
+  });
+  controller.setHotTarget(annotation({
+    selector: {
+      coordinate_space: "display_normalized",
+      points: [
+        { x: 0.25, y: 0.4 },
+        { x: 0.55, y: 0.4 },
+        { x: 0.55, y: 0.5 },
+        { x: 0.25, y: 0.5 },
+      ],
+    },
+    linked_artifact_ids: ["figure-1"],
+  }));
+  await controller.invoke("corrections.region.extract", { source: "test" });
+  assert.equal(calls.length, 1);
+  const wire = calls[0];
+  assert.equal(wire.schema, "org.whl.correction-transform-command");
+  assert.equal(wire.item_id, "book-1");
+  assert.equal(wire.artifact_id, "figure-1");
+  assert.equal(wire.artifact_revision, "artifact:r1");
+  assert.equal(wire.source_sha256, "ab".repeat(32));
+  assert.equal(wire.rerun_ocr, true);
+  assert.equal(wire.adjustment, null);
+  assert.ok(wire.operation_id.startsWith("op-extract-"));
+  assert.deepEqual(wire.quad, [
+    [0.23, 0.38],
+    [0.5700000000000001, 0.38],
+    [0.5700000000000001, 0.52],
+    [0.23, 0.52],
+  ]);
+});
+
+
+test("region extraction requires the region's image open in the editor", async () => {
+  const {
+    serializeCorrectionTransformCommand,
+  } = require("../tools/whl_explorer/static/corrections/image-editor-state");
+  const port = {
+    async queueTransform() {
+      throw new Error("must not queue without a source contract");
+    },
+  };
+  const errors = [];
+  const { controller } = harness({
+    port,
+    transformContract: () => null,
+    serializeTransformCommand: serializeCorrectionTransformCommand,
+    onError(error) {
+      errors.push(error);
+    },
+  });
+  controller.setHotTarget(annotation({
+    selector: {
+      points: [
+        { x: 0.1, y: 0.1 },
+        { x: 0.2, y: 0.1 },
+        { x: 0.2, y: 0.2 },
+      ],
+    },
+  }));
+  await assert.rejects(
+    controller.invoke("corrections.region.extract", { source: "test" }),
+    (error) => error.code === "transform_source_required",
+  );
+});
+
+
+test("region extraction stays unavailable without a transform queue port", () => {
+  const { controller } = harness({});
+  controller.setHotTarget(annotation({
+    selector: {
+      points: [
+        { x: 0.1, y: 0.1 },
+        { x: 0.2, y: 0.1 },
+        { x: 0.2, y: 0.2 },
+      ],
+    },
+  }));
+  assert.equal(
+    controller.registry.canInvoke(
+      "corrections.region.extract",
+      controller.commandContext("test"),
+    ),
+    false,
+  );
+});
+
+
+test("v archives the image as a metadata assertion and toggles back", async () => {
+  const statuses = [];
+  const calls = [];
+  const port = {
+    async assertArtifactMetadata(payload) {
+      calls.push(payload);
+      return {
+        receipt: {
+          inverse: {
+            action: "metadata.assert",
+            expected_targets: [],
+            payload: {},
+          },
+        },
+      };
+    },
+  };
+  const { controller } = harness({ port });
+  const statusesController = createClassificationController({
+    scope: new FakeNode("main", fakeDocument()),
+    documentRef: fakeDocument(),
+    port,
+    onStatus: (message) => statuses.push(message),
+    operationIdFactory: (prefix) => `op-${prefix}-1`,
+  });
+
+  statusesController.setSelectionTarget(image());
+  await statusesController.invoke(
+    "corrections.image.archive", { source: "test" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].itemId, "book-1");
+  assert.equal(calls[0].artifactId, "scan-1");
+  assert.equal(calls[0].expectedArtifactRevision, "scan-r1");
+  assert.equal(calls[0].assertions.archived, true);
+  assert.ok(typeof calls[0].assertions.archived_at === "string");
+  assert.deepEqual(calls[0].clearNames, []);
+  assert.match(statuses.at(-1), /archived — same key or undo restores it/);
+
+  statusesController.setSelectionTarget(image({
+    metadata_assertions: [
+      { name: "archived", value: true, origin: "manual" },
+    ],
+  }));
+  await statusesController.invoke(
+    "corrections.image.archive", { source: "test" });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].assertions, {});
+  // Restoring clears both names the archive asserted; leaving ``archived_at``
+  // behind would strand a stale orphan assertion on a restored image.
+  assert.deepEqual(calls[1].clearNames, ["archived", "archived_at"]);
+  assert.match(statuses.at(-1), /restored to the capture set/);
+  void controller;
+});
+
+
+test("the archive toggle reads archived state from the published target", async () => {
+  const calls = [];
+  const port = {
+    async assertArtifactMetadata(payload) {
+      calls.push(payload);
+      return { receipt: { targets: [] } };
+    },
+  };
+  // The Books panel publishes a lean capture row: authoritative identity and
+  // revision, but no metadata assertions. An archived capture published that
+  // way used to re-assert ``archived`` forever, so the documented "same key
+  // restores it" toggle never fired from the panel reviewers actually use.
+  const booksTarget = {
+    key: "artifact:scan-1",
+    objectType: "raster-artifact",
+    family: "image",
+    group: "source-images",
+    kind: "capture",
+    itemId: "book-1",
+    id: "scan-1",
+    artifactId: "scan-1",
+    revision: "scan-r1",
+    label: "Capture 1",
+  };
+  const controller = createClassificationController({
+    scope: new FakeNode("main", fakeDocument()),
+    documentRef: fakeDocument(),
+    port,
+    operationIdFactory: (prefix) => `op-${prefix}-1`,
+  });
+
+  controller.setSelectionTarget(booksTarget);
+  await controller.invoke("corrections.image.archive", { source: "test" });
+  assert.equal(calls[0].assertions.archived, true,
+    "a lean target with nothing archived still archives");
+
+  // The shell tops the same lean row up from the artifacts feature before
+  // publishing it (classificationTargetMetadata); with the assertions present
+  // the very same key restores instead of re-archiving.
+  controller.setSelectionTarget({
+    ...booksTarget,
+    metadataAssertions: [
+      { name: "archived", value: true, origin: "manual" },
+      { name: "archived_at", value: "2026-08-05T00:00:00Z", origin: "manual" },
+    ],
+  });
+  await controller.invoke("corrections.image.archive", { source: "test" });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].assertions, {});
+  assert.deepEqual(calls[1].clearNames, ["archived", "archived_at"]);
+});
+
+
+test("no default classification key is swallowed by the image editor", () => {
+  const {
+    DEFAULT_CLASSIFICATION_COMMANDS,
+  } = require("../tools/whl_explorer/static/corrections/commands");
+  const {
+    canEnterImageAdjust,
+  } = require("../tools/whl_explorer/static/corrections/image-adjust-tool");
+
+  const archive = DEFAULT_CLASSIFICATION_COMMANDS.find(
+    (command) => command.id === "corrections.image.archive");
+  assert.equal(archive.defaultBinding, "v");
+
+  // The editor's Image Adjust entry shortcut lives on a deeper node and calls
+  // stopPropagation, so any classification key it also claims never reaches
+  // the keymap while the canvas holds focus. Binding archive to ``a`` made it
+  // silently switch tools instead of archiving.
+  for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+    assert.equal(
+      canEnterImageAdjust({
+        key: command.defaultBinding,
+        canvasFocused: true,
+        canvasTarget: true,
+      }, {}),
+      false,
+      `${command.id} is swallowed by the Image Adjust shortcut`,
+    );
+  }
+  assert.equal(
+    canEnterImageAdjust({ key: "a", canvasFocused: true, canvasTarget: true }, {}),
+    true,
+    "the editor still owns a bare a; the guard above would pass vacuously",
+  );
+
+  // Books navigation owns j/k, and no two classification commands may share.
+  const bindings = DEFAULT_CLASSIFICATION_COMMANDS.map(
+    (command) => command.defaultBinding);
+  assert.equal(new Set(bindings).size, bindings.length);
+  for (const taken of ["j", "k"]) {
+    assert.equal(bindings.includes(taken), false,
+      `${taken} belongs to the Books navigation commands`);
+  }
 });

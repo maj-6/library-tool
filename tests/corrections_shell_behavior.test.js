@@ -3188,3 +3188,201 @@ test("shell styles and controllers cover compact and reduced-motion operation", 
   assert.match(shellSource, /workbenches\.onContext/);
   assert.doesNotMatch(shellSource, /innerHTML|window\.correctionsState|app\.js/);
 });
+
+
+test("lean Books targets borrow archived state from the artifacts feature", () => {
+  // ``captureCommandTarget`` in books.js publishes identity and revision only.
+  // The archive command decides archive-vs-restore from metadata assertions,
+  // so without this top-up an already-archived capture selected from Books
+  // re-asserts ``archived`` and the toggle never restores.
+  const booksTarget = Object.freeze({
+    key: "artifact:capture-1",
+    objectType: "raster-artifact",
+    family: "image",
+    group: "source-images",
+    kind: "capture",
+    itemId: "book-1",
+    id: "capture-1",
+    artifactId: "capture-1",
+    revision: "capture-r1",
+    label: "Capture 1",
+  });
+  const archived = Object.freeze([
+    Object.freeze({ name: "archived", value: true, origin: "manual" }),
+    Object.freeze({
+      name: "archived_at",
+      value: "2026-08-05T00:00:00Z",
+      origin: "manual",
+    }),
+  ]);
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.artifactsFeature = {
+    items: new Map([["artifact:capture-1", {
+      key: "artifact:capture-1",
+      objectType: "raster-artifact",
+      itemId: "book-1",
+      id: "capture-1",
+      revision: "capture-r1",
+      metadataAssertions: archived,
+    }]]),
+  };
+
+  const enriched = shell.classificationTargetMetadata(booksTarget);
+  assert.notEqual(enriched, booksTarget);
+  assert.deepEqual(enriched.metadataAssertions, archived);
+  assert.equal(enriched.revision, "capture-r1",
+    "the top-up borrows assertions only; identity and revision stay Books'");
+  assert.equal(enriched.artifactId, "capture-1");
+
+  // A target that already carries assertions is returned untouched, so the
+  // artifacts tree keeps publishing the exact decoded item it selected.
+  const decoded = Object.freeze({
+    key: "artifact:capture-1",
+    itemId: "book-1",
+    id: "capture-1",
+    metadataAssertions: Object.freeze([]),
+  });
+  assert.equal(shell.classificationTargetMetadata(decoded), decoded);
+
+  // Nothing to borrow from leaves the target alone rather than inventing one.
+  assert.equal(
+    shell.classificationTargetMetadata(Object.freeze({
+      key: "artifact:capture-9",
+      itemId: "book-1",
+      id: "capture-9",
+    })).metadataAssertions,
+    undefined,
+  );
+  assert.equal(shell.classificationTargetMetadata(null), null);
+
+  // The Books publication paths all route through the top-up.
+  const published = [];
+  shell.classificationController = {
+    stateSnapshot: () => ({ selectionTarget: null }),
+    setSelectionTarget(target) {
+      published.push(target);
+      return target;
+    },
+  };
+  shell.publishClassificationSelectionTarget(booksTarget, { source: "books" });
+  assert.deepEqual(published[0].metadataAssertions, archived);
+});
+
+
+test("region extraction refuses a region linked to another open image", () => {
+  // ``decodeArtifactSummary`` folds every link shape into ``linkedKeys``; the
+  // raw ``linked_artifact_ids`` wire name does not survive decoding, so a
+  // guard reading only the wire names saw no links on a decoded target and
+  // waved cross-image extractions through.
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.state = {
+    resource: { correction: { artifact_id: "figure-1", item_id: "book-1" } },
+  };
+
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-1",
+      linkedKeys: Object.freeze(["artifact:figure-1"]),
+    }),
+    shell.state.resource.correction,
+    "a decoded region linked to the open image extracts",
+  );
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-2",
+      linkedKeys: Object.freeze(["artifact:figure-2"]),
+    }),
+    null,
+    "a decoded region linked elsewhere cannot crop the open image",
+  );
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-3",
+      linkedKeys: Object.freeze([]),
+    }),
+    shell.state.resource.correction,
+    "a link-free legacy region still uses the open resource",
+  );
+
+  // The raw wire shapes the overlay publishes keep working.
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-4",
+      linked_artifact_ids: ["figure-1"],
+    }),
+    shell.state.resource.correction,
+  );
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-5",
+      linked_artifact_ids: ["figure-2"],
+    }),
+    null,
+  );
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-6",
+      linkedArtifactId: "figure-2",
+    }),
+    null,
+  );
+
+  shell.state = { resource: {} };
+  assert.equal(
+    shell.classificationTransformContract({ linkedKeys: [] }), null,
+    "no open correction resource means nothing to crop",
+  );
+});
+
+
+test("capture geometry is drawn without re-applying the display orientation", () => {
+  // capture_geometry normalizes against the EXIF-upright display: cv2
+  // applies the orientation when it decodes and Pillow's exif_transpose
+  // reaches the same frame. Re-applying the declared orientation here
+  // would rotate every box off the text on a rotated capture. Rendering
+  // the same region in a space already known to be upright pins that.
+  const render = (coordinateSpace) => {
+    const documentRef = fakeDocument();
+    const stage = new FakeNode("div", documentRef);
+    const image = new FakeNode("img", documentRef);
+    stage.append(image);
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      documentRef,
+      windowRef: {},
+      classificationController: null,
+    });
+    shell.mountArtifactOverlay({ image }, {
+      summary: { itemId: "book-1" },
+      coordinateSpace,
+      // A display that declares a rotation is exactly the case the old
+      // whitelist mishandled.
+      dimensions: { width: 100, height: 200, orientation: 6 },
+      regions: [{
+        annotation_id: "capture-region:abc",
+        object_type: "spatial-annotation",
+        revision: "region-r1",
+        selector: {
+          coordinate_space: coordinateSpace,
+          points: [
+            { x: 0.1, y: 0.1 }, { x: 0.5, y: 0.1 }, { x: 0.5, y: 0.4 },
+          ],
+        },
+      }],
+    });
+    const marker = stage.querySelector(".corrections-artifact-overlay-shape");
+    assert.ok(marker, `the overlay renders a marker for ${coordinateSpace}`);
+    const wrapper = stage.querySelector("[data-overlay-key]");
+    return {
+      clip: marker.style.clipPath,
+      left: wrapper.style.left,
+      top: wrapper.style.top,
+    };
+  };
+
+  assert.deepEqual(
+    render("display_normalized"),
+    render("canvas-normalized"),
+    "display_normalized coordinates are already upright, like canvas-normalized",
+  );
+});

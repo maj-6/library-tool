@@ -16,6 +16,8 @@
       manuscript: "corrections.role.manuscript",
       stamp: "corrections.role.stamp",
       damage: "corrections.role.damage",
+      extractRegion: "corrections.region.extract",
+      archiveImage: "corrections.image.archive",
     });
 
     const TARGET_KINDS = Object.freeze({
@@ -116,7 +118,49 @@
         action: "role.assign",
         value: "damage",
       }),
+      // Queue a correction transform cropped to the region's bounding quad
+      // (with re-OCR), which commits as a new artifact set — the region
+      // becomes its own reviewable image without touching the source.
+      Object.freeze({
+        id: COMMAND_IDS.extractRegion,
+        label: "Extract region as artifact",
+        shortLabel: "Extract region",
+        code: "EXT",
+        defaultBinding: "x",
+        targetKind: TARGET_KINDS.ANNOTATION,
+        action: "region.extract",
+        value: "",
+      }),
+      // Archive is a durable metadata assertion, not a delete: the image
+      // leaves the capture's working set but stays stored and linked for
+      // audit, and the same key restores it (undo also works).
+      // The key is ``v`` (archi-v-e) rather than the obvious ``a``: the image
+      // editor claims a bare ``a`` for its Image Adjust tool, and that
+      // handler sits deeper in the tree and calls stopPropagation, so an
+      // ``a`` binding never reaches the keymap while the editor canvas holds
+      // focus — the archive would silently switch tools instead.
+      Object.freeze({
+        id: COMMAND_IDS.archiveImage,
+        label: "Archive image (keep for audit)",
+        shortLabel: "Archive image",
+        code: "ARC",
+        defaultBinding: "v",
+        targetKind: TARGET_KINDS.IMAGE,
+        action: "metadata.archive",
+        value: "",
+      }),
     ]);
+
+    // Padding keeps a sliver of context around the region for the OCR pass;
+    // the minimum extent keeps the quad above the engine's edge-length and
+    // area floors even for degenerate hairline regions.
+    const REGION_EXTRACT_PADDING = 0.02;
+    const REGION_EXTRACT_MIN_EXTENT = 0.004;
+
+    // Archiving asserts both names together, so restoring has to clear both;
+    // clearing only ``archived`` leaves ``archived_at`` behind as a stale
+    // orphan assertion claiming a restored image was archived.
+    const ARCHIVE_ASSERTION_NAMES = Object.freeze(["archived", "archived_at"]);
 
     const PORTABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
     const MODIFIER_ORDER = Object.freeze(["ctrl", "alt", "shift", "meta"]);
@@ -463,12 +507,87 @@
           .includes(text(read(target, "kind"), 64).toLowerCase());
     }
 
+    function regionSelectorPoints(target) {
+      const selector = read(target, "selector");
+      const points = (selector && typeof selector === "object" &&
+        (selector.points || selector.polygon)) ||
+        read(target, "points", "polygon");
+      if (!Array.isArray(points) || points.length < 3) return null;
+      const result = [];
+      for (const point of points) {
+        const x = Number(Array.isArray(point)
+          ? point[0] : point && (point.x !== undefined ? point.x : NaN));
+        const y = Number(Array.isArray(point)
+          ? point[1] : point && (point.y !== undefined ? point.y : NaN));
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        result.push([
+          Math.min(1, Math.max(0, x)),
+          Math.min(1, Math.max(0, y)),
+        ]);
+      }
+      return result;
+    }
+
+    function regionExtractQuad(target) {
+      const points = regionSelectorPoints(target);
+      if (!points) return null;
+      let minX = 1;
+      let minY = 1;
+      let maxX = 0;
+      let maxY = 0;
+      for (const [x, y] of points) {
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+      minX = Math.max(0, minX - REGION_EXTRACT_PADDING);
+      minY = Math.max(0, minY - REGION_EXTRACT_PADDING);
+      maxX = Math.min(1, maxX + REGION_EXTRACT_PADDING);
+      maxY = Math.min(1, maxY + REGION_EXTRACT_PADDING);
+      if (maxX - minX < REGION_EXTRACT_MIN_EXTENT) {
+        const center = (minX + maxX) / 2;
+        minX = Math.max(0, Math.min(
+          center - REGION_EXTRACT_MIN_EXTENT / 2,
+          1 - REGION_EXTRACT_MIN_EXTENT));
+        maxX = minX + REGION_EXTRACT_MIN_EXTENT;
+      }
+      if (maxY - minY < REGION_EXTRACT_MIN_EXTENT) {
+        const center = (minY + maxY) / 2;
+        minY = Math.max(0, Math.min(
+          center - REGION_EXTRACT_MIN_EXTENT / 2,
+          1 - REGION_EXTRACT_MIN_EXTENT));
+        maxY = minY + REGION_EXTRACT_MIN_EXTENT;
+      }
+      return [
+        [minX, minY],
+        [maxX, minY],
+        [maxX, maxY],
+        [minX, maxY],
+      ];
+    }
+
     function commandRevision(target) {
       return text(read(
         target,
         "revision", "artifactRevision", "artifact_revision",
         "annotationRevision", "annotation_revision",
       ), 512);
+    }
+
+    // Only a target that carries metadata assertions can answer this. Lean
+    // navigation targets — the Books capture rows, which are the normal way
+    // into the archive toggle — carry none, so the host tops them up from the
+    // artifacts feature before publishing them (see the shell's
+    // ``classificationTargetMetadata``). Without that, an already-archived
+    // image would look unarchived here and the documented "same key restores
+    // it" toggle would only ever re-assert ``archived``.
+    function targetArchived(target) {
+      const assertions = read(target, "metadataAssertions", "metadata_assertions");
+      if (!Array.isArray(assertions)) return false;
+      return assertions.some((assertion) =>
+        assertion && typeof assertion === "object" &&
+        assertion.name === "archived" && Boolean(assertion.value));
     }
 
     function targetAccepted(target, command) {
@@ -755,6 +874,14 @@
 
     function portSupportsCommand(port, command) {
       if (!port || !command) return false;
+      if (command.action === "region.extract") {
+        // Extraction rides the transform queue, not the classification
+        // endpoints, so the generic invoke fallbacks do not cover it.
+        return typeof port.queueTransform === "function";
+      }
+      if (command.action === "metadata.archive") {
+        return typeof port.assertArtifactMetadata === "function";
+      }
       if (typeof port.invokeClassificationCommand === "function" ||
           typeof port.invoke === "function") return true;
       if (command.targetKind === TARGET_KINDS.IMAGE) {
@@ -879,9 +1006,38 @@
             resolved.target,
           ),
         ]);
+        let archiveRestored = false;
         let result;
         try {
-          if (command.targetKind === TARGET_KINDS.IMAGE) {
+          if (command.action === "region.extract") {
+            result = await this.executeRegionExtract(
+              context, command, resolved, identifiers, signal);
+          } else if (command.action === "metadata.archive") {
+            archiveRestored = targetArchived(resolved.target);
+            const payload = Object.freeze({
+              itemId: identifiers.itemId,
+              artifactId: identifiers.id,
+              expectedArtifactRevision: identifiers.revision,
+              ...(archiveRestored
+                ? { assertions: {}, clearNames: [...ARCHIVE_ASSERTION_NAMES] }
+                : {
+                  assertions: {
+                    archived: true,
+                    archived_at: new Date().toISOString(),
+                  },
+                  clearNames: [],
+                }),
+              operationId: operationId(
+                this.operationIdFactory, "archive", command, resolved.target),
+              signal,
+            });
+            result = await invokePort(
+              this.port,
+              ["assertArtifactMetadata"],
+              command,
+              payload,
+            );
+          } else if (command.targetKind === TARGET_KINDS.IMAGE) {
             const payload = Object.freeze({
               itemId: identifiers.itemId,
               artifactId: identifiers.id,
@@ -999,8 +1155,70 @@
           refreshAttempted: refresh.attempted,
           refreshErrors: refresh.errors,
         }));
-        this.onStatus(`${command.shortLabel} assigned to ${resolved.name}`, false);
+        this.onStatus(
+          command.action === "region.extract"
+            ? `Region extraction queued for ${resolved.name}`
+            : command.action === "metadata.archive"
+              ? archiveRestored
+                ? `${resolved.name} restored to the capture set`
+                : `${resolved.name} archived — same key or undo restores it`
+              : `${command.shortLabel} assigned to ${resolved.name}`,
+          false,
+        );
         return result;
+      }
+
+      async executeRegionExtract(context, command, resolved, identifiers, signal) {
+        const quad = regionExtractQuad(resolved.target);
+        if (!quad) {
+          throw new CorrectionCommandError(
+            "This region has no polygon to extract",
+            "region_polygon_required",
+          );
+        }
+        const contract = typeof context.transformContract === "function"
+          ? await context.transformContract(resolved.target)
+          : null;
+        if (!contract) {
+          throw new CorrectionCommandError(
+            "Open the region's image in the editor before extracting",
+            "transform_source_required",
+          );
+        }
+        if (typeof context.serializeTransformCommand !== "function") {
+          throw new CorrectionCommandError(
+            "Region extraction is not available",
+            "capability-unavailable",
+          );
+        }
+        let wire;
+        try {
+          wire = context.serializeTransformCommand({
+            pins: contract,
+            quad,
+            adjustment: null,
+            // The extracted crop exists to be read: always ask the engine
+            // for a machine OCR proposal alongside the new artifact.
+            rerunOcr: true,
+            operationId: operationId(
+              this.operationIdFactory, "extract", command, resolved.target),
+          });
+        } catch (error) {
+          throw new CorrectionCommandError(
+            error && error.message || "The extraction request is invalid",
+            error && error.code || "region_extract_invalid",
+          );
+        }
+        if (!wire) {
+          throw new CorrectionCommandError(
+            "Region extraction is not available",
+            "capability-unavailable",
+          );
+        }
+        return invokePort(this.port, ["queueTransform"], command, {
+          command: wire,
+          signal,
+        });
       }
 
       async undoLast(context = {}) {
@@ -1159,7 +1377,9 @@
       eventKeyBinding,
       imageTarget,
       annotationTarget,
+      linkedArtifactKeys,
       normalizeKeyBinding,
+      regionExtractQuad,
       registerClassificationCommands,
       resolveClassificationTarget,
     };

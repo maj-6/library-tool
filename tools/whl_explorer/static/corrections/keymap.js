@@ -235,6 +235,11 @@
         this.stateListeners = new Set();
         this.resolveLinkedArtifact = typeof options.resolveLinkedArtifact === "function"
           ? options.resolveLinkedArtifact : null;
+        this.transformContract = typeof options.transformContract === "function"
+          ? options.transformContract : null;
+        this.serializeTransformCommand =
+          typeof options.serializeTransformCommand === "function"
+            ? options.serializeTransformCommand : null;
         this.refreshTarget = typeof options.refreshTarget === "function"
           ? options.refreshTarget : null;
         this.promoteTarget = typeof options.promoteSoftTarget === "function"
@@ -389,6 +394,8 @@
           selectionTarget: this.selectionTarget,
           softTarget: this.hotTarget,
           resolveLinkedArtifact: this.resolveLinkedArtifact,
+          transformContract: this.transformContract,
+          serializeTransformCommand: this.serializeTransformCommand,
           refreshTarget: this.refreshTarget,
           promoteSoftTarget: (target, selectedCommand) =>
             this.promoteSoftTarget(target, selectedCommand),

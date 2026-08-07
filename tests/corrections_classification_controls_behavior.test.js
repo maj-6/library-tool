@@ -125,14 +125,14 @@ function harness() {
 }
 
 
-test("presenter renders and binds exactly the nine visible registered commands", async () => {
+test("presenter renders and binds exactly the eleven visible registered commands", async () => {
   const { calls, controller, controls, host } = harness();
   controller.setSelectionTarget(image());
   controller.mount();
   controls.mount();
 
   const buttons = host.querySelectorAll("[data-command-button]");
-  assert.equal(buttons.length, 9);
+  assert.equal(buttons.length, 11);
   assert.deepEqual(
     buttons.map((button) => button.dataset.classificationCommand),
     CLASSIFICATION_CONTROL_COMMAND_IDS,
@@ -193,17 +193,17 @@ test("toolbar, context menu, and palette reuse the registered command entries", 
   controls.mount();
 
   const toolbarButtons = toolbar.querySelectorAll("[data-command-button]");
-  assert.equal(toolbarButtons.length, 9);
-  assert.equal(controller.registry.list().length, 9,
+  assert.equal(toolbarButtons.length, 11);
+  assert.equal(controller.registry.list().length, 11,
     "additional command surfaces must not register parallel definitions");
-  controller.registry.remap(CLASSIFICATION_COMMAND_IDS.titlePage, "x");
+  controller.registry.remap(CLASSIFICATION_COMMAND_IDS.titlePage, "y");
   const toolbarTitle = byDataset(
     toolbar,
     "[data-command-button]",
     "classificationCommand",
     CLASSIFICATION_COMMAND_IDS.titlePage,
   );
-  assert.equal(toolbarTitle.getAttribute("aria-keyshortcuts"), "X");
+  assert.equal(toolbarTitle.getAttribute("aria-keyshortcuts"), "Y");
 
   const contextEvent = scope.emit("contextmenu", {
     target: contextTarget,
@@ -249,7 +249,7 @@ test("toolbar, context menu, and palette reuse the registered command entries", 
   const palette = scope.querySelector("[data-classification-palette]");
   assert.equal(palette.hidden, false);
   const paletteButtons = palette.querySelectorAll("[data-surface-command]");
-  assert.equal(paletteButtons.length, 9);
+  assert.equal(paletteButtons.length, 11);
   const paletteSpine = byDataset(
     palette,
     "[data-surface-command]",
@@ -364,24 +364,24 @@ test("inline shortcut editor captures remaps, updates labels, and reports confli
   const status = host.querySelector(".classification-shortcut-status");
 
   const remapEvent = titleInput.emit("keydown", {
-    key: "x",
+    key: "y",
     target: titleInput,
   });
   assert.equal(remapEvent.defaultPrevented, true);
   assert.equal(
     controller.registry.bindingFor(CLASSIFICATION_COMMAND_IDS.titlePage),
-    "x",
+    "y",
   );
-  assert.equal(titleInput.value, "X");
-  assert.equal(titleButton.getAttribute("aria-keyshortcuts"), "X");
+  assert.equal(titleInput.value, "Y");
+  assert.equal(titleButton.getAttribute("aria-keyshortcuts"), "Y");
   assert.equal(
     titleButton.querySelector(".classification-command-key").textContent,
-    "X",
+    "Y",
   );
-  assert.match(status.textContent, /now uses X/);
+  assert.match(status.textContent, /now uses Y/);
   assert.equal(bindingChanges.length, 1);
 
-  scope.emit("keydown", { key: "x", target: scope });
+  scope.emit("keydown", { key: "y", target: scope });
   await settled();
   assert.equal(calls.length, 1);
   assert.equal(calls[0][1].category, "title_page");
@@ -389,7 +389,7 @@ test("inline shortcut editor captures remaps, updates labels, and reports confli
   titleInput.emit("keydown", { key: "c", target: titleInput });
   assert.equal(
     controller.registry.bindingFor(CLASSIFICATION_COMMAND_IDS.titlePage),
-    "x",
+    "y",
   );
   assert.match(status.textContent, /already used by Mark as cover/);
   assert.equal(status.dataset.error, "true");
@@ -447,11 +447,11 @@ test("shortcut fields clear, cancel, reset one command, and reset all defaults",
     "t",
   );
 
-  titleInput.emit("keydown", { key: "x", target: titleInput });
+  titleInput.emit("keydown", { key: "y", target: titleInput });
   titleInput.emit("keydown", { key: "Escape", target: titleInput });
   assert.equal(
     controller.registry.bindingFor(CLASSIFICATION_COMMAND_IDS.titlePage),
-    "x",
+    "y",
     "Escape cancels capture instead of changing the existing binding",
   );
   assert.match(status.textContent, /cancelled/);
@@ -515,6 +515,6 @@ test("classification controls install through the standalone browser namespace",
   );
   assert.equal(
     context.LibraryToolCorrections.CLASSIFICATION_CONTROL_COMMAND_IDS.length,
-    9,
+    11,
   );
 });
