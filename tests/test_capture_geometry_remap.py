@@ -1,7 +1,6 @@
 """The capture geometry remap math against PIL/OpenCV ground truth."""
 
 import io
-import math
 
 import pytest
 
