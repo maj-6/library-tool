@@ -421,6 +421,50 @@ test("store ignores stale async responses and aborts the superseded request", as
 });
 
 
+test("a convergence notice joins the index load instead of restarting it", async () => {
+  const load = deferred();
+  const calls = [];
+  const store = new CorrectionsIndexStore({
+    api: {
+      loadIndex(options) {
+        calls.push(options);
+        return load.promise;
+      },
+    },
+  });
+
+  const opening = store.openWorkspace("workspace-1");
+  assert.equal(calls.length, 1);
+
+  // The convergence poll ticks while the index read is still running. Its
+  // notice only says the revision may have moved — which is precisely what
+  // this read is already fetching. Cancelling here starves a library whose
+  // index takes longer than the poll interval: every tick kills the read,
+  // the abort is discarded rather than reported, and the panel sits on
+  // "loading" with no error, forever.
+  const joined = [];
+  for (let tick = 0; tick < 5; tick += 1) {
+    joined.push(store.refresh({ reason: "external" }));
+  }
+  assert.equal(calls.length, 1,
+    "an in-flight load is joined, never cancelled and restarted");
+  assert.equal(calls[0].signal.aborted, false,
+    "the in-flight index request survives every poll tick");
+  assert.equal(store.snapshot().status, "loading");
+
+  load.resolve(withRevision(fixture(), "index-slow"));
+  const index = await opening;
+  assert.equal(index.revision, "index-slow");
+  for (const value of joined) {
+    assert.equal((await value).revision, "index-slow",
+      "every joined notice resolves with the load it waited on");
+  }
+  assert.equal(store.snapshot().status, "ready");
+  assert.equal(store.snapshot().error, null);
+  assert.equal(calls.length, 1, "no redundant index read was issued");
+});
+
+
 test("refresh preserves owned selection or reports precisely when it disappears", async () => {
   let current = fixture();
   const invalidated = [];
