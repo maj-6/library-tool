@@ -354,11 +354,19 @@ def process_photo_traced(img_bytes: bytes) -> tuple[bytes, dict]:
     The trace lets callers carry phone OCR geometry across the derivation
     (see ``librarytool.processing.capture_geometry``):
 
-      {"quad": [[x, y] * 4] | None,   # raw-pixel TL/TR/BR/BL warp quad
-       "raw_size": (w, h),            # as-stored size cv2 decoded
+      {"quad": [[x, y] * 4] | None,   # TL/TR/BR/BL warp quad, upright pixels
+       "source_size": (w, h),         # upright size the detector measured
        "warp_size": (w, h) | None,    # warp output size before standardize
-       "exif_orientation": 1..8,      # EXIF tag of the input bytes
+       "exif_orientation": 1..8,      # EXIF tag of the input (informational)
        "final_size": (w, h)}          # size of the returned JPEG
+
+    Every size and coordinate here lives in EXIF-UPRIGHT space, because
+    every stage of the derivation does: ``cv2.imdecode`` applies the EXIF
+    orientation itself (verified on OpenCV 5.0 — pass
+    ``IMREAD_IGNORE_ORIENTATION`` to get the stored grid instead), so the
+    detector's quad is already upright, and ``standardize`` reaches the
+    same frame through ``ImageOps.exif_transpose``. Coordinates therefore
+    need no orientation correction anywhere in the remap.
 
     The returned bytes are byte-identical to ``process_photo``'s: the same
     detector, warp kernel, and standardize encode run in the same order.
@@ -384,18 +392,20 @@ def process_photo_traced(img_bytes: bytes) -> tuple[bytes, dict]:
         # Identity output (a stubbed pipeline): no derivation happened, so
         # the trace must not claim one.
         quad, warp_size = None, None
-    from PIL import Image
+    from PIL import Image, ImageOps
     with Image.open(io.BytesIO(final)) as image:
         final_size = image.size
-    raw_size = None
+    # exif_transpose, not the stored size: the quad above came from cv2,
+    # which already applied the EXIF orientation, so the frame the quad
+    # indexes is the upright one.
     with Image.open(io.BytesIO(img_bytes)) as image:
-        raw_size = image.size
+        source_size = ImageOps.exif_transpose(image).size
     return final, {
         "quad": None if quad is None else [
             [float(x), float(y)] for x, y in
             (quad.tolist() if hasattr(quad, "tolist") else quad)
         ],
-        "raw_size": raw_size,
+        "source_size": source_size,
         "warp_size": warp_size,
         "exif_orientation": _capture_geometry.jpeg_exif_orientation(img_bytes),
         "final_size": final_size,
@@ -424,8 +434,7 @@ def remap_phone_geometry_for_import(
         try:
             remapped, _dropped = _capture_geometry.remap_phone_regions(
                 regions,
-                exif_orientation=trace.get("exif_orientation") or 1,
-                raw_size=trace.get("raw_size") or (0, 0),
+                source_size=trace.get("source_size") or (0, 0),
                 quad=trace.get("quad"),
                 warp_size=trace.get("warp_size"),
             )

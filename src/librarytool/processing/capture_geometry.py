@@ -10,10 +10,19 @@ warp fires.  This module carries the geometry across that derivation:
 * When no warp was applied the derivative is an EXIF-uprighted, aspect
   preserving resize (or plain re-encode) of the original, so normalized
   upright coordinates transfer unchanged.
-* When the warp was applied the polygon is taken from upright-normalized
-  space back to raw (as-stored) pixel space, through the exact perspective
-  homography the compat kernel used, and re-normalized against the warp
-  output.
+* When the warp was applied the polygon is scaled into upright pixel
+  space, pushed through the exact perspective homography the compat kernel
+  used, and re-normalized against the warp output.
+
+One orientation fact governs all of this: ``cv2.imdecode`` applies the EXIF
+orientation itself unless ``IMREAD_IGNORE_ORIENTATION`` is passed (verified
+empirically on OpenCV 5.0), so the detector's quad and the warp already
+operate on upright pixels — the same frame ``ImageOps.exif_transpose``
+produces for the Pillow half of the pipeline, and the same frame the phone
+normalizes its regions against.  There is therefore no orientation change
+to undo, and :func:`upright_to_raw_point` must NOT be applied to these
+coordinates; it is retained only for callers that genuinely hold
+as-stored-grid coordinates.
 
 Everything here is pure deterministic math over immutable inputs — no I/O,
 no OpenCV requirement — so an import path, a backfill tool, and tests share
@@ -176,28 +185,34 @@ def apply_matrix(
 def remap_phone_regions(
     regions: Sequence[Mapping[str, Any]],
     *,
-    exif_orientation: int,
-    raw_size: tuple[int, int],
+    source_size: tuple[int, int],
     quad: Sequence[Sequence[float]] | None,
     warp_size: tuple[int, int] | None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Remap phone display-normalized regions into the derivative's space.
 
-    ``raw_size`` is the as-stored pixel size of the camera original.  ``quad``
-    is the ordered TL/TR/BR/BL pixel quad the legacy warp applied (in raw
-    pixel space), or ``None`` when the derivative kept the original geometry;
-    ``warp_size`` is that warp's output size.  Returns the surviving remapped
-    regions plus the count of regions dropped because the warp cropped them
-    away.
+    ``source_size`` is the EXIF-upright pixel size of the camera original —
+    the frame both the phone's normalized coordinates and the detector's
+    quad already live in.  ``quad`` is the ordered TL/TR/BR/BL pixel quad
+    the legacy warp applied, or ``None`` when the derivative kept the
+    original geometry; ``warp_size`` is that warp's output size.  Returns
+    the surviving remapped regions plus the count dropped because the warp
+    cropped them away.
+
+    No orientation correction happens here, deliberately.  Every stage of
+    the desktop derivation observes the EXIF-upright frame: ``cv2.imdecode``
+    applies the orientation itself, and ``ImageOps.exif_transpose`` puts
+    Pillow in the same frame.  Applying :func:`upright_to_raw_point` here
+    would rotate coordinates into a grid nothing downstream ever uses.
     """
 
     if quad is None:
         return [dict(region) for region in regions], 0
     if warp_size is None:
         raise ValueError("warp_size is required when a quad was applied")
-    raw_width, raw_height = raw_size
+    source_width, source_height = source_size
     warp_width, warp_height = warp_size
-    if min(raw_width, raw_height, warp_width, warp_height) < 1:
+    if min(source_width, source_height, warp_width, warp_height) < 1:
         raise ValueError("raster sizes must be positive")
     destination = (
         (0.0, 0.0),
@@ -216,17 +231,10 @@ def remap_phone_regions(
         points: list[list[float]] = []
         try:
             for point in polygon:
-                upright_x = float(point[0])
-                upright_y = float(point[1])
-                raw_x, raw_y = upright_to_raw_point(
-                    upright_x,
-                    upright_y,
-                    exif_orientation,
-                )
                 pixel_x, pixel_y = apply_matrix(
                     matrix,
-                    raw_x * raw_width,
-                    raw_y * raw_height,
+                    float(point[0]) * source_width,
+                    float(point[1]) * source_height,
                 )
                 points.append(
                     [

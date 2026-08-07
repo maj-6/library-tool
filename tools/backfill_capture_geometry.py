@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import sys
 from pathlib import Path
+
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_pipeline as capture  # noqa: E402
@@ -43,6 +46,16 @@ def _asset_import_rows(manifest: dict) -> dict[str, dict]:
         if isinstance(row, dict) and isinstance(row.get("asset_id"), str):
             rows.setdefault(row["asset_id"], row)
     return rows
+
+
+def _asset_pinned(asset: dict, derivative_sha: str) -> bool:
+    """True when this asset already carries a record for these bytes."""
+
+    return any(
+        isinstance(record, dict)
+        and record.get("display_sha256") == derivative_sha
+        for record in (asset.get("geometry") or [])
+    )
 
 
 def _needs_backfill(asset: dict, derivative_sha: str) -> bool:
@@ -79,6 +92,7 @@ def backfill_capture(directory: Path, *, apply: bool) -> tuple[str, str]:
     changed = 0
     mismatched = 0
     examined = 0
+    already = 0
     for asset in assets:
         if not isinstance(asset, dict):
             continue
@@ -90,6 +104,8 @@ def backfill_capture(directory: Path, *, apply: bool) -> tuple[str, str]:
         if not derivative_sha or not raw_ref:
             continue
         if not _needs_backfill(asset, derivative_sha):
+            if _asset_pinned(asset, derivative_sha):
+                already += 1
             continue
         examined += 1
         try:
@@ -118,7 +134,19 @@ def backfill_capture(directory: Path, *, apply: bool) -> tuple[str, str]:
             if hashlib.sha256(rederived).hexdigest() != derivative_sha:
                 mismatched += 1
                 continue
-            trace = {**trace, "quad": None, "warp_size": None}
+            # The stored bytes are the UNWARPED derivation, so the trace's
+            # final_size still describes the warped one it just disproved.
+            # Carrying it through would stamp the record with dimensions
+            # the display does not have, and projection would reject it as
+            # stale — silently losing exactly the geometry this recovers.
+            with Image.open(io.BytesIO(rederived)) as image:
+                rederived_size = image.size
+            trace = {
+                **trace,
+                "quad": None,
+                "warp_size": None,
+                "final_size": rederived_size,
+            }
         records = capture.remap_phone_geometry_for_import(
             asset.get("geometry"), trace, derivative_sha)
         if not records:
@@ -128,6 +156,13 @@ def backfill_capture(directory: Path, *, apply: bool) -> tuple[str, str]:
 
     if not changed:
         if mismatched:
+            # A capture whose other photos are already pinned is partial,
+            # not a mismatch: re-running cannot improve it, but the
+            # geometry it does have is live. Reporting both as "mismatch"
+            # made a healthy library look broken on the second run.
+            if already:
+                return "partial", (
+                    f"{already} pinned, {mismatched}/{examined} undecidable")
             return "mismatch", f"{mismatched}/{examined} photos undecidable"
         return "current", ""
     if apply:
@@ -166,7 +201,8 @@ def main() -> int:
             continue
         status, detail = backfill_capture(directory, apply=args.apply)
         counts[status] = counts.get(status, 0) + 1
-        if status in {"updated", "would-update", "mismatch", "error"}:
+        if status in {"updated", "would-update", "partial",
+                      "mismatch", "error"}:
             print(f"{status:>13}  {directory.name}  {detail}")
     print()
     for status in sorted(counts):

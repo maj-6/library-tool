@@ -109,8 +109,7 @@ def test_remap_without_quad_is_identity():
     regions = [{"id": "r0", "polygon": [[0.1, 0.2], [0.9, 0.2], [0.9, 0.4]]}]
     remapped, dropped = cg.remap_phone_regions(
         regions,
-        exif_orientation=1,
-        raw_size=(600, 800),
+        source_size=(600, 800),
         quad=None,
         warp_size=None,
     )
@@ -132,8 +131,7 @@ def test_remap_through_axis_aligned_crop():
     ]
     remapped, dropped = cg.remap_phone_regions(
         regions,
-        exif_orientation=1,
-        raw_size=(800, 1000),
+        source_size=(800, 1000),
         quad=quad,
         warp_size=warp_size,
     )
@@ -149,32 +147,75 @@ def test_remap_through_axis_aligned_crop():
     assert polygon[0][1] == pytest.approx(expected_y, abs=1e-9)
 
 
-def test_remap_applies_exif_before_warp():
-    # Orientation 6 (raw rotated 90 CW renders upright): the upright point
-    # maps back into raw space before the homography applies.
+def test_remap_does_not_re_apply_exif_orientation():
+    """The remap must treat coordinates as already EXIF-upright.
+
+    cv2.imdecode applies the EXIF orientation itself, so the detector quad
+    and the phone's normalized regions are in the SAME upright frame. An
+    orientation correction here would rotate boxes off the text; this test
+    pins the frame by asserting a plain full-frame homography result.
+    """
     quad = ((0.0, 0.0), (799.0, 0.0), (799.0, 599.0), (0.0, 599.0))
     warp_size = cg.capture_warp_destination_size(quad)
     regions = [{"id": "r", "polygon": [[0.1, 0.1], [0.4, 0.1], [0.4, 0.2]]}]
     remapped, dropped = cg.remap_phone_regions(
         regions,
-        exif_orientation=6,
-        raw_size=(800, 600),
+        source_size=(800, 600),
         quad=quad,
         warp_size=warp_size,
     )
     assert dropped == 0
-    raw_point = cg.upright_to_raw_point(0.1, 0.1, 6)
-    # The kernel maps source [0..size-1] onto destination [0..size-1], so a
-    # full-frame quad scales pixel x by (w-1)/(w-1)=1 into the [0..w-1]
-    # range; normalization then divides by w.
+    # The kernel maps source [0..size-1] onto destination [0..size-1]; a
+    # full-frame quad is therefore a pure rescale, with NO axis swap.
     assert remapped[0]["polygon"][0][0] == pytest.approx(
-        raw_point[0] * 800.0 * (warp_size[0] - 1) / 799.0 / warp_size[0],
-        abs=1e-6,
-    )
+        0.1 * 800.0 * (warp_size[0] - 1) / 799.0 / warp_size[0], abs=1e-6)
     assert remapped[0]["polygon"][0][1] == pytest.approx(
-        raw_point[1] * 600.0 * (warp_size[1] - 1) / 599.0 / warp_size[1],
-        abs=1e-6,
-    )
+        0.1 * 600.0 * (warp_size[1] - 1) / 599.0 / warp_size[1], abs=1e-6)
+
+
+def test_cv2_imdecode_applies_exif_so_the_quad_is_upright():
+    """Pin the orientation fact the whole remap contract rests on.
+
+    If a future OpenCV stops applying EXIF on decode, the detector quad
+    would silently move to the as-stored grid and every warped remap would
+    be wrong by a rotation. Fail loudly here instead.
+    """
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    image = Image.new("RGB", (60, 40), (10, 10, 10))
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", exif=exif.tobytes(), quality=95)
+    data = buffer.getvalue()
+
+    decoded = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    with Image.open(io.BytesIO(data)) as opened:
+        upright = ImageOps.exif_transpose(opened).size
+    assert (decoded.shape[1], decoded.shape[0]) == upright, (
+        "cv2.imdecode no longer applies EXIF; capture_geometry's frame "
+        "assumption and process_photo_traced's source_size are now wrong")
+
+
+def test_traced_derivation_reports_the_upright_source_frame():
+    """process_photo_traced must measure the frame cv2 actually saw."""
+    pytest.importorskip("cv2")
+    from PIL import Image
+
+    import capture_pipeline
+
+    image = Image.new("RGB", (60, 40), (120, 90, 60))
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", exif=exif.tobytes(), quality=95)
+
+    _final, trace = capture_pipeline.process_photo_traced(buffer.getvalue())
+    # Stored is 60x40; upright (what cv2 and standardize both see) is 40x60.
+    assert trace["source_size"] == (40, 60)
+    assert trace["exif_orientation"] == 6
 
 
 def test_desktop_record_pins_and_preserves_provenance():
