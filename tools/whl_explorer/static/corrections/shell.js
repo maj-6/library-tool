@@ -1655,11 +1655,9 @@
           summary.orientation || 1) || 1;
         const coordinatesAreOriented = rawRegions.some((region) => {
           const selector = region && (region.selector || region.polygon) || region;
-          const coordinateSpace = String(
+          return deps.isOrientedCoordinateSpace(
             selector && (selector.coordinate_space || selector.coordinateSpace) ||
-            resource && resource.coordinateSpace || "").toLowerCase();
-          return coordinateSpace.includes("canvas-normalized") ||
-            coordinateSpace.includes("exif_oriented");
+            resource && resource.coordinateSpace || "");
         });
         const orientation = coordinatesAreOriented ? 1 : declaredOrientation;
         overlay.setView({ sourceWidth, sourceHeight, orientation });

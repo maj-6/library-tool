@@ -61,6 +61,23 @@
       return Number.isSafeInteger(number) && number >= 1 && number <= 8 ? number : 1;
     }
 
+    // Spaces whose points already sit in the EXIF-upright frame a browser
+    // renders an <img> in, so the declared orientation has nothing left to
+    // undo. Phone-capture OCR normalizes against the uprighted display
+    // rendition and reports "display_normalized"; orienting those points
+    // would rotate boxes that need no rotation.
+    const ORIENTED_COORDINATE_SPACES = Object.freeze([
+      "canvas-normalized",
+      "display_normalized",
+      "exif_oriented",
+    ]);
+
+    function isOrientedCoordinateSpace(value) {
+      const coordinateSpace = text(value, 64).toLowerCase();
+      return ORIENTED_COORDINATE_SPACES
+        .some((space) => coordinateSpace.includes(space));
+    }
+
     function orientNormalizedPoint(point, orientation = 1) {
       const x = finite(Array.isArray(point) ? point[0] : point && point.x);
       const y = finite(Array.isArray(point) ? point[1] : point && point.y);
@@ -644,12 +661,14 @@
     return {
       ARTIFACT_CATEGORY_CODES: CATEGORY_CODES,
       ARTIFACT_ROLE_CODES: ROLE_CODES,
+      ORIENTED_COORDINATE_SPACES,
       ArtifactOverlay,
       artifactCode,
       artifactPresentationMetadata,
       createArtifactOverlay,
       createOverlayTransform,
       exifOrientation,
+      isOrientedCoordinateSpace,
       localClipPath,
       normalizeOverlayRegion,
       orientNormalizedPoint,

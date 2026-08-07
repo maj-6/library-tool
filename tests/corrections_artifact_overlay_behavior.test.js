@@ -10,6 +10,7 @@ const {
   artifactPresentationMetadata,
   createArtifactOverlay,
   createOverlayTransform,
+  isOrientedCoordinateSpace,
   normalizeOverlayRegion,
   orientNormalizedPoint,
   projectPolygon,
@@ -105,6 +106,22 @@ test("EXIF orientation maps normalized coordinates into the displayed raster", (
   closePoint(orientNormalizedPoint({ x: 0, y: 0 }, 6), { x: 1, y: 0 });
   closePoint(orientNormalizedPoint({ x: 1, y: 0 }, 6), { x: 1, y: 1 });
   closePoint(orientNormalizedPoint({ x: 0, y: 1 }, 8), { x: 1, y: 1 });
+});
+
+
+test("coordinate spaces already in the upright frame are exempt from orienting", () => {
+  // "display_normalized" is what phone-capture Mistral OCR emits, normalized
+  // against the uprighted display rendition; there is no rotation to undo.
+  assert.ok(isOrientedCoordinateSpace("display_normalized"));
+  assert.ok(isOrientedCoordinateSpace("canvas-normalized"));
+  assert.ok(isOrientedCoordinateSpace("exif_oriented_normalized"));
+  assert.ok(isOrientedCoordinateSpace("  EXIF_Oriented_Normalized  "));
+
+  // Anything unrecognised keeps the raster's declared orientation.
+  assert.ok(!isOrientedCoordinateSpace(""));
+  assert.ok(!isOrientedCoordinateSpace(null));
+  assert.ok(!isOrientedCoordinateSpace("source-pixel"));
+  assert.ok(!isOrientedCoordinateSpace("normalized"));
 });
 
 

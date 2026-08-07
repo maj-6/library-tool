@@ -1123,6 +1123,83 @@ test("editor overlay teardown clears a hovered classification target", () => {
 });
 
 
+// The overlay draws over an <img>, which browsers render EXIF-upright. A
+// region already normalized against that upright frame must therefore ignore
+// the artifact's declared orientation; only as-stored coordinates get turned.
+function overlayRegionBox(coordinateSpace, orientation) {
+  const shell = Object.create(CorrectionsShell.prototype);
+  const documentRef = fakeDocument();
+  const stage = new FakeNode("div", documentRef);
+  const image = new FakeNode("img", documentRef);
+  stage.clientWidth = 400;
+  stage.clientHeight = 400;
+  stage.append(image);
+  Object.assign(shell, { documentRef, windowRef: {} });
+  const selector = {
+    points: [{ x: 0.1, y: 0.1 }, { x: 0.5, y: 0.1 }, { x: 0.5, y: 0.4 }],
+  };
+  if (coordinateSpace) selector.coordinate_space = coordinateSpace;
+  const cleanup = shell.mountArtifactOverlay({ image }, {
+    summary: { itemId: "book-1" },
+    regions: [{
+      annotation_id: "region-1",
+      object_type: "spatial-annotation",
+      revision: "region-r1",
+      selector,
+    }],
+    dimensions: { width: 400, height: 200, orientation },
+  });
+  const wrapper = stage.querySelector("[data-overlay-key]");
+  assert.ok(wrapper, "the overlay renders the region marker");
+  const box = {
+    left: wrapper.style.left,
+    top: wrapper.style.top,
+    width: wrapper.style.width,
+    height: wrapper.style.height,
+  };
+  cleanup();
+  return box;
+}
+
+
+test("a declared EXIF orientation never turns already-upright regions", () => {
+  const upright = overlayRegionBox("display_normalized", 1);
+  assert.deepEqual(upright, {
+    left: "40.000px",
+    top: "120.000px",
+    width: "160.000px",
+    height: "60.000px",
+  });
+
+  // Phone-capture Mistral OCR reports "display_normalized" against the
+  // uprighted display rendition, so a rotated capture must land identically.
+  assert.deepEqual(overlayRegionBox("display_normalized", 6), upright,
+    "orientation 6 must not move a display_normalized region");
+  assert.deepEqual(overlayRegionBox("display_normalized", 8), upright,
+    "orientation 8 must not move a display_normalized region");
+  assert.deepEqual(overlayRegionBox("canvas-normalized", 6), upright);
+  assert.deepEqual(overlayRegionBox("exif_oriented_normalized", 6), upright);
+});
+
+
+test("a declared EXIF orientation still turns as-stored regions", () => {
+  // The rotated raster is 200x400, so the marker turns a quarter clockwise
+  // and swaps extents. Without this the fix above would read as "never
+  // orient anything" rather than "only orient raw coordinates".
+  assert.deepEqual(overlayRegionBox("", 6), {
+    left: "220.000px",
+    top: "40.000px",
+    width: "60.000px",
+    height: "160.000px",
+  });
+  assert.notDeepEqual(
+    overlayRegionBox("source-pixel-normalized", 6),
+    overlayRegionBox("source-pixel-normalized", 1),
+    "an unrecognised coordinate space keeps the declared orientation",
+  );
+});
+
+
 test("category apply, undo, and conflict refresh expanded artifacts once", async () => {
   const artifactRefreshes = [];
   const detailRefreshes = [];
