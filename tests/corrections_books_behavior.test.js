@@ -465,6 +465,45 @@ test("a convergence notice joins the index load instead of restarting it", async
 });
 
 
+test("a superseded load settling does not disarm the coalesce for its successor", async () => {
+  const first = deferred();
+  const second = deferred();
+  const calls = [];
+  const store = new CorrectionsIndexStore({
+    api: {
+      loadIndex(options) {
+        calls.push(options);
+        return calls.length === 1 ? first.promise : second.promise;
+      },
+    },
+  });
+
+  const opening = store.openWorkspace("workspace-1");
+  const superseding = store.refresh({ reason: "manual" });
+  assert.equal(calls.length, 2, "a manual refresh still supersedes");
+  assert.equal(calls[0].signal.aborted, true);
+
+  // The superseded read settles late, as an aborted request does. Its cleanup
+  // must not retire the load that replaced it — if it does, the next poll tick
+  // sees no load to join, cancels the live read, and the starvation loop is
+  // back with every tick killing the request that would have finished.
+  first.resolve(withRevision(fixture(), "index-superseded"));
+  await opening;
+
+  store.refresh({ reason: "external" });
+  store.refresh({ reason: "external" });
+  assert.equal(calls.length, 2,
+    "poll notices still join the surviving load after its predecessor settles");
+  assert.equal(calls[1].signal.aborted, false,
+    "the surviving index request is never aborted by a poll notice");
+
+  second.resolve(withRevision(fixture(), "index-live"));
+  await superseding;
+  assert.equal(store.snapshot().status, "ready");
+  assert.equal(store.index.revision, "index-live");
+});
+
+
 test("refresh preserves owned selection or reports precisely when it disappears", async () => {
   let current = fixture();
   const invalidated = [];
