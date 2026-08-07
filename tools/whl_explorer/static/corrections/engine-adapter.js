@@ -35,6 +35,8 @@
     // Standalone re-OCR shares the "correction.ocr-followup" job kind with
     // the transform rider; the operation namespace is what tells the tracked
     // command apart, so the rider's whitelist and guards stay untouched.
+    const CORRECTIONS_INDEX_SUMMARY_SCHEMA =
+      "librarytool.corrections-index-summary/1";
     const CORRECTION_REOCR_OPERATION_PREFIX = "correction-reocr:";
     const CORRECTION_OCR_FOLLOWUP_JOB_KIND = "correction.ocr-followup";
     const PORTABLE_JOB_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -1310,6 +1312,89 @@
       let workspaceRequestGeneration = 0;
       let workspaceEpoch = 0;
 
+      // Reading the whole index costs 7.8 s on a thousand-book library because
+      // every book's captures are projected, and the list needs none of them.
+      // The tiered routes split that: the summary carries what the list orders
+      // and filters by, and the details route carries the capture rows for the
+      // rows actually drawn. Both must be present to switch — a sidecar with
+      // only one of them is not a shape the store is taught.
+      const tiered = typeof corrections.indexSummary === "function" &&
+        typeof corrections.indexDetails === "function";
+      // The whole /2 payload, kept only while the sidecar is untiered. Every
+      // question the tiered client asks is already answered inside it, so the
+      // fallback projects the same three shapes locally rather than teaching
+      // the store a second contract.
+      let fallbackIndex = null;
+
+      function summaryFromIndex(index) {
+        return {
+          schema: CORRECTIONS_INDEX_SUMMARY_SCHEMA,
+          revision: index.revision,
+          books: index.books.map((book) => ({
+            id: book.id,
+            revision: book.revision,
+            kind: book.kind,
+            title: book.title,
+            review: book.review,
+          })),
+          attention: index.attention,
+        };
+      }
+
+      function marksFromIndex(index) {
+        return {
+          schema: "librarytool.corrections-capture-marks/1",
+          revision: index.revision,
+          marks: index.books
+            .filter((book) => book.captures.length > 0)
+            .map((book) => ({
+              item_id: book.id,
+              capture_count: book.captures.length,
+              latest_imported_at: book.latest_imported_at || "",
+            }))
+            .sort((left, right) =>
+              left.item_id < right.item_id ? -1
+                : left.item_id > right.item_id ? 1 : 0),
+        };
+      }
+
+      function detailsFromIndex(index, itemIds) {
+        const books = new Map(index.books.map((book) => [book.id, book]));
+        const found = itemIds.filter((itemId) => books.has(itemId));
+        return {
+          schema: "librarytool.corrections-index-detail/1",
+          revision: index.revision,
+          books: found.map((itemId) => books.get(itemId)),
+          missing: itemIds.filter((itemId) => !books.has(itemId)),
+        };
+      }
+
+      async function readSummary(workspace, signal) {
+        if (tiered) {
+          return corrections.indexSummary({ workspaceId: workspace, signal });
+        }
+        const index = await corrections.index({ workspaceId: workspace, signal });
+        fallbackIndex = index;
+        return summaryFromIndex(index);
+      }
+
+      async function readIndexProbeRevision(workspace, signal) {
+        if (typeof corrections.indexProbe !== "function") return null;
+        try {
+          const probe = await corrections.indexProbe({
+            workspaceId: workspace,
+            signal,
+          });
+          return probe && typeof probe.revision === "string"
+            ? probe.revision : null;
+        } catch (error) {
+          if (signal && signal.aborted) throw error;
+          // No seed means the poll's first pass reports a change and the
+          // client reloads once. Losing the probe must not lose the summary.
+          return null;
+        }
+      }
+
       function itemIdForTarget(target) {
         if (!target || target.kind !== "book" ||
             typeof target.item_id !== "string" || !target.item_id) {
@@ -1503,10 +1588,9 @@
         }
         const itemId = itemIdForTarget(target);
         const expectedRevision = receiptReviewRevision(mutation, itemId);
-        const index = await corrections.index({
-          workspaceId: workspace.id,
-          signal,
-        });
+        // Convergence needs book.review and entry.review and nothing else,
+        // and both are tier-one fields.
+        const index = await readSummary(workspace.id, signal);
         if (!workspaceIsCurrent(workspace)) {
           throw reviewConflict(
             "The Corrections workspace changed before the mutation converged");
@@ -1545,14 +1629,26 @@
             requestedWorkspaceId = nextWorkspaceId;
             workspaceEpoch += 1;
             workspaceId = null;
+            fallbackIndex = null;
           }
-          const index = await corrections.index({
-            workspaceId: nextWorkspaceId,
-            signal,
-          });
+          // What the poll compares must be what the poll reads. The probe and
+          // the summary write the same server-side revision slot, so seeding
+          // the poll from the summary's own body revision would compare a
+          // body revision against a probe revision — different families the
+          // moment anything else touches that slot, and every comparison
+          // after that reports "changed" and refetches forever. Reading the
+          // probe first also errs safe: anything that moves while the summary
+          // builds leaves the observed value stale, which refetches once.
+          const observed = tiered
+            ? await readIndexProbeRevision(nextWorkspaceId, signal)
+            : null;
+          const index = await readSummary(nextWorkspaceId, signal);
           if (indexPolling && typeof indexPolling.observe === "function" &&
               !(signal && signal.aborted)) {
-            indexPolling.observe(nextWorkspaceId, index && index.revision);
+            indexPolling.observe(
+              nextWorkspaceId,
+              tiered ? observed : (index && index.revision),
+            );
           }
           if (generation === workspaceRequestGeneration &&
               requestedWorkspaceId === nextWorkspaceId &&
@@ -1563,6 +1659,35 @@
         },
         getReview({ target, signal } = {}) {
           return assembleReview(target, signal);
+        },
+        async loadCaptureMarks({ workspaceId: forWorkspaceId, signal } = {}) {
+          if (tiered && typeof corrections.captureMarks === "function") {
+            return corrections.captureMarks({
+              workspaceId: forWorkspaceId,
+              signal,
+            });
+          }
+          const index = fallbackIndex || await corrections.index({
+            workspaceId: forWorkspaceId,
+            signal,
+          });
+          fallbackIndex = index;
+          return marksFromIndex(index);
+        },
+        async loadDetails({ workspaceId: forWorkspaceId, itemIds, signal } = {}) {
+          if (tiered) {
+            return corrections.indexDetails({
+              workspaceId: forWorkspaceId,
+              itemIds,
+              signal,
+            });
+          }
+          const index = fallbackIndex || await corrections.index({
+            workspaceId: forWorkspaceId,
+            signal,
+          });
+          fallbackIndex = index;
+          return detailsFromIndex(index, itemIds);
         },
       };
       if (indexPolling && typeof indexPolling.subscribe === "function") {

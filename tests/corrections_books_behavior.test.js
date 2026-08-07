@@ -4,6 +4,13 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  detailsOf,
+  marksOf,
+  settle,
+  summaryOf,
+  tiered,
+} = require("./fixtures/corrections_tiers");
+const {
   BooksPanelController,
   CORRECTIONS_INDEX_CHANGE_SCHEMA,
   CORRECTIONS_INDEX_SCHEMA,
@@ -13,9 +20,12 @@ const {
   bookNeedsAttention,
   booksForView,
   captureBooks,
-  latestImportedAt,
+  markImportedAt,
   captureCommandTarget,
+  normalizeCaptureMarks,
   normalizeCorrectionsIndex,
+  normalizeCorrectionsIndexDetail,
+  normalizeCorrectionsIndexSummary,
   sortedBooks,
 } = require("../tools/whl_explorer/static/corrections/books");
 
@@ -26,6 +36,20 @@ const fixturePath = path.join(
 
 function fixture() {
   return JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+}
+
+
+// A few panel tests drive the store directly rather than through its api.
+// This leaves all three tiers as a completed load would.
+function seedStore(store, indexValue) {
+  store.index = normalizeCorrectionsIndexSummary(summaryOf(indexValue));
+  store.marks = new Map(normalizeCaptureMarks(marksOf(indexValue)).marks
+    .map((mark) => [mark.item_id, mark]));
+  store.details = new Map(normalizeCorrectionsIndexDetail(
+    detailsOf(indexValue, indexValue.books.map((book) => book.id))
+  ).books.map((book) => [book.id, book]));
+  store.status = "ready";
+  store.emit();
 }
 
 
@@ -358,7 +382,7 @@ test("Corrections index validation is strict and capture order is explicit", () 
 test("needs-attention books pin immediately with deterministic title and ID ties", async () => {
   const data = fixture();
   const store = new CorrectionsIndexStore({
-    api: { loadIndex: async () => data },
+    api: tiered({ loadIndex: async () => data }),
   });
   await store.openWorkspace("workspace-1");
 
@@ -398,12 +422,12 @@ test("store ignores stale async responses and aborts the superseded request", as
   const second = deferred();
   const calls = [];
   const store = new CorrectionsIndexStore({
-    api: {
+    api: tiered({
       loadIndex(options) {
         calls.push(options);
         return calls.length === 1 ? first.promise : second.promise;
       },
-    },
+    }),
   });
 
   const opening = store.openWorkspace("workspace-1");
@@ -425,7 +449,7 @@ test("refresh preserves owned selection or reports precisely when it disappears"
   let current = fixture();
   const invalidated = [];
   const store = new CorrectionsIndexStore({
-    api: { loadIndex: async () => current },
+    api: tiered({ loadIndex: async () => current }),
     onSelectionInvalidated: (event) => invalidated.push(event),
   });
   await store.openWorkspace("workspace-1");
@@ -465,6 +489,44 @@ test("refresh preserves owned selection or reports precisely when it disappears"
 });
 
 
+test("a selection survives a book whose captures have not been read", async () => {
+  const data = fixture();
+  const invalidated = [];
+  const detailRequests = [];
+  const store = new CorrectionsIndexStore({
+    api: {
+      loadIndex: async () => summaryOf(data),
+      loadCaptureMarks: async () => marksOf(data),
+      // Never answers: this is the window between the index landing and the
+      // captures arriving, which every cold open passes through.
+      loadDetails: ({ itemIds }) => {
+        detailRequests.push(itemIds);
+        return new Promise(() => {});
+      },
+    },
+    onSelectionInvalidated: (event) => invalidated.push(event),
+  });
+  const opening = store.openWorkspace("workspace-1");
+  store.setSelection({
+    itemId: "book-herbarium",
+    representationId: "scan-herbarium",
+    canvasId: "canvas-title",
+    artifactId: "capture-title",
+    annotationId: null,
+  }, { ownedByFeature: true });
+  await Promise.race([opening, settle()]);
+
+  // Nothing has been read about this book's captures, and unknown is not
+  // absent. Answering "gone" here would delete the reader's own selection and
+  // report that it disappeared, on every cold open of a capture address.
+  assert.equal(store.snapshot().status, "ready");
+  assert.equal(store.selection.artifactId, "capture-title");
+  assert.deepEqual(invalidated, []);
+  assert.ok(detailRequests.flat().includes("book-herbarium"),
+    "the store asks for the selected book's captures without being rendered");
+});
+
+
 test("external index notices refresh data without importing another window's selection",
   async () => {
     let current = fixture();
@@ -473,7 +535,7 @@ test("external index notices refresh data without importing another window's sel
     const externalChanges = [];
     const store = new CorrectionsIndexStore({
       onExternalChange: (change) => externalChanges.push(change),
-      api: {
+      api: tiered({
         async loadIndex() {
           loads += 1;
           return current;
@@ -482,7 +544,7 @@ test("external index notices refresh data without importing another window's sel
           onChange = options.onChange;
           return () => {};
         },
-      },
+      }),
     });
     await store.openWorkspace("workspace-1");
     const selection = {
@@ -512,7 +574,7 @@ test("Books panel renders honest states, accessible chips, and keyboard-focusabl
   async () => {
     const data = fixture();
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => data },
+      api: tiered({ loadIndex: async () => data }),
     });
     const harness = miniHarness();
     const navigations = [];
@@ -587,7 +649,7 @@ test("index-only capture clicks carry a validated thumbnail navigation preview",
       candidate.artifact_id === "capture-cover");
     capture.revision = "index:cover-preview-r1";
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => value },
+      api: tiered({ loadIndex: async () => value }),
     });
     const harness = miniHarness();
     const navigations = [];
@@ -625,7 +687,7 @@ test("hint capture blur does not clobber an authoritative hydrated target",
     const value = fixture();
     value.books[0].captures[0].revision = "index:abc123";
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => value },
+      api: tiered({ loadIndex: async () => value }),
     });
     const harness = miniHarness();
     let classificationTarget = null;
@@ -694,7 +756,7 @@ test("Books panel bounds book and capture DOM while retaining deep selections",
       attention: [],
     };
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => indexValue },
+      api: tiered({ loadIndex: async () => indexValue }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -715,6 +777,9 @@ test("Books panel bounds book and capture DOM while retaining deep selections",
     }, { ownedByFeature: true });
     assert.ok(harness.list.children.some((row) =>
       row.dataset.bookId === "book-batch-69"));
+    // The pinned row is outside the drawn window, so its captures were never
+    // asked for until it was pinned; they arrive a round trip later.
+    await settle();
     assert.ok(descendants(harness.list, "button").some((button) =>
       button.dataset.artifactId === "capture-batch-69-1"));
     store.setSelection({
@@ -763,9 +828,7 @@ test("Books panel bounds book and capture DOM while retaining deep selections",
     }];
     await store.openWorkspace("workspace-2", { selection: null });
     // Replace the API result for the new workspace and force the bounded load.
-    store.index = normalizeCorrectionsIndex(many);
-    store.status = "ready";
-    store.emit();
+    seedStore(store, many);
     assert.equal(descendants(harness.list, "button").filter((button) =>
       button.dataset.artifactId).length, 12);
     store.setSelection({
@@ -812,7 +875,7 @@ test("Books panel paints capture placeholders before visibility-driven thumbnail
   async () => {
     const observers = thumbnailObserverHarness();
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -883,7 +946,7 @@ test("Books panel paints capture placeholders before visibility-driven thumbnail
 test("Books thumbnails fall back safely when observation is unavailable",
   async () => {
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -913,7 +976,7 @@ test("selected captures hydrate eagerly without delaying click navigation",
   async () => {
     const observers = thumbnailObserverHarness();
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const navigationImages = [];
@@ -960,7 +1023,7 @@ test("selected captures hydrate eagerly without delaying click navigation",
 test("capture rerenders restore focused selection and blur reads the live selection",
   async () => {
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const targets = [];
@@ -1035,7 +1098,7 @@ test("capture rerenders restore focused selection and blur reads the live select
 test("Books rerenders preserve a still-present focused nonselected capture",
   async () => {
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const targets = [];
@@ -1076,7 +1139,7 @@ test("Books rerenders preserve a still-present focused nonselected capture",
 test("Books rerenders withdraw a hover contribution left without pointerleave",
   async () => {
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const hot = [];
@@ -1137,12 +1200,12 @@ test("Books panel distinguishes loading, empty, initial error, and stale refresh
     empty.attention = [];
     let failRefresh = false;
     const store = new CorrectionsIndexStore({
-      api: {
+      api: tiered({
         async loadIndex() {
           if (failRefresh) throw new Error("network unavailable");
           return pending.promise;
         },
-      },
+      }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -1164,7 +1227,7 @@ test("Books panel distinguishes loading, empty, initial error, and stale refresh
     controller.destroy();
 
     const failingStore = new CorrectionsIndexStore({
-      api: { loadIndex: async () => { throw new Error("service offline"); } },
+      api: tiered({ loadIndex: async () => { throw new Error("service offline"); } }),
     });
     const failingHarness = miniHarness();
     const failingController = new BooksPanelController({
@@ -1237,7 +1300,7 @@ test("unparseable engine-accepted timestamps degrade without failing the panel",
     data.books[0].captures[0].imported_at = "2026-07-28T09:00:00,500";
     data.books[0].latest_imported_at = "2026-07-28T09:00:00,500";
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => data },
+      api: tiered({ loadIndex: async () => data }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -1251,12 +1314,16 @@ test("unparseable engine-accepted timestamps degrade without failing the panel",
       "one unparseable timestamp must not kill the whole Books panel");
     assert.doesNotMatch(textOf(harness.list), /Books could not be loaded/);
     assert.equal(harness.list.children.length, 4);
-    const herbarium = store.index.books.find(
-      (book) => book.id === "book-herbarium");
+    await settle();
+    const herbarium = store.snapshot().details.get("book-herbarium");
     assert.equal(herbarium.latest_imported_at, "");
     assert.equal(herbarium.captures.find(
       (capture) => capture.artifact_id === "capture-cover").imported_at, "");
     controller.setView("captures");
+    await settle();
+    assert.equal(store.snapshot().marks.get("book-herbarium")
+      .latest_imported_at, "",
+    "the capture mark degrades the same way the inlined field did");
     assert.deepEqual(
       harness.list.children.map((row) => row.dataset.bookId),
       ["book-pending", "book-herbarium", "book-legacy"],
@@ -1266,8 +1333,11 @@ test("unparseable engine-accepted timestamps degrade without failing the panel",
 
 
 test("captures view orders newest import first with untimed items after", () => {
-  const index = normalizeCorrectionsIndex(fixture());
-  assert.deepEqual(captureBooks(index).map((book) => book.id), [
+  const source = fixture();
+  const index = normalizeCorrectionsIndexSummary(summaryOf(source));
+  const marks = new Map(normalizeCaptureMarks(marksOf(source)).marks
+    .map((mark) => [mark.item_id, mark]));
+  assert.deepEqual(captureBooks(index, marks).map((book) => book.id), [
     "book-pending",
     "book-herbarium",
     "book-legacy",
@@ -1278,25 +1348,20 @@ test("captures view orders newest import first with untimed items after", () => 
   ]);
   assert.deepEqual(booksForView(index, "all").map((book) => book.id),
     sortedBooks(index).map((book) => book.id));
-  assert.equal(latestImportedAt(
-    index.books.find((book) => book.id === "book-pending")),
+  assert.equal(markImportedAt(
+    marks, index.books.find((book) => book.id === "book-pending")),
   "2026-07-30T10:15:00+00:00");
-  assert.equal(latestImportedAt({
-    latest_imported_at: "",
-    captures: [
-      { imported_at: "" },
-      { imported_at: "2026-07-01T00:00:00Z" },
-      { imported_at: "2026-07-02T00:00:00Z" },
-    ],
-  }), "2026-07-02T00:00:00Z",
-  "the item-level timestamp is derivable from capture rows alone");
+  // No marks read yet is not the same as no captures: the view is empty rather
+  // than wrongly ordered, and fills in when the marks land.
+  assert.deepEqual(captureBooks(index, null), []);
+  assert.equal(markImportedAt(null, index.books[0]), "");
 });
 
 
 test("Books panel views compose with the text filter and show honest counts",
   async () => {
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -1311,12 +1376,19 @@ test("Books panel views compose with the text filter and show honest counts",
     const all = viewButton(harness, "all");
     assert.equal(all.getAttribute("aria-pressed"), "true");
     assert.equal(textOf(all).includes("4"), true);
-    assert.equal(textOf(captures).includes("3"), true);
     assert.equal(textOf(attention).includes("2"), true);
+    // How many books have captures is the only count that costs a
+    // whole-collection read of the captures, so the control says it does not
+    // know rather than showing a number it has not earned.
+    assert.equal(textOf(captures).includes("—"), true);
+    assert.equal(textOf(captures).includes("3"), false);
 
     captures.emit("click");
+    await settle();
     assert.equal(captures.getAttribute("aria-pressed"), "true");
     assert.equal(all.getAttribute("aria-pressed"), "false");
+    assert.equal(textOf(captures).includes("3"), true,
+      "opening the view is what pays for the count");
     assert.deepEqual(
       harness.list.children.map((row) => row.dataset.bookId),
       ["book-pending", "book-herbarium", "book-legacy"],
@@ -1347,7 +1419,12 @@ test("Books panel views compose with the text filter and show honest counts",
     controller.setView("captures");
     controller.render({
       status: "ready",
-      index: normalizeCorrectionsIndex(cleared),
+      index: normalizeCorrectionsIndexSummary(summaryOf(cleared)),
+      // Read, and naming nobody — the route omits books without captures, so
+      // an empty set is the positive claim that every book lost theirs. An
+      // unread set would empty this view too, for the wrong reason.
+      marks: new Map(),
+      details: new Map(),
       selection: null,
       error: null,
     });
@@ -1358,7 +1435,7 @@ test("Books panel views compose with the text filter and show honest counts",
 
 test("prev/next walk the current view order with hard end stops", async () => {
   const store = new CorrectionsIndexStore({
-    api: { loadIndex: async () => fixture() },
+    api: tiered({ loadIndex: async () => fixture() }),
   });
   const harness = miniHarness();
   const navigations = [];
@@ -1404,7 +1481,7 @@ test("when the selected item leaves the view, next takes its former slot",
   async () => {
     const data = fixture();
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => data },
+      api: tiered({ loadIndex: async () => data }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -1442,7 +1519,7 @@ test("previous clamps a remembered slot that outlived a shrunken view",
   async () => {
     let current = fixture();
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => current },
+      api: tiered({ loadIndex: async () => current }),
     });
     const harness = miniHarness();
     const controller = new BooksPanelController({
@@ -1480,7 +1557,7 @@ test("previous clamps a remembered slot that outlived a shrunken view",
 test("stepping keeps keyboard focus on the stepped row across rebuilds",
   async () => {
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const harness = miniHarness();
     const navigations = [];

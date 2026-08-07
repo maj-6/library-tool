@@ -68,6 +68,12 @@
   font-size: 0.68rem;
 }
 
+/* Not yet counted. Dimmer than a muted number so it reads as "no answer"
+   rather than as a small one, without changing the control's width. */
+[data-corrections-root] .books-view-count.is-unknown {
+  opacity: 0.55;
+}
+
 [data-corrections-root] .books-view-nav {
   display: inline-flex;
   gap: 0.2rem;
@@ -267,11 +273,18 @@
   text-overflow: ellipsis;
 }
 
-[data-corrections-root] .book-no-captures {
+[data-corrections-root] .book-no-captures,
+[data-corrections-root] .book-captures-pending {
   color: var(--text-muted, #aeb5bf);
   font-size: 0.78rem;
   margin: 0;
   padding: 0 0.5rem 0.55rem;
+}
+
+/* Deliberately no louder than "No captured images": a row whose photos are
+   still being read must not look more eventful than one that has none. */
+[data-corrections-root] .book-captures-pending {
+  opacity: 0.7;
 }
 
 [data-corrections-root] .books-panel-state,

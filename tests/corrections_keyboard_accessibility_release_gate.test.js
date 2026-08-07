@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
+const { settle, tiered } = require("./fixtures/corrections_tiers");
 const {
   BooksPanelController,
   CorrectionsIndexStore,
@@ -253,7 +254,7 @@ test("keyboard-only Corrections modules expose accessible Books, Artifacts, and 
 
     const booksPane = appendBooksPane(documentRef, scope);
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => fixture() },
+      api: tiered({ loadIndex: async () => fixture() }),
     });
     const books = new BooksPanelController({
       root: booksPane.root,
@@ -261,6 +262,7 @@ test("keyboard-only Corrections modules expose accessible Books, Artifacts, and 
       store,
     }).mount();
     await store.openWorkspace("local-library");
+    await settle();
 
     assert.equal(booksPane.count.textContent, "4");
     assert.equal(booksPane.list.children[0].dataset.bookId, "book-herbarium",

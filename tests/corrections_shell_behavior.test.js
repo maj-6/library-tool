@@ -2427,6 +2427,35 @@ test("standalone shell resolves reviews through the real engine client adapter",
         review: reviewSummary(),
       }],
     });
+    // The tiers the engine actually publishes, projected from the same state
+    // the /2 body reports, so this exercises the real routes end to end.
+    const summaryBody = () => {
+      const index = indexBody();
+      return {
+        ok: true,
+        schema: "librarytool.corrections-index-summary/1",
+        revision: `cri1-index-r${indexRevision}`,
+        books: index.books.map((book) => ({
+          id: book.id,
+          revision: book.revision,
+          kind: book.kind,
+          title: book.title,
+          review: book.review,
+        })),
+        attention: index.attention,
+      };
+    };
+    const detailBody = (itemIds) => {
+      const books = new Map(indexBody().books.map((book) => [book.id, book]));
+      return {
+        ok: true,
+        schema: "librarytool.corrections-index-detail/1",
+        revision: `crd-index-r${indexRevision}`,
+        books: itemIds.filter((itemId) => books.has(itemId))
+          .map((itemId) => books.get(itemId)),
+        missing: itemIds.filter((itemId) => !books.has(itemId)),
+      };
+    };
     const response = (body) => ({
       ok: true,
       status: 200,
@@ -2435,6 +2464,19 @@ test("standalone shell resolves reviews through the real engine client adapter",
     const engineClient = new EngineClient({
       transport: async (url, init) => {
         calls.push({ url, init });
+        if (url.startsWith("/api/v1/corrections/index/probe")) {
+          return response({
+            ok: true,
+            schema: "librarytool.corrections-index-probe/1",
+            revision: `cri1-index-r${indexRevision}`,
+          });
+        }
+        if (url.startsWith("/api/v1/corrections/index/summary")) {
+          return response(summaryBody());
+        }
+        if (url.startsWith("/api/v1/corrections/index/details")) {
+          return response(detailBody(JSON.parse(init.body).item_ids));
+        }
         if (url.startsWith("/api/v1/corrections/index")) {
           return response(indexBody());
         }
@@ -2523,9 +2565,16 @@ test("standalone shell resolves reviews through the real engine client adapter",
       url,
       init.body === undefined ? null : JSON.parse(init.body),
     ]), [
+      // The probe is read before the summary, so what the two-second poll
+      // compares is always a probe against a probe.
       [
         "GET",
-        "/api/v1/corrections/index?workspace_id=workspace-1",
+        "/api/v1/corrections/index/probe?workspace_id=workspace-1",
+        null,
+      ],
+      [
+        "GET",
+        "/api/v1/corrections/index/summary?workspace_id=workspace-1",
         null,
       ],
       [
@@ -2533,9 +2582,10 @@ test("standalone shell resolves reviews through the real engine client adapter",
         "/api/v1/items/book-1/corrections/review/resolve",
         { comment: "Verified" },
       ],
+      // Convergence needs only the review, which the summary carries whole.
       [
         "GET",
-        "/api/v1/corrections/index?workspace_id=workspace-1",
+        "/api/v1/corrections/index/summary?workspace_id=workspace-1",
         null,
       ],
     ]);
