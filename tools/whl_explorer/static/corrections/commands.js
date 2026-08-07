@@ -134,12 +134,17 @@
       // Archive is a durable metadata assertion, not a delete: the image
       // leaves the capture's working set but stays stored and linked for
       // audit, and the same key restores it (undo also works).
+      // The key is ``v`` (archi-v-e) rather than the obvious ``a``: the image
+      // editor claims a bare ``a`` for its Image Adjust tool, and that
+      // handler sits deeper in the tree and calls stopPropagation, so an
+      // ``a`` binding never reaches the keymap while the editor canvas holds
+      // focus — the archive would silently switch tools instead.
       Object.freeze({
         id: COMMAND_IDS.archiveImage,
         label: "Archive image (keep for audit)",
         shortLabel: "Archive image",
         code: "ARC",
-        defaultBinding: "a",
+        defaultBinding: "v",
         targetKind: TARGET_KINDS.IMAGE,
         action: "metadata.archive",
         value: "",
@@ -151,6 +156,11 @@
     // area floors even for degenerate hairline regions.
     const REGION_EXTRACT_PADDING = 0.02;
     const REGION_EXTRACT_MIN_EXTENT = 0.004;
+
+    // Archiving asserts both names together, so restoring has to clear both;
+    // clearing only ``archived`` leaves ``archived_at`` behind as a stale
+    // orphan assertion claiming a restored image was archived.
+    const ARCHIVE_ASSERTION_NAMES = Object.freeze(["archived", "archived_at"]);
 
     const PORTABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
     const MODIFIER_ORDER = Object.freeze(["ctrl", "alt", "shift", "meta"]);
@@ -565,6 +575,13 @@
       ), 512);
     }
 
+    // Only a target that carries metadata assertions can answer this. Lean
+    // navigation targets — the Books capture rows, which are the normal way
+    // into the archive toggle — carry none, so the host tops them up from the
+    // artifacts feature before publishing them (see the shell's
+    // ``classificationTargetMetadata``). Without that, an already-archived
+    // image would look unarchived here and the documented "same key restores
+    // it" toggle would only ever re-assert ``archived``.
     function targetArchived(target) {
       const assertions = read(target, "metadataAssertions", "metadata_assertions");
       if (!Array.isArray(assertions)) return false;
@@ -1002,7 +1019,7 @@
               artifactId: identifiers.id,
               expectedArtifactRevision: identifiers.revision,
               ...(archiveRestored
-                ? { assertions: {}, clearNames: ["archived"] }
+                ? { assertions: {}, clearNames: [...ARCHIVE_ASSERTION_NAMES] }
                 : {
                   assertions: {
                     archived: true,
@@ -1360,6 +1377,7 @@
       eventKeyBinding,
       imageTarget,
       annotationTarget,
+      linkedArtifactKeys,
       normalizeKeyBinding,
       regionExtractQuad,
       registerClassificationCommands,

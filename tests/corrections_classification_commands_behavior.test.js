@@ -921,7 +921,7 @@ test("region extraction stays unavailable without a transform queue port", () =>
 });
 
 
-test("a archives the image as a metadata assertion and toggles back", async () => {
+test("v archives the image as a metadata assertion and toggles back", async () => {
   const statuses = [];
   const calls = [];
   const port = {
@@ -968,7 +968,106 @@ test("a archives the image as a metadata assertion and toggles back", async () =
     "corrections.image.archive", { source: "test" });
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1].assertions, {});
-  assert.deepEqual(calls[1].clearNames, ["archived"]);
+  // Restoring clears both names the archive asserted; leaving ``archived_at``
+  // behind would strand a stale orphan assertion on a restored image.
+  assert.deepEqual(calls[1].clearNames, ["archived", "archived_at"]);
   assert.match(statuses.at(-1), /restored to the capture set/);
   void controller;
+});
+
+
+test("the archive toggle reads archived state from the published target", async () => {
+  const calls = [];
+  const port = {
+    async assertArtifactMetadata(payload) {
+      calls.push(payload);
+      return { receipt: { targets: [] } };
+    },
+  };
+  // The Books panel publishes a lean capture row: authoritative identity and
+  // revision, but no metadata assertions. An archived capture published that
+  // way used to re-assert ``archived`` forever, so the documented "same key
+  // restores it" toggle never fired from the panel reviewers actually use.
+  const booksTarget = {
+    key: "artifact:scan-1",
+    objectType: "raster-artifact",
+    family: "image",
+    group: "source-images",
+    kind: "capture",
+    itemId: "book-1",
+    id: "scan-1",
+    artifactId: "scan-1",
+    revision: "scan-r1",
+    label: "Capture 1",
+  };
+  const controller = createClassificationController({
+    scope: new FakeNode("main", fakeDocument()),
+    documentRef: fakeDocument(),
+    port,
+    operationIdFactory: (prefix) => `op-${prefix}-1`,
+  });
+
+  controller.setSelectionTarget(booksTarget);
+  await controller.invoke("corrections.image.archive", { source: "test" });
+  assert.equal(calls[0].assertions.archived, true,
+    "a lean target with nothing archived still archives");
+
+  // The shell tops the same lean row up from the artifacts feature before
+  // publishing it (classificationTargetMetadata); with the assertions present
+  // the very same key restores instead of re-archiving.
+  controller.setSelectionTarget({
+    ...booksTarget,
+    metadataAssertions: [
+      { name: "archived", value: true, origin: "manual" },
+      { name: "archived_at", value: "2026-08-05T00:00:00Z", origin: "manual" },
+    ],
+  });
+  await controller.invoke("corrections.image.archive", { source: "test" });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].assertions, {});
+  assert.deepEqual(calls[1].clearNames, ["archived", "archived_at"]);
+});
+
+
+test("no default classification key is swallowed by the image editor", () => {
+  const {
+    DEFAULT_CLASSIFICATION_COMMANDS,
+  } = require("../tools/whl_explorer/static/corrections/commands");
+  const {
+    canEnterImageAdjust,
+  } = require("../tools/whl_explorer/static/corrections/image-adjust-tool");
+
+  const archive = DEFAULT_CLASSIFICATION_COMMANDS.find(
+    (command) => command.id === "corrections.image.archive");
+  assert.equal(archive.defaultBinding, "v");
+
+  // The editor's Image Adjust entry shortcut lives on a deeper node and calls
+  // stopPropagation, so any classification key it also claims never reaches
+  // the keymap while the canvas holds focus. Binding archive to ``a`` made it
+  // silently switch tools instead of archiving.
+  for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+    assert.equal(
+      canEnterImageAdjust({
+        key: command.defaultBinding,
+        canvasFocused: true,
+        canvasTarget: true,
+      }, {}),
+      false,
+      `${command.id} is swallowed by the Image Adjust shortcut`,
+    );
+  }
+  assert.equal(
+    canEnterImageAdjust({ key: "a", canvasFocused: true, canvasTarget: true }, {}),
+    true,
+    "the editor still owns a bare a; the guard above would pass vacuously",
+  );
+
+  // Books navigation owns j/k, and no two classification commands may share.
+  const bindings = DEFAULT_CLASSIFICATION_COMMANDS.map(
+    (command) => command.defaultBinding);
+  assert.equal(new Set(bindings).size, bindings.length);
+  for (const taken of ["j", "k"]) {
+    assert.equal(bindings.includes(taken), false,
+      `${taken} belongs to the Books navigation commands`);
+  }
 });

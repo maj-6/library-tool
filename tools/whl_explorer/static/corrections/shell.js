@@ -825,7 +825,30 @@
       ].find((target) => targetKey(target) === key) || null;
     }
 
-    publishClassificationSelectionTarget(target, detail = {}) {
+    // Books publishes a lean capture row: authoritative identity and revision,
+    // but no metadata assertions. The archive command reads those assertions
+    // to decide whether its key archives or restores, so a Books-published
+    // target would always look unarchived and the toggle would never restore.
+    // Top the target up from the artifacts feature's decoded item for the same
+    // key: the panel's own target stays a pure navigation record, and every
+    // surface that publishes a target gets the same answer.
+    classificationTargetMetadata(target) {
+      if (!target || typeof target !== "object") return target;
+      if (Array.isArray(target.metadataAssertions) ||
+          Array.isArray(target.metadata_assertions)) return target;
+      const key = targetKey(target);
+      const item = key && this.artifactsFeature && this.artifactsFeature.items &&
+        this.artifactsFeature.items.get(key) || null;
+      if (!item || item === target ||
+          !Array.isArray(item.metadataAssertions)) return target;
+      return Object.freeze({
+        ...target,
+        metadataAssertions: item.metadataAssertions,
+      });
+    }
+
+    publishClassificationSelectionTarget(value, detail = {}) {
+      const target = this.classificationTargetMetadata(value);
       const controller = this.classificationController;
       if (!controller ||
           typeof controller.setSelectionTarget !== "function") return null;
@@ -862,10 +885,10 @@
           (this.booksFeature.books || this.booksFeature);
         if (!books ||
             typeof books.commandTargetForSelection !== "function") return null;
-        return books.commandTargetForSelection({
+        return this.classificationTargetMetadata(books.commandTargetForSelection({
           itemId: owner.itemId,
           artifactId: owner.artifactId,
-        });
+        }));
       }
       if (owner.kind === "artifact") {
         return this.artifactsFeature && this.artifactsFeature.items &&
@@ -911,7 +934,8 @@
         onHotTarget: (target, detail) => {
           if (this.classificationController &&
               typeof this.classificationController.setHotTarget === "function") {
-            this.classificationController.setHotTarget(target, detail);
+            this.classificationController.setHotTarget(
+              this.classificationTargetMetadata(target), detail);
           }
         },
         onSelectionInvalidated: () => this.clearSelection(),
@@ -1532,15 +1556,15 @@
       // request only when the hovered region is linked to that image (or
       // carries no links at all — legacy rows — in which case the open
       // resource is the only sensible source).
-      const links = [];
-      const many = target &&
-        (target.linkedArtifactIds || target.linked_artifact_ids);
-      if (Array.isArray(many)) links.push(...many.map(String));
-      const single = target &&
-        (target.linkedArtifactId || target.linked_artifact_id);
-      if (single != null) links.push(String(single));
+      //
+      // The links have to be read the way the artifact decoders write them:
+      // ``decodeArtifactSummary`` folds every link shape into ``linkedKeys``
+      // (``artifact:<id>`` entries), so a guard that inspected only the raw
+      // ``linked_artifact_ids`` wire names saw no links at all on a decoded
+      // target and waved every cross-image extraction through.
+      const links = deps.linkedArtifactKeys(target);
       if (links.length &&
-          !links.includes(String(correction.artifact_id))) {
+          !links.includes(`artifact:${correction.artifact_id}`)) {
         return null;
       }
       return correction;
@@ -1618,7 +1642,9 @@
       }
       const address = artifactSelection(target, this.state.selection);
       if (address) this.selectAddress(address, { source: "classification" });
-      return target;
+      // Promotion runs at invoke time, so this is also the freshest chance to
+      // give a lean hovered target its metadata assertions.
+      return this.classificationTargetMetadata(target);
     }
 
     mountArtifactOverlay(controller, resource) {
@@ -1694,8 +1720,16 @@
           const coordinateSpace = String(
             selector && (selector.coordinate_space || selector.coordinateSpace) ||
             resource && resource.coordinateSpace || "").toLowerCase();
+          // display_normalized belongs here too: capture geometry is
+          // normalized against the EXIF-upright display rendition — every
+          // stage that produces it (cv2, which applies the orientation on
+          // decode, and Pillow's exif_transpose) works in that frame, as
+          // librarytool.processing.capture_geometry documents. Applying
+          // the declared orientation again would rotate the boxes off the
+          // text for any capture whose display reports orientation != 1.
           return coordinateSpace.includes("canvas-normalized") ||
-            coordinateSpace.includes("exif_oriented");
+            coordinateSpace.includes("exif_oriented") ||
+            coordinateSpace.includes("display_normalized");
         });
         const orientation = coordinatesAreOriented ? 1 : declaredOrientation;
         overlay.setView({ sourceWidth, sourceHeight, orientation });
