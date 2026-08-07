@@ -29,6 +29,17 @@ Design rules, all learned the hard way elsewhere in this repo:
   regions), so a queue result is indistinguishable downstream from a
   synchronous engine's. A malformed result moves to failed/ with a
   diagnostic and is reported in collect()'s return value — never raised.
+* "never raised" is a hard guarantee, not an aspiration, because the queue
+  is ordered: anything that escapes collect() strands every job behind it,
+  forever, on one hostile or corrupt directory. json.loads has failure
+  modes that are neither JSONDecodeError nor even ValueError — a numeric
+  literal past CPython's 4300-digit int/str conversion limit raises a bare
+  ValueError, and a deeply nested container raises RecursionError, which
+  descends from RuntimeError — so collect() also wraps each job in a
+  catch-all. Nothing is swallowed: every rejection is written into that
+  job's COLLECT_DIAGNOSTIC.txt and returned to the caller.
+* Bounds are enforced by the read itself, never by a prior stat(): a size
+  checked before the bytes are pulled is a hint about a different file.
 * collect() is idempotent and safe against concurrent collectors: a job
   directory vanishing mid-scan (the other collector won the os.replace)
   is silently skipped, and only the collector whose move succeeded reports
@@ -41,6 +52,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -276,26 +288,88 @@ def _bounded_read_text(path: Path, limit: int) -> str:
         return ""
 
 
+def _read_capped_bytes(path: Path, limit: int) -> tuple[bytes | None, str | None]:
+    """Read at most ``limit`` bytes, or say why the file is unusable.
+
+    stat().st_size is only ever a hint about the cap: it follows symlinks,
+    reports a meaningless size for device nodes and FIFOs, and describes
+    whatever the path named at the moment it ran rather than what the next
+    open() gets. So the limit is enforced by the read — open once, fstat
+    THAT descriptor to prove it is a regular file, then ask for limit + 1
+    bytes and reject the file if the extra byte turns up. O_NONBLOCK keeps
+    a FIFO dropped into a job directory from parking the collector forever.
+    """
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        handle = os.open(path, flags)
+    except FileNotFoundError:
+        return None, f"{path.name} is missing"
+    except OSError:
+        return None, f"{path.name} could not be opened"
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            return None, f"{path.name} is not a regular file"
+        chunks: list[bytes] = []
+        remaining = limit + 1  # the +1 is what proves the file is oversized
+        while remaining > 0:
+            chunk = os.read(handle, min(remaining, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return None, f"{path.name} could not be read"
+    finally:
+        os.close(handle)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        return None, f"{path.name} is larger than the {limit} byte limit"
+    return data, None
+
+
+def _bounded_context(context) -> dict:
+    """The read-side twin of _validated_context, with the same bounds.
+
+    job.json is a file the external side can see, and collect() echoes its
+    context straight back to the caller — so what comes out gets the shape
+    and the caps that went in (scalars only, at most MAX_CONTEXT_KEYS of
+    them, keys and string values clipped). Without the value clip the cap
+    only binds callers of submit(), and an edited job.json becomes exactly
+    the arbitrary-payload vehicle _validated_context refuses to be. Reading
+    is not the place to raise, so an over-long value is truncated rather
+    than rejected: the caller keeps its bookkeeping, but never gets back
+    more than it could have submitted.
+    """
+    if not isinstance(context, dict):
+        return {}
+    out: dict = {}
+    for key, value in list(context.items())[:MAX_CONTEXT_KEYS]:
+        if isinstance(value, str):
+            value = value[:MAX_CONTEXT_VALUE_CHARS]
+        elif value is not None and not isinstance(value, (int, float, bool)):
+            continue
+        out[str(key)[:MAX_CONTEXT_KEY_CHARS]] = value
+    return out
+
+
 def _job_summary(job_dir: Path) -> tuple[dict, str, str]:
     """(context, submitted_at, image_file) from job.json; empty on damage."""
     raw = _bounded_read_text(job_dir / JOB_FILE, MAX_JOB_FILE_BYTES)
     try:
         payload = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except RecursionError:
+        return {}, "", ""  # deeply nested job.json; see _validated_result
+    except ValueError:  # JSONDecodeError, and the bare-ValueError cases
         return {}, "", ""
     if not isinstance(payload, dict):
         return {}, "", ""
-    context = payload.get("context")
-    if not isinstance(context, dict):
-        context = {}
     image = payload.get("image")
     image_file = ""
     if isinstance(image, dict):
         image_file = str(image.get("file") or "")[:200]
     return (
-        {str(k)[:MAX_CONTEXT_KEY_CHARS]: v for k, v in
-         list(context.items())[:MAX_CONTEXT_KEYS]
-         if v is None or isinstance(v, (str, int, float, bool))},
+        _bounded_context(payload.get("context")),
         str(payload.get("submitted_at") or "")[:40],
         image_file,
     )
@@ -362,19 +436,24 @@ def _validated_region(region, index: int) -> tuple[dict | None, str | None]:
 
 def _validated_result(job_dir: Path, job_id: str) -> tuple[dict | None, str | None]:
     """result.json -> (normalized OcrEngineResult, None) or (None, problem)."""
-    path = job_dir / RESULT_FILE
+    raw, problem = _read_capped_bytes(job_dir / RESULT_FILE,
+                                      MAX_RESULT_FILE_BYTES)
+    if problem:
+        return None, problem
     try:
-        size = path.stat().st_size
-    except OSError:
-        return None, f"{RESULT_FILE} is missing"
-    if size > MAX_RESULT_FILE_BYTES:
-        return None, (f"{RESULT_FILE} is {size} bytes; the limit is "
-                      f"{MAX_RESULT_FILE_BYTES}")
-    try:
-        payload = json.loads(path.read_bytes().decode("utf-8"))
-    except OSError:
-        return None, f"{RESULT_FILE} could not be read"
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(raw.decode("utf-8"))
+    except RecursionError:
+        # Deeply nested containers exhaust json's scanner, and RecursionError
+        # descends from RuntimeError — no `except ValueError` sees it. Caught
+        # by name because catching it is the whole point: unhandled, it walks
+        # out of collect() and strands every job queued behind this one.
+        return None, f"{RESULT_FILE} is nested too deeply to parse"
+    except ValueError as exc:
+        # ValueError, not just JSONDecodeError: a numeric literal longer than
+        # CPython's 4300-digit int/str conversion limit raises a plain
+        # ValueError from int(), and UnicodeDecodeError (from .decode above)
+        # is a ValueError too. The exception name goes in the diagnostic so
+        # the operator can tell a typo apart from a limit.
         return None, f"{RESULT_FILE} is not valid JSON ({type(exc).__name__})"
     if not isinstance(payload, dict):
         return None, f"{RESULT_FILE} must be a JSON object"
@@ -456,6 +535,32 @@ def _fail_job(job_dir: Path, failed_dir: Path, problem: str) -> bool:
     return _move_job(job_dir, failed_dir)
 
 
+def _collect_one(job_dir: Path, job_id: str, has_error: bool,
+                 done_dir: Path, failed_dir: Path) -> tuple[dict, bool]:
+    """Resolve one marked job -> (entry, moved). Only collect() may call it."""
+    context, submitted_at, _image_file = _job_summary(job_dir)
+    entry: dict = {
+        "job_id": job_id,
+        "status": "",
+        "result": None,
+        "error": None,
+        "context": context,
+        "submitted_at": submitted_at,
+    }
+    if has_error:
+        message = _bounded_read_text(
+            job_dir / ERROR_FILE, MAX_ERROR_CHARS
+        ).strip() or "the external worker reported an error"
+        entry.update(status="failed", error=message)
+        return entry, _move_job(job_dir, failed_dir)  # ERROR file rides along
+    result, problem = _validated_result(job_dir, job_id)
+    if problem:
+        entry.update(status="failed", error=problem)
+        return entry, _fail_job(job_dir, failed_dir, problem)
+    entry.update(status="done", result=result)
+    return entry, _move_job(job_dir, done_dir)
+
+
 def collect(*, data_root: Path | str | None = None) -> list[dict]:
     """Harvest finished jobs from pending/. Never raises for a bad job.
 
@@ -496,29 +601,33 @@ def collect(*, data_root: Path | str | None = None) -> list[dict]:
         if not (has_error or has_done):
             continue  # still the external side's turn — do not even read
         job_id = job_dir.name
-        context, submitted_at, _image_file = _job_summary(job_dir)
-        entry: dict = {
-            "job_id": job_id,
-            "status": "",
-            "result": None,
-            "error": None,
-            "context": context,
-            "submitted_at": submitted_at,
-        }
-        if has_error:
-            message = _bounded_read_text(
-                job_dir / ERROR_FILE, MAX_ERROR_CHARS
-            ).strip() or "the external worker reported an error"
-            entry.update(status="failed", error=message)
-            moved = _move_job(job_dir, failed_dir)  # ERROR file rides along
-        else:
-            result, problem = _validated_result(job_dir, job_id)
-            if problem:
-                entry.update(status="failed", error=problem)
+        try:
+            entry, moved = _collect_one(job_dir, job_id, has_error,
+                                        done_dir, failed_dir)
+        except Exception as exc:  # noqa: BLE001 — see the module docstring
+            # The queue is ordered, so an escaping exception is not one bad
+            # job, it is every job after it too. _validated_result names the
+            # parse failures we know of; this catches the ones we do not —
+            # an unforeseen interpreter limit, an exotic OSError subclass, a
+            # bug in the validators above. Quarantining beats both raising
+            # (wedges the queue) and skipping (retries the poison forever),
+            # and the exception type reaches the operator either way, so
+            # nothing here hides a defect. BaseException is deliberately not
+            # caught: KeyboardInterrupt still stops the collector.
+            problem = (f"the collector could not process this job: "
+                       f"{type(exc).__name__}: {str(exc)[:MAX_ERROR_CHARS]}")
+            entry = {
+                "job_id": job_id,
+                "status": "failed",
+                "result": None,
+                "error": problem,
+                "context": {},
+                "submitted_at": "",
+            }
+            try:
                 moved = _fail_job(job_dir, failed_dir, problem)
-            else:
-                entry.update(status="done", result=result)
-                moved = _move_job(job_dir, done_dir)
+            except Exception:  # noqa: BLE001 — leave it pending, but return
+                moved = False
         if moved:
             collected.append(entry)
     return collected

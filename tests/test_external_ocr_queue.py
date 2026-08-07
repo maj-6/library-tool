@@ -10,6 +10,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import pathlib
+import sys
 
 import pytest
 from PIL import Image
@@ -227,6 +230,153 @@ def test_garbage_result_fails_with_a_diagnostic_not_an_exception(tmp_path):
     diagnostic = (failed_dir / queue_mod.DIAGNOSTIC_FILE).read_text(
         encoding="utf-8")
     assert "not valid JSON" in diagnostic
+
+
+def _huge_int_literal_result() -> str:
+    """A result json.loads rejects with a BARE ValueError.
+
+    CPython caps int/str conversion at 4300 digits; over that, int() raises
+    a plain ValueError that json does not wrap in a JSONDecodeError.
+    """
+    return '{"schema": "x", "job_id": "y", "text": ' + "9" * 5000 + "}"
+
+
+def _deeply_nested_result() -> str:
+    """A result json.loads rejects with a RecursionError, not a ValueError.
+
+    The depth is derived from the live recursion limit rather than
+    hard-coded, so this still trips the scanner in an interpreter (or a
+    conftest) that has raised the limit.
+    """
+    depth = sys.getrecursionlimit() * 3
+    return "[" * depth + "]" * depth
+
+
+@pytest.mark.parametrize("poison, expected_problem", [
+    (_huge_int_literal_result, "not valid JSON"),
+    (_deeply_nested_result, "nested too deeply"),
+])
+def test_a_result_that_defeats_json_loads_cannot_wedge_the_queue(
+        tmp_path, poison, expected_problem):
+    """Neither json.loads failure mode may escape collect().
+
+    Both are invisible to `except (UnicodeDecodeError, JSONDecodeError)` —
+    one raises a bare ValueError, the other a RecursionError (a
+    RuntimeError). Escaping collect() would be far worse than losing one
+    job: the queue is ordered, so a single hostile or corrupt directory
+    would strand every job behind it in pending/ forever. The healthy job
+    submitted alongside must therefore come back from the SAME call,
+    whichever way the UUID-named directories happen to sort.
+    """
+    poisoned_id = queue_mod.submit(
+        _jpeg(), media_type="image/jpeg", data_root=tmp_path,
+        context={"item_id": "poisoned"})
+    healthy_id = queue_mod.submit(
+        _jpeg(), media_type="image/jpeg", data_root=tmp_path,
+        context={"item_id": "healthy"})
+    pending = tmp_path / "ocr_external" / "pending"
+    _complete(pending / poisoned_id, poison())
+    _complete(pending / healthy_id, _valid_result(healthy_id))
+
+    by_id = {e["job_id"]: e
+             for e in queue_mod.collect(data_root=tmp_path)}  # must not raise
+
+    assert by_id[poisoned_id]["status"] == "failed"
+    assert expected_problem in by_id[poisoned_id]["error"]
+    assert by_id[healthy_id]["status"] == "done"  # neighbour not stranded
+    diagnostic = (pending.parent / "failed" / poisoned_id
+                  / queue_mod.DIAGNOSTIC_FILE).read_text(encoding="utf-8")
+    assert expected_problem in diagnostic
+    assert not any(pending.iterdir())  # nothing wedged, nothing retried
+
+
+@pytest.mark.parametrize("stat_lies", [False, True])
+def test_an_oversized_result_is_rejected_by_the_read_not_by_stat(
+        tmp_path, monkeypatch, stat_lies):
+    """The cap has to bind the bytes actually taken in.
+
+    A size from stat() is a claim about whatever the path named at the
+    moment it ran: it follows symlinks, reports nothing meaningful for a
+    FIFO or a device node, and can go stale before the read. So the second
+    case here makes stat() under-report — the size guard is only real if
+    the file is still rejected when the number it was given is a lie.
+    """
+    monkeypatch.setattr(queue_mod, "MAX_RESULT_FILE_BYTES", 64)
+    if stat_lies:
+        real_stat = pathlib.Path.stat
+
+        def _understating_stat(self, *args, **kwargs):
+            info = real_stat(self, *args, **kwargs)
+            if self.name != queue_mod.RESULT_FILE:
+                return info
+            fields = list(info)
+            fields[6] = 0  # st_size, as a special file would report it
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(pathlib.Path, "stat", _understating_stat)
+
+    job_id = queue_mod.submit(
+        _jpeg(), media_type="image/jpeg", data_root=tmp_path)
+    job_dir = tmp_path / "ocr_external" / "pending" / job_id
+    _complete(job_dir, _valid_result(job_id))  # valid JSON, far over 64 bytes
+
+    collected = queue_mod.collect(data_root=tmp_path)
+    assert collected[0]["status"] == "failed"
+    assert "64 byte limit" in collected[0]["error"]
+    assert (tmp_path / "ocr_external" / "failed" / job_id
+            / queue_mod.DIAGNOSTIC_FILE).exists()
+
+
+def test_a_non_regular_result_file_is_rejected(tmp_path):
+    """result.json must be a regular file.
+
+    Only a regular file has a size the cap can mean anything about, and
+    only a regular file cannot block the collector on open. The exact
+    rejection is platform-specific (POSIX opens a directory and fstat
+    refuses it; Windows refuses the open) — what matters is that the job
+    is quarantined instead of crashing collect().
+    """
+    job_id = queue_mod.submit(
+        _jpeg(), media_type="image/jpeg", data_root=tmp_path)
+    job_dir = tmp_path / "ocr_external" / "pending" / job_id
+    (job_dir / queue_mod.RESULT_FILE).mkdir()  # not a file at all
+    (job_dir / queue_mod.DONE_FILE).write_bytes(b"")
+
+    collected = queue_mod.collect(data_root=tmp_path)  # must not raise
+    assert collected[0]["status"] == "failed"
+    assert queue_mod.RESULT_FILE in collected[0]["error"]
+    assert (tmp_path / "ocr_external" / "failed" / job_id).exists()
+
+
+def test_context_values_edited_on_disk_are_clipped_like_submitted_ones(
+        tmp_path):
+    """The submit-side context bound must also hold on the way back out.
+
+    job.json sits in a directory the external side owns for the duration
+    of the job, so what collect() echoes back is not necessarily what the
+    caller submitted. Without the same cap on read, context becomes
+    exactly the arbitrary-payload vehicle _validated_context refuses to be.
+    """
+    over_long = "x" * (queue_mod.MAX_CONTEXT_VALUE_CHARS + 1)
+    with pytest.raises(ValueError):  # the submit-side bound, for contrast
+        queue_mod.submit(_jpeg(), media_type="image/jpeg",
+                         data_root=tmp_path, context={"note": over_long})
+
+    job_id = queue_mod.submit(
+        _jpeg(), media_type="image/jpeg", data_root=tmp_path,
+        context={"note": "short"})
+    job_dir = tmp_path / "ocr_external" / "pending" / job_id
+    job_file = job_dir / queue_mod.JOB_FILE
+    payload = json.loads(job_file.read_text(encoding="utf-8"))
+    payload["context"]["note"] = "x" * 5000        # edited on disk
+    payload["context"]["blob"] = {"nested": "dict"}  # non-scalar: dropped
+    job_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    clipped = {"note": "x" * queue_mod.MAX_CONTEXT_VALUE_CHARS}
+    assert queue_mod.pending_jobs(data_root=tmp_path)[0]["context"] == clipped
+
+    _complete(job_dir, _valid_result(job_id))
+    assert queue_mod.collect(data_root=tmp_path)[0]["context"] == clipped
 
 
 @pytest.mark.parametrize("mutate, expected_problem", [
