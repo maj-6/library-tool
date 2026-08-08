@@ -309,8 +309,16 @@ def test_delete_and_restore_move_only_owned_tree_and_preserve_raw_record(
 
 
 def test_logical_empty_tree_delete_restore_never_materializes_a_directory(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
+    # This test reads the retained journals as its witness that the empty-tree
+    # lifecycle stays version-1 with no tree moves; production sweeps terminal
+    # directories at commit, so keep the crash-window journals for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "empty-library"
     _write_catalogue(root)
     store, repository = _repository(root)
@@ -327,7 +335,9 @@ def test_logical_empty_tree_delete_restore_never_materializes_a_directory(
     assert service.inspect("book-1").managed_tree.revision == (
         EMPTY_MANAGED_TREE_REVISION
     )
-    for journal_path in store.transactions_dir.glob("*/journal.json"):
+    journals = sorted(store.transactions_dir.glob("*/journal.json"))
+    assert len(journals) == 2, "the delete and restore journals are the witness"
+    for journal_path in journals:
         journal = json.loads(journal_path.read_text("utf-8"))
         assert journal["version"] == 1
         assert "tree_moves" not in journal
