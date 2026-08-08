@@ -91,16 +91,12 @@ def test_prepare_records_both_hashes_and_commit_publishes_the_set(tmp_path):
     assert not (root / "images").exists()
 
     transaction.commit(receipt={"pages_applied": [1, 2]})
-    committed = _journal(transaction)
-    assert committed["state"] == "committed"
-    assert committed["receipt"] == {"pages_applied": [1, 2]}
     assert (root / "layout.json").read_bytes() == b"new-layout"
     assert (root / "images" / "figure.png").read_bytes() == b"new-image"
     assert not (root / "obsolete.txt").exists()
-    assert not (transaction.journal_path.parent / "before").exists()
-    assert not (transaction.journal_path.parent / "after").exists()
-
-    store.cleanup(transaction.transaction_id)
+    # A committed transaction leaves nothing behind. Retention is not free:
+    # every workspace lease re-reads every retained journal, so an unswept
+    # workspace makes each lease O(history).
     assert not transaction.journal_path.parent.exists()
     assert (root / "layout.json").read_bytes() == b"new-layout"
 
@@ -135,7 +131,9 @@ def test_journal_publication_retries_transient_permission_errors(
     assert failures["remaining"] == 0
     assert sleeps == [0.05, 0.10]
     assert (root / "layout.json").read_bytes() == b"new-layout"
-    assert _journal(transaction)["state"] == "committed"
+    assert not transaction.journal_path.parent.exists(), (
+        "the retried commit still reaches terminal state and is swept"
+    )
 
 
 def test_injected_late_failure_rolls_back_bytes_deletion_and_directories(tmp_path):
@@ -293,7 +291,9 @@ def test_recovered_prepared_transaction_cannot_be_resurrected_by_old_handle(
     assert target.read_bytes() == b"before"
 
 
-def test_committed_journal_is_terminal_and_does_not_rewrite_later_edits(tmp_path):
+def test_committed_journal_is_terminal_and_does_not_rewrite_later_edits(
+    tmp_path, monkeypatch
+):
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "page.txt"
@@ -302,13 +302,22 @@ def test_committed_journal_is_terminal_and_does_not_rewrite_later_edits(tmp_path
     store = RecoverableWriteSet(root)
     transaction = store.begin()
     transaction.stage_write("page.txt", b"committed")
+    # Model the crash window: the journal reaches "committed" but the process
+    # dies before the terminal directory is removed.
+    monkeypatch.setattr(
+        store, "_remove_terminal_directory_locked", lambda directory: None
+    )
     transaction.commit()
+    assert transaction.journal_path.parent.exists()
     target.write_bytes(b"edited-after-commit")
 
     result = RecoverableWriteSet(root).recover(transaction.transaction_id)
     assert result.state == "committed"
     assert result.action == "already_committed"
     assert target.read_bytes() == b"edited-after-commit"
+    assert not transaction.journal_path.parent.exists(), (
+        "recovery sweeps the crash-window survivor"
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows exposes limited POSIX modes")
@@ -567,7 +576,9 @@ def test_tree_move_prepare_fingerprints_without_copying_and_commit_renames(
     assert destination.stat().st_ino == source_identity
     assert (destination / "pages" / "0001.png").read_bytes() == b"page-one"
     assert (destination / "empty-section").is_dir()
-    assert _journal(transaction)["receipt"] == {"item_id": "book-1"}
+    assert not transaction.journal_path.parent.exists(), (
+        "the committed tree move is swept with its receipt"
+    )
 
 
 def test_mixed_v2_transaction_publishes_trees_then_files_in_staged_order(tmp_path):
@@ -749,7 +760,9 @@ def test_error_reported_after_tree_rename_uses_the_observed_after_state(
 
     assert not source.exists()
     assert (root / "trash" / "book" / "data.bin").read_bytes() == b"preserve"
-    assert _journal(transaction)["state"] == "committed"
+    assert not transaction.journal_path.parent.exists(), (
+        "the late platform error does not stop the commit reaching terminal"
+    )
 
 
 def test_error_reported_after_reverse_rename_uses_the_observed_before_state(
@@ -1241,3 +1254,57 @@ def test_file_only_journal_keeps_the_original_version_one_shape(tmp_path):
     result = RecoverableWriteSet(root).recover(transaction.transaction_id)
     assert result.action == "abandoned_prepared"
     assert not (root / "one.txt").exists()
+
+
+def test_terminal_transactions_never_accumulate_across_commits(tmp_path):
+    """A workspace lease re-reads every retained journal, so retention is a
+    per-lease O(history) cost — measured at 236s for one corrections index
+    build over 983 leases against 1016 journals a real library accumulated in
+    three weeks. Commits must leave the transactions directory empty."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    store = RecoverableWriteSet(root)
+
+    for index in range(5):
+        transaction = store.begin()
+        transaction.stage_write("page.txt", b"v%d" % index)
+        transaction.commit()
+
+    leftovers = [
+        entry
+        for entry in store.transactions_dir.iterdir()
+        if entry.is_dir()
+    ]
+    assert leftovers == []
+    assert (root / "page.txt").read_bytes() == b"v4"
+
+
+def test_recover_all_sweeps_previously_retained_terminal_directories(
+    tmp_path, monkeypatch
+):
+    """Existing libraries hold weeks of retained committed journals; the
+    startup recovery pass must sweep them so leases stop paying for history."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    store = RecoverableWriteSet(root)
+    monkeypatch.setattr(
+        store, "_remove_terminal_directory_locked", lambda directory: None
+    )
+    for index in range(4):
+        transaction = store.begin()
+        transaction.stage_write("page.txt", b"v%d" % index)
+        transaction.commit()
+    retained = [
+        entry for entry in store.transactions_dir.iterdir() if entry.is_dir()
+    ]
+    assert len(retained) == 4, "the retention scenario is set up"
+
+    results = RecoverableWriteSet(root).recover_all()
+    assert [result.action for result in results] == ["already_committed"] * 4
+    fresh = RecoverableWriteSet(root)
+    leftovers = [
+        entry for entry in fresh.transactions_dir.iterdir() if entry.is_dir()
+    ]
+    assert leftovers == []
+    with fresh.workspace_lease():
+        pass

@@ -293,11 +293,13 @@ class RecoverableWriteSet:
             )
         if previous == "committed":
             self._discard_terminal_payloads_locked(directory)
+            self._remove_terminal_directory_locked(directory)
             return RecoveryResult(
                 transaction_id, previous, "committed", "already_committed"
             )
         if previous == "rolled_back":
             self._discard_terminal_payloads_locked(directory)
+            self._remove_terminal_directory_locked(directory)
             return RecoveryResult(
                 transaction_id, previous, "rolled_back", "already_rolled_back"
             )
@@ -681,6 +683,22 @@ class RecoverableWriteSet:
         for name in ("before", "after"):
             shutil.rmtree(directory / name, ignore_errors=True)
         _fsync_directory(directory)
+
+    def _remove_terminal_directory_locked(self, directory: Path) -> None:
+        """Best-effort removal of a terminally journalled transaction.
+
+        A terminal directory exists only for the crash window between the
+        journal reaching its terminal state and this removal; its receipt is
+        crash forensics, not storage (durable receipts live in their own
+        store). Retaining it is not free: every workspace lease re-reads every
+        retained journal, so an unswept workspace makes each lease O(history)
+        — measured at 236 seconds for one corrections index build over 983
+        leases against 1016 retained journals. Removal failure is safe to
+        ignore; recovery sweeps survivors at the next composition.
+        """
+        shutil.rmtree(directory, ignore_errors=True)
+        if not directory.exists():
+            _fsync_directory(self.transactions_dir)
 
     def _assert_recovery_clear_locked(self) -> None:
         """Refuse new work while prior publication has an unknown outcome.
@@ -1259,6 +1277,9 @@ class RecoverableWriteTransaction:
                 except RecoveryRequiredError as recovery_error:
                     raise recovery_error from exc
                 raise
+            # Outside the try: the transaction is durably committed, so a
+            # removal failure must never be answered with a rollback.
+            self._owner._remove_terminal_directory_locked(directory)
 
     def _prepare_locked(self) -> None:
         if self._prepared:

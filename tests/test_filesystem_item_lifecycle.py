@@ -247,8 +247,15 @@ def test_direct_inspection_validates_identity_before_opening_isolation(
 
 
 def test_delete_and_restore_move_only_owned_tree_and_preserve_raw_record(
-    tmp_path,
-):
+    tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "library"
     external = _write_catalogue(root)
     entry = root / "entries" / "book-1"
@@ -764,7 +771,15 @@ def test_broad_lock_failures_are_sanitized_at_the_adapter_boundary(tmp_path):
     assert "private" not in str(caught.value.as_dict())
 
 
-def test_journal_orders_tree_then_envelope_receipt_and_catalogue(tmp_path):
+def test_journal_orders_tree_then_envelope_receipt_and_catalogue(tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "ordering"
     _write_catalogue(root)
     entry = root / "entries" / "book-1"

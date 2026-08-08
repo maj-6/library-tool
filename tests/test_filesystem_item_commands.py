@@ -532,8 +532,15 @@ def test_durable_create_replay_precedes_identity_reservation_lookup(tmp_path):
 
 
 def test_composing_adapter_can_stage_managed_record_and_publish_catalogue_last(
-    tmp_path,
-):
+    tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "managed-composition"
     _write_catalogue(root, {"book": _raw_record()})
     store, repository = _repository(root)
@@ -571,8 +578,15 @@ def test_composing_adapter_can_stage_managed_record_and_publish_catalogue_last(
 
 
 def test_composing_lifecycle_can_restore_raw_record_and_publish_catalogue_last(
-    tmp_path,
-):
+    tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "restored-composition"
     store, repository = _repository(root)
     raw = _raw_record(
