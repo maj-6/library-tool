@@ -966,6 +966,7 @@
 
       addListener(removers, image, "load", () => {
         setData(imageStage, "loaded", true);
+        publishPaneBox();
         draw();
       });
       addListener(removers, image, "error", () => {
@@ -973,13 +974,40 @@
         validationStatus.textContent = "The image could not be loaded.";
       });
 
+      // The stage must shrink-wrap the image exactly — the quad canvas and
+      // the region overlay both stretch across the stage and convert
+      // normalized coordinates against that box, so an image bigger than its
+      // stage misdraws every region AND records wrong quad/mask coordinates.
+      // CSS alone cannot cap the image by the pane (a percentage cap inside
+      // a shrink-wrapped parent is circular, and size containment collapses
+      // the pane), so the pane's box is published as custom properties the
+      // image's max-width/height calc() against.
+      const publishPaneBox = () => {
+        if (!viewport.style || typeof viewport.style.setProperty !== "function") {
+          return;
+        }
+        const width = Number(viewport.clientWidth) || 0;
+        const height = Number(viewport.clientHeight) || 0;
+        if (width > 0) viewport.style.setProperty("--pane-w", `${width}px`);
+        if (height > 0) viewport.style.setProperty("--pane-h", `${height}px`);
+      };
+      publishPaneBox();
       const ResizeObserverRef = options.ResizeObserver ||
         windowRef && windowRef.ResizeObserver;
       if (typeof ResizeObserverRef === "function") {
-        observer = new ResizeObserverRef(() => draw());
-        if (typeof observer.observe === "function") observer.observe(imageStage);
+        observer = new ResizeObserverRef(() => {
+          publishPaneBox();
+          draw();
+        });
+        if (typeof observer.observe === "function") {
+          observer.observe(imageStage);
+          observer.observe(viewport);
+        }
       } else if (windowRef) {
-        addListener(removers, windowRef, "resize", draw);
+        addListener(removers, windowRef, "resize", () => {
+          publishPaneBox();
+          draw();
+        });
       }
 
       const controller = {

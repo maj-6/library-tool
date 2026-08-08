@@ -1676,9 +1676,13 @@
         root: stage,
         documentRef: this.documentRef,
         ResizeObserver: this.windowRef && this.windowRef.ResizeObserver,
+        // The overlay layer is positioned inset:0 in the stage, whose box is
+        // the image box by CSS invariant. Measure the image first anyway: if
+        // the stage ever diverges again (the alpha.11 clamp bug), regions
+        // stay pinned to the pixels they describe rather than to the frame.
         getViewport: () => ({
-          width: Number(stage.clientWidth) || Number(controller.image.clientWidth) || 1,
-          height: Number(stage.clientHeight) || Number(controller.image.clientHeight) || 1,
+          width: Number(controller.image.clientWidth) || Number(stage.clientWidth) || 1,
+          height: Number(controller.image.clientHeight) || Number(stage.clientHeight) || 1,
         }),
         onSoftTarget: (target, detail) => {
           if (this.classificationController &&

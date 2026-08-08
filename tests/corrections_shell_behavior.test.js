@@ -1123,6 +1123,46 @@ test("editor overlay teardown clears a hovered classification target", () => {
 });
 
 
+test("the editor overlay measures the image, not the stage around it", () => {
+  const shell = Object.create(CorrectionsShell.prototype);
+  const documentRef = fakeDocument();
+  const stage = new FakeNode("div", documentRef);
+  const image = new FakeNode("img", documentRef);
+  // The alpha.11 clamp bug: a stage shorter than its image. Regions must pin
+  // to the image's box — projecting into the stage box drew every region at
+  // ~64% scale and made the photo's bottom third unreachable.
+  stage.clientWidth = 400;
+  stage.clientHeight = 256;
+  image.clientWidth = 400;
+  image.clientHeight = 400;
+  stage.append(image);
+  Object.assign(shell, { documentRef, windowRef: {} });
+  const cleanup = shell.mountArtifactOverlay({ image }, {
+    summary: { itemId: "book-1" },
+    regions: [{
+      annotation_id: "region-1",
+      object_type: "spatial-annotation",
+      revision: "region-r1",
+      selector: {
+        coordinate_space: "canvas-normalized",
+        points: [
+          { x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 },
+        ],
+      },
+    }],
+    dimensions: { width: 400, height: 400, orientation: 1 },
+  });
+  const wrapper = stage.querySelector("[data-overlay-key]");
+  assert.ok(wrapper, "the overlay renders the region marker");
+  assert.deepEqual(
+    { width: wrapper.style.width, height: wrapper.style.height },
+    { width: "400.000px", height: "400.000px" },
+    "a full-frame region covers the image box, not the clamped stage box",
+  );
+  cleanup();
+});
+
+
 test("category apply, undo, and conflict refresh expanded artifacts once", async () => {
   const artifactRefreshes = [];
   const detailRefreshes = [];
