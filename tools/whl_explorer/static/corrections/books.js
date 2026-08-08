@@ -6,6 +6,12 @@
   "use strict";
 
   const CORRECTIONS_INDEX_SCHEMA = "librarytool.corrections-index/2";
+  const CORRECTIONS_INDEX_SUMMARY_SCHEMA =
+    "librarytool.corrections-index-summary/1";
+  const CORRECTIONS_INDEX_DETAIL_SCHEMA =
+    "librarytool.corrections-index-detail/1";
+  const CORRECTIONS_CAPTURE_MARKS_SCHEMA =
+    "librarytool.corrections-capture-marks/1";
   const CORRECTIONS_REVIEW_SCHEMA = "librarytool.corrections-review/1";
   const CORRECTIONS_REVIEW_RESULT_SCHEMA =
     "librarytool.corrections-review-result/1";
@@ -464,6 +470,140 @@
     });
   }
 
+  function normalizeSummaryBook(value, path) {
+    exactObject(value, path, ["id", "revision", "kind", "title", "review"]);
+    return freezeDeep({
+      id: identifier(value.id, `${path}.id`),
+      revision: revision(value.revision, `${path}.revision`),
+      kind: enumValue(value.kind, `${path}.kind`, ITEM_KINDS),
+      title: safeText(value.title, `${path}.title`, 2048),
+      review: normalizeReviewSummary(value.review, `${path}.review`),
+    });
+  }
+
+  // The books and attention arrays are each the whole collection here, exactly
+  // as they are in the full index, so the same closed statement holds: every
+  // non-clear review has one attention entry and they agree. That is why the
+  // cross-field checks below are a copy rather than a relaxation.
+  function normalizeCorrectionsIndexSummary(value) {
+    exactObject(value, "$", ["schema", "revision", "books", "attention"]);
+    if (value.schema !== CORRECTIONS_INDEX_SUMMARY_SCHEMA) {
+      fail("$.schema", `must equal ${CORRECTIONS_INDEX_SUMMARY_SCHEMA}`);
+    }
+    const books = boundedArray(value.books, "$.books", 100_000)
+      .map((book, index) => normalizeSummaryBook(book, `$.books[${index}]`));
+    const bookIds = books.map((book) => book.id.toLowerCase());
+    if (new Set(bookIds).size !== bookIds.length) {
+      fail("$.books", "contains duplicate item identifiers");
+    }
+    const knownBooks = new Set(books.map((book) => book.id));
+    const attention = boundedArray(value.attention, "$.attention", 1_000_000)
+      .map((entry, index) =>
+        normalizeAttentionEntry(entry, `$.attention[${index}]`));
+    const attentionKeys = attention.map((entry) => entry.key.toLowerCase());
+    const targetKeys = attention.map((entry) => targetIdentity(entry.target));
+    if (new Set(attentionKeys).size !== attentionKeys.length) {
+      fail("$.attention", "contains duplicate attention keys");
+    }
+    if (new Set(targetKeys).size !== targetKeys.length) {
+      fail("$.attention", "contains duplicate review targets");
+    }
+    for (let index = 0; index < attention.length; index += 1) {
+      if (!knownBooks.has(attention[index].target.item_id)) {
+        fail(`$.attention[${index}].target.item_id`,
+          "must identify a book in this index");
+      }
+    }
+    const bookAttention = new Map(attention
+      .filter((entry) => entry.target.kind === "book")
+      .map((entry) => [entry.target.item_id, entry]));
+    for (let index = 0; index < books.length; index += 1) {
+      const book = books[index];
+      const entry = bookAttention.get(book.id);
+      if (book.review.state === "clear" && entry) {
+        fail(`$.books[${index}].review`,
+          "clear book reviews cannot have a book attention entry");
+      }
+      if (book.review.state !== "clear" && !entry) {
+        fail(`$.books[${index}].review`,
+          "non-clear book reviews require one book attention entry");
+      }
+      if (entry && !sameReviewSummary(book.review, entry.review)) {
+        fail(`$.books[${index}].review`,
+          "must exactly match its book attention entry");
+      }
+    }
+    return freezeDeep({
+      schema: CORRECTIONS_INDEX_SUMMARY_SCHEMA,
+      revision: revision(value.revision, "$.revision"),
+      books: freezeDeep(books),
+      attention: freezeDeep(attention),
+    });
+  }
+
+  function normalizeCorrectionsIndexDetail(value) {
+    exactObject(value, "$", ["schema", "revision", "books", "missing"]);
+    if (value.schema !== CORRECTIONS_INDEX_DETAIL_SCHEMA) {
+      fail("$.schema", `must equal ${CORRECTIONS_INDEX_DETAIL_SCHEMA}`);
+    }
+    const books = boundedArray(value.books, "$.books", 100_000)
+      .map((book, index) => normalizeBook(book, `$.books[${index}]`));
+    const missing = boundedArray(value.missing, "$.missing", 100_000)
+      .map((itemId, index) => identifier(itemId, `$.missing[${index}]`));
+    const bookIds = books.map((book) => book.id.toLowerCase());
+    const missingIds = missing.map((itemId) => itemId.toLowerCase());
+    if (new Set(bookIds).size !== bookIds.length) {
+      fail("$.books", "contains duplicate item identifiers");
+    }
+    if (new Set(missingIds).size !== missingIds.length) {
+      fail("$.missing", "contains duplicate item identifiers");
+    }
+    const missingSet = new Set(missingIds);
+    if (bookIds.some((itemId) => missingSet.has(itemId))) {
+      fail("$.missing", "cannot repeat a book this response returned");
+    }
+    return freezeDeep({
+      schema: CORRECTIONS_INDEX_DETAIL_SCHEMA,
+      revision: revision(value.revision, "$.revision"),
+      books: freezeDeep(books),
+      missing: freezeDeep(missing),
+    });
+  }
+
+  function normalizeCaptureMark(value, path) {
+    exactObject(value, path, [
+      "item_id", "capture_count", "latest_imported_at",
+    ]);
+    return freezeDeep({
+      item_id: identifier(value.item_id, `${path}.item_id`),
+      capture_count: positiveInteger(
+        value.capture_count, `${path}.capture_count`),
+      latest_imported_at: normalizeImportTimestamp(
+        value.latest_imported_at, `${path}.latest_imported_at`),
+    });
+  }
+
+  // Only books that have captures are marked, so an id missing from a loaded
+  // set asserts "no captures" — as against the whole set being absent, which
+  // is the separate state "not read yet".
+  function normalizeCaptureMarks(value) {
+    exactObject(value, "$", ["schema", "revision", "marks"]);
+    if (value.schema !== CORRECTIONS_CAPTURE_MARKS_SCHEMA) {
+      fail("$.schema", `must equal ${CORRECTIONS_CAPTURE_MARKS_SCHEMA}`);
+    }
+    const marks = boundedArray(value.marks, "$.marks", 100_000)
+      .map((mark, index) => normalizeCaptureMark(mark, `$.marks[${index}]`));
+    const itemIds = marks.map((mark) => mark.item_id.toLowerCase());
+    if (new Set(itemIds).size !== itemIds.length) {
+      fail("$.marks", "contains duplicate item identifiers");
+    }
+    return freezeDeep({
+      schema: CORRECTIONS_CAPTURE_MARKS_SCHEMA,
+      revision: revision(value.revision, "$.revision"),
+      marks: freezeDeep(marks),
+    });
+  }
+
   function normalizeReviewDocument(value) {
     exactObject(value, "$", ["schema", "target", "review"]);
     if (value.schema !== CORRECTIONS_REVIEW_SCHEMA) {
@@ -491,7 +631,9 @@
       entry,
     };
     if (value.index !== undefined) {
-      const index = normalizeCorrectionsIndex(value.index);
+      // In lockstep with the store's own index read: the mutation's converged
+      // index is the same shape the store keeps, not the full one.
+      const index = normalizeCorrectionsIndexSummary(value.index);
       if (index.revision !== indexRevision) {
         fail("$.index_revision", "must match the complete index revision");
       }
@@ -551,25 +693,33 @@
     return Number.isFinite(time) ? time : NaN;
   }
 
-  function latestImportedAt(book) {
-    let latest = book.latest_imported_at || "";
-    let latestTime = importedAtTime(latest);
-    for (const capture of book.captures) {
-      const time = importedAtTime(capture.imported_at || "");
-      if (!Number.isFinite(time)) continue;
-      if (!Number.isFinite(latestTime) || time > latestTime ||
-          (time === latestTime &&
-            comparePortable(latest, capture.imported_at) < 0)) {
-        latest = capture.imported_at;
-        latestTime = time;
-      }
-    }
-    return Number.isFinite(latestTime) ? latest : "";
+  const EMPTY_LIST = Object.freeze([]);
+  // Read, and resolved to nothing — as against an absent entry, which means
+  // not read yet. Only the second may be shown as unknown.
+  const MISSING_DETAIL = Object.freeze({
+    import_state: "missing",
+    issues: EMPTY_LIST,
+    captures: EMPTY_LIST,
+    latest_imported_at: "",
+  });
+
+  // The mark's stamp is already the newest of the book's captures — the engine
+  // takes that maximum with the same time-then-value tie-break this comparison
+  // uses — so the capture rows add nothing to the answer. That is what lets
+  // the Captures view be ordered without reading a single capture row.
+  function markImportedAt(marks, book) {
+    const mark = marks && marks.get(book.id);
+    return mark ? mark.latest_imported_at || "" : "";
   }
 
-  function compareCaptureBooks(left, right) {
-    const leftTime = importedAtTime(latestImportedAt(left));
-    const rightTime = importedAtTime(latestImportedAt(right));
+  function detailCaptures(details, book) {
+    const detail = details && details.get(book.id);
+    return detail ? detail.captures : EMPTY_LIST;
+  }
+
+  function compareCaptureBooks(left, right, marks = null) {
+    const leftTime = importedAtTime(markImportedAt(marks, left));
+    const rightTime = importedAtTime(markImportedAt(marks, right));
     const leftKnown = Number.isFinite(leftTime);
     if (leftKnown !== Number.isFinite(rightTime)) return leftKnown ? -1 : 1;
     if (leftKnown && leftTime !== rightTime) return rightTime - leftTime;
@@ -577,11 +727,17 @@
       comparePortable(left.id, right.id);
   }
 
-  function captureBooks(index) {
+  // Membership comes from the mark, which covers the whole collection, and not
+  // from the loaded details, which cover only the drawn window — filtering on
+  // the details would make the view grow as the reader scrolled it.
+  function captureBooks(index, marks = null) {
     if (!index) return [];
     return index.books
-      .filter((book) => book.captures.length > 0)
-      .sort(compareCaptureBooks);
+      .filter((book) => {
+        const mark = marks && marks.get(book.id);
+        return mark ? mark.capture_count > 0 : false;
+      })
+      .sort((left, right) => compareCaptureBooks(left, right, marks));
   }
 
   function attentionBooks(index) {
@@ -590,8 +746,8 @@
       bookNeedsAttention(book, index.attention));
   }
 
-  function booksForView(index, view) {
-    if (view === "captures") return captureBooks(index);
+  function booksForView(index, view, marks = null) {
+    if (view === "captures") return captureBooks(index, marks);
     if (view === "attention") return attentionBooks(index);
     return sortedBooks(index);
   }
@@ -621,7 +777,7 @@
     });
   }
 
-  function selectionExists(index, address) {
+  function selectionExists(index, address, details = null) {
     const book = index.books.find((candidate) => candidate.id === address.itemId);
     if (!book) return false;
     if (!address.artifactId && !address.annotationId) return true;
@@ -630,7 +786,13 @@
         entry.target.item_id === address.itemId &&
         entry.target.annotation_id === address.annotationId);
     }
-    return book.captures.some((capture) =>
+    const detail = details && details.get(address.itemId);
+    // Unknown is not absent. Until this book's captures are read there is no
+    // evidence the artifact went away, and answering "gone" would delete the
+    // reader's own selection and announce that it disappeared — on every cold
+    // open of a capture address, which is the ordinary case.
+    if (!detail) return true;
+    return detail.captures.some((capture) =>
       capture.artifact_id === address.artifactId) ||
       index.attention.some((entry) =>
         entry.target.item_id === address.itemId &&
@@ -667,6 +829,18 @@
       this.listeners = new Set();
       this.workspaceId = null;
       this.index = null;
+      // null until the whole-collection read lands, and a Map afterwards. The
+      // distinction is load-bearing: a loaded Map omits every book without
+      // captures, so "absent id" and "nothing read yet" are different answers
+      // and only the second may be shown as unknown.
+      this.marks = null;
+      this.marksPending = null;
+      // Absent id means "not read yet" — details are only ever fetched for
+      // the rows being drawn, so this Map is never a claim about the rest.
+      this.details = new Map();
+      this.detailsPending = new Set();
+      this.detailsQueued = new Set();
+      this.detailsFlush = null;
       this.status = this.api && typeof this.api.loadIndex === "function"
         ? "idle" : "unavailable";
       this.error = null;
@@ -690,6 +864,8 @@
         error: this.error,
         refreshReason: this.refreshReason,
         selection: this.selection,
+        marks: this.marks,
+        details: this.details,
       });
     }
 
@@ -719,6 +895,7 @@
       this.selection = next;
       this.selectionOwned = ownsSelection;
       this.emit();
+      void this._ensureSelectionDetail();
       return this.selection;
     }
 
@@ -807,13 +984,28 @@
             (owner &&
               owner.mutationGeneration !== this.mutationGeneration) ||
             workspaceId !== this.workspaceId) return null;
-        const index = normalizeCorrectionsIndex(value);
+        const index = normalizeCorrectionsIndexSummary(value);
         this.abortController = null;
         this.index = index;
+        // Dropped on every successful refresh, and deliberately not keyed on
+        // index.revision. The summary revision covers only id, kind, title and
+        // review, so importing a photo — or deleting one — leaves it byte for
+        // byte the same. A cache that kept captures across an unchanged
+        // revision would serve the reader a stale capture list for as long as
+        // they left the window open. Refetching is the cost of that being
+        // impossible.
+        this._dropCaptureReads();
         this.status = "ready";
         this.error = null;
         this._reconcileSelection();
         this.emit();
+        // A refresh is not finished until the selected item has answered. The
+        // list is already painted by the emit above; what waits here is only
+        // the promise, so callers that await a refresh — setContext, an
+        // explicit refresh, the external-change notice — see the real capture
+        // target instead of the placeholder they would never be told to
+        // replace.
+        await this._ensureSelectionDetail();
         return index;
       } catch (error) {
         if (this.destroyed || generation !== this.generation ||
@@ -827,6 +1019,116 @@
           message: errorMessage(error),
         });
         this.emit();
+        return null;
+      }
+    }
+
+    // The selected item's captures are what answer selectionExists and the
+    // capture command target, so the store reads them itself rather than
+    // waiting to be asked by a panel that may not be mounted.
+    _ensureSelectionDetail() {
+      const selection = this.selection;
+      if (!selection || !selection.itemId || !selection.artifactId) return null;
+      return this.ensureDetails([selection.itemId]);
+    }
+
+    _dropCaptureReads() {
+      this.marks = null;
+      this.marksPending = null;
+      this.details = new Map();
+      this.detailsPending = new Set();
+      this.detailsQueued = new Set();
+      this.detailsFlush = null;
+    }
+
+    ensureMarks() {
+      if (this.marks || this.marksPending || !this.index || !this.workspaceId ||
+          !this.api || typeof this.api.loadCaptureMarks !== "function") {
+        return this.marksPending;
+      }
+      const workspaceId = this.workspaceId;
+      const index = this.index;
+      const pending = (async () => {
+        try {
+          const value = await this.api.loadCaptureMarks({ workspaceId });
+          const marks = normalizeCaptureMarks(value);
+          if (this.destroyed || this.marksPending !== pending ||
+              this.index !== index) return;
+          this.marks = new Map(marks.marks.map((mark) =>
+            [mark.item_id, mark]));
+          this.marksPending = null;
+          this.emit();
+        } catch (error) {
+          // The capture counts are an ornament on a list that already renders.
+          // Failing to read them leaves them unknown, which the shell shows as
+          // unknown; it must not tear down the index the reader is using.
+          if (!this.destroyed && this.marksPending === pending) {
+            this.marksPending = null;
+          }
+        }
+      })();
+      this.marksPending = pending;
+      return pending;
+    }
+
+    ensureDetails(itemIds) {
+      if (!Array.isArray(itemIds) || !this.index || !this.workspaceId ||
+          !this.api || typeof this.api.loadDetails !== "function") return null;
+      let queued = false;
+      for (const itemId of itemIds) {
+        if (typeof itemId !== "string" || !itemId ||
+            this.details.has(itemId) || this.detailsPending.has(itemId) ||
+            this.detailsQueued.has(itemId)) continue;
+        this.detailsQueued.add(itemId);
+        queued = true;
+      }
+      if (!queued || this.detailsFlush) return this.detailsFlush;
+      // A single render calls this from several places — the drawn rows, the
+      // rows a step can reach. Coalescing through one turn of the microtask
+      // queue turns that burst into one request, which matters because the
+      // route's cost is dominated by listing the catalogue once, not by the
+      // window's size.
+      const flush = Promise.resolve().then(() => {
+        if (this.detailsFlush !== flush) return null;
+        this.detailsFlush = null;
+        return this._loadQueuedDetails();
+      });
+      this.detailsFlush = flush;
+      return flush;
+    }
+
+    async _loadQueuedDetails() {
+      if (this.destroyed || !this.index || !this.workspaceId) return null;
+      const itemIds = [...this.detailsQueued].slice(0, 256);
+      if (!itemIds.length) return null;
+      this.detailsQueued = new Set(
+        [...this.detailsQueued].filter((itemId) => !itemIds.includes(itemId)));
+      for (const itemId of itemIds) this.detailsPending.add(itemId);
+      const workspaceId = this.workspaceId;
+      const index = this.index;
+      try {
+        const value = await this.api.loadDetails({ workspaceId, itemIds });
+        const detail = normalizeCorrectionsIndexDetail(value);
+        if (this.destroyed || this.index !== index ||
+            this.workspaceId !== workspaceId) return null;
+        const details = new Map(this.details);
+        for (const book of detail.books) details.set(book.id, book);
+        // A book that no longer resolves is recorded as read-and-empty rather
+        // than left pending, which would make every render ask again. The next
+        // refresh drops it from the summary.
+        for (const itemId of detail.missing) details.set(itemId, MISSING_DETAIL);
+        this.details = details;
+        for (const itemId of itemIds) this.detailsPending.delete(itemId);
+        this._reconcileSelection();
+        this.emit();
+        return detail;
+      } catch (error) {
+        // Leaving these ids unloaded rather than marking them empty keeps the
+        // difference between "no captures" and "not read" intact; the next
+        // render asks again.
+        if (!this.destroyed && this.index === index) {
+          for (const itemId of itemIds) this.detailsPending.delete(itemId);
+        }
         return null;
       }
     }
@@ -984,7 +1286,7 @@
         return freezeDeep({ ...book, review: entry.review });
       });
       this.index = freezeDeep({
-        schema: CORRECTIONS_INDEX_SCHEMA,
+        schema: CORRECTIONS_INDEX_SUMMARY_SCHEMA,
         revision: normalizedRevision,
         books: freezeDeep(books),
         attention: freezeDeep(attention),
@@ -997,7 +1299,7 @@
 
     _reconcileSelection() {
       if (!this.index || !this.selection || !this.selectionOwned ||
-          selectionExists(this.index, this.selection)) return;
+          selectionExists(this.index, this.selection, this.details)) return;
       const previous = this.selection;
       this.selection = null;
       this.selectionOwned = false;
@@ -1217,6 +1519,7 @@
       this.navControls = null;
       this.lastViewReference = null;
       this.pendingStepFocus = null;
+      this.pendingSelectionTarget = "";
       this.renderBatch = Number.isSafeInteger(options.renderBatch) &&
         options.renderBatch >= 8 && options.renderBatch <= 200
         ? options.renderBatch : 48;
@@ -1240,6 +1543,10 @@
       this.thumbnailObserver = null;
       this.pendingThumbnails = new Map();
       this.renderedIndex = null;
+      // Both are replaced wholesale rather than mutated, so identity is enough
+      // to notice that captures arrived under an unchanged index.
+      this.renderedDetails = null;
+      this.renderedMarks = null;
       this.renderedStatus = "";
       this.renderedError = null;
       this.renderedFilter = "";
@@ -1488,12 +1795,16 @@
       return match ? captureCommandTarget(match.book, match.capture) : null;
     }
 
+    // Null while the book's captures are still being read. Every caller here
+    // already treats null as "no capture target yet" — the same answer they
+    // get for a book address — so a pending detail degrades to a bare
+    // selection rather than a wrong one.
     captureForSelection(address) {
       if (!address || !address.itemId || !address.artifactId) return null;
       const snapshot = this.store.snapshot();
       const book = snapshot.index && snapshot.index.books
         .find((candidate) => candidate.id === address.itemId);
-      const capture = book && book.captures
+      const capture = book && detailCaptures(snapshot.details, book)
         .find((candidate) => candidate.artifact_id === address.artifactId);
       return book && capture ? { book, capture } : null;
     }
@@ -1515,11 +1826,12 @@
     visibleBooks(snapshot) {
       if (!snapshot.index) return [];
       const query = stableTitleKey(this.filter.trim());
-      return booksForView(snapshot.index, this.view).filter((book) => {
-        if (!query) return true;
-        return stableTitleKey(book.title).includes(query) ||
-          stableTitleKey(book.id).includes(query);
-      });
+      return booksForView(snapshot.index, this.view, snapshot.marks)
+        .filter((book) => {
+          if (!query) return true;
+          return stableTitleKey(book.title).includes(query) ||
+            stableTitleKey(book.id).includes(query);
+        });
     }
 
     viewOrderKey() {
@@ -1581,8 +1893,10 @@
       this.pendingStepFocus = book.id;
       // Stepping is the fix-page → next-page loop: land on the item's first
       // capture so its photo opens immediately. Items without captures keep
-      // the bare book address.
-      const capture = book.captures[0];
+      // the bare book address, as do items whose captures have not been read
+      // yet — which is why the render asks for the step neighbours' details
+      // alongside the rows it draws.
+      const capture = detailCaptures(this.store.snapshot().details, book)[0];
       if (capture) {
         this.navigate(
           captureAddress(book, capture),
@@ -1598,14 +1912,23 @@
       if (this.viewControls) {
         const index = snapshot.index;
         const counts = {
-          all: index ? index.books.length : 0,
-          captures: index ? captureBooks(index).length : 0,
-          attention: index ? attentionBooks(index).length : 0,
+          all: index ? String(index.books.length) : "0",
+          // How many books have captures is the one count that costs a
+          // whole-collection read, so it is only known once the Captures view
+          // has asked for it. Under-stated rather than absent: the control
+          // keeps its shape and says it does not know.
+          captures: index && snapshot.marks
+            ? String(captureBooks(index, snapshot.marks).length) : "—",
+          attention: index ? String(attentionBooks(index).length) : "0",
         };
         for (const [view, control] of this.viewControls) {
           setAttribute(control.button, "aria-pressed",
             view === this.view ? "true" : "false");
-          control.count.textContent = String(counts[view]);
+          control.count.textContent = counts[view];
+          if (control.count.classList) {
+            if (counts[view] === "—") control.count.classList.add("is-unknown");
+            else control.count.classList.remove("is-unknown");
+          }
         }
       }
       if (this.navControls) {
@@ -1707,8 +2030,8 @@
       const book = books[bookIndex];
       const bookPin = bookIndex >= this.renderLimit ? book.id : "";
       if (!selection.artifactId) return { book: bookPin, capture: "" };
-      const captureIndex = book.captures.findIndex((capture) =>
-        capture.artifact_id === selection.artifactId);
+      const captureIndex = detailCaptures(snapshot.details, book)
+        .findIndex((capture) => capture.artifact_id === selection.artifactId);
       const captureLimit = this.captureRenderLimits.get(book.id) ||
         this.captureRenderBatch;
       const capturePin = captureIndex >= captureLimit
@@ -1732,7 +2055,12 @@
         this.captureRenderLimits.clear();
         this.captureRenderRevision += 1;
       }
+      // The Captures view orders and filters the whole collection, so it needs
+      // every mark; no other view does, which is why this is asked for here
+      // and not with the index.
+      if (this.view === "captures") this.store.ensureMarks();
       const books = this.visibleBooks(snapshot);
+      this.requestVisibleDetails(snapshot, books);
       const renderPins = this.selectionRenderPins(snapshot, books);
       const renderedButtons = typeof list.querySelectorAll === "function"
         ? Array.from(list.querySelectorAll("button")) : [];
@@ -1749,6 +2077,8 @@
       );
       const selectionOnly = !this.hotCapture &&
         this.renderedIndex === snapshot.index &&
+        this.renderedDetails === snapshot.details &&
+        this.renderedMarks === snapshot.marks &&
         this.renderedStatus === snapshot.status &&
         this.renderedError === snapshot.error &&
         this.renderedFilter === this.filter &&
@@ -1760,6 +2090,7 @@
         !selectedNodeMissing;
       this.rememberSelectionIndex(snapshot, books);
       this.renderViewControls(snapshot);
+      this.publishPendingSelectionTarget(snapshot);
       if (selectionOnly) {
         this.syncRenderedSelection(list, snapshot);
         this.pendingStepFocus = null;
@@ -1767,6 +2098,8 @@
         return;
       }
       this.renderedIndex = snapshot.index;
+      this.renderedDetails = snapshot.details;
+      this.renderedMarks = snapshot.marks;
       this.renderedStatus = snapshot.status;
       this.renderedError = snapshot.error;
       this.renderedFilter = this.filter;
@@ -1873,6 +2206,51 @@
       this.restoreBookFocus(list, focusedBook);
     }
 
+    // A capture's command target cannot be known until its book's captures
+    // have been read, so a cold open on a capture address publishes "no target
+    // yet". This answers it when the read lands: every other publication is
+    // driven by the selection changing, and this selection never changed.
+    // Fires once per selection that was unresolvable and became resolvable, so
+    // a selection that was answerable all along publishes exactly as before.
+    publishPendingSelectionTarget(snapshot) {
+      const selection = snapshot.selection;
+      const key = selection && selection.itemId && selection.artifactId
+        ? `${selection.itemId} ${selection.artifactId}` : "";
+      if (!key) {
+        this.pendingSelectionTarget = "";
+        return;
+      }
+      if (!this.commandTargetForSelection(selection)) {
+        this.pendingSelectionTarget = key;
+        return;
+      }
+      if (this.pendingSelectionTarget !== key) return;
+      this.pendingSelectionTarget = "";
+      this.syncSelectionTarget(selection, {
+        focused: false,
+        source: "captures",
+      });
+    }
+
+    // The rows about to be drawn, plus the rows one step of the keyboard can
+    // reach. The step targets cost two ids and are what keeps j/k landing on
+    // an item's first photo instead of its bare book address; without them the
+    // row past the render limit is always a page the reader has to open twice.
+    requestVisibleDetails(snapshot, books) {
+      if (typeof this.store.ensureDetails !== "function") return;
+      const wanted = books.slice(0, this.renderLimit).map((book) => book.id);
+      const selection = snapshot.selection;
+      const selected = selection && selection.itemId
+        ? books.findIndex((book) => book.id === selection.itemId) : -1;
+      if (selected >= 0) {
+        for (const neighbour of [books[selected - 1], books[selected + 1]]) {
+          if (neighbour) wanted.push(neighbour.id);
+        }
+      }
+      if (selection && selection.itemId) wanted.push(selection.itemId);
+      this.store.ensureDetails(wanted);
+    }
+
     renderMessage(list, title, message, error = false) {
       clearNode(list);
       list.append(this.messageRow(title, message, error));
@@ -1924,14 +2302,31 @@
         attention.append(icon, element(this.documentRef, "span", "", "Needs attention"));
         select.append(attention);
       }
-      if (book.import_state !== "ready") {
+      const detail = snapshot.details && snapshot.details.get(book.id) || null;
+      // The import state is a capture-derived fact, so it is unknown until the
+      // detail lands. Saying nothing is already how this row reports "ready" —
+      // the chip only ever appears for the exceptions — so an unread book is
+      // indistinguishable from a healthy one for the moment it takes to read.
+      if (detail && detail.import_state !== "ready") {
         select.append(element(this.documentRef, "span", "book-import-state",
-          `${book.import_state.replace("_", " ")} import`));
+          `${detail.import_state.replace("_", " ")} import`));
       }
       this.listenRow(select, "click", () => this.navigate(bookAddress(book), "book"));
       row.append(select);
 
-      if (!book.captures.length) {
+      const bookCaptures = detail ? detail.captures : null;
+      if (!bookCaptures) {
+        const mark = snapshot.marks && snapshot.marks.get(book.id);
+        const pending = element(this.documentRef, "p", "book-captures-pending",
+          mark
+            ? `Loading ${mark.capture_count} captured image${
+                mark.capture_count === 1 ? "" : "s"}…`
+            : "Loading captured images…");
+        setAttribute(pending, "aria-busy", "true");
+        row.append(pending);
+        return row;
+      }
+      if (!bookCaptures.length) {
         row.append(element(this.documentRef, "p", "book-no-captures",
           "No captured images"));
         return row;
@@ -1940,10 +2335,10 @@
       setAttribute(captures, "aria-label", `Captured images for ${title}`);
       const captureLimit = this.captureRenderLimits.get(book.id) ||
         this.captureRenderBatch;
-      let visibleCaptures = book.captures.slice(0, captureLimit);
+      let visibleCaptures = bookCaptures.slice(0, captureLimit);
       const selectedCapture = snapshot.selection &&
         snapshot.selection.itemId === book.id &&
-        book.captures.find((capture) =>
+        bookCaptures.find((capture) =>
           capture.artifact_id === snapshot.selection.artifactId);
       if (selectedCapture && !visibleCaptures.includes(selectedCapture)) {
         visibleCaptures = [
@@ -2044,10 +2439,10 @@
         item.append(button);
         captures.append(item);
       }
-      if (visibleCaptures.length < book.captures.length) {
+      if (visibleCaptures.length < bookCaptures.length) {
         const moreItem = element(
           this.documentRef, "li", "book-captures-load-more");
-        const remaining = book.captures.length - visibleCaptures.length;
+        const remaining = bookCaptures.length - visibleCaptures.length;
         const more = element(
           this.documentRef,
           "button",
@@ -2059,7 +2454,7 @@
         setAttribute(more, "aria-label",
           `${more.textContent} for ${title}`);
         this.listenRow(more, "click", () => {
-          const firstNewCapture = book.captures[captureLimit] || null;
+          const firstNewCapture = bookCaptures[captureLimit] || null;
           this.captureRenderLimits.set(book.id,
             captureLimit + this.captureRenderBatch);
           this.captureRenderRevision += 1;
@@ -2109,8 +2504,11 @@
   return {
     BOOKS_PANEL_VIEWS,
     CATEGORY_PRESENTATION,
+    CORRECTIONS_CAPTURE_MARKS_SCHEMA,
     CORRECTIONS_INDEX_CHANGE_SCHEMA,
+    CORRECTIONS_INDEX_DETAIL_SCHEMA,
     CORRECTIONS_INDEX_SCHEMA,
+    CORRECTIONS_INDEX_SUMMARY_SCHEMA,
     CORRECTIONS_REVIEW_RESULT_SCHEMA,
     CORRECTIONS_REVIEW_SCHEMA,
     BooksPanelController,
@@ -2128,9 +2526,13 @@
     captureState,
     compareBooks,
     compareCaptureBooks,
-    latestImportedAt,
+    detailCaptures,
+    markImportedAt,
     normalizeAttentionEntry,
+    normalizeCaptureMarks,
     normalizeCorrectionsIndex,
+    normalizeCorrectionsIndexDetail,
+    normalizeCorrectionsIndexSummary,
     normalizeIndexChange,
     normalizeReviewDocument,
     normalizeReviewMutationResult,

@@ -30,7 +30,11 @@
     const title = book && book.title.trim() || entry.target.item_id;
     if (entry.target.kind === "book") return title;
     if (entry.target.kind === "image") {
-      const capture = book && book.captures.find(
+      // A book carries its captures only where they have been read, and the
+      // Reviews panel never asks for them — it works off the summary alone.
+      // The artifact id was already the fallback label; it is now the usual
+      // one, which is why nothing else here changes.
+      const capture = book && book.captures && book.captures.find(
         (candidate) => candidate.artifact_id === entry.target.artifact_id);
       return `${title} · Image · ${
         capture && capture.label.trim() || entry.target.artifact_id}`;

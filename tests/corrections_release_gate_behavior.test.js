@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { settle, tiered } = require("./fixtures/corrections_tiers");
 const { performance } = require("node:perf_hooks");
 const test = require("node:test");
 
@@ -322,7 +323,7 @@ test("large cached thumbnail and artifact browsing stays bounded by release budg
     list.setAttribute("data-books-list", "");
     booksRoot.append(count, filter, list);
     const store = new CorrectionsIndexStore({
-      api: { loadIndex: async () => payload },
+      api: tiered({ loadIndex: async () => payload }),
     });
     const panel = new BooksPanelController({
       root: booksRoot,
@@ -331,6 +332,9 @@ test("large cached thumbnail and artifact browsing stays bounded by release budg
     }).mount();
     const renderStarted = performance.now();
     await store.openWorkspace("local-library");
+    // The budget covers a fully drawn list, which now means the index read,
+    // the window of captures, and the render they trigger.
+    await settle();
     const renderElapsed = performance.now() - renderStarted;
     const captureButtons = list.querySelectorAll("[data-artifact-id]");
     assert.equal(captureButtons.length, 12,

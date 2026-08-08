@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
+const { settle, summaryOf, tiered } = require("./fixtures/corrections_tiers");
 const {
   CORRECTIONS_REVIEW_RESULT_SCHEMA,
   CORRECTIONS_REVIEW_SCHEMA,
@@ -89,7 +90,8 @@ function mutationResult(entry, revision, data = fixture()) {
     schema: CORRECTIONS_REVIEW_RESULT_SCHEMA,
     index_revision: revision,
     entry,
-    index: indexWithEntry(data, entry, revision),
+    // Convergence reads the summary, the same tier the store keeps.
+    index: summaryOf(indexWithEntry(data, entry, revision)),
   };
 }
 
@@ -316,7 +318,7 @@ test("review filtering and traversal support precise book, image, and region tar
 test("resolve and reopen send CAS revisions, actor, operation, and comment", async () => {
   const data = fixture();
   const calls = [];
-  const api = {
+  const api = tiered({
     loadIndex: async () => data,
     async resolveReview(options) {
       calls.push({ action: "resolve", options });
@@ -334,7 +336,7 @@ test("resolve and reopen send CAS revisions, actor, operation, and comment", asy
         "index-r9",
       );
     },
-  };
+  });
   const store = new CorrectionsIndexStore({ api });
   await store.openWorkspace("workspace-1");
   const original = store.index.attention[0];
@@ -385,7 +387,7 @@ test("trusted engine reviews do not require or transmit a renderer actor",
     const resolved = transitionedEntry(
       data.attention[0], "resolve", "review-book-r3");
     let mutation;
-    const api = {
+    const api = tiered({
       trustedActor: true,
       loadIndex: async () => data,
       async resolveReview(options) {
@@ -395,7 +397,7 @@ test("trusted engine reviews do not require or transmit a renderer actor",
       reopenReview: async () => {
         throw new Error("not expected");
       },
-    };
+    });
     const store = new CorrectionsIndexStore({ api });
     await store.openWorkspace("workspace-1");
     const controller = new ReviewsPanelController({
@@ -435,7 +437,7 @@ test("partial mutation results reload the complete index before convergence",
     converged.books[1].revision = "book-concurrent-r2";
     let loads = 0;
     const store = new CorrectionsIndexStore({
-      api: {
+      api: tiered({
         async loadIndex() {
           loads += 1;
           return loads === 1 ? data : converged;
@@ -447,7 +449,7 @@ test("partial mutation results reload the complete index before convergence",
             entry: resolved,
           };
         },
-      },
+      }),
     });
     await store.openWorkspace("workspace-1");
 
@@ -480,7 +482,7 @@ test("a review mutation re-converges after an overlapping refresh", async () => 
   );
   let loads = 0;
   const store = new CorrectionsIndexStore({
-    api: {
+    api: tiered({
       loadIndex() {
         loads += 1;
         if (loads === 1) return Promise.resolve(data);
@@ -488,7 +490,7 @@ test("a review mutation re-converges after an overlapping refresh", async () => 
         return Promise.resolve(convergedIndex);
       },
       resolveReview: () => mutation.promise,
-    },
+    }),
   });
   await store.openWorkspace("workspace-1");
 
@@ -522,14 +524,14 @@ test("a review mutation cannot overwrite a newly opened workspace", async () => 
   workspaceBIndex.revision = "index-workspace-b-r1";
   workspaceBIndex.books[1].title = "Workspace B";
   const store = new CorrectionsIndexStore({
-    api: {
+    api: tiered({
       loadIndex({ workspaceId }) {
         return workspaceId === "workspace-a"
           ? Promise.resolve(data)
           : workspaceB.promise;
       },
       resolveReview: () => mutation.promise,
-    },
+    }),
   });
   await store.openWorkspace("workspace-a");
 
@@ -558,13 +560,13 @@ test("concurrent review requests serialize so every committed result converges",
     const secondMutation = deferred();
     let mutations = 0;
     const store = new CorrectionsIndexStore({
-      api: {
+      api: tiered({
         loadIndex: async () => data,
         resolveReview() {
           mutations += 1;
           return mutations === 1 ? firstMutation.promise : secondMutation.promise;
         },
-      },
+      }),
     });
     await store.openWorkspace("workspace-1");
     const firstSource = store.index.attention[0];
@@ -618,7 +620,7 @@ test("a CAS conflict refreshes the queue instead of overwriting newer state", as
   const external = indexWithEntry(data, externalEntry, "index-external-r1");
   let loads = 0;
   const store = new CorrectionsIndexStore({
-    api: {
+    api: tiered({
       async loadIndex() {
         loads += 1;
         return loads === 1 ? data : external;
@@ -629,7 +631,7 @@ test("a CAS conflict refreshes the queue instead of overwriting newer state", as
         error.code = "target_revision_conflict";
         throw error;
       },
-    },
+    }),
   });
   await store.openWorkspace("workspace-1");
   await assert.rejects(
@@ -652,13 +654,13 @@ test("controller can advance to the next open target after a successful resolve"
     const data = fixture();
     const resolved = transitionedEntry(
       data.attention[0], "resolve", "review-book-r3");
-    const api = {
+    const api = tiered({
       loadIndex: async () => data,
       resolveReview: async () => mutationResult(resolved, "index-r8"),
       reopenReview: async () => {
         throw new Error("not expected");
       },
-    };
+    });
     const store = new CorrectionsIndexStore({ api });
     await store.openWorkspace("workspace-1");
     const navigations = [];
@@ -695,7 +697,7 @@ test("audit history is fetched lazily, validated, and cached by review revision"
     const data = fixture();
     let auditCalls = 0;
     const store = new CorrectionsIndexStore({
-      api: {
+      api: tiered({
         loadIndex: async () => data,
         async getReview({ target }) {
           auditCalls += 1;
@@ -704,7 +706,7 @@ test("audit history is fetched lazily, validated, and cached by review revision"
               candidate.target.kind === target.kind);
           return fullReviewDocument(entry);
         },
-      },
+      }),
     });
     await store.openWorkspace("workspace-1");
     const root = { ownerDocument: {}, querySelector: () => null };
@@ -726,13 +728,13 @@ test("audit history is fetched lazily, validated, and cached by review revision"
 test("Review panel exposes focused deep links and honest action capabilities", async () => {
   const data = fixture();
   const store = new CorrectionsIndexStore({
-    api: {
+    api: tiered({
       loadIndex: async () => data,
       getReview: async ({ target }) => fullReviewDocument(
         data.attention.find((entry) =>
           entry.target.kind === target.kind &&
           entry.target.item_id === target.item_id)),
-    },
+    }),
   });
   const harness = reviewHarness();
   const navigations = [];
@@ -794,7 +796,7 @@ test("feature factory shares one per-window store and never falls back to sample
     const feature = createBooksAttentionFeature({
       root: harness.root,
       documentRef: harness.documentRef,
-      api: { loadIndex: async () => data },
+      api: tiered({ loadIndex: async () => data }),
       onNavigate: (address) => navigations.push(address),
     });
     feature.mount();
@@ -835,13 +837,13 @@ test("feature external convergence refreshes the local capture command target",
     const feature = createBooksAttentionFeature({
       root: harness.root,
       documentRef: harness.documentRef,
-      api: {
+      api: tiered({
         async loadIndex() { return current; },
         subscribe(options) {
           notify = options.onChange;
           return () => { notify = null; };
         },
-      },
+      }),
       onSelectionTarget: (target, detail) => targets.push({ target, detail }),
       onExternalChange: (change) => changes.push(change),
     });
@@ -852,6 +854,8 @@ test("feature external convergence refreshes the local capture command target",
       canvas_id: "canvas-cover",
       artifact_id: "capture-cover",
     });
+    // setContext resolves only once the selected item's captures have been
+    // read, so the target it publishes is the real one and not a placeholder.
     assert.equal(targets.at(-1).target.revision, "capture-cover-r2");
 
     current = clone(current);

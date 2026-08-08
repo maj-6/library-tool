@@ -6050,3 +6050,222 @@ test("processing preset names use Unicode scalar limits across the transport", a
     );
   }
 });
+
+
+function correctionsIndexSummary(overrides = {}) {
+  const index = correctionsIndex();
+  return {
+    ok: true,
+    schema: "librarytool.corrections-index-summary/1",
+    revision: "cri1-index-r2",
+    books: index.books.map((book) => ({
+      id: book.id,
+      revision: "crs-book-r2",
+      kind: book.kind,
+      title: book.title,
+      review: book.review,
+    })),
+    attention: index.attention,
+    ...overrides,
+  };
+}
+
+test("the Corrections index summary carries the whole collection, strictly",
+  async () => {
+    const calls = [];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, correctionsIndexSummary());
+      },
+    });
+
+    const summary = await client.corrections.indexSummary({
+      workspaceId: "workspace:one",
+    });
+
+    assert.equal(summary.schema, "librarytool.corrections-index-summary/1");
+    assert.equal(summary.ok, undefined);
+    assert.deepEqual(Object.keys(summary.books[0]).sort(),
+      ["id", "kind", "review", "revision", "title"],
+      "a summary row carries only the fields that cost nothing to know");
+    assert.deepEqual(calls, [{
+      url: "/api/v1/corrections/index/summary?workspace_id=workspace%3Aone",
+      init: {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-cache",
+      },
+    }]);
+    assert.throws(() => client.corrections.indexSummary({
+      workspaceId: "bad workspace",
+    }), TypeError);
+
+    // The cross-field checks are kept, not relaxed: both arrays are still the
+    // whole collection, so an attention entry that names nobody is still a
+    // contradiction rather than a book that happens to be outside a window.
+    const orphaned = correctionsIndexSummary();
+    orphaned.attention[0].target.item_id = "missing:book";
+    const orphanedClient = new EngineClient({
+      transport: async () => response(200, orphaned),
+    });
+    await assert.rejects(
+      orphanedClient.corrections.indexSummary({ workspaceId: "workspace:one" }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+
+    const contradictory = correctionsIndexSummary();
+    contradictory.attention[0].review.state = "resolved";
+    const contradictoryClient = new EngineClient({
+      transport: async () => response(200, contradictory),
+    });
+    await assert.rejects(
+      contradictoryClient.corrections.indexSummary({
+        workspaceId: "workspace:one",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+
+    const inflated = correctionsIndexSummary();
+    inflated.books[0].captures = [];
+    const inflatedClient = new EngineClient({
+      transport: async () => response(200, inflated),
+    });
+    await assert.rejects(
+      inflatedClient.corrections.indexSummary({ workspaceId: "workspace:one" }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  });
+
+test("Corrections index details name their window and validate as index rows",
+  async () => {
+    const calls = [];
+    const detail = () => ({
+      ok: true,
+      schema: "librarytool.corrections-index-detail/1",
+      revision: "crd-index-r2",
+      books: correctionsIndex().books,
+      missing: ["book:gone"],
+    });
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, detail());
+      },
+    });
+
+    const result = await client.corrections.indexDetails({
+      workspaceId: "workspace:one",
+      itemIds: ["book:one", "book:gone"],
+    });
+
+    assert.equal(result.schema, "librarytool.corrections-index-detail/1");
+    assert.deepEqual(result.missing, ["book:gone"]);
+    assert.deepEqual(result.books[0], correctionsIndex().books[0],
+      "a detail row is the index's row for that book, unchanged");
+    assert.equal(calls.length, 1);
+    assert.equal(
+      calls[0].url,
+      "/api/v1/corrections/index/details?workspace_id=workspace%3Aone");
+    assert.equal(calls[0].init.method, "POST");
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+      schema: "librarytool.corrections-index-detail-request/1",
+      item_ids: ["book:one", "book:gone"],
+    });
+
+    assert.throws(() => client.corrections.indexDetails({
+      workspaceId: "workspace:one",
+      itemIds: [],
+    }), TypeError);
+    assert.throws(() => client.corrections.indexDetails({
+      workspaceId: "workspace:one",
+      itemIds: ["book:one", "book:one"],
+    }), TypeError);
+    assert.throws(() => client.corrections.indexDetails({
+      workspaceId: "workspace:one",
+      itemIds: Array.from({ length: 257 }, (_value, index) => `book:${index}`),
+    }), TypeError);
+
+    // A book cannot be both returned and missing.
+    const contradictory = detail();
+    contradictory.missing = ["book:one"];
+    const contradictoryClient = new EngineClient({
+      transport: async () => response(200, contradictory),
+    });
+    await assert.rejects(
+      contradictoryClient.corrections.indexDetails({
+        workspaceId: "workspace:one",
+        itemIds: ["book:one"],
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  });
+
+test("Corrections capture marks report counts and stamps for marked books only",
+  async () => {
+    const calls = [];
+    const marks = () => ({
+      ok: true,
+      schema: "librarytool.corrections-capture-marks/1",
+      revision: "crm-index-r2",
+      marks: [{
+        item_id: "book:one",
+        capture_count: 3,
+        latest_imported_at: "2026-07-28T09:00:00+00:00",
+      }],
+    });
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, marks());
+      },
+    });
+
+    const result = await client.corrections.captureMarks({
+      workspaceId: "workspace:one",
+    });
+
+    assert.equal(result.schema, "librarytool.corrections-capture-marks/1");
+    assert.equal(result.marks[0].capture_count, 3);
+    assert.deepEqual(calls, [{
+      url:
+        "/api/v1/corrections/index/capture-marks?workspace_id=workspace%3Aone",
+      init: {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-cache",
+      },
+    }]);
+
+    // Zero would be indistinguishable from "no captures", which the route
+    // reports by omitting the book entirely.
+    const zeroed = marks();
+    zeroed.marks[0].capture_count = 0;
+    const zeroedClient = new EngineClient({
+      transport: async () => response(200, zeroed),
+    });
+    await assert.rejects(
+      zeroedClient.corrections.captureMarks({ workspaceId: "workspace:one" }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+
+    // The engine keeps any stamp its own parser accepted, so one Date.parse
+    // cannot read degrades to "import time unknown" rather than failing the
+    // whole read — the same degradation the index does for the same field.
+    const unparseable = marks();
+    unparseable.marks[0].latest_imported_at = "2026-07-28T09:00:00,500";
+    const unparseableClient = new EngineClient({
+      transport: async () => response(200, unparseable),
+    });
+    assert.equal(
+      (await unparseableClient.corrections.captureMarks({
+        workspaceId: "workspace:one",
+      })).marks[0].latest_imported_at,
+      "",
+    );
+  });

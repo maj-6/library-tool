@@ -13,6 +13,7 @@ const {
 );
 const {
   CorrectionsIndexStore,
+  booksForView,
 } = require("../tools/whl_explorer/static/corrections/books");
 
 
@@ -2174,9 +2175,15 @@ test("production books port ignores a late aborted workspace load", async () => 
   superseded.abort();
   const openingB = books.loadIndex({ workspaceId: "workspace-b" });
 
-  workspaceB.resolve({});
+  const emptyIndex = {
+    schema: "librarytool.corrections-index/2",
+    revision: "index-r1",
+    books: [],
+    attention: [],
+  };
+  workspaceB.resolve(emptyIndex);
   await openingB;
-  workspaceA.resolve({});
+  workspaceA.resolve(emptyIndex);
   await openingA;
   const result = await books.resolveReview({
     target: { kind: "book", item_id: "book-1" },
@@ -2233,7 +2240,14 @@ test("same-workspace refresh does not invalidate mutation convergence",
       corrections: {
         async index() {
           indexCalls += 1;
-          return indexCalls < 3 ? {} : converged;
+          return indexCalls < 3
+            ? {
+                schema: "librarytool.corrections-index/2",
+                revision: "index-r1",
+                books: [],
+                attention: [],
+              }
+            : converged;
         },
         async getReview() {
           throw new Error("not expected");
@@ -2547,5 +2561,322 @@ test("index polling falls back to the index when the probe is unavailable",
       "the probe is attempted once, then abandoned for the port's lifetime");
     assert.ok(indexCalls > afterOpen,
       "polling continues against the index once the probe is abandoned");
+    store.destroy();
+  });
+
+
+// One library, described once, in the two shapes an engine can serve it in.
+const TIERED_LIBRARY = Object.freeze({
+  schema: "librarytool.corrections-index/2",
+  revision: "index-r4",
+  books: [
+    {
+      id: "book-herbal",
+      revision: "book-herbal-r2",
+      kind: "book",
+      title: "An Herbal",
+      import_state: "partial",
+      issues: ["One captured image is missing"],
+      review: {
+        revision: "review-herbal-r1",
+        state: "needs_attention",
+        reason: "Verify the title page",
+        history_count: 1,
+        latest_event: {
+          operation_id: "op-mark",
+          action: "attention.mark",
+          actor_id: "curator-1",
+          occurred_at: "2026-07-22T18:00:00Z",
+          before_state: "clear",
+          after_state: "needs_attention",
+          reason: "Verify the title page",
+          comment: "",
+        },
+      },
+      captures: [{
+        artifact_id: "capture-cover",
+        revision: "capture-cover-r2",
+        capture_order: 0,
+        label: "Front cover",
+        representation_id: "scan-herbal",
+        canvas_id: "canvas-cover",
+        effective_category: "cover",
+        resource_state: "available",
+        import_state: "ready",
+        freshness: "current",
+        imported_at: "2026-07-28T09:00:00+00:00",
+        thumbnail: null,
+      }],
+      latest_imported_at: "2026-07-28T09:00:00+00:00",
+    },
+    {
+      id: "book-quiet",
+      revision: "book-quiet-r1",
+      kind: "capture",
+      title: "Zoological Botany",
+      import_state: "ready",
+      issues: [],
+      review: {
+        revision: "review-quiet-r1",
+        state: "clear",
+        reason: "",
+        history_count: 0,
+        latest_event: null,
+      },
+      captures: [],
+      latest_imported_at: "",
+    },
+  ],
+  attention: [{
+    key: "attention-book-herbal",
+    target: { kind: "book", item_id: "book-herbal" },
+    review: {
+      revision: "review-herbal-r1",
+      state: "needs_attention",
+      reason: "Verify the title page",
+      history_count: 1,
+      latest_event: {
+        operation_id: "op-mark",
+        action: "attention.mark",
+        actor_id: "curator-1",
+        occurred_at: "2026-07-22T18:00:00Z",
+        before_state: "clear",
+        after_state: "needs_attention",
+        reason: "Verify the title page",
+        comment: "",
+      },
+    },
+  }],
+});
+
+
+function libraryCopy() {
+  return JSON.parse(JSON.stringify(TIERED_LIBRARY));
+}
+
+
+// The three routes, projected from the /2 payload the way the engine projects
+// them from the catalogue — including the distinct revision prefixes, so the
+// comparison below cannot pass by the two shapes being literally the same.
+function tieredCorrections(readIndex, calls = []) {
+  return {
+    // Present because every engine client has it, and fatal because a tiered
+    // sidecar must never be read through it.
+    async index() {
+      throw new Error("the tiered path must not read the whole index");
+    },
+    async indexSummary({ workspaceId }) {
+      calls.push(["summary", workspaceId]);
+      const index = await readIndex();
+      return {
+        schema: "librarytool.corrections-index-summary/1",
+        revision: "cri1-" + index.revision,
+        books: index.books.map((book) => ({
+          id: book.id,
+          revision: "crs-" + book.revision,
+          kind: book.kind,
+          title: book.title,
+          review: book.review,
+        })),
+        attention: index.attention,
+      };
+    },
+    async indexDetails({ workspaceId, itemIds }) {
+      calls.push(["details", workspaceId, [...itemIds]]);
+      const index = await readIndex();
+      const books = new Map(index.books.map((book) => [book.id, book]));
+      return {
+        schema: "librarytool.corrections-index-detail/1",
+        revision: "crd-" + index.revision,
+        books: itemIds.filter((itemId) => books.has(itemId))
+          .map((itemId) => books.get(itemId)),
+        missing: itemIds.filter((itemId) => !books.has(itemId)),
+      };
+    },
+    async captureMarks({ workspaceId }) {
+      calls.push(["marks", workspaceId]);
+      const index = await readIndex();
+      return {
+        schema: "librarytool.corrections-capture-marks/1",
+        revision: "crm-" + index.revision,
+        marks: index.books
+          .filter((book) => book.captures.length > 0)
+          .map((book) => ({
+            item_id: book.id,
+            capture_count: book.captures.length,
+            latest_imported_at: book.latest_imported_at || "",
+          })),
+      };
+    },
+    async getReview() { throw new Error("not expected"); },
+    async listReviewHistory() { throw new Error("not expected"); },
+  };
+}
+
+
+function untieredCorrections(readIndex, calls = []) {
+  return {
+    async index({ workspaceId }) {
+      calls.push(["index", workspaceId]);
+      return readIndex();
+    },
+    async getReview() { throw new Error("not expected"); },
+    async listReviewHistory() { throw new Error("not expected"); },
+  };
+}
+
+
+async function storeState(corrections, drive) {
+  const { engineClient } = engineHarness({ corrections });
+  const store = new CorrectionsIndexStore({
+    api: createCorrectionsEnginePorts(engineClient).books,
+  });
+  await store.openWorkspace("workspace-1");
+  await drive(store);
+  const snapshot = store.snapshot();
+  const state = {
+    status: snapshot.status,
+    // A summary revision and a summary book revision are server-side hashes of
+    // the tier itself, so the two shapes are not expected to agree on them and
+    // nothing in the shell reads them. Everything the reader sees is compared.
+    books: snapshot.index.books.map((book) => ({
+      id: book.id,
+      kind: book.kind,
+      title: book.title,
+      review: book.review,
+    })),
+    attention: snapshot.index.attention,
+    marks: snapshot.marks ? [...snapshot.marks.entries()].sort() : null,
+    details: [...snapshot.details.entries()]
+      .map(([itemId, detail]) => [itemId, {
+        import_state: detail.import_state,
+        issues: detail.issues,
+        captures: detail.captures,
+        latest_imported_at: detail.latest_imported_at,
+      }])
+      .sort((left, right) => (left[0] < right[0] ? -1 : 1)),
+    selection: snapshot.selection,
+  };
+  store.destroy();
+  return JSON.parse(JSON.stringify(state));
+}
+
+
+test("a tiered sidecar and a /2 one leave the store in the same state",
+  async () => {
+    const drive = async (store) => {
+      store.setSelection({
+        itemId: "book-herbal",
+        representationId: "scan-herbal",
+        canvasId: "canvas-cover",
+        artifactId: "capture-cover",
+        annotationId: null,
+      }, { ownedByFeature: true });
+      await store.ensureMarks();
+      await store.ensureDetails(["book-herbal", "book-quiet", "book-gone"]);
+    };
+    const tieredState = await storeState(
+      tieredCorrections(async () => libraryCopy()), drive);
+    const untieredState = await storeState(
+      untieredCorrections(async () => libraryCopy()), drive);
+
+    assert.deepEqual(tieredState, untieredState,
+      "the reader must not be able to tell which sidecar answered");
+    // Not vacuous: what was compared is the whole library, in all three tiers.
+    assert.equal(tieredState.books.length, 2);
+    assert.equal(tieredState.marks.length, 1);
+    assert.equal(tieredState.details.length, 3,
+      "an id the engine could not resolve is read-and-empty, not pending");
+    assert.equal(
+      tieredState.details.find(([id]) => id === "book-herbal")[1]
+        .captures.length,
+      1);
+    assert.equal(tieredState.selection.artifactId, "capture-cover",
+      "a selection that both shapes can prove is kept by both");
+  });
+
+
+test("the three view orders do not depend on where the captures come from",
+  async () => {
+    const order = async (corrections) => {
+      const { engineClient } = engineHarness({ corrections });
+      const store = new CorrectionsIndexStore({
+        api: createCorrectionsEnginePorts(engineClient).books,
+      });
+      await store.openWorkspace("workspace-1");
+      await store.ensureMarks();
+      const snapshot = store.snapshot();
+      const views = Object.fromEntries(["all", "captures", "attention"]
+        .map((view) => [
+          view,
+          booksForView(snapshot.index, view, snapshot.marks)
+            .map((book) => book.id),
+        ]));
+      store.destroy();
+      return views;
+    };
+
+    const tieredViews = await order(
+      tieredCorrections(async () => libraryCopy()));
+    assert.deepEqual(tieredViews, {
+      all: ["book-herbal", "book-quiet"],
+      captures: ["book-herbal"],
+      attention: ["book-herbal"],
+    });
+    assert.deepEqual(
+      await order(untieredCorrections(async () => libraryCopy())),
+      tieredViews);
+  });
+
+
+test("a captures-only change still reaches the reader after a refresh",
+  async () => {
+    // The summary hashes id, kind, title and review, and importing a photo
+    // touches none of them: the tier comes back byte for byte what it was.
+    // A detail cache keyed on the index revision would therefore keep serving
+    // the old capture list for as long as the window stayed open. That cache
+    // was built once and reverted; this is what would catch it returning.
+    let library = libraryCopy();
+    const calls = [];
+    const { engineClient } = engineHarness({
+      corrections: tieredCorrections(async () => library, calls),
+    });
+    const store = new CorrectionsIndexStore({
+      api: createCorrectionsEnginePorts(engineClient).books,
+    });
+    await store.openWorkspace("workspace-1");
+    await store.ensureDetails(["book-herbal"]);
+    assert.equal(
+      store.snapshot().details.get("book-herbal").captures.length, 1);
+    const revisionBefore = store.snapshot().index.revision;
+
+    library = libraryCopy();
+    library.books[0].captures.push({
+      artifact_id: "capture-title",
+      revision: "capture-title-r1",
+      capture_order: 1,
+      label: "Title leaf",
+      representation_id: "scan-herbal",
+      canvas_id: "canvas-title",
+      effective_category: "title_page",
+      resource_state: "available",
+      import_state: "ready",
+      freshness: "current",
+      imported_at: "2026-07-29T09:00:00+00:00",
+      thumbnail: null,
+    });
+    library.books[0].latest_imported_at = "2026-07-29T09:00:00+00:00";
+    await store.refresh();
+    assert.equal(store.snapshot().index.revision, revisionBefore,
+      "the summary is unchanged, which is exactly the trap");
+    assert.equal(store.snapshot().details.has("book-herbal"), false,
+      "the refresh dropped what it had read rather than trusting a revision");
+
+    await store.ensureDetails(["book-herbal"]);
+    assert.equal(
+      store.snapshot().details.get("book-herbal").captures.length, 2,
+      "the new capture reaches the reader");
+    assert.equal(calls.filter(([kind]) => kind === "details").length, 2,
+      "the captures were read again rather than served from a cache");
     store.destroy();
   });
