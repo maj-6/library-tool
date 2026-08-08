@@ -667,6 +667,8 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.spatialAnnotations.list, "function");
   assert.equal(typeof client.spatialAnnotations.get, "function");
   assert.equal(typeof client.corrections.index, "function");
+  assert.equal(typeof client.corrections.indexSummary, "function");
+  assert.equal(typeof client.corrections.indexDetails, "function");
   assert.equal(typeof client.corrections.assignImageCategory, "function");
   assert.equal(typeof client.corrections.clearImageCategory, "function");
   assert.equal(typeof client.corrections.assignRegionRole, "function");
@@ -1397,6 +1399,219 @@ test("corrections index degrades engine-accepted timestamps Date.parse rejects",
       "non-string timestamps are contract violations, not degradations",
     );
   });
+
+function correctionsIndexSummary(overrides = {}) {
+  const index = correctionsIndex();
+  return {
+    ok: true,
+    schema: "librarytool.corrections-index-summary/1",
+    revision: "summary-r2",
+    books: index.books.map((book) => ({
+      id: book.id,
+      revision: `summary-${book.revision}`,
+      kind: book.kind,
+      title: book.title,
+      review: copyJson(book.review),
+    })),
+    attention: index.attention,
+    ...overrides,
+  };
+}
+
+function correctionsIndexDetails(overrides = {}) {
+  const index = correctionsIndex();
+  return {
+    ok: true,
+    schema: "librarytool.corrections-index-detail/1",
+    revision: "detail-r2",
+    books: index.books,
+    missing: [],
+    ...overrides,
+  };
+}
+
+test("corrections index summary is strict, versioned, and workspace scoped",
+  async () => {
+    const calls = [];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, correctionsIndexSummary());
+      },
+    });
+
+    const summary = await client.corrections.indexSummary({
+      workspaceId: "workspace:one",
+    });
+
+    assert.equal(summary.schema, "librarytool.corrections-index-summary/1");
+    assert.equal(summary.ok, undefined);
+    assert.deepEqual(Object.keys(summary.books[0]),
+      ["id", "revision", "kind", "title", "review"]);
+    assert.equal(summary.books[0].review.state, "needs_attention");
+    assert.deepEqual(calls, [{
+      url: "/api/v1/corrections/index/summary?workspace_id=workspace%3Aone",
+      init: {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-cache",
+      },
+    }]);
+    assert.throws(() => client.corrections.indexSummary({
+      workspaceId: "bad workspace",
+    }), TypeError);
+
+    for (const mutate of [
+      (body) => {
+        body.schema = "librarytool.corrections-index/2";
+      },
+      (body) => {
+        // A summary book must never smuggle in a capture-derived field.
+        body.books[0].import_state = "ready";
+      },
+      (body) => {
+        body.attention[0].review.revision = "review-contradictory-r1";
+      },
+      (body) => {
+        body.attention = [];
+      },
+      (body) => {
+        body.attention[0].target.item_id = "missing:book";
+      },
+    ]) {
+      const contradictory = correctionsIndexSummary();
+      mutate(contradictory);
+      const contradictoryClient = new EngineClient({
+        transport: async () => response(200, contradictory),
+      });
+      await assert.rejects(
+        contradictoryClient.corrections.indexSummary({
+          workspaceId: "workspace:one",
+        }),
+        (error) => error instanceof EngineClientError &&
+          error.code === "invalid-response",
+      );
+    }
+  });
+
+test("corrections index details are strict, bounded, and complete", async () => {
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, correctionsIndexDetails());
+    },
+  });
+
+  const details = await client.corrections.indexDetails({
+    workspaceId: "workspace:one",
+    itemIds: ["book:one"],
+  });
+
+  assert.equal(details.schema, "librarytool.corrections-index-detail/1");
+  assert.equal(details.ok, undefined);
+  assert.equal(details.books[0].id, "book:one");
+  assert.deepEqual(details.missing, []);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url,
+    "/api/v1/corrections/index/details?workspace_id=workspace%3Aone");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    schema: "librarytool.corrections-index-detail-request/1",
+    item_ids: ["book:one"],
+  });
+
+  // The request is validated before it is ever sent.
+  assert.throws(() => client.corrections.indexDetails({
+    workspaceId: "workspace:one",
+    itemIds: [],
+  }), TypeError);
+  assert.throws(() => client.corrections.indexDetails({
+    workspaceId: "workspace:one",
+    itemIds: ["book:one", "book:one"],
+  }), TypeError);
+  assert.throws(() => client.corrections.indexDetails({
+    workspaceId: "workspace:one",
+    itemIds: Array.from({ length: 257 }, (_, index) => `b-${index}`),
+  }), TypeError);
+
+  // A requested id may be reported missing, never silently dropped, and a
+  // row for a book the window never asked about is a contract violation.
+  const reported = correctionsIndexDetails({ missing: ["gone:one"] });
+  const reportedClient = new EngineClient({
+    transport: async () => response(200, reported),
+  });
+  const window = await reportedClient.corrections.indexDetails({
+    workspaceId: "workspace:one",
+    itemIds: ["book:one", "gone:one"],
+  });
+  assert.deepEqual(window.missing, ["gone:one"]);
+
+  for (const [mutate, itemIds] of [
+    [(body) => {
+      body.books = [];
+    }, ["book:one"]],
+    [(body) => {
+      body.missing = ["unrequested:book"];
+    }, ["book:one"]],
+    [(body) => {
+      body.extra = true;
+    }, ["book:one"]],
+    [(body) => {
+      body.books[0].captures = [{
+        artifact_id: "image:one",
+        revision: "capture-r1",
+        capture_order: 0,
+        label: "Title leaf",
+        effective_category: "title_page",
+        resource_state: "unavailable",
+        import_state: "ready",
+        freshness: "current",
+        imported_at: 20260723,
+        thumbnail: null,
+      }];
+    }, ["book:one"]],
+  ]) {
+    const malformed = correctionsIndexDetails();
+    mutate(malformed);
+    const malformedClient = new EngineClient({
+      transport: async () => response(200, malformed),
+    });
+    await assert.rejects(
+      malformedClient.corrections.indexDetails({
+        workspaceId: "workspace:one",
+        itemIds,
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  }
+
+  // Import-timestamp degradation mirrors the monolithic index read exactly.
+  const degraded = correctionsIndexDetails();
+  degraded.books[0].latest_imported_at = "20260723T120000";
+  degraded.books[0].captures = [{
+    artifact_id: "image:one",
+    revision: "capture-r1",
+    capture_order: 0,
+    label: "Title leaf",
+    effective_category: "title_page",
+    resource_state: "unavailable",
+    import_state: "ready",
+    freshness: "current",
+    imported_at: "2026-07-23T12:00:00,500",
+    thumbnail: null,
+  }];
+  const degradedClient = new EngineClient({
+    transport: async () => response(200, degraded),
+  });
+  const degradedWindow = await degradedClient.corrections.indexDetails({
+    workspaceId: "workspace:one",
+    itemIds: ["book:one"],
+  });
+  assert.equal(degradedWindow.books[0].latest_imported_at, "");
+  assert.equal(degradedWindow.books[0].captures[0].imported_at, "");
+});
 
 test("correction review reads expose revisioned audit state and reject drift",
   async () => {
