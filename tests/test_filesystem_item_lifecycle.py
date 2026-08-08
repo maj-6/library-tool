@@ -247,8 +247,15 @@ def test_direct_inspection_validates_identity_before_opening_isolation(
 
 
 def test_delete_and_restore_move_only_owned_tree_and_preserve_raw_record(
-    tmp_path,
-):
+    tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "library"
     external = _write_catalogue(root)
     entry = root / "entries" / "book-1"
@@ -302,8 +309,16 @@ def test_delete_and_restore_move_only_owned_tree_and_preserve_raw_record(
 
 
 def test_logical_empty_tree_delete_restore_never_materializes_a_directory(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
+    # This test reads the retained journals as its witness that the empty-tree
+    # lifecycle stays version-1 with no tree moves; production sweeps terminal
+    # directories at commit, so keep the crash-window journals for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "empty-library"
     _write_catalogue(root)
     store, repository = _repository(root)
@@ -320,7 +335,9 @@ def test_logical_empty_tree_delete_restore_never_materializes_a_directory(
     assert service.inspect("book-1").managed_tree.revision == (
         EMPTY_MANAGED_TREE_REVISION
     )
-    for journal_path in store.transactions_dir.glob("*/journal.json"):
+    journals = sorted(store.transactions_dir.glob("*/journal.json"))
+    assert len(journals) == 2, "the delete and restore journals are the witness"
+    for journal_path in journals:
         journal = json.loads(journal_path.read_text("utf-8"))
         assert journal["version"] == 1
         assert "tree_moves" not in journal
@@ -764,7 +781,15 @@ def test_broad_lock_failures_are_sanitized_at_the_adapter_boundary(tmp_path):
     assert "private" not in str(caught.value.as_dict())
 
 
-def test_journal_orders_tree_then_envelope_receipt_and_catalogue(tmp_path):
+def test_journal_orders_tree_then_envelope_receipt_and_catalogue(tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "ordering"
     _write_catalogue(root)
     entry = root / "entries" / "book-1"

@@ -189,8 +189,15 @@ def _live_tree(root: Path) -> dict[str, bytes]:
 
 
 def test_open_publishes_both_aggregates_and_all_receipts_in_one_transaction(
-    tmp_path,
-):
+    tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "library"
     allocations: list[frozenset[str]] = []
     store, repository = _repository(root, allocations=allocations)

@@ -342,7 +342,15 @@ def test_attach_replace_detach_preserve_transitional_fields_and_sources(
     assert second_source.read_bytes() == b"second source"
 
 
-def test_receipt_uses_opaque_path_and_never_persists_the_source_token(tmp_path):
+def test_receipt_uses_opaque_path_and_never_persists_the_source_token(tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "library"
     source = _source(tmp_path, "private-source.pdf", b"private bytes")
     _write_catalogue(root)
@@ -409,8 +417,15 @@ def test_durable_replay_survives_restart_and_changed_operation_conflicts(
 
 
 def test_representation_receipt_precedes_catalogue_in_recovery_journal(
-    tmp_path,
-):
+    tmp_path, monkeypatch):
+    # This test reads the retained journal as its witness of staged
+    # content; production sweeps terminal directories at commit, so keep
+    # the crash-window journal in place for observation.
+    monkeypatch.setattr(
+        RecoverableWriteSet,
+        "_remove_terminal_directory_locked",
+        lambda self, directory: None,
+    )
     root = tmp_path / "library"
     source = _source(tmp_path, "source.pdf", b"source")
     _write_catalogue(root)
