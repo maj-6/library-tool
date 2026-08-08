@@ -5,10 +5,12 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const {
+  MAX_OPERATIONS_PER_RECIPE,
   POINT_ORDER,
   PROPOSAL_SCHEMA,
   TOOLS,
   createImageEditorState,
+  normalizeProcessingOperations,
   reduceImageEditorState,
   serializeCorrectionTransformCommand,
 } = require("../tools/whl_explorer/static/corrections/image-editor-state");
@@ -16,16 +18,21 @@ const {
   BINARY_ALGORITHM,
   BRIGHTNESS_MAX,
   BRIGHTNESS_MIN,
+  CONTRAST_MAX,
+  CONTRAST_MIN,
   DEFAULT_CONTRAST,
   IMAGE_ADJUST_PROFILE_KEY,
+  PROCESSING_OPERATION_DEFAULTS,
   THRESHOLD_RULE,
   applyManualBinaryPreview,
   canApplyWheel,
   canEnterImageAdjust,
   canQueueImageAdjustShortcut,
+  clampOperationParameter,
   composeImageAdjustRendererOptions,
   createImageAdjustTool,
   createManualBinaryAdjustment,
+  createProcessingOperation,
   normalizeImageAdjustProfile,
   renderBinaryCanvasPreview,
   serializeImageAdjustProfile,
@@ -43,6 +50,12 @@ const parityFixture = JSON.parse(fs.readFileSync(path.join(
   __dirname,
   "fixtures",
   "manual_binary_adjust_parity.json",
+), "utf8"));
+
+const canonicalOperations = JSON.parse(fs.readFileSync(path.join(
+  __dirname,
+  "fixtures",
+  "processing_operations_canonical.json",
 ), "utf8"));
 
 
@@ -159,6 +172,27 @@ function descendants(root) {
 function byClass(root, className) {
   return descendants(root).filter((node) =>
     String(node.className || "").split(/\s+/).includes(className));
+}
+
+
+function activateImageAdjust(harness) {
+  harness.controller.dispatch({ type: "SET_TOOL", tool: TOOLS.IMAGE_ADJUST });
+  harness.tool.syncEditorState(
+    harness.controller.getState(),
+    harness.controller.resource,
+  );
+}
+
+
+function operationsEditor(harness) {
+  const panel = byClass(harness.inspector, "image-adjust-panel")[0];
+  return {
+    panel,
+    select: byClass(panel, "image-adjust-operation-add-select")[0],
+    add: byClass(panel, "image-adjust-operation-add")[0],
+    hint: byClass(panel, "image-adjust-operations-hint")[0],
+    rows: () => byClass(panel, "image-adjust-operation"),
+  };
 }
 
 
@@ -601,7 +635,10 @@ test("mounted UI exposes controls, A enters mode, and wheel direction clamps", (
   } = harness;
   const panel = byClass(inspector, "image-adjust-panel")[0];
   const inputs = descendants(panel).filter((node) => node.tagName === "INPUT");
-  const brightness = inputs.find((node) => node.type === "number");
+  const brightness = inputs.find(
+    (node) => node.type === "number" && node.min === "-100");
+  const contrast = inputs.find(
+    (node) => node.type === "number" && node.min === "0");
   const rerun = inputs.find((node) => node.type === "checkbox");
 
   assert.ok(panel);
@@ -609,6 +646,8 @@ test("mounted UI exposes controls, A enters mode, and wheel direction clamps", (
   assert.equal(brightness.min, "-100");
   assert.equal(brightness.max, "100");
   assert.equal(brightness.value, "99");
+  assert.equal(contrast.max, "100");
+  assert.equal(contrast.value, String(DEFAULT_CONTRAST));
   assert.ok(rerun);
   assert.match(panel.textContent, /Re-run OCR/);
   assert.deepEqual(tool.serializeProfile(), { lastAppliedBrightness: 99 });
@@ -981,6 +1020,311 @@ test("a command adapter observes an immediately returned terminal result", () =>
   assert.equal(profileEvents.length, 1);
   assert.equal(tool.getState().pendingOperationIds.length, 0);
   assert.equal(tool.getState().lastOcrOutcome.state, "succeeded");
+});
+
+
+test("authoring builds the engine's canonical operation documents byte-for-byte", () => {
+  assert.equal(
+    canonicalOperations.schema,
+    "librarytool.processing-operations-canonical/1",
+  );
+  const algorithms = new Set();
+  for (const entry of canonicalOperations.operations) {
+    const built = createProcessingOperation(
+      entry.authoring.algorithm,
+      entry.authoring.parameters,
+    );
+    assert.deepEqual(built, entry.canonical, entry.authoring.algorithm);
+    assert.deepEqual(
+      normalizeProcessingOperations([built]),
+      [entry.canonical],
+      `${entry.authoring.algorithm} passes the shared client validator`,
+    );
+    algorithms.add(entry.authoring.algorithm);
+  }
+  assert.deepEqual(
+    [...algorithms].sort(),
+    Object.keys(PROCESSING_OPERATION_DEFAULTS).sort(),
+    "every published algorithm is pinned by the Python-generated fixture",
+  );
+  for (const algorithm of Object.keys(PROCESSING_OPERATION_DEFAULTS)) {
+    assert.ok(
+      canonicalOperations.operations.some((entry) =>
+        entry.authoring.algorithm === algorithm &&
+        Object.keys(entry.authoring.parameters).length === 0),
+      `${algorithm} Add-button defaults are pinned by the fixture`,
+    );
+  }
+  assert.throws(
+    () => createProcessingOperation("median-filter-v1"),
+    /unsupported processing algorithm/,
+  );
+});
+
+
+test("operation parameter authoring clamps to the engine's validated ranges", () => {
+  assert.equal(clampOperationParameter("gamma-v1", "gamma_hundredths", 5000), 1000);
+  assert.equal(clampOperationParameter("gamma-v1", "gamma_hundredths", 0), 10);
+  assert.equal(clampOperationParameter("contrast-v1", "contrast_percent", -250), -100);
+  assert.equal(clampOperationParameter("unsharp-mask-v1", "radius_tenths", 2.6), 3);
+  const clamped = createProcessingOperation("channel-gain-v1", {
+    red_percent: 999,
+    green_percent: -3,
+    blue_percent: 200.4,
+  });
+  assert.equal(clamped.red_percent, 400);
+  assert.equal(clamped.green_percent, 0);
+  assert.equal(clamped.blue_percent, 200);
+  assert.deepEqual(normalizeProcessingOperations([clamped]), [clamped]);
+  const grayWorld = createProcessingOperation("white-balance-v1", {
+    mode: "gray_world",
+    temperature: 40,
+    tint: -20,
+  });
+  assert.equal(grayWorld.temperature, 0, "gray_world cannot carry temperature");
+  assert.equal(grayWorld.tint, 0, "gray_world cannot carry tint");
+  assert.deepEqual(normalizeProcessingOperations([grayWorld]), [grayWorld]);
+});
+
+
+test("the operations editor authors, edits, reorders, and removes the pipeline", () => {
+  const harness = mountedHarness();
+  const editor = operationsEditor(harness);
+  assert.equal(editor.add.disabled, true, "authoring requires the active tool");
+  assert.equal(editor.hint.hidden, true, "no queue-time note before any op exists");
+  activateImageAdjust(harness);
+  assert.equal(editor.add.disabled, false);
+
+  editor.select.value = "gamma-v1";
+  editor.add.emit("click");
+  assert.deepEqual(
+    harness.controller.getState().operations,
+    normalizeProcessingOperations([createProcessingOperation("gamma-v1")]),
+    "Add dispatches the exact normalized default document",
+  );
+  assert.equal(editor.hint.hidden, false);
+  assert.match(editor.hint.textContent, /Applied on queue/);
+
+  editor.select.value = "contrast-v1";
+  editor.add.emit("click");
+  let rows = editor.rows();
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].dataset.operationAlgorithm, "gamma-v1");
+  assert.equal(rows[1].dataset.operationAlgorithm, "contrast-v1");
+
+  const gammaInput = descendants(rows[0]).find((node) => node.tagName === "INPUT");
+  gammaInput.value = "120";
+  gammaInput.emit("change");
+  assert.equal(
+    harness.controller.getState().operations[0].gamma_hundredths, 120);
+  assert.equal(
+    harness.controller.getState().operations[0].rule,
+    "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+    "an edited parameter keeps the canonical rule string",
+  );
+
+  rows = editor.rows();
+  const overflow = descendants(rows[0]).find((node) => node.tagName === "INPUT");
+  overflow.value = "99999";
+  overflow.emit("change");
+  assert.equal(
+    harness.controller.getState().operations[0].gamma_hundredths, 1000,
+    "out-of-range edits clamp to the engine bound");
+  assert.equal(descendants(editor.rows()[0])
+    .find((node) => node.tagName === "INPUT").value, "1000");
+
+  rows = editor.rows();
+  byClass(rows[0], "image-adjust-operation-down")[0].emit("click");
+  assert.deepEqual(
+    harness.controller.getState().operations.map((value) => value.algorithm),
+    ["contrast-v1", "gamma-v1"],
+    "order is authored, never sorted",
+  );
+  byClass(editor.rows()[0], "image-adjust-operation-up")[0].emit("click");
+  assert.deepEqual(
+    harness.controller.getState().operations.map((value) => value.algorithm),
+    ["contrast-v1", "gamma-v1"],
+    "moving the first row up is a guarded no-op",
+  );
+
+  byClass(editor.rows()[1], "image-adjust-operation-remove")[0].emit("click");
+  assert.deepEqual(
+    harness.controller.getState().operations.map((value) => value.algorithm),
+    ["contrast-v1"],
+  );
+
+  const serialized = serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: harness.controller.getState().quad,
+    adjustment: createManualBinaryAdjustment(0),
+    operations: harness.controller.getState().operations,
+    rerunOcr: false,
+    operationId: "authored-ops-1",
+  });
+  assert.deepEqual(
+    serialized.operations,
+    harness.controller.getState().operations,
+    "the authored pipeline reaches the queue command untouched",
+  );
+
+  harness.controller.dispatch({
+    type: "SET_PROCESSING_OPERATIONS",
+    operations: Array.from(
+      { length: MAX_OPERATIONS_PER_RECIPE },
+      () => createProcessingOperation("gamma-v1"),
+    ),
+  });
+  harness.tool.syncEditorState(
+    harness.controller.getState(), harness.controller.resource);
+  assert.equal(editor.add.disabled, true, "the 16-operation cap disables Add");
+  editor.add.emit("click");
+  assert.equal(
+    harness.controller.getState().operations.length,
+    MAX_OPERATIONS_PER_RECIPE,
+    "a full recipe cannot grow past the engine cap",
+  );
+  harness.cleanup();
+});
+
+
+test("white balance authoring keeps gray_world canonical and manual editable", () => {
+  const harness = mountedHarness();
+  activateImageAdjust(harness);
+  const editor = operationsEditor(harness);
+  const byLabel = (nodes, pattern) => nodes.find((node) =>
+    pattern.test(String(node.getAttribute("aria-label"))));
+
+  editor.select.value = "white-balance-v1";
+  editor.add.emit("click");
+  let inputs = descendants(editor.rows()[0])
+    .filter((node) => node.tagName === "INPUT");
+  assert.equal(byLabel(inputs, /Temp/).disabled, true);
+  assert.equal(byLabel(inputs, /Tint/).disabled, true);
+  assert.match(
+    harness.controller.getState().operations[0].rule,
+    /mean_of_all_channels/,
+  );
+
+  const mode = descendants(editor.rows()[0])
+    .find((node) => node.tagName === "SELECT");
+  mode.value = "manual";
+  mode.emit("change");
+  inputs = descendants(editor.rows()[0])
+    .filter((node) => node.tagName === "INPUT");
+  const temperature = byLabel(inputs, /Temp/);
+  assert.equal(temperature.disabled, false);
+  temperature.value = "-300";
+  temperature.emit("change");
+  const manual = harness.controller.getState().operations[0];
+  assert.equal(manual.mode, "manual");
+  assert.equal(manual.temperature, -100, "clamps to the engine range");
+  assert.match(manual.rule, /red gain = 1 \+ strength_percent/);
+  assert.deepEqual(normalizeProcessingOperations([manual]), [manual]);
+
+  const back = descendants(editor.rows()[0])
+    .find((node) => node.tagName === "SELECT");
+  back.value = "gray_world";
+  back.emit("change");
+  const grayWorld = harness.controller.getState().operations[0];
+  assert.equal(grayWorld.temperature, 0, "switching modes re-canonicalizes");
+  assert.equal(grayWorld.tint, 0);
+  assert.match(grayWorld.rule, /mean_of_all_channels/);
+  assert.deepEqual(normalizeProcessingOperations([grayWorld]), [grayWorld]);
+  harness.cleanup();
+});
+
+
+test("the Binarize input authors the real 0..100 blend weight", () => {
+  assert.equal(CONTRAST_MIN, 0);
+  assert.equal(CONTRAST_MAX, 100);
+  const harness = mountedHarness();
+  activateImageAdjust(harness);
+  const panel = byClass(harness.inspector, "image-adjust-panel")[0];
+  const contrast = descendants(panel).find((node) =>
+    node.tagName === "INPUT" && node.type === "number" && node.min === "0");
+  assert.equal(contrast.disabled, false);
+  assert.equal(contrast.value, String(DEFAULT_CONTRAST));
+  assert.match(
+    String(contrast.getAttribute("aria-label")),
+    /blend weight/,
+    "the control is labeled as the blend weight it is, not a contrast dial",
+  );
+
+  contrast.value = "25";
+  contrast.emit("input");
+  assert.equal(harness.tool.getState().contrast, 25);
+  const adjustment = harness.tool.getAdjustment({
+    state: harness.controller.getState(),
+  });
+  assert.equal(adjustment.contrast_percent, 25);
+  assert.deepEqual(harness.previewCalls.at(-1), adjustment,
+    "the exact blend weight reaches the preview kernel");
+
+  contrast.value = "999";
+  contrast.emit("change");
+  assert.equal(harness.tool.getState().contrast, 100, "clamps high");
+  assert.equal(contrast.value, "100");
+
+  contrast.value = "-3";
+  contrast.emit("change");
+  assert.equal(harness.tool.getState().contrast, 0, "clamps low");
+
+  contrast.value = "abc";
+  contrast.emit("input");
+  assert.equal(contrast.getAttribute("aria-invalid"), "true");
+  assert.equal(harness.tool.getState().contrast, 0,
+    "invalid input never dispatches");
+
+  assert.match(
+    byClass(panel, "image-adjust-threshold")[0].textContent,
+    /Binarize 0%/,
+  );
+  harness.cleanup();
+});
+
+
+test("a preset saved after authoring captures the exact operations pipeline", async () => {
+  const created = [];
+  const rows = [];
+  const presets = {
+    async list() { return { presets: rows.slice() }; },
+    async create({ preset }) {
+      created.push(preset);
+      rows.push({ ...preset, revision: `preset-r${created.length}` });
+      return { preset: rows.at(-1) };
+    },
+    async remove() { return { removed: true }; },
+  };
+  const harness = mountedHarness({ createPresetPanel, presets });
+  await new Promise((resolve) => setImmediate(resolve));
+  activateImageAdjust(harness);
+  const editor = operationsEditor(harness);
+  editor.select.value = "unsharp-mask-v1";
+  editor.add.emit("click");
+  editor.select.value = "contrast-v1";
+  editor.add.emit("click");
+  const contrastInput = descendants(editor.rows()[1])
+    .find((node) => node.tagName === "INPUT");
+  contrastInput.value = "25";
+  contrastInput.emit("change");
+
+  const panel = byClass(harness.inspector, "preset-panel")[0];
+  byClass(panel, "preset-name")[0].value = "Authored pipeline";
+  byClass(panel, "preset-save")[0].emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(created.length, 1);
+  assert.deepEqual(created[0].operations, [
+    createProcessingOperation("unsharp-mask-v1"),
+    createProcessingOperation("contrast-v1", { contrast_percent: 25 }),
+  ]);
+  assert.deepEqual(
+    created[0].operations,
+    harness.controller.getState().operations,
+    "the preset captures the authored state, not a rebuilt approximation",
+  );
+  harness.cleanup();
 });
 
 
