@@ -677,6 +677,7 @@
       this.mutationGeneration = 0;
       this.mutationQueue = Promise.resolve();
       this.abortController = null;
+      this.loadPromise = null;
       this.unsubscribeExternal = null;
       this.destroyed = false;
     }
@@ -767,7 +768,27 @@
         this.emit();
         return null;
       }
+      // A convergence notice only says the index MAY have moved; a load that
+      // is already in flight for this workspace is fetching exactly that, so
+      // restarting it makes no progress. It also cannot be allowed to: the
+      // poll is far cheaper than the index read, so cancelling on every tick
+      // means an index slower than the poll interval never finishes, and the
+      // panel sits on "loading" forever with no error to show.
+      if (options.reason === "external" && !owner &&
+          this.status === "loading" && this.loadPromise) {
+        return this.loadPromise;
+      }
       this._cancelLoad();
+      const promise = this._load(options, owner);
+      this.loadPromise = promise;
+      try {
+        return await promise;
+      } finally {
+        if (this.loadPromise === promise) this.loadPromise = null;
+      }
+    }
+
+    async _load(options, owner) {
       const generation = ++this.generation;
       const workspaceId = this.workspaceId;
       const controller = typeof AbortController === "function"
@@ -993,6 +1014,8 @@
       this.generation += 1;
       if (this.abortController) this.abortController.abort();
       this.abortController = null;
+      // A cancelled load must stop being something a later notice can join.
+      this.loadPromise = null;
     }
 
     _connectExternal() {
