@@ -117,11 +117,19 @@
   background-size: 16px 16px;
 }
 
+/* INVARIANT: the stage box must equal the image content box exactly. The
+   region overlay layer and the quad canvas both stretch inset:0 across the
+   stage and convert between normalized and pixel space against that box, so
+   a stage that is smaller than its image draws every region and quad at the
+   wrong scale AND writes wrong normalized coordinates for corner drags and
+   mask points. The stage therefore carries no size caps of its own — it
+   shrink-wraps the image — and the image is capped by the PANE via the
+   --pane-w/--pane-h properties the editor's ResizeObserver publishes, never
+   by the window (a viewport-based cap let the image overflow a short pane,
+   which is exactly the mismatch that misdrew and miswrote coordinates). */
 .perspective-image-stage {
   position: relative;
   display: inline-block;
-  max-width: 100%;
-  max-height: 100%;
   line-height: 0;
   box-shadow: 0 12px 38px rgb(0 0 0 / 48%);
 }
@@ -129,9 +137,9 @@
 .perspective-image {
   display: block;
   width: auto;
-  max-width: 100%;
+  max-width: calc(var(--pane-w, 100vw) - 48px);
   height: auto;
-  max-height: calc(100vh - 190px);
+  max-height: calc(var(--pane-h, 90vh) - 48px);
   user-select: none;
 }
 

@@ -696,7 +696,9 @@ test("renderer disposer disconnects observers and removes all owned listeners", 
   );
   assert.ok(listenerCount() > 20);
   assert.equal(FakeResizeObserver.instances.length, 1);
-  assert.equal(FakeResizeObserver.instances[0].observed.length, 1);
+  // The stage drives canvas redraws; the viewport drives the --pane-w/-h
+  // republication that caps the image by its pane.
+  assert.equal(FakeResizeObserver.instances[0].observed.length, 2);
 
   dispose();
   assert.equal(listenerCount(), 0);
