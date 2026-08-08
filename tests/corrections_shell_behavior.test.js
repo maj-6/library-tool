@@ -2961,7 +2961,20 @@ test("the shell wires the CH panel to selection, metadata saves, and refreshes",
         item_id: "book-1",
         list_available: true,
         match: null,
-        candidates: [],
+        candidates: [{
+          index: 0,
+          key: "6e805628-39",
+          title: "Captured Herbal",
+          author: "Greene, R.",
+          year: "1901",
+          score: 0.91,
+          fields: {
+            title: "Captured Herbal",
+            author: "Greene, R.",
+            year: "1901",
+            publisher: "Field Press",
+          },
+        }],
         rejected: null,
       }),
     };
@@ -3033,6 +3046,17 @@ test("the shell wires the CH panel to selection, metadata saves, and refreshes",
   assert.equal(chHost.hidden, false);
   assert.deepEqual(loadCalls, ["book-1"],
     "item selection also loads the metadata editor");
+  assert.equal(fetchCalls.length, 1,
+    "item properties consumes the CH panel's state body — one request " +
+    "per selection, no duplicate fetch");
+  const yearInput = propertiesHost.querySelector('[data-item-field="year"]');
+  assert.equal(yearInput.getAttribute("data-item-provisional"), "ch",
+    "the shared state body provisionally fills the empty year field");
+  assert.equal(yearInput.getAttribute("placeholder"), "1901");
+  assert.equal(yearInput.getAttribute("title"), "CH candidate: 6e805628-39");
+  assert.equal(propertiesHost.querySelector("[data-item-title]")
+    .getAttribute("data-item-provisional"), null,
+  "the real capture title never shows a provisional value");
 
   const beforeSave = fetchCalls.length;
   shell.itemProperties.onChanged(item, { replayed: false });

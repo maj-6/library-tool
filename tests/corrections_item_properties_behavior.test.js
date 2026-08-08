@@ -10,6 +10,7 @@ const {
   CORRECTIONS_ITEM_SCHEMA,
   CorrectionsItemApi,
   MAX_METADATA_TEXT,
+  chProvisionalPlan,
   createItemMetadataEditor,
   editableMetadata,
   isConflict,
@@ -1000,6 +1001,281 @@ test("server field errors mark the matching typed input", async () => {
   marked.emit("input");
   assert.equal(editor.fieldErrors, null);
   assert.equal(marked.getAttribute("aria-invalid"), null);
+});
+
+
+// --- CH provisional blank-fill ---------------------------------------------
+
+const CH_KEY = "6e805628-39";
+
+function chCandidateState(overrides = {}, fieldOverrides = {}) {
+  return {
+    ok: true,
+    item_id: "capture-b9f1",
+    list_available: true,
+    match: null,
+    candidates: [{
+      index: 4,
+      key: CH_KEY,
+      title: "The Field Herbal",
+      author: "Green, A.",
+      year: "1897",
+      score: 0.914,
+      fields: {
+        title: "The Field Herbal",
+        author: "A. Green",
+        year: "1897",
+        publisher: "Field Press",
+        city: "London",
+        pages: "204",
+        condition: "good",
+        categories: "Herbal",
+        ...fieldOverrides,
+      },
+    }],
+    rejected: null,
+    ...overrides,
+  };
+}
+
+
+function provisionalHarness(metadata, overrides = {}) {
+  const raw = item({ metadata, ...overrides });
+  const calls = [];
+  const saved = item({
+    metadata: { ...metadata, year: "1901" },
+    record_revision: "mir-r2",
+  });
+  return {
+    raw,
+    calls,
+    ...harness({
+      api: {
+        async loadItem() { return raw; },
+        async updateItem(payload) {
+          calls.push(payload);
+          return { item: saved, replayed: false };
+        },
+      },
+    }),
+  };
+}
+
+
+test("CH candidates provisionally fill only empty fields, display-only", async () => {
+  const { editor, root } = provisionalHarness({
+    authors: "Unknown",
+    condition: "foxed",
+    extra: { pages: "204 p." },
+  });
+  await editor.setSelection("capture-b9f1");
+  editor.setChState(chCandidateState());
+
+  const year = root.querySelector('[data-item-field="year"]');
+  assert.equal(year.getAttribute("data-item-provisional"), "ch");
+  assert.equal(year.getAttribute("placeholder"), "1897");
+  assert.equal(year.getAttribute("title"), `CH candidate: ${CH_KEY}`);
+  assert.equal(year.value, "",
+    "the provisional value never becomes the input value");
+  const publisher = root.querySelector('[data-item-field="publisher"]');
+  assert.equal(publisher.getAttribute("placeholder"), "Field Press");
+  assert.equal(
+    root.querySelector('[data-item-field="publisher_city"]')
+      .getAttribute("placeholder"), "London");
+  assert.equal(
+    root.querySelector('[data-item-field="categories"]')
+      .getAttribute("placeholder"), "Herbal");
+
+  const authors = root.querySelector('[data-item-field="authors"]');
+  assert.equal(authors.getAttribute("data-item-provisional"), null,
+    "an occupied field never previews an agreement");
+  assert.equal(authors.getAttribute("placeholder"), null);
+  const condition = root.querySelector('[data-item-field="condition"]');
+  assert.equal(condition.getAttribute("data-item-provisional"), null,
+    "a disagreement is the CH panel's conflict, never a provisional value");
+  const pages = root.querySelector('[data-item-field="pages"]');
+  assert.equal(pages.getAttribute("data-item-provisional"), null,
+    "a value held in extra under the phone's field name blocks blank-fill");
+  const title = root.querySelector("[data-item-title]");
+  assert.equal(title.getAttribute("data-item-provisional"), null,
+    "a real title never shows a provisional value");
+  assert.equal(
+    root.querySelector("[data-item-provisional-legend]").hidden, false,
+    "the legend appears alongside provisional fields");
+});
+
+
+test("an ingest placeholder title counts as blank for provisional fill", async () => {
+  const { editor, root } = provisionalHarness({}, {
+    title: "(untitled capture b9f1a2c3)",
+  });
+  await editor.setSelection("capture-b9f1");
+  editor.setChState(chCandidateState());
+
+  const title = root.querySelector("[data-item-title]");
+  assert.equal(title.getAttribute("data-item-provisional"), "ch");
+  assert.equal(title.getAttribute("title"), `CH candidate: ${CH_KEY}`);
+  assert.equal(title.getAttribute("placeholder"), "The Field Herbal");
+  assert.equal(title.value, "(untitled capture b9f1a2c3)",
+    "the stored placeholder text itself is never rewritten");
+});
+
+
+test("a stamped match or another item's state clears every provisional value",
+  async () => {
+    const { editor, root } = provisionalHarness({});
+    await editor.setSelection("capture-b9f1");
+    editor.setChState(chCandidateState());
+    assert.ok(root.querySelectorAll("[data-item-provisional]").length > 0);
+
+    editor.setChState(chCandidateState({
+      match: { resolution: "key", key: CH_KEY },
+      candidates: [],
+    }));
+    assert.equal(root.querySelectorAll("[data-item-provisional]").length, 0,
+      "a stamped match means the reconciliation already happened");
+    assert.equal(
+      root.querySelector("[data-item-provisional-legend]").hidden, true);
+    for (const input of root.querySelectorAll("[data-item-field]")) {
+      assert.equal(input.getAttribute("placeholder"), null);
+      assert.equal(input.getAttribute("title"), null);
+    }
+
+    editor.setChState(chCandidateState());
+    assert.ok(root.querySelectorAll("[data-item-provisional]").length > 0);
+    editor.setChState(chCandidateState({ item_id: "some-other-item" }));
+    assert.equal(root.querySelectorAll("[data-item-provisional]").length, 0,
+      "a late body for another item never decorates this one");
+  });
+
+
+test("a user edit replaces the provisional value and only real input saves",
+  async () => {
+    const { calls, editor, root } = provisionalHarness({
+      authors: "Unknown",
+    });
+    await editor.setSelection("capture-b9f1");
+    editor.setChState(chCandidateState());
+    const year = root.querySelector('[data-item-field="year"]');
+    assert.equal(year.getAttribute("data-item-provisional"), "ch");
+
+    year.value = "1901";
+    year.emit("input");
+
+    assert.equal(year.getAttribute("data-item-provisional"), null);
+    assert.equal(year.getAttribute("placeholder"), null);
+    assert.equal(year.getAttribute("title"), null);
+    assert.equal(
+      root.querySelector('[data-item-field="publisher"]')
+        .getAttribute("data-item-provisional"), "ch",
+      "untouched empty fields keep their provisional display");
+
+    await editor.save();
+
+    assert.deepEqual(calls[0].patch, {
+      title: null,
+      metadata_set: { year: "1901" },
+      metadata_remove: [],
+    }, "the patch carries the typed value and no provisional field");
+  });
+
+
+test("provisional values are never serialized into drafts or patches", async () => {
+  const { calls, editor, root } = provisionalHarness({ authors: "Unknown" });
+  await editor.setSelection("capture-b9f1");
+  editor.setChState(chCandidateState());
+  assert.equal(root.querySelector('[data-item-field="year"]')
+    .getAttribute("placeholder"), "1897");
+
+  editor.updateDraft({ title: "Corrected title" });
+  const draftMetadata = JSON.parse(editor.draft.metadataText);
+  for (const key of ["year", "publisher", "publisher_city", "categories"]) {
+    assert.equal(Object.prototype.hasOwnProperty.call(draftMetadata, key),
+      false, `${key} must not leak into the draft`);
+  }
+
+  await editor.save();
+
+  assert.deepEqual(calls[0].patch, {
+    title: "Corrected title",
+    metadata_set: {},
+    metadata_remove: [],
+  }, "a save while provisional values display commits none of them");
+});
+
+
+test("the never-serialized assertion detects the value-writing mutant", async () => {
+  // The plausible regression: provisional display writing candidate values
+  // into input.value instead of the placeholder attribute. The invalid-JSON
+  // Advanced fallback merges from input values, so that mutant leaks the
+  // candidate into the draft — first prove the correct implementation does
+  // not leak through that exact path, then apply the mutation by hand and
+  // show the same assertion trips, so the guard above is not vacuous.
+  const clean = provisionalHarness({ authors: "Unknown" });
+  await clean.editor.setSelection("capture-b9f1");
+  clean.editor.setChState(chCandidateState());
+  clean.editor.updateDraft({ metadataText: "{ not json" });
+  const cleanAdvanced = clean.root.querySelector(
+    "[data-item-metadata-advanced]");
+  cleanAdvanced.value = "{}";
+  cleanAdvanced.emit("input");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      JSON.parse(clean.editor.draft.metadataText), "year"), false,
+    "a placeholder survives the fallback merge without leaking");
+
+  const mutant = provisionalHarness({ authors: "Unknown" });
+  await mutant.editor.setSelection("capture-b9f1");
+  mutant.editor.setChState(chCandidateState());
+  const year = mutant.root.querySelector('[data-item-field="year"]');
+  year.value = year.getAttribute("placeholder"); // the mutation
+  mutant.editor.updateDraft({ metadataText: "{ not json" });
+  const advanced = mutant.root.querySelector("[data-item-metadata-advanced]");
+  advanced.value = "{}";
+  advanced.emit("input");
+  assert.equal(JSON.parse(mutant.editor.draft.metadataText).year, "1897",
+    "the mutant leaks the candidate value, so the guard assertion catches it");
+});
+
+
+test("chProvisionalPlan mirrors the server merge plan's blank-fill rules", () => {
+  const base = { id: "capture-b9f1", kind: "capture", storageKind: "manual" };
+  const draft = {
+    title: "",
+    metadataText: JSON.stringify({ authors: "" }),
+  };
+  const plan = chProvisionalPlan(base, draft, chCandidateState());
+  assert.equal(plan.key, CH_KEY);
+  assert.equal(plan.title, "The Field Herbal");
+  assert.deepEqual(plan.values, {
+    authors: "A. Green",
+    year: "1897",
+    publisher: "Field Press",
+    publisher_city: "London",
+    pages: "204",
+    condition: "good",
+    categories: "Herbal",
+  });
+  assert.equal("edition" in plan.values, false,
+    "a blank CH column never fills anything");
+
+  const buildPlan = chProvisionalPlan(
+    { ...base, kind: "book", storageKind: "build" }, draft,
+    chCandidateState());
+  assert.equal("condition" in buildPlan.values, false,
+    "build storage has no columns for condition/illustrations/price");
+  assert.equal(buildPlan.values.publisher, "Field Press");
+
+  assert.equal(chProvisionalPlan(base, draft, chCandidateState({
+    match: { resolution: "key", key: CH_KEY },
+  })), null, "a stamped match never previews");
+  assert.equal(chProvisionalPlan(base, draft,
+    chCandidateState({ item_id: "other" })), null);
+  assert.equal(chProvisionalPlan(base, draft,
+    chCandidateState({ candidates: [] })), null);
+  assert.equal(chProvisionalPlan(base,
+    { title: "", metadataText: "{ nope" }, chCandidateState()), null,
+  "an unparsable draft offers no safe view of which fields are empty");
 });
 
 
