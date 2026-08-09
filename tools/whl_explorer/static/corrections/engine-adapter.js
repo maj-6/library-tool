@@ -1309,6 +1309,88 @@
       let requestedWorkspaceId = null;
       let workspaceRequestGeneration = 0;
       let workspaceEpoch = 0;
+      // The tiered index routes (summary + details) replace the monolithic
+      // /corrections/index read wherever the client serves them. The summary
+      // is the only request that holds the workspace lease for a whole
+      // projection pass, and it reads no capture manifests at all, so a load
+      // stops starving concurrent per-item requests. An engine client without
+      // the tiered calls keeps the monolithic path byte-for-byte unchanged.
+      const tiered = typeof corrections.indexSummary === "function" &&
+        typeof corrections.indexDetails === "function";
+      const DETAIL_BATCH_LIMIT = 256;
+      // The last whole index this port produced, so a review mutation can
+      // converge through one single-item detail window instead of reloading
+      // every book.
+      let assembled = null;
+
+      function invalidIndexAssembly(message) {
+        const error = new Error(message);
+        error.code = "invalid-corrections-index-assembly";
+        return error;
+      }
+
+      async function assembleTieredIndex(
+        nextWorkspaceId,
+        signal,
+        retry = true,
+      ) {
+        const summary = await corrections.indexSummary({
+          workspaceId: nextWorkspaceId,
+          signal,
+        });
+        const ids = summary.books.map((book) => book.id);
+        const batches = [];
+        for (let start = 0; start < ids.length; start += DETAIL_BATCH_LIMIT) {
+          batches.push(ids.slice(start, start + DETAIL_BATCH_LIMIT));
+        }
+        const details = await Promise.all(batches.map((itemIds) =>
+          corrections.indexDetails({
+            workspaceId: nextWorkspaceId,
+            itemIds,
+            signal,
+          })));
+        const rows = new Map();
+        let torn = false;
+        for (const detail of details) {
+          if (detail.missing.length) torn = true;
+          for (const book of detail.books) rows.set(book.id, book);
+        }
+        torn = torn || ids.some((id) => !rows.has(id));
+        if (torn) {
+          // A book the summary listed but no detail window resolved was
+          // deleted between the two reads. One clean retry re-lists; a second
+          // tear is reported rather than papered over with a fabricated row.
+          if (retry) {
+            return assembleTieredIndex(nextWorkspaceId, signal, false);
+          }
+          throw invalidIndexAssembly(
+            "The Corrections summary and its detail windows kept diverging");
+        }
+        // A detail row is exactly what the monolithic index would have
+        // inlined, including its captures — "captures": [] is the row's
+        // positive claim that the book has none. The review is still taken
+        // from the summary: the attention list comes from the summary
+        // snapshot and the index contract requires each book's review to
+        // equal its attention entry, so a review that moved between the two
+        // reads must not tear the assembled document. The next convergence
+        // poll reloads the newer state.
+        const books = summary.books.map((lean) => ({
+          ...rows.get(lean.id),
+          review: lean.review,
+        }));
+        return {
+          schema: "librarytool.corrections-index/2",
+          revision: summary.revision,
+          books,
+          attention: summary.attention,
+        };
+      }
+
+      function loadWholeIndex(nextWorkspaceId, signal) {
+        return tiered
+          ? assembleTieredIndex(nextWorkspaceId, signal)
+          : corrections.index({ workspaceId: nextWorkspaceId, signal });
+      }
 
       function itemIdForTarget(target) {
         if (!target || target.kind !== "book" ||
@@ -1490,6 +1572,77 @@
         return target.after_revision;
       }
 
+      async function refreshMutationEntryFromDetails(
+        itemId,
+        expectedRevision,
+        expectedState,
+        workspace,
+        signal,
+      ) {
+        const cached = assembled &&
+          assembled.workspaceId === workspace.id &&
+          assembled.epoch === workspace.epoch
+          ? assembled.index : null;
+        const cachedEntry = cached ? cached.attention.find((candidate) =>
+          candidate.target && candidate.target.kind === "book" &&
+          candidate.target.item_id === itemId) : null;
+        const cachedBook = cached ? cached.books.find((candidate) =>
+          candidate.id === itemId) : null;
+        // Review transitions only move between non-clear states, so the
+        // acted-on book and its attention entry are both in the last loaded
+        // index. Without one (no index loaded through this port yet) the
+        // whole-index fallback converges instead.
+        if (!cached || !cachedEntry || !cachedBook) return null;
+        const details = await corrections.indexDetails({
+          workspaceId: workspace.id,
+          itemIds: [itemId],
+          signal,
+        });
+        if (!workspaceIsCurrent(workspace)) {
+          throw reviewConflict(
+            "The Corrections workspace changed before the mutation converged");
+        }
+        const book = details.books.find((candidate) =>
+          candidate.id === itemId);
+        if (!book) {
+          throw invalidMutation(
+            "Engine review mutation did not return its indexed book review");
+        }
+        if (book.review.revision !== expectedRevision ||
+            book.review.state !== expectedState) {
+          throw reviewConflict(
+            "The review changed again before the mutation converged");
+        }
+        const entry = {
+          key: cachedEntry.key,
+          target: { kind: "book", item_id: itemId },
+          review: book.review,
+        };
+        // The detail window's revision stands in for the index revision: it
+        // moves with every change to the acted-on row and can never equal a
+        // summary revision, so the convergence poll still reloads the whole
+        // index once the server has settled.
+        const index = {
+          schema: cached.schema,
+          revision: details.revision,
+          books: cached.books.map((candidate) =>
+            candidate.id === itemId ? book : candidate),
+          attention: cached.attention.map((candidate) =>
+            candidate === cachedEntry ? entry : candidate),
+        };
+        assembled = Object.freeze({
+          workspaceId: workspace.id,
+          epoch: workspace.epoch,
+          index,
+        });
+        return Object.freeze({
+          schema: "librarytool.corrections-review-result/1",
+          index_revision: index.revision,
+          entry,
+          index,
+        });
+      }
+
       async function refreshMutationEntry(
         target,
         mutation,
@@ -1503,10 +1656,17 @@
         }
         const itemId = itemIdForTarget(target);
         const expectedRevision = receiptReviewRevision(mutation, itemId);
-        const index = await corrections.index({
-          workspaceId: workspace.id,
-          signal,
-        });
+        if (tiered) {
+          const patched = await refreshMutationEntryFromDetails(
+            itemId,
+            expectedRevision,
+            expectedState,
+            workspace,
+            signal,
+          );
+          if (patched) return patched;
+        }
+        const index = await loadWholeIndex(workspace.id, signal);
         if (!workspaceIsCurrent(workspace)) {
           throw reviewConflict(
             "The Corrections workspace changed before the mutation converged");
@@ -1529,6 +1689,11 @@
           throw reviewConflict(
             "The review changed again before the mutation converged");
         }
+        assembled = Object.freeze({
+          workspaceId: workspace.id,
+          epoch: workspace.epoch,
+          index,
+        });
         return Object.freeze({
           schema: "librarytool.corrections-review-result/1",
           index_revision: index.revision,
@@ -1546,10 +1711,7 @@
             workspaceEpoch += 1;
             workspaceId = null;
           }
-          const index = await corrections.index({
-            workspaceId: nextWorkspaceId,
-            signal,
-          });
+          const index = await loadWholeIndex(nextWorkspaceId, signal);
           if (indexPolling && typeof indexPolling.observe === "function" &&
               !(signal && signal.aborted)) {
             indexPolling.observe(nextWorkspaceId, index && index.revision);
@@ -1558,6 +1720,11 @@
               requestedWorkspaceId === nextWorkspaceId &&
               !(signal && signal.aborted)) {
             workspaceId = nextWorkspaceId;
+            assembled = Object.freeze({
+              workspaceId: nextWorkspaceId,
+              epoch: workspaceEpoch,
+              index,
+            });
           }
           return index;
         },

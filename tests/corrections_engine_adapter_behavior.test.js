@@ -2549,3 +2549,391 @@ test("index polling falls back to the index when the probe is unavailable",
       "polling continues against the index once the probe is abandoned");
     store.destroy();
   });
+
+function copyJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+// A monolithic Corrections index document large enough to force detail
+// batching, with attention, captures, and issues represented so the tiered
+// assembly is proven field-for-field, not just for the trivial rows.
+function monolithicIndexFixture(count = 300) {
+  const books = [];
+  const attention = [];
+  for (let index = 0; index < count; index += 1) {
+    const id = `b-${String(index).padStart(4, "0")}`;
+    const flagged = index === 3 || index === 257;
+    const review = flagged ? {
+      revision: `review-${id}`,
+      state: "needs_attention",
+      reason: "Check the title leaf",
+      history_count: 1,
+      latest_event: {
+        operation_id: `mark-${id}`,
+        action: "attention.mark",
+        actor_id: "local-desktop",
+        occurred_at: "2026-07-23T12:00:00Z",
+        before_state: "clear",
+        after_state: "needs_attention",
+        reason: "Check the title leaf",
+        comment: "",
+      },
+    } : {
+      revision: `review-${id}`,
+      state: "clear",
+      reason: "",
+      history_count: 0,
+      latest_event: null,
+    };
+    const captures = index === 5 ? [{
+      artifact_id: `capture-${id}`,
+      revision: `capture-${id}-r1`,
+      capture_order: 0,
+      label: "Title leaf",
+      effective_category: "title_page",
+      resource_state: "available",
+      import_state: "ready",
+      freshness: "current",
+      imported_at: "2026-07-23T12:00:00+00:00",
+      thumbnail: { url: `/thumbnails/${id}`, alt: "Title leaf" },
+    }] : [];
+    books.push({
+      id,
+      revision: `book-${id}-r1`,
+      kind: "book",
+      title: `Herbal ${id}`,
+      import_state: captures.length ? "ready" : "missing",
+      issues: captures.length ? [] : ["Captured image manifest is missing"],
+      review,
+      captures,
+      latest_imported_at: captures.length ? "2026-07-23T12:00:00+00:00" : "",
+    });
+    if (flagged) {
+      attention.push({
+        key: `attention:${id}`,
+        target: { kind: "book", item_id: id },
+        review: copyJson(review),
+      });
+    }
+  }
+  return {
+    schema: "librarytool.corrections-index/2",
+    revision: "cri-full-r1",
+    books,
+    attention,
+  };
+}
+
+// Client-shaped tiered mocks derived from one monolithic fixture, so the
+// assembled result can be compared against what the /index route would have
+// returned for the same library state.
+function tieredCorrections(full, calls, overrides = {}) {
+  return {
+    async index() {
+      calls.push(["index"]);
+      throw new Error("the monolithic index must not be fetched");
+    },
+    async indexSummary({ workspaceId }) {
+      calls.push(["summary", workspaceId]);
+      return {
+        schema: "librarytool.corrections-index-summary/1",
+        revision: "cri1-summary-r1",
+        books: full.books.map((book) => ({
+          id: book.id,
+          revision: `crs-${book.id}`,
+          kind: book.kind,
+          title: book.title,
+          review: copyJson(book.review),
+        })),
+        attention: copyJson(full.attention),
+      };
+    },
+    async indexDetails({ itemIds }) {
+      calls.push(["details", itemIds.slice()]);
+      const wanted = new Set(itemIds);
+      return {
+        schema: "librarytool.corrections-index-detail/1",
+        revision: `crd-${itemIds.length}-r1`,
+        books: full.books
+          .filter((book) => wanted.has(book.id))
+          .map(copyJson),
+        missing: itemIds.filter((id) =>
+          !full.books.some((book) => book.id === id)),
+      };
+    },
+    async getReview() {
+      throw new Error("not expected");
+    },
+    async listReviewHistory() {
+      throw new Error("not expected");
+    },
+    ...overrides,
+  };
+}
+
+test("tiered load assembles the monolithic index from summary and bounded detail windows",
+  async () => {
+    const full = monolithicIndexFixture(300);
+    const calls = [];
+    const { engineClient } = engineHarness({
+      corrections: tieredCorrections(full, calls),
+    });
+    const scheduler = manualScheduler();
+    const ports = createCorrectionsEnginePorts(engineClient, {
+      indexPolling: { ...scheduler, intervalMs: 250 },
+    });
+
+    const assembled = await ports.books.loadIndex({
+      workspaceId: "workspace-1",
+    });
+
+    assert.equal(assembled.schema, "librarytool.corrections-index/2");
+    assert.equal(assembled.revision, "cri1-summary-r1",
+      "the assembled index carries the summary revision the probe reports");
+    assert.deepEqual(assembled.books, full.books,
+      "every assembled book row equals its monolithic row, captures included");
+    assert.deepEqual(assembled.attention, full.attention);
+    assert.deepEqual(calls.filter(([name]) => name === "index"), [],
+      "the monolithic /corrections/index is never fetched");
+    assert.deepEqual(
+      calls.filter(([name]) => name === "details")
+        .map(([, itemIds]) => itemIds.length),
+      [256, 44],
+      "detail windows split at the server's 256-id batch limit",
+    );
+    assert.deepEqual(
+      calls.filter(([name]) => name === "details")
+        .flatMap(([, itemIds]) => itemIds),
+      full.books.map((book) => book.id),
+      "the batches cover every summary book exactly once, in order",
+    );
+
+    // The store's validator accepts the assembled document end to end: the
+    // whole downstream Corrections UI is untouched by the cutover.
+    const store = new CorrectionsIndexStore({ api: ports.books });
+    await store.openWorkspace("workspace-1");
+    assert.equal(store.status, "ready");
+    assert.equal(store.index.books.length, 300);
+    assert.equal(store.index.books[5].captures.length, 1,
+      "capture rows survive assembly as the positive claims they are");
+    store.destroy();
+  });
+
+test("tiered load retries once when a summary book vanishes mid-load",
+  async () => {
+    const full = monolithicIndexFixture(2);
+    const calls = [];
+    let summaries = 0;
+    // Books the details route can no longer resolve; the summary keeps
+    // listing them once (a stale first read) and drops them on the retry —
+    // unless it is pinned stale to prove the bounded-retry ceiling.
+    const deleted = new Set([full.books[1].id]);
+    let summaryStaysStale = false;
+    const corrections = tieredCorrections(full, calls, {
+      async indexSummary({ workspaceId }) {
+        calls.push(["summary", workspaceId]);
+        summaries += 1;
+        const books = summaries === 1 || summaryStaysStale
+          ? full.books
+          : full.books.filter((book) => !deleted.has(book.id));
+        return {
+          schema: "librarytool.corrections-index-summary/1",
+          revision: `cri1-summary-r${summaries}`,
+          books: books.map((book) => ({
+            id: book.id,
+            revision: `crs-${book.id}`,
+            kind: book.kind,
+            title: book.title,
+            review: copyJson(book.review),
+          })),
+          attention: [],
+        };
+      },
+      async indexDetails({ itemIds }) {
+        calls.push(["details", itemIds.slice()]);
+        return {
+          schema: "librarytool.corrections-index-detail/1",
+          revision: `crd-${itemIds.length}-r1`,
+          books: full.books
+            .filter((book) =>
+              itemIds.includes(book.id) && !deleted.has(book.id))
+            .map(copyJson),
+          missing: itemIds.filter((id) => deleted.has(id)),
+        };
+      },
+    });
+    const { engineClient } = engineHarness({ corrections });
+    const ports = createCorrectionsEnginePorts(engineClient);
+
+    const assembled = await ports.books.loadIndex({
+      workspaceId: "workspace-1",
+    });
+
+    assert.equal(summaries, 2, "one clean retry re-lists the library");
+    assert.deepEqual(assembled.books.map((book) => book.id),
+      [full.books[0].id]);
+
+    // A tear that survives the retry is reported, never papered over with a
+    // fabricated row.
+    summaries = 0;
+    summaryStaysStale = true;
+    await assert.rejects(
+      ports.books.loadIndex({ workspaceId: "workspace-1" }),
+      (error) => error.code === "invalid-corrections-index-assembly",
+    );
+  });
+
+test("a review mutation converges through one single-item detail window",
+  async () => {
+    const full = monolithicIndexFixture(4);
+    const flagged = full.books[3];
+    assert.equal(flagged.review.state, "needs_attention");
+    const calls = [];
+    const resolvedReview = {
+      revision: "review-resolved-r2",
+      state: "resolved",
+      reason: flagged.review.reason,
+      history_count: 2,
+      latest_event: {
+        operation_id: "resolve-op-1",
+        action: "attention.resolve",
+        actor_id: "local-desktop",
+        occurred_at: "2026-07-23T12:05:00Z",
+        before_state: "needs_attention",
+        after_state: "resolved",
+        reason: flagged.review.reason,
+        comment: "Verified",
+      },
+    };
+    const corrections = tieredCorrections(full, calls, {
+      async resolveCorrections(payload) {
+        calls.push(["resolve", payload.itemId]);
+        flagged.review = copyJson(resolvedReview);
+        return {
+          receipt: {
+            targets: [{
+              kind: "review",
+              target_id: flagged.id,
+              before_revision: `review-${flagged.id}`,
+              after_revision: resolvedReview.revision,
+            }],
+          },
+        };
+      },
+    });
+    const { engineClient } = engineHarness({ corrections });
+    const ports = createCorrectionsEnginePorts(engineClient);
+    await ports.books.loadIndex({ workspaceId: "workspace-1" });
+    const before = calls.length;
+
+    const result = await ports.books.resolveReview({
+      target: { kind: "book", item_id: flagged.id },
+      expectedRevision: `review-${flagged.id}`,
+      operationId: "resolve-op-1",
+      comment: "Verified",
+    });
+
+    assert.deepEqual(calls.slice(before), [
+      ["resolve", flagged.id],
+      ["details", [flagged.id]],
+    ], "convergence is one single-item detail window, never a full reload");
+    assert.equal(result.entry.key, `attention:${flagged.id}`);
+    assert.deepEqual(result.entry.review, resolvedReview);
+    assert.equal(result.index_revision, "crd-1-r1");
+    assert.equal(result.index.revision, result.index_revision);
+    assert.deepEqual(result.index.books[3].review, resolvedReview,
+      "the acted-on book is patched from the fresh detail row");
+    assert.deepEqual(result.index.books[0], full.books[0],
+      "untouched books keep their loaded rows");
+    assert.equal(result.index.attention.length, full.attention.length,
+      "a resolved review stays in the attention index");
+
+    // The store applies the patched document without a full refresh.
+    const storeCalls = [];
+    const storeFull = monolithicIndexFixture(4);
+    const storePorts = createCorrectionsEnginePorts(engineHarness({
+      corrections: tieredCorrections(storeFull, storeCalls, {
+        async resolveCorrections(payload) {
+          storeCalls.push(["resolve", payload.itemId]);
+          storeFull.books[3].review = copyJson(resolvedReview);
+          return {
+            receipt: {
+              targets: [{
+                kind: "review",
+                target_id: storeFull.books[3].id,
+                before_revision: `review-${storeFull.books[3].id}`,
+                after_revision: resolvedReview.revision,
+              }],
+            },
+          };
+        },
+      }),
+    }).engineClient);
+    const store = new CorrectionsIndexStore({ api: storePorts.books });
+    await store.openWorkspace("workspace-1");
+    const marker = storeCalls.length;
+    await store.transitionReview("resolve", {
+      entry: store.index.attention.find((entry) =>
+        entry.target.item_id === storeFull.books[3].id),
+      operationId: "resolve-op-1",
+      comment: "Verified",
+    });
+    assert.equal(store.status, "ready");
+    assert.equal(store.index.books[3].review.state, "resolved");
+    assert.deepEqual(storeCalls.slice(marker), [
+      ["resolve", storeFull.books[3].id],
+      ["details", [storeFull.books[3].id]],
+    ], "the store never falls back to a whole-index reload on success");
+    store.destroy();
+  });
+
+test("a review mutation that drifted again conflicts instead of patching",
+  async () => {
+    const full = monolithicIndexFixture(4);
+    const flagged = full.books[3];
+    const calls = [];
+    const corrections = tieredCorrections(full, calls, {
+      async resolveCorrections() {
+        // A concurrent actor moved the review again after this receipt.
+        flagged.review = {
+          revision: "review-moved-again-r4",
+          state: "needs_attention",
+          reason: "Check the title leaf",
+          history_count: 3,
+          latest_event: {
+            operation_id: "reopen-op-9",
+            action: "attention.reopen",
+            actor_id: "another-desktop",
+            occurred_at: "2026-07-23T12:06:00Z",
+            before_state: "resolved",
+            after_state: "needs_attention",
+            reason: "Check the title leaf",
+            comment: "",
+          },
+        };
+        return {
+          receipt: {
+            targets: [{
+              kind: "review",
+              target_id: flagged.id,
+              before_revision: `review-${flagged.id}`,
+              after_revision: "review-resolved-r2",
+            }],
+          },
+        };
+      },
+    });
+    const { engineClient } = engineHarness({ corrections });
+    const ports = createCorrectionsEnginePorts(engineClient);
+    await ports.books.loadIndex({ workspaceId: "workspace-1" });
+
+    await assert.rejects(
+      ports.books.resolveReview({
+        target: { kind: "book", item_id: flagged.id },
+        expectedRevision: `review-${flagged.id}`,
+        operationId: "resolve-op-1",
+      }),
+      (error) => error.code === "review_revision_conflict" &&
+        error.status === 409,
+    );
+  });

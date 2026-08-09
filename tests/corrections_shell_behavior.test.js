@@ -2467,6 +2467,33 @@ test("standalone shell resolves reviews through the real engine client adapter",
         review: reviewSummary(),
       }],
     });
+    const summaryBody = () => {
+      const index = indexBody();
+      return {
+        ok: true,
+        schema: "librarytool.corrections-index-summary/1",
+        revision: index.revision,
+        books: index.books.map((book) => ({
+          id: book.id,
+          revision: `summary-${book.revision}`,
+          kind: book.kind,
+          title: book.title,
+          review: book.review,
+        })),
+        attention: index.attention,
+      };
+    };
+    const detailBody = (itemIds) => {
+      const index = indexBody();
+      return {
+        ok: true,
+        schema: "librarytool.corrections-index-detail/1",
+        revision: `detail-${index.revision}`,
+        books: index.books.filter((book) => itemIds.includes(book.id)),
+        missing: itemIds.filter((id) =>
+          !index.books.some((book) => book.id === id)),
+      };
+    };
     const response = (body) => ({
       ok: true,
       status: 200,
@@ -2475,6 +2502,12 @@ test("standalone shell resolves reviews through the real engine client adapter",
     const engineClient = new EngineClient({
       transport: async (url, init) => {
         calls.push({ url, init });
+        if (url.startsWith("/api/v1/corrections/index/summary")) {
+          return response(summaryBody());
+        }
+        if (url.startsWith("/api/v1/corrections/index/details")) {
+          return response(detailBody(JSON.parse(init.body).item_ids));
+        }
         if (url.startsWith("/api/v1/corrections/index")) {
           return response(indexBody());
         }
@@ -2558,6 +2591,9 @@ test("standalone shell resolves reviews through the real engine client adapter",
 
     assert.equal(result.entry.review.state, "resolved");
     assert.equal(store.index.books[0].review.state, "resolved");
+    // The cutover contract: the monolithic /corrections/index is never
+    // fetched. A load is one summary plus bounded detail windows, and a
+    // review mutation converges through one single-item detail window.
     assert.deepEqual(calls.map(({ url, init }) => [
       init.method,
       url,
@@ -2565,8 +2601,16 @@ test("standalone shell resolves reviews through the real engine client adapter",
     ]), [
       [
         "GET",
-        "/api/v1/corrections/index?workspace_id=workspace-1",
+        "/api/v1/corrections/index/summary?workspace_id=workspace-1",
         null,
+      ],
+      [
+        "POST",
+        "/api/v1/corrections/index/details?workspace_id=workspace-1",
+        {
+          schema: "librarytool.corrections-index-detail-request/1",
+          item_ids: ["book-1"],
+        },
       ],
       [
         "POST",
@@ -2574,9 +2618,12 @@ test("standalone shell resolves reviews through the real engine client adapter",
         { comment: "Verified" },
       ],
       [
-        "GET",
-        "/api/v1/corrections/index?workspace_id=workspace-1",
-        null,
+        "POST",
+        "/api/v1/corrections/index/details?workspace_id=workspace-1",
+        {
+          schema: "librarytool.corrections-index-detail-request/1",
+          item_ids: ["book-1"],
+        },
       ],
     ]);
   });
