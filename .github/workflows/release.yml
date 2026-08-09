@@ -11,18 +11,19 @@ name: release
 # redeploy. Each app keeps its own version (gradle versionName, package.json),
 # and each tag is checked against the version of the product it publishes.
 #
-# workflow_dispatch runs the two builds as a dry run: artifacts to inspect,
-# nothing published.
+# workflow_dispatch first performs the same read-only production cloud check as
+# a tag, then runs the two builds as a dry run: artifacts to inspect, nothing
+# published.
 #
 # One-time repository setup, all under Settings > Secrets and variables:
 #   vars.SUPABASE_URL                  required for a publishable Android APK
 #   vars.SUPABASE_ANON_KEY             required for a publishable Android APK
 #   secrets.SUPABASE_RELEASE_SECRET_KEY
 #                                      preferred dedicated `sb_secret_...` key
-#                                      that registers rows in `releases`.
+#                                      for cloud preflight and release rows.
 #   secrets.SUPABASE_SERVICE_ROLE_KEY  legacy fallback while migrating. A tag
-#                                      fails before publication when neither
-#                                      registrar credential is configured.
+#                                      or manual dry run fails preflight when
+#                                      neither cloud credential is configured.
 #   secrets.ANDROID_KEYSTORE_B64       required to publish Android on a tag:
 #   secrets.ANDROID_KEYSTORE_PASSWORD  base64 of the signing keystore, its
 #   secrets.ANDROID_KEY_ALIAS          password, and the key alias. A tagged
@@ -66,6 +67,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22.12"
+
+      - name: Verify production cloud setup
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_RELEASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$SUPABASE_KEY" ]; then
+            echo "::error::No Supabase cloud-check credential is configured. \
+          Add SUPABASE_RELEASE_SECRET_KEY (preferred) or \
+          SUPABASE_SERVICE_ROLE_KEY under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          python3 tools/cloud_setup.py check
 
       # A desktop tag drives the updater channel; an Android-only tag is tied to
       # Gradle's versionName. Refuse publication when either tag disagrees with

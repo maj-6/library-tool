@@ -72,6 +72,11 @@ Two ways a row gets there:
 pushed. An `android-v*` tag follows the same signed Android path but skips the
 desktop job, which lets the two applications ship on independent schedules:
 
+Before selecting or building products, preflight runs
+`python tools/cloud_setup.py check` against production with the configured
+server credential. This is a read-only schema, migration, bucket, and role
+smoke test; a mismatch stops both tagged publication and manual dry runs.
+
 1. **validation** installs the committed runtime/development dependencies and
    runs Ruff, the complete Python suite, JavaScript syntax checks, and the
    complete JavaScript behavior suite. A separate, always-run
@@ -163,8 +168,9 @@ git tag android-v0.5.1-alpha.7
 git push <public> android-v0.5.1-alpha.7
 ```
 
-A `workflow_dispatch` run of the same workflow is a dry run: both apps build
-and the artifacts are inspectable, nothing is published.
+A `workflow_dispatch` run of the same workflow first performs that read-only
+production cloud check, then builds both apps. The artifacts are inspectable;
+nothing is published.
 
 ### One-time repository setup (public repo, Settings → Secrets and variables)
 
@@ -172,8 +178,8 @@ and the artifacts are inspectable, nothing is published.
 |---|---|---|
 | `SUPABASE_URL` | variable | baked into the APK; **required for tagged Android builds** because the app has no in-app project fallback |
 | `SUPABASE_ANON_KEY` | variable | public anon key baked into the APK; **required for tagged Android builds** |
-| `SUPABASE_RELEASE_SECRET_KEY` | secret | preferred dedicated `sb_secret_…` key for writing release rows. A tagged publish fails before creating the GitHub Release when neither registrar credential is available. |
-| `SUPABASE_SERVICE_ROLE_KEY` | secret | legacy service-role JWT fallback while migrating to `SUPABASE_RELEASE_SECRET_KEY`; never bundle either server credential into an app. |
+| `SUPABASE_RELEASE_SECRET_KEY` | secret | preferred dedicated `sb_secret_…` key for the read-only production preflight and writing release rows. A tagged publish or manual dry run fails when neither cloud credential is available. |
+| `SUPABASE_SERVICE_ROLE_KEY` | secret | legacy fallback for the production preflight and release registration while migrating to `SUPABASE_RELEASE_SECRET_KEY`; never bundle either server credential into an app. |
 | `ANDROID_KEYSTORE_B64` | secret | **required to publish Android on a tag.** base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
 | `ANDROID_KEYSTORE_PASSWORD` | secret | its password |
 | `ANDROID_KEY_ALIAS` | secret | `bookcapture` |
