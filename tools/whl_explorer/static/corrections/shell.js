@@ -377,9 +377,14 @@
       ? `annotation:${id}` : `artifact:${id}`;
   }
 
+  function captureLogicalDisplayArtifactId(value) {
+    if (typeof value !== "string") return "";
+    const match = /^capture:([^:]+):(display|original)$/.exec(value);
+    return match ? `capture:${match[1]}:display` : "";
+  }
+
   function isCaptureDisplayArtifactId(value) {
-    return typeof value === "string" && value.startsWith("capture:") &&
-      value.endsWith(":display") && value.length > "capture::display".length;
+    return captureLogicalDisplayArtifactId(value) === value;
   }
 
   function navigationOnlyTarget(value) {
@@ -2005,16 +2010,25 @@
           observation.operationId !== operationId) return null;
       const artifactId = command.artifact_id || command.artifactId || "";
       const itemId = command.item_id || command.itemId || "";
-      if (!isCaptureDisplayArtifactId(artifactId)) return null;
+      const displayArtifactId = captureLogicalDisplayArtifactId(artifactId);
+      if (!displayArtifactId) return null;
       const selection = this.state && this.state.selection || {};
-      if (selection.artifactId !== artifactId ||
+      if (![artifactId, displayArtifactId].includes(selection.artifactId) ||
           (itemId && selection.itemId !== itemId)) return null;
       const feature = this.artifactsFeature;
-      const key = `artifact:${artifactId}`;
-      if (!feature || feature.selectedKey !== key ||
-          typeof feature.reloadSelection !== "function") return null;
-      const selected = feature.items && feature.items.get(key);
+      const key = `artifact:${displayArtifactId}`;
+      const selectionKey = `artifact:${selection.artifactId}`;
+      if (!feature || feature.selectedKey !== selectionKey) return null;
+      const selected = feature.items && feature.items.get(selectionKey);
       if (selected && selected.family && selected.family !== "image") return null;
+      const reloadDisplay = isCaptureDisplayArtifactId(selection.artifactId) &&
+        typeof feature.reloadSelection === "function";
+      const refreshOriginal = artifactId !== displayArtifactId &&
+        selection.artifactId === artifactId &&
+        typeof feature.refresh === "function";
+      const refreshBooks = this.booksFeature &&
+        typeof this.booksFeature.refresh === "function";
+      if (!reloadDisplay && !refreshOriginal && !refreshBooks) return null;
       const refreshes = this.captureDisplayRefreshes instanceof Map
         ? this.captureDisplayRefreshes
         : (this.captureDisplayRefreshes = new Map());
@@ -2022,38 +2036,71 @@
       const selectionGeneration = feature.selectionGeneration;
       const existing = refreshes.get(operationId);
       if (existing && existing.key === key &&
+          existing.selectionKey === selectionKey &&
           existing.contextGeneration === contextGeneration &&
           existing.selectionGeneration === selectionGeneration) {
         return existing.promise;
       }
       const record = {
         key,
+        selectionKey,
         contextGeneration,
         selectionGeneration,
         promise: null,
       };
       const refresh = (async () => {
-        try {
-          const tasks = [Promise.resolve(feature.reloadSelection(key))];
-          if (this.booksFeature &&
-              typeof this.booksFeature.refresh === "function") {
-            tasks.push(Promise.resolve(
-              this.booksFeature.refresh("transform-committed")));
-          }
-          const settled = await Promise.allSettled(tasks);
-          const failure = settled.find((value) => value.status === "rejected");
-          if (failure) throw failure.reason;
-          return settled[0].value;
-        } catch (error) {
-          if (!this.destroyed && feature.selectedKey === key &&
-              (!error || error.name !== "AbortError")) {
-            this.setStatus(
-              error && error.message || "The corrected display could not be refreshed",
-              true,
-            );
-          }
-          return null;
+        let refreshed = null;
+        let succeeded = true;
+        const tasks = [];
+        if (reloadDisplay || refreshOriginal) {
+          tasks.push((async () => {
+            try {
+              const pending = reloadDisplay
+                ? feature.reloadSelection(key)
+                : feature.refresh({
+                    preserveSelection: true,
+                    reason: "capture-transform",
+                  });
+              record.contextGeneration = feature.contextGeneration;
+              record.selectionGeneration = feature.selectionGeneration;
+              refreshed = await pending;
+            } catch (error) {
+              succeeded = false;
+              if (!this.destroyed && feature.selectedKey === selectionKey &&
+                  (!error || error.name !== "AbortError")) {
+                this.setStatus(
+                  error && error.message ||
+                    "The corrected display could not be refreshed",
+                  true,
+                );
+              }
+            } finally {
+              record.contextGeneration = feature.contextGeneration;
+              record.selectionGeneration = feature.selectionGeneration;
+            }
+          })());
         }
+        if (refreshBooks) {
+          tasks.push((async () => {
+            try {
+              await this.booksFeature.refresh("transform-committed");
+            } catch (error) {
+              succeeded = false;
+              if (!this.destroyed && (!error || error.name !== "AbortError")) {
+                this.setStatus(
+                  error && error.message ||
+                    "The captures list could not be refreshed",
+                  true,
+                );
+              }
+            }
+          })());
+        }
+        await Promise.all(tasks);
+        if (!succeeded) return null;
+        if (refreshed) return refreshed;
+        if (refreshBooks) return true;
+        return null;
       })();
       record.promise = refresh;
       refreshes.set(operationId, record);

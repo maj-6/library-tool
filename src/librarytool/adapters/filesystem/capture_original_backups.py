@@ -289,7 +289,7 @@ class _CaptureTarget:
 
 
 class FilesystemCaptureOriginalBackupStore:
-    """Plan atomic backup promotion and serve explicit cold-store actions."""
+    """Plan atomic original backups and serve explicit cold-store actions."""
 
     def __init__(
         self,
@@ -367,11 +367,12 @@ class FilesystemCaptureOriginalBackupStore:
     ) -> CorrectionTransformPublicationPlan | None:
         """Join original backup metadata to one transform transaction.
 
-        Normal display transforms leave the stable base rendition and its
-        geometry untouched; the transform store publishes their corrected
-        logical display through its mutable head. A transform explicitly
-        started from the separately exposed original retains the legacy
-        physical-promotion fallback because it has no logical display head.
+        Capture transforms begun from either the display or the separately
+        exposed original leave the stable base rendition and its geometry
+        untouched; the transform store publishes their corrected logical
+        display through its mutable head. The deterministic physical-promotion
+        path remains only as a compatibility fallback for a caller that cannot
+        supply a logical display identity.
         """
 
         if not isinstance(draft, CorrectionTransformCommitDraft):
@@ -498,10 +499,11 @@ class FilesystemCaptureOriginalBackupStore:
                     code="invalid_capture_photo_assets",
                     item_id=target.item_id,
                 )
-            # The original-source fallback cannot be represented by a #301
-            # logical display head. Promote its deterministic JPEG to the
-            # stable capture slot and remove any older head in the same write
-            # set so it cannot continue shadowing the new base display.
+            # A legacy publication plan without a logical display identity
+            # cannot be represented by a mutable head. Promote its
+            # deterministic JPEG to the stable capture slot and remove any
+            # older head in the same write set so it cannot continue shadowing
+            # the new base display.
             new_display_path = target.directory / f"photo_{order}.jpg"
             self._assert_target(new_display_path, self._capture_root)
             if old_display_path != new_display_path:

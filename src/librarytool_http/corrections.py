@@ -1988,6 +1988,29 @@ def _capture_rank(value: RasterArtifactView) -> tuple[int, str]:
     return (0 if is_display else 1, value.key.artifact_id)
 
 
+def _capture_thumbnail_url(
+    item_id: str,
+    artifact_id: str,
+    revision: str,
+) -> str:
+    """Name list thumbnails by the capture row state they represent.
+
+    Capture display identities are deliberately stable when a correction
+    replaces their bytes. Chromium may therefore retain the old image for an
+    unchanged ``img.src`` even though the preview response has validators.
+    The opaque token is a cache identity only, not a mutation/resource
+    precondition; the preview resolver still validates and snapshots the
+    current display authority.
+    """
+
+    version = hashlib.sha256(revision.encode("utf-8")).hexdigest()
+    return (
+        f"/api/v1/items/{quote(item_id, safe='')}/"
+        "raster-artifacts/"
+        f"{quote(artifact_id, safe='')}/preview?v={version}"
+    )
+
+
 def _capture_rows(
     item_id: str,
     values: Sequence[RasterArtifactView],
@@ -2027,10 +2050,10 @@ def _capture_rows(
             value.resource_state is ResourceState.AVAILABLE
             and value.resource is not None
         ):
-            thumbnail_url = (
-                f"/api/v1/items/{quote(item_id, safe='')}/"
-                "raster-artifacts/"
-                f"{quote(value.key.artifact_id, safe='')}/preview"
+            thumbnail_url = _capture_thumbnail_url(
+                item_id,
+                value.key.artifact_id,
+                value.revision,
             )
             if not _index_text(
                 thumbnail_url,
@@ -2166,10 +2189,10 @@ def _capture_hint_rows(
             )
         thumbnail = None
         if resource_state == ResourceState.AVAILABLE.value:
-            thumbnail_url = (
-                f"/api/v1/items/{quote(item_id, safe='')}/"
-                "raster-artifacts/"
-                f"{quote(artifact_id, safe='')}/preview"
+            thumbnail_url = _capture_thumbnail_url(
+                item_id,
+                artifact_id,
+                revision,
             )
             thumbnail = {
                 "url": thumbnail_url,
@@ -4127,10 +4150,16 @@ def create_corrections_blueprint(
     def get_raster_preview(item_id: str, artifact_id: str):
         try:
             if request.args:
-                raise ValidationError(
-                    "raster preview does not accept query parameters",
-                    code="invalid_raster_preview_query",
-                )
+                versions = request.args.getlist("v")
+                if (
+                    set(request.args) != {"v"}
+                    or len(versions) != 1
+                    or _SHA256_RE.fullmatch(versions[0]) is None
+                ):
+                    raise ValidationError(
+                        "the raster preview cache identity is invalid",
+                        code="invalid_raster_preview_query",
+                    )
             return _preview_response(
                 raster_resource_resolver_for_request,
                 item_id,

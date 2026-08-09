@@ -1655,7 +1655,7 @@ def test_uncorrected_build_index_never_reads_capture_or_layout_bytes(
     assert [book["id"] for book in books] == [BOOK_ID]
     assert len(books[0]["captures"]) == 1
     assert books[0]["captures"][0]["revision"].startswith("index:")
-    assert books[0]["captures"][0]["thumbnail"]["url"].endswith("/preview")
+    assert "/preview?v=" in books[0]["captures"][0]["thumbnail"]["url"]
     assert books[0]["captures"][0]["imported_at"] == (
         "2026-08-04T12:34:56Z"
     )
@@ -1682,6 +1682,16 @@ def test_corrected_capture_head_stays_stable_in_lazy_index_and_hydration(
     )
     assert before_response.status_code == 200
     before = before_response.get_json()["books"][0]["captures"][0]
+    before_thumbnail_url = before["thumbnail"]["url"]
+    assert before_thumbnail_url.endswith(
+        "?v="
+        + hashlib.sha256(before["revision"].encode("utf-8")).hexdigest()
+    )
+    before_preview = client.get(before_thumbnail_url)
+    assert before_preview.status_code == 200
+    assert hashlib.sha256(before_preview.data).hexdigest() == (
+        source.content_sha256
+    )
 
     transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
     command = _transform_command(source, "bridge-lazy-capture-display-head")
@@ -1700,9 +1710,19 @@ def test_corrected_capture_head_stays_stable_in_lazy_index_and_hydration(
     assert lazy["artifact_id"] == source.key.artifact_id
     assert lazy["revision"].startswith("index:")
     assert lazy["revision"] != before["revision"]
+    assert lazy["thumbnail"]["url"] != before_thumbnail_url
+    assert lazy["thumbnail"]["url"].endswith(
+        "?v="
+        + hashlib.sha256(lazy["revision"].encode("utf-8")).hexdigest()
+    )
     assert lazy["capture_order"] == before["capture_order"] == 1
     assert lazy["imported_at"] == before["imported_at"] == (
         "2026-08-04T12:34:56Z"
+    )
+    corrected_preview = client.get(lazy["thumbnail"]["url"])
+    assert corrected_preview.status_code == 200
+    assert hashlib.sha256(corrected_preview.data).hexdigest() == (
+        corrected.content_sha256
     )
 
     detail_response = client.get(
@@ -1730,6 +1750,37 @@ def test_corrected_capture_head_stays_stable_in_lazy_index_and_hydration(
         corrected.content_sha256
     )
 
+    # A display-root head cannot outlive the display bytes that authorized its
+    # ancestry. This differs from an original-root head, whose independently
+    # pinned original remains sufficient when only the superseded display is
+    # missing.
+    display_path = server.CAPTURES_DIR / CAPTURE_ID / "photo_1.jpg"
+    display_bytes = display_path.read_bytes()
+    display_path.unlink()
+    missing_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert missing_response.status_code == 200
+    missing = missing_response.get_json()["books"][0]["captures"][0]
+    assert missing["resource_state"] == "missing"
+    assert missing["thumbnail"] is None
+    missing_detail = rasters.get_raster_artifact(source.key)
+    assert missing_detail is not None
+    assert missing_detail.resource_state.value == "missing"
+    assert "correction_display_head" not in missing_detail.extensions
+    display_path.write_bytes(display_bytes)
+
+    restored_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert restored_response.status_code == 200
+    restored = restored_response.get_json()["books"][0]["captures"][0]
+    restored_preview = client.get(restored["thumbnail"]["url"])
+    assert restored_preview.status_code == 200
+    assert hashlib.sha256(restored_preview.data).hexdigest() == (
+        corrected.content_sha256
+    )
+
     monkeypatch.setattr(
         server,
         "_corrections_uses_lazy_capture_index",
@@ -1744,6 +1795,177 @@ def test_corrected_capture_head_stays_stable_in_lazy_index_and_hydration(
     assert full[0]["artifact_id"] == lazy["artifact_id"]
     assert full[0]["capture_order"] == lazy["capture_order"]
     assert full[0]["imported_at"] == lazy["imported_at"]
+
+
+def test_original_root_replaces_warmed_lazy_display_and_stales_with_original(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    engine = server._library_engine()
+    rasters = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    artifacts = rasters.list_raster_artifacts(BOOK_ID)
+    original = next(
+        value
+        for value in artifacts
+        if value.key.artifact_id.endswith(":original")
+    )
+    display = next(
+        value
+        for value in artifacts
+        if value.key.artifact_id.endswith(":display")
+    )
+    assert original.resource is not None
+    assert display.resource is not None
+    base_annotations = rasters.list_spatial_annotations(BOOK_ID)
+    assert len(base_annotations) == 2
+    assert all(
+        display.key.artifact_id in value.linked_artifact_ids
+        for value in base_annotations
+    )
+
+    endpoint = "/api/v1/corrections/index?workspace_id=local-library"
+    before_response = client.get(endpoint)
+    warmed_response = client.get(endpoint)
+    assert before_response.status_code == warmed_response.status_code == 200
+    before = before_response.get_json()["books"][0]["captures"][0]
+    warmed = warmed_response.get_json()["books"][0]["captures"][0]
+    assert warmed["revision"] == before["revision"]
+    assert warmed["thumbnail"]["url"] == before["thumbnail"]["url"]
+    base_preview = client.get(warmed["thumbnail"]["url"])
+    assert base_preview.status_code == 200
+    assert hashlib.sha256(base_preview.data).hexdigest() == (
+        display.content_sha256
+    )
+
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    command = _transform_command(original, "bridge-original-capture-head")
+    assert transforms.queue(command).created is True
+    result = transforms.execute_queued(command)
+    assert result.image_commit is not None
+    corrected = result.image_commit.output("corrected-display")
+
+    corrected_response = client.get(endpoint)
+    assert corrected_response.status_code == 200
+    corrected_row = corrected_response.get_json()["books"][0]["captures"][0]
+    assert corrected_row["artifact_id"] == display.key.artifact_id
+    assert corrected_row["revision"] != warmed["revision"]
+    assert corrected_row["thumbnail"]["url"] != warmed["thumbnail"]["url"]
+    corrected_preview = client.get(corrected_row["thumbnail"]["url"])
+    assert corrected_preview.status_code == 200
+    assert hashlib.sha256(corrected_preview.data).hexdigest() == (
+        corrected.content_sha256
+    )
+    current_display = rasters.get_raster_artifact(display.key)
+    current_original = rasters.get_raster_artifact(original.key)
+    assert current_display is not None
+    assert current_display.content_sha256 == corrected.content_sha256
+    assert current_original is not None
+    assert current_original.content_sha256 == original.content_sha256
+    assert "correction_display_head" not in current_original.extensions
+    # Phone/display-frame geometry cannot be attached to pixels transformed
+    # from the differently revisioned original canvas. With no source-frame
+    # annotations to remap, the corrected display drops those overlays.
+    assert rasters.list_spatial_annotations(BOOK_ID) == ()
+
+    capture_dir = server.CAPTURES_DIR / CAPTURE_ID
+    display_path = capture_dir / "photo_1.jpg"
+    display_bytes = display_path.read_bytes()
+    display_path.unlink()
+    missing_response = client.get(endpoint)
+    assert missing_response.status_code == 200
+    missing_row = missing_response.get_json()["books"][0]["captures"][0]
+    assert missing_row["resource_state"] == "available"
+    assert missing_row["import_state"] == "partial"
+    assert missing_row["thumbnail"] is not None
+    missing_preview = client.get(missing_row["thumbnail"]["url"])
+    assert missing_preview.status_code == 200
+    assert hashlib.sha256(missing_preview.data).hexdigest() == (
+        corrected.content_sha256
+    )
+    missing_detail = rasters.get_raster_artifact(display.key)
+    assert missing_detail is not None
+    assert missing_detail.resource_state.value == "available"
+    assert missing_detail.content_sha256 == corrected.content_sha256
+    assert missing_detail.extensions["correction_display_head"][
+        "operation_id"
+    ] == command.operation_id
+
+    lazy_selector = server._corrections_uses_lazy_capture_index
+    monkeypatch.setattr(
+        server,
+        "_corrections_uses_lazy_capture_index",
+        lambda _item_id: False,
+    )
+    full_missing_response = client.get(endpoint)
+    assert full_missing_response.status_code == 200
+    full_missing = full_missing_response.get_json()["books"][0]["captures"][0]
+    assert full_missing["artifact_id"] == display.key.artifact_id
+    assert full_missing["resource_state"] == "available"
+    assert full_missing["import_state"] == "partial"
+    full_missing_preview = client.get(full_missing["thumbnail"]["url"])
+    assert full_missing_preview.status_code == 200
+    assert hashlib.sha256(full_missing_preview.data).hexdigest() == (
+        corrected.content_sha256
+    )
+    monkeypatch.setattr(
+        server,
+        "_corrections_uses_lazy_capture_index",
+        lazy_selector,
+    )
+
+    display_path.write_bytes(display_bytes)
+    restored_response = client.get(endpoint)
+    assert restored_response.status_code == 200
+    restored = restored_response.get_json()["books"][0]["captures"][0]
+    restored_preview = client.get(restored["thumbnail"]["url"])
+    assert restored_preview.status_code == 200
+    assert hashlib.sha256(restored_preview.data).hexdigest() == (
+        corrected.content_sha256
+    )
+
+    replacement_stream = io.BytesIO()
+    Image.new("RGB", (7, 11), (180, 40, 70)).save(
+        replacement_stream,
+        format="JPEG",
+    )
+    replacement = replacement_stream.getvalue()
+    replacement_sha = hashlib.sha256(replacement).hexdigest()
+    (capture_dir / "orig_1.jpg").write_bytes(replacement)
+    manifest_path = capture_dir / "photo_assets.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["assets"][0]["original"].update(
+        {"sha256": replacement_sha, "revision": 2}
+    )
+    manifest["desktop_import"]["assets"][0]["source_checksum"] = (
+        replacement_sha
+    )
+    for geometry in manifest["assets"][0]["geometry"]:
+        geometry["source_sha256"] = replacement_sha
+        geometry["source_revision"] = 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    stale_response = client.get(endpoint)
+    assert stale_response.status_code == 200
+    stale = stale_response.get_json()["books"][0]["captures"][0]
+    assert stale["artifact_id"] == display.key.artifact_id
+    assert stale["revision"] != restored["revision"]
+    assert stale["thumbnail"]["url"] != restored["thumbnail"]["url"]
+    stale_preview = client.get(stale["thumbnail"]["url"])
+    assert stale_preview.status_code == 200
+    assert hashlib.sha256(stale_preview.data).hexdigest() == (
+        display.content_sha256
+    )
+    stale_display = rasters.get_raster_artifact(display.key)
+    assert stale_display is not None
+    assert stale_display.content_sha256 == display.content_sha256
+    assert "correction_display_head" not in stale_display.extensions
+    assert len(rasters.list_spatial_annotations(BOOK_ID)) == 2
+    history = rasters.list_raster_artifacts(BOOK_ID)
+    assert any(value.key.artifact_id == corrected.artifact_id for value in history)
 
 
 def test_lazy_and_full_indexes_match_missing_original_and_import_time(
@@ -1959,7 +2181,7 @@ def test_manual_archive_uses_lazy_index_then_byte_verified_preview(
     assert [book["id"] for book in books] == [manual_book_id]
     capture = books[0]["captures"][0]
     assert capture["revision"].startswith("index:")
-    assert capture["thumbnail"]["url"].endswith("/preview")
+    assert "/preview?v=" in capture["thumbnail"]["url"]
     assert books[0]["latest_imported_at"] == "2026-08-04T12:34:56Z"
 
     monkeypatch.setattr(

@@ -13,6 +13,7 @@ ASSET_ID = "asset-2ec86526-p1"
 CORRECTION_ID = "1f" * 32
 SOURCE_SHA256 = "2e" * 32
 DISPLAY_SHA256 = "3d" * 32
+THUMBNAIL_SHA256 = "4e" * 32
 SELECTED = ("capture_id,asset_id,correction_id,source_original_sha256,"
             "result,revision,updated_at")
 
@@ -37,6 +38,15 @@ def correction_result(correction_id=CORRECTION_ID,
                 "bytes": 123456,
                 "width": 1600,
                 "height": 1200,
+                "content_type": "image/jpeg",
+            },
+            "thumbnail": {
+                "bucket": "capture-derivatives",
+                "path": f"{prefix}/thumbnail-{THUMBNAIL_SHA256[:20]}.jpg",
+                "sha256": THUMBNAIL_SHA256,
+                "bytes": 12_345,
+                "width": 512,
+                "height": 384,
                 "content_type": "image/jpeg",
             },
         },
@@ -206,9 +216,8 @@ def test_correction_publish_does_not_overwrite_row_newer_than_observation(
 def test_correction_publish_short_circuits_matching_cloud_row(monkeypatch):
     calls = []
     published = cloud_row(revision=3)
-    # Only correction_id and the display sha are compared; incidental result
-    # drift (here: byte count) must not force a republish.
-    published["result"]["artifacts"]["display"]["bytes"] = 1
+    # Assembly time is volatile and does not change the immutable correction.
+    published["result"]["generated_at"] = "2026-08-02T12:00:00Z"
 
     def rest(_cfg, method, path, payload=None, prefer=""):
         calls.append(method)
@@ -221,6 +230,146 @@ def test_correction_publish_short_circuits_matching_cloud_row(monkeypatch):
     assert supabase_sync.publish_capture_corrections(
         {"url": "test"}, [correction_row()]) == 0
     assert calls == ["GET"]
+
+
+def test_correction_publish_repairs_bool_instead_of_integer(monkeypatch):
+    desired = correction_row()
+    desired["result"]["artifacts"]["display"]["width"] = 1
+    malformed = cloud_row(revision=3)
+    malformed["result"]["artifacts"]["display"]["width"] = True
+    calls = []
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        del path, prefer
+        calls.append((method, deepcopy(payload)))
+        if method == "GET":
+            return [malformed]
+        return [{
+            **deepcopy(payload),
+            "capture_id": CAPTURE_ID,
+            "asset_id": ASSET_ID,
+            "revision": 4,
+            "updated_at": "2026-08-02T12:00:01Z",
+        }]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    assert supabase_sync.publish_capture_corrections(
+        {"url": "test"}, [desired]) == 1
+    assert [method for method, _payload in calls] == ["GET", "PATCH"]
+    assert calls[1][1]["result"]["artifacts"]["display"]["width"] == 1
+    assert calls[1][1]["result"]["artifacts"]["display"]["width"] is not True
+
+
+def test_correction_writable_equality_ignores_json_object_key_order():
+    expected = correction_row()
+    reordered_result = {
+        key: expected["result"][key]
+        for key in reversed(expected["result"])
+    }
+    reordered = {
+        "result": reordered_result,
+        "source_original_sha256": expected["source_original_sha256"],
+        "correction_id": expected["correction_id"],
+        "asset_id": expected["asset_id"],
+        "capture_id": expected["capture_id"],
+    }
+
+    assert supabase_sync._capture_correction_writable_equal(
+        reordered, expected)
+
+
+def test_correction_publish_allows_equal_row_after_expected_revision_changes(
+        monkeypatch):
+    calls = []
+    published = cloud_row(revision=4)
+    published["result"]["generated_at"] = "2026-08-02T12:00:00Z"
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        del path, payload, prefer
+        calls.append(method)
+        if method == "GET":
+            return [published]
+        raise AssertionError("an equal newer row must not be rewritten")
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    assert supabase_sync.publish_capture_corrections(
+        {"url": "test"},
+        [correction_row()],
+        expected_existing={(CAPTURE_ID, ASSET_ID): 3},
+    ) == 0
+    assert calls == ["GET"]
+
+
+@pytest.mark.parametrize("expected_revision,current_revision", [
+    (None, 1),
+    (6, 7),
+])
+def test_correction_publish_rejects_cloud_change_since_candidate_selection(
+        monkeypatch, expected_revision, current_revision):
+    foreign_correction = "fb" * 32
+    published = cloud_row(
+        revision=current_revision,
+        correction_id=foreign_correction,
+        result=correction_result(foreign_correction, "ac" * 32),
+    )
+    calls = []
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        del path, payload, prefer
+        calls.append(method)
+        if method == "GET":
+            return [published]
+        raise AssertionError("a changed guarded row must not be written")
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    with pytest.raises(
+            supabase_sync.SyncError,
+            match="cloud correction changed since candidate selection"):
+        supabase_sync.publish_capture_corrections(
+            {"url": "test"},
+            [correction_row()],
+            expected_existing={
+                (CAPTURE_ID, ASSET_ID): expected_revision,
+            },
+        )
+    assert calls == ["GET"]
+
+
+def test_correction_publish_repairs_a_malformed_same_id_row(monkeypatch):
+    calls = []
+    published = cloud_row(revision=3)
+    # These fields are all consumed by Android. The old display-only equality
+    # check treated this row as current and left the phone rejecting it forever.
+    published["source_original_sha256"] = "9f" * 32
+    published["result"]["artifacts"]["display"]["bytes"] = 1
+    published["result"]["artifacts"]["thumbnail"]["path"] = "wrong/path.jpg"
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        del path, prefer
+        calls.append((method, deepcopy(payload)))
+        if method == "GET":
+            return [published]
+        return [{
+            **deepcopy(payload),
+            "capture_id": CAPTURE_ID,
+            "asset_id": ASSET_ID,
+            "revision": 4,
+            "updated_at": "2026-08-02T12:00:01Z",
+        }]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    assert supabase_sync.publish_capture_corrections(
+        {"url": "test"}, [correction_row()]) == 1
+    assert [method for method, _payload in calls] == ["GET", "PATCH"]
+    assert calls[1][1] == {
+        "correction_id": CORRECTION_ID,
+        "source_original_sha256": SOURCE_SHA256,
+        "result": correction_result(),
+    }
 
 
 def test_correction_publish_reports_cas_miss_after_other_rows_succeed(monkeypatch):

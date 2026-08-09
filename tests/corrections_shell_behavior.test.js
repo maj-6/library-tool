@@ -892,6 +892,124 @@ test("terminal transform reloads only the selected stable capture display", asyn
 });
 
 
+test("an original-root transform reloads the selected logical display", async () => {
+  const namespace = "a".repeat(40);
+  const originalId = `capture:${namespace}:original`;
+  const displayId = `capture:${namespace}:display`;
+  const displayKey = `artifact:${displayId}`;
+  const selected = {
+    key: displayKey,
+    id: displayId,
+    itemId: "book-1",
+    family: "image",
+  };
+  const reloads = [];
+  const bookRefreshes = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    destroyed: false,
+    state: {
+      selection: { itemId: "book-1", artifactId: displayId },
+    },
+    artifactsFeature: {
+      selectedKey: displayKey,
+      items: new Map([[displayKey, selected]]),
+      async reloadSelection(key) {
+        reloads.push(key);
+        return selected;
+      },
+    },
+    booksFeature: {
+      async refresh(reason) { bookRefreshes.push(reason); },
+    },
+    setStatus() {},
+  });
+  const command = {
+    item_id: "book-1",
+    artifact_id: originalId,
+    operation_id: "original-transform-display-selected",
+  };
+
+  assert.equal(await shell.refreshCommittedCaptureDisplay({
+    operationId: command.operation_id,
+    imageCommitted: true,
+  }, command), selected);
+  assert.deepEqual(reloads, [displayKey]);
+  assert.deepEqual(bookRefreshes, ["transform-committed"]);
+  assert.deepEqual(shell.state.selection, {
+    itemId: "book-1",
+    artifactId: displayId,
+  });
+});
+
+
+test("an original-root transform refreshes sibling caches without moving the original",
+  async () => {
+    const namespace = "b".repeat(40);
+    const originalId = `capture:${namespace}:original`;
+    const originalKey = `artifact:${originalId}`;
+    const selected = {
+      key: originalKey,
+      id: originalId,
+      itemId: "book-1",
+      family: "image",
+    };
+    const artifactRefreshes = [];
+    const bookRefreshes = [];
+    let finishRefresh;
+    const refreshFinished = new Promise((resolve) => { finishRefresh = resolve; });
+    const feature = {
+      contextGeneration: 3,
+      selectionGeneration: 5,
+      selectedKey: originalKey,
+      items: new Map([[originalKey, selected]]),
+      async refresh(options) {
+        artifactRefreshes.push(options);
+        this.contextGeneration += 1;
+        await refreshFinished;
+        return { itemId: "book-1" };
+      },
+    };
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      destroyed: false,
+      state: {
+        selection: { itemId: "book-1", artifactId: originalId },
+      },
+      artifactsFeature: feature,
+      booksFeature: {
+        async refresh(reason) { bookRefreshes.push(reason); },
+      },
+      setStatus() {},
+    });
+    const command = {
+      item_id: "book-1",
+      artifact_id: originalId,
+      operation_id: "original-transform-original-selected",
+    };
+    const observation = {
+      operationId: command.operation_id,
+      imageCommitted: true,
+    };
+
+    const immediate = shell.refreshCommittedCaptureDisplay(observation, command);
+    const streamed = shell.refreshCommittedCaptureDisplay(observation, command);
+    assert.deepEqual(artifactRefreshes, [{
+      preserveSelection: true,
+      reason: "capture-transform",
+    }]);
+    assert.deepEqual(bookRefreshes, ["transform-committed"]);
+    finishRefresh();
+    await Promise.all([immediate, streamed]);
+
+    assert.deepEqual(shell.state.selection, {
+      itemId: "book-1",
+      artifactId: originalId,
+    });
+    assert.equal(feature.selectedKey, originalKey);
+  });
+
+
 test("immediate terminal repaint is deduplicated against its streamed result", async () => {
   const artifactId = "capture:stable-immediate:display";
   const key = `artifact:${artifactId}`;

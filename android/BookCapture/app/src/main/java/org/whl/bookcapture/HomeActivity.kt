@@ -151,6 +151,8 @@ class HomeActivity : AppCompatActivity() {
     private data class ScanListItem(
         val entry: Entries.Entry,
         val titleLabel: String,
+        val authorLabel: String,
+        val yearLabel: String,
         val statusLabel: String,
     )
 
@@ -2180,9 +2182,16 @@ class HomeActivity : AppCompatActivity() {
                 ScanListSnapshot(
                     items = entries.map { entry ->
                         loadContext.ensureActive()
+                        val bibliography = Entries.captureListBibliography(entry)
                         ScanListItem(
                             entry = entry,
-                            titleLabel = Entries.titleLabel(this@HomeActivity, entry),
+                            titleLabel = Entries.titleLabel(
+                                this@HomeActivity,
+                                entry,
+                                bibliography,
+                            ),
+                            authorLabel = bibliography.author,
+                            yearLabel = bibliography.year,
                             statusLabel = Entries.statusLabel(this@HomeActivity, entry),
                         )
                     },
@@ -2316,8 +2325,8 @@ class HomeActivity : AppCompatActivity() {
                 row.findViewById<TextView>(R.id.title).text = item.titleLabel
                 row.findViewById<TextView>(R.id.sub).text =
                     listOf(
-                        e.author,
-                        e.year,
+                        item.authorLabel,
+                        item.yearLabel,
                         resources.getQuantityString(
                             R.plurals.capture_count, e.photoCount, e.photoCount),
                         if (e.from.isEmpty()) ""

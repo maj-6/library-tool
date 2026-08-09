@@ -239,14 +239,20 @@ class DesktopCorrectionsTest {
                 ownerId,
             ),
         )
-        assertEquals(
-            DesktopCorrectionDecision.AlreadyApplied,
-            validateDesktopCorrection(
-                localContract(appliedCorrectionId = correctionA),
-                correctionRow(),
-                ownerId,
-            ),
-        )
+        // The id alone is not a no-op: this contract still names the original
+        // phone display, so the same-id row must repair it.
+        val sameIdMismatch = validateDesktopCorrection(
+            localContract(appliedCorrectionId = correctionA),
+            correctionRow(),
+            ownerId,
+        ) as DesktopCorrectionDecision.Ready
+        assertEquals(2, sameIdMismatch.plan.targetRevision)
+        assertEquals(artifact().sha256, sameIdMismatch.plan.artifact.sha256)
+        assertTrue(validateDesktopCorrection(
+            localContract(appliedCorrectionId = correctionA),
+            correctionRow(result = null),
+            ownerId,
+        ) is DesktopCorrectionDecision.Rejected)
     }
 
     @Test
@@ -324,14 +330,13 @@ class DesktopCorrectionsTest {
             )
 
             // The same row is now a no-op regardless of its server revision.
-            assertEquals(
-                DesktopCorrectionDecision.AlreadyApplied,
-                validateDesktopCorrection(
-                    PhotoAssetStore.read(dir),
-                    row.copy(revision = 9),
-                    ownerId,
-                ),
-            )
+            val alreadyApplied = validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row.copy(revision = 9),
+                ownerId,
+            ) as DesktopCorrectionDecision.AlreadyApplied
+            assertEquals(2, alreadyApplied.plan.targetRevision)
+            assertEquals(artifact, alreadyApplied.plan.artifact)
 
             val correctedGeometry = OcrGeometryDraft(
                 width = 12,
@@ -361,6 +366,47 @@ class DesktopCorrectionsTest {
                     .geometries.single { it.displayRevision == 2 }.regions.single().text,
             )
             assertTrue(PhotoAssetStore.pendingCloudDisplayReocrTargets(dir).isEmpty())
+        }
+    }
+
+    @Test
+    fun sameIdDamagedDisplayCanRepairWithoutAdvancingTheRevision() {
+        withEntryDir { dir ->
+            val bytes = jpeg(12, 18)
+            val artifact = artifact(sha256(bytes), bytes.size.toLong(), 12, 18)
+            val row = correctionRow(artifact = artifact)
+            val firstPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row,
+                ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                firstPlan,
+                File(dir, ".first.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+
+            val installed = PhotoAssetStore.read(dir).assets.single()
+            val installedFile = File(dir, installed.display.reference)
+            installedFile.writeBytes(jpeg(12, 19))
+            val repairPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row.copy(revision = 8),
+                ownerId,
+            ) as DesktopCorrectionDecision.AlreadyApplied).plan
+
+            assertEquals(2, repairPlan.targetRevision)
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                repairPlan,
+                File(dir, ".repair.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+            val repaired = PhotoAssetStore.read(dir).assets.single()
+            assertEquals(2, repaired.display.revision)
+            assertEquals(correctionA, repaired.appliedDesktopCorrectionId)
+            assertEquals(bytes.toList(), installedFile.readBytes().toList())
         }
     }
 
@@ -474,9 +520,9 @@ class DesktopCorrectionsTest {
             // is still discoverable — exactly the pair the sync worker keys
             // its enqueuePending re-arm off, so Ready is not the only trigger.
             assertFalse(shouldRetryCloudDisplayReocr(MAX_CLOUD_DISPLAY_REOCR_ATTEMPTS - 1))
-            assertEquals(
-                DesktopCorrectionDecision.AlreadyApplied,
-                validateDesktopCorrection(PhotoAssetStore.read(dir), row, ownerId),
+            assertTrue(
+                validateDesktopCorrection(PhotoAssetStore.read(dir), row, ownerId) is
+                    DesktopCorrectionDecision.AlreadyApplied,
             )
             val target = PhotoAssetStore.pendingCloudDisplayReocrTargets(dir).single()
             assertEquals(2, target.displayRevision)
@@ -502,6 +548,11 @@ class DesktopCorrectionsTest {
         // fresh Ready install — so a terminally failed re-OCR is re-armed by
         // every later pull (the marker-side behavior is covered above).
         assertTrue(workerSource.contains("DesktopCorrectionDecision.AlreadyApplied"))
+        val alreadyAppliedBranch = workerSource
+            .substringAfter("is DesktopCorrectionDecision.AlreadyApplied")
+            .substringBefore("is DesktopCorrectionDecision.Ready")
+        assertTrue(alreadyAppliedBranch.contains("verifyCloudDisplayDownload("))
+        assertTrue(alreadyAppliedBranch.contains("download(decision.plan)"))
         // Not push-gated: corrections must flow on plain pulls (Home resume),
         // not only explicit syncs. The first `if (!pushReviews` in the worker
         // opens the push-only tail of doWork, so the corrections fetch and the

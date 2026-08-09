@@ -1167,7 +1167,7 @@ class FilesystemCorrectionsArtifactRepository(
         self,
         item_id: str,
     ) -> Mapping[str, Any]:
-        """Return navigation hints plus private manifest-only display pins.
+        """Return navigation hints plus private manifest-only capture pins.
 
         These hints are deliberately not raster artifact views and their
         ``index:`` revisions must never be used as mutation preconditions.
@@ -3441,10 +3441,36 @@ class FilesystemCorrectionsArtifactRepository(
                 import_state = "ready"
             namespace = record.namespace
             artifact_id = record.display_id
+            original_sha256 = _sha256(
+                imported.get("source_checksum")
+                or original.get("sha256")
+            )
             display_sha256 = _sha256(
                 imported.get("derivative_checksum")
                 or display.get("sha256")
             )
+            if (
+                authority_hints is not None
+                and original_state is ResourceState.AVAILABLE
+                and original_sha256
+            ):
+                authority_hints[record.original_id.casefold()] = {
+                    "artifact_id": record.original_id,
+                    "source_revision": f"bytes:{original_sha256}",
+                    "source_sha256": original_sha256,
+                    "representation_id": "capture",
+                    "representation_revision": representation_revision,
+                    "canvas_id": namespace,
+                    # These current-state pins are private to composition.
+                    # A cold original remains an authoritative transform root,
+                    # but only for the operation that promoted it.
+                    "original_backed_up": record.original_backup is not None,
+                    "active_operation_id": (
+                        imported.get("active_desktop_correction_id", "")
+                        if record.original_backup is not None
+                        else ""
+                    ),
+                }
             if authority_hints is not None:
                 authority_hints[artifact_id.casefold()] = {
                     "artifact_id": artifact_id,

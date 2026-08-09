@@ -1407,16 +1407,21 @@ class _CorrectionProjectionUnion:
         validated = cls._validated_capture_authorities(item_id, authorities)
         for head in head_hints:
             identity = head.logical_key.artifact_id.casefold()
-            authority = validated.get(identity)
+            root_identity = head.root_key.artifact_id.casefold()
+            authority = validated.get(root_identity)
             hint = hints_by_id.get(identity)
             source = head.root_source
             if (
                 authority is None
                 or hint is None
                 or head.logical_key.item_id != item_id
-                or hint.get("resource_state")
-                != ResourceState.AVAILABLE.value
-                or authority["artifact_id"].casefold() != identity
+                or head.root_key.item_id != item_id
+                or (
+                    root_identity == identity
+                    and hint.get("resource_state")
+                    != ResourceState.AVAILABLE.value
+                )
+                or authority["artifact_id"].casefold() != root_identity
                 or authority["source_revision"]
                 != head.root_source_revision
                 or authority["source_sha256"] != head.root_source_sha256
@@ -1474,32 +1479,80 @@ class _CorrectionProjectionUnion:
         active: dict[str, Any] = {}
         for head in projection.display_heads:
             identity = head.logical_key.artifact_id.casefold()
+            root_identity = head.root_key.artifact_id.casefold()
             authority = (
-                authorities.get(identity) if authorities is not None else None
+                authorities.get(root_identity)
+                if authorities is not None
+                else None
             )
-            base = base_by_id.get(identity)
-            if base is None:
-                base = self._base.get_raster_artifact(head.logical_key)
-            if base is None:
-                continue
-            original_backed_up = isinstance(
-                base.extensions.get("original_backup"),
-                Mapping,
+            logical = base_by_id.get(identity)
+            if logical is None:
+                logical = self._base.get_raster_artifact(head.logical_key)
+            root = base_by_id.get(root_identity)
+            if root is None:
+                root = self._base.get_raster_artifact(head.root_key)
+            logical_original_backed_up = (
+                logical is not None
+                and isinstance(
+                    logical.extensions.get("original_backup"),
+                    Mapping,
+                )
+            )
+            root_is_available = (
+                root is not None
+                and root.key == head.root_key
+                and root.resource_state is ResourceState.AVAILABLE
+                and root.resource is not None
+                and root.content_sha256 == head.root_source_sha256
+                and root.resource.revision == head.root_source_revision
+                and root.source == head.root_source
+            )
+            # #297 deliberately removes a promoted original from the hot
+            # capture directory and suppresses its RasterArtifactView.  Its
+            # private manifest authority still pins the immutable backup bytes
+            # and the one operation allowed to project from them.  This
+            # authority-only fallback is never valid for a display root: a
+            # missing display must continue to fail closed.
+            backed_up_original_is_authoritative = (
+                root_identity != identity
+                and root is None
+                and authority is not None
+                and authority["original_backed_up"]
+                and authority["active_operation_id"] == head.operation_id
+                and authority["artifact_id"].casefold() == root_identity
+                and authority["source_revision"]
+                == head.root_source_revision
+                and authority["source_sha256"] == head.root_source_sha256
+                and authority["representation_id"]
+                == head.root_source.representation_id
+                and authority["representation_revision"]
+                == head.root_source.representation_revision
+                and authority["canvas_id"] == head.root_source.canvas_id
             )
             if (
-                base.key.item_id != item_id
-                or base.resource_state is not ResourceState.AVAILABLE
-                or base.resource is None
-                or base.content_sha256 != head.root_source_sha256
-                or base.resource.revision != head.root_source_revision
-                or base.source != head.root_source
+                logical is None
+                or logical.key != head.logical_key
+                or logical.key.item_id != item_id
+                or head.logical_key.item_id != item_id
+                or head.root_key.item_id != item_id
+                or not (
+                    root_is_available
+                    or backed_up_original_is_authoritative
+                )
                 or (
-                    original_backed_up
+                    logical_original_backed_up
                     and (
                         authority is None
                         or not authority["original_backed_up"]
-                        or authority["active_operation_id"] != head.operation_id
+                        or authority["active_operation_id"]
+                        != head.operation_id
                     )
+                )
+                or (
+                    authority is not None
+                    and authority["original_backed_up"]
+                    and authority["active_operation_id"]
+                    != head.operation_id
                 )
             ):
                 continue

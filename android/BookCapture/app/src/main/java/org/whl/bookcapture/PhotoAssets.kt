@@ -1216,6 +1216,7 @@ internal object PhotoAssetStore {
             proposed.row,
             proposed.row.ownerId,
         )) {
+            is DesktopCorrectionDecision.AlreadyApplied -> decision.plan
             is DesktopCorrectionDecision.Ready -> decision.plan
             else -> return@synchronized false
         }

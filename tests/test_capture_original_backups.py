@@ -1301,17 +1301,9 @@ def test_legacy_capture_without_manifest_keeps_transform_history_behavior(tmp_pa
     )
 
 
-def test_transform_started_from_original_promotes_the_stable_display(tmp_path):
+def test_transform_started_from_original_projects_the_logical_display_head(tmp_path):
     original = _image("JPEG", (10, 20, 30))
     display = _image("JPEG", (40, 50, 60))
-    original_source = _source(original)
-    original_source = replace(
-        original_source,
-        artifact=replace(
-            original_source.artifact,
-            key=RasterArtifactKey(ITEM_ID, _original_id()),
-        ),
-    )
     display_source = _source(display)
     source_box = {"value": display_source}
     artifact_box = {_display_id(): display_source.artifact}
@@ -1324,30 +1316,6 @@ def test_transform_started_from_original_promotes_the_stable_display(tmp_path):
         coordination_write_set=coordination,
     )
     _write_capture(capture_dir, original, display)
-    transforms.commit_transform(_draft(display_source, "seed-display-head"))
-    assert len(transforms.project_item(ITEM_ID).display_heads) == 1
-    source_box["value"] = original_source
-
-    result = transforms.commit_transform(
-        _draft(original_source, "transform-from-original")
-    )
-
-    manifest = json.loads((capture_dir / "photo_assets.json").read_text("ascii"))
-    imported = manifest["desktop_import"]["assets"][0]
-    assert imported["active_desktop_correction_id"] == result.operation_id
-    assert "raw_ref" not in imported
-    assert _backup_path(output, original).read_bytes() == original
-    assert (capture_dir / "photo_1.jpg").read_bytes() != display
-    assert transforms.project_item(ITEM_ID).display_heads == ()
-    assert not correction_display_head_path(
-        output,
-        ITEM_ID,
-        _display_id(),
-    ).exists()
-
-    # An original-source transform promotes corrected bytes directly into the
-    # stable display slot and intentionally publishes no display head. The
-    # active-operation pin must not hide that physical fallback.
     base = FilesystemCorrectionsArtifactRepository(
         coordination,
         item_exists=lambda item_id: item_id == ITEM_ID,
@@ -1358,6 +1326,58 @@ def test_transform_started_from_original_promotes_the_stable_display(tmp_path):
         representation_revision_for=lambda _item_id, _source_id: None,
         lock_context_for=_lock,
     )
+    original_artifact = base.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, _original_id())
+    )
+    display_artifact = base.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, _display_id())
+    )
+    assert original_artifact is not None and original_artifact.resource is not None
+    assert display_artifact is not None
+    original_source = CorrectionSourceSnapshot(
+        original_artifact,
+        original_artifact.resource.revision,
+        original,
+    )
+    source_box["value"] = original_source
+    artifact_box[_display_id()] = display_artifact
+
+    result = transforms.commit_transform(
+        _draft(original_source, "transform-from-original")
+    )
+
+    manifest = json.loads((capture_dir / "photo_assets.json").read_text("ascii"))
+    imported = manifest["desktop_import"]["assets"][0]
+    assert imported["active_desktop_correction_id"] == result.operation_id
+    assert "raw_ref" not in imported
+    assert _backup_path(output, original).read_bytes() == original
+    assert not (capture_dir / "orig_1.jpg").exists()
+    assert (capture_dir / "photo_1.jpg").read_bytes() == display
+    assert manifest["assets"][0]["original"] == _manifest(original, display)[
+        "assets"
+    ][0]["original"]
+    assert manifest["assets"][0]["display"] == _manifest(original, display)[
+        "assets"
+    ][0]["display"]
+
+    heads = transforms.project_item(ITEM_ID).display_heads
+    assert len(heads) == 1
+    head = heads[0]
+    assert head.logical_key == RasterArtifactKey(ITEM_ID, _display_id())
+    assert head.root_key == original_artifact.key
+    assert head.operation_id == result.operation_id
+    assert correction_display_head_path(
+        output,
+        ITEM_ID,
+        _display_id(),
+    ).is_file()
+
+    # The original has moved cold, so routine projections cannot resolve it.
+    # Its validated backup authority still activates the head without reading
+    # the backup, and only the sibling logical display is replaced.
+    assert base.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, _original_id())
+    ) is None
     composed = _CorrectionProjectionUnion(
         base,
         transforms,
@@ -1365,18 +1385,18 @@ def test_transform_started_from_original_promotes_the_stable_display(tmp_path):
         lock_context_for=_lock,
         original_backups=originals,
     )
-    physical = composed.get_raster_artifact(
+    projected = composed.get_raster_artifact(
         RasterArtifactKey(ITEM_ID, _display_id())
     )
-    assert physical is not None
-    assert physical.resource_state == "available"
-    assert physical.content_sha256 == _sha256(
-        (capture_dir / "photo_1.jpg").read_bytes()
+    assert projected is not None
+    assert projected.resource_state == "available"
+    assert projected.content_sha256 == head.artifact.content_sha256
+    assert projected.extensions["correction_display_head"]["operation_id"] == (
+        result.operation_id
     )
-    assert "correction_display_head" not in physical.extensions
-    assert composed.list_capture_index_hints_many([ITEM_ID]) == (
-        base.list_capture_index_hints_many([ITEM_ID])
-    )
+    projected_hints = composed.list_capture_index_hints_many([ITEM_ID])[ITEM_ID]
+    base_hints = base.list_capture_index_hints_many([ITEM_ID])[ITEM_ID]
+    assert projected_hints[0]["revision"] != base_hints[0]["revision"]
 
 
 def test_interrupted_atomic_promotion_recovers_original_display_and_manifest(tmp_path):

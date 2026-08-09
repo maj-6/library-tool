@@ -422,21 +422,37 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                 ) != CloudUploadOwnership.ALLOWED || !entry.dir.isDirectory) {
                 return@withLock null
             }
-            when (val decision = validateDesktopCorrection(
-                PhotoAssetStore.read(entry.dir),
-                row,
-                owner,
-            )) {
-                DesktopCorrectionDecision.AlreadyApplied ->
-                    DesktopCorrectionStage.AlreadyApplied
-                is DesktopCorrectionDecision.Ready -> DesktopCorrectionStage.Download(
-                    decision.plan,
+            val contract = PhotoAssetStore.read(entry.dir)
+            fun download(plan: DesktopCorrectionInstallPlan) =
+                DesktopCorrectionStage.Download(
+                    plan,
                     File.createTempFile(
                         ".desktop-${row.correctionId.take(12)}-",
                         ".part",
                         entry.dir,
                     ),
                 )
+            when (val decision = validateDesktopCorrection(
+                contract,
+                row,
+                owner,
+            )) {
+                is DesktopCorrectionDecision.AlreadyApplied -> {
+                    val asset = contract.assets.firstOrNull { it.assetId == row.assetId }
+                        ?: return@withLock null
+                    val installed = File(entry.dir, asset.display.reference)
+                    if (verifyCloudDisplayDownload(
+                            installed,
+                            decision.plan.artifact,
+                            decision.plan.artifact.mime,
+                            installed.length(),
+                        ) == null) {
+                        DesktopCorrectionStage.AlreadyApplied
+                    } else {
+                        download(decision.plan)
+                    }
+                }
+                is DesktopCorrectionDecision.Ready -> download(decision.plan)
                 else -> null
             }
         } ?: return false
