@@ -199,6 +199,44 @@ def test_source_projects_metadata_and_photo_assets_without_local_locators(
     assert "file://" not in notes_serialized
 
 
+def test_archive_keeps_deleted_capture_evidence_with_its_portable_tombstone(
+    tmp_path,
+):
+    """A rebuilt archive remains recoverable without resurrecting the page.
+
+    Capture deletion is membership lifecycle, not byte destruction. Both image
+    representations therefore remain immutable evidence in lib/3 while the
+    exact portable lifecycle marker tells every current consumer to hide them.
+    """
+
+    original = _jpeg()
+    display = _jpeg(13, 9, "gray")
+    directory = tmp_path / "capture-deleted"
+    _write_pair(directory, original, display)
+    assets = _photo_assets(original, display)
+    assets["assets"][0]["desktop_lifecycle"] = {
+        "state": "deleted",
+        "revision": 1,
+        "updated_at": 1_786_320_000_000,
+    }
+    _write_photo_assets(directory, assets)
+
+    source = capture_lib.build_capture_archive_source(
+        CAPTURE_ID,
+        _entry(),
+        directory,
+    )
+
+    portable = _resource_json(source, "artifacts/photo-assets.json")
+    assert portable["assets"][0]["desktop_lifecycle"] == {
+        "state": "deleted",
+        "revision": 1,
+        "updated_at": 1_786_320_000_000,
+    }
+    assert source.resources["representations/capture-original-1.jpg"]
+    assert source.resources["representations/capture-display-1.jpg"]
+
+
 def test_archive_build_reads_a_corrected_capture_original_from_cold_backup(
     tmp_path,
 ):

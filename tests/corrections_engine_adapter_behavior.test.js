@@ -555,6 +555,8 @@ test("spatial catalog and region resources retain engine paging", async () => {
   assert.equal(page.items[0].object_type, "spatial-annotation");
   assert.equal(page.nextCursor, "regions-2");
   assert.equal(page.total, 2);
+  assert.equal(calls.spatialList[0].visibility, "tree",
+    "overlay-only mask markers must not enter the Layout/Mistral tree count");
 
   const next = await ports.artifacts.resources.listRegions({
     context: { itemId: "book-1", representationId: "scan-1" },
@@ -566,6 +568,8 @@ test("spatial catalog and region resources retain engine paging", async () => {
   assert.deepEqual(next.items.map((item) => item.key.annotation_id), ["region-2"]);
   assert.equal(calls.spatialList[1].representationId, "scan-7");
   assert.equal(calls.spatialList[1].canvasId, "page-7");
+  assert.equal(calls.spatialList[1].visibility, "overlay",
+    "the capture editor still receives durable mask markers");
 
   const detail = await ports.artifacts.catalog.get({
     context: { itemId: "book-1" },
@@ -845,6 +849,38 @@ test("adapter fails closed when the required engine surfaces are incomplete", as
     }),
     /catalog key is invalid/,
   );
+});
+
+
+test("capture Trash commands delegate the stable operation and CAS pin", async () => {
+  const invocations = [];
+  const { engineClient } = engineHarness({
+    rasterArtifacts: {
+      async trashCaptureAsset(payload) {
+        invocations.push(payload);
+        return { action: "delete", inverse: { action: "restore" } };
+      },
+    },
+  });
+  const commands = createCorrectionsEnginePorts(engineClient).artifacts.commands;
+  const signal = new AbortController().signal;
+
+  const result = await commands.trashCaptureAsset({
+    itemId: "book-1",
+    artifactId: "image-1",
+    expectedArtifactRevision: "image-r1",
+    operationId: "capture-trash-op",
+    signal,
+  });
+
+  assert.equal(result.action, "delete");
+  assert.deepEqual(invocations, [{
+    itemId: "book-1",
+    artifactId: "image-1",
+    expectedArtifactRevision: "image-r1",
+    idempotencyKey: "capture-trash-op",
+    signal,
+  }]);
 });
 
 

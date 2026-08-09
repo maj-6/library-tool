@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import replace
 
+import pytest
+
 from librarytool.engine.correction_projection import (
     CorrectionAggregateProjector,
     CorrectionProjectionService,
@@ -12,6 +14,7 @@ from librarytool.engine.corrections import (
     CORRECTION_TARGET_AUTHORITY_EXTENSION,
     CorrectionAggregateSnapshot,
 )
+from librarytool.engine.errors import RepositoryError
 from librarytool.engine.raster_artifacts import (
     ArtifactMetadataAssertion,
     ArtifactFreshness,
@@ -959,6 +962,53 @@ def test_links_are_only_promoted_when_exactly_one_known_artifact_is_linked():
     assert values["missing"].linked_artifact_ids == ("not-in-projection",)
 
 
+def test_extracted_crop_links_do_not_make_role_source_authority_ambiguous():
+    rasters = (
+        _raster("source-image"),
+        _raster("crop-image"),
+        _raster("foreign-image"),
+    )
+    extracted = replace(
+        _annotation(
+            "extracted",
+            linked_artifact_ids=("source-image", "crop-image"),
+        ),
+        extensions={
+            "correction_extraction": {"artifact_ids": ("crop-image",)},
+        },
+    )
+    foreign = replace(
+        _annotation(
+            "foreign",
+            linked_artifact_ids=(
+                "source-image",
+                "crop-image",
+                "foreign-image",
+            ),
+        ),
+        extensions={
+            "correction_extraction": {"artifact_ids": ("crop-image",)},
+        },
+    )
+
+    live = _project(rasters, (extracted, foreign))
+    extracted_snapshot = live.annotation("extracted")
+    foreign_snapshot = live.annotation("foreign")
+
+    assert extracted_snapshot is not None
+    assert extracted_snapshot.linked_artifact_id == "source-image"
+    assert extracted_snapshot.extensions["correction_link_authority"] == {
+        "state": "single",
+        "live_artifact_ids": ("source-image",),
+    }
+    assert foreign_snapshot is not None
+    assert foreign_snapshot.linked_artifact_id == ""
+    assert foreign_snapshot.extensions["correction_link_authority"] == {
+        "state": "ambiguous",
+        "live_artifact_ids": ("source-image", "foreign-image"),
+    }
+
+
 def test_projection_service_delegates_raster_resource_resolution():
     artifact = _raster("image-a")
     resolved = object()
@@ -978,3 +1028,81 @@ def test_projection_service_delegates_raster_resource_resolution():
     assert raster_projector.resolve_calls == [
         ("book-1", artifact.resource),
     ]
+
+
+def test_projection_service_delegates_capture_asset_lifecycle_commands():
+    artifact = _raster("image-a")
+
+    class _LifecycleRasterProjector(_RasterProjector):
+        def __init__(self):
+            super().__init__((artifact,))
+            self.lifecycle_calls = []
+
+        def delete_capture_asset(self, *args):
+            self.lifecycle_calls.append(("delete", args))
+            return {"action": "delete"}
+
+        def restore_capture_asset(self, *args):
+            self.lifecycle_calls.append(("restore", args))
+            return {"action": "restore"}
+
+    projector = _LifecycleRasterProjector()
+    service = CorrectionProjectionService(
+        projector,
+        _SpatialProjector(()),
+        _ReadRepository(_project((artifact,))),
+    )
+    inverse = {"schema": "test-inverse"}
+
+    deleted = service.delete_capture_asset(
+        "book-1",
+        "image-a",
+        "image-a-r1",
+        "delete-op-1",
+    )
+    restored = service.restore_capture_asset(
+        "book-1",
+        "image-a",
+        inverse,
+        "restore-op-1",
+    )
+
+    assert deleted == {"action": "delete"}
+    assert restored == {"action": "restore"}
+    assert projector.lifecycle_calls == [
+        (
+            "delete",
+            ("book-1", "image-a", "image-a-r1", "delete-op-1"),
+        ),
+        (
+            "restore",
+            ("book-1", "image-a", inverse, "restore-op-1"),
+        ),
+    ]
+
+
+def test_projection_service_requires_capture_asset_lifecycle_delegate():
+    artifact = _raster("image-a")
+    service = CorrectionProjectionService(
+        _RasterProjector((artifact,)),
+        _SpatialProjector(()),
+        _ReadRepository(_project((artifact,))),
+    )
+
+    with pytest.raises(RepositoryError) as unavailable:
+        service.delete_capture_asset(
+            "book-1",
+            "image-a",
+            "image-a-r1",
+            "delete-op-1",
+        )
+    with pytest.raises(TypeError):
+        service.restore_capture_asset(  # type: ignore[arg-type]
+            "book-1",
+            "image-a",
+            None,
+            "restore-op-1",
+        )
+
+    assert unavailable.value.code == "capture_asset_lifecycle_unavailable"
+    assert unavailable.value.retryable is True

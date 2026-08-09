@@ -169,6 +169,156 @@ class PhotoAssetsTest {
     }
 
     @Test
+    fun desktopLifecycleIsAdditiveStrictAndRoundTrips() {
+        val legacy = CapturePhotoAssets("capture-1", listOf(asset("asset-1", 1)))
+        val legacyJson = legacy.toJson()
+        assertFalse(
+            legacyJson.getJSONArray("assets").getJSONObject(0)
+                .has("desktop_lifecycle"),
+        )
+        assertEquals(
+            DesktopPhotoAssetLifecycle(),
+            capturePhotoAssetsFromJson(legacyJson, "capture-1")!!
+                .assets.single().desktopLifecycle,
+        )
+
+        val deleted = legacy.copy(assets = listOf(
+            legacy.assets.single().copy(
+                desktopLifecycle = DesktopPhotoAssetLifecycle(
+                    DesktopPhotoAssetState.DELETED,
+                    revision = 4L,
+                    updatedAt = 1_722_000_000_123L,
+                ),
+            ),
+        ))
+        val deletedJson = deleted.toJson()
+        assertEquals(
+            setOf("state", "revision", "updated_at"),
+            deletedJson.getJSONArray("assets").getJSONObject(0)
+                .getJSONObject("desktop_lifecycle").keys().asSequence().toSet(),
+        )
+        assertEquals(deleted, capturePhotoAssetsFromJson(deletedJson, "capture-1"))
+
+        fun invalid(mutator: (JSONObject) -> Unit): JSONObject {
+            val json = JSONObject(deletedJson.toString())
+            mutator(json.getJSONArray("assets").getJSONObject(0)
+                .getJSONObject("desktop_lifecycle"))
+            return json
+        }
+        assertNull(capturePhotoAssetsFromJson(invalid { it.put("revision", 0) }, "capture-1"))
+        assertNull(capturePhotoAssetsFromJson(invalid { it.put("updated_at", 0) }, "capture-1"))
+        assertNull(capturePhotoAssetsFromJson(invalid { it.put("state", "archived") }, "capture-1"))
+        assertNull(capturePhotoAssetsFromJson(invalid { it.put("state", "DELETED") }, "capture-1"))
+        assertNull(capturePhotoAssetsFromJson(invalid { it.put("extra", true) }, "capture-1"))
+    }
+
+    @Test
+    fun interiorDesktopTombstoneHidesWithoutRemovingBytesOrStableOrder() {
+        val dir = Files.createTempDirectory("photo-assets-desktop-delete-").toFile()
+        try {
+            val assets = (1..3).map { order ->
+                asset("asset-$order", order).also {
+                    File(dir, it.captureFile).writeText("camera-$order")
+                    File(dir, it.original.reference).writeText("original-$order")
+                }
+            }
+            val selectedDeleted = CapturePhotoAssets(
+                dir.name,
+                assets.map { current ->
+                    if (current.assetId == "asset-2") current.copy(
+                        desktopLifecycle = DesktopPhotoAssetLifecycle(
+                            DesktopPhotoAssetState.DELETED,
+                            revision = 2L,
+                            updatedAt = 2_000L,
+                        ),
+                    ) else current
+                },
+                selections = CapturePhotoSelections(
+                    primaryTitle = PhotoSelectionChoice(
+                        "asset-2", manual = true, revision = 1, updatedAt = 1_000L,
+                    ),
+                ),
+            )
+            File(dir, PHOTO_ASSETS_FILE).writeText(selectedDeleted.toJson().toString())
+
+            assertEquals(
+                listOf("asset-1", "asset-3"),
+                PhotoAssetStore.descriptors(dir).map { it.assetId },
+            )
+            assertEquals("asset-1", PhotoAssetStore.detailHero(dir)?.assetId)
+            assertEquals("camera-2", File(dir, "photo_2.jpg").readText())
+            assertEquals("original-2", File(dir, "original_asset-2.jpg").readText())
+            val persisted = PhotoAssetStore.payload(dir)
+            assertEquals(3, persisted.getJSONArray("assets").length())
+            assertEquals(
+                listOf(1, 3),
+                PhotoAssetStore.read(dir).orderedAssets().map { it.captureOrder },
+            )
+
+            val restored = selectedDeleted.copy(assets = selectedDeleted.assets.map { current ->
+                if (current.assetId == "asset-2") current.copy(
+                    desktopLifecycle = DesktopPhotoAssetLifecycle(
+                        DesktopPhotoAssetState.ACTIVE,
+                        revision = 3L,
+                        updatedAt = 3_000L,
+                    ),
+                ) else current
+            })
+            assertTrue(PhotoAssetStore.mergeIncoming(dir, restored.toJson()))
+            assertEquals(
+                listOf("asset-1", "asset-2", "asset-3"),
+                PhotoAssetStore.descriptors(dir).map { it.assetId },
+            )
+            assertEquals("asset-2", PhotoAssetStore.detailHero(dir)?.assetId)
+            assertEquals(listOf(1, 2, 3), PhotoAssetStore.read(dir).orderedAssets()
+                .map { it.captureOrder })
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun lifecycleMergeRequiresANewerRevisionAndMissingAssetsAreNoOp() {
+        val base = asset("asset-1", 2).copy(
+            desktopLifecycle = DesktopPhotoAssetLifecycle(
+                DesktopPhotoAssetState.DELETED,
+                revision = 5L,
+                updatedAt = 5_000L,
+            ),
+        )
+        val local = CapturePhotoAssets("capture-1", listOf(base))
+        fun incoming(lifecycle: DesktopPhotoAssetLifecycle) = CapturePhotoAssets(
+            "capture-1",
+            listOf(base.copy(
+                display = base.display.copy(revision = 2, sha256 = "c".repeat(64)),
+                desktopLifecycle = lifecycle,
+            )),
+        )
+
+        assertEquals(local, mergePhotoAssetContracts(
+            local,
+            CapturePhotoAssets("capture-1", emptyList()),
+        ))
+        for (stale in listOf(
+            DesktopPhotoAssetLifecycle(),
+            DesktopPhotoAssetLifecycle(DesktopPhotoAssetState.ACTIVE, 4L, 4_000L),
+            DesktopPhotoAssetLifecycle(DesktopPhotoAssetState.ACTIVE, 5L, 5_001L),
+        )) {
+            assertEquals(base, mergePhotoAssetContracts(local, incoming(stale)).assets.single())
+        }
+
+        val restored = DesktopPhotoAssetLifecycle(
+            DesktopPhotoAssetState.ACTIVE,
+            revision = 6L,
+            updatedAt = 6_000L,
+        )
+        val merged = mergePhotoAssetContracts(local, incoming(restored)).assets.single()
+        assertEquals(restored, merged.desktopLifecycle)
+        assertEquals(2, merged.display.revision)
+        assertEquals(2, merged.captureOrder)
+    }
+
+    @Test
     fun futureVersionsAndWrongCaptureIdsAreRejected() {
         val json = CapturePhotoAssets("capture-1", listOf(asset("asset-1", 1))).toJson()
 

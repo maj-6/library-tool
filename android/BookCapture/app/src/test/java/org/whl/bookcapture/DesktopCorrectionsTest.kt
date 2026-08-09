@@ -175,6 +175,44 @@ class DesktopCorrectionsTest {
     }
 
     @Test
+    fun desktopTombstoneBlocksValidationAndAPreviouslyStagedInstall() {
+        val deleted = localContract().let { contract ->
+            contract.copy(assets = contract.assets.map { asset ->
+                asset.copy(desktopLifecycle = DesktopPhotoAssetLifecycle(
+                    DesktopPhotoAssetState.DELETED,
+                    revision = 3L,
+                    updatedAt = 3_000L,
+                ))
+            })
+        }
+        assertEquals(
+            DesktopCorrectionDecision.NotApplicable,
+            validateDesktopCorrection(deleted, correctionRow(), ownerId),
+        )
+
+        withEntryDir { dir ->
+            val bytes = jpeg(12, 18)
+            val artifact = artifact(sha256(bytes), bytes.size.toLong(), 12, 18)
+            val row = correctionRow(artifact = artifact)
+            val staged = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), row, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+
+            File(dir, PHOTO_ASSETS_FILE).writeText(deleted.toJson().toString())
+            assertFalse(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                staged,
+                File(dir, ".deleted-race.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+            val preserved = PhotoAssetStore.read(dir).assets.single()
+            assertTrue(preserved.desktopLifecycle.deleted)
+            assertEquals(1, preserved.display.revision)
+            assertEquals("", preserved.appliedDesktopCorrectionId)
+        }
+    }
+
+    @Test
     fun validatorRejectsEveryTamperedAxisWithoutTrustingTheRowsPath() {
         val local = localContract()
         fun mutated(block: (JSONObject) -> Unit): DesktopCorrectionDecision {

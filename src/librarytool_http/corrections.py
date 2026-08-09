@@ -124,6 +124,9 @@ CORRECTION_REOCR_QUEUE_SCHEMA = (
 ORIGINAL_BACKUP_RESTORE_SCHEMA = (
     "librarytool.original-backup-restore/1"
 )
+CAPTURE_ASSET_LIFECYCLE_RESULT_SCHEMA = (
+    "librarytool.capture-asset-lifecycle-result/1"
+)
 CORRECTION_OCR_PROPOSAL_LIST_SCHEMA = (
     "librarytool.correction-ocr-proposals/1"
 )
@@ -158,6 +161,9 @@ _ITEM_OPERATION_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 )
 _OCR_PROPOSAL_REF_RE = re.compile(r"^cop-[0-9a-f]{40}$")
+_CAPTURE_ARTIFACT_RE = re.compile(
+    r"^capture:[0-9a-f]{40}:(?:display|original)$"
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UNSAFE_TEXT_RE = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]"
@@ -180,7 +186,9 @@ _TRANSFORM_COMMAND_FIELDS = frozenset(
 # Mirrors _COMMAND_OPTIONAL_FIELDS in librarytool.engine.correction_transforms;
 # see the schema-evolution note there for why these are additive rather than a
 # version bump.
-_TRANSFORM_COMMAND_OPTIONAL_FIELDS = frozenset({"mask_polygon", "operations"})
+_TRANSFORM_COMMAND_OPTIONAL_FIELDS = frozenset(
+    {"mask_polygon", "operations", "extraction"}
+)
 _RASTER_GROUP_KINDS = {
     "source-images": frozenset(
         {"capture", "captured-image", "page-image", "scan", "source-image"}
@@ -3444,12 +3452,28 @@ def _spatial_list(
     representation_id = request.args.get("representation_id", "")
     canvas_id = request.args.get("canvas_id", "")
     canvas_revision = request.args.get("canvas_revision", "")
+    visibility = request.args.get("visibility", "")
+    if visibility not in {"", "tree", "overlay"}:
+        raise ValidationError(
+            "spatial annotation visibility is invalid",
+            code="invalid_spatial_annotation_visibility",
+            details={"field": "visibility"},
+        )
     values = _spatial_service(engine_for_request).list_spatial_annotations(
         item_id,
         representation_id=representation_id,
         canvas_id=canvas_id,
     )
     rows = _validated_annotations(values, item_id=item_id)
+    if visibility == "tree":
+        rows = [
+            value
+            for value in rows
+            if not (
+                isinstance(value.extensions.get("corrections_ui"), Mapping)
+                and value.extensions["corrections_ui"].get("overlay_only") is True
+            )
+        ]
     if canvas_revision:
         rows = [
             value
@@ -3734,6 +3758,186 @@ def _restore_original_backup(
             "ok": True,
             "schema": ORIGINAL_BACKUP_RESTORE_SCHEMA,
             **dict(receipt),
+        }
+    )
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _capture_lifecycle_text(
+    value: Any,
+    *,
+    maximum: int,
+) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= maximum
+        and _UNSAFE_TEXT_RE.search(value) is None
+    )
+
+
+def _capture_lifecycle_state(value: Any, expected: str) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"state", "revision", "updated_at"}
+        and value.get("state") == expected
+        and type(value.get("revision")) is int
+        and value["revision"] > 0
+        and type(value.get("updated_at")) is int
+        and value["updated_at"] > 0
+    )
+
+
+def _valid_capture_asset_delete_result(
+    result: Any,
+    *,
+    key: RasterArtifactKey,
+    operation_id: str,
+    expected_revision: str,
+) -> bool:
+    fields = {
+        "operation_id",
+        "action",
+        "item_id",
+        "capture_id",
+        "asset_id",
+        "artifact_id",
+        "artifact_revision",
+        "capture_order",
+        "before_lifecycle",
+        "after_lifecycle",
+        "item_updated_at",
+        "inverse",
+        "replayed",
+    }
+    if (
+        not isinstance(result, Mapping)
+        or set(result) != fields
+        or result.get("operation_id") != operation_id
+        or result.get("action") != "delete"
+        or result.get("item_id") != key.item_id
+        or result.get("artifact_id") != key.artifact_id
+        or result.get("artifact_revision") != expected_revision
+        or not _capture_lifecycle_text(result.get("capture_id"), maximum=512)
+        or not _capture_lifecycle_text(result.get("asset_id"), maximum=512)
+        or type(result.get("capture_order")) is not int
+        or result["capture_order"] <= 0
+        or type(result.get("replayed")) is not bool
+        or not _capture_lifecycle_text(
+            result.get("item_updated_at"),
+            maximum=2048,
+        )
+    ):
+        return False
+    before = result.get("before_lifecycle")
+    after = result.get("after_lifecycle")
+    if (
+        before is not None
+        and not _capture_lifecycle_state(before, "active")
+    ) or not _capture_lifecycle_state(after, "deleted"):
+        return False
+    expected_lifecycle_revision = (
+        1 if before is None else before["revision"] + 1
+    )
+    if (
+        after["revision"] != expected_lifecycle_revision
+        or before is not None
+        and after["updated_at"] <= before["updated_at"]
+    ):
+        return False
+    inverse = result.get("inverse")
+    inverse_fields = {
+        "schema",
+        "action",
+        "source_operation_id",
+        "item_id",
+        "capture_id",
+        "asset_id",
+        "artifact_id",
+        "artifact_revision",
+        "capture_order",
+        "expected_lifecycle",
+    }
+    return (
+        isinstance(inverse, Mapping)
+        and set(inverse) == inverse_fields
+        and inverse.get("schema")
+        == "librarytool.capture-asset-lifecycle-inverse/1"
+        and inverse.get("action") == "restore"
+        and inverse.get("source_operation_id") == operation_id
+        and inverse.get("item_id") == key.item_id
+        and inverse.get("capture_id") == result["capture_id"]
+        and inverse.get("asset_id") == result["asset_id"]
+        and inverse.get("artifact_id") == key.artifact_id
+        and inverse.get("artifact_revision") == expected_revision
+        and inverse.get("capture_order") == result["capture_order"]
+        and inverse.get("expected_lifecycle") == after
+    )
+
+
+def _trash_capture_asset(
+    resolver_for_request: Callable[[], Any] | None,
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    key = RasterArtifactKey(item_id, artifact_id)
+    if _CAPTURE_ARTIFACT_RE.fullmatch(key.artifact_id) is None:
+        raise ValidationError(
+            "only capture raster artifacts can be moved to Trash",
+            code="invalid_capture_asset_lifecycle_target",
+            details=key.as_dict(),
+        )
+    operation_id = _correction_item_operation_id(key.item_id)
+    expected_revision = _strong_revision("If-Artifact-Match")
+    if request.args:
+        raise ValidationError(
+            "capture asset trash does not accept query parameters",
+            code="invalid_capture_asset_lifecycle_query",
+            details=key.as_dict(),
+        )
+    if request.content_encoding or request.stream.read(1):
+        raise ValidationError(
+            "capture asset trash requires an empty request body",
+            code="invalid_capture_asset_lifecycle_document",
+            details=key.as_dict(),
+        )
+    if resolver_for_request is None:
+        raise EngineError(
+            "the capture asset lifecycle resolver is unavailable",
+            code="capture_asset_lifecycle_unavailable",
+            retryable=True,
+        )
+    resolver = resolver_for_request()
+    delete = getattr(resolver, "delete_capture_asset", None)
+    if not callable(delete):
+        raise EngineError(
+            "the capture asset lifecycle resolver is unavailable",
+            code="capture_asset_lifecycle_unavailable",
+            retryable=True,
+        )
+    result = delete(
+        key.item_id,
+        key.artifact_id,
+        expected_revision,
+        operation_id,
+    )
+    if not _valid_capture_asset_delete_result(
+        result,
+        key=key,
+        operation_id=operation_id,
+        expected_revision=expected_revision,
+    ):
+        raise RepositoryError(
+            "the capture asset lifecycle resolver returned an invalid result",
+            code="invalid_capture_asset_lifecycle_result",
+            details=key.as_dict(),
+        )
+    response = jsonify(
+        {
+            "ok": True,
+            "schema": CAPTURE_ASSET_LIFECYCLE_RESULT_SCHEMA,
+            "result": dict(result),
         }
     )
     response.cache_control.no_store = True
@@ -4189,6 +4393,19 @@ def create_corrections_blueprint(
     def restore_original_backup(item_id: str, artifact_id: str):
         try:
             return _restore_original_backup(
+                raster_resource_resolver_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.post(
+        "/api/v1/items/<item_id>/raster-artifacts/<artifact_id>/trash"
+    )
+    def trash_capture_asset(item_id: str, artifact_id: str):
+        try:
+            return _trash_capture_asset(
                 raster_resource_resolver_for_request,
                 item_id,
                 artifact_id,

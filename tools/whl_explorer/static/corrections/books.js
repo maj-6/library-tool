@@ -1498,6 +1498,22 @@
       return book && capture ? { book, capture } : null;
     }
 
+    captureDeletionFallback(address) {
+      const match = this.captureForSelection(address);
+      if (!match) return null;
+      const captures = match.book.captures;
+      const index = captures.findIndex((candidate) =>
+        candidate.artifact_id === match.capture.artifact_id);
+      if (index < 0) return null;
+      const capture = captures[index + 1] || captures[index - 1] || null;
+      return freezeDeep({
+        address: capture
+          ? captureAddress(match.book, capture) : bookAddress(match.book),
+        navigationPreview: capture
+          ? captureNavigationPreview(match.book, capture) : null,
+      });
+    }
+
     syncSelectionTarget(address, options = {}) {
       const match = this.captureForSelection(address);
       const target = match

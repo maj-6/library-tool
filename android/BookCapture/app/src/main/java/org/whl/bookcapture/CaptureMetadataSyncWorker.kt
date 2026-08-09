@@ -156,6 +156,20 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                     Log.w(TAG, "capture corrections unavailable: ${e.message}")
                     emptyMap()
                 }
+                val assetLifecycleRows = try {
+                    client.captureAssetLifecycles(ids)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: SupabaseClient.SignedOut) {
+                    throw e
+                } catch (e: SupabaseClient.AccountChanged) {
+                    throw e
+                } catch (e: Exception) {
+                    // Migration rollout is additive. A project without the
+                    // lifecycle table keeps every local asset exactly as-is.
+                    Log.w(TAG, "capture asset lifecycle unavailable: ${e.message}")
+                    emptyMap()
+                }
 
                 for ((captureId, metadata) in desktopRows) {
                     if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
@@ -192,6 +206,26 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                         throw CaptureMetadataStateException(
                             "conflicting cloud capture state for $captureId",
                         )
+                    }
+                }
+
+                // Apply visibility before corrected-display rows. A delete in
+                // this same pull therefore prevents a correction download,
+                // and restoration exposes the same retained bytes/history.
+                for ((captureId, rows) in assetLifecycleRows) {
+                    for (row in rows) {
+                        if (!sameSignedInOwner(ctx, owner)) {
+                            return@withContext Result.success()
+                        }
+                        EntryOperationLocks.withLock(captureId) {
+                            val entry = Entries.find(ctx, captureId) ?: return@withLock
+                            if (!entry.uploaded || entry.deliveryTransport == "lan" ||
+                                cloudUploadOwnership(
+                                    readCaptureCreator(ctx, entry.dir),
+                                    owner,
+                                ) != CloudUploadOwnership.ALLOWED) return@withLock
+                            PhotoAssetStore.applyDesktopLifecycle(entry.dir, row, owner)
+                        }
                     }
                 }
 

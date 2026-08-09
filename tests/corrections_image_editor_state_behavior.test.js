@@ -392,6 +392,140 @@ test("transform serialization exactly follows the engine command contract", () =
     rerunOcr: true,
     operationId: "correction-op-2",
   }), /canonical raster recipe/);
+
+  const extraction = serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: true,
+    operationId: "correction-extract-1",
+    extraction: {
+      annotation_id: "region-1",
+      annotation_revision: "region-r2",
+      label: "Figure 1",
+    },
+  });
+  assert.deepEqual(extraction.extraction, {
+    annotation_id: "region-1",
+    annotation_revision: "region-r2",
+    label: "Figure 1",
+  });
+  assert.throws(() => serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: true,
+    operationId: "correction-extract-2",
+    extraction: {
+      annotation_id: "region-1",
+      annotation_revision: "region-r2",
+      label: "Figure 1",
+      unknown: true,
+    },
+  }), /fields must match/);
+});
+
+
+test("committed-mask extraction is strict and converges transient mask history", () => {
+  const mask = [[0.15, 0.2], [0.75, 0.25], [0.55, 0.8]];
+  const command = serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: [[0.13, 0.18], [0.77, 0.18], [0.77, 0.82], [0.13, 0.82]],
+    adjustment: null,
+    maskPolygon: mask,
+    rerunOcr: true,
+    operationId: "correction-mask-extract-1",
+    extraction: { source_kind: "committed-mask", label: "Pressed leaf" },
+  });
+  assert.deepEqual(command.extraction, {
+    source_kind: "committed-mask",
+    label: "Pressed leaf",
+  });
+  assert.deepEqual(command.mask_polygon, mask);
+  assert.throws(() => serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    rerunOcr: true,
+    operationId: "correction-mask-extract-2",
+    extraction: { source_kind: "committed-mask", label: "Pressed leaf" },
+  }), /requires a committed mask polygon/);
+  assert.throws(() => serializeCorrectionTransformCommand({
+    pins: pins(),
+    quad: proposal().quad,
+    adjustment: null,
+    maskPolygon: mask,
+    rerunOcr: true,
+    operationId: "correction-mask-extract-3",
+    extraction: {
+      annotation_id: "region-1",
+      annotation_revision: "region-r2",
+      label: "Figure 1",
+    },
+  }), /annotation extraction must not carry/);
+
+  let state = createImageEditorState({ tool: TOOLS.PERSPECTIVE });
+  state = reduceImageEditorState(state, {
+    type: "BEGIN_GESTURE", kind: "pointer", pointerId: 1,
+    cornerIndex: 0, point: [0.05, 0.05],
+  });
+  state = reduceImageEditorState(state, { type: "COMMIT_GESTURE" });
+  state = reduceImageEditorState(state, { type: "SET_TOOL", tool: TOOLS.POLYGON });
+  state = reduceImageEditorState(state, {
+    type: "MASK_BEGIN", point: mask[0], freehand: false,
+  });
+  state = reduceImageEditorState(state, { type: "MASK_EXTEND", point: mask[1] });
+  state = reduceImageEditorState(state, { type: "MASK_EXTEND", point: mask[2] });
+  state = reduceImageEditorState(state, { type: "MASK_COMMIT" });
+  assert.equal(state.undoStack.length, 2);
+
+  const converged = reduceImageEditorState(state, {
+    type: "MASK_EXTRACTION_COMMITTED",
+  });
+  assert.equal(converged.maskPolygon, null);
+  assert.equal(converged.maskDraft, null);
+  assert.equal(converged.undoStack.length, 1,
+    "mask-only history is removed while the unrelated quad edit remains");
+
+  let maskFirst = createImageEditorState({ tool: TOOLS.POLYGON });
+  maskFirst = reduceImageEditorState(maskFirst, {
+    type: "MASK_BEGIN", point: mask[0], freehand: false,
+  });
+  maskFirst = reduceImageEditorState(maskFirst, {
+    type: "MASK_EXTEND", point: mask[1],
+  });
+  maskFirst = reduceImageEditorState(maskFirst, {
+    type: "MASK_EXTEND", point: mask[2],
+  });
+  maskFirst = reduceImageEditorState(maskFirst, { type: "MASK_COMMIT" });
+  maskFirst = reduceImageEditorState(maskFirst, {
+    type: "BEGIN_GESTURE", kind: "pointer", pointerId: 2,
+    cornerIndex: 0, point: [0.04, 0.04],
+  });
+  maskFirst = reduceImageEditorState(maskFirst, { type: "COMMIT_GESTURE" });
+  maskFirst = reduceImageEditorState(maskFirst, {
+    type: "BEGIN_GESTURE", kind: "pointer", pointerId: 3,
+    cornerIndex: 1, point: [0.96, 0.04],
+  });
+  maskFirst = reduceImageEditorState(maskFirst, { type: "COMMIT_GESTURE" });
+
+  const scrubbed = reduceImageEditorState(maskFirst, {
+    type: "MASK_EXTRACTION_COMMITTED",
+  });
+  assert.equal(scrubbed.undoStack.length, 2,
+    "distinct perspective steps made after masking remain undoable");
+  assert.ok(scrubbed.undoStack.every((entry) => entry.maskPolygon === null),
+    "undo cannot resurrect an already-extracted transient mask");
+
+  const laterDraft = reduceImageEditorState(maskFirst, {
+    type: "MASK_BEGIN", point: [0.2, 0.2], freehand: false,
+  });
+  const staleTerminal = reduceImageEditorState(laterDraft, {
+    type: "MASK_EXTRACTION_COMMITTED",
+    maskPolygon: mask,
+  });
+  assert.equal(staleTerminal, laterDraft,
+    "a late terminal result cannot discard a newer in-progress mask");
 });
 
 

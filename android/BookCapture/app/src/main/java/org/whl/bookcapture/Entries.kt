@@ -162,9 +162,7 @@ object Entries {
         val author: String get() = meta?.optString("author") ?: ""
         val year: String get() = meta?.optString("year") ?: ""
 
-        fun photos(): List<File> =
-            dir.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }
-                ?.sortedBy { photoNumber(it.name) } ?: emptyList()
+        fun photos(): List<File> = photoDescriptors().map { it.captureFile }
 
         /** Versioned photo descriptors when present, deterministic legacy
          * descriptors otherwise. Callers should display [displayFile], while
@@ -500,7 +498,10 @@ object Entries {
             archived = archived,
             createdAt = manifest?.optLong("created_at", 0L)?.takeIf { it > 0 }
                 ?: (photos.maxOfOrNull { it.lastModified() } ?: dir.lastModified()),
-            photoCount = photos.size,
+            // Desktop tombstones keep camera bytes on disk. Count only the
+            // visible contract records so an interior deleted page neither
+            // appears in the UI nor enters later OCR/reprocessing work.
+            photoCount = PhotoAssetStore.descriptors(dir).size,
             meta = meta,
             cloudStatus = manifest?.optString("cloud_status") ?: "",
             deliveryTransport = deliveryTransport,

@@ -123,6 +123,7 @@ function harness(options = {}) {
   const published = [];
   const selections = [];
   const hotTargets = [];
+  const previews = [];
   const statuses = [];
   const feature = createArtifactsFeature({
     treeRoot,
@@ -142,6 +143,10 @@ function harness(options = {}) {
     },
     onSelection: (selection) => selections.push(selection),
     onHotTarget: (target) => hotTargets.push(target),
+    onPreview: (preview) => {
+      previews.push(preview);
+      if (typeof options.onPreview === "function") options.onPreview(preview);
+    },
     onStatus: (...status) => statuses.push(status),
   }).mount();
   return {
@@ -149,11 +154,63 @@ function harness(options = {}) {
     feature,
     hotTargets,
     published,
+    previews,
     selections,
     statuses,
     treeRoot,
   };
 }
+
+
+test("extracted figure tree activation previews without replacing the editor", async () => {
+  let revoked = 0;
+  const crop = raster("crop-1", "extracted-figure");
+  const { feature, previews, published, selections } = harness({
+    initialExpandedGroups: ["extracted-figures", "layout-regions"],
+    catalog: {
+      async list({ group }) {
+        return {
+          revision: `${group}-r1`,
+          items: group === "extracted-figures" ? [crop] : [],
+          nextCursor: null,
+        };
+      },
+      async get({ key }) {
+        assert.equal(key, "artifact:crop-1");
+        return crop;
+      },
+    },
+    resources: {
+      async resolveRaster() {
+        return { url: "/safe/crop-1.jpg", revoke() { revoked += 1; } };
+      },
+    },
+  });
+  await feature.setContext({ item_id: "book-1" });
+  assert.deepEqual(
+    feature.rows.filter((row) => row.type === "item")
+      .map((row) => [row.key, row.group]),
+    [["artifact:crop-1", "extracted-figures"]],
+    "one mask extraction adds only its public figure to the visible tree",
+  );
+  const publishedBefore = published.length;
+  const selectionsBefore = selections.length;
+
+  const preview = await feature.activateItem("artifact:crop-1", {
+    source: "tree",
+  });
+
+  assert.equal(preview.url, "/safe/crop-1.jpg");
+  assert.equal(previews.length, 1);
+  assert.equal(published.length, publishedBefore,
+    "preview never publishes a replacement editor resource");
+  assert.equal(selections.length, selectionsBefore,
+    "preview never changes the authoritative artifact selection");
+  assert.equal(feature.selectedKey, "");
+  preview.close();
+  assert.equal(revoked, 1);
+  feature.destroy();
+});
 
 
 test("tree groups load lazily, page on demand, and remain keyboard navigable", async () => {
@@ -557,6 +614,91 @@ test("refresh evicts same-revision details before restoring inherited-category s
     feature.currentResource.summary.effectiveCategory,
     "title_page",
   );
+});
+
+
+test("refresh forgets an explicitly removed selection instead of reopening it", async () => {
+  let deleted = false;
+  let detailReads = 0;
+  const capture = () => raster("capture-1", "captured-image");
+  const { feature } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() {
+        return { items: deleted ? [] : [capture()] };
+      },
+      async get() {
+        detailReads += 1;
+        return capture();
+      },
+    },
+    resources: {
+      async resolveRaster() { return { url: "/safe/display.jpg" }; },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select("artifact:capture-1");
+  assert.equal(detailReads, 1);
+
+  deleted = true;
+  await feature.refresh({
+    preserveSelection: true,
+    forgetSelectionKey: "artifact:capture-1",
+  });
+
+  assert.equal(feature.selectedKey, "");
+  assert.equal(detailReads, 1,
+    "the removed capture must not be fetched again through openDeepLink");
+});
+
+
+test("refresh cannot restore its preserved key over newer navigation", async () => {
+  let refreshing = false;
+  let firstSelectedReads = 0;
+  const staleDetail = deferred();
+  const staleDetailStarted = deferred();
+  const selected = () => raster("capture-selected", "captured-image");
+  const newer = () => raster("capture-newer", "captured-image");
+  const { feature, published } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() {
+        return { items: refreshing ? [newer()] : [selected(), newer()] };
+      },
+      get({ key }) {
+        if (key === "artifact:capture-selected") {
+          firstSelectedReads += 1;
+          if (firstSelectedReads > 1) {
+            staleDetailStarted.resolve();
+            return staleDetail.promise;
+          }
+          return Promise.resolve(selected());
+        }
+        return Promise.resolve(newer());
+      },
+    },
+    resources: {
+      async resolveRaster({ artifactId }) {
+        return { url: `/safe/${artifactId}.jpg` };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select("artifact:capture-selected");
+  refreshing = true;
+  const refresh = feature.refresh({ preserveSelection: true });
+  await staleDetailStarted.promise;
+
+  await feature.select("artifact:capture-newer");
+  staleDetail.resolve(selected());
+  await refresh;
+
+  assert.equal(feature.selectedKey, "artifact:capture-newer");
+  assert.equal(feature.currentResource.summary.id, "capture-newer");
+  assert.equal(published.at(-1).summary.id, "capture-newer",
+    "the completed stale deep link must not republish the prior capture");
 });
 
 

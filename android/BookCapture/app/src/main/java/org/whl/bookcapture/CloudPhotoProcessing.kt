@@ -17,6 +17,8 @@ internal const val DESKTOP_CORRECTION_RESULT_SCHEMA = "org.whl.capture-correctio
 internal const val DESKTOP_CORRECTION_RESULT_VERSION = 1
 internal const val DESKTOP_CORRECTION_PROCESSOR = "whl-desktop-corrections"
 internal const val DESKTOP_CORRECTION_RECIPE = "whl-desktop-correction-v1"
+internal const val CAPTURE_ASSET_LIFECYCLE_SCHEMA = "org.whl.capture-asset-lifecycle"
+internal const val CAPTURE_ASSET_LIFECYCLE_VERSION = 1
 
 private val CLOUD_SAFE_TOKEN = Regex("[A-Za-z0-9._-]+")
 private val CLOUD_SHA256 = Regex("[0-9a-f]{64}")
@@ -154,6 +156,7 @@ internal fun validateCloudPhotoResult(
     }
     val asset = local.assets.firstOrNull { it.assetId == job.assetId }
         ?: return CloudResultDecision.NotApplicable
+    if (asset.desktopLifecycle.deleted) return CloudResultDecision.NotApplicable
     if (!cloudJobMatchesAsset(local.captureId, asset, job)) {
         return CloudResultDecision.NotApplicable
     }
@@ -282,6 +285,118 @@ internal fun validateCloudPhotoResult(
     ))
 }
 
+/** One CAS-versioned desktop visibility row for a stable capture asset. The
+ * table revision orders row writes; `lifecycleRevision` is the semantic clock
+ * persisted into photo_assets.json and survives export/import. */
+internal data class CaptureAssetLifecycleRow(
+    val captureId: String,
+    val assetId: String,
+    val ownerId: String,
+    val sourceOriginalSha256: String,
+    val state: DesktopPhotoAssetState,
+    val captureOrder: Int,
+    val lifecycleRevision: Long,
+    val changedAt: Long,
+    val revision: Long,
+    val updatedAt: String,
+)
+
+internal fun captureAssetLifecycleRowFromJson(row: JSONObject): CaptureAssetLifecycleRow? {
+    val captureId = row.strictCloudString("capture_id") ?: return null
+    val assetId = row.strictCloudString("asset_id") ?: return null
+    val ownerId = row.strictCloudString("owner_id") ?: return null
+    val sourceSha256 = row.strictCloudString("source_original_sha256")?.lowercase()
+        ?: return null
+    val revision = row.strictCloudLong("revision") ?: return null
+    val updatedAt = row.strictCloudString("updated_at") ?: return null
+    if (!listOf(captureId, assetId, ownerId).all(::cloudSafeToken) ||
+        !sourceSha256.matches(CLOUD_SHA256) || revision < 1L ||
+        updatedAt.isEmpty() || updatedAt.length > 80) return null
+
+    val result = row.optJSONObject("result") ?: return null
+    if (result.keys().asSequence().toSet() != setOf(
+            "schema",
+            "version",
+            "capture_id",
+            "asset_id",
+            "state",
+            "capture_order",
+            "source_original_sha256",
+            "lifecycle_revision",
+            "changed_at",
+        ) || result.strictCloudString("schema") != CAPTURE_ASSET_LIFECYCLE_SCHEMA ||
+        result.strictCloudInt("version") != CAPTURE_ASSET_LIFECYCLE_VERSION) return null
+    if (result.strictCloudString("capture_id") != captureId ||
+        result.strictCloudString("asset_id") != assetId) return null
+    val stateValue = result.strictCloudString("state") ?: return null
+    val state = DesktopPhotoAssetState.fromWire(stateValue)
+        ?.takeIf { it.wireValue == stateValue } ?: return null
+    val captureOrder = result.strictCloudInt("capture_order")?.takeIf { it > 0 }
+        ?: return null
+    val resultSource = result.strictCloudString("source_original_sha256")?.lowercase()
+        ?: return null
+    val lifecycleRevision = result.strictCloudLong("lifecycle_revision")
+        ?.takeIf { it > 0L } ?: return null
+    val changedAt = result.strictCloudLong("changed_at")?.takeIf { it > 0L }
+        ?: return null
+    if (resultSource != sourceSha256) return null
+    return CaptureAssetLifecycleRow(
+        captureId = captureId,
+        assetId = assetId,
+        ownerId = ownerId,
+        sourceOriginalSha256 = sourceSha256,
+        state = state,
+        captureOrder = captureOrder,
+        lifecycleRevision = lifecycleRevision,
+        changedAt = changedAt,
+        revision = revision,
+        updatedAt = updatedAt,
+    )
+}
+
+internal sealed interface CaptureAssetLifecycleDecision {
+    data object NotApplicable : CaptureAssetLifecycleDecision
+    data object AlreadyApplied : CaptureAssetLifecycleDecision
+    data class Rejected(val reason: String) : CaptureAssetLifecycleDecision
+    data class Ready(
+        val assetId: String,
+        val lifecycle: DesktopPhotoAssetLifecycle,
+    ) : CaptureAssetLifecycleDecision
+}
+
+internal fun validateCaptureAssetLifecycle(
+    local: CapturePhotoAssets,
+    row: CaptureAssetLifecycleRow,
+    expectedOwnerId: String,
+): CaptureAssetLifecycleDecision {
+    if (row.ownerId != expectedOwnerId || row.captureId != local.captureId) {
+        return CaptureAssetLifecycleDecision.NotApplicable
+    }
+    val asset = local.assets.firstOrNull { it.assetId == row.assetId }
+        ?: return CaptureAssetLifecycleDecision.NotApplicable
+    if (asset.original.sha256.isEmpty() ||
+        asset.original.sha256 != row.sourceOriginalSha256) {
+        return CaptureAssetLifecycleDecision.Rejected("original anchor")
+    }
+    if (asset.captureOrder != row.captureOrder) {
+        return CaptureAssetLifecycleDecision.Rejected("capture order")
+    }
+    val incoming = DesktopPhotoAssetLifecycle(
+        state = row.state,
+        revision = row.lifecycleRevision,
+        updatedAt = row.changedAt,
+    )
+    return when {
+        incoming.revision < asset.desktopLifecycle.revision ->
+            CaptureAssetLifecycleDecision.NotApplicable
+        incoming.revision == asset.desktopLifecycle.revision &&
+            incoming == asset.desktopLifecycle -> CaptureAssetLifecycleDecision.AlreadyApplied
+        incoming.revision == asset.desktopLifecycle.revision ->
+            CaptureAssetLifecycleDecision.Rejected("lifecycle revision collision")
+        else -> CaptureAssetLifecycleDecision.Ready(asset.assetId, incoming)
+    }
+}
+
 /** One CAS-superseded row in capture_corrections: the desktop's latest
  * committed correction of one capture photo. */
 internal data class CaptureCorrectionRow(
@@ -363,6 +478,7 @@ internal fun validateDesktopCorrection(
     }
     val asset = local.assets.firstOrNull { it.assetId == row.assetId }
         ?: return DesktopCorrectionDecision.NotApplicable
+    if (asset.desktopLifecycle.deleted) return DesktopCorrectionDecision.NotApplicable
     if (asset.original.sha256.isEmpty() ||
         asset.original.sha256 != row.sourceOriginalSha256) {
         return DesktopCorrectionDecision.Rejected("original anchor")
@@ -473,7 +589,7 @@ internal fun cloudLifecycleForRemoteState(state: String): PhotoAssetLifecycle? =
 }
 
 internal fun cloudPhotoWorkPending(contract: CapturePhotoAssets): Boolean =
-    contract.assets.any { asset ->
+    contract.orderedAssets().any { asset ->
         photoPostProcessingPending(asset) && asset.lifecycle.state !in setOf(
             PhotoAssetLifecycle.FAILED,
             PhotoAssetLifecycle.CANCELLED,

@@ -15928,11 +15928,230 @@ def _trash_put(kind: str, label: str, origin: dict, restore: dict,
     return _trash_commit(tid, kind, label, origin, restore, "json", written)
 
 
+_CAPTURE_ASSET_RECEIPT_DIR = (
+    lib.OUTPUT_DIR / ".engine" / "receipts" / "capture-asset-lifecycle"
+)
+_CAPTURE_ASSET_RESULT_FIELDS = {
+    "operation_id", "action", "item_id", "capture_id", "asset_id",
+    "artifact_id", "artifact_revision", "capture_order",
+    "before_lifecycle", "after_lifecycle", "item_updated_at", "inverse",
+    "replayed",
+}
+_CAPTURE_ASSET_INVERSE_FIELDS = {
+    "schema", "action", "source_operation_id", "item_id", "capture_id",
+    "asset_id", "artifact_id", "artifact_revision", "capture_order",
+    "expected_lifecycle",
+}
+
+
+def _capture_asset_membership(value: object, *, nullable: bool = False):
+    if value is None:
+        return None if nullable else False
+    if not isinstance(value, Mapping) or set(value) != {
+        "state", "revision", "updated_at"
+    }:
+        return False
+    return (
+        value.get("state") in {"active", "deleted"}
+        and isinstance(value.get("revision"), int)
+        and not isinstance(value.get("revision"), bool)
+        and value["revision"] > 0
+        and isinstance(value.get("updated_at"), int)
+        and not isinstance(value.get("updated_at"), bool)
+        and value["updated_at"] > 0
+    )
+
+
+def _capture_asset_delete_receipt(value: object) -> dict | None:
+    """Return one validated terminal delete result, never an untrusted row."""
+
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {
+            "schema", "version", "operation_id", "action",
+            "command_sha256", "result",
+        }
+        or value.get("schema")
+        != "librarytool.capture-asset-lifecycle-receipt"
+        or value.get("version") != 1
+        or value.get("action") != "delete"
+        or not isinstance(value.get("command_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["command_sha256"]) is None
+    ):
+        return None
+    result = value.get("result")
+    if (
+        not isinstance(result, Mapping)
+        or set(result) != _CAPTURE_ASSET_RESULT_FIELDS
+        or result.get("action") != "delete"
+        or result.get("operation_id") != value.get("operation_id")
+        or not all(
+            isinstance(result.get(field), str) and
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}",
+                         result[field]) is not None
+            for field in (
+                "operation_id", "item_id", "capture_id", "asset_id",
+                "artifact_id", "artifact_revision",
+            )
+        )
+        or not isinstance(result.get("capture_order"), int)
+        or isinstance(result.get("capture_order"), bool)
+        or result["capture_order"] <= 0
+        or not _capture_asset_membership(
+            result.get("before_lifecycle"), nullable=True)
+        and result.get("before_lifecycle") is not None
+        or not _capture_asset_membership(result.get("after_lifecycle"))
+        or result["after_lifecycle"]["state"] != "deleted"
+        or type(result.get("replayed")) is not bool
+    ):
+        return None
+    inverse = result.get("inverse")
+    if (
+        not isinstance(inverse, Mapping)
+        or set(inverse) != _CAPTURE_ASSET_INVERSE_FIELDS
+        or inverse.get("schema")
+        != "librarytool.capture-asset-lifecycle-inverse/1"
+        or inverse.get("action") != "restore"
+        or inverse.get("source_operation_id") != result["operation_id"]
+        or any(
+            inverse.get(field) != result.get(field)
+            for field in (
+                "item_id", "capture_id", "asset_id", "artifact_id",
+                "artifact_revision", "capture_order",
+            )
+        )
+        or inverse.get("expected_lifecycle") != result["after_lifecycle"]
+    ):
+        return None
+    return dict(result)
+
+
+def _capture_asset_current_lifecycle(result: Mapping[str, object]):
+    capture_id = str(result.get("capture_id") or "")
+    asset_id = str(result.get("asset_id") or "")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", capture_id) is None:
+        return None
+    directory = (CAPTURES_DIR / capture_id).resolve()
+    try:
+        directory.relative_to(CAPTURES_DIR.resolve())
+    except ValueError:
+        return None
+    manifest = lib.load_json(directory / "photo_assets.json", {})
+    assets = manifest.get("assets") if isinstance(manifest, Mapping) else None
+    if not isinstance(assets, list):
+        return None
+    match = next((row for row in assets if isinstance(row, Mapping)
+                  and row.get("asset_id") == asset_id), None)
+    if match is None:
+        return None
+    lifecycle = match.get("desktop_lifecycle")
+    return dict(lifecycle) if _capture_asset_membership(lifecycle) else None
+
+
+def _capture_asset_trash_reconcile() -> None:
+    """Project durable lifecycle receipts into the legacy Info Trash index.
+
+    The lifecycle receipt is committed atomically with the manifest.  Building
+    this small presentation row on both mutation response and Trash reads
+    closes the process-crash window without making the legacy index part of
+    capture authority.  A receipt fingerprint remains recorded after Forget
+    or retention pruning, so old deletions never reappear.
+    """
+
+    try:
+        paths = tuple(_CAPTURE_ASSET_RECEIPT_DIR.glob("*.json"))
+    except OSError:
+        return
+    receipts: list[tuple[str, dict]] = []
+    for path in paths:
+        if re.fullmatch(r"[0-9a-f]{64}", path.stem) is None:
+            continue
+        try:
+            info = path.lstat()
+            if (not path.is_file() or stat.S_ISLNK(info.st_mode)
+                    or info.st_size > 1024 * 1024):
+                continue
+            raw = json.loads(path.read_text("ascii"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        result = _capture_asset_delete_receipt(raw)
+        if result is not None:
+            receipts.append((path.stem, result))
+    if not receipts:
+        return
+
+    def apply(doc):
+        doc.setdefault("version", 1)
+        items = doc.setdefault("items", {})
+        observed = doc.setdefault("capture_asset_receipts", {})
+        for fingerprint, result in receipts:
+            tid = observed.get(fingerprint)
+            if not isinstance(tid, str):
+                tid = f"capture-asset-{fingerprint[:40]}"
+                observed[fingerprint] = tid
+                millis = result["after_lifecycle"]["updated_at"]
+                created = datetime.fromtimestamp(
+                    millis / 1000, timezone.utc
+                ).isoformat(timespec="seconds")
+                items[tid] = {
+                    "id": tid,
+                    "kind": "capture_asset",
+                    "label": f"Capture page {result['capture_order']}",
+                    "created": created,
+                    "origin": {
+                        key: result[key]
+                        for key in (
+                            "item_id", "capture_id", "asset_id",
+                            "artifact_id", "capture_order",
+                        )
+                    },
+                    "payload_kind": "contract",
+                    "bytes": 0,
+                    "files": [],
+                    "restore": {
+                        "inverse": result["inverse"],
+                        "operation_id": (
+                            "capture-restore-" + hashlib.sha256(
+                                result["operation_id"].encode("utf-8")
+                            ).hexdigest()[:40]
+                        ),
+                    },
+                    "restored_at": "",
+                    "note": "",
+                }
+            row = items.get(tid)
+            if not isinstance(row, dict):
+                continue
+            current = _capture_asset_current_lifecycle(result)
+            if (
+                current is not None
+                and current != result["after_lifecycle"]
+                and not row.get("restored_at")
+            ):
+                timestamp = current and current.get("updated_at")
+                row["restored_at"] = (
+                    datetime.fromtimestamp(
+                        timestamp / 1000, timezone.utc
+                    ).isoformat(timespec="seconds")
+                    if isinstance(timestamp, int) and timestamp > 0
+                    else datetime.now(timezone.utc).isoformat(timespec="seconds")
+                )
+        _trash_prune_locked(doc)
+
+    _mutate_json(
+        TRASH_PATH,
+        _trash_lock,
+        {"version": 1, "items": {}, "capture_asset_receipts": {}},
+        apply,
+    )
+
+
 @app.route("/api/trash")
 def api_trash():
     """List trashed items, newest first, plus the retention summary the Info
     tab footer shows. Plain read: save_json is atomic tmp+replace, so a reader
     never sees a torn document and needs no lock."""
+    _capture_asset_trash_reconcile()
     doc = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
     items = []
     for raw in (doc.get("items") or {}).values():
@@ -16281,6 +16500,66 @@ def _trash_restore_translation_guarded(item: dict) -> tuple[dict, int]:
     return {"ok": True, "restored": restored, "skipped": skipped}, 200
 
 
+def _trash_restore_capture_asset(item: dict) -> tuple[dict, int]:
+    origin = item.get("origin") or {}
+    restore_contract = item.get("restore") or {}
+    item_id = str(origin.get("item_id") or "")
+    artifact_id = str(origin.get("artifact_id") or "")
+    operation_id = str(restore_contract.get("operation_id") or "")
+    inverse = restore_contract.get("inverse")
+    if (
+        not item_id
+        or not artifact_id
+        or not operation_id
+        or not isinstance(inverse, Mapping)
+    ):
+        return {
+            "ok": False,
+            "error": "the trashed capture page has no restore contract",
+        }, 410
+    resolver = _ensure_engine_session().raster_resource_resolver
+    restore = getattr(resolver, "restore_capture_asset", None)
+    if not callable(restore):
+        raise EngineRepositoryError(
+            "capture page restore is unavailable",
+            code="capture_asset_lifecycle_unavailable",
+            retryable=True,
+        )
+    result = restore(
+        item_id,
+        artifact_id,
+        inverse,
+        operation_id,
+    )
+    if (
+        not isinstance(result, Mapping)
+        or set(result) != _CAPTURE_ASSET_RESULT_FIELDS
+        or result.get("action") != "restore"
+        or result.get("item_id") != item_id
+        or result.get("artifact_id") != artifact_id
+        or result.get("operation_id") != operation_id
+        or not _capture_asset_membership(result.get("before_lifecycle"))
+        or result["before_lifecycle"]["state"] != "deleted"
+        or not _capture_asset_membership(result.get("after_lifecycle"))
+        or result["after_lifecycle"]["state"] != "active"
+        or type(result.get("replayed")) is not bool
+    ):
+        raise EngineRepositoryError(
+            "capture page restore returned an invalid receipt",
+            code="invalid_capture_asset_lifecycle_receipt",
+        )
+    return {
+        "ok": True,
+        "restored": ["capture page"],
+        "skipped": [],
+        "kind": "capture_asset",
+        "item_id": item_id,
+        "artifact_id": artifact_id,
+        "receipt": dict(result),
+        "replayed": result["replayed"],
+    }, 200
+
+
 @app.route("/api/trash/restore", methods=["POST"])
 def api_trash_restore():
     """Restore one item. The body carries ONLY an id — never a path, never a
@@ -16316,7 +16595,9 @@ def api_trash_restore():
         return jsonify({"ok": False, "error": str(item.get("note") or "")
                         or "this item can no longer be restored"}), 409
     kind = str(item.get("kind") or "")
-    if kind not in ("pdf_pages", "build", "manual_entry", "translation"):
+    if kind not in (
+        "pdf_pages", "build", "manual_entry", "translation", "capture_asset"
+    ):
         return jsonify({"ok": False,
                         "error": f"restoring '{kind}' is not supported yet"}), 501
     # claim the payload for the duration: a concurrent forget/prune would
@@ -16324,12 +16605,17 @@ def api_trash_restore():
     with _trash_lock:
         _trash_restoring.add(tid)
     try:
-        if kind == "pdf_pages":
-            body, code = _trash_restore_pdf_pages(item)
-        elif kind == "translation":
-            body, code = _trash_restore_translation(item)
-        else:
-            body, code = _trash_restore_record(item)
+        try:
+            if kind == "pdf_pages":
+                body, code = _trash_restore_pdf_pages(item)
+            elif kind == "translation":
+                body, code = _trash_restore_translation(item)
+            elif kind == "capture_asset":
+                body, code = _trash_restore_capture_asset(item)
+            else:
+                body, code = _trash_restore_record(item)
+        except EngineError as exc:
+            return _engine_error_response(exc)
     finally:
         with _trash_lock:
             _trash_restoring.discard(tid)
@@ -27814,6 +28100,402 @@ def _publish_capture_book_metadata(owner_cfg: dict, capture_cfg: dict) -> int:
     return pushed
 
 
+# --- capture asset lifecycle publisher (desktop -> phone) -----------------------
+
+_CAPTURE_ASSET_LIFECYCLE_RESULT_SCHEMA = "org.whl.capture-asset-lifecycle"
+_CAPTURE_ASSET_LIFECYCLE_ASSET_ID_RE = re.compile(
+    r"^[A-Za-z0-9._-]{1,160}$")
+_CAPTURE_ASSET_LIFECYCLE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CAPTURE_ASSET_LIFECYCLE_MISSING_NOTICE = (
+    "capture_asset_lifecycle table missing on the cloud project -- apply "
+    "docs/cloud/migrations/027_capture_asset_lifecycle.sql"
+)
+
+
+def _valid_capture_asset_lifecycle_asset_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value not in {".", ".."}
+        and _CAPTURE_ASSET_LIFECYCLE_ASSET_ID_RE.fullmatch(value) is not None
+    )
+
+
+def _capture_asset_lifecycle_relation_missing(owner_cfg: dict,
+                                              exc: Exception) -> bool:
+    if not isinstance(exc, sbase.SyncError):
+        return False
+    message = str(exc)
+    table = (owner_cfg.get("capture_asset_lifecycle_table")
+             or "capture_asset_lifecycle")
+    if f"/rest/v1/{table}" not in message:
+        return False
+    return ("PGRST205" in message or "42P01" in message
+            or message.startswith("HTTP 404 "))
+
+
+def _capture_asset_lifecycle_manifest_rows(
+        capture_id: str, manifest: Mapping) -> list[dict]:
+    """Project explicit portable memberships from one strict manifest.
+
+    The phone's original checksum and the desktop import checksum are both
+    immutable anchors. Requiring agreement prevents a lifecycle tombstone from
+    being applied to reused or damaged asset metadata.
+    """
+
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("schema") != "org.whl.bookcapture.photo-assets"
+        or manifest.get("version") != 1
+        or isinstance(manifest.get("version"), bool)
+        or manifest.get("capture_id") != capture_id
+    ):
+        raise ValueError("capture photo asset manifest identity is invalid")
+    assets = manifest.get("assets")
+    desktop_import = manifest.get("desktop_import")
+    imports = desktop_import.get("assets") \
+        if isinstance(desktop_import, Mapping) else None
+    if (
+        not isinstance(assets, list)
+        or not isinstance(desktop_import, Mapping)
+        or desktop_import.get("version") != 1
+        or isinstance(desktop_import.get("version"), bool)
+        or not isinstance(imports, list)
+    ):
+        raise ValueError("capture photo asset manifest rows are invalid")
+    imports_by_id: dict[str, Mapping] = {}
+    for imported in imports:
+        asset_id = imported.get("asset_id") \
+            if isinstance(imported, Mapping) else None
+        if (
+            not _valid_capture_asset_lifecycle_asset_id(asset_id)
+            or asset_id in imports_by_id
+        ):
+            raise ValueError("capture desktop import identity is invalid")
+        imports_by_id[asset_id] = imported
+
+    projected: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_orders: set[int] = set()
+    for asset in assets:
+        if not isinstance(asset, Mapping):
+            raise ValueError("capture photo asset row is invalid")
+        asset_id = asset.get("asset_id")
+        capture_order = asset.get("capture_order")
+        if (
+            not _valid_capture_asset_lifecycle_asset_id(asset_id)
+            or asset_id in seen_ids
+            or isinstance(capture_order, bool)
+            or not isinstance(capture_order, int)
+            or capture_order <= 0
+            or capture_order in seen_orders
+        ):
+            raise ValueError("capture photo asset identity or order is invalid")
+        seen_ids.add(asset_id)
+        seen_orders.add(capture_order)
+        imported = imports_by_id.get(asset_id)
+        if imported is None:
+            raise ValueError("capture desktop import membership is incomplete")
+        lifecycle = asset.get("desktop_lifecycle")
+        if lifecycle is None:
+            continue
+        if not isinstance(lifecycle, Mapping) or set(lifecycle) != {
+                "state", "revision", "updated_at"}:
+            raise ValueError(f"asset {asset_id}: desktop lifecycle is invalid")
+        lifecycle_revision = lifecycle.get("revision")
+        changed_at = lifecycle.get("updated_at")
+        if (
+            lifecycle.get("state") not in {"active", "deleted"}
+            or isinstance(lifecycle_revision, bool)
+            or not isinstance(lifecycle_revision, int)
+            or lifecycle_revision <= 0
+            or isinstance(changed_at, bool)
+            or not isinstance(changed_at, int)
+            or changed_at <= 0
+        ):
+            raise ValueError(f"asset {asset_id}: desktop lifecycle is invalid")
+        original = asset.get("original")
+        original_sha = str(
+            original.get("sha256") or ""
+        ).strip().lower() if isinstance(original, Mapping) else ""
+        imported_sha = str(
+            imported.get("source_checksum") or ""
+        ).strip().lower()
+        if (
+            not _CAPTURE_ASSET_LIFECYCLE_SHA256_RE.fullmatch(original_sha)
+            or imported_sha != original_sha
+        ):
+            raise ValueError(
+                f"asset {asset_id}: original checksum anchor is invalid")
+        result = {
+            "schema": _CAPTURE_ASSET_LIFECYCLE_RESULT_SCHEMA,
+            "version": 1,
+            "capture_id": capture_id,
+            "asset_id": asset_id,
+            "source_original_sha256": original_sha,
+            "state": lifecycle["state"],
+            "capture_order": capture_order,
+            "lifecycle_revision": lifecycle_revision,
+            "changed_at": changed_at,
+        }
+        projected.append({
+            "capture_id": capture_id,
+            "asset_id": asset_id,
+            "source_original_sha256": original_sha,
+            "result": result,
+        })
+    if set(imports_by_id) != seen_ids:
+        raise ValueError("capture desktop import membership is inconsistent")
+    return projected
+
+
+def _capture_asset_lifecycle_token(row: Mapping) -> str:
+    return hashlib.sha256(json.dumps(
+        row,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")).hexdigest()
+
+
+@contextlib.contextmanager
+def _capture_asset_lifecycle_revalidate_prepared(
+        capture_id: str, prepared: Sequence[dict],
+        ) -> Iterator[tuple[list[dict], list[str]]]:
+    """Hold local authority while the exact revalidated rows are CAS-written."""
+
+    retained: list[dict] = []
+    notices: list[str] = []
+    with _ensure_engine_session().write_set.workspace_lease():
+        with _corrections_workspace_locks():
+            try:
+                manifest = lib.load_json(
+                    CAPTURES_DIR / capture_id / "photo_assets.json", {}) or {}
+                current = {
+                    row["asset_id"]: row
+                    for row in _capture_asset_lifecycle_manifest_rows(
+                        capture_id, manifest)
+                }
+            except Exception:
+                current = {}
+            for entry in prepared:
+                row = entry["row"]
+                live = current.get(row["asset_id"])
+                if (
+                    live is not None
+                    and _capture_asset_lifecycle_token(live) == entry["token"]
+                ):
+                    retained.append(row)
+                else:
+                    notices.append(
+                        f"capture {capture_id[:8]}: asset "
+                        f"{row['asset_id']}: skipped stale lifecycle state "
+                        "that changed before publication"
+                    )
+            yield retained, notices
+
+
+def _publish_capture_asset_lifecycle(owner_cfg: dict) -> dict:
+    """Publish explicit active/deleted manifest rows without deleting bytes."""
+
+    result = {
+        "candidates": 0,
+        "pushed": 0,
+        "up_to_date": 0,
+        "no_cloud_row": 0,
+        "unreadable_capture": 0,
+        "notices": [],
+        "errors": [],
+    }
+    pending: dict[str, list[dict]] = {}
+    try:
+        with _ensure_engine_session().write_set.workspace_lease():
+            with _corrections_workspace_locks():
+                manual_entries = lib.load_json(
+                    lib.MANUAL_ENTRIES_PATH, {}) or {}
+                capture_ids = sorted({
+                    capture_id
+                    for entry in manual_entries.values()
+                    if isinstance(entry, Mapping)
+                    and (capture_id := _capture_archive_id(
+                        entry.get("capture_id")))
+                })
+                for capture_id in capture_ids:
+                    try:
+                        manifest = lib.load_json(
+                            CAPTURES_DIR / capture_id / "photo_assets.json",
+                            {},
+                        ) or {}
+                        rows = _capture_asset_lifecycle_manifest_rows(
+                            capture_id, manifest)
+                    except Exception as exc:
+                        result["unreadable_capture"] += 1
+                        result["notices"].append(
+                            f"capture {capture_id[:8]}: skipped unreadable "
+                            f"asset lifecycle state -- {exc}"
+                        )
+                        continue
+                    if rows:
+                        pending[capture_id] = rows
+    except Exception as exc:
+        result["errors"].append(f"asset lifecycle authority: {exc}")
+        return result
+    result["candidates"] = sum(len(rows) for rows in pending.values())
+    if not pending:
+        return result
+    try:
+        owner_ids = _capture_correction_owner_ids(owner_cfg, sorted(pending))
+        existing_rows = sbase.list_capture_asset_lifecycle(
+            owner_cfg, sorted(pending))
+    except Exception as exc:
+        if _capture_asset_lifecycle_relation_missing(owner_cfg, exc):
+            result["skipped"] = _CAPTURE_ASSET_LIFECYCLE_MISSING_NOTICE
+        else:
+            result["errors"].append(f"asset lifecycle read: {exc}")
+        return result
+    existing = {
+        (str(row.get("capture_id")), str(row.get("asset_id"))): row
+        for row in existing_rows if isinstance(row, Mapping)
+    }
+    prepared_by_capture: dict[str, list[dict]] = {}
+    for capture_id, rows in pending.items():
+        if capture_id not in owner_ids:
+            result["no_cloud_row"] += 1
+            continue
+        for row in rows:
+            asset_id = row["asset_id"]
+            previous = existing.get((capture_id, asset_id))
+            if previous is not None and \
+                    sbase._capture_asset_lifecycle_writable_equal(
+                        previous, row):
+                result["up_to_date"] += 1
+                continue
+            expected_revision = None
+            if previous is not None:
+                expected_revision = previous.get("revision")
+                previous_result = previous.get("result")
+                if (
+                    isinstance(expected_revision, bool)
+                    or not isinstance(expected_revision, int)
+                    or expected_revision < 1
+                ):
+                    result["errors"].append(
+                        f"capture {capture_id[:8]}: asset {asset_id}: "
+                        "cloud lifecycle row is invalid"
+                    )
+                    continue
+                if (previous.get("source_original_sha256")
+                        != row["source_original_sha256"]):
+                    result["errors"].append(
+                        f"capture {capture_id[:8]}: asset {asset_id}: "
+                        "cloud lifecycle identity contradicts the manifest"
+                    )
+                    continue
+                cloud_valid = True
+                try:
+                    sbase._capture_asset_lifecycle_write_row(previous)
+                except sbase.SyncError:
+                    # A malformed result cannot be installed by Android. Its
+                    # valid top-level original anchor still lets this desktop
+                    # repair it through the observed cloud CAS.
+                    cloud_valid = False
+                if not cloud_valid:
+                    prepared_by_capture.setdefault(capture_id, []).append({
+                        "row": row,
+                        "token": _capture_asset_lifecycle_token(row),
+                        "expected_revision": expected_revision,
+                    })
+                    continue
+                assert isinstance(previous_result, Mapping)
+                if (previous_result.get("capture_order")
+                        != row["result"]["capture_order"]):
+                    result["errors"].append(
+                        f"capture {capture_id[:8]}: asset {asset_id}: "
+                        "cloud lifecycle order contradicts the manifest"
+                    )
+                    continue
+                cloud_clock = previous_result.get("lifecycle_revision")
+                local_clock = row["result"]["lifecycle_revision"]
+                cloud_changed = previous_result.get("changed_at")
+                if (
+                    isinstance(cloud_clock, bool)
+                    or not isinstance(cloud_clock, int)
+                    or cloud_clock <= 0
+                    or isinstance(cloud_changed, bool)
+                    or not isinstance(cloud_changed, int)
+                    or cloud_changed <= 0
+                ):
+                    result["errors"].append(
+                        f"capture {capture_id[:8]}: asset {asset_id}: "
+                        "cloud lifecycle clock is invalid"
+                    )
+                    continue
+                if cloud_clock == local_clock:
+                    # Android intentionally rejects unequal rows at the same
+                    # semantic revision. Publishing one based on changed_at
+                    # would create a cloud value that an already-synced phone
+                    # can never install. Exact equality returned above; every
+                    # row reaching here is therefore a split-brain conflict.
+                    result["errors"].append(
+                        f"capture {capture_id[:8]}: asset {asset_id}: "
+                        f"cloud lifecycle conflicts at revision {cloud_clock}"
+                    )
+                    continue
+                if cloud_clock > local_clock:
+                    result["notices"].append(
+                        f"capture {capture_id[:8]}: asset {asset_id}: "
+                        "kept newer cloud lifecycle state"
+                    )
+                    continue
+            prepared_by_capture.setdefault(capture_id, []).append({
+                "row": row,
+                "token": _capture_asset_lifecycle_token(row),
+                "expected_revision": expected_revision,
+            })
+    relation_missing = False
+    for capture_id in sorted(prepared_by_capture):
+        entries = prepared_by_capture[capture_id]
+        try:
+            with _capture_asset_lifecycle_revalidate_prepared(
+                    capture_id, entries) as (rows, notices):
+                result["notices"].extend(notices)
+                if not rows:
+                    continue
+                expected = {
+                    (entry["row"]["capture_id"], entry["row"]["asset_id"]):
+                        entry["expected_revision"]
+                    for entry in entries
+                }
+                try:
+                    result["pushed"] += int(
+                        sbase.publish_capture_asset_lifecycle(
+                            owner_cfg,
+                            rows,
+                            expected_revisions={
+                                (row["capture_id"], row["asset_id"]):
+                                    expected[(row["capture_id"],
+                                              row["asset_id"])]
+                                for row in rows
+                            },
+                        ) or 0
+                    )
+                except Exception as exc:
+                    if _capture_asset_lifecycle_relation_missing(
+                            owner_cfg, exc):
+                        result["skipped"] = (
+                            _CAPTURE_ASSET_LIFECYCLE_MISSING_NOTICE)
+                        relation_missing = True
+                    else:
+                        result["errors"].append(
+                            f"asset lifecycle rows: {exc}")
+        except Exception as exc:
+            result["errors"].append(
+                f"asset lifecycle authority revalidation: {exc}")
+        if relation_missing:
+            break
+    return result
+
+
 # --- capture corrections publisher (desktop -> phone) ---------------------------
 # Contract: docs/capture-corrections-sync.md. Committed correction-transform
 # display renditions are transcoded to JPEG, uploaded to the private
@@ -29276,6 +29958,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
             }
         pushed = metadata_pushed = 0
         review_sync: dict = {}
+        lifecycle_sync: dict = {}
         corrections_sync: dict = {}
         stores: dict = {}
         entries_res: dict = {}
@@ -29343,6 +30026,22 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                 errors.append(
                     "capture metadata: skipped because builds sync was unsafe")
             _cloudsync_set_stage(
+                "capture_asset_lifecycle",
+                "Publishing capture page membership",
+                total=0, completed=0, unit="operations",
+                indeterminate=True)
+            try:
+                lifecycle_sync = _publish_capture_asset_lifecycle(owner_cfg)
+                errors.extend(
+                    f"capture asset lifecycle: {error}"
+                    for error in lifecycle_sync.get("errors") or [])
+            except Exception as exc:
+                lifecycle_sync = {
+                    "pushed": 0,
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+                errors.append(f"capture asset lifecycle: {exc}")
+            _cloudsync_set_stage(
                 "capture_corrections", "Publishing photo corrections",
                 total=0, completed=0, unit="operations",
                 indeterminate=True)
@@ -29375,6 +30074,7 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
                   "capture_associations": association_sync,
                   "capture_metadata_pushed": metadata_pushed,
                   "capture_reviews": review_sync,
+                  "capture_asset_lifecycle": lifecycle_sync,
                   "capture_corrections": corrections_sync,
                   "stores": stores,
                   "entries": entries_res, "errors": errors,
@@ -29389,11 +30089,14 @@ def _cloud_sync_run_with_configs(owner_cfg: dict | None,
         if result.get("ok"):
             stores = result.get("stores") or {}
             log.info("cloud sync done: %d imported, %d skipped, %d books pushed, "
-                     "%d capture snapshots pushed, %d corrections pushed, "
+                     "%d capture snapshots pushed, %d lifecycle rows pushed, "
+                     "%d corrections pushed, "
                      "stores %d up / %d down, entry files %d up / %d down",
                      result.get("imported", 0), result.get("skipped", 0),
                      result.get("books_pushed", 0),
                      result.get("capture_metadata_pushed", 0),
+                     (result.get("capture_asset_lifecycle") or {}).get(
+                         "pushed", 0),
                      (result.get("capture_corrections") or {}).get("pushed", 0),
                      sum(r.get("pushed", 0) + r.get("tombstoned", 0)
                          for r in stores.values()),

@@ -155,6 +155,9 @@
   const COMMITTED_OUTPUT_KINDS = new Set([
     "corrected-display", "ocr-ready", "thumbnail", "transform-manifest",
   ]);
+  const EXTRACTED_OUTPUT_KINDS = new Set([
+    "extracted-figure", "ocr-ready", "transform-manifest",
+  ]);
   // Standalone re-OCR targets a committed transform output; the raster view
   // advertises that lineage through extensions.correction_transform.
   const REOCR_SOURCE_KINDS = new Set(["corrected-display", "ocr-ready"]);
@@ -514,14 +517,16 @@
     });
   }
 
-  function committedOperation(result) {
+  function committedOperation(result, command = null) {
     if (!isPlainObject(result) || result.cancelled_before_commit === true ||
         !isPlainObject(result.image_commit)) return "";
     const outer = operationIdentifier(result.operation_id);
     const inner = operationIdentifier(result.image_commit.operation_id);
+    const expectedKinds = command && isPlainObject(command.extraction)
+      ? EXTRACTED_OUTPUT_KINDS : COMMITTED_OUTPUT_KINDS;
     if (!outer || !inner || outer !== inner ||
         !Array.isArray(result.image_commit.outputs) ||
-        result.image_commit.outputs.length !== COMMITTED_OUTPUT_KINDS.size) {
+        result.image_commit.outputs.length !== expectedKinds.size) {
       return "";
     }
     const kinds = new Set();
@@ -532,12 +537,12 @@
       const artifactId = output && typeof output.artifact_id === "string" &&
         PORTABLE_IDENTIFIER_RE.test(output.artifact_id)
         ? output.artifact_id : "";
-      if (!COMMITTED_OUTPUT_KINDS.has(kind) || kinds.has(kind) ||
+      if (!expectedKinds.has(kind) || kinds.has(kind) ||
           !artifactId || artifactIds.has(artifactId)) return "";
       kinds.add(kind);
       artifactIds.add(artifactId);
     }
-    if (kinds.size !== COMMITTED_OUTPUT_KINDS.size) return "";
+    if (kinds.size !== expectedKinds.size) return "";
     return outer;
   }
 
@@ -1490,7 +1495,10 @@
       );
       const pending = this.pending.get(operationId);
       const command = canonicalCommand(suppliedCommand) || pending || null;
-      const committedId = committedOperation(result);
+      const committedId = committedOperation(
+        result,
+        command && command.command,
+      );
       const pendingJobId = operationIdentifier(pending && pending.jobId);
       const resultJobId = operationIdentifier(
         result && (result.job_id || result.jobId),
@@ -1504,7 +1512,10 @@
       const terminalState = terminalJobState(result, imageCommitted);
       let profileChanged = false;
 
-      if (imageCommitted && command &&
+      const extraction = Boolean(
+        command && isPlainObject(command.command && command.command.extraction),
+      );
+      if (imageCommitted && !extraction && command &&
           command.operationId === committedId && command.adjustment) {
         const lastAppliedBrightness = command.adjustment.brightness_percent;
         if (lastAppliedBrightness !== this.profile.lastAppliedBrightness) {
@@ -1549,6 +1560,16 @@
           record.jobStatus.textContent =
             "Image adjustment output was rejected; source and saved brightness " +
             "are unchanged.";
+        } else if (imageCommitted && extraction && ocrOutcome &&
+                   ocrOutcome.state === "failed") {
+          record.jobStatus.textContent =
+            "Region extracted; OCR follow-up failed.";
+        } else if (imageCommitted && extraction && ocrOutcome &&
+                   ocrOutcome.state === "cancelled") {
+          record.jobStatus.textContent =
+            "Region extracted; OCR follow-up was cancelled.";
+        } else if (imageCommitted && extraction) {
+          record.jobStatus.textContent = "Region extracted.";
         } else if (imageCommitted && ocrOutcome && ocrOutcome.state === "failed") {
           record.jobStatus.textContent =
             "Image adjustment applied; OCR follow-up failed.";
