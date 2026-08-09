@@ -51,7 +51,9 @@ const {
   artifactSelection,
   correctionsRuntimePorts,
   navigationOnlyTarget,
+  nextCaptureAddress,
   nextTrayTab,
+  normalizePerspectiveProfile,
   normalizeSelection,
   normalizeWorkbenchContext,
   selectionContext,
@@ -411,6 +413,7 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
     normalizeEditors: (value) => registry.validateChoices(value),
     normalizeTools: (value) => ({
       imageAdjust: normalizeImageAdjustProfile(value && value.imageAdjust),
+      perspective: normalizePerspectiveProfile(value && value.perspective),
       artifactOverlay: normalizeArtifactOverlayProfile(
         value && value.artifactOverlay),
     }),
@@ -420,6 +423,7 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
     editors: { image: "image-plain", text: "image-overlay" },
     tools: {
       imageAdjust: { lastAppliedBrightness: 24 },
+      perspective: { advanceAfterQueue: true },
       artifactOverlay: { regionLabels: false },
       privateLocator: "must-not-persist",
     },
@@ -431,11 +435,16 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
   assert.deepEqual(saved.editors, { image: "image-plain" });
   assert.deepEqual(saved.tools, {
     imageAdjust: { lastAppliedBrightness: 24 },
+    perspective: { advanceAfterQueue: true },
     artifactOverlay: { regionLabels: false },
   });
   assert.deepEqual(
     store.load("corrections/default").tools.imageAdjust,
     { lastAppliedBrightness: 24 },
+  );
+  assert.deepEqual(
+    store.load("corrections/default").tools.perspective,
+    { advanceAfterQueue: true },
   );
   assert.deepEqual(
     store.load("corrections/default").tools.artifactOverlay,
@@ -444,6 +453,7 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
   store.save("corrections/default", {
     tools: {
       imageAdjust: { lastAppliedBrightness: -12 },
+      perspective: { advanceAfterQueue: true },
       artifactOverlay: { regionLabels: false },
     },
   });
@@ -487,9 +497,12 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
     "corrections/default", "imageAdjust");
   const artifactOverlayKey = store.toolKey(
     "corrections/default", "artifactOverlay");
+  const perspectiveKey = store.toolKey(
+    "corrections/default", "perspective");
   assert.equal(store.clear("corrections/default"), true);
   assert.equal(storage.getItem(imageAdjustKey), null);
   assert.equal(storage.getItem(artifactOverlayKey), null);
+  assert.equal(storage.getItem(perspectiveKey), null);
   assert.equal(store.load("corrections/default").found, false);
 });
 
@@ -769,6 +782,176 @@ test("region label profile sync updates open overlays and the compact control", 
   assert.deepEqual(persisted, {
     toolUpdates: { artifactOverlay: { regionLabels: true } },
   });
+});
+
+
+test("perspective advance profile sync updates and persists the compact control", () => {
+  const storage = new MemoryStorage();
+  const store = new CorrectionsProfileStore({
+    storage,
+    normalizeTools: (value) => ({
+      perspective: normalizePerspectiveProfile(value && value.perspective),
+      artifactOverlay: normalizeArtifactOverlayProfile(
+        value && value.artifactOverlay),
+    }),
+  });
+  store.save("corrections/default", {
+    tools: { perspective: { advanceAfterQueue: true } },
+  });
+  const documentRef = fakeDocument();
+  const rootNode = new FakeNode("div", documentRef);
+  const toggle = new FakeNode("button", documentRef);
+  toggle.dataset.perspectiveAdvanceToggle = "";
+  rootNode.append(toggle);
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    root: rootNode,
+    profileKey: "corrections/default",
+    profileStore: store,
+    imageAdjustTool: null,
+    perspectiveProfile: normalizePerspectiveProfile(null),
+    artifactOverlayProfile: { regionLabels: true },
+    artifactOverlays: new Set(),
+  });
+
+  assert.equal(shell.handleProfileStorageEvent({
+    key: store.toolKey("corrections/default", "perspective"),
+    storageArea: storage,
+  }), true);
+  assert.deepEqual(shell.perspectiveProfile, { advanceAfterQueue: true });
+  assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  assert.equal(toggle.title, "Disable advance after transform");
+
+  let persisted = null;
+  shell.listeners = [];
+  shell.persistProfile = (options) => { persisted = options; };
+  shell.bindPerspectiveAdvanceToggle();
+  toggle.emit("click");
+  assert.deepEqual(shell.perspectiveProfile, { advanceAfterQueue: false });
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  assert.equal(toggle.title, "Enable advance after transform");
+  assert.deepEqual(persisted, {
+    toolUpdates: { perspective: { advanceAfterQueue: false } },
+  });
+  assert.deepEqual(normalizePerspectiveProfile({ advanceAfterQueue: 1 }), {
+    advanceAfterQueue: false,
+  });
+  assert.deepEqual(normalizePerspectiveProfile(null), {
+    advanceAfterQueue: false,
+  });
+});
+
+
+test("queued perspective transforms advance by capture_order and report job failures", async () => {
+  const index = {
+    books: [{
+      id: "book-1",
+      captures: [
+        {
+          artifact_id: "capture:last:display",
+          capture_order: 9,
+          representation_id: "scan-1",
+          canvas_id: "canvas-last",
+        },
+        {
+          artifact_id: "capture:current:display",
+          capture_order: 4,
+          representation_id: "scan-1",
+          canvas_id: "canvas-current",
+        },
+        {
+          artifact_id: "capture:first:display",
+          capture_order: 0,
+          representation_id: "scan-1",
+          canvas_id: "canvas-first",
+        },
+      ],
+    }],
+  };
+  const current = {
+    itemId: "book-1",
+    artifactId: "capture:current:display",
+  };
+  const command = {
+    item_id: "book-1",
+    artifact_id: "capture:current:original",
+    adjustment: null,
+    operation_id: "perspective-advance-1",
+  };
+  assert.deepEqual(nextCaptureAddress(index, current, command), {
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "canvas-last",
+    artifactId: "capture:last:display",
+    annotationId: null,
+  });
+  assert.equal(nextCaptureAddress(index, {
+    itemId: "book-1",
+    artifactId: "capture:last:display",
+  }, { ...command, artifact_id: "capture:last:display" }), null);
+  assert.equal(nextCaptureAddress(index, {
+    itemId: "book-2",
+    artifactId: "capture:current:display",
+  }, command), null, "a late queue receipt cannot move a newer selection");
+
+  const selections = [];
+  const statuses = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    perspectiveProfile: { advanceAfterQueue: true },
+    state: { selection: { ...current } },
+    booksFeature: { store: { snapshot: () => ({ index }) } },
+    selectAddress(address, metadata) {
+      selections.push([address, metadata]);
+      this.state.selection = address;
+      return address;
+    },
+    setStatus(message, error) { statuses.push([message, error]); },
+  });
+
+  assert.equal(await shell.handleQueuedTransformResult(
+    { job_id: "job-perspective-1" }, command, null), null);
+  assert.deepEqual(selections, [[{
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "canvas-last",
+    artifactId: "capture:last:display",
+    annotationId: null,
+  }, { source: "transform-advance", targetKind: "image" }]]);
+  assert.deepEqual(statuses, [["Perspective transform queued", undefined]]);
+
+  shell.state.selection = { ...current };
+  shell.perspectiveProfile = { advanceAfterQueue: false };
+  await shell.handleQueuedTransformResult(
+    { job_id: "job-perspective-disabled" }, command, null);
+  shell.perspectiveProfile = { advanceAfterQueue: true };
+  await shell.handleQueuedTransformResult({ job_id: "job-adjustment" }, {
+    ...command,
+    adjustment: { brightness_percent: 12 },
+  }, null);
+  assert.equal(selections.length, 1,
+    "the opt-out and non-perspective image processing keep the current capture");
+
+  assert.equal(shell.reportTransformFailure({
+    failure: { message: "worker stopped unexpectedly" },
+  }, command, {
+    imageCommitted: false,
+    terminalState: "failed",
+  }), true);
+  assert.deepEqual(statuses.at(-1), [
+    "Perspective transform failed: worker stopped unexpectedly",
+    true,
+  ]);
+  assert.equal(shell.reportTransformFailure({
+    cancelled_before_commit: true,
+  }, command, {
+    imageCommitted: false,
+    terminalState: "cancelled",
+  }), true);
+  assert.deepEqual(statuses.at(-1), [
+    "Perspective transform cancelled; source image was not changed",
+    true,
+  ]);
 });
 
 
@@ -1542,6 +1725,131 @@ test("classification shortcuts stay scoped and context menus use exact event tar
   assert.equal(shell.classificationContextMenuEligible(
     { target: classificationToolbarButton }), false,
     "classification context menus stay on browsable image/artifact surfaces");
+});
+
+
+test("book scan-candidate commands use fresh item CAS and persist explicit false", async () => {
+  const shell = Object.create(CorrectionsShell.prototype);
+  const calls = [];
+  let enabled = false;
+  let revision = 1;
+  shell.itemMetadataApi = {
+    async loadItem(payload) {
+      calls.push(["load", payload]);
+      return {
+        id: payload.itemId,
+        revision: `record-r${revision}`,
+        metadata: { digitization_candidate: enabled },
+      };
+    },
+    async updateItem(payload) {
+      calls.push(["update", payload]);
+      enabled = payload.patch.metadata_set.digitization_candidate;
+      revision += 1;
+      return {
+        item: {
+          id: payload.itemId,
+          revision: `record-r${revision}`,
+          metadata: { digitization_candidate: enabled },
+        },
+        replayed: false,
+      };
+    },
+  };
+  const port = shell.createBookMetadataCommandPort();
+
+  const enabledResult = await port.toggleBookDigitizationCandidate({
+    itemId: "book-1",
+    operationId: "scan-candidate-op-1",
+  });
+  const disabledResult = await port.toggleBookDigitizationCandidate({
+    itemId: "book-1",
+    operationId: "scan-candidate-op-2",
+  });
+
+  assert.equal(enabledResult.digitizationCandidate, true);
+  assert.equal(disabledResult.digitizationCandidate, false);
+  const updates = calls.filter(([kind]) => kind === "update")
+    .map(([, payload]) => payload);
+  assert.deepEqual(updates.map((payload) => ({
+    expectedRevision: payload.expectedRevision,
+    operationId: payload.operationId,
+    patch: payload.patch,
+  })), [
+    {
+      expectedRevision: "record-r1",
+      operationId: "scan-candidate-op-1",
+      patch: {
+        title: null,
+        metadata_set: { digitization_candidate: true },
+        metadata_remove: [],
+      },
+    },
+    {
+      expectedRevision: "record-r2",
+      operationId: "scan-candidate-op-2",
+      patch: {
+        title: null,
+        metadata_set: { digitization_candidate: false },
+        metadata_remove: [],
+      },
+    },
+  ]);
+
+  shell.state = { selection: { itemId: "book-1" } };
+  shell.booksFeature = {
+    store: {
+      snapshot: () => ({
+        index: {
+          books: [
+            { id: "book-1", title: "Selected", digitization_candidate: false },
+            { id: "book-2", title: "Hovered", digitization_candidate: true },
+          ],
+        },
+      }),
+    },
+  };
+  assert.deepEqual(shell.currentBookCommandTarget(), {
+    key: "book:book-1",
+    objectType: "book",
+    kind: "book",
+    itemId: "book-1",
+    id: "book-1",
+    label: "Selected",
+    digitizationCandidate: false,
+  });
+});
+
+
+test("book scan-candidate refresh reports every stale projection", async () => {
+  const booksError = new Error("books unavailable");
+  const propertiesError = new Error("properties unavailable");
+  const refreshReasons = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    booksFeature: {
+      async refresh(reason) {
+        refreshReasons.push(reason);
+        throw booksError;
+      },
+    },
+    itemProperties: {
+      async refresh() {
+        throw propertiesError;
+      },
+    },
+    currentBookCommandTarget() {
+      return { key: "book:book-1" };
+    },
+  });
+
+  const outcome = await shell.refreshBookCommandTarget(null, {
+    reason: "committed",
+  });
+
+  assert.deepEqual(refreshReasons, ["scan-candidate"]);
+  assert.deepEqual(outcome.target, { key: "book:book-1" });
+  assert.deepEqual(outcome.refreshErrors, [booksError, propertiesError]);
 });
 
 
@@ -3843,6 +4151,8 @@ test("standalone shell markup exposes accessible panes, tree, editor, tray, and 
   assert.match(templateSource, /data-editor-selector/);
   assert.match(templateSource,
     /data-region-labels-toggle[^>]+aria-pressed="true"/);
+  assert.match(templateSource,
+    /data-perspective-advance-toggle[^>]+aria-pressed="false"[^>]*>Advance after transform/);
   assert.match(templateSource,
     /data-editor-resource-label[^>]+aria-live="polite"[^>]+aria-atomic="true"/);
   assert.doesNotMatch(templateSource, /data-editor-host[^>]+aria-live=/,

@@ -161,6 +161,104 @@ def test_snapshot_uses_newest_registered_build_and_skips_non_cloud_ids():
     ]
 
 
+def test_digitization_candidate_projects_from_the_selected_active_item_only():
+    manual = {
+        "capture_id": CAPTURE_ID,
+        "digitization_candidate": True,
+        "updated_at": "2026-08-09T10:00:00Z",
+    }
+    unregistered = server._capture_book_metadata_rows(
+        builds={}, manual_entries={"manual-1": manual}, reviews={},
+        registration_cache={},
+    )[0]
+    assert unregistered["book_id"] == ""
+    assert unregistered["data"]["digitization_candidate"] is True
+
+    # A promoted build is the active book. Its explicit clear wins over the
+    # stale originating manual row; the projection must never OR the two.
+    cleared = server._capture_book_metadata_rows(
+        builds={"book-1": {
+            "capture_id": CAPTURE_ID,
+            "digitization_candidate": False,
+            "updated_at": "2026-08-09T10:01:00Z",
+        }},
+        manual_entries={"manual-1": manual}, reviews={},
+        registration_cache={},
+    )[0]
+    assert cleared["data"]["digitization_candidate"] is False
+
+    # Absence remains absence for compatibility with old item records. It is
+    # distinct from an explicit false during cross-desktop projection merges.
+    legacy = server._capture_book_metadata_rows(
+        builds={"book-1": {
+            "capture_id": CAPTURE_ID,
+            "updated_at": "2026-08-09T10:01:00Z",
+        }},
+        manual_entries={"manual-1": manual}, reviews={},
+        registration_cache={},
+    )[0]
+    assert "digitization_candidate" not in legacy["data"]
+
+
+def test_candidate_merge_preserves_legacy_unknown_but_explicit_false_clears():
+    known = server._capture_book_metadata_rows(
+        builds={"book-1": {
+            "capture_id": CAPTURE_ID,
+            "digitization_candidate": True,
+            "updated_at": "2026-08-09T10:00:00Z",
+        }},
+        manual_entries={"manual-1": {
+            "capture_id": CAPTURE_ID,
+            "updated_at": "2026-08-09T09:00:00Z",
+        }},
+        reviews={}, registration_cache={},
+    )[0]
+    legacy_record = server._capture_book_metadata_rows(
+        builds={"book-1": {
+            "capture_id": CAPTURE_ID,
+            "updated_at": "2026-08-09T10:00:00Z",
+        }},
+        # Presence of the originating row must not change missing-vs-false
+        # semantics for the selected active build.
+        manual_entries={"manual-1": {
+            "capture_id": CAPTURE_ID,
+            "updated_at": "2026-08-09T09:00:00Z",
+        }},
+        reviews={}, registration_cache={},
+    )[0]
+
+    preserved = server._merge_capture_projection_with_existing(
+        legacy_record, {**known, "revision": 2},
+    )
+    assert preserved["data"]["digitization_candidate"] is True
+
+    explicit_clear = server._capture_book_metadata_rows(
+        builds={"book-1": {
+            "capture_id": CAPTURE_ID,
+            "digitization_candidate": False,
+            "updated_at": "2026-08-09T10:01:00Z",
+        }},
+        manual_entries={}, reviews={}, registration_cache={},
+    )[0]
+    cleared = server._merge_capture_projection_with_existing(
+        explicit_clear, {**known, "revision": 2},
+    )
+    assert cleared["data"]["digitization_candidate"] is False
+
+    tombstone = server._capture_book_metadata_rows(
+        builds={}, manual_entries={}, reviews={}, registration_cache={},
+        tombstone_capture_ids=[CAPTURE_ID],
+        tombstone_updated_at={CAPTURE_ID: "2026-08-09T10:02:00Z"},
+    )[0]
+    merged_tombstone = server._merge_capture_projection_with_existing(
+        tombstone, {**known, "revision": 2},
+    )
+    retained = merged_tombstone["data"]["projection_source"][
+        "_retained_desktop_evidence"
+    ]
+    assert retained["digitization_candidate"] is True
+
+
 def test_bibliography_reads_both_author_spellings_and_prefers_the_build():
     """The phone's box listing has no other source of a title.
 

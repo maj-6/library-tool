@@ -391,6 +391,42 @@ class HomeListResourceTest {
         )
     }
 
+    @Test
+    fun digitizationCandidateHasDistinctHomeAndDetailIndicators() {
+        val home = xml("src/main/res/layout/item_home.xml")
+        val indicator = elementById(home, "digitizationCandidateStatus")
+        assertEquals("@style/WhlMetadataIcon", indicator.getAttribute("style"))
+        assertEquals(
+            "@drawable/ic_scan_candidate",
+            indicator.getAttributeNS(androidNs, "src"),
+        )
+        assertEquals(
+            "@string/home_digitization_candidate",
+            indicator.getAttributeNS(androidNs, "contentDescription"),
+        )
+        assertEquals("gone", indicator.getAttributeNS(androidNs, "visibility"))
+
+        val candidateIcon = File("src/main/res/drawable/ic_scan_candidate.xml").readText()
+        assertTrue(candidateIcon.contains("@color/whl_amber"))
+        assertFalse(candidateIcon == File("src/main/res/drawable/ic_scan_status.xml").readText())
+
+        val homeSource = source("HomeActivity")
+        assertTrue(homeSource.contains("R.id.digitizationCandidateStatus"))
+        assertTrue(homeSource.contains("desktop?.digitizationCandidate == true"))
+        val summary = homeSource.substringAfter("val summaryIds = listOf(")
+            .substringBefore(")")
+        assertTrue(summary.contains("R.id.digitizationCandidateStatus"))
+
+        val detailSource = source("EntryDetailActivity")
+        assertTrue(detailSource.contains("if (desktop.digitizationCandidate)"))
+        assertTrue(detailSource.contains("R.string.detail_digitization"))
+        assertTrue(detailSource.contains("R.string.home_digitization_candidate"))
+
+        val strings = File("src/main/res/values/strings.xml").readText()
+        assertTrue(strings.contains(">Scan candidate</string>"))
+        assertTrue(strings.contains("name=\"detail_digitization\">Digitization</string>"))
+    }
+
     private fun source(name: String): String =
         File("src/main/java/org/whl/bookcapture/$name.kt").readText()
 

@@ -244,6 +244,10 @@
           ? options.extractionTarget : null;
         this.refreshTarget = typeof options.refreshTarget === "function"
           ? options.refreshTarget : null;
+        this.refreshBookTarget = typeof options.refreshBookTarget === "function"
+          ? options.refreshBookTarget : null;
+        this.getBookTarget = typeof options.getBookTarget === "function"
+          ? options.getBookTarget : null;
         this.promoteTarget = typeof options.promoteSoftTarget === "function"
           ? options.promoteSoftTarget : null;
         this.onTarget = typeof options.onTarget === "function"
@@ -255,6 +259,7 @@
         });
         const registered = commands.registerClassificationCommands(this.registry, {
           port: options.port || options.commands,
+          itemPort: options.itemPort || options.items,
           history: options.history,
           operationIdFactory: options.operationIdFactory,
           onChanged: options.onChanged,
@@ -401,6 +406,8 @@
           transformContract: this.transformContract,
           serializeTransformCommand: this.serializeTransformCommand,
           refreshTarget: this.refreshTarget,
+          refreshBookTarget: this.refreshBookTarget,
+          bookTarget: this.getBookTarget ? this.getBookTarget() : null,
           promoteSoftTarget: (target, selectedCommand) =>
             this.promoteSoftTarget(target, selectedCommand),
           announceTarget: (detail) => this.announceTarget(detail),

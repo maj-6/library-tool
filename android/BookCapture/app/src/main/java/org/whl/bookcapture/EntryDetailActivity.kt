@@ -231,6 +231,12 @@ class EntryDetailActivity : AppCompatActivity() {
             getString(R.string.detail_ia_availability),
             desktopAvailabilityText(desktop.internetArchive),
         )
+        if (desktop.digitizationCandidate) {
+            fields += BookDetailField(
+                getString(R.string.detail_digitization),
+                getString(R.string.home_digitization_candidate),
+            )
+        }
         desktop.scanStatus.takeIf(String::isNotBlank)?.let {
             fields += BookDetailField(getString(R.string.detail_scan_status), it)
         }

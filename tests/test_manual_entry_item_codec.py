@@ -67,6 +67,70 @@ def test_decode_projects_path_free_metadata_and_capture_kind():
     assert "checks" not in snapshot.metadata
 
 
+def test_digitization_candidate_round_trips_as_first_class_metadata():
+    row = _row()
+    row["digitization_candidate"] = True
+    codec = _codec()
+
+    snapshot = codec.decode("manual-row", row)
+    assert snapshot.metadata["digitization_candidate"] is True
+
+    metadata = dict(snapshot.metadata)
+    metadata["digitization_candidate"] = False
+    disabled = codec.encode(
+        "manual-row",
+        ItemDraft(
+            kind="capture",
+            title=snapshot.title,
+            metadata=metadata,
+        ),
+        row,
+    )
+    assert disabled["digitization_candidate"] is False
+
+    metadata.pop("digitization_candidate")
+    removed = codec.encode(
+        "manual-row",
+        ItemDraft(
+            kind="capture",
+            title=snapshot.title,
+            metadata=metadata,
+        ),
+        disabled,
+    )
+    assert "digitization_candidate" not in removed
+
+
+def test_digitization_candidate_requires_a_boolean():
+    row = _row()
+    row["digitization_candidate"] = "yes"
+
+    with pytest.raises(TypeError, match="digitization_candidate"):
+        _codec().decode("manual-row", row)
+
+    with pytest.raises(TypeError, match="digitization_candidate"):
+        _codec().encode(
+            "manual-row",
+            ItemDraft(
+                kind="capture",
+                title=row["title"],
+                metadata={"digitization_candidate": "yes"},
+            ),
+            _row(),
+        )
+
+    with pytest.raises(TypeError, match="digitization_candidate"):
+        _codec().encode(
+            "manual-row",
+            ItemDraft(
+                kind="capture",
+                title=row["title"],
+                metadata={"digitization_candidate": None},
+            ),
+            _row(),
+        )
+
+
 def test_decode_recursively_projects_only_public_generated_extra_metadata():
     row = _row()
     row["extra"] = {

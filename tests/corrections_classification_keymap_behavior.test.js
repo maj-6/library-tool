@@ -116,6 +116,63 @@ test("default bare bindings ignore modifiers while explicit modifier remaps work
 });
 
 
+test("the remappable g hotkey toggles the current book outside typing targets", async () => {
+  const documentRef = fakeDocument();
+  documentRef.hasFocus = () => true;
+  const scope = new FakeNode("main", documentRef);
+  const input = new FakeNode("input", documentRef);
+  scope.append(input);
+  const calls = [];
+  const controller = createClassificationController({
+    scope,
+    documentRef,
+    getBookTarget: () => ({
+      key: "book:book-1",
+      objectType: "book",
+      kind: "book",
+      itemId: "book-1",
+      id: "book-1",
+      label: "Current book",
+    }),
+    itemPort: {
+      async toggleBookDigitizationCandidate(payload) {
+        calls.push(payload);
+        return { digitizationCandidate: calls.length % 2 === 1 };
+      },
+    },
+    operationIdFactory: () => `scan-op-${calls.length + 1}`,
+  });
+  controller.setSelectionTarget(image());
+  controller.mount();
+
+  const typing = scope.emit("keydown", { key: "g", target: input });
+  await settled();
+  assert.equal(typing.defaultPrevented, false);
+  assert.equal(calls.length, 0);
+
+  const invoked = scope.emit("keydown", { key: "g", target: scope });
+  await settled();
+  assert.equal(invoked.defaultPrevented, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].itemId, "book-1");
+
+  controller.registry.remap(
+    CLASSIFICATION_COMMAND_IDS.scanCandidate,
+    "ctrl+g",
+  );
+  const oldBinding = scope.emit("keydown", { key: "g", target: scope });
+  const remapped = scope.emit("keydown", {
+    key: "g",
+    target: scope,
+    ctrlKey: true,
+  });
+  await settled();
+  assert.equal(oldBinding.defaultPrevented, false);
+  assert.equal(remapped.defaultPrevented, true);
+  assert.equal(calls.length, 2);
+});
+
+
 test("Space and Enter remaps preserve native activation on focused controls", async () => {
   const documentRef = fakeDocument();
   documentRef.hasFocus = () => true;

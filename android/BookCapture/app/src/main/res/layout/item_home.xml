@@ -130,6 +130,13 @@
                 <include layout="@layout/view_catalog_indicators" />
 
                 <ImageView
+                    android:id="@+id/digitizationCandidateStatus"
+                    style="@style/WhlMetadataIcon"
+                    android:contentDescription="@string/home_digitization_candidate"
+                    android:src="@drawable/ic_scan_candidate"
+                    android:visibility="gone" />
+
+                <ImageView
                     android:id="@+id/scanStatus"
                     style="@style/WhlMetadataIcon"
                     android:contentDescription="@string/home_scan_status"

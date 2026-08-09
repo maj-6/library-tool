@@ -3277,9 +3277,22 @@ def test_index_summary_agrees_with_the_index_on_every_free_field(
     # Attention drives the shell's primary sort, so it must be identical.
     assert body["attention"] == full.get_json()["attention"]
     for lean, rich in zip(body["books"], full.get_json()["books"], strict=True):
-        assert set(lean) == {"id", "revision", "kind", "title", "review"}
+        assert set(lean) == {
+            "id",
+            "revision",
+            "kind",
+            "title",
+            "digitization_candidate",
+            "review",
+        }
         assert lean["revision"].startswith("crs-")
-        for field in ("id", "kind", "title", "review"):
+        for field in (
+            "id",
+            "kind",
+            "title",
+            "digitization_candidate",
+            "review",
+        ):
             assert lean[field] == rich[field]
 
 

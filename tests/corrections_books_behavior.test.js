@@ -13,6 +13,7 @@ const {
   bookNeedsAttention,
   booksForView,
   captureBooks,
+  digitizationCandidateBooks,
   latestImportedAt,
   captureCommandTarget,
   normalizeCorrectionsIndex,
@@ -291,6 +292,11 @@ test("Corrections index validation is strict and capture order is explicit", () 
   );
   assert.ok(Object.isFrozen(normalized));
   assert.ok(Object.isFrozen(normalized.books[0].captures));
+  assert.equal(normalized.books.find(
+    (book) => book.id === "book-legacy").digitization_candidate, true);
+  assert.equal(normalized.books.find(
+    (book) => book.id === "book-herbarium").digitization_candidate, false,
+    "legacy rows without the optional field default to false");
 
   const wrongSchema = fixture();
   wrongSchema.schema = "librarytool.corrections-index/1";
@@ -312,6 +318,11 @@ test("Corrections index validation is strict and capture order is explicit", () 
   unsupportedKind.books[0].kind = "periodical";
   assert.throws(() => normalizeCorrectionsIndex(unsupportedKind),
     /kind: has an unsupported value/);
+
+  const malformedCandidate = fixture();
+  malformedCandidate.books[0].digitization_candidate = "yes";
+  assert.throws(() => normalizeCorrectionsIndex(malformedCandidate),
+    /digitization_candidate: must be a boolean/);
 
   const implicitOrder = fixture();
   delete implicitOrder.books[0].captures[0].capture_order;
@@ -1410,6 +1421,13 @@ test("captures view orders newest import first with untimed items after", () => 
     "book-herbarium",
     "book-pending",
   ]);
+  assert.deepEqual(digitizationCandidateBooks(index).map((book) => book.id), [
+    "book-legacy",
+  ]);
+  assert.deepEqual(
+    booksForView(index, "scan-candidates").map((book) => book.id),
+    ["book-legacy"],
+  );
   assert.deepEqual(booksForView(index, "all").map((book) => book.id),
     sortedBooks(index).map((book) => book.id));
   assert.equal(latestImportedAt(
@@ -1442,11 +1460,19 @@ test("Books panel views compose with the text filter and show honest counts",
 
     const captures = viewButton(harness, "captures");
     const attention = viewButton(harness, "attention");
+    const scanCandidates = viewButton(harness, "scan-candidates");
     const all = viewButton(harness, "all");
     assert.equal(all.getAttribute("aria-pressed"), "true");
     assert.equal(textOf(all).includes("4"), true);
     assert.equal(textOf(captures).includes("3"), true);
     assert.equal(textOf(attention).includes("2"), true);
+    assert.equal(textOf(scanCandidates).includes("1"), true);
+    const legacyRow = harness.list.children.find(
+      (row) => row.dataset.bookId === "book-legacy");
+    assert.equal(legacyRow.dataset.digitizationCandidate, "true");
+    assert.match(textOf(legacyRow), /Scan candidate/);
+    assert.match(descendants(legacyRow, "button")[0].getAttribute("aria-label"),
+      /scan candidate/);
 
     captures.emit("click");
     assert.equal(captures.getAttribute("aria-pressed"), "true");
@@ -1475,6 +1501,12 @@ test("Books panel views compose with the text filter and show honest counts",
       ["book-herbarium", "book-pending"],
     );
 
+    scanCandidates.emit("click");
+    assert.deepEqual(
+      harness.list.children.map((row) => row.dataset.bookId),
+      ["book-legacy"],
+      "the harvest view contains only marked books");
+
     const cleared = fixture();
     cleared.revision = "index-cleared-r1";
     for (const book of cleared.books) book.captures = [];
@@ -1486,6 +1518,17 @@ test("Books panel views compose with the text filter and show honest counts",
       error: null,
     });
     assert.match(textOf(harness.list), /No captures/);
+
+    for (const book of cleared.books) delete book.digitization_candidate;
+    controller.setView("scan-candidates");
+    controller.render({
+      status: "ready",
+      index: normalizeCorrectionsIndex(cleared),
+      selection: null,
+      error: null,
+    });
+    assert.match(textOf(harness.list), /No scan candidates/);
+    assert.match(textOf(harness.list), /No books are marked as scan candidates/);
     controller.destroy();
   });
 

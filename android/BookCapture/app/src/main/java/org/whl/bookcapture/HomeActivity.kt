@@ -2868,6 +2868,7 @@ class HomeActivity : AppCompatActivity() {
             // reason.
             R.id.whlAvailability,
             R.id.internetArchiveAvailability,
+            R.id.digitizationCandidateStatus,
             R.id.scanStatus,
             R.id.remarksStatus,
             R.id.attentionStatus,
@@ -3103,6 +3104,14 @@ class HomeActivity : AppCompatActivity() {
         }
 
         bindCatalogIndicators(row, entry)
+        row.findViewById<ImageView>(R.id.digitizationCandidateStatus).apply {
+            visibility = if (desktop?.digitizationCandidate == true) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+            contentDescription = getString(R.string.home_digitization_candidate)
+        }
         row.findViewById<ImageView>(R.id.scanStatus).apply {
             val status = desktop?.scanStatus.orEmpty().trim()
             val actionable = status.isNotEmpty() &&

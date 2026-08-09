@@ -195,14 +195,14 @@ class _Items:
         return self.rows
 
 
-def _item(item_id="book-1", title="A Herbal"):
+def _item(item_id="book-1", title="A Herbal", *, metadata=None):
     return ItemView(
         item_id=item_id,
         revision=f"{item_id}-r1",
         record_revision=f"{item_id}-record-r1",
         kind="book",
         title=title,
-        metadata={},
+        metadata={} if metadata is None else metadata,
         representations=(),
         artifacts=(),
         workbench_state=WorkbenchState(
@@ -426,6 +426,7 @@ def _book_item(
     title: str = "Book One",
     *,
     kind: str = "book",
+    metadata=None,
 ) -> ItemView:
     return ItemView(
         item_id=item_id,
@@ -433,7 +434,7 @@ def _book_item(
         record_revision=f"{item_id}-record-r1",
         kind=kind,
         title=title,
-        metadata={},
+        metadata={} if metadata is None else metadata,
         representations=(),
         artifacts=(),
         workbench_state=WorkbenchState(
@@ -1818,6 +1819,44 @@ def test_corrections_index_includes_books_and_capture_entries_only():
         "book-1": "book",
         "capture-1": "book",
     }
+
+
+def test_corrections_indexes_project_digitization_candidate_flag():
+    reviews = _ReviewService(_review_with_history(0, "review-clear-r1"))
+    engine = _Engine(
+        _RasterProjector(()),
+        _SpatialProjector(()),
+        reviews,
+        items=_ItemService(
+            (
+                _book_item(
+                    "book-1",
+                    "Candidate",
+                    metadata={"digitization_candidate": True},
+                ),
+                _book_item("book-2", "Not marked"),
+            )
+        ),
+    )
+    client = _app(engine).test_client()
+
+    full = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    summary = client.get(
+        "/api/v1/corrections/index/summary?workspace_id=local-library"
+    )
+
+    assert full.status_code == 200
+    assert summary.status_code == 200
+    assert [
+        book["digitization_candidate"]
+        for book in full.get_json()["books"]
+    ] == [True, False]
+    assert [
+        book["digitization_candidate"]
+        for book in summary.get_json()["books"]
+    ] == [True, False]
 
 
 def test_corrections_index_projects_capture_import_timestamps():

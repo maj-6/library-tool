@@ -1023,6 +1023,7 @@
         node.id = `artifact-tree-row-${domToken(row.key)}`;
         node.dataset.treeKey = row.key;
         node.dataset.treeType = row.type;
+        node.dataset.depth = String(Math.max(0, row.level - 1));
         node.setAttribute("role", "treeitem");
         node.setAttribute("aria-level", String(row.level));
         node.style.height = `${this.rowHeight}px`;
