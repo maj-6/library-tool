@@ -15,7 +15,7 @@
   const MAX_JSON_COLLECTION = 512;
   const MAX_JSON_STRING = 8192;
   const MAX_METADATA_ASSERTION_ENCODED_BYTES = 32 * 1024;
-  const DEFAULT_ROW_HEIGHT = 28;
+  const DEFAULT_ROW_HEIGHT = 20;
   const DEFAULT_OVERSCAN = 6;
   const PORTABLE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
   const PRIVATE_JSON_KEYS = new Set([

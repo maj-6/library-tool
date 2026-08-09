@@ -125,14 +125,18 @@ function harness() {
 }
 
 
-test("presenter renders and binds exactly the eleven visible registered commands", async () => {
+test("presenter renders and binds every visible registered command", async () => {
   const { calls, controller, controls, host } = harness();
   controller.setSelectionTarget(image());
   controller.mount();
   controls.mount();
 
   const buttons = host.querySelectorAll("[data-command-button]");
-  assert.equal(buttons.length, 11);
+  assert.equal(buttons.length, 12);
+  assert.match(
+    host.querySelector(".classification-controls-hint").textContent,
+    /selected book/,
+  );
   assert.deepEqual(
     buttons.map((button) => button.dataset.classificationCommand),
     CLASSIFICATION_CONTROL_COMMAND_IDS,
@@ -193,8 +197,8 @@ test("toolbar, context menu, and palette reuse the registered command entries", 
   controls.mount();
 
   const toolbarButtons = toolbar.querySelectorAll("[data-command-button]");
-  assert.equal(toolbarButtons.length, 11);
-  assert.equal(controller.registry.list().length, 11,
+  assert.equal(toolbarButtons.length, 12);
+  assert.equal(controller.registry.list().length, 12,
     "additional command surfaces must not register parallel definitions");
   controller.registry.remap(CLASSIFICATION_COMMAND_IDS.titlePage, "y");
   const toolbarTitle = byDataset(
@@ -249,7 +253,7 @@ test("toolbar, context menu, and palette reuse the registered command entries", 
   const palette = scope.querySelector("[data-classification-palette]");
   assert.equal(palette.hidden, false);
   const paletteButtons = palette.querySelectorAll("[data-surface-command]");
-  assert.equal(paletteButtons.length, 11);
+  assert.equal(paletteButtons.length, 12);
   const paletteSpine = byDataset(
     palette,
     "[data-surface-command]",
@@ -515,6 +519,6 @@ test("classification controls install through the standalone browser namespace",
   );
   assert.equal(
     context.LibraryToolCorrections.CLASSIFICATION_CONTROL_COMMAND_IDS.length,
-    11,
+    12,
   );
 });

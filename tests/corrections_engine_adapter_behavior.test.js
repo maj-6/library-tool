@@ -2602,6 +2602,7 @@ function monolithicIndexFixture(count = 300) {
       revision: `book-${id}-r1`,
       kind: "book",
       title: `Herbal ${id}`,
+      digitization_candidate: index === 7,
       import_state: captures.length ? "ready" : "missing",
       issues: captures.length ? [] : ["Captured image manifest is missing"],
       review,
@@ -2643,6 +2644,7 @@ function tieredCorrections(full, calls, overrides = {}) {
           revision: `crs-${book.id}`,
           kind: book.kind,
           title: book.title,
+          digitization_candidate: book.digitization_candidate,
           review: copyJson(book.review),
         })),
         attention: copyJson(full.attention),
@@ -2716,6 +2718,8 @@ test("tiered load assembles the monolithic index from summary and bounded detail
     assert.equal(store.index.books.length, 300);
     assert.equal(store.index.books[5].captures.length, 1,
       "capture rows survive assembly as the positive claims they are");
+    assert.equal(store.index.books[7].digitization_candidate, true,
+      "the scan-candidate flag survives tiered assembly");
     store.destroy();
   });
 

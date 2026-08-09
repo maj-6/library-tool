@@ -478,16 +478,19 @@ body.desktop .window-controls {
   padding-right: 25px;
 }
 
-.editor-region-labels-toggle {
+.editor-region-labels-toggle,
+.editor-perspective-advance-toggle {
   min-height: 22px;
   padding: 0 7px;
   border-color: var(--line);
   background: transparent;
   color: var(--ink-muted);
   font-size: 10px;
+  white-space: nowrap;
 }
 
-.editor-region-labels-toggle[aria-pressed="true"] {
+.editor-region-labels-toggle[aria-pressed="true"],
+.editor-perspective-advance-toggle[aria-pressed="true"] {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
   color: var(--ink);
 }

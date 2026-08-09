@@ -82,6 +82,7 @@
     <string name="home_copyright_status">Copyright status</string>
     <string name="home_whl_available">Available in WHL</string>
     <string name="home_ia_available">Available in Internet Archive</string>
+    <string name="home_digitization_candidate">Scan candidate</string>
     <string name="home_scan_status">Scan status</string>
     <string name="home_scan_status_value">Scan status: %1$s</string>
     <string name="home_availability_detail">%1$s: %2$s</string>
@@ -145,6 +146,7 @@
     <string name="detail_copyright">Copyright</string>
     <string name="detail_whl_availability">WHL availability</string>
     <string name="detail_ia_availability">Internet Archive availability</string>
+    <string name="detail_digitization">Digitization</string>
     <string name="detail_scan_status">Scan status</string>
     <string name="detail_remarks">Remarks</string>
     <string name="detail_available">Available</string>

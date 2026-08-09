@@ -53,6 +53,20 @@ function annotation(overrides = {}) {
 }
 
 
+function book(overrides = {}) {
+  return {
+    key: "book:book-1",
+    objectType: "book",
+    kind: "book",
+    itemId: "book-1",
+    id: "book-1",
+    label: "The Current Herbal",
+    digitizationCandidate: false,
+    ...overrides,
+  };
+}
+
+
 function revisionTarget(kind, id, before, after) {
   return {
     kind,
@@ -119,15 +133,19 @@ function harness(options = {}) {
     documentRef,
     windowRef: options.windowRef,
     port,
+    itemPort: options.itemPort,
     history: options.history,
     resolveLinkedArtifact: options.resolveLinkedArtifact,
     transformContract: options.transformContract,
     serializeTransformCommand: options.serializeTransformCommand,
     refreshTarget: options.refreshTarget,
+    refreshBookTarget: options.refreshBookTarget,
+    getBookTarget: options.getBookTarget,
     promoteSoftTarget: options.promoteSoftTarget,
     onTarget: options.onTarget,
     onChanged: options.onChanged,
     onConflict: options.onConflict,
+    onStatus: options.onStatus,
     onError: options.onError || ((error) => {
       throw error;
     }),
@@ -621,7 +639,7 @@ test("manuscript, stamp, and damage assign their open-vocabulary region roles", 
       ["Mark region as damage", "DMG", "d"],
     ],
   );
-  assert.equal(controller.registry.list().length, 11,
+  assert.equal(controller.registry.list().length, 12,
     "the new default bindings register without a KeyBindingConflictError");
 
   for (const key of ["n", "p", "d"]) {
@@ -639,6 +657,129 @@ test("manuscript, stamp, and damage assign their open-vocabulary region roles", 
     assert.equal(payload.annotationId, "region-1");
     assert.equal(payload.expectedAnnotationRevision, "region-r1");
   }
+});
+
+
+test("g toggles the selected book scan candidate independently of artifact hover", async () => {
+  const calls = [];
+  const changes = [];
+  const statuses = [];
+  let enabled = false;
+  const currentBook = book();
+  const { controller } = harness({
+    getBookTarget: () => currentBook,
+    itemPort: {
+      async toggleBookDigitizationCandidate(payload) {
+        calls.push(payload);
+        enabled = !enabled;
+        return { digitizationCandidate: enabled };
+      },
+    },
+    onChanged(_result, detail) {
+      changes.push(detail);
+    },
+    onStatus(...args) {
+      statuses.push(args);
+    },
+  });
+  controller.setSelectionTarget(image({
+    itemId: "book-2",
+    id: "scan-other",
+    key: "artifact:scan-other",
+  }));
+  controller.setHotTarget(annotation({
+    itemId: "book-3",
+    id: "region-other",
+    key: "annotation:region-other",
+    linkedKeys: [],
+  }));
+
+  assert.equal(
+    controller.registry.bindingFor(CLASSIFICATION_COMMAND_IDS.scanCandidate),
+    "g",
+  );
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.scanCandidate);
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.scanCandidate);
+
+  assert.deepEqual(calls.map((payload) => ({
+    itemId: payload.itemId,
+    operationId: payload.operationId,
+  })), [
+    { itemId: "book-1", operationId: "op-scan-candidate-1" },
+    { itemId: "book-1", operationId: "op-scan-candidate-2" },
+  ]);
+  assert.deepEqual(
+    changes.map((detail) => detail.digitizationCandidate),
+    [true, false],
+  );
+  assert.deepEqual(changes.map((detail) => detail.target.key), [
+    "book:book-1",
+    "book:book-1",
+  ]);
+  assert.match(statuses[0][0], /marked as a scan candidate/i);
+  assert.match(statuses[1][0], /removed from scan candidates/i);
+});
+
+
+test("scan-candidate conflicts reload book state without retrying", async () => {
+  const conflict = Object.assign(new Error("book changed elsewhere"), {
+    code: "record_revision_conflict",
+    status: 409,
+  });
+  let attempts = 0;
+  let refreshes = 0;
+  let conflicts = 0;
+  const { controller } = harness({
+    getBookTarget: () => book(),
+    itemPort: {
+      async toggleBookDigitizationCandidate() {
+        attempts += 1;
+        throw conflict;
+      },
+    },
+    async refreshBookTarget() {
+      refreshes += 1;
+    },
+    async onConflict(error, detail) {
+      assert.equal(error, conflict);
+      assert.equal(detail.target.key, "book:book-1");
+      assert.equal(detail.refreshAttempted, true);
+      conflicts += 1;
+    },
+  });
+
+  await assert.rejects(
+    controller.invoke(CLASSIFICATION_COMMAND_IDS.scanCandidate),
+    (error) => error === conflict,
+  );
+  assert.equal(attempts, 1);
+  assert.equal(refreshes, 1);
+  assert.equal(conflicts, 1);
+});
+
+
+test("scan-candidate commits keep post-refresh failures visible", async () => {
+  const statuses = [];
+  const { controller } = harness({
+    getBookTarget: () => book(),
+    itemPort: {
+      async toggleBookDigitizationCandidate() {
+        return { digitizationCandidate: true };
+      },
+    },
+    async onChanged() {
+      return { refreshErrors: [new Error("index unavailable")] };
+    },
+    onStatus(...args) {
+      statuses.push(args);
+    },
+  });
+
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.scanCandidate);
+
+  assert.equal(statuses.length, 1);
+  assert.match(statuses[0][0], /saved, but .* could not be refreshed/i);
+  assert.equal(statuses[0][1], true);
 });
 
 

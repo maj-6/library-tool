@@ -26,19 +26,28 @@
   box-sizing: border-box;
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 3px;
   min-width: 0;
-  padding: 0 7px;
+  padding: 0 5px;
   border: 1px solid transparent;
   color: var(--ink-muted, #b4bdb2);
   font-size: 11px;
-  line-height: 1;
+  line-height: 1.1;
   cursor: default;
   user-select: none;
 }
 
-.artifact-tree-row[aria-level="2"] {
-  padding-left: 23px;
+/* Every depth keeps the same disclosure slot. Leaves use the empty slot so
+   their labels remain visibly nested instead of sliding beneath a parent's
+   caret. */
+.artifact-tree-row::before {
+  width: 10px;
+  flex: 0 0 10px;
+  content: "";
+}
+
+.artifact-tree-row[data-depth="1"] {
+  padding-left: 17px;
 }
 
 .artifact-tree-row[data-active="true"] {
@@ -75,8 +84,6 @@
 }
 
 .artifact-tree-archived::before {
-  width: 10px;
-  flex: 0 0 10px;
   color: var(--ink-faint, #778076);
   content: "\203A";
   font-size: 13px;
@@ -92,8 +99,6 @@
 }
 
 .artifact-tree-group::before {
-  width: 10px;
-  flex: 0 0 10px;
   color: var(--ink-faint, #778076);
   content: "\203A";
   font-size: 15px;
@@ -116,7 +121,7 @@
 .artifact-tree-state,
 .artifact-state {
   flex: 0 0 auto;
-  padding: 2px 4px;
+  padding: 1px 3px;
   border-radius: 2px;
   background: color-mix(in srgb, var(--face-sh) 68%, var(--face-hi));
   color: var(--ink-muted, #b4bdb2);

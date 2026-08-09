@@ -1377,6 +1377,7 @@
         const books = summary.books.map((lean) => ({
           ...rows.get(lean.id),
           review: lean.review,
+          digitization_candidate: lean.digitization_candidate === true,
         }));
         return {
           schema: "librarytool.corrections-index/2",

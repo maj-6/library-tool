@@ -100,6 +100,7 @@
       "revision": "book-legacy-r4",
       "kind": "book",
       "title": "Materia Medica",
+      "digitization_candidate": true,
       "import_state": "legacy",
       "issues": [],
       "review": {

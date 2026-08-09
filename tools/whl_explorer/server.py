@@ -27396,7 +27396,7 @@ def _capture_retained_projection_evidence(data: dict) -> dict:
     # permanently, because the owning desktop's replay then compares "equal" and
     # push_capture_book_metadata refuses it.
     for key in ("bibliography", "copyright", "availability", "scan_status",
-                "remarks"):
+                "digitization_candidate", "remarks"):
         value = data.get(key)
         if value not in (None, "", [], {}):
             out[key] = json.loads(json.dumps(value, ensure_ascii=False))
@@ -27477,6 +27477,17 @@ def _merge_capture_projection_with_existing(row: dict,
                 [str(value)[:1000] for value in old_remarks + new_remarks
                  if str(value).strip()]
             ))[:25]
+
+    # This boolean is intentionally optional in the projection. Absence means
+    # a legacy active record does not know the classification, while False is an
+    # explicit curator-authored clear. Preserve a known cloud value only for a
+    # live row with no value at all; tombstones retain it inside the merge
+    # envelope below instead of exposing it to Android as current metadata.
+    old_candidate = previous_facts.get("digitization_candidate")
+    if (desired.get("registered") is not False and
+            "digitization_candidate" not in desired and
+            isinstance(old_candidate, bool)):
+        desired["digitization_candidate"] = old_candidate
 
     desired_evidence = _capture_projection_stamp(
         desired_source.get("evidence_updated_at"))
@@ -27708,6 +27719,15 @@ def _capture_book_metadata_rows(builds: dict | None = None,
                                if registered else ""),
             "remarks": _capture_remarks(build, source),
         }
+        # `digitization_candidate` is book metadata, not phone scan
+        # provenance. Project only a real boolean from the selected active item
+        # (`build` is the manual row for an unregistered capture). Keeping the
+        # key absent for legacy rows lets the merge distinguish "unknown" from
+        # an explicit False and prevents stale source metadata from resurrecting
+        # a flag that was cleared on the promoted build.
+        digitization_candidate = build.get("digitization_candidate")
+        if isinstance(digitization_candidate, bool):
+            data["digitization_candidate"] = digitization_candidate
         rows.append({
             "capture_id": capture_id,
             # An unregistered capture has no book id, and the phone's

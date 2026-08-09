@@ -375,11 +375,15 @@
   function normalizeBook(value, path) {
     exactObject(value, path, [
       "id", "revision", "kind", "title", "import_state", "issues", "review",
-      "captures", "latest_imported_at",
+      "captures", "latest_imported_at", "digitization_candidate",
     ], [
       "id", "revision", "kind", "title", "import_state", "issues", "review",
       "captures",
     ]);
+    if (Object.prototype.hasOwnProperty.call(value, "digitization_candidate") &&
+        typeof value.digitization_candidate !== "boolean") {
+      fail(`${path}.digitization_candidate`, "must be a boolean");
+    }
     const captures = boundedArray(value.captures, `${path}.captures`, 100_000)
       .map((capture, index) => normalizeCapture(capture, `${path}.captures[${index}]`))
       .sort(compareCaptures);
@@ -405,6 +409,7 @@
       captures: freezeDeep(captures),
       latest_imported_at: normalizeImportTimestamp(
         value.latest_imported_at, `${path}.latest_imported_at`),
+      digitization_candidate: value.digitization_candidate === true,
     });
   }
 
@@ -543,7 +548,9 @@
       compareBooks(left, right, attentionIds));
   }
 
-  const BOOKS_PANEL_VIEWS = Object.freeze(["all", "captures", "attention"]);
+  const BOOKS_PANEL_VIEWS = Object.freeze([
+    "all", "captures", "attention", "scan-candidates",
+  ]);
 
   function importedAtTime(value) {
     if (!value) return NaN;
@@ -590,9 +597,15 @@
       bookNeedsAttention(book, index.attention));
   }
 
+  function digitizationCandidateBooks(index) {
+    if (!index) return [];
+    return sortedBooks(index).filter((book) => book.digitization_candidate);
+  }
+
   function booksForView(index, view) {
     if (view === "captures") return captureBooks(index);
     if (view === "attention") return attentionBooks(index);
+    if (view === "scan-candidates") return digitizationCandidateBooks(index);
     return sortedBooks(index);
   }
 
@@ -1436,6 +1449,7 @@
       this.viewControls = new Map();
       for (const [view, label] of [
         ["all", "All"], ["captures", "Captures"], ["attention", "Attention"],
+        ["scan-candidates", "Scan candidates"],
       ]) {
         const button = element(this.documentRef, "button", "books-view-option");
         button.type = "button";
@@ -1601,6 +1615,7 @@
           all: index ? index.books.length : 0,
           captures: index ? captureBooks(index).length : 0,
           attention: index ? attentionBooks(index).length : 0,
+          "scan-candidates": index ? digitizationCandidateBooks(index).length : 0,
         };
         for (const [view, control] of this.viewControls) {
           setAttribute(control.button, "aria-pressed",
@@ -1828,6 +1843,9 @@
         } else if (this.view === "captures") {
           list.append(this.messageRow("No captures",
             "No items have synced phone captures."));
+        } else if (this.view === "scan-candidates") {
+          list.append(this.messageRow("No scan candidates",
+            "No books are marked as scan candidates."));
         } else {
           list.append(this.messageRow("Nothing needs attention",
             "No items are marked for attention."));
@@ -1892,8 +1910,13 @@
     renderBook(book, snapshot) {
       const needsAttention = bookNeedsAttention(book, snapshot.index.attention);
       const row = element(this.documentRef, "li",
-        `corrections-book${needsAttention ? " needs-attention" : ""}`);
-      row.dataset && (row.dataset.bookId = book.id);
+        `corrections-book${needsAttention ? " needs-attention" : ""}` +
+        `${book.digitization_candidate ? " is-scan-candidate" : ""}`);
+      if (row.dataset) {
+        row.dataset.bookId = book.id;
+        row.dataset.digitizationCandidate =
+          book.digitization_candidate ? "true" : "false";
+      }
       const select = element(this.documentRef, "button", "book-select");
       select.type = "button";
       if (select.dataset) {
@@ -1907,7 +1930,8 @@
       setAttribute(select, "aria-pressed", selected ? "true" : "false");
       setAttribute(select, "aria-label",
         `${title}${book.kind === "capture" ? ", captured entry" : ""}` +
-        `${needsAttention ? ", needs attention" : ""}`);
+        `${needsAttention ? ", needs attention" : ""}` +
+        `${book.digitization_candidate ? ", scan candidate" : ""}`);
       select.append(element(this.documentRef, "span", "book-title", title));
       if (book.kind === "capture") {
         select.append(element(
@@ -1915,6 +1939,14 @@
           "span",
           "book-kind",
           "Captured entry",
+        ));
+      }
+      if (book.digitization_candidate) {
+        select.append(element(
+          this.documentRef,
+          "span",
+          "book-kind book-digitization-candidate",
+          "Scan candidate",
         ));
       }
       if (needsAttention) {
@@ -2128,6 +2160,7 @@
     captureState,
     compareBooks,
     compareCaptureBooks,
+    digitizationCandidateBooks,
     latestImportedAt,
     normalizeAttentionEntry,
     normalizeCorrectionsIndex,

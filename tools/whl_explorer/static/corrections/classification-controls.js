@@ -149,7 +149,7 @@
           this.documentRef,
           "p",
           "classification-controls-hint",
-          "Choose a label for the focused image or region.",
+          "Choose a command for the focused image or region, or the selected book.",
         );
 
         const toolbar = element(

@@ -177,6 +177,34 @@ def test_update_preserves_managed_state_and_unknown_metadata_exactly():
     assert codec.decode("book-one", updated).as_draft() == draft
 
 
+def test_digitization_candidate_round_trips_and_requires_a_boolean():
+    revisions = _RevisionSequence(
+        "2026-07-19T12:35:00.000000+00:00",
+        "2026-07-19T12:36:00.000000+00:00",
+    )
+    codec = _codec(revisions)
+    previous = {**_managed_row(), "digitization_candidate": True}
+
+    snapshot = codec.decode("book-one", previous)
+    assert snapshot.metadata["digitization_candidate"] is True
+
+    metadata = dict(snapshot.metadata)
+    metadata["digitization_candidate"] = False
+    updated = codec.encode(
+        "book-one",
+        ItemDraft(title=snapshot.title, metadata=metadata),
+        previous,
+    )
+    assert updated["digitization_candidate"] is False
+
+    with pytest.raises(TypeError, match="digitization_candidate"):
+        codec.encode(
+            "book-two",
+            ItemDraft(metadata={"digitization_candidate": "yes"}),
+            None,
+        )
+
+
 def test_record_revision_preserves_explicit_tokens_and_stable_fallbacks():
     raw = {
         "title": "Legacy",

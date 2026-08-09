@@ -18,11 +18,13 @@
       damage: "corrections.role.damage",
       extractRegion: "corrections.region.extract",
       archiveImage: "corrections.image.archive",
+      scanCandidate: "corrections.book.scan-candidate",
     });
 
     const TARGET_KINDS = Object.freeze({
       IMAGE: "image",
       ANNOTATION: "annotation",
+      BOOK: "book",
     });
 
     const DEFAULT_COMMAND_DEFINITIONS = Object.freeze([
@@ -147,6 +149,18 @@
         defaultBinding: "v",
         targetKind: TARGET_KINDS.IMAGE,
         action: "metadata.archive",
+        value: "",
+      }),
+      Object.freeze({
+        id: COMMAND_IDS.scanCandidate,
+        label: "Toggle scan candidate",
+        shortLabel: "Scan candidate",
+        code: "SCAN",
+        // S is already the spine command. G is an unclaimed mnemonic for
+        // diGitization and remains fully remappable with the other commands.
+        defaultBinding: "g",
+        targetKind: TARGET_KINDS.BOOK,
+        action: "item.digitization-candidate.toggle",
         value: "",
       }),
     ]);
@@ -507,6 +521,17 @@
           .includes(text(read(target, "kind"), 64).toLowerCase());
     }
 
+    function bookTarget(target) {
+      if (!target || typeof target !== "object") return false;
+      const objectType = targetObjectType(target);
+      const kind = text(read(target, "kind"), 64).toLowerCase();
+      const key = targetKey(target);
+      const itemId = text(read(target, "itemId", "item_id", "id"), 256);
+      return Boolean(itemId) && (
+        objectType === "book" || kind === "book" || key.startsWith("book:")
+      );
+    }
+
     function regionSelectorPoints(target) {
       const selector = read(target, "selector");
       const points = (selector && typeof selector === "object" &&
@@ -591,6 +616,7 @@
     }
 
     function targetAccepted(target, command) {
+      if (command.targetKind === TARGET_KINDS.BOOK) return bookTarget(target);
       const revision = commandRevision(target);
       if (!revision || revision.startsWith("index:")) return false;
       return command.targetKind === TARGET_KINDS.IMAGE
@@ -606,6 +632,11 @@
     }
 
     function resolveClassificationTarget(context, command) {
+      if (command.targetKind === TARGET_KINDS.BOOK) {
+        const target = candidateValue(context, "bookTarget", "currentBookTarget");
+        return targetAccepted(target, command)
+          ? Object.freeze({ target, source: "book" }) : null;
+      }
       const focused = candidateValue(context, "focusedTarget");
       const selected = candidateValue(context, "selectionTarget", "selectedTarget");
       const soft = candidateValue(context, "softTarget", "hotTarget");
@@ -636,15 +667,29 @@
         "id", "artifactId", "artifact_id", "annotationId", "annotation_id",
       );
       const id = text(rawId || targetKey(target).split(":").slice(1).join(":"), 256);
-      const kind = command && command.targetKind === TARGET_KINDS.ANNOTATION
-        ? "region" : "image";
+      const kind = command && command.targetKind === TARGET_KINDS.BOOK
+        ? "book"
+        : command && command.targetKind === TARGET_KINDS.ANNOTATION
+          ? "region" : "image";
       return label ? `${label} (${kind})` : id ? `${kind} ${id}` : "";
     }
 
     function targetIdentifiers(target, targetKind) {
       const key = targetKey(target);
       const keyId = key.includes(":") ? key.split(":").slice(1).join(":") : "";
-      const itemId = identifier(read(target, "itemId", "item_id"), "item id");
+      const itemId = identifier(
+        read(target, "itemId", "item_id") ||
+          (targetKind === TARGET_KINDS.BOOK && read(target, "id")) || keyId,
+        "item id",
+      );
+      if (targetKind === TARGET_KINDS.BOOK) {
+        return Object.freeze({
+          itemId,
+          id: itemId,
+          revision: "",
+          key: key || `book:${itemId}`,
+        });
+      }
       const revision = commandRevision(target);
       if (!revision || revision.startsWith("index:")) {
         throw new CorrectionCommandError(
@@ -874,6 +919,9 @@
 
     function portSupportsCommand(port, command) {
       if (!port || !command) return false;
+      if (command.action === "item.digitization-candidate.toggle") {
+        return typeof port.toggleBookDigitizationCandidate === "function";
+      }
       if (command.action === "region.extract") {
         // Extraction rides the transform queue, not the classification
         // endpoints, so the generic invoke fallbacks do not cover it.
@@ -897,6 +945,7 @@
     class ClassificationCommandExecutor {
       constructor(options = {}) {
         this.port = options.port || options.commands || null;
+        this.itemPort = options.itemPort || options.items || null;
         this.history = options.history || null;
         this.operationIdFactory = typeof options.operationIdFactory === "function"
           ? options.operationIdFactory : defaultOperationId;
@@ -911,7 +960,9 @@
       }
 
       available(context, command) {
-        if (!portSupportsCommand(this.port, command)) return false;
+        const port = command.targetKind === TARGET_KINDS.BOOK
+          ? this.itemPort : this.port;
+        if (!portSupportsCommand(port, command)) return false;
         const resolved = resolveClassificationTarget(context, command);
         return !!resolved;
       }
@@ -979,12 +1030,17 @@
       async execute(context, command) {
         const initial = resolveClassificationTarget(context, command);
         if (!initial) {
+          const target = command.targetKind === TARGET_KINDS.BOOK
+            ? "a selected book" : "a compatible image or region";
           throw new CorrectionCommandError(
-            `${command.label} needs a compatible image or region`,
+            `${command.label} needs ${target}`,
             "command_target_required",
           );
         }
         const resolved = await this.targetBeforeMutation(initial, context, command);
+        if (command.targetKind === TARGET_KINDS.BOOK) {
+          return this.executeBookToggle(context, command, resolved);
+        }
         const identifiers = targetIdentifiers(resolved.target, command.targetKind);
         const busyKey = `${command.id}:${identifiers.key}`;
         if (this.busy.has(busyKey)) {
@@ -1165,6 +1221,103 @@
               : `${command.shortLabel} assigned to ${resolved.name}`,
           false,
         );
+        return result;
+      }
+
+      async executeBookToggle(context, command, resolved) {
+        const identifiers = targetIdentifiers(
+          resolved.target, TARGET_KINDS.BOOK);
+        const busyKey = `${command.id}:${identifiers.key}`;
+        if (this.busy.has(busyKey)) {
+          throw new CorrectionCommandError(
+            "That correction is already being applied",
+            "command_busy",
+          );
+        }
+        this.busy.add(busyKey);
+        let result;
+        try {
+          result = await invokePort(
+            this.itemPort,
+            ["toggleBookDigitizationCandidate"],
+            command,
+            Object.freeze({
+              itemId: identifiers.itemId,
+              operationId: operationId(
+                this.operationIdFactory,
+                "scan-candidate",
+                command,
+                resolved.target,
+              ),
+              signal: context.signal,
+            }),
+          );
+        } catch (error) {
+          if (conflictError(error)) {
+            const refreshErrors = [];
+            if (typeof context.refreshBookTarget === "function") {
+              try {
+                await context.refreshBookTarget(resolved.target, {
+                  command,
+                  error,
+                  reason: "conflict",
+                });
+              } catch (refreshError) {
+                refreshErrors.push(refreshError);
+              }
+            }
+            attachRefreshErrors(error, {
+              errors: Object.freeze(refreshErrors),
+            });
+            await this.onConflict(error, Object.freeze({
+              command,
+              target: resolved.target,
+              targets: Object.freeze([]),
+              name: resolved.name,
+              refreshAttempted: typeof context.refreshBookTarget === "function",
+              refreshErrors: Object.freeze(refreshErrors),
+            }));
+          }
+          throw error;
+        } finally {
+          this.busy.delete(busyKey);
+        }
+
+        const item = read(result, "item");
+        const metadata = item && read(item, "metadata");
+        const direct = read(
+          result,
+          "digitizationCandidate",
+          "digitization_candidate",
+        );
+        const enabled = typeof direct === "boolean"
+          ? direct
+          : metadata && typeof metadata.digitization_candidate === "boolean"
+            ? metadata.digitization_candidate : null;
+        if (typeof enabled !== "boolean") {
+          throw new CorrectionCommandError(
+            "The scan-candidate update returned an invalid result",
+            "invalid_command_result",
+          );
+        }
+        const refreshOutcome = await this.onChanged(result, Object.freeze({
+          command,
+          target: resolved.target,
+          targets: Object.freeze([]),
+          name: resolved.name,
+          digitizationCandidate: enabled,
+          refreshAttempted: false,
+          refreshErrors: Object.freeze([]),
+        }));
+        const refreshErrors = refreshOutcome &&
+          Array.isArray(refreshOutcome.refreshErrors)
+          ? refreshOutcome.refreshErrors : [];
+        const success = enabled
+          ? `${resolved.name} marked as a scan candidate`
+          : `${resolved.name} removed from scan candidates`;
+        this.onStatus(refreshErrors.length
+          ? `${success}; saved, but the Books or Properties view could not be refreshed`
+          : success, refreshErrors.length > 0);
         return result;
       }
 
@@ -1377,6 +1530,7 @@
       eventKeyBinding,
       imageTarget,
       annotationTarget,
+      bookTarget,
       linkedArtifactKeys,
       normalizeKeyBinding,
       regionExtractQuad,

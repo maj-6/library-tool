@@ -65,7 +65,9 @@ _CANONICAL_TO_LEGACY = {
     canonical: legacy
     for legacy, canonical in _LEGACY_TO_CANONICAL.items()
 }
-_OPTIONAL_EDITABLE_FIELDS = frozenset({"category_ids", "extra"})
+_OPTIONAL_EDITABLE_FIELDS = frozenset(
+    {"category_ids", "digitization_candidate", "extra"}
+)
 _WINDOWS_PATH_RE = re.compile(r"(?:^|[\s\"'(])[A-Za-z]:[\\/]")
 _ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
@@ -499,6 +501,12 @@ class ManualEntryItemCodec:
             raise TypeError(
                 "manual entry category_ids must be unique strings"
             )
+        if "digitization_candidate" in raw and not isinstance(
+            raw["digitization_candidate"], bool
+        ):
+            raise TypeError(
+                "manual entry digitization_candidate must be a boolean"
+            )
         if "extra" in raw and not isinstance(raw["extra"], Mapping):
             raise TypeError("manual entry extra must be an object")
 
@@ -513,6 +521,10 @@ class ManualEntryItemCodec:
         }
         if "category_ids" in raw:
             result["category_ids"] = list(raw["category_ids"])
+        if "digitization_candidate" in raw:
+            result["digitization_candidate"] = raw[
+                "digitization_candidate"
+            ]
         if "extra" in raw:
             result["extra"] = cls.public_extra(raw["extra"])
         images = raw.get("images")
@@ -582,6 +594,18 @@ class ManualEntryItemCodec:
             or len(category_ids) != len(set(category_ids))
         ):
             raise TypeError("manual entry category_ids must be unique strings")
+        has_digitization_candidate = (
+            "digitization_candidate" in draft.metadata
+        )
+        digitization_candidate = draft.metadata.get(
+            "digitization_candidate"
+        )
+        if has_digitization_candidate and not isinstance(
+            digitization_candidate, bool
+        ):
+            raise TypeError(
+                "manual entry digitization_candidate must be a boolean"
+            )
         has_extra = "extra" in draft.metadata
         extra = draft.metadata.get("extra")
         detached_extra: Mapping[str, Any] | None = None
@@ -636,6 +660,10 @@ class ManualEntryItemCodec:
             result.pop("category_ids", None)
         else:
             result["category_ids"] = list(draft.metadata["category_ids"])
+        if "digitization_candidate" not in draft.metadata:
+            result.pop("digitization_candidate", None)
+        else:
+            result["digitization_candidate"] = digitization_candidate
 
         previous_extra = (
             previous.get("extra")

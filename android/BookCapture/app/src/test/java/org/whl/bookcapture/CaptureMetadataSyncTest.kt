@@ -88,6 +88,7 @@ class CaptureMetadataSyncTest {
                     ),
             )
             .put("scan_status", "needs scan")
+            .put("digitization_candidate", true)
             .put("remarks", JSONArray().put("First remark").put(
                 JSONObject().put("text", "Second remark"),
             ))
@@ -103,7 +104,22 @@ class CaptureMetadataSyncTest {
         assertEquals(DesktopAvailabilityState.UNAVAILABLE, parsed.internetArchive.state)
         assertEquals(false, parsed.internetArchive.available)
         assertEquals("needs scan", parsed.scanStatus)
+        assertTrue(parsed.digitizationCandidate)
         assertEquals(listOf("First remark", "Second remark"), parsed.remarks)
+    }
+
+    @Test
+    fun legacyOrMalformedCandidateMetadataFailsClosed() {
+        assertFalse(desktopBookMetadataFromJson(desktopRow())!!.digitizationCandidate)
+        assertFalse(desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject().put("digitization_candidate", false),
+        ))!!.digitizationCandidate)
+        assertFalse(desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject().put("digitization_candidate", "true"),
+        ))!!.digitizationCandidate)
+        assertFalse(desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject().put("digitization_candidate", 1),
+        ))!!.digitizationCandidate)
     }
 
     @Test

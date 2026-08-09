@@ -15,6 +15,9 @@ const {
   createArtifactsFeature,
 } = require("../tools/whl_explorer/static/corrections/artifacts");
 const {
+  DEFAULT_ROW_HEIGHT,
+} = require("../tools/whl_explorer/static/corrections/artifact-model");
+const {
   FakeNode,
   deferred,
   fakeDocument,
@@ -131,7 +134,7 @@ function harness(options = {}) {
     resources: options.resources,
     commands: options.commands,
     initialExpandedGroups: options.initialExpandedGroups,
-    rowHeight: options.rowHeight || 28,
+    rowHeight: options.rowHeight,
     overscan: options.overscan == null ? 2 : options.overscan,
     pageLimit: options.pageLimit || 2,
     objectUrls: options.objectUrls,
@@ -197,6 +200,20 @@ test("tree groups load lazily, page on demand, and remain keyboard navigable", a
   assert.equal(treeRoot.getAttribute("role"), "tree");
   assert.equal(treeRoot.getAttribute("tabindex"), "0");
   assert.ok(treeRoot.getAttribute("aria-activedescendant"));
+  const renderedRows = treeRoot.querySelectorAll("[data-tree-key]");
+  const groupRow = renderedRows.find((node) =>
+    node.dataset.treeKey === "group:source-images");
+  const artifactRow = renderedRows.find((node) =>
+    node.dataset.treeKey === "artifact:capture-1");
+  assert.equal(DEFAULT_ROW_HEIGHT, 20);
+  assert.equal(groupRow.dataset.depth, "0");
+  assert.equal(groupRow.getAttribute("role"), "treeitem");
+  assert.equal(groupRow.getAttribute("aria-level"), "1");
+  assert.equal(groupRow.style.height, "20px");
+  assert.equal(artifactRow.dataset.depth, "1");
+  assert.equal(artifactRow.getAttribute("role"), "treeitem");
+  assert.equal(artifactRow.getAttribute("aria-level"), "2");
+  assert.equal(artifactRow.style.height, "20px");
 
   await feature.loadGroup("source-images");
   assert.deepEqual(calls[1], {
@@ -1453,6 +1470,8 @@ test("feature source and scoped styles enforce cancellation, virtualization, and
   assert.match(artifactStyles, /\[data-hot="true"\]/);
   assert.match(artifactStyles, /aria-selected/);
   assert.match(artifactStyles, /prefers-reduced-motion/);
+  assert.match(artifactStyles, /\.artifact-tree-row\[data-depth="1"\]/);
+  assert.match(artifactStyles, /padding-left:\s*17px/);
 });
 
 

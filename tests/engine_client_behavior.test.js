@@ -622,6 +622,7 @@ function correctionsIndex(overrides = {}) {
       revision: "book-r2",
       kind: "book",
       title: "A Herbal",
+      digitization_candidate: true,
       import_state: "ready",
       issues: [],
       review,
@@ -1410,6 +1411,19 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
     "capture",
   );
 
+  const legacy = correctionsIndex();
+  delete legacy.books[0].digitization_candidate;
+  const legacyClient = new EngineClient({
+    transport: async () => response(200, legacy),
+  });
+  assert.equal(
+    (await legacyClient.corrections.index({
+      workspaceId: "workspace:one",
+    })).books[0].digitization_candidate,
+    undefined,
+    "the transport accepts an older index that predates the optional flag",
+  );
+
   const malformed = correctionsIndex();
   malformed.attention[0].target.item_id = "missing:book";
   const malformedClient = new EngineClient({
@@ -1439,6 +1453,9 @@ test("corrections index is strict, versioned, and workspace scoped", async () =>
     },
     (body) => {
       body.books[0].kind = "periodical";
+    },
+    (body) => {
+      body.books[0].digitization_candidate = "yes";
     },
     (body) => {
       body.schema = "librarytool.corrections-index/1";
@@ -1529,6 +1546,7 @@ function correctionsIndexSummary(overrides = {}) {
       revision: `summary-${book.revision}`,
       kind: book.kind,
       title: book.title,
+      digitization_candidate: book.digitization_candidate,
       review: copyJson(book.review),
     })),
     attention: index.attention,
@@ -1565,7 +1583,10 @@ test("corrections index summary is strict, versioned, and workspace scoped",
     assert.equal(summary.schema, "librarytool.corrections-index-summary/1");
     assert.equal(summary.ok, undefined);
     assert.deepEqual(Object.keys(summary.books[0]),
-      ["id", "revision", "kind", "title", "review"]);
+      [
+        "id", "revision", "kind", "title", "digitization_candidate", "review",
+      ]);
+    assert.equal(summary.books[0].digitization_candidate, true);
     assert.equal(summary.books[0].review.state, "needs_attention");
     assert.deepEqual(calls, [{
       url: "/api/v1/corrections/index/summary?workspace_id=workspace%3Aone",
@@ -1579,6 +1600,19 @@ test("corrections index summary is strict, versioned, and workspace scoped",
       workspaceId: "bad workspace",
     }), TypeError);
 
+    const legacy = correctionsIndexSummary();
+    delete legacy.books[0].digitization_candidate;
+    const legacyClient = new EngineClient({
+      transport: async () => response(200, legacy),
+    });
+    assert.equal(
+      (await legacyClient.corrections.indexSummary({
+        workspaceId: "workspace:one",
+      })).books[0].digitization_candidate,
+      undefined,
+      "the optional summary flag remains backward compatible",
+    );
+
     for (const mutate of [
       (body) => {
         body.schema = "librarytool.corrections-index/2";
@@ -1586,6 +1620,9 @@ test("corrections index summary is strict, versioned, and workspace scoped",
       (body) => {
         // A summary book must never smuggle in a capture-derived field.
         body.books[0].import_state = "ready";
+      },
+      (body) => {
+        body.books[0].digitization_candidate = "yes";
       },
       (body) => {
         body.attention[0].review.revision = "review-contradictory-r1";

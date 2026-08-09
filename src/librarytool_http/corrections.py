@@ -2260,6 +2260,16 @@ def _item_has_capture_inventory(item: ItemView) -> bool:
     )
 
 
+def _item_digitization_candidate(item: ItemView) -> bool:
+    value = item.metadata.get("digitization_candidate", False)
+    if not isinstance(value, bool):
+        raise _invalid_index_projection(
+            "the item query returned an invalid digitization candidate flag",
+            item_id=item.item_id,
+        )
+    return value
+
+
 def _index_capture_inventory(
     rasters: Any,
     item: ItemView,
@@ -2575,6 +2585,7 @@ def _corrections_index_book(
         "id": item.item_id,
         "kind": item_kind,
         "title": item.title,
+        "digitization_candidate": _item_digitization_candidate(item),
         "import_state": import_state,
         "issues": _book_issues(
             item,
@@ -2650,6 +2661,7 @@ def _corrections_index_summary_projection(
             "id": item.item_id,
             "kind": item_kind,
             "title": item.title,
+            "digitization_candidate": _item_digitization_candidate(item),
             "review": review_summary,
         }
         book = {

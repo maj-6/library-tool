@@ -201,6 +201,13 @@ class WhlBookItemCommandPolicy:
             )
         if "bundle" in metadata:
             self._validate_bundle(metadata["bundle"])
+        if "digitization_candidate" in metadata and not isinstance(
+            metadata["digitization_candidate"], bool
+        ):
+            self._invalid_metadata(
+                "digitization_candidate",
+                "boolean_required",
+            )
 
     def _validate_category_ids(
         self,

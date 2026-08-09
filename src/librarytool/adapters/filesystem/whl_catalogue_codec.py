@@ -226,6 +226,12 @@ class WhlCatalogueItemCodec:
                     )
         if "bundle" in metadata:
             self.validate_bundle(metadata["bundle"])
+        if "digitization_candidate" in metadata and not isinstance(
+            metadata["digitization_candidate"], bool
+        ):
+            raise TypeError(
+                "metadata.digitization_candidate must be a boolean"
+            )
 
     def validate_managed_record(
         self,

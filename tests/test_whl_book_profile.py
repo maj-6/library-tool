@@ -226,6 +226,10 @@ def test_update_rejects_managed_removals_representation_changes_and_bad_writes()
             ItemPatch(metadata_set={"authors": " Padded "}),
             "invalid_item_metadata",
         ),
+        (
+            ItemPatch(metadata_set={"digitization_candidate": "yes"}),
+            "invalid_item_metadata",
+        ),
     )
 
     for patch, code in cases:

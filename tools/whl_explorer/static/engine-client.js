@@ -1307,6 +1307,11 @@
         Object.prototype.hasOwnProperty.call(value, key));
   }
 
+  function hasOptionalBoolean(value, name) {
+    return !Object.prototype.hasOwnProperty.call(value, name) ||
+      typeof value[name] === "boolean";
+  }
+
   function isCorrectionsText(value, maximum, allowEmpty = true) {
     try {
       correctionText(value, "value", maximum, allowEmpty);
@@ -1446,11 +1451,12 @@
   function isCorrectionsBook(value) {
     if (!hasAllowedKeys(value, [
       "id", "revision", "kind", "title", "import_state", "issues", "review",
-      "captures", "latest_imported_at",
+      "captures", "latest_imported_at", "digitization_candidate",
     ], [
       "id", "revision", "kind", "title", "import_state", "issues", "review",
       "captures",
     ]) || !isCorrectionsImportTimestamp(value.latest_imported_at) ||
+        !hasOptionalBoolean(value, "digitization_candidate") ||
         !isPortableIdentifier(value.id) ||
         !isArtifactRevision(value.revision) ||
         !["book", "capture"].includes(value.kind) ||
@@ -1513,12 +1519,14 @@
 
   // A summary book carries the free half of an index row: everything except
   // what a capture manifest read would have paid for. The shapes mirror the
-  // server's summary projection exactly (hasExactKeys, so an added or
-  // dropped field is a contract violation, never a silent pass-through).
+  // server's summary projection exactly, except that additive optional fields
+  // remain compatible with older engines. Unknown fields still fail closed.
   function isCorrectionsIndexSummaryBook(value) {
-    return hasExactKeys(value, [
+    return hasAllowedKeys(value, [
       "id", "revision", "kind", "title", "review",
-    ]) &&
+      "digitization_candidate",
+    ], ["id", "revision", "kind", "title", "review"]) &&
+      hasOptionalBoolean(value, "digitization_candidate") &&
       isPortableIdentifier(value.id) &&
       isArtifactRevision(value.revision) &&
       ["book", "capture"].includes(value.kind) &&

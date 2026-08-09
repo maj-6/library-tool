@@ -68,6 +68,11 @@ class DesktopBookMetadata internal constructor(
 
     val scanStatus: String get() = dataCopy().strictString("scan_status", 80).orEmpty()
 
+    /** Book-level curator classification. Projections written before issue #312
+     * omit the key, and malformed future/legacy values fail closed to false. */
+    val digitizationCandidate: Boolean
+        get() = dataCopy().strictBoolean("digitization_candidate") ?: false
+
     val remarks: List<String> get() = parseDesktopRemarks(dataCopy().opt("remarks"))
 
     /**

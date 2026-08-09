@@ -46,7 +46,7 @@
   const TRAY_TABS = Object.freeze(["reviews", "jobs"]);
   // The command registry's binding grammar accepts single letters only, so
   // the bracket-style previous/next keys land on j/k (both unclaimed by the
-  // default classification bindings t/c/s/e/m/i/n/p/d).
+  // default classification bindings t/c/s/e/m/i/n/p/d/x/v/g).
   const BOOKS_NAVIGATION_COMMANDS = Object.freeze([
     Object.freeze({
       id: "corrections.books.previous-item",
@@ -80,6 +80,13 @@
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const prototype = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
+  }
+
+  function normalizePerspectiveProfile(value) {
+    const source = isPlainObject(value) ? value : {};
+    return Object.freeze({
+      advanceAfterQueue: source.advanceAfterQueue === true,
+    });
   }
 
   function contextIdentifier(value, name, required = false) {
@@ -383,6 +390,49 @@
     return match ? `capture:${match[1]}:display` : "";
   }
 
+  function sameCaptureSlot(left, right) {
+    if (typeof left !== "string" || typeof right !== "string") return false;
+    if (left === right) return true;
+    const leftDisplay = captureLogicalDisplayArtifactId(left);
+    return Boolean(leftDisplay && leftDisplay === captureLogicalDisplayArtifactId(right));
+  }
+
+  function nextCaptureAddress(index, selection, command) {
+    if (!index || !Array.isArray(index.books) ||
+        !selection || !command || typeof command !== "object") return null;
+    const itemId = command.item_id || command.itemId || "";
+    const artifactId = command.artifact_id || command.artifactId || "";
+    if (!itemId || !artifactId || selection.itemId !== itemId ||
+        !sameCaptureSlot(selection.artifactId, artifactId)) return null;
+    const book = index.books.find((candidate) => candidate && candidate.id === itemId);
+    if (!book || !Array.isArray(book.captures)) return null;
+    const captures = [...book.captures].sort((left, right) => {
+      const leftOrder = Number(left && left.capture_order);
+      const rightOrder = Number(right && right.capture_order);
+      if (Number.isFinite(leftOrder) && Number.isFinite(rightOrder) &&
+          leftOrder !== rightOrder) return leftOrder - rightOrder;
+      const leftId = String(left && left.artifact_id || "");
+      const rightId = String(right && right.artifact_id || "");
+      return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+    });
+    const currentIndex = captures.findIndex((capture) =>
+      sameCaptureSlot(capture && capture.artifact_id, artifactId));
+    const next = currentIndex >= 0 ? captures[currentIndex + 1] : null;
+    if (!next || typeof next.artifact_id !== "string" || !next.artifact_id) {
+      return null;
+    }
+    if (typeof deps.captureAddress === "function") {
+      return deps.captureAddress(book, next);
+    }
+    return Object.freeze({
+      itemId: book.id,
+      representationId: next.representation_id || null,
+      canvasId: next.canvas_id || null,
+      artifactId: next.artifact_id,
+      annotationId: null,
+    });
+  }
+
   function isCaptureDisplayArtifactId(value) {
     return captureLogicalDisplayArtifactId(value) === value;
   }
@@ -493,6 +543,7 @@
       this.editorCanvasState = null;
       // In-place region/metadata updater for the mounted editor overlay.
       this.activeOverlayUpdate = null;
+      this.perspectiveProfile = normalizePerspectiveProfile(null);
       this.artifactOverlayProfile = typeof deps.normalizeArtifactOverlayProfile === "function"
         ? deps.normalizeArtifactOverlayProfile(null) : { regionLabels: true };
       this.destroyed = false;
@@ -512,6 +563,10 @@
       this.artifactPorts = options.artifactPorts ||
         desktopCorrections && desktopCorrections.artifacts ||
         this.engineCorrections && this.engineCorrections.artifacts || {};
+      this.itemMetadataApi = this.resolveItemMetadataApi(options);
+      this.itemCommandPort = Object.prototype.hasOwnProperty.call(
+        options, "itemCommandPort",
+      ) ? options.itemCommandPort : this.createBookMetadataCommandPort();
       const invokeCommand = typeof options.invokeCommand === "function"
         ? options.invokeCommand
         : desktopCorrections && typeof desktopCorrections.invokeCommand === "function"
@@ -669,6 +724,8 @@
             : {},
           classification: normalizeClassificationProfile(
             isPlainObject(value) ? value.classification : null),
+          perspective: normalizePerspectiveProfile(
+            isPlainObject(value) ? value.perspective : null),
           artifactOverlay: typeof deps.normalizeArtifactOverlayProfile === "function"
             ? deps.normalizeArtifactOverlayProfile(
               isPlainObject(value) ? value.artifactOverlay : null)
@@ -678,6 +735,9 @@
         }),
       });
       const profile = this.profileStore.load(this.profileKey);
+      this.restorePerspectiveProfile(
+        profile.tools && profile.tools.perspective,
+      );
       this.restoreArtifactOverlayProfile(
         profile.tools && profile.tools.artifactOverlay,
       );
@@ -730,6 +790,109 @@
         options.chPanelFeature || this.createChPanelFeature(options);
     }
 
+    resolveItemMetadataApi(options = {}) {
+      if (Object.prototype.hasOwnProperty.call(options, "itemMetadataApi")) {
+        return options.itemMetadataApi || null;
+      }
+      if (typeof deps.createCorrectionsItemApi !== "function") return null;
+      const fetchImpl = typeof options.fetchImpl === "function"
+        ? options.fetchImpl
+        : this.windowRef && typeof this.windowRef.fetch === "function"
+          ? this.windowRef.fetch.bind(this.windowRef)
+          : typeof fetch === "function" ? fetch.bind(globalThis) : null;
+      return fetchImpl ? deps.createCorrectionsItemApi({ fetchImpl }) : null;
+    }
+
+    createBookMetadataCommandPort() {
+      const api = this.itemMetadataApi;
+      if (!api || typeof api.loadItem !== "function" ||
+          typeof api.updateItem !== "function") return null;
+      return Object.freeze({
+        toggleBookDigitizationCandidate: async ({
+          itemId,
+          operationId,
+          signal,
+        } = {}) => {
+          const item = await api.loadItem({ itemId, signal });
+          const current = item && item.metadata &&
+            item.metadata.digitization_candidate;
+          if (current !== undefined && typeof current !== "boolean") {
+            throw new TypeError(
+              "The selected book has an invalid scan-candidate flag");
+          }
+          const next = current !== true;
+          const mutation = await api.updateItem({
+            itemId,
+            expectedRevision: item.revision,
+            operationId,
+            patch: {
+              title: null,
+              metadata_set: { digitization_candidate: next },
+              metadata_remove: [],
+            },
+            signal,
+          });
+          const saved = mutation && mutation.item;
+          if (!saved || !saved.metadata ||
+              saved.metadata.digitization_candidate !== next) {
+            throw new TypeError(
+              "The scan-candidate update returned an invalid item");
+          }
+          return Object.freeze({
+            ...mutation,
+            digitizationCandidate: next,
+          });
+        },
+      });
+    }
+
+    currentBookCommandTarget() {
+      const itemId = this.state && this.state.selection &&
+        this.state.selection.itemId;
+      const store = this.booksFeature && this.booksFeature.store;
+      const snapshot = store && typeof store.snapshot === "function"
+        ? store.snapshot() : null;
+      const books = snapshot && snapshot.index && snapshot.index.books;
+      const book = itemId && Array.isArray(books)
+        ? books.find((candidate) => candidate && candidate.id === itemId)
+        : null;
+      if (!book) return null;
+      return Object.freeze({
+        key: `book:${book.id}`,
+        objectType: "book",
+        kind: "book",
+        itemId: book.id,
+        id: book.id,
+        label: book.title || book.id,
+        digitizationCandidate: book.digitization_candidate === true,
+      });
+    }
+
+    async refreshBookCommandTarget(_target, detail = {}) {
+      const reason = detail.reason === "conflict"
+        ? "scan-candidate-conflict" : "scan-candidate";
+      const refreshErrors = [];
+      if (this.booksFeature && typeof this.booksFeature.refresh === "function") {
+        try {
+          await this.booksFeature.refresh(reason);
+        } catch (error) {
+          refreshErrors.push(error);
+        }
+      }
+      if (this.itemProperties &&
+          typeof this.itemProperties.refresh === "function") {
+        try {
+          await this.itemProperties.refresh();
+        } catch (error) {
+          refreshErrors.push(error);
+        }
+      }
+      return Object.freeze({
+        target: this.currentBookCommandTarget(),
+        refreshErrors: Object.freeze(refreshErrors),
+      });
+    }
+
     createClassificationFeature(options, profile) {
       if (options.features === false ||
           typeof deps.createClassificationController !== "function") return null;
@@ -740,6 +903,7 @@
         documentRef: this.documentRef,
         windowRef: this.windowRef,
         port: this.artifactPorts && this.artifactPorts.commands,
+        itemPort: this.itemCommandPort,
         bindings: classification.bindings,
         history: options.correctionHistory,
         operationIdFactory: options.correctionOperationIdFactory,
@@ -755,9 +919,19 @@
             : null,
         refreshTarget: (target, detail) =>
           this.refreshClassificationTarget(target, detail),
+        getBookTarget: () => this.currentBookCommandTarget(),
+        refreshBookTarget: (target, detail) =>
+          this.refreshBookCommandTarget(target, detail),
         promoteSoftTarget: (target) => this.promoteClassificationTarget(target),
-        onChanged: (_result, detail) => detail && detail.refreshAttempted
-          ? null : this.refreshClassificationTarget(detail && detail.target, detail),
+        onChanged: (_result, detail) => {
+          if (detail && detail.command &&
+              detail.command.targetKind === "book") {
+            return this.refreshBookCommandTarget(detail.target, detail);
+          }
+          return detail && detail.refreshAttempted
+            ? null
+            : this.refreshClassificationTarget(detail && detail.target, detail);
+        },
         onConflict: (error) => this.setStatus(
           error && error.message ||
             "The classification target changed; its latest revision was loaded",
@@ -1070,15 +1244,7 @@
           typeof deps.createItemMetadataEditor !== "function") return null;
       const propertiesRoot = this.root.querySelector("[data-item-properties]");
       if (!propertiesRoot) return null;
-      let api = options.itemMetadataApi || null;
-      if (!api && typeof deps.createCorrectionsItemApi === "function") {
-        const fetchImpl = typeof options.fetchImpl === "function"
-          ? options.fetchImpl
-          : this.windowRef && typeof this.windowRef.fetch === "function"
-            ? this.windowRef.fetch.bind(this.windowRef)
-            : typeof fetch === "function" ? fetch.bind(globalThis) : null;
-        if (fetchImpl) api = deps.createCorrectionsItemApi({ fetchImpl });
-      }
+      const api = this.itemMetadataApi;
       if (!api) return null;
       return deps.createItemMetadataEditor({
         root: propertiesRoot,
@@ -2000,6 +2166,7 @@
 
     mount() {
       this.bindEditorSelector();
+      this.bindPerspectiveAdvanceToggle();
       this.bindRegionLabelsToggle();
       this.bindLayoutReset();
       this.bindWindowControls();
@@ -2052,13 +2219,55 @@
       return () => this.selectionListeners.delete(listener);
     }
 
-    handleQueuedTransformResult(_result, command, _resource, observation = null) {
+    handleQueuedTransformResult(result, command, _resource, observation = null) {
+      const imageProcessing = Boolean(
+        command && (command.adjustment || command.operations));
       this.setStatus(
-        command && (command.adjustment || command.operations)
-          ? "Image processing queued"
-          : "Perspective transform queued",
+        imageProcessing ? "Image processing queued" : "Perspective transform queued",
       );
+      if (!imageProcessing) this.advanceAfterQueuedPerspective(command);
+      this.reportTransformFailure(result, command, observation);
       return this.refreshCommittedCaptureDisplay(observation, command);
+    }
+
+    advanceAfterQueuedPerspective(command) {
+      if (!this.perspectiveProfile ||
+          this.perspectiveProfile.advanceAfterQueue !== true) return null;
+      const store = this.booksFeature && this.booksFeature.store;
+      const snapshot = store && typeof store.snapshot === "function"
+        ? store.snapshot() : null;
+      const address = nextCaptureAddress(
+        snapshot && snapshot.index,
+        this.state && this.state.selection,
+        command,
+      );
+      if (!address) return null;
+      this.selectAddress(address, {
+        source: "transform-advance",
+        targetKind: "image",
+      });
+      return address;
+    }
+
+    reportTransformFailure(result, command, observation) {
+      if (!observation || observation.imageCommitted === true) return false;
+      const terminalState = observation.terminalState;
+      const stopped = observation.invalidImageCommit === true ||
+        ["cancelled", "failed", "interrupted"].includes(terminalState);
+      if (!stopped) return false;
+      const processing = Boolean(
+        command && (command.adjustment || command.operations));
+      const outcome = terminalState === "cancelled" ? "cancelled" : "failed";
+      const prefix = processing ? `Image processing ${outcome}` :
+        `Perspective transform ${outcome}`;
+      const rawDetail = result && result.failure && result.failure.message;
+      const detail = typeof rawDetail === "string"
+        ? rawDetail.trim().replace(/\s+/g, " ").slice(0, 512) : "";
+      this.setStatus(
+        detail ? `${prefix}: ${detail}` : `${prefix}; source image was not changed`,
+        true,
+      );
+      return true;
     }
 
     async refreshCommittedCaptureDisplay(observation, command = null) {
@@ -2258,6 +2467,7 @@
           if (this.destroyed ||
               typeof this.imageAdjustTool.observeTransformResult !== "function") return;
           const observation = this.imageAdjustTool.observeTransformResult(result, command);
+          this.reportTransformFailure(result, command, observation);
           void this.refreshCommittedCaptureDisplay(observation, command);
         });
         if (typeof release === "function") this.unsubscribeTransformResults = release;
@@ -2370,6 +2580,37 @@
       this.refreshEditorSelector();
     }
 
+    bindPerspectiveAdvanceToggle() {
+      const toggle = this.root.querySelector("[data-perspective-advance-toggle]");
+      this.listen(toggle, "click", () => {
+        const enabled = !(this.perspectiveProfile &&
+          this.perspectiveProfile.advanceAfterQueue === true);
+        this.restorePerspectiveProfile({ advanceAfterQueue: enabled });
+        this.persistProfile({
+          toolUpdates: { perspective: this.perspectiveProfile },
+        });
+      });
+      this.updatePerspectiveAdvanceToggle();
+    }
+
+    updatePerspectiveAdvanceToggle() {
+      const toggle = this.root &&
+        this.root.querySelector("[data-perspective-advance-toggle]");
+      if (!toggle) return;
+      const enabled = Boolean(
+        this.perspectiveProfile && this.perspectiveProfile.advanceAfterQueue);
+      toggle.setAttribute("aria-pressed", String(enabled));
+      toggle.title = enabled
+        ? "Disable advance after transform"
+        : "Enable advance after transform";
+    }
+
+    restorePerspectiveProfile(value) {
+      this.perspectiveProfile = normalizePerspectiveProfile(value);
+      this.updatePerspectiveAdvanceToggle();
+      return this.perspectiveProfile;
+    }
+
     bindRegionLabelsToggle() {
       const toggle = this.root.querySelector("[data-region-labels-toggle]");
       this.listen(toggle, "click", () => {
@@ -2418,6 +2659,7 @@
             typeof this.imageAdjustTool.restoreProfile === "function") {
           this.imageAdjustTool.restoreProfile(null);
         }
+        this.restorePerspectiveProfile(null);
         this.restoreArtifactOverlayProfile(null);
         this.restoreClassificationProfile(null);
         this.refreshEditorSelector();
@@ -2618,6 +2860,9 @@
           typeof this.imageAdjustTool.restoreProfile === "function") {
         this.imageAdjustTool.restoreProfile(profile.tools && profile.tools.imageAdjust);
       }
+      this.restorePerspectiveProfile(
+        profile.tools && profile.tools.perspective,
+      );
       this.restoreArtifactOverlayProfile(
         profile.tools && profile.tools.artifactOverlay,
       );
@@ -2666,6 +2911,9 @@
         this.imageAdjustTool.restoreProfile(
           profile.tools && profile.tools.imageAdjust);
       }
+      this.restorePerspectiveProfile(
+        profile.tools && profile.tools.perspective,
+      );
       this.restoreArtifactOverlayProfile(
         profile.tools && profile.tools.artifactOverlay,
       );
@@ -2680,6 +2928,8 @@
           ? this.imageAdjustTool.serializeProfile()
           : {},
         classification: classificationProfile(this.classificationController),
+        perspective: this.perspectiveProfile ||
+          normalizePerspectiveProfile(null),
         artifactOverlay: this.artifactOverlayProfile ||
           { regionLabels: true },
       };
@@ -3035,7 +3285,9 @@
     correctionsRuntimePorts,
     installAutoBoot,
     navigationOnlyTarget,
+    nextCaptureAddress,
     nextTrayTab,
+    normalizePerspectiveProfile,
     normalizeSelection,
     normalizeWorkbenchContext,
     selectionContext,
