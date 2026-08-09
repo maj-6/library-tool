@@ -851,6 +851,14 @@ test("image selection resolves only display data until full resolution is explic
               quad: [[0, 0], [1, 0], [1, 1], [0, 1]],
             },
           },
+          extensions: {
+            original_backup: {
+              available: true,
+              sha256: "b".repeat(64),
+              bytes: 2048,
+              media_type: "image/jpeg",
+            },
+          },
         });
       },
     },
@@ -867,6 +875,10 @@ test("image selection resolves only display data until full resolution is explic
   }]);
   const display = published.at(-1);
   assert.equal(display.url, "/resource/capture-1-resource/display");
+  assert.equal(display.itemId, "book-1");
+  assert.equal(display.resourceRef.variant, "display");
+  assert.equal(display.extensions.original_backup.available, true);
+  assert.equal(display.extensions.original_backup.sha256, "b".repeat(64));
   assert.equal(typeof display.requestFull, "function");
   assert.equal(display.correction.item_id, "book-1");
   assert.equal(display.correction.artifact_id, "capture-1");
@@ -965,6 +977,123 @@ test("engine-backed images page same-canvas annotations into the editor overlay"
     ["region-1", "region-2"],
   );
 });
+
+
+test("refresh keeps a stable capture selected and reloads mapped regions at its new canvas revision",
+  async () => {
+    let revision = 1;
+    const regionCalls = [];
+    const revoked = [];
+    const stableCapture = () => raster("capture-1", "captured-image", {
+      revision: `capture-1-r${revision}`,
+      resource: {
+        resource_id: "capture-1-resource",
+        revision: `display-resource-r${revision}`,
+        variant: "display",
+      },
+      source: {
+        representation_id: "capture",
+        representation_revision: `capture-r${revision}`,
+        canvas_id: "capture:asset-1",
+        canvas_revision: `canvas-r${revision}`,
+      },
+      extensions: { corrections_ui: { paged_regions: true } },
+    });
+    const region = (id, canvasRevision, coordinateSpace) => ({
+      annotation_id: id,
+      object_type: "spatial-annotation",
+      revision: `${id}-r1`,
+      source: {
+        representation_id: "capture",
+        representation_revision: `capture-r${revision}`,
+        canvas_id: "capture:asset-1",
+        canvas_revision: canvasRevision,
+      },
+      selector: {
+        type: "polygon",
+        coordinate_space: coordinateSpace,
+        coordinate_space_revision: canvasRevision,
+        points: [
+          { x: 0.1, y: 0.1 },
+          { x: 0.4, y: 0.1 },
+          { x: 0.4, y: 0.3 },
+        ],
+      },
+      linked_artifact_ids: ["capture-1"],
+    });
+    const { feature, published } = harness({
+      initialExpandedGroups: ["source-images"],
+      catalog: {
+        async list() { return { items: [stableCapture()] }; },
+        async get() { return stableCapture(); },
+      },
+      resources: {
+        async resolveRaster({ resourceRef }) {
+          return {
+            url: `/safe/${resourceRef.revision}.jpg`,
+            revoke: () => revoked.push(resourceRef.revision),
+          };
+        },
+        async listRegions({
+          representationId, canvasId, canvasRevision, cursor, limit,
+        }) {
+          regionCalls.push({
+            representationId, canvasId, canvasRevision, cursor, limit,
+          });
+          return {
+            items: canvasRevision === "canvas-r2"
+              ? [region(
+                "mapped-region",
+                "canvas-r2",
+                "corrected-output-normalized",
+              )]
+              : [region("source-region", "canvas-r1", "canvas-normalized")],
+            nextCursor: null,
+          };
+        },
+      },
+    });
+
+    await feature.setContext({ item_id: "book-1" });
+    await feature.select("artifact:capture-1");
+    assert.equal(published.at(-1).regions[0].annotation_id, "source-region");
+
+    revision = 2;
+    await feature.refresh({
+      preserveSelection: true,
+      reason: "transform-committed",
+    });
+
+    assert.equal(feature.selectedKey, "artifact:capture-1");
+    assert.equal(feature.currentResource.summary.revision, "capture-1-r2");
+    assert.equal(feature.currentResource.url, "/safe/display-resource-r2.jpg");
+    assert.deepEqual(revoked, ["display-resource-r1"]);
+    assert.deepEqual(regionCalls, [
+      {
+        representationId: "capture",
+        canvasId: "capture:asset-1",
+        canvasRevision: "canvas-r1",
+        cursor: null,
+        limit: 200,
+      },
+      {
+        representationId: "capture",
+        canvasId: "capture:asset-1",
+        canvasRevision: "canvas-r2",
+        cursor: null,
+        limit: 200,
+      },
+    ]);
+    assert.equal(
+      feature.currentResource.regions[0].annotation_id,
+      "mapped-region",
+    );
+    assert.equal(
+      feature.currentResource.regions[0].selector.coordinate_space,
+      "corrected-output-normalized",
+    );
+    feature.destroy();
+  });
 
 
 test("paged image regions do not delay the resolved display resource", async () => {

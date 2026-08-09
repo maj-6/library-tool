@@ -148,15 +148,41 @@ class CorrectionAggregateProjector:
         self._spatial_annotations = spatial_annotations
 
     def project(self, item_id: str) -> CorrectionAggregateSnapshot:
+        return self.project_values(
+            item_id,
+            self._raster_artifacts.list_raster_artifacts(item_id),
+            self._spatial_annotations.list_spatial_annotations(item_id),
+        )
+
+    @staticmethod
+    def project_values(
+        item_id: str,
+        raster_values: Sequence[RasterArtifactView],
+        annotation_values: Sequence[SpatialAnnotationView],
+    ) -> CorrectionAggregateSnapshot:
+        """Project an already-coherent base snapshot.
+
+        Publication paths use this to reconcile a staged raster and its staged
+        geometry before either is visible on disk. Callers own the read lock
+        that makes the supplied values one coherent snapshot.
+        """
+
+        if isinstance(raster_values, (str, bytes)) or not isinstance(
+            raster_values,
+            Sequence,
+        ):
+            raise TypeError("raster_values must be a sequence")
+        if isinstance(annotation_values, (str, bytes)) or not isinstance(
+            annotation_values,
+            Sequence,
+        ):
+            raise TypeError("annotation_values must be a sequence")
         rasters = tuple(
-            sorted(
-                self._raster_artifacts.list_raster_artifacts(item_id),
-                key=lambda value: value.key.artifact_id,
-            )
+            sorted(raster_values, key=lambda value: value.key.artifact_id)
         )
         annotations = tuple(
             sorted(
-                self._spatial_annotations.list_spatial_annotations(item_id),
+                annotation_values,
                 key=lambda value: value.key.annotation_id,
             )
         )
@@ -564,6 +590,63 @@ class CorrectionProjectionService(
             for value in values
         )
 
+    def raster_revision_for_publication(
+        self,
+        value: RasterArtifactView,
+        replacement_annotations: Sequence[SpatialAnnotationView],
+    ) -> str:
+        """Return the public revision for one staged raster/canvas snapshot."""
+
+        if not isinstance(value, RasterArtifactView):
+            raise TypeError("value must be a RasterArtifactView")
+        if isinstance(replacement_annotations, (str, bytes)) or not isinstance(
+            replacement_annotations,
+            Sequence,
+        ):
+            raise TypeError("replacement_annotations must be a sequence")
+        item_id = value.key.item_id
+        canvas_identity = (
+            value.source.representation_id,
+            value.source.canvas_id,
+        )
+        with self._repository.unit_of_work(
+            operation_id=_QUERY_OPERATION_ID
+        ) as unit:
+            rasters = tuple(self._raster_artifacts.list_raster_artifacts(item_id))
+            if not any(candidate.key == value.key for candidate in rasters):
+                raise RepositoryError(
+                    "the prospective raster does not replace a live target",
+                    code="invalid_correction_base_projection",
+                    details=value.key.as_dict(),
+                )
+            prospective_rasters = tuple(
+                value if candidate.key == value.key else candidate
+                for candidate in rasters
+            )
+            current_annotations = tuple(
+                self._spatial_annotations.list_spatial_annotations(item_id)
+            )
+            prospective_annotations = (
+                *(
+                    candidate
+                    for candidate in current_annotations
+                    if (
+                        candidate.source.representation_id,
+                        candidate.source.canvas_id,
+                    )
+                    != canvas_identity
+                    or candidate.provenance.origin not in {"ocr", "transform"}
+                ),
+                *replacement_annotations,
+            )
+            live = CorrectionAggregateProjector.project_values(
+                item_id,
+                prospective_rasters,
+                prospective_annotations,
+            )
+            aggregate = self._state(unit.reconcile_live(live), item_id)
+        return self._overlay_raster(value, aggregate).revision
+
     @staticmethod
     def _overlay_raster(
         value: RasterArtifactView,
@@ -819,6 +902,46 @@ class CorrectionProjectionService(
         if not callable(resolver):
             return None
         return resolver(item_id, artifact_id)
+
+    def resolve_original_backup(
+        self,
+        item_id: str,
+        artifact_id: str,
+        expected_revision: str,
+    ) -> Any:
+        resolver = getattr(
+            self._raster_artifacts,
+            "resolve_original_backup",
+            None,
+        )
+        if not callable(resolver):
+            return None
+        return resolver(item_id, artifact_id, expected_revision)
+
+    def restore_original_backup(
+        self,
+        item_id: str,
+        artifact_id: str,
+        expected_revision: str,
+        operation_id: str,
+    ) -> Mapping[str, Any]:
+        restore = getattr(
+            self._raster_artifacts,
+            "restore_original_backup",
+            None,
+        )
+        if not callable(restore):
+            raise RepositoryError(
+                "the original backup store is unavailable",
+                code="capture_original_backup_unavailable",
+                retryable=True,
+            )
+        return restore(
+            item_id,
+            artifact_id,
+            expected_revision,
+            operation_id,
+        )
 
 
 __all__ = [

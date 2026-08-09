@@ -39,6 +39,12 @@ from librarytool.engine.capture_archives import (  # noqa: E402
     capture_book_id,
 )
 from librarytool.engine.errors import EngineError  # noqa: E402
+from librarytool.adapters.filesystem.corrections_artifact_repository import (  # noqa: E402
+    _AuthorityDirectorySnapshot,
+    _AuthoritySnapshot,
+    _finish_verified_regular,
+    _open_verified_regular,
+)
 
 
 _PHOTO_ASSETS_SCHEMA = "org.whl.bookcapture.photo-assets"
@@ -89,6 +95,13 @@ _PRIVATE_LOCATOR_KEYS = frozenset(
         "url",
         "workspace_path",
     }
+)
+_ORIGINAL_BACKUP_FIELDS = frozenset(
+    {"version", "store", "key", "sha256", "bytes", "media_type"}
+)
+_ORIGINAL_BACKUP_STORE = "output-originals-sha256"
+_ORIGINAL_BACKUP_MEDIA_TYPES = frozenset(
+    {"image/jpeg"}
 )
 _PRIVATE_LOCATOR_SUFFIXES = frozenset(
     {"file", "filename", "filepath", "locator", "path", "ref", "reference", "uri", "url"}
@@ -342,6 +355,160 @@ def _read_regular(path: Path, *, maximum: int, artifact: str) -> bytes:
     except FileNotFoundError:
         raise
     except OSError as exc:
+        raise ValueError(f"{artifact} could not be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _confined_authority_snapshot(
+    authority_root: Path,
+    confined_root: Path,
+    path: Path,
+    *,
+    artifact: str,
+) -> _AuthoritySnapshot:
+    """Snapshot every directory identity from an authority root to a file."""
+
+    authority_root = Path(authority_root)
+    confined_root = Path(confined_root)
+    path = Path(path)
+    if not authority_root.is_absolute():
+        raise ValueError(f"{artifact} authority root must be absolute")
+    try:
+        confined_root.relative_to(authority_root)
+        path.relative_to(confined_root)
+        relative = path.relative_to(authority_root)
+    except ValueError as exc:
+        raise ValueError(f"{artifact} escapes its confined store") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"{artifact} has an unsafe confined path")
+
+    try:
+        named_root = authority_root.lstat()
+        resolved_root = authority_root.resolve(strict=True)
+        if (
+            not stat.S_ISDIR(named_root.st_mode)
+            or _is_redirecting_path(authority_root)
+        ):
+            raise ValueError(f"{artifact} authority root is redirecting or invalid")
+
+        directories: list[_AuthorityDirectorySnapshot] = []
+        current = authority_root
+        for part in relative.parts[:-1]:
+            current /= part
+            named = current.lstat()
+            if not stat.S_ISDIR(named.st_mode) or _is_redirecting_path(current):
+                raise ValueError(
+                    f"{artifact} authority redirects through an invalid directory"
+                )
+            current.resolve(strict=True).relative_to(resolved_root)
+            directories.append(_AuthorityDirectorySnapshot(current, named))
+        confined_root.resolve(strict=True).relative_to(resolved_root)
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"{artifact} authority is unavailable") from exc
+    return _AuthoritySnapshot(
+        authority_root,
+        named_root,
+        tuple(directories),
+    )
+
+
+def _same_confined_authority(
+    before: _AuthoritySnapshot,
+    after: _AuthoritySnapshot,
+) -> bool:
+    """Compare replacement-sensitive identities without rejecting child churn."""
+
+    if before.root != after.root or not os.path.samestat(
+        before.named_root,
+        after.named_root,
+    ):
+        return False
+    if _authority_stat_identity(before.named_root) != _authority_stat_identity(
+        after.named_root
+    ):
+        return False
+    if len(before.directories) != len(after.directories):
+        return False
+    for expected, actual in zip(
+        before.directories,
+        after.directories,
+        strict=True,
+    ):
+        if (
+            expected.path != actual.path
+            or expected.named is None
+            or actual.named is None
+            or not os.path.samestat(expected.named, actual.named)
+            or _authority_stat_identity(expected.named)
+            != _authority_stat_identity(actual.named)
+        ):
+            return False
+    return True
+
+
+def _read_confined_regular(
+    path: Path,
+    *,
+    authority_root: Path,
+    confined_root: Path,
+    maximum: int,
+    artifact: str,
+) -> bytes:
+    """Read one private file while pinning its complete authority chain."""
+
+    descriptor = -1
+    try:
+        authority = _confined_authority_snapshot(
+            authority_root,
+            confined_root,
+            path,
+            artifact=artifact,
+        )
+        named_before = path.lstat()
+        if (
+            not stat.S_ISREG(named_before.st_mode)
+            or named_before.st_nlink != 1
+            or _is_redirecting_path(path)
+            or named_before.st_size > maximum
+        ):
+            raise ValueError(f"{artifact} is not a bounded private regular file")
+        descriptor, opened_before = _open_verified_regular(
+            path,
+            named_before,
+            authority=authority,
+        )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1 << 20, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise ValueError(f"{artifact} exceeds its size limit")
+        _finish_verified_regular(
+            path,
+            descriptor,
+            named_before=named_before,
+            opened_before=opened_before,
+        )
+        after = _confined_authority_snapshot(
+            authority_root,
+            confined_root,
+            path,
+            artifact=artifact,
+        )
+        if not _same_confined_authority(authority, after):
+            raise ValueError(f"{artifact} authority changed while it was read")
+        return b"".join(chunks)
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
         raise ValueError(f"{artifact} could not be read safely") from exc
     finally:
         if descriptor >= 0:
@@ -736,6 +903,95 @@ def _desktop_import_rows(
     return rows
 
 
+def _capture_image_reference(
+        directory: Path, reference: Any, *, artifact: str) -> Path:
+    if (
+        not isinstance(reference, str)
+        or not reference
+        or reference in {".", ".."}
+        or "/" in reference
+        or "\\" in reference
+        or Path(reference).name != reference
+    ):
+        raise ValueError(f"{artifact} has an invalid local reference")
+    return directory / reference
+
+
+def _cold_original_bytes(
+        directory: Path, imported: Mapping[str, Any],
+        original: Mapping[str, Any], *, index: int) -> bytes:
+    """Read one explicitly requested original from live or cold storage."""
+
+    raw_ref = imported.get("raw_ref")
+    marker = imported.get("original_backup")
+    if "raw_ref" in imported:
+        if marker is not None:
+            raise ValueError(
+                f"photo asset {index} has both live and backed-up originals")
+        if not raw_ref:
+            raise ValueError(
+                f"photo asset {index} has an invalid live original reference"
+            )
+        return _read_regular(
+            _capture_image_reference(
+                directory,
+                raw_ref,
+                artifact=f"photo asset {index} original",
+            ),
+            maximum=_MAX_CAPTURE_RESOURCE_BYTES,
+            artifact=f"capture original {index}",
+        )
+    source_sha256 = _required_checksum(
+        imported.get("source_checksum") or original.get("sha256"),
+        artifact=f"photo asset {index} original",
+    )
+    for anchor in (imported.get("source_checksum"), original.get("sha256")):
+        if anchor not in (None, "") and _required_checksum(
+            anchor,
+            artifact=f"photo asset {index} original",
+        ) != source_sha256:
+            raise ValueError(
+                f"photo asset {index} original checksums disagree"
+            )
+    if (
+        not isinstance(marker, Mapping)
+        or set(marker) != _ORIGINAL_BACKUP_FIELDS
+        or marker.get("version") != 1
+        or isinstance(marker.get("version"), bool)
+        or marker.get("store") != _ORIGINAL_BACKUP_STORE
+        or marker.get("sha256") != source_sha256
+        or marker.get("key") != f"sha256:{source_sha256}"
+        or marker.get("media_type") not in _ORIGINAL_BACKUP_MEDIA_TYPES
+        or isinstance(marker.get("bytes"), bool)
+        or not isinstance(marker.get("bytes"), int)
+        or marker["bytes"] <= 0
+        or marker["bytes"] > _MAX_CAPTURE_RESOURCE_BYTES
+    ):
+        raise ValueError(f"photo asset {index} has an invalid original backup")
+    data_root = directory.parent.parent
+    backup_root = data_root / "output" / "backups" / "originals"
+    backup_path = (
+        backup_root
+        / "v1"
+        / "sha256"
+        / source_sha256[:2]
+        / source_sha256[2:]
+    )
+    original_bytes = _read_confined_regular(
+        backup_path,
+        authority_root=data_root,
+        confined_root=backup_root,
+        maximum=_MAX_CAPTURE_RESOURCE_BYTES,
+        artifact=f"capture original backup {index}",
+    )
+    if (
+        len(original_bytes) != marker["bytes"]
+        or _digest(original_bytes) != source_sha256
+    ):
+        raise ValueError(f"photo asset {index} original backup is corrupt")
+    return original_bytes
+
+
 def _asset_evidence(
     *,
     index: int,
@@ -983,6 +1239,8 @@ def _portable_photo_assets(
                                     "display_ref",
                                     "source_checksum",
                                     "derivative_checksum",
+                                    "original_backup",
+                                    "active_desktop_correction_id",
                                 }
                             },
                             artifact=(
@@ -1280,27 +1538,28 @@ def build_capture_archive_source(
         raise ValueError("capture entry identity does not match its asset directory")
     directory = Path(capture_directory)
     directory_snapshot = _capture_directory_snapshot(directory)
-    originals, displays = _numbered_images(directory, directory_snapshot)
-    pairs = []
-    total_image_bytes = 0
-    for index in sorted(originals):
-        original = _read_regular(
-            originals[index],
-            maximum=_MAX_CAPTURE_RESOURCE_BYTES,
-            artifact=f"capture original {index}",
-        )
-        display = _read_regular(
-            displays[index],
-            maximum=_MAX_CAPTURE_RESOURCE_BYTES,
-            artifact=f"capture display {index}",
-        )
-        total_image_bytes += len(original) + len(display)
-        if total_image_bytes > _MAX_CAPTURE_TOTAL_BYTES:
-            raise ValueError("capture image resources exceed their total size limit")
-        pairs.append((index, original, display))
-
     photo_assets = _optional_json(directory, "photo_assets.json")
+    pairs: list[tuple[int, bytes, bytes]] = []
+    total_image_bytes = 0
     if photo_assets is None:
+        originals, displays = _numbered_images(directory, directory_snapshot)
+        for index in sorted(originals):
+            original = _read_regular(
+                originals[index],
+                maximum=_MAX_CAPTURE_RESOURCE_BYTES,
+                artifact=f"capture original {index}",
+            )
+            display = _read_regular(
+                displays[index],
+                maximum=_MAX_CAPTURE_RESOURCE_BYTES,
+                artifact=f"capture display {index}",
+            )
+            total_image_bytes += len(original) + len(display)
+            if total_image_bytes > _MAX_CAPTURE_TOTAL_BYTES:
+                raise ValueError(
+                    "capture image resources exceed their total size limit"
+                )
+            pairs.append((index, original, display))
         photo_assets = _legacy_photo_assets(capture_id, pairs)
     if (
         photo_assets.get("schema") != _PHOTO_ASSETS_SCHEMA
@@ -1308,8 +1567,59 @@ def build_capture_archive_source(
         or str(photo_assets.get("capture_id") or "") != capture_id
     ):
         raise ValueError("photo_assets.json does not describe this capture")
-    asset_rows = _asset_rows(photo_assets, count=len(pairs))
+    assets = photo_assets.get("assets")
+    count = len(assets) if isinstance(assets, list) else 0
+    asset_rows = _asset_rows(photo_assets, count=count or len(pairs))
     import_rows = _desktop_import_rows(photo_assets, asset_rows=asset_rows)
+    if not pairs:
+        for index in sorted(asset_rows):
+            asset = asset_rows[index]
+            imported = import_rows.get(index)
+            original_record = asset.get("original")
+            display_record = asset.get("display")
+            assert isinstance(original_record, Mapping)
+            assert isinstance(display_record, Mapping)
+            if imported is None:
+                original = _read_regular(
+                    directory / f"orig_{index}.jpg",
+                    maximum=_MAX_CAPTURE_RESOURCE_BYTES,
+                    artifact=f"capture original {index}",
+                )
+                display_ref = asset.get("capture_file")
+            else:
+                original = _cold_original_bytes(
+                    directory,
+                    imported,
+                    original_record,
+                    index=index,
+                )
+                display_ref = imported.get("display_ref")
+                try:
+                    _capture_image_reference(
+                        directory,
+                        display_ref,
+                        artifact=f"photo asset {index} display",
+                    )
+                except ValueError:
+                    # Older import evidence sometimes retained an absolute
+                    # diagnostic locator. The canonical capture_file remains
+                    # the confined local rendition in that contract.
+                    display_ref = asset.get("capture_file")
+            display = _read_regular(
+                _capture_image_reference(
+                    directory,
+                    display_ref or asset.get("capture_file"),
+                    artifact=f"photo asset {index} display",
+                ),
+                maximum=_MAX_CAPTURE_RESOURCE_BYTES,
+                artifact=f"capture display {index}",
+            )
+            total_image_bytes += len(original) + len(display)
+            if total_image_bytes > _MAX_CAPTURE_TOTAL_BYTES:
+                raise ValueError(
+                    "capture image resources exceed their total size limit"
+                )
+            pairs.append((index, original, display))
     asset_evidence = {
         index: _asset_evidence(
             index=index,

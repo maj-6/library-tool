@@ -394,12 +394,35 @@ def open_filesystem_engine(
         raise TypeError("contribute_modules must be callable")
 
     write_set = RecoverableWriteSet(config.workspace_root)
+    corrections_write_set: RecoverableWriteSet | None = None
+    if (
+        bindings.corrections is not None
+        and bindings.corrections.transaction_root is not None
+    ):
+        configured_root = bindings.corrections.transaction_root.resolve()
+        corrections_write_set = (
+            write_set
+            if configured_root == write_set.root
+            else RecoverableWriteSet(configured_root)
+        )
     lease = WorkspaceSessionLease.acquire(write_set)
     try:
         job_history_path = _safe_job_history_path(write_set, config)
-        with write_set.recovery_lease():
-            with bindings.recovery_lock_context():
-                recovery_results = write_set.recover_all()
+        if corrections_write_set is None or corrections_write_set is write_set:
+            with write_set.recovery_lease():
+                with bindings.recovery_lock_context():
+                    recovery_results = write_set.recover_all()
+        else:
+            # Runtime mutation follows this same lock order: the engine
+            # workspace coordinates readers, then the broader corrections
+            # write-set spans output backups and live captures.
+            with write_set.recovery_lease():
+                with corrections_write_set.recovery_lease():
+                    with bindings.recovery_lock_context():
+                        recovery_results = (
+                            *corrections_write_set.recover_all(),
+                            *write_set.recover_all(),
+                        )
 
         jobs = JobManager(
             FilesystemJobHistoryRepository(
@@ -422,6 +445,7 @@ def open_filesystem_engine(
                 workspace_lock_context_for=(
                     bindings.workspace_lock_context_for
                 ),
+                corrections_write_set=corrections_write_set,
             ),
             catalogue=bindings.catalogue,
             replica=bindings.replica,

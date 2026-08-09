@@ -16,6 +16,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import hmac
+import io
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from typing import (
     BinaryIO,
     ContextManager,
     Protocol,
+    TYPE_CHECKING,
     TypeAlias,
     runtime_checkable,
 )
@@ -73,6 +75,9 @@ from ...engine.spatial_annotations import (
     project_legacy_rectangle_annotation,
 )
 from .recoverable_write_set import RecoverableWriteSet, _is_redirecting_path
+
+if TYPE_CHECKING:
+    from .capture_original_backups import OriginalBackupDescriptor
 
 
 ItemExists: TypeAlias = Callable[[str], bool]
@@ -887,6 +892,7 @@ class _CaptureAssetRecord:
     original_valid: bool
     display_valid: bool
     imported_at: str
+    original_backup: OriginalBackupDescriptor | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3377,7 +3383,9 @@ class FilesystemCorrectionsArtifactRepository(
                 or display.get("reference")
             )
             original_state, original_identity = (
-                self._capture_index_resource_state(
+                (ResourceState.AVAILABLE, None)
+                if record.original_backup is not None
+                else self._capture_index_resource_state(
                     item_id,
                     directory,
                     original_ref,
@@ -3437,14 +3445,24 @@ class FilesystemCorrectionsArtifactRepository(
                 imported.get("derivative_checksum")
                 or display.get("sha256")
             )
-            if authority_hints is not None and display_sha256:
+            if authority_hints is not None:
                 authority_hints[artifact_id.casefold()] = {
                     "artifact_id": artifact_id,
-                    "source_revision": f"bytes:{display_sha256}",
+                    "source_revision": (
+                        f"bytes:{display_sha256}" if display_sha256 else ""
+                    ),
                     "source_sha256": display_sha256,
                     "representation_id": "capture",
                     "representation_revision": representation_revision,
                     "canvas_id": namespace,
+                    # Private current-state pins consumed only by the
+                    # composition union. They must never enter public hints.
+                    "original_backed_up": record.original_backup is not None,
+                    "active_operation_id": (
+                        imported.get("active_desktop_correction_id", "")
+                        if record.original_backup is not None
+                        else ""
+                    ),
                 }
             assignments = self._capture_assignments(
                 item_id,
@@ -3543,6 +3561,33 @@ class FilesystemCorrectionsArtifactRepository(
                 field=field,
             )
 
+    @staticmethod
+    def _capture_original_backup(
+        item_id: str,
+        *,
+        original: Mapping[str, Any],
+        imported: Mapping[str, Any],
+    ) -> OriginalBackupDescriptor | None:
+        """Validate one explicit cold-original marker without resolving it."""
+
+        # Import lazily: the backup store reuses this module's verified-stream
+        # primitives, so a module-level import would make the two adapters
+        # initialize circularly.
+        from .capture_original_backups import parse_original_backup_marker
+
+        try:
+            if "original_backup" in imported and "raw_ref" in imported:
+                raise ValueError("raw_ref and original_backup are exclusive")
+            return parse_original_backup_marker(imported, original)
+        except ValueError as exc:
+            raise _repository_error(
+                "a desktop original backup marker is invalid",
+                code="invalid_capture_photo_assets",
+                item_id=item_id,
+                section="capture",
+                field="desktop_import.assets.original_backup",
+            ) from exc
+
     def _capture_manifest_records(
         self,
         item_id: str,
@@ -3635,6 +3680,12 @@ class FilesystemCorrectionsArtifactRepository(
             display_valid = isinstance(display_value, Mapping)
             original = original_value if original_valid else {}
             display = display_value if display_valid else {}
+            imported = import_rows.get(asset_id, {})
+            original_backup = self._capture_original_backup(
+                item_id,
+                original=original,
+                imported=imported,
+            )
             seen_assets.add(asset_id)
             seen_orders.add(order)
             namespace = _opaque_identity("capture", capture_id, asset_id)
@@ -3645,20 +3696,40 @@ class FilesystemCorrectionsArtifactRepository(
                     order=order,
                     original=original,
                     display=display,
-                    imported=import_rows.get(asset_id, {}),
+                    imported=imported,
                     namespace=namespace,
                     original_id=f"{namespace}:original",
                     display_id=f"{namespace}:display",
                     original_valid=original_valid,
                     display_valid=display_valid,
                     imported_at=imported_at,
+                    original_backup=original_backup,
                 )
             )
             manifest_source.append(
                 {
                     "asset_id": asset_id,
-                    "sha256": original.get("sha256"),
-                    "revision": original.get("revision"),
+                    "original": {
+                        "sha256": original.get("sha256"),
+                        "revision": original.get("revision"),
+                    },
+                    # Display replacement is a representation change even
+                    # though the immutable original source stays pinned. Keep
+                    # the complete Android display record plus the desktop
+                    # fields which select the effective local derivative.
+                    "display": display,
+                    # Backup availability and the active correction pointer
+                    # are public metadata, not raster-source authority. The
+                    # artifact's safe extensions and the index's full import
+                    # payload still invalidate their public revisions. Keeping
+                    # them out of this source revision lets a display head
+                    # published in the same transaction remain pinned to
+                    # unchanged base bytes.
+                    "desktop_display": {
+                        "reference": imported.get("display_ref"),
+                        "sha256": imported.get("derivative_checksum"),
+                        "recipe": imported.get("recipe"),
+                    },
                 }
             )
         return (
@@ -3678,6 +3749,9 @@ class FilesystemCorrectionsArtifactRepository(
         manifest: Mapping[str, Any],
         *,
         artifact_id: str = "",
+        display_observation_overrides: (
+            Mapping[str, _ResourceObservation] | None
+        ) = None,
     ) -> tuple[
         tuple[RasterArtifactView, ...],
         tuple[SpatialAnnotationView, ...],
@@ -3691,6 +3765,10 @@ class FilesystemCorrectionsArtifactRepository(
                 record
                 for record in records
                 if artifact_id in {record.original_id, record.display_id}
+                and not (
+                    record.original_backup is not None
+                    and artifact_id == record.original_id
+                )
             )
         values: list[RasterArtifactView] = []
         spatial: list[SpatialAnnotationView] = []
@@ -3705,10 +3783,15 @@ class FilesystemCorrectionsArtifactRepository(
             original_valid = record.original_valid
             display_valid = record.display_valid
             imported_at = record.imported_at
+            original_backup = record.original_backup
             original_ref = imported.get("raw_ref") or original.get("reference")
             display_ref = imported.get("display_ref") or display.get("reference")
-            original_sha = _sha256(
-                imported.get("source_checksum") or original.get("sha256")
+            original_sha = (
+                original_backup.sha256
+                if original_backup is not None
+                else _sha256(
+                    imported.get("source_checksum") or original.get("sha256")
+                )
             )
             display_sha = _sha256(
                 imported.get("derivative_checksum") or display.get("sha256")
@@ -3716,7 +3799,7 @@ class FilesystemCorrectionsArtifactRepository(
             original_id = record.original_id
             display_id = record.display_id
             canvas_id = record.namespace
-            original_observation = (
+            original_observation = None if original_backup is not None else (
                 self._observe_resource(
                     item_id,
                     directory,
@@ -3744,6 +3827,15 @@ class FilesystemCorrectionsArtifactRepository(
                 )
             )
             display_observation = (
+                display_observation_overrides.get(display_id)
+                if (
+                    display_observation_overrides is not None
+                    and display_id in display_observation_overrides
+                )
+                else None
+            )
+            if display_observation is None:
+                display_observation = (
                 self._observe_resource(
                     item_id,
                     directory,
@@ -3758,6 +3850,7 @@ class FilesystemCorrectionsArtifactRepository(
                     orientation=(
                         1
                         if imported
+                        and imported.get("recipe") != "camera-original"
                         else _orientation(display.get("orientation"))
                     ),
                     section="capture",
@@ -3773,25 +3866,29 @@ class FilesystemCorrectionsArtifactRepository(
                     height=None,
                     orientation=1,
                 )
-            )
-            original_source = RasterSourceRef(
-                "capture",
-                representation_revision,
-                canvas_id,
-                _digest_revision(
-                    "canvas",
-                    {
-                        "asset_id": asset_id,
-                        "rendition": "original",
-                        "record_revision": original.get("revision"),
-                        "content_sha256": (
-                            original_observation.content_sha256
-                        ),
-                        "dimensions": (
-                            original_observation.dimensions.as_dict()
-                        ),
-                    },
-                ),
+                )
+            original_source = (
+                RasterSourceRef(
+                    "capture",
+                    representation_revision,
+                    canvas_id,
+                    _digest_revision(
+                        "canvas",
+                        {
+                            "asset_id": asset_id,
+                            "rendition": "original",
+                            "record_revision": original.get("revision"),
+                            "content_sha256": (
+                                original_observation.content_sha256
+                            ),
+                            "dimensions": (
+                                original_observation.dimensions.as_dict()
+                            ),
+                        },
+                    ),
+                )
+                if original_observation is not None
+                else None
             )
             display_source = RasterSourceRef(
                 "capture",
@@ -3824,32 +3921,38 @@ class FilesystemCorrectionsArtifactRepository(
                 provider_id="android",
                 model="bookcapture",
             )
-            original_view = self._capture_view(
-                item_id,
-                artifact_id=original_id,
-                kind="captured-image",
-                observation=original_observation,
-                source=original_source,
-                label=f"Capture {order} original",
-                freshness=self._capture_freshness(
-                    raw,
-                    original_observation,
-                ),
-                assignments=assignments,
-                provenance=provenance,
-                lineage=(),
-                extensions={
-                    "capture_order": order,
-                    "legacy_capture": legacy_capture,
-                    **({"imported_at": imported_at} if imported_at else {}),
-                    "corrections_ui": {"annotation_frame": "canvas"},
-                    "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
-                    "rendition": _unknown_fields(
-                        original,
-                        _PHOTO_RENDITION_FIELDS,
+            original_view = None
+            if original_observation is not None and original_source is not None:
+                original_view = self._capture_view(
+                    item_id,
+                    artifact_id=original_id,
+                    kind="captured-image",
+                    observation=original_observation,
+                    source=original_source,
+                    label=f"Capture {order} original",
+                    freshness=self._capture_freshness(
+                        raw,
+                        original_observation,
                     ),
-                },
-            )
+                    assignments=assignments,
+                    provenance=provenance,
+                    lineage=(),
+                    extensions={
+                        "capture_order": order,
+                        "legacy_capture": legacy_capture,
+                        **(
+                            {"imported_at": imported_at}
+                            if imported_at
+                            else {}
+                        ),
+                        "corrections_ui": {"annotation_frame": "canvas"},
+                        "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
+                        "rendition": _unknown_fields(
+                            original,
+                            _PHOTO_RENDITION_FIELDS,
+                        ),
+                    },
+                )
             display_lineage = (
                 (
                     RasterLineageRef(
@@ -3858,7 +3961,11 @@ class FilesystemCorrectionsArtifactRepository(
                         "derived_from",
                     ),
                 )
-                if original_observation.state is ResourceState.AVAILABLE
+                if (
+                    original_view is not None
+                    and original_observation is not None
+                    and original_observation.state is ResourceState.AVAILABLE
+                )
                 else ()
             )
             recipe = _public_text(
@@ -3949,9 +4056,10 @@ class FilesystemCorrectionsArtifactRepository(
             display_view = self._capture_view(
                 item_id,
                 artifact_id=display_id,
-                # The display is the stable, user-facing capture slot. Its
-                # recipe/provenance may advance, but moving it between public
-                # buckets would invalidate navigation and editor deep links.
+                # The display is the stable logical capture slot. Processing
+                # changes its bytes and revision, while immutable ctr-* history
+                # remains in the processed group; the capture itself must not
+                # jump groups and break an open editor/deep link.
                 kind="captured-image",
                 observation=display_observation,
                 source=display_source,
@@ -3968,6 +4076,21 @@ class FilesystemCorrectionsArtifactRepository(
                     "legacy_capture": legacy_capture,
                     **({"imported_at": imported_at} if imported_at else {}),
                     "recipe": recipe,
+                    **(
+                        {
+                            "original_backup": (
+                                {
+                                    **original_backup.as_public_dict(),
+                                    "restore_available": (
+                                        "active_desktop_correction_id"
+                                        in imported
+                                    ),
+                                }
+                            )
+                        }
+                        if original_backup is not None
+                        else {}
+                    ),
                     "corrections_ui": {"annotation_frame": "canvas"},
                     "android": _unknown_fields(raw, _PHOTO_ASSET_FIELDS),
                     "rendition": _unknown_fields(
@@ -3981,21 +4104,130 @@ class FilesystemCorrectionsArtifactRepository(
                     ),
                 },
             )
-            values.extend((original_view, display_view))
-            for view, observation in (
-                (original_view, original_observation),
-                (display_view, display_observation),
-            ):
-                if view.resource is not None and observation.resolved is not None:
+            if original_view is not None and original_observation is not None:
+                values.append(original_view)
+                if (
+                    original_view.resource is not None
+                    and original_observation.resolved is not None
+                ):
                     resources[
                         (
-                            view.resource.resource_id,
-                            view.resource.revision,
-                            view.resource.variant,
+                            original_view.resource.resource_id,
+                            original_view.resource.revision,
+                            original_view.resource.variant,
                         )
-                    ] = observation.resolved
+                    ] = original_observation.resolved
+            values.append(display_view)
+            if (
+                display_view.resource is not None
+                and display_observation.resolved is not None
+            ):
+                resources[
+                    (
+                        display_view.resource.resource_id,
+                        display_view.resource.revision,
+                        display_view.resource.variant,
+                    )
+                ] = display_observation.resolved
             spatial.extend(geometry_values)
         return tuple(values), tuple(spatial), resources
+
+    def capture_display_projection_for_publication(
+        self,
+        item_id: str,
+        capture_id: str,
+        artifact_id: str,
+        manifest: Mapping[str, Any],
+        content: bytes,
+    ) -> tuple[RasterArtifactView, tuple[SpatialAnnotationView, ...]]:
+        """Project the exact public display and geometry for staged bytes.
+
+        Promotion and restore use this while their write-set transaction is
+        still being assembled. The in-memory observation avoids publishing or
+        reading the target display early, while every other revision input is
+        computed by the normal capture projector.
+        """
+
+        if not isinstance(content, bytes) or not content:
+            raise TypeError("content must be non-empty bytes")
+        directory = self._managed_directory(
+            self._capture_directory_for,
+            capture_id,
+            item_id=item_id,
+            section="capture",
+            authority_root=self._capture_authority_root,
+        )
+        try:
+            with Image.open(io.BytesIO(content)) as image:
+                image.load()
+                media_type = _PIL_MEDIA_TYPES.get(str(image.format or "").upper())
+                dimensions = RasterDimensions(*image.size)
+        except (OSError, UnidentifiedImageError, ValueError) as exc:
+            raise _repository_error(
+                "the staged capture display is not a decodable image",
+                code="invalid_capture_rendition",
+                item_id=item_id,
+                section="capture",
+            ) from exc
+        if media_type is None:
+            raise _repository_error(
+                "the staged capture display media type is unsupported",
+                code="invalid_capture_rendition",
+                item_id=item_id,
+                section="capture",
+            )
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        prospective = _ResolvedRasterCandidate(
+            path=directory / ".prospective-display",
+            file_identity=(0,),
+            section="capture",
+            media_type=media_type,
+            content_sha256=content_sha256,
+            size=len(content),
+            revision=f"prospective:{content_sha256}",
+        )
+        observation = _ResourceObservation(
+            ResourceState.AVAILABLE,
+            media_type,
+            content_sha256,
+            dimensions,
+            prospective,
+        )
+        values, _spatial, _resources = self._project_capture(
+            item_id,
+            capture_id,
+            directory,
+            manifest,
+            artifact_id=artifact_id,
+            display_observation_overrides={artifact_id: observation},
+        )
+        if len(values) != 1 or values[0].key.artifact_id != artifact_id:
+            raise _repository_error(
+                "the staged capture display cannot be projected",
+                code="invalid_capture_rendition",
+                item_id=item_id,
+                section="capture",
+            )
+        return values[0], _spatial
+
+    def capture_display_revision_for_publication(
+        self,
+        item_id: str,
+        capture_id: str,
+        artifact_id: str,
+        manifest: Mapping[str, Any],
+        content: bytes,
+    ) -> str:
+        """Project the base revision for staged display bytes."""
+
+        value, _spatial = self.capture_display_projection_for_publication(
+            item_id,
+            capture_id,
+            artifact_id,
+            manifest,
+            content,
+        )
+        return value.revision
 
     def _capture_geometry_annotations(
         self,

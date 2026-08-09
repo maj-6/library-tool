@@ -660,6 +660,8 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.rasterArtifacts.list, "function");
   assert.equal(typeof client.rasterArtifacts.get, "function");
   assert.equal(typeof client.rasterArtifacts.resolveResource, "function");
+  assert.equal(typeof client.rasterArtifacts.resolveOriginalBackup, "function");
+  assert.equal(typeof client.rasterArtifacts.restoreOriginalBackup, "function");
   assert.equal(typeof client.rasterArtifacts.resourceUrl, "function");
   assert.equal(typeof client.documentArtifacts.list, "function");
   assert.equal(typeof client.documentArtifacts.get, "function");
@@ -982,6 +984,122 @@ test("raster resources cross authenticated transport as bounded blobs", async ()
   assert.equal(calls[0].init.headers.Accept, "image/*");
   assert.equal(calls[0].init.cache, "no-store");
 });
+
+
+test("original backups resolve and restore through pinned raster endpoints",
+  async () => {
+    const payload = new Uint8Array([8, 6, 7, 5, 3, 0, 9]);
+    const digest = "a".repeat(64);
+    const revision = "artifact-corrected-r2";
+    const calls = [];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        if (init.method === "GET") {
+          return {
+            ok: true,
+            status: 200,
+            headers: {
+              get(name) {
+                return {
+                  "Content-Type": "image/jpeg",
+                  "Content-Length": String(payload.byteLength),
+                  "X-Resource-Revision": revision,
+                }[name] || null;
+              },
+            },
+            blob: async () => new Blob([payload], { type: "image/jpeg" }),
+          };
+        }
+        return response(200, {
+          ok: true,
+          schema: "librarytool.original-backup-restore/1",
+          operation_id: "restore-original-1",
+          item_id: "book:one",
+          artifact_id: "image:one",
+          before_revision: revision,
+          after_revision: "artifact-original-r3",
+          backup_sha256: digest,
+          replayed: false,
+        });
+      },
+    });
+
+    const original = await client.rasterArtifacts.resolveOriginalBackup({
+      itemId: "book:one",
+      artifactId: "image:one",
+      revision,
+    });
+    const restored = await client.rasterArtifacts.restoreOriginalBackup({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: revision,
+      idempotencyKey: "restore-original-1",
+    });
+
+    assert.equal(original.blob.size, payload.byteLength);
+    assert.equal(original.revision, revision);
+    assert.equal(restored.after_revision, "artifact-original-r3");
+    assert.equal(calls[0].url,
+      "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/" +
+      "original-backup?revision=artifact-corrected-r2");
+    assert.equal(calls[0].init.method, "GET");
+    assert.equal(calls[0].init.headers.Accept, "image/*");
+    assert.equal(calls[1].url,
+      "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/" +
+      "restore-original");
+    assert.equal(calls[1].init.method, "POST");
+    assert.equal(calls[1].init.headers["Idempotency-Key"],
+      "restore-original-1");
+    assert.equal(calls[1].init.headers["If-Artifact-Match"],
+      '"artifact-corrected-r2"');
+    assert.equal(calls[1].init.body, "{}");
+    assert.equal(calls[1].init.cache, "no-store");
+  });
+
+
+test("original-backup client rejects unsafe inputs and invalid receipts",
+  async () => {
+    const revision = "artifact-corrected-r2";
+    const client = new EngineClient({
+      transport: async () => response(200, {
+        ok: true,
+        schema: "librarytool.original-backup-restore/1",
+        operation_id: "restore-original-1",
+        item_id: "book:one",
+        artifact_id: "image:one",
+        before_revision: revision,
+        after_revision: revision,
+        backup_sha256: "a".repeat(64),
+        replayed: false,
+      }),
+    });
+
+    assert.throws(() => client.rasterArtifacts.resolveOriginalBackup({
+      itemId: "book:one",
+      artifactId: "image:one",
+      revision: 'unsafe"revision',
+    }), TypeError);
+    await assert.rejects(
+      client.rasterArtifacts.restoreOriginalBackup({
+        itemId: "book:one",
+        artifactId: "image:one",
+        expectedArtifactRevision: revision,
+        idempotencyKey: "not portable",
+      }),
+      TypeError,
+    );
+    await assert.rejects(
+      client.rasterArtifacts.restoreOriginalBackup({
+        itemId: "book:one",
+        artifactId: "image:one",
+        expectedArtifactRevision: revision,
+        idempotencyKey: "restore-original-1",
+      }),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response",
+    );
+  });
 
 
 test("raster resources reject oversized and mismatched bodies", async () => {

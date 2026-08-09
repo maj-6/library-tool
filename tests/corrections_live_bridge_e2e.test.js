@@ -347,9 +347,11 @@ test("production EngineClient completes the representative Corrections flow", {
     itemId,
   });
   assert.equal(
-    preservedAnnotations.annotations.some((value) => value.extensions &&
-      value.extensions.android_geometry &&
-      value.extensions.android_geometry.region_id === "margin-1"),
+    preservedAnnotations.annotations.some(
+      (value) => value.extensions &&
+        value.extensions.android_geometry &&
+        value.extensions.android_geometry.region_id === "margin-1",
+    ),
     false,
     "geometry outside the corrected canvas must not remain as a stale overlay",
   );

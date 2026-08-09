@@ -121,6 +121,9 @@ CORRECTION_TRANSFORM_QUEUE_SCHEMA = (
 CORRECTION_REOCR_QUEUE_SCHEMA = (
     "librarytool.correction-reocr-queue-receipt/1"
 )
+ORIGINAL_BACKUP_RESTORE_SCHEMA = (
+    "librarytool.original-backup-restore/1"
+)
 CORRECTION_OCR_PROPOSAL_LIST_SCHEMA = (
     "librarytool.correction-ocr-proposals/1"
 )
@@ -3589,6 +3592,132 @@ def _preview_response(
     return _resolved_resource_response(resolved, key)
 
 
+def _original_backup_response(
+    resolver_for_request: Callable[[], Any] | None,
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    key = RasterArtifactKey(item_id, artifact_id)
+    revisions = request.args.getlist("revision")
+    if not revisions or revisions == [""]:
+        raise PreconditionRequiredError(
+            "an original-backup revision is required",
+            code="original_backup_revision_required",
+            details={"query": "revision", **key.as_dict()},
+        )
+    if (
+        set(request.args) != {"revision"}
+        or len(revisions) != 1
+        or not _is_correction_item_revision(revisions[0])
+    ):
+        raise ValidationError(
+            "original-backup revision must be one transport-safe token",
+            code="invalid_original_backup_revision",
+            details={"query": "revision", **key.as_dict()},
+        )
+    expected_revision = revisions[0]
+    if resolver_for_request is None:
+        raise EngineError(
+            "the original-backup resolver is unavailable",
+            code="original_backup_resolver_unavailable",
+            retryable=True,
+        )
+    resolver = resolver_for_request()
+    resolve = getattr(resolver, "resolve_original_backup", None)
+    if not callable(resolve):
+        raise EngineError(
+            "the original-backup resolver is unavailable",
+            code="original_backup_resolver_unavailable",
+            retryable=True,
+        )
+    resolved = resolve(item_id, artifact_id, expected_revision)
+    if resolved is None:
+        raise NotFoundError(
+            "the original backup is not available",
+            code="original_backup_not_found",
+            details=key.as_dict(),
+        )
+    return _resolved_resource_response(
+        resolved,
+        key,
+        expected_revision=expected_revision,
+    )
+
+
+def _restore_original_backup(
+    resolver_for_request: Callable[[], Any] | None,
+    item_id: str,
+    artifact_id: str,
+) -> Response:
+    key = RasterArtifactKey(item_id, artifact_id)
+    operation_id = _correction_item_operation_id(item_id)
+    expected_revision = _strong_revision("If-Artifact-Match")
+    _mutation_document(frozenset())
+    if request.args:
+        raise ValidationError(
+            "restore-original does not accept query parameters",
+            code="invalid_original_backup_restore_query",
+            details=key.as_dict(),
+        )
+    if resolver_for_request is None:
+        raise EngineError(
+            "the original-backup resolver is unavailable",
+            code="original_backup_resolver_unavailable",
+            retryable=True,
+        )
+    resolver = resolver_for_request()
+    restore = getattr(resolver, "restore_original_backup", None)
+    if not callable(restore):
+        raise EngineError(
+            "the original-backup resolver is unavailable",
+            code="original_backup_resolver_unavailable",
+            retryable=True,
+        )
+    receipt = restore(
+        item_id,
+        artifact_id,
+        expected_revision,
+        operation_id,
+    )
+    fields = {
+        "operation_id",
+        "item_id",
+        "artifact_id",
+        "before_revision",
+        "after_revision",
+        "backup_sha256",
+        "replayed",
+    }
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != fields
+        or receipt.get("operation_id") != operation_id
+        or receipt.get("item_id") != item_id
+        or receipt.get("artifact_id") != artifact_id
+        or receipt.get("before_revision") != expected_revision
+        or not _is_correction_item_revision(receipt.get("after_revision"))
+        or receipt.get("after_revision") == expected_revision
+        or not isinstance(receipt.get("backup_sha256"), str)
+        or _SHA256_RE.fullmatch(receipt["backup_sha256"]) is None
+        or type(receipt.get("replayed")) is not bool
+    ):
+        raise RepositoryError(
+            "the original-backup resolver returned an invalid receipt",
+            code="invalid_original_backup_restore_receipt",
+            details=key.as_dict(),
+        )
+    response = jsonify(
+        {
+            "ok": True,
+            "schema": ORIGINAL_BACKUP_RESTORE_SCHEMA,
+            **dict(receipt),
+        }
+    )
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 def _resolved_resource_response(
     resolved: Any,
     key: RasterArtifactKey,
@@ -4003,6 +4132,34 @@ def create_corrections_blueprint(
                     code="invalid_raster_preview_query",
                 )
             return _preview_response(
+                raster_resource_resolver_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.get(
+        "/api/v1/items/<item_id>/raster-artifacts/"
+        "<artifact_id>/original-backup"
+    )
+    def get_original_backup(item_id: str, artifact_id: str):
+        try:
+            return _original_backup_response(
+                raster_resource_resolver_for_request,
+                item_id,
+                artifact_id,
+            )
+        except EngineError as error:
+            return _error_response(error)
+
+    @blueprint.post(
+        "/api/v1/items/<item_id>/raster-artifacts/"
+        "<artifact_id>/restore-original"
+    )
+    def restore_original_backup(item_id: str, artifact_id: str):
+        try:
+            return _restore_original_backup(
                 raster_resource_resolver_for_request,
                 item_id,
                 artifact_id,

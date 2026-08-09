@@ -8,8 +8,10 @@ item-scoped immutable pointer, an optional capture-display head, and the
 idempotency receipt in one :class:`RecoverableWriteSet` transaction.
 
 Public identifiers never become path components.  Private storage uses
-SHA-256-addressed filenames below ``.engine`` and a receipt is staged last so a
-durable replay can only become visible with the complete publication. Public
+SHA-256-addressed filenames below ``.engine``. An optional host publication
+plan can join capture backup metadata or an original-source display promotion
+and its manifest visibility boundary to the same transaction, so a durable
+replay can only observe the complete publication. Public
 queries inspect only the requested item's pointer directory; legacy version-1
 publications remain replayable but are intentionally not projected because
 they do not pin a representation/canvas source scope.
@@ -84,6 +86,48 @@ SourceSnapshotLookup: TypeAlias = Callable[
     [RasterArtifactKey], CorrectionSourceSnapshot | None
 ]
 LockContextFactory: TypeAlias = Callable[[], ContextManager[Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionTransformPublicationPlan:
+    """Additional writes joined to an immutable transform publication.
+
+    Paths are absolute, already-authorized targets below the transaction
+    write-set. ``prefix_writes`` are published before immutable transform
+    objects, while ``final_writes`` are the host visibility boundary and are
+    staged immediately before the terminal transform receipt. This lets a host
+    atomically update capture metadata without weakening the transform store's
+    immutable output contract.
+    """
+
+    prefix_writes: tuple[tuple[Path, bytes], ...] = ()
+    writes: tuple[tuple[Path, bytes], ...] = ()
+    deletes: tuple[Path, ...] = ()
+    final_writes: tuple[tuple[Path, bytes], ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name in ("prefix_writes", "writes", "final_writes"):
+            values = tuple(getattr(self, field_name))
+            if any(
+                not isinstance(path, Path) or not isinstance(payload, bytes)
+                for path, payload in values
+            ):
+                raise TypeError(f"{field_name} must contain Path/bytes pairs")
+            object.__setattr__(self, field_name, values)
+        deletes = tuple(self.deletes)
+        if any(not isinstance(path, Path) for path in deletes):
+            raise TypeError("deletes must contain Paths")
+        object.__setattr__(self, "deletes", deletes)
+
+
+PublicationPlanFactory: TypeAlias = Callable[
+    [
+        CorrectionTransformCommitDraft,
+        CorrectionTransformCommitResult,
+        str | None,
+    ],
+    CorrectionTransformPublicationPlan | None,
+]
 
 
 @runtime_checkable
@@ -407,6 +451,27 @@ def _digest_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def correction_display_head_path(
+    storage_root: Path,
+    item_id: str,
+    artifact_id: str,
+) -> Path:
+    """Return the private mutable-head path for one logical capture display."""
+
+    root = Path(storage_root)
+    if not root.is_absolute():
+        raise ValueError("storage_root must be absolute")
+    if not isinstance(item_id, str) or not isinstance(artifact_id, str):
+        raise TypeError("item_id and artifact_id must be strings")
+    return root.joinpath(
+        *(
+            _DISPLAY_HEAD_ROOT
+            / _digest_text(item_id)
+            / f"{_digest_text(artifact_id)}.json"
+        ).parts
+    )
+
+
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -515,6 +580,9 @@ class FilesystemCorrectionTransformStore:
         *,
         source_snapshot_for: SourceSnapshotLookup,
         lock_context_for: LockContextFactory,
+        storage_root: Path | None = None,
+        coordination_write_set: RecoverableWriteSet | None = None,
+        publication_plan_for: PublicationPlanFactory | None = None,
         recover: bool = True,
     ) -> None:
         if not isinstance(write_set, RecoverableWriteSet):
@@ -523,9 +591,23 @@ class FilesystemCorrectionTransformStore:
             raise TypeError("source_snapshot_for must be callable")
         if not callable(lock_context_for):
             raise TypeError("lock_context_for must be callable")
+        if publication_plan_for is not None and not callable(publication_plan_for):
+            raise TypeError("publication_plan_for must be callable or None")
         self._write_set = write_set
+        self._coordination_write_set = coordination_write_set or write_set
+        if not isinstance(self._coordination_write_set, RecoverableWriteSet):
+            raise TypeError("coordination_write_set must be a RecoverableWriteSet")
+        configured_storage = Path(storage_root or write_set.root)
+        if not configured_storage.is_absolute():
+            raise ValueError("storage_root must be absolute")
+        try:
+            configured_storage.relative_to(write_set.root)
+        except ValueError as exc:
+            raise ValueError("storage_root must be below the write-set root") from exc
+        self._storage_root = configured_storage
         self._source_snapshot_for = source_snapshot_for
         self._lock_context_for = lock_context_for
+        self._publication_plan_for = publication_plan_for
         self._unindexed_v2_cache: dict[
             str,
             tuple[_ItemPublicationPointer, ...],
@@ -534,9 +616,15 @@ class FilesystemCorrectionTransformStore:
         self._unindexed_v2_errors: dict[str, RepositoryError] = {}
         if recover:
             try:
-                with self._write_set.recovery_lease():
-                    with self._lock_context_for():
-                        self._write_set.recover_all()
+                if self._coordination_write_set is self._write_set:
+                    with self._write_set.recovery_lease():
+                        with self._lock_context_for():
+                            self._write_set.recover_all()
+                else:
+                    with self._coordination_write_set.workspace_lease():
+                        with self._write_set.recovery_lease():
+                            with self._lock_context_for():
+                                self._write_set.recover_all()
             except WriteSetError as exc:
                 raise _repository_error(
                     "the correction transform store could not recover",
@@ -556,7 +644,7 @@ class FilesystemCorrectionTransformStore:
         if not isinstance(key, RasterArtifactKey):
             raise TypeError("key must be a RasterArtifactKey")
         try:
-            with self._write_set.workspace_lease():
+            with self._coordination_write_set.workspace_lease():
                 with self._lock_context_for():
                     return self._load_source_locked(key)
         except WriteSetError as exc:
@@ -583,38 +671,39 @@ class FilesystemCorrectionTransformStore:
         if not isinstance(draft, CorrectionTransformCommitDraft):
             raise TypeError("draft must be a CorrectionTransformCommitDraft")
         try:
-            with self._write_set.workspace_lease():
-                with self._lock_context_for():
-                    replay = self._read_receipt(draft.command.operation_id)
-                    if replay is not None:
-                        command_sha256, publication_sha256, result = replay
-                        if command_sha256 != draft.command.fingerprint:
-                            raise ConflictError(
-                                "correction operation was reused for another command",
-                                code="correction_operation_conflict",
-                                details={"operation_id": draft.command.operation_id},
-                            )
-                        publication = self._validate_replay_publication(
-                            draft.command,
-                            result,
-                            publication_sha256=publication_sha256,
-                        )
-                        if (
-                            publication["version"]
-                            == CORRECTION_TRANSFORM_PUBLICATION_VERSION
-                        ):
-                            self._ensure_item_pointer(
+            with self._coordination_write_set.workspace_lease():
+                with self._write_set.workspace_lease():
+                    with self._lock_context_for():
+                        replay = self._read_receipt(draft.command.operation_id)
+                        if replay is not None:
+                            command_sha256, publication_sha256, result = replay
+                            if command_sha256 != draft.command.fingerprint:
+                                raise ConflictError(
+                                    "correction operation was reused for another command",
+                                    code="correction_operation_conflict",
+                                    details={"operation_id": draft.command.operation_id},
+                                )
+                            publication = self._validate_replay_publication(
                                 draft.command,
+                                result,
                                 publication_sha256=publication_sha256,
                             )
-                        return result
+                            if (
+                                publication["version"]
+                                == CORRECTION_TRANSFORM_PUBLICATION_VERSION
+                            ):
+                                self._ensure_item_pointer(
+                                    draft.command,
+                                    publication_sha256=publication_sha256,
+                                )
+                            return result
 
-                    self._validate_draft(draft)
-                    live = self._load_source_locked(draft.command.key)
-                    self._compare_source(draft, live)
-                    result = _commit_result_for(draft)
-                    self._publish(draft, result, live=live)
-                    return result
+                        self._validate_draft(draft)
+                        live = self._load_source_locked(draft.command.key)
+                        self._compare_source(draft, live)
+                        result = _commit_result_for(draft)
+                        self._publish(draft, result, live=live)
+                        return result
         except WriteSetError as exc:
             raise _repository_error(
                 "the correction transform transaction failed",
@@ -643,7 +732,7 @@ class FilesystemCorrectionTransformStore:
         if not isinstance(command, CorrectionTransformCommand):
             raise TypeError("command must be a CorrectionTransformCommand")
         try:
-            with self._write_set.workspace_lease():
+            with self._coordination_write_set.workspace_lease():
                 with self._lock_context_for():
                     validated = self._validated_operation_publication(
                         command.item_id,
@@ -707,7 +796,7 @@ class FilesystemCorrectionTransformStore:
         """Project one item's outputs and validated logical display heads."""
 
         try:
-            with self._write_set.workspace_lease():
+            with self._coordination_write_set.workspace_lease():
                 with self._lock_context_for():
                     return self._project_locked(item_id)
         except WriteSetError as exc:
@@ -824,7 +913,7 @@ class FilesystemCorrectionTransformStore:
         """Project immutable mapped geometry for corrected display outputs."""
 
         try:
-            with self._write_set.workspace_lease():
+            with self._coordination_write_set.workspace_lease():
                 with self._lock_context_for():
                     values = self._project_locked(item_id).spatial_annotations
         except WriteSetError as exc:
@@ -878,7 +967,7 @@ class FilesystemCorrectionTransformStore:
         if not isinstance(resource, RasterResourceRef):
             raise TypeError("resource must be a RasterResourceRef")
         try:
-            with self._write_set.workspace_lease():
+            with self._coordination_write_set.workspace_lease():
                 with self._lock_context_for():
                     candidate = self._project_locked(item_id).resources.get(
                         (
@@ -928,7 +1017,7 @@ class FilesystemCorrectionTransformStore:
         if not isinstance(operation_id, str) or not operation_id:
             raise TypeError("operation_id must be a non-empty string")
         try:
-            with self._write_set.workspace_lease():
+            with self._coordination_write_set.workspace_lease():
                 with self._lock_context_for():
                     candidate = self._committed_output_candidate_locked(
                         item_id,
@@ -2673,6 +2762,27 @@ class FilesystemCorrectionTransformStore:
             live=live,
             publication_sha256=receipt["publication_sha256"],
         )
+        logical_display_artifact_id = (
+            display_head_payload[0] if display_head_payload is not None else None
+        )
+        additional = (
+            self._publication_plan_for(
+                draft,
+                result,
+                logical_display_artifact_id,
+            )
+            if self._publication_plan_for is not None
+            else None
+        )
+        if additional is not None and not isinstance(
+            additional,
+            CorrectionTransformPublicationPlan,
+        ):
+            raise _repository_error(
+                "the correction transform publication plan is invalid",
+                code="invalid_correction_transform_draft",
+                artifact="capture_display_publication",
+            )
 
         targets: list[tuple[Path, bytes, str, bool]] = []
         for kind in CORRECTION_OUTPUT_KINDS:
@@ -2711,29 +2821,17 @@ class FilesystemCorrectionTransformStore:
                 ),
             )
         )
+        display_head_target: tuple[Path, bytes] | None = None
         if display_head_payload is not None:
             logical_artifact_id, head_payload = display_head_payload
-            targets.append(
-                (
-                    self._display_head_path(
-                        draft.command.item_id,
-                        logical_artifact_id,
-                    ),
-                    head_payload,
-                    "correction_display_head",
-                    False,
-                )
+            display_head_target = (
+                self._display_head_path(
+                    draft.command.item_id,
+                    logical_artifact_id,
+                ),
+                head_payload,
             )
-        # The receipt stays last: durable replay must never become visible
-        # before the mutable logical-display head is recoverable with it.
-        targets.append(
-            (
-                self._receipt_path(operation_id),
-                receipt_payload,
-                "correction_transform_receipt",
-                True,
-            )
-        )
+        receipt_target = (self._receipt_path(operation_id), receipt_payload)
         for path, _payload, artifact, immutable in targets:
             if immutable and self._path_exists(path, artifact=artifact):
                 raise _repository_error(
@@ -2741,6 +2839,15 @@ class FilesystemCorrectionTransformStore:
                     code="correction_transform_target_exists",
                     artifact=artifact,
                 )
+        if self._path_exists(
+            receipt_target[0],
+            artifact="correction_transform_receipt",
+        ):
+            raise _repository_error(
+                "an immutable correction transform target already exists",
+                code="correction_transform_target_exists",
+                artifact="correction_transform_receipt",
+            )
         self._assert_item_pointer_capacity(draft.command.item_id)
 
         try:
@@ -2753,8 +2860,28 @@ class FilesystemCorrectionTransformStore:
                     "command_sha256": draft.command.fingerprint,
                 },
             )
+            if additional is not None:
+                for path, payload in additional.prefix_writes:
+                    transaction.stage_write(self._relative(path), payload)
             for path, payload, _artifact, _immutable in targets:
                 transaction.stage_write(self._relative(path), payload)
+            if display_head_target is not None:
+                path, payload = display_head_target
+                transaction.stage_write(self._relative(path), payload)
+            if additional is not None:
+                for path, payload in additional.writes:
+                    transaction.stage_write(self._relative(path), payload)
+                for path in additional.deletes:
+                    transaction.stage_delete(self._relative(path))
+                for path, payload in additional.final_writes:
+                    transaction.stage_write(self._relative(path), payload)
+            # The receipt stays last overall: durable replay must never become
+            # visible before the mutable head and host publication plan are
+            # recoverable with it.
+            transaction.stage_write(
+                self._relative(receipt_target[0]),
+                receipt_target[1],
+            )
             transaction.commit(
                 receipt={
                     "operation_id": operation_id,
@@ -3503,7 +3630,7 @@ class FilesystemCorrectionTransformStore:
         artifact: str,
     ) -> _AuthoritySnapshot:
         target = self._safe_target(path, artifact=artifact)
-        root = self._write_set.root
+        root = self._storage_root
         relative = target.relative_to(root)
         try:
             named_root = root.lstat()
@@ -3597,7 +3724,7 @@ class FilesystemCorrectionTransformStore:
     def _safe_target(self, path: Path, *, artifact: str) -> Path:
         target = Path(path)
         try:
-            relative = target.relative_to(self._write_set.root)
+            relative = target.relative_to(self._storage_root)
         except ValueError as exc:
             raise _repository_error(
                 "a correction transform target escapes its workspace",
@@ -3605,7 +3732,7 @@ class FilesystemCorrectionTransformStore:
                 artifact=artifact,
                 cause=exc,
             ) from exc
-        current = self._write_set.root
+        current = self._storage_root
         for part in relative.parts:
             if part in {"", ".", ".."}:
                 raise _repository_error(
@@ -3640,17 +3767,17 @@ class FilesystemCorrectionTransformStore:
         )
 
     def _display_head_path(self, item_id: str, artifact_id: str) -> Path:
-        return self._target(
-            _DISPLAY_HEAD_ROOT
-            / _digest_text(item_id)
-            / f"{_digest_text(artifact_id)}.json"
+        return correction_display_head_path(
+            self._storage_root,
+            item_id,
+            artifact_id,
         )
 
     def _receipt_path(self, operation_id: str) -> Path:
         return self._target(_RECEIPT_ROOT / f"{_digest_text(operation_id)}.json")
 
     def _target(self, relative: PurePosixPath) -> Path:
-        return self._write_set.root.joinpath(*relative.parts)
+        return self._storage_root.joinpath(*relative.parts)
 
     def _relative(self, path: Path) -> str:
         return path.relative_to(self._write_set.root).as_posix()
@@ -3663,7 +3790,10 @@ __all__ = [
     "CORRECTION_TRANSFORM_PUBLICATION_VERSION",
     "CORRECTION_TRANSFORM_RECEIPT_SCHEMA",
     "CORRECTION_TRANSFORM_RECEIPT_VERSION",
+    "CorrectionTransformPublicationPlan",
     "CorrectionTransformOutputResolverPort",
     "FilesystemCorrectionTransformStore",
+    "PublicationPlanFactory",
     "SourceSnapshotLookup",
+    "correction_display_head_path",
 ]

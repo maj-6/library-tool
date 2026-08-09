@@ -998,10 +998,13 @@ class CorrectionTransformStorePort(Protocol):
     ``commit_transform`` must compare artifact revision, source revision, and
     checksum from ``draft.command``, plus
     ``draft.source.dependent_revision_pins``, in the same transaction that
-    publishes the outputs. Every output must have a new, distinct artifact
-    identity; the source artifact is never updated in place. Replaying an
-    operation ID with the same command must return the original result; reusing
-    it for a different command must conflict.
+    publishes the outputs. Every immutable history output must have a new,
+    distinct artifact identity. A filesystem adapter may also promote
+    ``corrected-display`` into the stable live capture-display slot in that
+    same recoverable transaction; such promotion must retain the distinct
+    immutable output and an inverse for any displaced bytes. Replaying an
+    operation ID with the same command must return the original result;
+    reusing it for a different command must conflict.
     """
 
     def load_source(self, key: RasterArtifactKey) -> CorrectionSourceSnapshot: ...

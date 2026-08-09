@@ -199,6 +199,155 @@ def test_source_projects_metadata_and_photo_assets_without_local_locators(
     assert "file://" not in notes_serialized
 
 
+def test_archive_build_reads_a_corrected_capture_original_from_cold_backup(
+    tmp_path,
+):
+    original = _jpeg()
+    display = _jpeg(13, 9, "gray")
+    directory = tmp_path / "library" / "captures" / CAPTURE_ID
+    directory.parent.mkdir(parents=True)
+    _write_pair(directory, original, display)
+    assets = _photo_assets(
+        original,
+        display,
+        original_dimensions=(11, 7),
+    )
+    digest = hashlib.sha256(original).hexdigest()
+    assets["desktop_import"] = {
+        "version": 1,
+        "assets": [
+            {
+                "order": 0,
+                "asset_id": "asset-1",
+                "display_ref": "photo_1.jpg",
+                "source_checksum": digest,
+                "derivative_checksum": hashlib.sha256(display).hexdigest(),
+                "transport_representation": "original",
+                "recipe": "desktop-correction-transform-v1",
+                "lifecycle": "completed",
+                "original_backup": {
+                    "version": 1,
+                    "store": "output-originals-sha256",
+                    "key": f"sha256:{digest}",
+                    "sha256": digest,
+                    "bytes": len(original),
+                    "media_type": "image/jpeg",
+                },
+                "active_desktop_correction_id": "transform-op-1",
+            }
+        ],
+    }
+    _write_photo_assets(directory, assets)
+    (directory / "orig_1.jpg").unlink()
+    backup = (
+        tmp_path
+        / "library"
+        / "output"
+        / "backups"
+        / "originals"
+        / "v1"
+        / "sha256"
+        / digest[:2]
+        / digest[2:]
+    )
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(original)
+
+    source = capture_lib.build_capture_archive_source(
+        CAPTURE_ID,
+        _entry(),
+        directory,
+    )
+
+    assert source.resources["representations/capture-original-1.jpg"] == original
+    assert source.resources["representations/capture-display-1.jpg"] == display
+    portable = _resource_json(source, "artifacts/photo-assets.json")
+    portable_import = portable["desktop_import"]["assets"][0]
+    assert "original_backup" not in portable_import
+    assert "active_desktop_correction_id" not in portable_import
+    assert "output-originals-sha256" not in json.dumps(portable, sort_keys=True)
+
+
+def test_cold_backup_read_rejects_parent_replacement_between_snapshot_and_open(
+    tmp_path,
+    monkeypatch,
+):
+    original = _jpeg()
+    display = _jpeg(13, 9, "gray")
+    directory = tmp_path / "library" / "captures" / CAPTURE_ID
+    directory.parent.mkdir(parents=True)
+    _write_pair(directory, original, display)
+    assets = _photo_assets(original, display)
+    digest = hashlib.sha256(original).hexdigest()
+    assets["desktop_import"] = {
+        "version": 1,
+        "assets": [
+            {
+                "order": 0,
+                "asset_id": "asset-1",
+                "display_ref": "photo_1.jpg",
+                "source_checksum": digest,
+                "derivative_checksum": hashlib.sha256(display).hexdigest(),
+                "transport_representation": "original",
+                "recipe": "desktop-correction-transform-v1",
+                "lifecycle": "completed",
+                "original_backup": {
+                    "version": 1,
+                    "store": "output-originals-sha256",
+                    "key": f"sha256:{digest}",
+                    "sha256": digest,
+                    "bytes": len(original),
+                    "media_type": "image/jpeg",
+                },
+                "active_desktop_correction_id": "transform-op-1",
+            }
+        ],
+    }
+    _write_photo_assets(directory, assets)
+    (directory / "orig_1.jpg").unlink()
+    backup = (
+        tmp_path
+        / "library"
+        / "output"
+        / "backups"
+        / "originals"
+        / "v1"
+        / "sha256"
+        / digest[:2]
+        / digest[2:]
+    )
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(original)
+
+    open_verified = capture_lib._open_verified_regular
+    displaced = backup.parent.with_name(f"{backup.parent.name}-displaced")
+    replaced = False
+
+    def replace_parent(path, named_before, *, authority):
+        nonlocal replaced
+        if path == backup and not replaced:
+            replaced = True
+            backup.parent.rename(displaced)
+            backup.parent.mkdir()
+            (displaced / backup.name).rename(backup)
+        return open_verified(path, named_before, authority=authority)
+
+    monkeypatch.setattr(
+        capture_lib,
+        "_open_verified_regular",
+        replace_parent,
+    )
+
+    with pytest.raises(ValueError, match="could not be read safely"):
+        capture_lib.build_capture_archive_source(
+            CAPTURE_ID,
+            _entry(),
+            directory,
+        )
+
+    assert replaced is True
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

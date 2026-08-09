@@ -33,6 +33,7 @@ from ..adapters.filesystem import (
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
     FilesystemCaptureDocumentArtifactRepository,
+    FilesystemCaptureOriginalBackupStore,
     FilesystemCorrectionOcrProposalRepository,
     FilesystemCorrectionRepository,
     FilesystemCorrectionSourceSnapshotReader,
@@ -228,6 +229,7 @@ CorrectionsCaptureDirectory = Callable[[str], Path]
 CorrectionsEntryDirectory = Callable[[str], Path]
 CorrectionsRepresentationRevision = Callable[[str, str], str | None]
 CorrectionsTextLayerItemIdentity = Callable[[str], str | None]
+CorrectionsItemUpdatedAtPublication = Callable[[str], tuple[Path, bytes, str]]
 TextLayerItemMembership = Callable[[str], bool]
 TextLayerSourceSnapshotLoader = Callable[
     [str, str], TextLayerSourceSnapshot | None
@@ -472,6 +474,11 @@ class CorrectionsBindings:
     job_start_context_for: ItemLockFactory | None = None
     ocr_provider: CorrectionOcrProviderPort | None = None
     text_layer_item_id_for: CorrectionsTextLayerItemIdentity | None = None
+    transaction_root: Path | None = None
+    original_backup_root: Path | None = None
+    item_updated_at_publication_for: (
+        CorrectionsItemUpdatedAtPublication | None
+    ) = None
 
     def __post_init__(self) -> None:
         capture_authority_root = Path(self.capture_authority_root)
@@ -482,6 +489,27 @@ class CorrectionsBindings:
             "capture_authority_root",
             capture_authority_root,
         )
+        if (self.transaction_root is None) != (self.original_backup_root is None):
+            raise ValueError(
+                "transaction_root and original_backup_root must be configured together"
+            )
+        if self.transaction_root is not None:
+            transaction_root = Path(self.transaction_root)
+            backup_root = Path(self.original_backup_root)  # type: ignore[arg-type]
+            if not transaction_root.is_absolute() or not backup_root.is_absolute():
+                raise ValueError("correction backup roots must be absolute")
+            for child, name in (
+                (capture_authority_root, "capture_authority_root"),
+                (backup_root, "original_backup_root"),
+            ):
+                try:
+                    child.relative_to(transaction_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{name} must be below transaction_root"
+                    ) from exc
+            object.__setattr__(self, "transaction_root", transaction_root)
+            object.__setattr__(self, "original_backup_root", backup_root)
         for callback, name in (
             (self.item_exists_for, "item_exists_for"),
             (self.capture_id_for, "capture_id_for"),
@@ -505,6 +533,13 @@ class CorrectionsBindings:
         ):
             raise TypeError(
                 "text_layer_item_id_for must be callable or None"
+            )
+        if (
+            self.item_updated_at_publication_for is not None
+            and not callable(self.item_updated_at_publication_for)
+        ):
+            raise TypeError(
+                "item_updated_at_publication_for must be callable or None"
             )
         if (
             self.job_start_context_for is not None
@@ -736,6 +771,7 @@ class _CorrectionProjectionUnion:
         *,
         write_set: RecoverableWriteSet,
         lock_context_for: CatalogueLockFactory,
+        original_backups: FilesystemCaptureOriginalBackupStore | None = None,
     ) -> None:
         if not isinstance(write_set, RecoverableWriteSet):
             raise TypeError("write_set must be a RecoverableWriteSet")
@@ -745,6 +781,7 @@ class _CorrectionProjectionUnion:
         self._transforms = transforms
         self._write_set = write_set
         self._lock_context_for = lock_context_for
+        self._original_backups = original_backups
 
     @contextmanager
     def _read_context(self):
@@ -1118,6 +1155,40 @@ class _CorrectionProjectionUnion:
                 return None
             return resolver(item_id, resource)
 
+    def resolve_original_backup(
+        self,
+        item_id: str,
+        artifact_id: str,
+        expected_revision: str,
+    ) -> Any:
+        if self._original_backups is None:
+            return None
+        return self._original_backups.resolve_original_backup(
+            item_id,
+            artifact_id,
+            expected_revision,
+        )
+
+    def restore_original_backup(
+        self,
+        item_id: str,
+        artifact_id: str,
+        expected_revision: str,
+        operation_id: str,
+    ) -> Mapping[str, Any]:
+        if self._original_backups is None:
+            raise RepositoryError(
+                "the original backup store is unavailable",
+                code="capture_original_backup_unavailable",
+                retryable=True,
+            )
+        return self._original_backups.restore_original_backup(
+            item_id,
+            artifact_id,
+            expected_revision,
+            operation_id,
+        )
+
     def list_spatial_annotations(
         self,
         item_id: str,
@@ -1257,7 +1328,70 @@ class _CorrectionProjectionUnion:
         return tuple(sorted(values, key=lambda value: value.key.annotation_id))
 
     @staticmethod
+    def _validated_capture_authorities(
+        item_id: str,
+        authorities: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Mapping[str, Any]]:
+        authority_fields = frozenset(
+            {
+                "artifact_id",
+                "source_revision",
+                "source_sha256",
+                "representation_id",
+                "representation_revision",
+                "canvas_id",
+                "original_backed_up",
+                "active_operation_id",
+            }
+        )
+        for identity, authority in authorities.items():
+            if (
+                not isinstance(identity, str)
+                or not isinstance(authority, Mapping)
+                or frozenset(authority) != authority_fields
+            ):
+                raise RepositoryError(
+                    "the correction capture index returned invalid authority pins",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item_id},
+                )
+            artifact_id = authority["artifact_id"]
+            source_revision = authority["source_revision"]
+            source_sha256 = authority["source_sha256"]
+            if (
+                not isinstance(artifact_id, str)
+                or identity != artifact_id.casefold()
+                or any(
+                    not isinstance(authority[field], str)
+                    or not authority[field]
+                    for field in authority_fields
+                    - {
+                        "source_revision",
+                        "source_sha256",
+                        "original_backed_up",
+                        "active_operation_id",
+                    }
+                )
+                or not isinstance(source_revision, str)
+                or not isinstance(source_sha256, str)
+                or bool(source_revision) != bool(source_sha256)
+                or type(authority["original_backed_up"]) is not bool
+                or not isinstance(authority["active_operation_id"], str)
+                or (
+                    not authority["original_backed_up"]
+                    and authority["active_operation_id"]
+                )
+            ):
+                raise RepositoryError(
+                    "the correction capture index returned invalid authority pins",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item_id},
+                )
+        return dict(authorities)
+
+    @classmethod
     def _active_display_head_hints(
+        cls,
         item_id: str,
         head_hints: Sequence[Any],
         *,
@@ -1270,41 +1404,10 @@ class _CorrectionProjectionUnion:
             if isinstance((artifact_id := value.get("artifact_id")), str)
         }
         active: dict[str, Any] = {}
-        authority_fields = frozenset(
-            {
-                "artifact_id",
-                "source_revision",
-                "source_sha256",
-                "representation_id",
-                "representation_revision",
-                "canvas_id",
-            }
-        )
-        for identity, authority in authorities.items():
-            if frozenset(authority) != authority_fields:
-                raise RepositoryError(
-                    "the correction capture index returned invalid authority pins",
-                    code="invalid_corrections_index_projection",
-                    details={"item_id": item_id},
-                )
-            artifact_id = authority["artifact_id"]
-            if (
-                not isinstance(artifact_id, str)
-                or identity != artifact_id.casefold()
-                or any(
-                    not isinstance(authority[field], str)
-                    or not authority[field]
-                    for field in authority_fields - {"artifact_id"}
-                )
-            ):
-                raise RepositoryError(
-                    "the correction capture index returned invalid authority pins",
-                    code="invalid_corrections_index_projection",
-                    details={"item_id": item_id},
-                )
+        validated = cls._validated_capture_authorities(item_id, authorities)
         for head in head_hints:
             identity = head.logical_key.artifact_id.casefold()
-            authority = authorities.get(identity)
+            authority = validated.get(identity)
             hint = hints_by_id.get(identity)
             source = head.root_source
             if (
@@ -1322,10 +1425,37 @@ class _CorrectionProjectionUnion:
                 or authority["representation_revision"]
                 != source.representation_revision
                 or authority["canvas_id"] != source.canvas_id
+                or (
+                    authority["original_backed_up"]
+                    and authority["active_operation_id"] != head.operation_id
+                )
             ):
                 continue
             active[identity] = head
         return active
+
+    def _capture_display_authorities(
+        self,
+        item_id: str,
+    ) -> dict[str, Mapping[str, Any]] | None:
+        snapshotter = getattr(self._base, "capture_index_hint_snapshot", None)
+        if not callable(snapshotter):
+            # Preserve the generic union's pre-#297 behavior for alternate
+            # projectors which do not expose capture manifest authority.
+            return None
+        snapshot = snapshotter(item_id)
+        authorities = (
+            snapshot.get("authorities")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        if not isinstance(authorities, Mapping):
+            raise RepositoryError(
+                "the correction capture index returned invalid authority pins",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item_id},
+            )
+        return self._validated_capture_authorities(item_id, authorities)
 
     def _active_display_heads(
         self,
@@ -1334,24 +1464,43 @@ class _CorrectionProjectionUnion:
         *,
         base_values: Sequence[RasterArtifactView] = (),
     ) -> dict[str, Any]:
+        if not projection.display_heads:
+            return {}
         base_by_id = {
             value.key.artifact_id.casefold(): value
             for value in base_values
         }
+        authorities = self._capture_display_authorities(item_id)
         active: dict[str, Any] = {}
         for head in projection.display_heads:
             identity = head.logical_key.artifact_id.casefold()
+            authority = (
+                authorities.get(identity) if authorities is not None else None
+            )
             base = base_by_id.get(identity)
             if base is None:
                 base = self._base.get_raster_artifact(head.logical_key)
+            if base is None:
+                continue
+            original_backed_up = isinstance(
+                base.extensions.get("original_backup"),
+                Mapping,
+            )
             if (
-                base is None
-                or base.key.item_id != item_id
+                base.key.item_id != item_id
                 or base.resource_state is not ResourceState.AVAILABLE
                 or base.resource is None
                 or base.content_sha256 != head.root_source_sha256
                 or base.resource.revision != head.root_source_revision
                 or base.source != head.root_source
+                or (
+                    original_backed_up
+                    and (
+                        authority is None
+                        or not authority["original_backed_up"]
+                        or authority["active_operation_id"] != head.operation_id
+                    )
+                )
             ):
                 continue
             active[identity] = head
@@ -1425,6 +1574,7 @@ class FilesystemEngineResources:
     jobs: JobManager
     provenance: TranslationProvenanceService
     workspace_lock_context_for: ItemLockFactory
+    corrections_write_set: RecoverableWriteSet | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1774,6 +1924,34 @@ def compose_filesystem_engine(
         correction_source_reader: (
             FilesystemCorrectionSourceSnapshotReader | None
         ) = None
+        correction_projection_service: CorrectionProjectionService | None = None
+
+        def capture_display_revision_for_publication(
+            item_id: str,
+            capture_id: str,
+            artifact_id: str,
+            manifest: Mapping[str, Any],
+            content: bytes,
+        ) -> str:
+            if correction_projection_service is None:
+                raise RepositoryError(
+                    "the correction projection service is not bound",
+                    code="correction_projection_authority_unavailable",
+                    retryable=True,
+                )
+            value, annotations = (
+                corrections_base.capture_display_projection_for_publication(
+                    item_id,
+                    capture_id,
+                    artifact_id,
+                    manifest,
+                    content,
+                )
+            )
+            return correction_projection_service.raster_revision_for_publication(
+                value,
+                annotations,
+            )
 
         def correction_source_snapshot_for(
             key: RasterArtifactKey,
@@ -1786,10 +1964,59 @@ def compose_filesystem_engine(
                 )
             return correction_source_reader(key)
 
+        def correction_artifact_for(key: RasterArtifactKey):
+            if correction_projection_service is None:
+                return corrections_base.get_raster_artifact(key)
+            return correction_projection_service.get_raster_artifact(key)
+
+        original_backups = None
+        transform_write_set = resources.write_set
+        if corrections.transaction_root is not None:
+            transform_write_set = resources.corrections_write_set  # type: ignore[assignment]
+            if not isinstance(transform_write_set, RecoverableWriteSet):
+                raise ValueError(
+                    "corrections_write_set is required for original backups"
+                )
+            if transform_write_set.root != corrections.transaction_root.resolve():
+                raise ValueError(
+                    "corrections_write_set must use the configured transaction_root"
+                )
+            try:
+                resources.write_set.root.relative_to(transform_write_set.root)
+            except ValueError as exc:
+                raise ValueError(
+                    "the engine workspace must be below transaction_root"
+                ) from exc
+            assert corrections.original_backup_root is not None
+            original_backups = FilesystemCaptureOriginalBackupStore(
+                transform_write_set,
+                coordination_write_set=resources.write_set,
+                storage_root=resources.write_set.root,
+                capture_authority_root=corrections.capture_authority_root,
+                backup_root=corrections.original_backup_root,
+                capture_id_for=corrections.capture_id_for,
+                capture_directory_for=corrections.capture_directory_for,
+                artifact_for=correction_artifact_for,
+                artifact_revision_for_publication=(
+                    capture_display_revision_for_publication
+                ),
+                lock_context_for=corrections_lock,
+                item_updated_at_publication_for=(
+                    corrections.item_updated_at_publication_for
+                ),
+            )
+
         correction_transform_store = FilesystemCorrectionTransformStore(
-            resources.write_set,
+            transform_write_set,
             source_snapshot_for=correction_source_snapshot_for,
             lock_context_for=corrections_lock,
+            storage_root=resources.write_set.root,
+            coordination_write_set=resources.write_set,
+            publication_plan_for=(
+                original_backups.plan_transform_publication
+                if original_backups is not None
+                else None
+            ),
             recover=False,
         )
         correction_projection = _CorrectionProjectionUnion(
@@ -1797,6 +2024,7 @@ def compose_filesystem_engine(
             correction_transform_store,
             write_set=resources.write_set,
             lock_context_for=corrections_lock,
+            original_backups=original_backups,
         )
         aggregate_projector = CorrectionAggregateProjector(
             correction_projection,
@@ -1815,6 +2043,7 @@ def compose_filesystem_engine(
             correction_projection,
             correction_repository,
         )
+        correction_projection_service = corrections_artifacts
         correction_source_reader = FilesystemCorrectionSourceSnapshotReader(
             corrections_artifacts,
             corrections_artifacts,

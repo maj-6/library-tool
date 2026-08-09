@@ -28,6 +28,27 @@ Anchor identity: `(capture_id, asset_id, original sha256)`.
 - Desktop display renditions do NOT byte-match phone display renditions, so
   display checksums are never used as the anchor.
 
+After the first local display replacement, desktop removes only the local
+`raw_ref` and records a versioned `original_backup` descriptor on the matching
+`desktop_import.assets[]` row. The portable `asset.original` identity,
+checksum, revision, dimensions, and orientation remain unchanged for Android;
+the backup key is desktop-private and is stripped from `.lib` projections.
+
+The verified camera bytes are stored below
+`output/backups/originals/v1/sha256/`, split into a two-hex directory and a
+62-hex filename, in the same recoverable transaction that publishes the
+transform receipt, display head when applicable, active
+operation, capture manifest, and item timestamp. Normal display corrections
+leave the base `photo_N.jpg` and capture geometry unchanged; the validated
+display head supplies corrected pixels and mapped geometry. A transform begun
+from the separately exposed original uses a deterministic JPEG promotion
+because that source cannot be represented by the display-head root contract.
+Restore verifies and copies the cold object into the stable display slot,
+clears active geometry, deletes the display head, and retains the shared backup
+object. Routine index, detail, preview, and editor reads never stat or open the
+cold object; only View original, Restore original, and an explicit archive
+build may resolve it.
+
 ## Cloud: table `capture_corrections` (migration 024)
 
 One row per `(capture_id, asset_id)` — latest correction wins, superseded in
@@ -117,14 +138,18 @@ Stateless diff-and-publish (no local outbox):
    `json.dumps((capture_id, asset_id), sort_keys=True, separators=(",", ":"))`
    — i.e. `["<capture_id>","<asset_id>"]`. Item pointers, publications,
    and receipts must bind to one another exactly before a publication
-   participates. When a receipt-witnessed `correction-display-head` exists
-   for the logical display slot, that head is authoritative only if its
-   ancestry roots at the capture's current derivative checksum. An invalid or
-   stale head fails closed; the publisher never substitutes an unrelated
-   history leaf. Publications for lifecycle-failed assets are skipped.
+   participates. Once the desktop import row carries a validated
+   `original_backup` marker, its `active_desktop_correction_id` is the current
+   state authority: only that exact receipt-witnessed operation may publish,
+   and a backed-up row without an active operation is restored and produces no
+   candidate. For an ordinary display correction, the active operation must
+   also match the validated `correction-display-head`; an invalid or stale
+   head fails closed. Legacy rows without the marker use the validated display
+   head when present and otherwise retain the history-derived winner behavior.
+   Publications for lifecycle-failed assets are skipped.
 
-   Histories created before display heads use this ordering signal: **chain
-   ancestry** — a publication
+   Histories without a current-state marker or display head use this ordering
+   signal: **chain ancestry** — a publication
    whose resolution chain passes through another candidate's outputs
    supersedes it (content-derived; the engine never stamps
    `outputs[].provenance.generated_at` for correction transforms, and
@@ -145,7 +170,10 @@ Stateless diff-and-publish (no local outbox):
      later order signal). A legacy tie —
      e.g. equal or disturbed pointer mtimes — skips the asset with a
      per-capture notice instead of overwriting, so mtime damage becomes a
-     no-op rather than a downgrade the phone would reinstall.
+     no-op rather than a downgrade the phone would reinstall. The explicit
+     active operation on a validated backup marker bypasses this local-history
+     heuristic because the capture manifest is then the durable current-state
+     authority.
    - **Foreign rows** — if the row's `correction_id` is not locally known
      (another desktop authored it), publish only when the local winner's
      `correction_id` is lexicographically greater; otherwise skip with a
@@ -208,8 +236,13 @@ bumping the display revision.
   so it cannot round-trip.
 - Metadata corrections (categories, roles, captions) stay desktop-local;
   only corrected pixels round-trip in v1.
+- Existing sealed `.lib` source packages remain immutable and may retain their
+  embedded camera representation. Rebuilding one explicitly reads and verifies
+  the cold object, then strips the desktop-private backup locator from the
+  portable manifest; routine Corrections raster projection does neither.
 - No revocation flow: deleting a correction locally does not retract a
-  published row.
+  published row. Restoring the local original likewise suppresses future
+  publication without deleting an existing cloud row or derivative object.
 - Two desktops that each hold a different correction for the same
   `(capture_id, asset_id)` do not merge: the lexicographically greater
   `correction_id` wins the cloud row, and the losing desktop keeps its

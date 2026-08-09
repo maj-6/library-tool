@@ -168,6 +168,9 @@ class _ReadUnit:
     def get(self, item_id):
         return self.state if self.state.item_id == item_id else None
 
+    def reconcile_live(self, live):
+        return reconcile_correction_aggregates(live, self.state)
+
 
 class _ReadRepository:
     def __init__(self, state):
@@ -525,6 +528,104 @@ def test_projection_service_exposes_manual_metadata_without_erasing_machine_evid
     assert public["metadata_assertions"][0]["provenance"]["provider_id"] == (
         "mistral"
     )
+
+
+def test_publication_revision_reconciles_staged_geometry_with_human_overlays():
+    raster = _raster("image-a")
+    current_annotation = replace(
+        _annotation("region-a", linked_artifact_ids=("image-a",)),
+        source=SpatialSourceRef(
+            "capture",
+            "corrected-output-r1",
+            "page-1",
+            "corrected-output-r1",
+        ),
+        selector=replace(
+            _annotation("region-a").selector,
+            coordinate_space_revision="corrected-output-r1",
+        ),
+        provenance=ArtifactProvenance(origin="transform"),
+    )
+    live = _project((raster,), (current_annotation,))
+    live_artifact = live.artifact("image-a")
+    assert live_artifact is not None
+    durable = replace(
+        live,
+        revision="aggregate-correction-r1",
+        artifacts=(
+            replace(
+                live_artifact,
+                revision="artifact-correction-r1",
+                category_assignments=(
+                    CategoryAssignment(
+                        "title_page",
+                        AssignmentOrigin.MANUAL,
+                        "manual-category-r1",
+                    ),
+                ),
+                caption_assertions=(
+                    CaptionAssertion(
+                        "Retained review caption",
+                        CaptionOrigin.MANUAL,
+                        "manual-caption-r1",
+                    ),
+                ),
+            ),
+        ),
+    )
+    service = CorrectionProjectionService(
+        _RasterProjector((raster,)),
+        _SpatialProjector((current_annotation,)),
+        _ReadRepository(durable),
+    )
+    prospective = replace(
+        raster,
+        revision="image-a-restored-r2",
+        content_sha256="cd" * 32,
+        source=replace(
+            raster.source,
+            representation_revision="capture-r2",
+            canvas_revision="page-1-r2",
+        ),
+    )
+    replacement_annotation = replace(
+        current_annotation,
+        revision="region-a-restored-r2",
+        source=SpatialSourceRef(
+            prospective.source.representation_id,
+            prospective.source.representation_revision,
+            prospective.source.canvas_id,
+            prospective.source.canvas_revision,
+        ),
+        selector=replace(
+            current_annotation.selector,
+            coordinate_space_revision=prospective.source.canvas_revision,
+        ),
+    )
+
+    revision = service.raster_revision_for_publication(
+        prospective,
+        (replacement_annotation,),
+    )
+
+    prospective_live = CorrectionAggregateProjector.project_values(
+        "book-1",
+        (prospective,),
+        (replacement_annotation,),
+    )
+    expected = reconcile_correction_aggregates(prospective_live, durable)
+    expected_artifact = expected.artifact("image-a")
+    assert expected_artifact is not None
+    assert expected_artifact.category(AssignmentOrigin.MANUAL).category == (
+        "title_page"
+    )
+    assert expected_artifact.caption(CaptionOrigin.MANUAL).text == (
+        "Retained review caption"
+    )
+    assert revision == CorrectionProjectionService._overlay_raster(
+        prospective,
+        expected,
+    ).revision
 
 
 def test_projection_service_exposes_linked_artifact_role_assignments():

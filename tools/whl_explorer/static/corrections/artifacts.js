@@ -1250,12 +1250,14 @@
           const display = await this.resolveRaster(detail, "display", selectionGeneration);
           const resource = {
             id: detail.id,
+            itemId: detail.itemId,
             label: resourceLabel(detail),
             kind: detail.kind,
             family: "image",
             media_type: detail.mediaType || "image/*",
             url: display.url,
             resourceRef: detail.resourceRef,
+            extensions: detail.extensions,
             freshness: detail.freshness,
             correction: detail.correction,
             dimensions: detail.dimensions,

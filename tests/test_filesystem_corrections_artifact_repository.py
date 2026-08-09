@@ -213,6 +213,22 @@ def _photo_manifest(
     }
 
 
+def _backed_up_photo_manifest(original: bytes, display: bytes) -> dict:
+    manifest = _photo_manifest(original, display)
+    imported = manifest["desktop_import"]["assets"][0]
+    imported.pop("raw_ref")
+    digest = _digest(original)
+    imported["original_backup"] = {
+        "version": 1,
+        "store": "output-originals-sha256",
+        "key": f"sha256:{digest}",
+        "sha256": digest,
+        "bytes": len(original),
+        "media_type": "image/jpeg",
+    }
+    return manifest
+
+
 def _capture_geometry(
     original: bytes,
     *,
@@ -536,6 +552,265 @@ def test_android_capture_projection_is_stable_safe_and_read_only(tmp_path):
     assert [value.key.artifact_id for value in after] == first_ids
     assert [value.resource for value in after] == first_resources
     assert all(value.effective_category == "spine" for value in after)
+
+
+def test_backed_up_original_stays_off_index_and_projection_hot_paths(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((120, 20, 30), (17, 23))
+    display = _jpeg_bytes((20, 120, 30), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _backed_up_photo_manifest(original, display)
+    _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    observed: list[tuple[str, str]] = []
+    observe = repository._observe_resource
+
+    def reject_original_observation(_item_id, _directory, reference, **kwargs):
+        variant = kwargs["variant"]
+        if variant == "original":
+            raise AssertionError("a backed-up original was observed")
+        observed.append((reference, variant))
+        return observe(_item_id, _directory, reference, **kwargs)
+
+    real_lstat = Path.lstat
+    real_open = os.open
+
+    def reject_original_stat(path, *args, **kwargs):
+        candidate = Path(path)
+        if candidate.name in {"orig_1.jpg", "original_asset-1.jpg"}:
+            raise AssertionError("a backed-up original was statted")
+        return real_lstat(candidate, *args, **kwargs)
+
+    def reject_original_open(path, flags, *args, **kwargs):
+        if not isinstance(path, int):
+            candidate = Path(path)
+            if candidate.name in {"orig_1.jpg", "original_asset-1.jpg"}:
+                raise AssertionError("a backed-up original was opened")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(repository, "_observe_resource", reject_original_observation)
+    monkeypatch.setattr(Path, "lstat", reject_original_stat)
+    monkeypatch.setattr(os, "open", reject_original_open)
+
+    builds = {"count": 0}
+    build_hints = repository._capture_index_hints
+
+    def count_hint_builds(*args, **kwargs):
+        builds["count"] += 1
+        return build_hints(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "_capture_index_hints", count_hint_builds)
+    cold = repository.list_capture_index_hints_many([ITEM_ID])
+    warm = repository.list_capture_index_hints_many([ITEM_ID])
+    snapshot = repository.capture_index_hint_snapshots_many([ITEM_ID])[ITEM_ID]
+    hints = cold[ITEM_ID]
+    artifacts = repository.list_raster_artifacts(ITEM_ID)
+
+    assert warm == cold
+    assert builds["count"] == 1
+    assert len(hints) == 1
+    assert hints[0]["resource_state"] == "available"
+    assert hints[0]["import_state"] == "ready"
+    assert hints[0]["diagnostic_scopes"] == ()
+    assert tuple(snapshot["hints"]) == hints
+    authority = snapshot["authorities"][CAPTURE_DISPLAY_ID.casefold()]
+    assert authority == {
+        "artifact_id": CAPTURE_DISPLAY_ID,
+        "source_revision": f"bytes:{_digest(display)}",
+        "source_sha256": _digest(display),
+        "representation_id": "capture",
+        "representation_revision": artifacts[0].source.representation_revision,
+        "canvas_id": artifacts[0].source.canvas_id,
+        "original_backed_up": True,
+        "active_operation_id": "",
+    }
+    assert [value.key.artifact_id for value in artifacts] == [CAPTURE_DISPLAY_ID]
+    assert observed == [("photo_1.jpg", "display")]
+
+    shown = artifacts[0]
+    assert shown.resource_state is ResourceState.AVAILABLE
+    assert shown.lineage == ()
+    assert shown.extensions["original_backup"] == {
+        "available": True,
+        "restore_available": False,
+        "sha256": _digest(original),
+        "bytes": len(original),
+        "media_type": "image/jpeg",
+    }
+    encoded = json.dumps(
+        {
+            "cold_hints": cold,
+            "warm_hints": warm,
+            "artifact": shown.as_dict(),
+        },
+        sort_keys=True,
+    )
+    marker = manifest["desktop_import"]["assets"][0]["original_backup"]
+    assert marker["store"] not in encoded
+    assert marker["key"] not in encoded
+    assert "original_asset-1.jpg" not in encoded
+    cached_stats = repository._capture_hint_cache[CAPTURE_ID][1]
+    assert [path.name for path, _identity in cached_stats] == ["photo_1.jpg"]
+    assert repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_ORIGINAL_ID)
+    ) is None
+
+    assert shown.resource is not None
+    resolved = repository.resolve_raster_resource(ITEM_ID, shown.resource)
+    assert resolved is not None
+    try:
+        assert resolved.stream.read() == display
+    finally:
+        resolved.stream.close()
+
+
+def test_backup_metadata_keeps_display_head_source_authority_stable(tmp_path):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((120, 20, 30), (17, 23))
+    display = _jpeg_bytes((20, 120, 30), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _photo_manifest(original, display)
+    _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    before = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+    before_snapshot = repository.capture_index_hint_snapshot(ITEM_ID)
+    assert before is not None
+    assert before.resource is not None
+
+    promoted = _backed_up_photo_manifest(original, display)
+    promoted["desktop_import"]["assets"][0][
+        "active_desktop_correction_id"
+    ] = "transform-op-1"
+    _write_photo_manifest(root, promoted)
+
+    after = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+    after_snapshot = repository.capture_index_hint_snapshot(ITEM_ID)
+    assert after is not None
+    assert after.resource is not None
+
+    # Backup availability and the active operation are public metadata, not a
+    # new raster source. The source pins remain stable while the composition
+    # union receives the private current-operation authority separately.
+    assert after.content_sha256 == before.content_sha256
+    assert after.resource.revision == before.resource.revision
+    assert after.source == before.source
+    before_authority = before_snapshot["authorities"][CAPTURE_DISPLAY_ID.casefold()]
+    after_authority = after_snapshot["authorities"][CAPTURE_DISPLAY_ID.casefold()]
+    for field in (
+        "artifact_id",
+        "source_revision",
+        "source_sha256",
+        "representation_id",
+        "representation_revision",
+        "canvas_id",
+    ):
+        assert after_authority[field] == before_authority[field]
+    assert before_authority["original_backed_up"] is False
+    assert before_authority["active_operation_id"] == ""
+    assert after_authority["original_backed_up"] is True
+    assert after_authority["active_operation_id"] == "transform-op-1"
+
+    # The public projections still invalidate when the original moves cold.
+    assert after.revision != before.revision
+    assert after_snapshot["hints"][0]["revision"] != before_snapshot["hints"][0][
+        "revision"
+    ]
+    assert after.extensions["original_backup"]["restore_available"] is True
+    assert repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_ORIGINAL_ID)
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "invalid_field",
+    (
+        "raw_ref",
+        "extra",
+        "version",
+        "store",
+        "key",
+        "sha256",
+        "source_checksum",
+        "bytes",
+        "media_type",
+    ),
+)
+def test_backed_up_original_marker_is_strict(tmp_path, invalid_field):
+    root = tmp_path / invalid_field
+    original = _jpeg_bytes((120, 20, 30), (17, 23))
+    display = _jpeg_bytes((20, 120, 30), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _backed_up_photo_manifest(original, display)
+    imported = manifest["desktop_import"]["assets"][0]
+    marker = imported["original_backup"]
+    if invalid_field == "raw_ref":
+        imported["raw_ref"] = "orig_1.jpg"
+    elif invalid_field == "extra":
+        marker["future"] = True
+    elif invalid_field == "version":
+        marker["version"] = 2
+    elif invalid_field == "store":
+        marker["store"] = "somewhere-else"
+    elif invalid_field == "key":
+        marker["key"] = "sha256:" + "ab" * 32
+    elif invalid_field == "sha256":
+        marker["sha256"] = "ab" * 32
+    elif invalid_field == "source_checksum":
+        imported["source_checksum"] = "ab" * 32
+    elif invalid_field == "bytes":
+        marker["bytes"] = 0
+    elif invalid_field == "media_type":
+        marker["media_type"] = "application/octet-stream"
+
+    _write_photo_manifest(root, manifest)
+
+    hint = _repository(root).list_capture_index_hints(ITEM_ID)[0]
+
+    assert hint["resource_state"] == "unavailable"
+    assert hint["import_state"] == "unavailable"
+
+
+def test_capture_representation_revision_includes_display_fields(tmp_path):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((120, 20, 30), (17, 23))
+    display = _jpeg_bytes((20, 120, 30), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "photo_1.jpg").write_bytes(display)
+    manifest = _backed_up_photo_manifest(original, display)
+    path = _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    before = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+    assert before is not None
+
+    changed = copy.deepcopy(manifest)
+    changed["assets"][0]["display"]["recipe_version"] = "2"
+    path.write_text(json.dumps(changed, indent=2), encoding="utf-8")
+    after = repository.get_raster_artifact(
+        RasterArtifactKey(ITEM_ID, CAPTURE_DISPLAY_ID)
+    )
+
+    assert after is not None
+    assert after.source.representation_revision != before.source.representation_revision
 
 
 def test_android_geometry_projects_only_on_its_revision_pinned_display(tmp_path):

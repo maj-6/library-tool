@@ -8,6 +8,8 @@ import hashlib
 import io
 import json
 import os
+import threading
+from pathlib import Path
 
 import libcommon as lib
 import pytest
@@ -20,6 +22,7 @@ from PIL import Image
 
 
 OWNER_ID = "0f0e0d0c-0b0a-4a09-8807-060504030201"
+_NO_ACTIVE_CORRECTION = object()
 
 
 @pytest.fixture()
@@ -104,6 +107,26 @@ def _photo_assets(capture_id: str, assets) -> dict:
             } for index, (asset_id, checksum, lifecycle) in enumerate(assets)],
         },
     }
+
+
+def _mark_original_backed_up(
+        photo_assets: dict, asset_id: str, source_sha256: str, *,
+        active_operation_id=_NO_ACTIVE_CORRECTION) -> None:
+    imported = next(
+        row for row in photo_assets["desktop_import"]["assets"]
+        if row["asset_id"] == asset_id
+    )
+    imported.pop("raw_ref")
+    imported["original_backup"] = {
+        "version": 1,
+        "store": "output-originals-sha256",
+        "key": f"sha256:{source_sha256}",
+        "sha256": source_sha256,
+        "bytes": 321,
+        "media_type": "image/jpeg",
+    }
+    if active_operation_id is not _NO_ACTIVE_CORRECTION:
+        imported["active_desktop_correction_id"] = active_operation_id
 
 
 def _publish_transform(engine_root, item_id: str, operation_id: str,
@@ -671,6 +694,291 @@ def test_mapping_latest_wins_by_pointer_mtime_without_stamps(tmp_path):
         hashlib.sha256(newer_png).hexdigest()
 
 
+def test_mapping_backed_up_asset_publishes_only_active_operation(tmp_path):
+    """The display manifest, not retained transform history, is authoritative
+    once the immutable original has entered the backup store."""
+
+    capture_id = "c7777777-7777-4777-8777-777777777777"
+    item_id = "b-" + "5" * 32
+    source_sha = "f" * 64
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", source_sha, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    active_png = _png(6, 6, color=(20, 40, 60))
+    later_png = _png(6, 6, color=(80, 100, 120))
+    active_id = _publish_transform(
+        tmp_path, item_id, "op-active", f"{namespace}:display",
+        "ctr-" + "a" * 40, active_png, pointer_mtime=1_000_000.0,
+        source_revision="capture-display-r1", source_sha256="e" * 64,
+        display_head=True,
+        display_head_artifact_id=f"{namespace}:display")
+    later_id = _publish_transform(
+        tmp_path, item_id, "op-later", "ctr-" + "a" * 40,
+        "ctr-" + "b" * 40, later_png, pointer_mtime=2_000_000.0)
+    _mark_original_backed_up(
+        photo_assets,
+        "asset-01",
+        source_sha,
+        active_operation_id="op-active",
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    assert targets["asset-01"]["correction_id"] == active_id
+    assert targets["asset-01"]["display_sha256"] == \
+        hashlib.sha256(active_png).hexdigest()
+    assert targets["asset-01"]["manifest_authoritative"] is True
+    assert set(targets["asset-01"]["candidates"]) == {active_id, later_id}
+
+
+def test_mapping_backed_up_original_source_allows_pinned_physical_promotion(
+        tmp_path):
+    capture_id = "c7878787-7878-4878-8878-787878787878"
+    item_id = "b-" + "d" * 32
+    asset_id = "asset-01"
+    source_sha = "a" * 64
+    photo_assets = _photo_assets(
+        capture_id, [(asset_id, source_sha, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, asset_id)
+    promoted_png = _png(7, 5, color=(33, 66, 99))
+    promoted_sha = server._capture_correction_promoted_display_sha256(
+        promoted_png)
+    correction_id = _publish_transform(
+        tmp_path,
+        item_id,
+        "op-promoted-original",
+        f"{namespace}:original",
+        "ctr-" + "3" * 40,
+        promoted_png,
+        source_revision="capture-original-r1",
+        source_sha256=source_sha,
+    )
+    imported = photo_assets["desktop_import"]["assets"][0]
+    imported["derivative_checksum"] = promoted_sha
+    photo_assets["assets"] = [{
+        "asset_id": asset_id,
+        "display": {"sha256": promoted_sha},
+    }]
+    _mark_original_backed_up(
+        photo_assets,
+        asset_id,
+        source_sha,
+        active_operation_id="op-promoted-original",
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    assert targets[asset_id]["correction_id"] == correction_id
+    assert targets[asset_id]["manifest_authoritative"] is True
+    assert targets[asset_id]["authoritative_display_head"] is False
+    assert server._capture_correction_source_bytes(
+        targets[asset_id], engine_root=tmp_path) == promoted_png
+
+
+@pytest.mark.parametrize("mismatch", ["desktop", "public"])
+def test_mapping_backed_up_original_source_requires_both_current_display_pins(
+        tmp_path, mismatch):
+    capture_id = "c7979797-7979-4979-8979-797979797979"
+    item_id = "b-" + "e" * 32
+    asset_id = "asset-01"
+    source_sha = "b" * 64
+    photo_assets = _photo_assets(
+        capture_id, [(asset_id, source_sha, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, asset_id)
+    promoted_png = _png(7, 5, color=(44, 77, 100))
+    promoted_sha = server._capture_correction_promoted_display_sha256(
+        promoted_png)
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-promoted-original",
+        f"{namespace}:original",
+        "ctr-" + "4" * 40,
+        promoted_png,
+        source_revision="capture-original-r1",
+        source_sha256=source_sha,
+    )
+    imported = photo_assets["desktop_import"]["assets"][0]
+    imported["derivative_checksum"] = (
+        "c" * 64 if mismatch == "desktop" else promoted_sha
+    )
+    photo_assets["assets"] = [{
+        "asset_id": asset_id,
+        "display": {
+            "sha256": "d" * 64 if mismatch == "public" else promoted_sha,
+        },
+    }]
+    _mark_original_backed_up(
+        photo_assets,
+        asset_id,
+        source_sha,
+        active_operation_id="op-promoted-original",
+    )
+
+    assert server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path) == {}
+
+
+def test_mapping_backed_up_display_source_requires_matching_display_head(
+        tmp_path):
+    capture_id = "c7070707-7070-4070-8070-707070707070"
+    item_id = "b-" + "f" * 32
+    asset_id = "asset-01"
+    source_sha = "1" * 64
+    photo_assets = _photo_assets(
+        capture_id, [(asset_id, source_sha, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, asset_id)
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-unheaded-display",
+        f"{namespace}:display",
+        "ctr-" + "5" * 40,
+        _png(7, 5),
+    )
+    _mark_original_backed_up(
+        photo_assets,
+        asset_id,
+        source_sha,
+        active_operation_id="op-unheaded-display",
+    )
+
+    assert server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path) == {}
+
+
+def test_ocr_source_resolution_requires_active_marker_and_display_head(
+        monkeypatch, tmp_path):
+    capture_id = "c7171717-7171-4171-8171-717171717171"
+    item_id = "b-" + "7" * 32
+    asset_id = "asset-01"
+    source_sha = "2" * 64
+    photo_assets = _photo_assets(
+        capture_id, [(asset_id, source_sha, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, asset_id)
+    display_id = "ctr-" + "6" * 40
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-active-display",
+        f"{namespace}:display",
+        display_id,
+        _png(7, 5),
+        source_revision="capture-display-r1",
+        source_sha256="e" * 64,
+        display_head=True,
+        display_head_artifact_id=f"{namespace}:display",
+    )
+    _mark_original_backed_up(
+        photo_assets,
+        asset_id,
+        source_sha,
+        active_operation_id="op-active-display",
+    )
+    captures = tmp_path / "captures"
+    capture_dir = captures / capture_id
+    capture_dir.mkdir(parents=True)
+    manifest_path = capture_dir / "photo_assets.json"
+    manifest_path.write_text(json.dumps(photo_assets), encoding="utf-8")
+    monkeypatch.setattr(server, "CAPTURES_DIR", captures)
+
+    located = server._ocr_apply_capture_asset(
+        item_id, capture_id, display_id, tmp_path)
+
+    assert located is not None
+    assert located[:3] == (asset_id, 1, "display")
+    assert len(located[3]) == 1
+
+    photo_assets["desktop_import"]["assets"][0].pop(
+        "active_desktop_correction_id")
+    manifest_path.write_text(json.dumps(photo_assets), encoding="utf-8")
+    assert server._ocr_apply_capture_asset(
+        item_id, capture_id, display_id, tmp_path) is None
+
+
+def test_ocr_source_resolution_accepts_pinned_original_physical_promotion(
+        monkeypatch, tmp_path):
+    capture_id = "c7272727-7272-4272-8272-727272727272"
+    item_id = "b-" + "8" * 32
+    asset_id = "asset-01"
+    source_sha = "3" * 64
+    photo_assets = _photo_assets(
+        capture_id, [(asset_id, source_sha, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, asset_id)
+    display_id = "ctr-" + "7" * 40
+    promoted_png = _png(7, 5, color=(55, 88, 111))
+    promoted_sha = server._capture_correction_promoted_display_sha256(
+        promoted_png)
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-active-original",
+        f"{namespace}:original",
+        display_id,
+        promoted_png,
+        source_revision="capture-original-r1",
+        source_sha256=source_sha,
+    )
+    photo_assets["desktop_import"]["assets"][0][
+        "derivative_checksum"
+    ] = promoted_sha
+    photo_assets["assets"] = [{
+        "asset_id": asset_id,
+        "display": {"sha256": promoted_sha},
+    }]
+    _mark_original_backed_up(
+        photo_assets,
+        asset_id,
+        source_sha,
+        active_operation_id="op-active-original",
+    )
+    captures = tmp_path / "captures"
+    capture_dir = captures / capture_id
+    capture_dir.mkdir(parents=True)
+    (capture_dir / "photo_assets.json").write_text(
+        json.dumps(photo_assets), encoding="utf-8")
+    monkeypatch.setattr(server, "CAPTURES_DIR", captures)
+
+    assert server._ocr_apply_capture_asset(
+        item_id, capture_id, display_id, tmp_path) == (
+            asset_id,
+            1,
+            "display",
+            [],
+        )
+
+
+@pytest.mark.parametrize(
+    "active_operation_id",
+    [_NO_ACTIVE_CORRECTION, ""],
+    ids=["missing", "empty"],
+)
+def test_mapping_backed_up_restored_asset_suppresses_history(
+        tmp_path, active_operation_id):
+    capture_id = "c8888888-8888-4888-8888-888888888888"
+    item_id = "b-" + "6" * 32
+    source_sha = "1" * 64
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", source_sha, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    _publish_transform(
+        tmp_path, item_id, "op-retained", f"{namespace}:display",
+        "ctr-" + "c" * 40, _png(6, 6))
+    _mark_original_backed_up(
+        photo_assets,
+        "asset-01",
+        source_sha,
+        active_operation_id=active_operation_id,
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    assert targets == {}
+
+
 def test_correction_jpeg_transcode_caps_edges_without_upscaling():
     png = _png(3200, 1600)
 
@@ -689,6 +997,20 @@ def test_correction_jpeg_transcode_caps_edges_without_upscaling():
     assert display["bytes"] == len(display["data"])
     assert (thumbnail["width"], thumbnail["height"]) == (512, 256)
     assert (small["width"], small["height"]) == (100, 50)
+
+
+@pytest.mark.parametrize("pixel_limit", [1, 3])
+def test_transcode_rejects_pillow_decompression_bombs(
+        monkeypatch, pixel_limit):
+    payload = _png(2, 2)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", pixel_limit)
+
+    with pytest.raises(ValueError, match="decoded image safety limit"):
+        server._capture_correction_jpeg(
+            payload,
+            long_edge=1600,
+            quality=90,
+        )
 
 
 def _seed_corrected_capture(monkeypatch, *, lifecycle: str = "completed",
@@ -757,7 +1079,14 @@ def _strip_transport_field(capture_id: str) -> None:
 
 
 def _stub_cloud(monkeypatch, capture_id: str, *, owner_rows, existing):
-    calls = {"rest": [], "uploads": [], "published": [], "listed": []}
+    calls = {
+        "rest": [],
+        "uploads": [],
+        "published": [],
+        "expected_revisions": [],
+        "listed": [],
+        "photo_deletes": [],
+    }
 
     def rest(cfg, method, path, payload=None, prefer=""):
         calls["rest"].append((method, path))
@@ -780,11 +1109,22 @@ def _stub_cloud(monkeypatch, capture_id: str, *, owner_rows, existing):
             (bucket, path, hashlib.sha256(data).hexdigest(), content_type)
         ) or path,
     )
+    def publish(cfg, rows, *, expected_revisions=None):
+        del cfg
+        calls["published"].append(rows)
+        calls["expected_revisions"].append(expected_revisions)
+        return len(rows)
+
     monkeypatch.setattr(
         server.sbase,
         "publish_capture_corrections",
-        lambda cfg, rows: calls["published"].append(rows) or len(rows),
+        publish,
         raising=False,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "delete_photos",
+        lambda cfg, paths: calls["photo_deletes"].append(tuple(paths)),
     )
     return calls
 
@@ -826,6 +1166,9 @@ def test_publish_uploads_objects_and_rows_per_contract(
     assert row["asset_id"] == seeded["asset_id"]
     assert row["correction_id"] == seeded["correction_id"]
     assert row["source_original_sha256"] == seeded["source_sha"]
+    assert calls["expected_revisions"] == [{
+        (capture_id, seeded["asset_id"]): None,
+    }]
     doc = row["result"]
     assert doc["schema"] == "org.whl.capture-correction-result"
     assert doc["version"] == 1
@@ -889,7 +1232,10 @@ def test_publish_holds_local_authority_through_cloud_row_cas(
             finally:
                 authority_depth -= 1
 
-    def publish(_cfg, rows):
+    def publish(_cfg, rows, *, expected_revisions=None):
+        assert expected_revisions == {
+            (seeded["capture_id"], seeded["asset_id"]): None,
+        }
         assert capture_depth == 1
         assert authority_depth == 1
         calls["published"].append(rows)
@@ -1037,6 +1383,309 @@ def test_publish_revalidation_detects_removed_display_head_policy(
     assert result["errors"] == []
     assert len(result["notices"]) == 1
     assert "authority changed before publication" in result["notices"][0]
+def test_publish_rejects_oversized_transform_object_before_reading_or_upload(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch)
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+    monkeypatch.setattr(
+        server,
+        "_CAPTURE_CORRECTION_SOURCE_MAX_BYTES",
+        len(seeded["png"]) - 1,
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["candidates"] == 1
+    assert outcome["pushed"] == 0
+    assert len(outcome["errors"]) == 1
+    assert "invalid or too large" in outcome["errors"][0]
+    assert calls["uploads"] == []
+    assert calls["published"] == []
+
+
+@pytest.mark.parametrize(
+    ("document", "limit_name"),
+    [
+        ("pointer", "_CAPTURE_CORRECTION_POINTER_MAX_BYTES"),
+        ("publication", "_CAPTURE_CORRECTION_PUBLICATION_MAX_BYTES"),
+    ],
+)
+def test_publish_bounds_transform_documents_before_json_decode(
+        monkeypatch, capture_workspace, document, limit_name):
+    seeded = _seed_corrected_capture(monkeypatch)
+    engine_root = server._ensure_engine_session().write_set.root
+    transforms = engine_root / ".engine" / "correction-transforms"
+    if document == "pointer":
+        document_path = next((transforms / "by-item").rglob("*.json"))
+    else:
+        document_path = next((transforms / "publications").glob("*.json"))
+    monkeypatch.setattr(
+        server,
+        limit_name,
+        len(document_path.read_bytes()) - 1,
+    )
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["candidates"] == 0
+    assert outcome["pushed"] == 0
+    assert calls["rest"] == []
+    assert calls["uploads"] == []
+    assert calls["published"] == []
+
+
+@pytest.mark.parametrize("target_kind", ["pointer", "publication", "object"])
+def test_publish_rejects_transform_parent_replacement_with_preserved_leaf(
+        monkeypatch, capture_workspace, target_kind):
+    seeded = _seed_corrected_capture(monkeypatch)
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+    original_open = server._open_verified_regular
+    replaced = []
+
+    def kind(path):
+        if path.parent.parent.name == "by-item":
+            return "pointer"
+        if path.parent.name == "publications":
+            return "publication"
+        if path.parent.name == "objects":
+            return "object"
+        return ""
+
+    def replace_parent_before_open(path, named_before, *, authority):
+        if not replaced and kind(path) == target_kind:
+            parent = path.parent
+            displaced = parent.with_name(parent.name + ".displaced")
+            parent.rename(displaced)
+            parent.mkdir()
+            (displaced / path.name).replace(path)
+            replaced.append(path)
+        return original_open(path, named_before, authority=authority)
+
+    monkeypatch.setattr(
+        server,
+        "_open_verified_regular",
+        replace_parent_before_open,
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert len(replaced) == 1
+    assert outcome["pushed"] == 0
+    assert calls["uploads"] == []
+    assert calls["published"] == []
+
+
+def test_confined_transform_read_rejects_escape_and_redirected_ancestor(
+        monkeypatch, tmp_path):
+    engine_root = tmp_path / "output"
+    transforms = engine_root / ".engine" / "correction-transforms"
+    objects = transforms / "objects"
+    objects.mkdir(parents=True)
+    payload = b"confined"
+    object_path = objects / "object.bin"
+    object_path.write_bytes(payload)
+    outside = engine_root / "outside.bin"
+    outside.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="could not be read safely"):
+        server._capture_correction_confined_bytes(
+            outside,
+            authority_root=engine_root,
+            confined_root=transforms,
+            maximum=len(payload),
+            artifact="test transform object",
+        )
+
+    original_redirect = server._capture_path_is_redirecting
+    monkeypatch.setattr(
+        server,
+        "_capture_path_is_redirecting",
+        lambda path: Path(path) == objects or original_redirect(path),
+    )
+    with pytest.raises(ValueError, match="could not be read safely"):
+        server._capture_correction_confined_bytes(
+            object_path,
+            authority_root=engine_root,
+            confined_root=transforms,
+            maximum=len(payload),
+            artifact="test transform object",
+        )
+
+
+def test_publish_restored_backed_up_original_is_cloud_noop(
+        monkeypatch, capture_workspace):
+    """Restore is deliberately desktop-local in v1: retained transform
+    history cannot recreate a correction row or disturb source photos."""
+
+    seeded = _seed_corrected_capture(monkeypatch)
+    capture_id = seeded["capture_id"]
+    manifest_path = server.CAPTURES_DIR / capture_id / "photo_assets.json"
+    photo_assets = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _mark_original_backed_up(
+        photo_assets,
+        seeded["asset_id"],
+        seeded["source_sha"],
+    )
+    manifest_path.write_text(json.dumps(photo_assets), encoding="utf-8")
+    calls = _stub_cloud(
+        monkeypatch,
+        capture_id,
+        owner_rows=[{"id": capture_id, "created_by": OWNER_ID}],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome == {
+        "candidates": 0,
+        "pushed": 0,
+        "up_to_date": 0,
+        "no_cloud_row": 0,
+        "unreadable_capture": 0,
+        "notices": [],
+        "errors": [],
+    }
+    assert calls["rest"] == []
+    assert calls["listed"] == []
+    assert calls["uploads"] == []
+    assert calls["published"] == []
+    assert calls["photo_deletes"] == []
+
+
+def test_publish_revalidates_capture_state_before_cloud_row_publication(
+        monkeypatch, capture_workspace):
+    """A restore after discovery suppresses the row, not safe object uploads."""
+
+    seeded = _seed_corrected_capture(monkeypatch)
+    capture_id = seeded["capture_id"]
+    calls = _stub_cloud(
+        monkeypatch,
+        capture_id,
+        owner_rows=[{"id": capture_id, "created_by": OWNER_ID}],
+        existing=[],
+    )
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    restore_acquired = threading.Event()
+    upload_started = threading.Event()
+    original_targets = server._capture_correction_targets
+
+    def paused_targets(*args, **kwargs):
+        snapshot_started.set()
+        assert release_snapshot.wait(5)
+        return original_targets(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_capture_correction_targets", paused_targets)
+    original_list = server.sbase.list_capture_corrections
+
+    def listed_after_restore(cfg, ids):
+        assert restore_acquired.wait(5)
+        return original_list(cfg, ids)
+
+    monkeypatch.setattr(
+        server.sbase,
+        "list_capture_corrections",
+        listed_after_restore,
+    )
+    original_upload = server.sbase.upload_object
+
+    def observed_upload(*args, **kwargs):
+        upload_started.set()
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(server.sbase, "upload_object", observed_upload)
+    publish_result = {}
+    publish_errors = []
+
+    def publish():
+        try:
+            publish_result.update(server._publish_capture_corrections(
+                {"url": "cloud", "key": "service"}))
+        except BaseException as exc:  # surface worker failures in this thread
+            publish_errors.append(exc)
+
+    manifest_path = server.CAPTURES_DIR / capture_id / "photo_assets.json"
+
+    def restore_manifest():
+        session = server._ensure_engine_session()
+        with session.write_set.workspace_lease():
+            restore_acquired.set()
+            photo_assets = json.loads(manifest_path.read_text("utf-8"))
+            _mark_original_backed_up(
+                photo_assets, seeded["asset_id"], seeded["source_sha"])
+            manifest_path.write_text(
+                json.dumps(photo_assets), encoding="utf-8")
+            # Storage uploads must not wait for the output/corrections
+            # authority held by this restore. Only the final row CAS does.
+            assert upload_started.wait(5)
+
+    publisher = threading.Thread(target=publish)
+    restorer = threading.Thread(target=restore_manifest)
+    publisher.start()
+    assert snapshot_started.wait(5)
+    restorer.start()
+    assert not restore_acquired.wait(0.1)
+    release_snapshot.set()
+    publisher.join(5)
+    restorer.join(5)
+
+    assert not publisher.is_alive()
+    assert not restorer.is_alive()
+    assert publish_errors == []
+    assert restore_acquired.is_set()
+    assert upload_started.is_set()
+    assert publish_result["pushed"] == 0
+    assert publish_result["errors"] == []
+    assert any(
+        "authority changed before publication" in notice
+        for notice in publish_result["notices"]
+    )
+    assert len(calls["uploads"]) == 2
+    assert calls["published"] == []
+    assert calls["photo_deletes"] == []
+    first_call_counts = {
+        key: len(calls[key])
+        for key in ("rest", "listed", "uploads", "published",
+                    "photo_deletes")
+    }
+
+    restored = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert restored["candidates"] == 0
+    assert {
+        key: len(calls[key])
+        for key in first_call_counts
+    } == first_call_counts
 
 
 def test_publish_diff_short_circuits_matching_rows(
@@ -1149,13 +1798,16 @@ def test_publish_skips_lifecycle_failed_assets(
     assert calls["published"] == []
 
 
-def _cloud_row(seeded, *, correction_id: str, display_sha256: str) -> dict:
+def _cloud_row(
+        seeded, *, correction_id: str, display_sha256: str,
+        revision: int = 1) -> dict:
     return {
         "capture_id": seeded["capture_id"],
         "asset_id": seeded["asset_id"],
         "correction_id": correction_id,
         "source_original_sha256": seeded["source_sha"],
         "result": {"artifacts": {"display": {"sha256": display_sha256}}},
+        "revision": revision,
     }
 
 
@@ -1288,6 +1940,155 @@ def test_publish_display_head_replaces_restored_newer_cloud_sibling(
     assert row["correction_id"] != sibling_id
 
 
+def test_publish_manifest_active_operation_overrides_local_mtime_tie(
+        monkeypatch, capture_workspace):
+    """The backed-up manifest is authoritative over retained local history."""
+
+    seeded = _seed_corrected_capture(
+        monkeypatch,
+        pointer_mtime=1_000_000.0,
+        display_head=True,
+    )
+    sibling_png = _png(64, 48, color=(5, 100, 200))
+    sibling_id = _publish_transform(
+        server._ensure_engine_session().write_set.root,
+        seeded["item_id"], "op-sibling", f"{seeded['namespace']}:display",
+        "ctr-" + "1" * 40, sibling_png, pointer_mtime=1_000_000.0)
+    manifest_path = (
+        server.CAPTURES_DIR / seeded["capture_id"] / "photo_assets.json"
+    )
+    photo_assets = json.loads(manifest_path.read_text("utf-8"))
+    _mark_original_backed_up(
+        photo_assets,
+        seeded["asset_id"],
+        seeded["source_sha"],
+        active_operation_id="op-seeded",
+    )
+    manifest_path.write_text(json.dumps(photo_assets), encoding="utf-8")
+    sibling_display = server._capture_correction_jpeg(
+        sibling_png, long_edge=1600, quality=90)
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[_cloud_row(
+            seeded,
+            correction_id=sibling_id,
+            display_sha256=sibling_display["sha256"],
+        )],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["pushed"] == 1
+    assert outcome["notices"] == []
+    assert outcome["errors"] == []
+    (rows,) = calls["published"]
+    assert rows[0]["correction_id"] == seeded["correction_id"]
+    assert calls["photo_deletes"] == []
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    [
+        "malformed-marker",
+        "missing-raw",
+        "whitespace-raw",
+        "portable-original-mismatch",
+    ],
+)
+def test_publish_fails_closed_for_invalid_original_authority(
+        monkeypatch, capture_workspace, invalid_state):
+    seeded = _seed_corrected_capture(monkeypatch)
+    capture_id = seeded["capture_id"]
+    manifest_path = server.CAPTURES_DIR / capture_id / "photo_assets.json"
+    photo_assets = json.loads(manifest_path.read_text(encoding="utf-8"))
+    imported = photo_assets["desktop_import"]["assets"][0]
+    if invalid_state == "malformed-marker":
+        imported["original_backup"] = {"version": 1}
+    elif invalid_state == "missing-raw":
+        imported.pop("raw_ref")
+    elif invalid_state == "whitespace-raw":
+        imported["raw_ref"] = "   "
+    else:
+        _mark_original_backed_up(
+            photo_assets,
+            seeded["asset_id"],
+            seeded["source_sha"],
+            active_operation_id="op-seeded",
+        )
+        photo_assets["assets"] = [{
+            "asset_id": seeded["asset_id"],
+            "original": {"sha256": "f" * 64},
+        }]
+    manifest_path.write_text(json.dumps(photo_assets), encoding="utf-8")
+    calls = _stub_cloud(
+        monkeypatch,
+        capture_id,
+        owner_rows=[{"id": capture_id, "created_by": OWNER_ID}],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["candidates"] == 0
+    assert outcome["pushed"] == 0
+    assert outcome["unreadable_capture"] == 1
+    assert outcome["errors"] == []
+    assert len(outcome["notices"]) == 1
+    assert "unreadable local capture" in outcome["notices"][0]
+    assert calls["rest"] == []
+    assert calls["listed"] == []
+    assert calls["uploads"] == []
+    assert calls["published"] == []
+    assert calls["photo_deletes"] == []
+
+
+def test_publish_manifest_active_operation_keeps_greater_foreign_row(
+        monkeypatch, capture_workspace):
+    """Manifest authority does not erase another desktop's cloud winner."""
+
+    seeded = _seed_corrected_capture(monkeypatch, display_head=True)
+    manifest_path = (
+        server.CAPTURES_DIR / seeded["capture_id"] / "photo_assets.json"
+    )
+    photo_assets = json.loads(manifest_path.read_text("utf-8"))
+    _mark_original_backed_up(
+        photo_assets,
+        seeded["asset_id"],
+        seeded["source_sha"],
+        active_operation_id="op-seeded",
+    )
+    manifest_path.write_text(json.dumps(photo_assets), encoding="utf-8")
+    assert seeded["correction_id"] < "f" * 64
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[_cloud_row(
+            seeded, correction_id="f" * 64, display_sha256="1" * 64)],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["pushed"] == 0
+    assert outcome["errors"] == []
+    assert len(outcome["notices"]) == 1
+    assert "another desktop" in outcome["notices"][0]
+    assert calls["uploads"] == []
+    assert calls["published"] == []
+    assert calls["photo_deletes"] == []
+
+
 def test_publish_replaces_local_row_when_winner_descends_from_it(
         monkeypatch, capture_workspace):
     """Chain ancestry overrides the cloud row even when the row's own
@@ -1350,7 +2151,8 @@ def test_publish_replaces_lesser_foreign_correction_id(
         monkeypatch, seeded["capture_id"],
         owner_rows=[{"id": seeded["capture_id"], "created_by": OWNER_ID}],
         existing=[_cloud_row(
-            seeded, correction_id="0" * 64, display_sha256="1" * 64)],
+            seeded, correction_id="0" * 64, display_sha256="1" * 64,
+            revision=7)],
     )
 
     outcome = server._publish_capture_corrections(
@@ -1361,6 +2163,9 @@ def test_publish_replaces_lesser_foreign_correction_id(
     assert outcome["errors"] == []
     (rows,) = calls["published"]
     assert rows[0]["correction_id"] == seeded["correction_id"]
+    assert calls["expected_revisions"] == [{
+        (seeded["capture_id"], seeded["asset_id"]): 7,
+    }]
 
 
 _MISSING_RELATION_ERROR = (
@@ -1403,7 +2208,7 @@ def test_publish_row_write_tolerates_missing_migration_too(
         existing=[],
     )
 
-    def missing(_cfg, _rows):
+    def missing(_cfg, _rows, **_kwargs):
         raise server.sbase.SyncError(_MISSING_RELATION_ERROR)
 
     monkeypatch.setattr(

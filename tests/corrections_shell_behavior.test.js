@@ -776,6 +776,7 @@ test("terminal transform reloads only the selected stable capture display", asyn
   const key = `artifact:${artifactId}`;
   const observed = [];
   const reloads = [];
+  const bookRefreshes = [];
   const statuses = [];
   let listener = null;
   let released = 0;
@@ -814,6 +815,12 @@ test("terminal transform reloads only the selected stable capture display", asyn
         return selected;
       },
     },
+    booksFeature: {
+      async refresh(reason) {
+        bookRefreshes.push(reason);
+        return { revision: "index-r2" };
+      },
+    },
     subscribeTransformResults(callback) {
       listener = callback;
       return () => { released += 1; };
@@ -832,8 +839,10 @@ test("terminal transform reloads only the selected stable capture display", asyn
     image_commit: { operation_id: "display-transform-1", outputs: [] },
   }, command);
   await reloaded;
+  await Promise.resolve();
 
   assert.deepEqual(reloads, [key]);
+  assert.deepEqual(bookRefreshes, ["transform-committed"]);
   assert.equal(shell.artifactsFeature.selectedKey, key);
   assert.equal(shell.artifactsFeature.items.get(key).group, "source-images");
   assert.deepEqual(shell.state.selection, {
@@ -876,6 +885,7 @@ test("terminal transform reloads only the selected stable capture display", asyn
     "#295 terminal observation still receives every result");
   assert.deepEqual(reloads, [key],
     "cancelled, sibling, non-selected, and command-mismatched results are ignored");
+  assert.deepEqual(bookRefreshes, ["transform-committed"]);
   assert.deepEqual(statuses, []);
   shell.unsubscribeTransformResults();
   assert.equal(released, 1);
@@ -886,6 +896,7 @@ test("immediate terminal repaint is deduplicated against its streamed result", a
   const artifactId = "capture:stable-immediate:display";
   const key = `artifact:${artifactId}`;
   const reloads = [];
+  const bookRefreshes = [];
   const statuses = [];
   let listener = null;
   let finishReload;
@@ -920,6 +931,12 @@ test("immediate terminal repaint is deduplicated against its streamed result", a
         return selected;
       },
     },
+    booksFeature: {
+      async refresh(reason) {
+        bookRefreshes.push(reason);
+        return { revision: "index-r2" };
+      },
+    },
     subscribeTransformResults(callback) {
       listener = callback;
       return () => {};
@@ -947,6 +964,8 @@ test("immediate terminal repaint is deduplicated against its streamed result", a
 
   assert.deepEqual(reloads, [key],
     "the immediate and streamed copies share one in-flight repaint");
+  assert.deepEqual(bookRefreshes, ["transform-committed"],
+    "the immediate and streamed copies share one Books convergence");
   assert.deepEqual(statuses, [["Image processing queued", undefined]]);
   finishReload();
   assert.equal(await immediate, selected);
@@ -955,6 +974,7 @@ test("immediate terminal repaint is deduplicated against its streamed result", a
   await Promise.resolve();
   assert.deepEqual(reloads, [key],
     "a later replay of the same operation stays deduplicated");
+  assert.deepEqual(bookRefreshes, ["transform-committed"]);
   shell.unsubscribeTransformResults();
 });
 
@@ -2132,6 +2152,125 @@ test("standalone shell mounts presets from the production EngineClient port", as
   }), null, "an operations-only preset stays operations-only");
   shell.destroy();
 });
+
+
+test("shell restore-original wiring converges books and artifacts without clearing selection",
+  async () => {
+    const refreshes = [];
+    const restoreCalls = [];
+    const documentRef = fakeDocument();
+    const windowRef = {
+      confirm: () => true,
+      localStorage: new MemoryStorage(),
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    documentRef.defaultView = windowRef;
+    const rootElement = new FakeNode("div", documentRef);
+    const artifactsFeature = {
+      async refresh(options) {
+        refreshes.push(["artifacts", options]);
+        return { item_id: "book-1" };
+      },
+      destroy() {},
+    };
+    const booksFeature = {
+      async refresh(reason) {
+        refreshes.push(["books", reason]);
+        return { revision: "index-r4" };
+      },
+      destroy() {},
+    };
+    const shell = new CorrectionsShell({
+      root: rootElement,
+      documentRef,
+      windowRef,
+      engine: {
+        rasterArtifacts: {
+          async resolveOriginalBackup() {
+            throw new Error("not used");
+          },
+          async restoreOriginalBackup(args) {
+            restoreCalls.push(args);
+            return {
+              operation_id: args.idempotencyKey,
+              item_id: args.itemId,
+              artifact_id: args.artifactId,
+              before_revision: args.expectedArtifactRevision,
+              after_revision: "artifact-original-r4",
+              backup_sha256: "b".repeat(64),
+              replayed: false,
+            };
+          },
+        },
+      },
+      artifactsFeature,
+      booksFeature,
+      layoutController: {
+        getState: () => ({ ...DEFAULT_LAYOUT }),
+        replaceState() {},
+        destroy() {},
+      },
+      features: false,
+      itemProperties: false,
+      ocrProposalsFeature: false,
+      chPanelFeature: false,
+    });
+    shell.state.setSelection({
+      itemId: "book-1",
+      artifactId: "capture-7",
+    });
+    const container = new FakeNode("div", documentRef);
+    shell.editorRegistry.setResource({
+      id: "capture-7",
+      itemId: "book-1",
+      kind: "captured-image",
+      media_type: "image/jpeg",
+      url: "/capture-7.jpg",
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "display-resource-r3",
+        variant: "display",
+      },
+      extensions: {
+        original_backup: {
+          available: true,
+          restore_available: true,
+          sha256: "b".repeat(64),
+          bytes: 2048,
+          media_type: "image/jpeg",
+        },
+      },
+      correction: {
+        item_id: "book-1",
+        artifact_id: "capture-7",
+        artifact_revision: "artifact-r3",
+        source_revision: "source-r17",
+        source_sha256: "b".repeat(64),
+        proposal: null,
+      },
+    });
+    shell.editorRegistry.render(container);
+
+    container.querySelector(".perspective-restore-original").emit("click");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(restoreCalls.length, 1);
+    assert.equal(restoreCalls[0].itemId, "book-1");
+    assert.equal(restoreCalls[0].artifactId, "capture-7");
+    assert.equal(restoreCalls[0].expectedArtifactRevision, "artifact-r3");
+    assert.match(restoreCalls[0].idempotencyKey, /^correction:/);
+    assert.deepEqual(refreshes, [
+      ["books", "restore-original"],
+      ["artifacts", {
+        preserveSelection: true,
+        reason: "restore-original",
+      }],
+    ]);
+    assert.equal(shell.state.selection.itemId, "book-1");
+    assert.equal(shell.state.selection.artifactId, "capture-7");
+    shell.destroy();
+  });
 
 
 test("mask drafts own classification keys and editor replacement releases them", () => {

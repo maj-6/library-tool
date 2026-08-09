@@ -424,6 +424,75 @@ def test_native_text_layer_vertical_uses_only_host_owned_recovery(
     assert recovery_roots == [root.resolve()]
 
 
+def test_host_recovers_broad_capture_transaction_before_composition(tmp_path):
+    data_root = tmp_path / "library"
+    output_root = data_root / "output"
+    capture_root = data_root / "captures"
+    capture_directory = capture_root / "capture-1"
+    capture_directory.mkdir(parents=True)
+    output_root.mkdir(parents=True)
+    original = capture_directory / "orig_1.jpg"
+    display = capture_directory / "photo_1.jpg"
+    manifest = capture_directory / "photo_assets.json"
+    backup = output_root / "backups" / "originals" / "object"
+    original.write_bytes(b"original")
+    display.write_bytes(b"display-before")
+    manifest.write_bytes(b"manifest-before")
+
+    def crash_before_manifest(_index: int, target: Path) -> None:
+        if target == manifest:
+            raise SystemExit("simulated broad transaction interruption")
+
+    interrupted = RecoverableWriteSet(data_root, publish_hook=crash_before_manifest)
+    transaction = interrupted.begin(scope="capture-display-promotion")
+    transaction.stage_write(
+        backup.relative_to(data_root).as_posix(),
+        b"original",
+    )
+    transaction.stage_write(
+        display.relative_to(data_root).as_posix(),
+        b"display-after",
+    )
+    transaction.stage_delete(original.relative_to(data_root).as_posix())
+    transaction.stage_write(
+        manifest.relative_to(data_root).as_posix(),
+        b"manifest-after",
+    )
+    with pytest.raises(SystemExit, match="simulated broad transaction"):
+        transaction.commit()
+
+    corrections = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        transaction_root=data_root,
+        original_backup_root=output_root / "backups" / "originals",
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+    config, bindings, modules = _host_inputs(
+        output_root,
+        corrections=corrections,
+    )
+
+    with open_filesystem_engine(
+        config=config,
+        bindings=bindings,
+        contribute_modules=modules,
+    ) as session:
+        assert any(
+            result.action == "rolled_back_interrupted"
+            for result in session.recovery_results
+        )
+        assert original.read_bytes() == b"original"
+        assert display.read_bytes() == b"display-before"
+        assert manifest.read_bytes() == b"manifest-before"
+        assert not backup.exists()
+
+
 def test_host_rejects_a_mismatched_native_text_layer_binding(tmp_path):
     _config, bindings, _modules = _host_inputs(tmp_path / "workspace")
 

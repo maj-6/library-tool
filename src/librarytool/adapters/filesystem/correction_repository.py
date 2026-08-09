@@ -691,6 +691,32 @@ class FilesystemCorrectionUnitOfWork:
         self._loaded[item_id] = aggregate
         return aggregate
 
+    def reconcile_live(
+        self,
+        live: CorrectionAggregateSnapshot,
+    ) -> CorrectionAggregateSnapshot:
+        """Reconcile a caller-supplied coherent base against durable state."""
+
+        self._ensure_open()
+        if not isinstance(live, CorrectionAggregateSnapshot):
+            raise TypeError("live must be a CorrectionAggregateSnapshot")
+        item_id = live.item_id
+        path = self._safe_target(
+            self._aggregate_relative(item_id),
+            artifact="correction_aggregate",
+        )
+        raw = _read_json(
+            path,
+            artifact="correction_aggregate",
+            maximum_bytes=_MAX_AGGREGATE_BYTES,
+        )
+        if raw is None:
+            return live
+        durable = self._aggregate_from_document(raw, item_id=item_id)
+        if self._reconcile_aggregate is None:
+            return durable
+        return self._reconcile(live, durable, item_id=item_id)
+
     def has_durable_aggregate(self, item_id: str) -> bool:
         """Report persisted aggregate presence without invoking live loading.
 

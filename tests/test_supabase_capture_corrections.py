@@ -145,6 +145,64 @@ def test_correction_publish_updates_via_revision_cas(monkeypatch):
     }
 
 
+def test_correction_publish_uses_callers_observed_revision_without_reread(
+        monkeypatch):
+    new_correction = "4b" * 32
+    new_display = "5c" * 32
+    desired = correction_row(
+        correction_id=new_correction,
+        result=correction_result(new_correction, new_display),
+    )
+    calls = []
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        calls.append((method, path, deepcopy(payload), prefer))
+        assert method != "GET"
+        return [{**deepcopy(payload), "capture_id": CAPTURE_ID,
+                 "asset_id": ASSET_ID, "revision": 7,
+                 "updated_at": "2026-08-01T12:00:02Z"}]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    assert supabase_sync.publish_capture_corrections(
+        {"url": "test"},
+        [desired],
+        expected_revisions={(CAPTURE_ID, ASSET_ID): 6},
+    ) == 1
+    assert len(calls) == 1
+    assert calls[0][0] == "PATCH"
+    assert "revision=eq.6" in calls[0][1]
+
+
+def test_correction_publish_does_not_overwrite_row_newer_than_observation(
+        monkeypatch):
+    desired = correction_row(
+        correction_id="4b" * 32,
+        result=correction_result("4b" * 32, "5c" * 32),
+    )
+    calls = []
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        del payload, prefer
+        calls.append((method, path))
+        assert method != "GET"
+        return []  # revision 6 was replaced before this exact CAS
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    with pytest.raises(
+            supabase_sync.SyncError,
+            match="compare-and-set conflict"):
+        supabase_sync.publish_capture_corrections(
+            {"url": "test"},
+            [desired],
+            expected_revisions={(CAPTURE_ID, ASSET_ID): 6},
+        )
+    assert len(calls) == 1
+    assert calls[0][0] == "PATCH"
+    assert "revision=eq.6" in calls[0][1]
+
+
 def test_correction_publish_short_circuits_matching_cloud_row(monkeypatch):
     calls = []
     published = cloud_row(revision=3)

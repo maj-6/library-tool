@@ -27,6 +27,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from datetime import datetime, timezone
 
 TIMEOUT = 30.0
@@ -1532,14 +1533,22 @@ def _correction_display_sha256(result) -> str:
     return sha256 if isinstance(sha256, str) else ""
 
 
-def publish_capture_corrections(cfg: dict, rows: list[dict]) -> int:
+def publish_capture_corrections(
+        cfg: dict,
+        rows: list[dict],
+        *,
+        expected_revisions: Mapping[tuple[str, str], int | None] | None = None,
+) -> int:
     """CAS-publish desktop corrections, one row per (capture_id, asset_id).
 
     Unlike the book-metadata projection there is no vector clock: the desktop
     under the owner service credential is the sole writer, so CAS on
     ``revision`` alone guards against a concurrent desktop run. Invalid rows
     and revision conflicts are reported after unrelated valid rows have had an
-    opportunity to publish.
+    opportunity to publish. A caller that already compared cloud state may
+    supply ``expected_revisions``; those exact observations drive the INSERT
+    or revision-filtered PATCH without a second read that could silently
+    authorize a newer concurrent row.
     """
     desired: dict[tuple[str, str], dict] = {}
     failures: list[str] = []
@@ -1557,17 +1566,21 @@ def publish_capture_corrections(cfg: dict, rows: list[dict]) -> int:
             failures.append(f"{label}: {exc}")
             continue
         desired[(normalized["capture_id"], normalized["asset_id"])] = normalized
-    existing = {
+    if expected_revisions is not None and not isinstance(
+            expected_revisions, Mapping):
+        raise SyncError("capture correction expected revisions are invalid")
+    existing = ({
         (str(row.get("capture_id")), str(row.get("asset_id"))): row
         for row in list_capture_corrections(
             cfg, (key[0] for key in desired))
-    }
+    } if expected_revisions is None else {})
     table = cfg.get("capture_corrections_table") or "capture_corrections"
     pushed = 0
     selected = ("capture_id,asset_id,correction_id,source_original_sha256,"
                 "result,revision,updated_at")
     for (capture_id, asset_id), row in desired.items():
-        previous = existing.get((capture_id, asset_id))
+        key = (capture_id, asset_id)
+        previous = existing.get(key)
         if (previous is not None and
                 str(previous.get("correction_id") or "") ==
                 row["correction_id"] and
@@ -1575,7 +1588,21 @@ def publish_capture_corrections(cfg: dict, rows: list[dict]) -> int:
                 _correction_display_sha256(row["result"])):
             continue
         try:
-            if previous is None:
+            if expected_revisions is not None:
+                if key not in expected_revisions:
+                    raise SyncError(
+                        "capture correction expected revision is missing")
+                revision = expected_revisions[key]
+                if (revision is not None and (
+                        isinstance(revision, bool)
+                        or not isinstance(revision, int)
+                        or revision < 1)):
+                    raise SyncError(
+                        "capture correction expected revision is invalid")
+            else:
+                revision = previous.get("revision") \
+                    if previous is not None else None
+            if revision is None:
                 response = _rest(
                     cfg, "POST",
                     f"{table}?on_conflict=capture_id,asset_id"
@@ -1584,7 +1611,6 @@ def publish_capture_corrections(cfg: dict, rows: list[dict]) -> int:
                 )
                 expected_revision = 1
             else:
-                revision = previous.get("revision")
                 if (isinstance(revision, bool) or
                         not isinstance(revision, int) or revision < 1):
                     raise SyncError("cloud correction has an invalid revision")

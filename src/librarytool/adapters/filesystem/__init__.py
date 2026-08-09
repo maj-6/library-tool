@@ -18,11 +18,13 @@ from .capture_archive_repository import FilesystemCaptureArchiveRepository
 from .capture_document_artifact_repository import (
     FilesystemCaptureDocumentArtifactRepository,
 )
+from .capture_original_backups import FilesystemCaptureOriginalBackupStore
 from .correction_repository import FilesystemCorrectionRepository
 from .correction_ocr_proposal_repository import (
     FilesystemCorrectionOcrProposalRepository,
 )
 from .correction_transform_store import (
+    CorrectionTransformPublicationPlan,
     CorrectionTransformOutputResolverPort,
     FilesystemCorrectionTransformStore,
 )
@@ -90,9 +92,11 @@ __all__ = [
     "FilesystemCanvasQueryRepository",
     "FilesystemCaptureArchiveRepository",
     "FilesystemCaptureDocumentArtifactRepository",
+    "FilesystemCaptureOriginalBackupStore",
     "FilesystemCorrectionRepository",
     "FilesystemCorrectionOcrProposalRepository",
     "FilesystemCorrectionTransformStore",
+    "CorrectionTransformPublicationPlan",
     "CorrectionTransformOutputResolverPort",
     "FilesystemCorrectionSourceSnapshotReader",
     "FilesystemCorrectionsArtifactRepository",

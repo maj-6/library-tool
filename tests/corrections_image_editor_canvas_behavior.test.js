@@ -12,6 +12,7 @@ const {
 const {
   correctionResourceContract,
   createPerspectiveImageRenderer,
+  originalBackupContract,
   safeRasterUrl,
   serializeProcessingPresetCommand,
 } = require("../tools/whl_explorer/static/corrections/image-editor");
@@ -343,6 +344,182 @@ test("renderer exposes strict resource pins, safe raster URLs, and accessible nu
   assert.ok(controller.canvas.drawCalls.some(([name]) => name === "fillText"));
   dispose();
 });
+
+
+test("verified original actions appear only on backed-up display artifacts",
+  async () => {
+    const marker = {
+      available: true,
+      restore_available: true,
+      sha256: "b".repeat(64),
+      bytes: 7,
+      media_type: "image/jpeg",
+    };
+    const display = fixtureResource({
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "display-resource-r3",
+        variant: "display",
+      },
+      extensions: { original_backup: marker },
+    });
+    assert.deepEqual(originalBackupContract(display), marker);
+    assert.equal(originalBackupContract({
+      ...display,
+      resourceRef: { ...display.resourceRef, variant: "thumbnail" },
+    }), null);
+
+    const calls = [];
+    const revoked = [];
+    const { container, dispose } = renderHarness({
+      engine: {
+        rasterArtifacts: {
+          async resolveOriginalBackup(args) {
+            calls.push(args);
+            return {
+              blob: new Blob([new Uint8Array([1, 2, 3, 4, 5, 6, 7])], {
+                type: "image/jpeg",
+              }),
+              mediaType: "image/jpeg",
+              revision: "artifact-r3",
+            };
+          },
+          async restoreOriginalBackup() {
+            throw new Error("not used");
+          },
+        },
+      },
+      objectUrls: {
+        createObjectURL: () => "blob:verified-original-1",
+        revokeObjectURL: (url) => revoked.push(url),
+      },
+    }, display);
+
+    assert.equal(byClass(container, "perspective-view-original").length, 1);
+    assert.equal(byClass(container, "perspective-restore-original").length, 1);
+    byClass(container, "perspective-view-original")[0].emit("click");
+    await nextTurn();
+
+    assert.deepEqual(calls, [{
+      itemId: "book-1",
+      artifactId: "capture-7",
+      revision: "artifact-r3",
+    }]);
+    const dialog = byClass(container, "perspective-original-dialog")[0];
+    assert.equal(dialog.getAttribute("open"), "");
+    assert.equal(byClass(container, "perspective-original-preview")[0].src,
+      "blob:verified-original-1");
+    assert.match(
+      byClass(container, "perspective-original-status")[0].textContent,
+      /verified original opened/i,
+    );
+
+    byClass(container, "perspective-original-close")[0].emit("click");
+    assert.deepEqual(revoked, ["blob:verified-original-1"]);
+    assert.equal(dialog.getAttribute("open"), null);
+    dispose();
+
+    const ordinary = renderHarness({}, fixtureResource({
+      extensions: { original_backup: marker },
+      resourceRef: {
+        id: "capture-7-thumbnail",
+        revision: "thumbnail-r3",
+        variant: "thumbnail",
+      },
+    }));
+    assert.equal(byClass(ordinary.container, "perspective-view-original").length, 0);
+    assert.equal(byClass(ordinary.container, "perspective-restore-original").length, 0);
+    ordinary.dispose();
+
+    const restored = renderHarness({}, fixtureResource({
+      resourceRef: display.resourceRef,
+      extensions: {
+        original_backup: { ...marker, restore_available: false },
+      },
+    }));
+    assert.equal(byClass(restored.container, "perspective-view-original").length, 1);
+    assert.equal(byClass(restored.container, "perspective-restore-original").length, 0);
+    restored.dispose();
+  });
+
+
+test("restore original confirms, uses current CAS, and refreshes the same selection",
+  async () => {
+    const display = fixtureResource({
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "display-resource-r3",
+        variant: "display",
+      },
+      extensions: {
+        original_backup: {
+          available: true,
+          restore_available: true,
+          sha256: "b".repeat(64),
+          bytes: 7,
+          media_type: "image/jpeg",
+        },
+      },
+    });
+    const restores = [];
+    const refreshes = [];
+    const confirmations = [false, true];
+    const receipt = {
+      operation_id: "correction:restore-original-1",
+      item_id: "book-1",
+      artifact_id: "capture-7",
+      before_revision: "artifact-r3",
+      after_revision: "artifact-original-r4",
+      backup_sha256: "b".repeat(64),
+      replayed: false,
+    };
+    const { container, dispose, resource } = renderHarness({
+      engine: {
+        rasterArtifacts: {
+          async resolveOriginalBackup() {
+            throw new Error("not used");
+          },
+          async restoreOriginalBackup(args) {
+            restores.push(args);
+            return receipt;
+          },
+        },
+      },
+      createOperationId: () => "correction:restore-original-1",
+      confirmRestoreOriginal(detail) {
+        assert.match(detail.message, /replace the corrected display/i);
+        return confirmations.shift();
+      },
+      async refreshAfterOriginalRestore(detail) {
+        refreshes.push(detail);
+      },
+    }, display);
+    const restore = byClass(container, "perspective-restore-original")[0];
+
+    restore.emit("click");
+    await nextTurn();
+    assert.equal(restores.length, 0, "cancelling confirmation cannot mutate");
+
+    restore.emit("click");
+    await nextTurn();
+    assert.deepEqual(restores, [{
+      itemId: "book-1",
+      artifactId: "capture-7",
+      expectedArtifactRevision: "artifact-r3",
+      idempotencyKey: "correction:restore-original-1",
+    }]);
+    assert.equal(refreshes.length, 1);
+    assert.equal(refreshes[0].itemId, "book-1");
+    assert.equal(refreshes[0].artifactId, "capture-7");
+    assert.equal(refreshes[0].preserveSelection, true);
+    assert.equal(refreshes[0].receipt, receipt);
+    assert.equal(refreshes[0].resource, resource);
+    assert.match(
+      byClass(container, "perspective-original-status")[0].textContent,
+      /original display restored/i,
+    );
+    dispose();
+  });
 
 
 test("preset command serialization derives fresh pins and quad from its target resource", () => {

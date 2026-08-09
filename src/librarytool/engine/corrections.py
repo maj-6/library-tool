@@ -1196,6 +1196,11 @@ class CorrectionUnitOfWorkPort(Protocol):
 
     def get(self, item_id: str) -> CorrectionAggregateSnapshot | None: ...
 
+    def reconcile_live(
+        self,
+        live: CorrectionAggregateSnapshot,
+    ) -> CorrectionAggregateSnapshot: ...
+
     def stage(
         self,
         current: CorrectionAggregateSnapshot,

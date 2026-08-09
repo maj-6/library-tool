@@ -25,7 +25,8 @@
 }
 
 .perspective-tool-group,
-.perspective-history-group {
+.perspective-history-group,
+.perspective-original-actions {
   display: flex;
   align-items: center;
   gap: 3px;
@@ -64,6 +65,15 @@
 .perspective-history-group {
   padding-left: 7px;
   border-left: var(--border-w, 1px) solid var(--line);
+}
+
+.perspective-original-actions {
+  padding-left: 7px;
+  border-left: var(--border-w, 1px) solid var(--line);
+}
+
+.perspective-restore-original {
+  border-color: color-mix(in srgb, var(--amber) 62%, var(--line)) !important;
 }
 
 .perspective-proposal-badge {
@@ -207,7 +217,9 @@
 .perspective-coordinate-hint,
 .perspective-tool-instruction,
 .perspective-validation-status,
-.perspective-queue-status {
+.perspective-queue-status,
+.perspective-original-status,
+.perspective-original-dialog-note {
   margin: 0;
   color: var(--ink-muted);
   font-size: 11px;
@@ -281,7 +293,8 @@
 
 .perspective-coordinate-control input:focus-visible,
 .perspective-toolbar button:focus-visible,
-.perspective-corner-inspector button:focus-visible {
+.perspective-corner-inspector button:focus-visible,
+.perspective-original-dialog button:focus-visible {
   outline: 2px solid var(--perspective-accent);
   outline-offset: 1px;
 }
@@ -297,7 +310,8 @@
 }
 
 .perspective-tool-instruction,
-.perspective-queue-status {
+.perspective-queue-status,
+.perspective-original-status {
   min-height: 34px;
   padding: 7px 10px;
   border-top: var(--border-w, 1px) solid var(--line);
@@ -305,6 +319,57 @@
 
 .perspective-queue-status {
   color: var(--ink-muted);
+}
+
+.perspective-original-status[data-error="true"] {
+  color: var(--red);
+}
+
+.perspective-original-dialog {
+  width: min(92vw, 1100px);
+  max-width: 1100px;
+  max-height: 92vh;
+  padding: 14px;
+  overflow: auto;
+  border: var(--border-w, 1px) solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--face);
+  color: var(--ink);
+}
+
+.perspective-original-dialog::backdrop {
+  background: rgb(0 0 0 / 72%);
+}
+
+.perspective-original-dialog h2 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.perspective-original-dialog-note {
+  margin: 0 0 10px;
+}
+
+.perspective-original-preview {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: calc(92vh - 120px);
+  margin: 0 auto 10px;
+  background: #0c0f0c;
+  object-fit: contain;
+}
+
+.perspective-original-close {
+  min-height: var(--ctl-h);
+  padding: 4px 12px;
+  border: var(--border-w, 1px) solid var(--line);
+  border-radius: var(--radius);
+  background: var(--face-hi);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
 }
 
 @media (max-width: 820px) {
@@ -343,6 +408,7 @@
 
 @media (forced-colors: active) {
   .perspective-proposal-badge,
+  .perspective-original-actions,
   .perspective-tool-button[aria-pressed="true"],
   .perspective-corner-select[aria-pressed="true"],
   .perspective-coordinate-control input[aria-invalid="true"] {

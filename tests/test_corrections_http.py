@@ -740,6 +740,191 @@ def test_invalid_preview_resolution_closes_its_owned_stream():
     assert stream.closed is True
 
 
+def test_original_backup_bytes_and_restore_receipt_are_revision_pinned():
+    content = b"\x89PNG\r\n\x1a\nverified-original"
+    digest = hashlib.sha256(content).hexdigest()
+    revision = "artifact-image-a-corrected-r2"
+
+    class ExplodingProjector:
+        def list_raster_artifacts(self, _item_id):
+            pytest.fail("original backup listed authoritative artifacts")
+
+        def get_raster_artifact(self, _key):
+            pytest.fail("original backup projected artifact detail")
+
+    class OriginalBackupResolver:
+        def __init__(self):
+            self.calls = []
+
+        def resolve_original_backup(
+            self,
+            item_id,
+            artifact_id,
+            expected_revision,
+        ):
+            self.calls.append(
+                ("resolve", item_id, artifact_id, expected_revision)
+            )
+            return _Resolved(
+                io.BytesIO(content),
+                "image/png",
+                digest,
+                len(content),
+                expected_revision,
+            )
+
+        def restore_original_backup(
+            self,
+            item_id,
+            artifact_id,
+            expected_revision,
+            operation_id,
+        ):
+            self.calls.append(
+                (
+                    "restore",
+                    item_id,
+                    artifact_id,
+                    expected_revision,
+                    operation_id,
+                )
+            )
+            return {
+                "operation_id": operation_id,
+                "item_id": item_id,
+                "artifact_id": artifact_id,
+                "before_revision": expected_revision,
+                "after_revision": "artifact-image-a-original-r3",
+                "backup_sha256": digest,
+                "replayed": False,
+            }
+
+    resolver = OriginalBackupResolver()
+    client = _app(
+        _Engine(ExplodingProjector(), _SpatialProjector(())),
+        resolver,
+    ).test_client()
+    base = "/api/v1/items/book-1/raster-artifacts/image-a"
+
+    resolved = client.get(
+        f"{base}/original-backup",
+        query_string={"revision": revision},
+    )
+
+    assert resolved.status_code == 200
+    assert resolved.data == content
+    assert resolved.mimetype == "image/png"
+    assert resolved.headers["X-Resource-Revision"] == revision
+    assert resolved.headers["Content-Digest"].startswith("sha-256=:")
+
+    restored = client.post(
+        f"{base}/restore-original",
+        headers={
+            "Idempotency-Key": "restore-original-1",
+            "If-Artifact-Match": f'"{revision}"',
+        },
+        json={},
+    )
+
+    assert restored.status_code == 200
+    assert restored.get_json() == {
+        "ok": True,
+        "schema": "librarytool.original-backup-restore/1",
+        "operation_id": "restore-original-1",
+        "item_id": "book-1",
+        "artifact_id": "image-a",
+        "before_revision": revision,
+        "after_revision": "artifact-image-a-original-r3",
+        "backup_sha256": digest,
+        "replayed": False,
+    }
+    assert restored.cache_control.no_store is True
+    assert resolver.calls == [
+        ("resolve", "book-1", "image-a", revision),
+        (
+            "restore",
+            "book-1",
+            "image-a",
+            revision,
+            "restore-original-1",
+        ),
+    ]
+
+
+def test_original_backup_transport_rejects_unpinned_and_invalid_receipts():
+    revision = "artifact-image-a-corrected-r2"
+
+    class InvalidReceiptResolver:
+        def __init__(self):
+            self.calls = []
+
+        def resolve_original_backup(self, *_args):
+            pytest.fail("an unpinned backup must not be resolved")
+
+        def restore_original_backup(self, *args):
+            self.calls.append(args)
+            return {
+                "operation_id": args[-1],
+                "item_id": args[0],
+                "artifact_id": args[1],
+                "before_revision": args[2],
+                "after_revision": "artifact-image-a-original-r3",
+                "backup_sha256": "not-a-digest",
+                "replayed": False,
+            }
+
+    resolver = InvalidReceiptResolver()
+    client = _app(
+        _Engine(_RasterProjector(()), _SpatialProjector(())),
+        resolver,
+    ).test_client()
+    base = "/api/v1/items/book-1/raster-artifacts/image-a"
+
+    missing = client.get(f"{base}/original-backup")
+    assert missing.status_code == 428
+    assert missing.get_json()["code"] == "original_backup_revision_required"
+
+    duplicate = client.get(
+        f"{base}/original-backup?revision={revision}&revision=other"
+    )
+    assert duplicate.status_code == 400
+    assert duplicate.get_json()["code"] == "invalid_original_backup_revision"
+
+    nonempty = client.post(
+        f"{base}/restore-original",
+        headers={
+            "Idempotency-Key": "restore-original-1",
+            "If-Artifact-Match": f'"{revision}"',
+        },
+        json={"force": True},
+    )
+    assert nonempty.status_code == 400
+    assert nonempty.get_json()["code"] == (
+        "invalid_correction_mutation_envelope"
+    )
+
+    invalid = client.post(
+        f"{base}/restore-original",
+        headers={
+            "Idempotency-Key": "restore-original-1",
+            "If-Artifact-Match": f'"{revision}"',
+        },
+        json={},
+    )
+    assert invalid.status_code == 500
+    assert invalid.get_json()["code"] == (
+        "invalid_original_backup_restore_receipt"
+    )
+    assert resolver.calls == [
+        (
+            "book-1",
+            "image-a",
+            revision,
+            "restore-original-1",
+        )
+    ]
+
+
 def test_invalid_resolver_result_closes_its_owned_stream():
     artifact = _raster("image-a")
     stream = io.BytesIO(b"invalid metadata")

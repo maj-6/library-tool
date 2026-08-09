@@ -103,6 +103,17 @@
     };
   }
 
+  function originalBackupContract(resource) {
+    const resourceRef = resource && isPlainObject(resource.resourceRef)
+      ? resource.resourceRef : null;
+    if (!resourceRef || resourceRef.variant !== "display") return null;
+    const extensions = resource && isPlainObject(resource.extensions)
+      ? resource.extensions : null;
+    const backup = extensions && isPlainObject(extensions.original_backup)
+      ? extensions.original_backup : null;
+    return backup && backup.available === true ? backup : null;
+  }
+
   function serializeProcessingPresetCommand({ resource, preset, operationId } = {}) {
     if (!isPlainObject(preset) || !Array.isArray(preset.operations)) {
       throw new TypeError("a canonical processing preset is required");
@@ -365,6 +376,40 @@
       redoButton.setAttribute("aria-keyshortcuts", "Control+Shift+Z");
       historyGroup.append(undoButton, redoButton);
 
+      const originalBackup = originalBackupContract(resource);
+      let originalActions = null;
+      let viewOriginalButton = null;
+      let restoreOriginalButton = null;
+      if (originalBackup) {
+        originalActions = element(
+          documentRef,
+          "div",
+          "perspective-original-actions",
+        );
+        originalActions.setAttribute("role", "group");
+        originalActions.setAttribute("aria-label", "Original capture backup");
+        viewOriginalButton = element(
+          documentRef,
+          "button",
+          "perspective-view-original",
+          "View original",
+        );
+        viewOriginalButton.type = "button";
+        setData(viewOriginalButton, "originalAction", "view");
+        originalActions.append(viewOriginalButton);
+        if (originalBackup.restore_available === true) {
+          restoreOriginalButton = element(
+            documentRef,
+            "button",
+            "perspective-restore-original",
+            "Restore original",
+          );
+          restoreOriginalButton.type = "button";
+          setData(restoreOriginalButton, "originalAction", "restore");
+          originalActions.append(restoreOriginalButton);
+        }
+      }
+
       const queueButton = element(
         documentRef,
         "button",
@@ -376,7 +421,9 @@
       setData(queueButton, "commandId", commandId);
       const proposalBadge = element(documentRef, "span", "perspective-proposal-badge");
       setData(proposalBadge, "quadSource", state.quadSource.kind);
-      toolbar.append(toolGroup, historyGroup, proposalBadge, queueButton);
+      toolbar.append(toolGroup, historyGroup);
+      if (originalActions) toolbar.append(originalActions);
+      toolbar.append(proposalBadge, queueButton);
 
       const editorLayout = element(documentRef, "div", "perspective-editor-layout");
       const viewport = element(documentRef, "div", "perspective-viewport");
@@ -466,6 +513,12 @@
       const queueStatus = element(documentRef, "p", "perspective-queue-status");
       queueStatus.setAttribute("role", "status");
       queueStatus.setAttribute("aria-live", "polite");
+      const originalStatus = originalBackup
+        ? element(documentRef, "p", "perspective-original-status") : null;
+      if (originalStatus) {
+        originalStatus.setAttribute("role", "status");
+        originalStatus.setAttribute("aria-live", "polite");
+      }
       const instruction = element(documentRef, "p", "perspective-tool-instruction");
       instruction.id = `${instanceId}-instruction`;
       canvas.setAttribute(
@@ -473,6 +526,7 @@
         `${instruction.id} ${validationStatus.id}`,
       );
       inspector.append(fieldset, instruction, queueStatus);
+      if (originalStatus) inspector.append(originalStatus);
       editorLayout.append(viewport, inspector);
       surface.append(toolbar, editorLayout);
       container.append(surface);
@@ -484,6 +538,260 @@
       const hostHasSelection = () => typeof options.hasSelection === "function"
         ? options.hasSelection(resource) === true
         : state.selectionPresent;
+      let originalBusy = "";
+      let originalStatusText = "";
+      let originalStatusError = false;
+      let originalPreviewDialog = null;
+      let originalPreviewImage = null;
+      let originalPreviewUrl = "";
+      let originalPreviewUrlApi = null;
+      let restoreOperationId = "";
+
+      function originalIdentity() {
+        const pins = contract.pins || {};
+        return {
+          itemId: String(pins.item_id || resource.itemId || ""),
+          artifactId: String(pins.artifact_id || resource.id || ""),
+          revision: String(
+            pins.artifact_revision ||
+            resource.summary && resource.summary.revision || "",
+          ),
+        };
+      }
+
+      function originalApi() {
+        const engine = options.engine || options.engineClient ||
+          windowRef && windowRef.engineClient;
+        return engine && engine.rasterArtifacts || null;
+      }
+
+      function objectUrlApi() {
+        if (options.objectUrls) return options.objectUrls;
+        if (windowRef && windowRef.URL) return windowRef.URL;
+        return typeof URL !== "undefined" ? URL : null;
+      }
+
+      function releaseOriginalPreview() {
+        if (originalPreviewImage) removeAttribute(originalPreviewImage, "src");
+        if (originalPreviewUrl && originalPreviewUrlApi &&
+            typeof originalPreviewUrlApi.revokeObjectURL === "function") {
+          originalPreviewUrlApi.revokeObjectURL(originalPreviewUrl);
+        }
+        originalPreviewUrl = "";
+        originalPreviewUrlApi = null;
+      }
+
+      function closeOriginalPreview() {
+        if (originalPreviewDialog) {
+          if (typeof originalPreviewDialog.close === "function" &&
+              originalPreviewDialog.open === true) {
+            try { originalPreviewDialog.close(); } catch (error) {}
+          }
+          removeAttribute(originalPreviewDialog, "open");
+        }
+        releaseOriginalPreview();
+      }
+
+      function ensureOriginalPreviewDialog() {
+        if (originalPreviewDialog) return originalPreviewDialog;
+        const dialog = element(
+          documentRef,
+          "dialog",
+          "perspective-original-dialog",
+        );
+        dialog.setAttribute("aria-label", "Original capture backup");
+        const heading = element(documentRef, "h2", "", "Original capture");
+        const description = element(
+          documentRef,
+          "p",
+          "perspective-original-dialog-note",
+          "Verified original camera bytes from the backup store.",
+        );
+        const preview = element(
+          documentRef,
+          "img",
+          "perspective-original-preview",
+        );
+        preview.alt = `Original capture for ${resourceLabel(resource)}`;
+        const closeButton = element(
+          documentRef,
+          "button",
+          "perspective-original-close",
+          "Close",
+        );
+        closeButton.type = "button";
+        dialog.append(heading, description, preview, closeButton);
+        surface.append(dialog);
+        addListener(removers, closeButton, "click", closeOriginalPreview);
+        addListener(removers, dialog, "cancel", (event) => {
+          if (typeof event.preventDefault === "function") event.preventDefault();
+          closeOriginalPreview();
+        });
+        addListener(removers, dialog, "close", releaseOriginalPreview);
+        originalPreviewDialog = dialog;
+        originalPreviewImage = preview;
+        return dialog;
+      }
+
+      function presentOriginal(resolved) {
+        if (!resolved || !resolved.blob ||
+            !Number.isFinite(Number(resolved.blob.size)) ||
+            Number(resolved.blob.size) < 1) {
+          throw new TypeError("The original backup response has no image bytes");
+        }
+        const api = objectUrlApi();
+        if (!api || typeof api.createObjectURL !== "function" ||
+            typeof api.revokeObjectURL !== "function") {
+          throw new Error("This browser cannot open the original backup");
+        }
+        closeOriginalPreview();
+        const url = api.createObjectURL(resolved.blob);
+        if (typeof url !== "string" || !/^blob:[^\s]+$/.test(url)) {
+          if (typeof url === "string" && url) api.revokeObjectURL(url);
+          throw new Error("The browser returned an unsafe original image URL");
+        }
+        originalPreviewUrl = url;
+        originalPreviewUrlApi = api;
+        const dialog = ensureOriginalPreviewDialog();
+        originalPreviewImage.src = url;
+        if (typeof dialog.showModal === "function") {
+          try { dialog.showModal(); } catch (error) {
+            dialog.setAttribute("open", "");
+          }
+        } else {
+          dialog.setAttribute("open", "");
+        }
+      }
+
+      function reportOriginalError(error, fallback) {
+        originalStatusText = error && error.message || fallback;
+        originalStatusError = true;
+        if (typeof options.onCommandError === "function") {
+          options.onCommandError(error, resource);
+        }
+      }
+
+      async function requestViewOriginal() {
+        const identity = originalIdentity();
+        const api = originalApi();
+        if (destroyed || originalBusy || !originalBackup || !api ||
+            typeof api.resolveOriginalBackup !== "function" ||
+            !identity.itemId || !identity.artifactId || !identity.revision) {
+          return null;
+        }
+        originalBusy = "view";
+        originalStatusText = "Retrieving and verifying the original…";
+        originalStatusError = false;
+        update();
+        try {
+          const resolved = await api.resolveOriginalBackup({
+            itemId: identity.itemId,
+            artifactId: identity.artifactId,
+            revision: identity.revision,
+          });
+          if (destroyed) return null;
+          presentOriginal(resolved);
+          originalStatusText = "Verified original opened from backup.";
+          return resolved;
+        } catch (error) {
+          if (!destroyed) reportOriginalError(
+            error,
+            "The original backup could not be opened",
+          );
+          return null;
+        } finally {
+          originalBusy = "";
+          update();
+        }
+      }
+
+      async function confirmOriginalRestore(identity) {
+        const message =
+          "Restore the original camera image? This will replace the corrected " +
+          "display while keeping its correction history.";
+        if (typeof options.confirmRestoreOriginal === "function") {
+          return (await options.confirmRestoreOriginal({
+            message,
+            resource,
+            ...identity,
+          })) === true;
+        }
+        return Boolean(windowRef && typeof windowRef.confirm === "function" &&
+          windowRef.confirm(message));
+      }
+
+      async function requestRestoreOriginal() {
+        const identity = originalIdentity();
+        const api = originalApi();
+        if (destroyed || originalBusy || !originalBackup ||
+            originalBackup.restore_available !== true || !api ||
+            typeof api.restoreOriginalBackup !== "function" ||
+            !identity.itemId || !identity.artifactId || !identity.revision) {
+          return null;
+        }
+        originalBusy = "confirm";
+        update();
+        let confirmed = false;
+        try {
+          confirmed = await confirmOriginalRestore(identity);
+        } catch (error) {
+          originalBusy = "";
+          reportOriginalError(error, "The restore confirmation failed");
+          update();
+          return null;
+        }
+        if (!confirmed || destroyed) {
+          originalBusy = "";
+          update();
+          return null;
+        }
+        if (!restoreOperationId) restoreOperationId = operationId();
+        originalBusy = "restore";
+        originalStatusText = "Restoring the original display…";
+        originalStatusError = false;
+        update();
+        try {
+          const receipt = await api.restoreOriginalBackup({
+            itemId: identity.itemId,
+            artifactId: identity.artifactId,
+            expectedArtifactRevision: identity.revision,
+            idempotencyKey: restoreOperationId,
+          });
+          restoreOperationId = "";
+          if (destroyed) return receipt;
+          closeOriginalPreview();
+          originalStatusText = "Original display restored.";
+          if (typeof options.refreshAfterOriginalRestore === "function") {
+            try {
+              await options.refreshAfterOriginalRestore({
+                itemId: identity.itemId,
+                artifactId: identity.artifactId,
+                preserveSelection: true,
+                receipt,
+                resource,
+              });
+            } catch (refreshError) {
+              reportOriginalError(
+                refreshError,
+                "The original was restored, but the artifact could not be refreshed",
+              );
+            }
+          }
+          return receipt;
+        } catch (error) {
+          if (!(error && (error.retryable === true || error.ambiguous === true))) {
+            restoreOperationId = "";
+          }
+          if (!destroyed) reportOriginalError(
+            error,
+            "The original display could not be restored",
+          );
+          return null;
+        } finally {
+          originalBusy = "";
+          update();
+        }
+      }
 
       function editorFocused(event) {
         const active = documentRef.activeElement;
@@ -551,6 +859,35 @@
           !queueAllowed();
         queueButton.textContent = state.submission.status === "retryable"
           ? "Retry queue" : "Queue transform";
+        if (viewOriginalButton) {
+          const identity = originalIdentity();
+          const api = originalApi();
+          const pinned = Boolean(
+            identity.itemId && identity.artifactId && identity.revision,
+          );
+          viewOriginalButton.disabled = Boolean(originalBusy) || !pinned ||
+            !api || typeof api.resolveOriginalBackup !== "function";
+          viewOriginalButton.textContent = originalBusy === "view"
+            ? "Opening…" : "View original";
+          setBooleanAttribute(
+            viewOriginalButton,
+            "aria-busy",
+            originalBusy === "view",
+          );
+          if (restoreOriginalButton) {
+            restoreOriginalButton.disabled = Boolean(originalBusy) || !pinned ||
+              !api || typeof api.restoreOriginalBackup !== "function";
+            restoreOriginalButton.textContent = originalBusy === "restore"
+              ? "Restoring…" : "Restore original";
+            setBooleanAttribute(
+              restoreOriginalButton,
+              "aria-busy",
+              originalBusy === "restore",
+            );
+          }
+          originalStatus.textContent = originalStatusText;
+          setData(originalStatus, "error", originalStatusError);
+        }
         validationStatus.textContent = validationText();
         setData(validationStatus, "validationCode", state.validation.code || "valid");
         instruction.textContent = toolInstruction();
@@ -895,6 +1232,12 @@
       addListener(removers, undoButton, "click", () => dispatch({ type: "UNDO" }));
       addListener(removers, redoButton, "click", () => dispatch({ type: "REDO" }));
       addListener(removers, queueButton, "click", () => { void requestQueue("toolbar"); });
+      addListener(removers, viewOriginalButton, "click", () => {
+        void requestViewOriginal();
+      });
+      addListener(removers, restoreOriginalButton, "click", () => {
+        void requestRestoreOriginal();
+      });
       addListener(removers, canvas, "pointerdown", handlePointerDown);
       addListener(removers, canvas, "pointermove", handlePointerMove);
       addListener(removers, canvas, "pointerup", handlePointerUp);
@@ -1018,6 +1361,8 @@
         image,
         inspector,
         requestQueue,
+        requestRestoreOriginal,
+        requestViewOriginal,
         resource,
         surface,
         syncCanvas: draw,
@@ -1034,6 +1379,7 @@
         destroyed = true;
         if (observer && typeof observer.disconnect === "function") observer.disconnect();
         observer = null;
+        closeOriginalPreview();
         for (const remove of removers.splice(0)) remove();
         if (typeof mountCleanup === "function") mountCleanup();
         mountCleanup = null;
@@ -1051,6 +1397,7 @@
     correctionResourceContract,
     createPerspectiveImageRenderer,
     drawPerspectiveOverlay,
+    originalBackupContract,
     safeRasterUrl,
     serializeProcessingPresetCommand,
   };

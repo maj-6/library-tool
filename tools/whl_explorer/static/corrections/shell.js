@@ -544,6 +544,8 @@
                 this.engineCorrections.transforms)
               : null;
       let imageRendererOptions = {
+        engine: options.engine || options.engineClient ||
+          this.windowRef && this.windowRef.engineClient || null,
         invokeCommand,
         // Select, not Perspective: the perspective/image-adjust surfaces
         // deliberately mute overlay pointer events (classification.css), so
@@ -558,6 +560,16 @@
         onQueueResult: (result, command, resource, observation) =>
           this.handleQueuedTransformResult(
             result, command, resource, observation),
+        refreshAfterOriginalRestore: async (detail = {}) => {
+          const refreshed = await this.refreshCaptureMutationState(
+            "restore-original",
+            {
+              preserveSelection: detail.preserveSelection !== false,
+            },
+          );
+          this.setStatus("Original display restored");
+          return refreshed;
+        },
         onStateChange: (state) => {
           if (!this.classificationController ||
               typeof this.classificationController.setCanvasOwner !== "function") {
@@ -1883,6 +1895,28 @@
       return refresh;
     }
 
+    async refreshCaptureMutationState(reason, options = {}) {
+      const artifacts = this.artifactsFeature;
+      if (!artifacts || typeof artifacts.refresh !== "function") {
+        throw new Error("The restored artifact cannot be refreshed");
+      }
+      const tasks = [];
+      if (this.booksFeature &&
+          typeof this.booksFeature.refresh === "function") {
+        tasks.push(Promise.resolve().then(() =>
+          this.booksFeature.refresh(reason)));
+      }
+      const artifactIndex = tasks.length;
+      tasks.push(Promise.resolve().then(() => artifacts.refresh({
+        preserveSelection: options.preserveSelection !== false,
+        reason,
+      })));
+      const settled = await Promise.allSettled(tasks);
+      const failure = settled.find((result) => result.status === "rejected");
+      if (failure) throw failure.reason;
+      return settled[artifactIndex].value;
+    }
+
     bindExternalRefresh() {
       this.listen(this.windowRef, "focus", () => {
         void this.refreshExternalState("window-focus");
@@ -2000,7 +2034,16 @@
       };
       const refresh = (async () => {
         try {
-          return await feature.reloadSelection(key);
+          const tasks = [Promise.resolve(feature.reloadSelection(key))];
+          if (this.booksFeature &&
+              typeof this.booksFeature.refresh === "function") {
+            tasks.push(Promise.resolve(
+              this.booksFeature.refresh("transform-committed")));
+          }
+          const settled = await Promise.allSettled(tasks);
+          const failure = settled.find((value) => value.status === "rejected");
+          if (failure) throw failure.reason;
+          return settled[0].value;
         } catch (error) {
           if (!this.destroyed && feature.selectedKey === key &&
               (!error || error.name !== "AbortError")) {

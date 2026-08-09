@@ -2294,6 +2294,10 @@
         list: (args) => this._rasterArtifactList(args),
         get: (args) => this._rasterArtifactGet(args),
         resolveResource: (args) => this._rasterArtifactResolveResource(args),
+        resolveOriginalBackup: (args) =>
+          this._rasterArtifactResolveOriginalBackup(args),
+        restoreOriginalBackup: (args) =>
+          this._rasterArtifactRestoreOriginalBackup(args),
         resourceUrl: (args) => this._rasterArtifactResourceUrl(args),
       });
       this.documentArtifacts = Object.freeze({
@@ -3407,6 +3411,64 @@
       return this._requestBlob("GET", path, {
         query: { revision }, signal, expectedRevision: revision,
       });
+    }
+
+    _rasterArtifactResolveOriginalBackup({ itemId, artifactId, revision,
+      signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      if (!isArtifactRevision(revision)) {
+        throw new TypeError(
+          "revision is not a valid original-backup revision");
+      }
+      const path = `/v1/items/${encodePart(item)}/raster-artifacts/` +
+        `${encodePart(artifact)}/original-backup`;
+      return this._requestBlob("GET", path, {
+        query: { revision }, signal, expectedRevision: revision,
+      });
+    }
+
+    async _rasterArtifactRestoreOriginalBackup({ itemId, artifactId,
+      expectedArtifactRevision, idempotencyKey, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      if (!isArtifactRevision(expectedArtifactRevision)) {
+        throw new TypeError(
+          "expectedArtifactRevision is not a valid correction revision");
+      }
+      const operationId = operationKey(idempotencyKey, "idempotencyKey");
+      const path = `/v1/items/${encodePart(item)}/raster-artifacts/` +
+        `${encodePart(artifact)}/restore-original`;
+      const { body, status } = await this._requestJson("POST", path, {
+        headers: {
+          "Idempotency-Key": operationId,
+          "If-Artifact-Match": quoteRevision(
+            expectedArtifactRevision, "expectedArtifactRevision"),
+        },
+        body: {},
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+        ambiguousOnSuccessJsonFailure: true,
+      });
+      if (status !== 200 || !hasExactKeys(body, [
+        "ok", "schema", "operation_id", "item_id", "artifact_id",
+        "before_revision", "after_revision", "backup_sha256", "replayed",
+      ]) || body.ok !== true ||
+          body.schema !== "librarytool.original-backup-restore/1" ||
+          body.operation_id !== operationId || body.item_id !== item ||
+          body.artifact_id !== artifact ||
+          body.before_revision !== expectedArtifactRevision ||
+          !isArtifactRevision(body.after_revision) ||
+          body.after_revision === expectedArtifactRevision ||
+          !/^[0-9a-f]{64}$/.test(body.backup_sha256) ||
+          typeof body.replayed !== "boolean" ||
+          containsCommandFingerprint(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid original-backup restore receipt",
+          "POST", path, null, undefined, status);
+      }
+      return body;
     }
 
     _spatialAnnotationList({ itemId, representationId, canvasId,
