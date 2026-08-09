@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.14` (version code 45) is the Android
+Library Tool Capture `0.5.2-alpha.15` (version code 46) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -18,6 +18,9 @@ The Scans tab groups books into collapsible collection sections. The current
 collection is listed first and expanded initially. Waiting work uses an
 animated indicator, delivered work uses an icon, and the colored state marker
 carries the successful/complete state.
+
+Books marked as scan candidates in desktop Corrections show a scan icon on
+Home and a **Digitization** entry in book details after metadata sync.
 
 Scan-row gestures are literal:
 

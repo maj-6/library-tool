@@ -3,6 +3,16 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.15 — 2026-08-09
+
+Android version code: `46`.
+
+### Additions
+
+- Books marked as scan candidates in desktop Corrections now show a scan
+  candidate icon on Home and a **Digitization** entry in book details after
+  capture metadata sync.
+
 ## 0.5.2-alpha.14 — 2026-08-09
 
 Android version code: `45`.
