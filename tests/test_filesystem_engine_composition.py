@@ -1307,7 +1307,8 @@ def test_production_composition_reopens_projected_transform_outputs(
     source = next(
         value
         for value in raster.list_raster_artifacts("book-one")
-        if value.kind == "processed-image"
+        if value.key.artifact_id.endswith(":display")
+        and "capture_order" in value.extensions
     )
     assert source.resource is not None
     command = CorrectionTransformCommand(
@@ -1369,7 +1370,12 @@ def test_production_composition_reopens_projected_transform_outputs(
         "list_raster_artifacts",
         base_list,
     )
-    assert reopened_raster.get_raster_artifact(corrected.key) == corrected
+    detail = reopened_raster.get_raster_artifact(corrected.key)
+    assert detail is not None
+    assert detail.key == corrected.key
+    assert detail.kind == corrected.kind
+    assert detail.content_sha256 == corrected.content_sha256
+    assert detail.resource == corrected.resource
     resolved = reopened_raster.resolve_raster_resource(
         "book-one",
         corrected.resource,
@@ -1393,11 +1399,424 @@ def test_production_composition_reopens_projected_transform_outputs(
     assert mapped[0].linked_artifact_ids == (
         corrected.key.artifact_id,
     )
-    assert mapped[0].source.canvas_revision == corrected.revision
+    assert mapped[0].source.canvas_revision == corrected.source.canvas_revision
     assert (
         mapped[0].selector.coordinate_space_revision
-        == corrected.revision
+        == corrected.source.canvas_revision
     )
+    assert mapped[0].extensions["android_geometry"] == {
+        "region_id": "figure-1",
+        "provider_type": "image",
+        "engine_version": "composition-test",
+    }
+
+
+def test_capture_display_slot_tracks_the_latest_transform_across_reopen(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    manifest_path = capture_root / "capture-1" / "photo_assets.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["desktop_import"]["imported_at"] = "2026-08-04T12:34:56Z"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_before = manifest_path.read_bytes()
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+
+    def composed_engine():
+        return _composition(
+            tmp_path,
+            contribution_factory=first_party_module_contributions,
+            corrections=bindings,
+        )["engine"]
+
+    def display_artifact(query):
+        values = [
+            value
+            for value in query.list_raster_artifacts("book-one")
+            if value.key.artifact_id.endswith(":display")
+            and "capture_order" in value.extensions
+        ]
+        assert len(values) == 1
+        return values[0]
+
+    def resolved_bytes(query, artifact):
+        assert artifact.resource is not None
+        resolved = query.resolve_raster_resource(
+            "book-one",
+            artifact.resource,
+        )
+        assert resolved is not None
+        try:
+            return resolved.stream.read()
+        finally:
+            resolved.stream.close()
+
+    def preview_bytes(query, artifact_id):
+        preview = query.resolve_capture_preview("book-one", artifact_id)
+        assert preview is not None
+        try:
+            return preview.stream.read()
+        finally:
+            preview.stream.close()
+
+    engine = composed_engine()
+    query = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = display_artifact(query)
+    stable_key = source.key
+    stable_order = source.extensions["capture_order"]
+    stable_imported_at = source.extensions["imported_at"]
+    import_mark = query.list_capture_import_marks(("book-one",))[0]
+    base_hint = query.list_capture_index_hints("book-one")[0]
+
+    assert source.kind == "captured-image"
+    assert source.resource is not None
+    assert stable_order == 1
+    assert stable_imported_at == "2026-08-04T12:34:56Z"
+    assert import_mark == {
+        "item_id": "book-one",
+        "capture_count": 1,
+        "imported_at": stable_imported_at,
+        "legacy": False,
+    }
+
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    first_command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=stable_key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=-25),
+        rerun_ocr=False,
+        operation_id="composition-capture-slot-1",
+    )
+    transforms.queue(first_command)
+    first_run = transforms.execute_queued(first_command)
+    assert first_run.image_commit is not None
+    first_output = first_run.image_commit.output("corrected-display")
+
+    first_alias = query.get_raster_artifact(stable_key)
+    assert first_alias is not None
+    assert first_alias.key == stable_key
+    assert first_alias.kind == "captured-image"
+    assert first_alias.extensions["capture_order"] == stable_order
+    assert first_alias.extensions["imported_at"] == stable_imported_at
+    assert first_alias.extensions["correction_transform"]["operation_id"] == (
+        first_command.operation_id
+    )
+    assert first_alias.extensions["correction_transform"]["output_kind"] == (
+        "corrected-display"
+    )
+    assert first_alias.content_sha256 == first_output.content_sha256
+    assert first_alias.resource is not None
+    assert first_alias.resource.revision == first_output.artifact_revision
+    assert hashlib.sha256(resolved_bytes(query, first_alias)).hexdigest() == (
+        first_output.content_sha256
+    )
+    assert hashlib.sha256(
+        preview_bytes(query, stable_key.artifact_id)
+    ).hexdigest() == first_output.content_sha256
+    corrected_hint = query.list_capture_index_hints("book-one")[0]
+    assert corrected_hint["artifact_id"] == stable_key.artifact_id
+    assert corrected_hint["revision"].startswith("index:")
+    assert corrected_hint["revision"] != base_hint["revision"]
+    assert corrected_hint["capture_order"] == stable_order
+    assert corrected_hint["imported_at"] == stable_imported_at
+    first_values = query.list_raster_artifacts("book-one")
+    assert not any(
+        value.key.artifact_id == first_output.artifact_id
+        for value in first_values
+    )
+    assert [value.key for value in first_values].count(stable_key) == 1
+
+    second_command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=stable_key.artifact_id,
+        artifact_revision=first_alias.revision,
+        source_revision=first_alias.resource.revision,
+        source_sha256=first_alias.content_sha256,
+        quad=((0.0, 0.0), (0.75, 0.0), (0.75, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=25),
+        rerun_ocr=False,
+        operation_id="composition-capture-slot-2",
+    )
+    assert second_command.artifact_id == first_command.artifact_id
+    assert second_command.source_revision == first_output.artifact_revision
+    assert second_command.source_sha256 == first_output.content_sha256
+    transforms.queue(second_command)
+    second_run = transforms.execute_queued(second_command)
+    assert second_run.image_commit is not None
+    second_output = second_run.image_commit.output("corrected-display")
+    assert second_output.content_sha256 != first_output.content_sha256
+
+    reopened_engine = composed_engine()
+    reopened_query = reopened_engine.require_service(
+        RASTER_ARTIFACT_QUERY_SERVICE
+    )
+    current = reopened_query.get_raster_artifact(stable_key)
+    assert current is not None
+    assert current.key == stable_key
+    assert current.kind == "captured-image"
+    assert current.extensions["capture_order"] == stable_order
+    assert current.extensions["imported_at"] == stable_imported_at
+    assert current.extensions["correction_transform"]["operation_id"] == (
+        second_command.operation_id
+    )
+    assert current.content_sha256 == second_output.content_sha256
+    assert current.resource is not None
+    assert current.resource.revision == second_output.artifact_revision
+    assert hashlib.sha256(resolved_bytes(reopened_query, current)).hexdigest() == (
+        second_output.content_sha256
+    )
+    assert hashlib.sha256(
+        preview_bytes(reopened_query, stable_key.artifact_id)
+    ).hexdigest() == second_output.content_sha256
+    assert reopened_query.list_capture_import_marks(("book-one",))[0] == import_mark
+    assert manifest_path.read_bytes() == manifest_before
+
+    reopened_values = reopened_query.list_raster_artifacts("book-one")
+    assert [value.key for value in reopened_values].count(stable_key) == 1
+    assert not any(
+        value.key.artifact_id == second_output.artifact_id
+        for value in reopened_values
+    )
+    current_outputs = [
+        value
+        for value in reopened_values
+        if value.extensions.get("correction_transform", {}).get("operation_id")
+        == second_command.operation_id
+        and value.extensions["correction_transform"].get("output_kind")
+        == "corrected-display"
+    ]
+    assert [value.key for value in current_outputs] == [stable_key]
+
+    replacement_stream = io.BytesIO()
+    Image.new("RGB", (40, 30), (200, 20, 30)).save(
+        replacement_stream,
+        format="JPEG",
+        quality=90,
+    )
+    replacement_bytes = replacement_stream.getvalue()
+    replacement_sha256 = hashlib.sha256(replacement_bytes).hexdigest()
+    (capture_root / "capture-1" / "photo_1.jpg").write_bytes(
+        replacement_bytes
+    )
+    replacement_manifest = json.loads(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    replacement_manifest["assets"][0]["display"].update(
+        {
+            "sha256": replacement_sha256,
+            "revision": 5,
+        }
+    )
+    replacement_manifest["desktop_import"]["assets"][0][
+        "derivative_checksum"
+    ] = replacement_sha256
+    manifest_path.write_text(
+        json.dumps(replacement_manifest),
+        encoding="utf-8",
+    )
+
+    new_base = reopened_query.get_raster_artifact(stable_key)
+    assert new_base is not None and new_base.resource is not None
+    assert "correction_display_head" not in new_base.extensions
+    assert new_base.content_sha256 == replacement_sha256
+    reset_command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=stable_key.artifact_id,
+        artifact_revision=new_base.revision,
+        source_revision=new_base.resource.revision,
+        source_sha256=new_base.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=10),
+        rerun_ocr=False,
+        operation_id="composition-capture-slot-new-root",
+    )
+    reset_transforms = reopened_engine.require_service(
+        CORRECTION_TRANSFORM_SERVICE
+    )
+    reset_transforms.queue(reset_command)
+    reset_run = reset_transforms.execute_queued(reset_command)
+    assert reset_run.image_commit is not None
+    reset_output = reset_run.image_commit.output("corrected-display")
+    reset_alias = reopened_query.get_raster_artifact(stable_key)
+    assert reset_alias is not None
+    assert reset_alias.content_sha256 == reset_output.content_sha256
+    assert reset_alias.extensions["correction_transform"]["operation_id"] == (
+        reset_command.operation_id
+    )
+
+    replacement_manifest["assets"][0]["lifecycle"]["state"] = "failed"
+    manifest_path.write_text(
+        json.dumps(replacement_manifest),
+        encoding="utf-8",
+    )
+    stale_alias = reopened_query.get_raster_artifact(stable_key)
+    assert stale_alias is not None
+    assert stale_alias.content_sha256 == reset_output.content_sha256
+    assert stale_alias.freshness.value == "stale"
+    stale_hint = reopened_query.list_capture_index_hints("book-one")[0]
+    assert stale_hint["revision"].startswith("index:")
+    assert stale_hint["revision"] != stale_alias.revision
+    assert stale_hint["freshness"] == "stale"
+
+    replacement_manifest["assets"][0]["geometry"] = ["invalid-geometry"]
+    manifest_path.write_text(
+        json.dumps(replacement_manifest),
+        encoding="utf-8",
+    )
+    diagnostic_alias = reopened_query.get_raster_artifact(stable_key)
+    assert diagnostic_alias is not None
+    assert diagnostic_alias.extensions["artifact_diagnostics"] == (
+        {
+            "scope": "capture_geometry",
+            "code": "capture_geometry_invalid",
+            "state": "unavailable",
+            "component": "display",
+        },
+    )
+    diagnostic_hint = reopened_query.list_capture_index_hints("book-one")[0]
+    assert diagnostic_hint["import_state"] == "partial"
+    assert diagnostic_hint["diagnostic_scopes"] == ("capture_geometry",)
+
+
+def test_capture_hint_overlay_holds_one_authority_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    manifest_path = capture_root / "capture-1" / "photo_assets.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["desktop_import"]["imported_at"] = "2026-08-04T12:34:56Z"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    lock_state = {
+        "held": False,
+        "entries": 0,
+        "mutate_on_exit": False,
+    }
+
+    @contextmanager
+    def authority_lock():
+        if lock_state["held"]:
+            raise RuntimeError("authority lock was reacquired")
+        lock_state["held"] = True
+        lock_state["entries"] += 1
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
+            if lock_state["mutate_on_exit"]:
+                changed = json.loads(manifest_path.read_text(encoding="utf-8"))
+                changed["assets"][0]["capture_order"] = 2
+                changed["desktop_import"]["imported_at"] = (
+                    "2026-08-05T12:34:56Z"
+                )
+                manifest_path.write_text(json.dumps(changed), encoding="utf-8")
+                lock_state["mutate_on_exit"] = False
+
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=authority_lock,
+    )
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    query = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in query.list_raster_artifacts("book-one")
+        if value.key.artifact_id.endswith(":display")
+    )
+    assert source.resource is not None
+    command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=10),
+        rerun_ocr=False,
+        operation_id="composition-capture-hint-snapshot",
+    )
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    transforms.queue(command)
+    result = transforms.execute_queued(command)
+    assert result.image_commit is not None
+    corrected = result.image_commit.output("corrected-display")
+
+    entries_before = lock_state["entries"]
+    lock_state["mutate_on_exit"] = True
+    projection_union = query._raster_artifacts
+    transform_store = projection_union._transforms
+    read_regular = transform_store._read_regular
+    object_root = (
+        tmp_path / ".engine" / "correction-transforms" / "objects"
+    ).resolve()
+
+    def metadata_read_only(path, **kwargs):
+        try:
+            Path(path).resolve().relative_to(object_root)
+        except ValueError:
+            return read_regular(path, **kwargs)
+        pytest.fail("capture index hint projection read a transform object")
+
+    with monkeypatch.context() as hint_guard:
+        hint_guard.setattr(
+            projection_union._base,
+            "get_raster_artifact",
+            lambda _key: pytest.fail(
+                "capture index hint projection hydrated a keyed raster"
+            ),
+        )
+        hint_guard.setattr(
+            projection_union._base,
+            "_observe_resource",
+            lambda *_args, **_kwargs: pytest.fail(
+                "capture index hint projection read capture image bytes"
+            ),
+        )
+        hint_guard.setattr(
+            transform_store,
+            "_read_regular",
+            metadata_read_only,
+        )
+        first = query.list_capture_index_hints("book-one")[0]
+
+        assert lock_state["entries"] == entries_before + 1
+        assert first["revision"].startswith("index:")
+        assert first["capture_order"] == 1
+        assert first["imported_at"] == "2026-08-04T12:34:56Z"
+
+        second = query.list_capture_index_hints("book-one")[0]
+        assert second["revision"].startswith("index:")
+        assert second["revision"] != first["revision"]
+        assert second["capture_order"] == 2
+        assert second["imported_at"] == "2026-08-05T12:34:56Z"
+    alias = query.get_raster_artifact(source.key)
+    assert alias is not None
+    assert alias.content_sha256 == corrected.content_sha256
 
 
 def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
@@ -1486,7 +1905,8 @@ def test_production_transform_reads_exact_output_and_commits_ocr_proposal(
     source = next(
         value
         for value in raster.list_raster_artifacts("book-one")
-        if value.kind == "processed-image"
+        if value.key.artifact_id.endswith(":display")
+        and "capture_order" in value.extensions
     )
     assert source.resource is not None
     text_authority.update({

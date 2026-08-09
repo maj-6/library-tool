@@ -10,11 +10,12 @@ same service graph without introducing a second locking or recovery domain.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from inspect import getattr_static
 from pathlib import Path
 from typing import Any, ContextManager
@@ -161,6 +162,7 @@ from ..engine.raster_artifacts import (
     RasterArtifactProjectorPort,
     RasterArtifactView,
     RasterResourceRef,
+    ResourceState,
 )
 from ..engine.spatial_annotations import (
     SpatialAnnotationKey,
@@ -766,9 +768,27 @@ class _CorrectionProjectionUnion:
             # The base lookup is first so missing-item semantics remain owned
             # by the catalogue/capture authority rather than the private
             # output store.
+            base = tuple(self._base.list_raster_artifacts(item_id))
+            projection = self._transforms.project_item(item_id)
+            heads = self._active_display_heads(
+                item_id,
+                projection,
+                base_values=base,
+            )
+            hidden = {
+                value.artifact.key.artifact_id.casefold()
+                for value in heads.values()
+            }
             values = (
-                *self._base.list_raster_artifacts(item_id),
-                *self._transforms.list_raster_artifacts(item_id),
+                *(
+                    self._display_alias(value, heads.get(value.key.artifact_id.casefold()))
+                    for value in base
+                ),
+                *(
+                    value
+                    for value in projection.raster_artifacts
+                    if value.key.artifact_id.casefold() not in hidden
+                ),
             )
         identities = [value.key.artifact_id.casefold() for value in values]
         if len(identities) != len(set(identities)):
@@ -811,18 +831,30 @@ class _CorrectionProjectionUnion:
         if not callable(hints):
             return ()
         with self._read_context():
-            values = hints(item_id)
-        if (
-            isinstance(values, (str, bytes))
-            or not isinstance(values, Sequence)
-            or any(not isinstance(value, Mapping) for value in values)
-        ):
-            raise RepositoryError(
-                "the correction capture index returned invalid hints",
-                code="invalid_corrections_index_projection",
-                details={"item_id": item_id},
+            snapshotter = getattr(
+                self._base,
+                "capture_index_hint_snapshot",
+                None,
             )
-        return tuple(values)
+            if callable(snapshotter):
+                snapshot = snapshotter(item_id)
+                if not isinstance(snapshot, Mapping):
+                    raise RepositoryError(
+                        "the correction capture index returned an invalid snapshot",
+                        code="invalid_corrections_index_projection",
+                        details={"item_id": item_id},
+                    )
+            else:
+                snapshot = {
+                    "hints": hints(item_id),
+                    "authorities": {},
+                }
+            head_hints = self._transforms.project_display_head_hints(item_id)
+            return self._project_capture_index_hint_snapshot(
+                item_id,
+                snapshot,
+                head_hints,
+            )
 
     def list_capture_index_hints_many(
         self,
@@ -830,37 +862,144 @@ class _CorrectionProjectionUnion:
     ) -> Mapping[str, tuple[Mapping[str, Any], ...]]:
         """Batch capture hints under one lease instead of one per item."""
 
+        items = tuple(item_ids)
+        snapshots_many = getattr(
+            self._base,
+            "capture_index_hint_snapshots_many",
+            None,
+        )
+        snapshotter = getattr(
+            self._base,
+            "capture_index_hint_snapshot",
+            None,
+        )
         many = getattr(self._base, "list_capture_index_hints_many", None)
-        if not callable(many):
-            # Composed against an adapter without the batch read: preserve
-            # per-item semantics by looping the single read, still under one
-            # outer lease (the inner lease is reentrant).
-            with self._read_context():
-                return {
-                    item_id: self.list_capture_index_hints(item_id)
-                    for item_id in item_ids
-                }
+        single = getattr(self._base, "list_capture_index_hints", None)
         with self._read_context():
-            values = many(item_ids)
-        if not isinstance(values, Mapping):
-            raise RepositoryError(
-                "the correction capture index returned invalid hints",
-                code="invalid_corrections_index_projection",
-            )
-        for item_id, rows in values.items():
-            if (
-                isinstance(rows, (str, bytes))
-                or not isinstance(rows, Sequence)
-                or any(not isinstance(row, Mapping) for row in rows)
+            if callable(snapshots_many):
+                snapshots = snapshots_many(items)
+            elif callable(snapshotter):
+                snapshots = {
+                    item_id: snapshotter(item_id) for item_id in items
+                }
+            elif callable(many):
+                rows_by_item = many(items)
+                if not isinstance(rows_by_item, Mapping):
+                    raise RepositoryError(
+                        "the correction capture index returned invalid hints",
+                        code="invalid_corrections_index_projection",
+                    )
+                snapshots = {
+                    item_id: {"hints": rows, "authorities": {}}
+                    for item_id, rows in rows_by_item.items()
+                }
+            elif callable(single):
+                snapshots = {
+                    item_id: {
+                        "hints": single(item_id),
+                        "authorities": {},
+                    }
+                    for item_id in items
+                }
+            else:
+                return {str(item_id): () for item_id in items}
+            if not isinstance(snapshots, Mapping) or any(
+                not isinstance(item_id, str)
+                or not isinstance(snapshot, Mapping)
+                for item_id, snapshot in snapshots.items()
             ):
                 raise RepositoryError(
                     "the correction capture index returned invalid hints",
                     code="invalid_corrections_index_projection",
-                    details={"item_id": str(item_id)},
                 )
-        return {
-            str(item_id): tuple(rows) for item_id, rows in values.items()
-        }
+            project_many = getattr(
+                self._transforms,
+                "project_display_head_hints_many",
+                None,
+            )
+            if callable(project_many):
+                heads_by_item = project_many(tuple(snapshots))
+            else:
+                heads_by_item = {
+                    item_id: self._transforms.project_display_head_hints(
+                        item_id
+                    )
+                    for item_id in snapshots
+                }
+            if not isinstance(heads_by_item, Mapping):
+                raise RepositoryError(
+                    "the correction capture index returned invalid hints",
+                    code="invalid_corrections_index_projection",
+                )
+            return {
+                item_id: self._project_capture_index_hint_snapshot(
+                    item_id,
+                    snapshot,
+                    heads_by_item.get(item_id, ()),
+                )
+                for item_id, snapshot in snapshots.items()
+            }
+
+    def _project_capture_index_hint_snapshot(
+        self,
+        item_id: str,
+        snapshot: Mapping[str, Any],
+        head_hints: Sequence[Any],
+    ) -> tuple[Mapping[str, Any], ...]:
+        values = snapshot.get("hints")
+        authorities = snapshot.get("authorities")
+        if (
+            isinstance(values, (str, bytes))
+            or not isinstance(values, Sequence)
+            or any(not isinstance(value, Mapping) for value in values)
+            or not isinstance(authorities, Mapping)
+            or any(
+                not isinstance(identity, str)
+                or not isinstance(authority, Mapping)
+                for identity, authority in authorities.items()
+            )
+        ):
+            raise RepositoryError(
+                "the correction capture index returned invalid hints",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item_id},
+            )
+        heads = self._active_display_head_hints(
+            item_id,
+            head_hints,
+            values=values,
+            authorities=authorities,
+        )
+        return tuple(
+            {
+                **value,
+                "revision": self._display_head_revision(
+                    "index",
+                    authority_revision,
+                    self._display_head_revision(
+                        "correction-display-hint",
+                        heads[identity].operation_id,
+                        heads[identity].publication_sha256,
+                        heads[identity].output_artifact_revision,
+                        heads[identity].output_content_sha256,
+                    ),
+                ),
+                "resource_state": ResourceState.AVAILABLE.value,
+            }
+            if (
+                isinstance(
+                    (artifact_id := value.get("artifact_id")),
+                    str,
+                )
+                and (identity := artifact_id.casefold()) in heads
+                and isinstance(
+                    (authority_revision := value.get("revision")),
+                    str,
+                )
+            )
+            else value
+            for value in values
+        )
 
     def get_raster_artifact(
         self,
@@ -870,7 +1009,24 @@ class _CorrectionProjectionUnion:
             raise TypeError("key must be a RasterArtifactKey")
         with self._read_context():
             base = self._base.get_raster_artifact(key)
-            transformed = self._transforms.get_raster_artifact(key)
+            projection = self._transforms.project_item(key.item_id)
+            heads = self._active_display_heads(
+                key.item_id,
+                projection,
+                base_values=(() if base is None else (base,)),
+            )
+            transformed = next(
+                (
+                    value
+                    for value in projection.raster_artifacts
+                    if value.key == key
+                ),
+                None,
+            )
+        if base is not None:
+            head = heads.get(key.artifact_id.casefold())
+            if head is not None:
+                return self._display_alias(base, head)
         if base is not None and transformed is not None:
             raise RepositoryError(
                 "a correction transform output reuses a raster identity",
@@ -883,7 +1039,7 @@ class _CorrectionProjectionUnion:
         self,
         key: RasterArtifactKey,
     ) -> RasterArtifactView | None:
-        """Return only base capture authority for the no-durable fast path."""
+        """Return a stable capture slot, including its current display head."""
 
         if not isinstance(key, RasterArtifactKey):
             raise TypeError("key must be a RasterArtifactKey")
@@ -891,7 +1047,19 @@ class _CorrectionProjectionUnion:
         if not callable(getter):
             return None
         with self._read_context():
-            return getter(key)
+            base = getter(key)
+            if base is None:
+                return None
+            projection = self._transforms.project_item(key.item_id)
+            heads = self._active_display_heads(
+                key.item_id,
+                projection,
+                base_values=(base,),
+            )
+            return self._display_alias(
+                base,
+                heads.get(key.artifact_id.casefold()),
+            )
 
     def resolve_capture_preview(
         self,
@@ -900,6 +1068,19 @@ class _CorrectionProjectionUnion:
     ) -> Any:
         key = RasterArtifactKey(item_id, artifact_id)
         with self._read_context():
+            base = self._base.get_raster_artifact(key)
+            projection = self._transforms.project_item(item_id)
+            heads = self._active_display_heads(
+                item_id,
+                projection,
+                base_values=(() if base is None else (base,)),
+            )
+            head = heads.get(artifact_id.casefold())
+            if base is not None and head is not None:
+                return self._transforms.resolve_raster_resource(
+                    item_id,
+                    head.artifact.resource,
+                )
             preview = getattr(self._base, "resolve_capture_preview", None)
             if callable(preview):
                 resolved = preview(item_id, artifact_id)
@@ -945,18 +1126,127 @@ class _CorrectionProjectionUnion:
         canvas_id: str = "",
     ) -> tuple[SpatialAnnotationView, ...]:
         with self._read_context():
-            values = (
-                *self._base.list_spatial_annotations(
+            base = tuple(
+                self._base.list_spatial_annotations(
                     item_id,
                     representation_id=representation_id,
                     canvas_id=canvas_id,
-                ),
-                *self._transforms.list_spatial_annotations(
-                    item_id,
-                    representation_id=representation_id,
-                    canvas_id=canvas_id,
-                ),
+                )
             )
+            projection = self._transforms.project_item(item_id)
+            heads = self._active_display_heads(item_id, projection)
+            logical_ids = set(heads)
+            physical_ids = {
+                head.artifact.key.artifact_id.casefold()
+                for head in heads.values()
+            }
+            base_by_annotation_id = {
+                value.key.annotation_id.casefold(): value
+                for value in base
+            }
+            values = [
+                value
+                for value in base
+                if not any(
+                    linked.casefold() in logical_ids
+                    for linked in value.linked_artifact_ids
+                )
+            ]
+            values.extend(
+                value
+                for value in projection.spatial_annotations
+                if (
+                    not any(
+                        linked.casefold() in physical_ids
+                        for linked in value.linked_artifact_ids
+                    )
+                    and (
+                        not representation_id
+                        or value.source.representation_id == representation_id
+                    )
+                    and (not canvas_id or value.source.canvas_id == canvas_id)
+                )
+            )
+            for identity, head in heads.items():
+                for annotation in head.spatial_annotations:
+                    if (
+                        representation_id
+                        and annotation.source.representation_id != representation_id
+                    ) or (canvas_id and annotation.source.canvas_id != canvas_id):
+                        continue
+                    linked = tuple(
+                        dict.fromkeys(
+                            head.logical_key.artifact_id
+                            if value.casefold()
+                            == head.artifact.key.artifact_id.casefold()
+                            else value
+                            for value in annotation.linked_artifact_ids
+                        )
+                    )
+                    transform_extension = annotation.extensions.get(
+                        "correction_transform",
+                        {},
+                    )
+                    source_annotation_id = (
+                        transform_extension.get("source_annotation_id")
+                        if isinstance(transform_extension, Mapping)
+                        else None
+                    )
+                    key = (
+                        SpatialAnnotationKey(item_id, source_annotation_id)
+                        if isinstance(source_annotation_id, str)
+                        and source_annotation_id
+                        else annotation.key
+                    )
+                    original = base_by_annotation_id.get(
+                        key.annotation_id.casefold()
+                    )
+                    extensions = (
+                        {
+                            **dict(original.extensions),
+                            **dict(annotation.extensions),
+                        }
+                        if original is not None
+                        else annotation.extensions
+                    )
+                    extensions = dict(extensions)
+                    android_geometry = extensions.get("android_geometry")
+                    if isinstance(android_geometry, Mapping):
+                        projected_geometry = dict(android_geometry)
+                        projected_geometry.pop("source_revision", None)
+                        projected_geometry.pop("display_revision", None)
+                        if projected_geometry:
+                            extensions["android_geometry"] = projected_geometry
+                        else:
+                            extensions.pop("android_geometry", None)
+                    values.append(
+                        replace(
+                            annotation,
+                            key=key,
+                            revision=self._display_head_revision(
+                                "correction-annotation",
+                                (
+                                    original.revision
+                                    if original is not None
+                                    else ""
+                                ),
+                                annotation.revision,
+                                key.annotation_id,
+                            ),
+                            order=(
+                                original.order
+                                if original is not None
+                                else annotation.order
+                            ),
+                            label=(
+                                original.label
+                                if original is not None
+                                else annotation.label
+                            ),
+                            linked_artifact_ids=linked,
+                            extensions=extensions,
+                        )
+                    )
         identities = [value.key.annotation_id.casefold() for value in values]
         if len(identities) != len(set(identities)):
             raise RepositoryError(
@@ -965,6 +1255,146 @@ class _CorrectionProjectionUnion:
                 details={"item_id": item_id},
             )
         return tuple(sorted(values, key=lambda value: value.key.annotation_id))
+
+    @staticmethod
+    def _active_display_head_hints(
+        item_id: str,
+        head_hints: Sequence[Any],
+        *,
+        values: Sequence[Mapping[str, Any]],
+        authorities: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        hints_by_id = {
+            artifact_id.casefold(): value
+            for value in values
+            if isinstance((artifact_id := value.get("artifact_id")), str)
+        }
+        active: dict[str, Any] = {}
+        authority_fields = frozenset(
+            {
+                "artifact_id",
+                "source_revision",
+                "source_sha256",
+                "representation_id",
+                "representation_revision",
+                "canvas_id",
+            }
+        )
+        for identity, authority in authorities.items():
+            if frozenset(authority) != authority_fields:
+                raise RepositoryError(
+                    "the correction capture index returned invalid authority pins",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item_id},
+                )
+            artifact_id = authority["artifact_id"]
+            if (
+                not isinstance(artifact_id, str)
+                or identity != artifact_id.casefold()
+                or any(
+                    not isinstance(authority[field], str)
+                    or not authority[field]
+                    for field in authority_fields - {"artifact_id"}
+                )
+            ):
+                raise RepositoryError(
+                    "the correction capture index returned invalid authority pins",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item_id},
+                )
+        for head in head_hints:
+            identity = head.logical_key.artifact_id.casefold()
+            authority = authorities.get(identity)
+            hint = hints_by_id.get(identity)
+            source = head.root_source
+            if (
+                authority is None
+                or hint is None
+                or head.logical_key.item_id != item_id
+                or hint.get("resource_state")
+                != ResourceState.AVAILABLE.value
+                or authority["artifact_id"].casefold() != identity
+                or authority["source_revision"]
+                != head.root_source_revision
+                or authority["source_sha256"] != head.root_source_sha256
+                or authority["representation_id"]
+                != source.representation_id
+                or authority["representation_revision"]
+                != source.representation_revision
+                or authority["canvas_id"] != source.canvas_id
+            ):
+                continue
+            active[identity] = head
+        return active
+
+    def _active_display_heads(
+        self,
+        item_id: str,
+        projection: Any,
+        *,
+        base_values: Sequence[RasterArtifactView] = (),
+    ) -> dict[str, Any]:
+        base_by_id = {
+            value.key.artifact_id.casefold(): value
+            for value in base_values
+        }
+        active: dict[str, Any] = {}
+        for head in projection.display_heads:
+            identity = head.logical_key.artifact_id.casefold()
+            base = base_by_id.get(identity)
+            if base is None:
+                base = self._base.get_raster_artifact(head.logical_key)
+            if (
+                base is None
+                or base.key.item_id != item_id
+                or base.resource_state is not ResourceState.AVAILABLE
+                or base.resource is None
+                or base.content_sha256 != head.root_source_sha256
+                or base.resource.revision != head.root_source_revision
+                or base.source != head.root_source
+            ):
+                continue
+            active[identity] = head
+        return active
+
+    @staticmethod
+    def _display_alias(base: RasterArtifactView, head: Any) -> RasterArtifactView:
+        if head is None:
+            return base
+        corrected = head.artifact
+        extensions = dict(base.extensions)
+        extensions.pop("recipe", None)
+        extensions.pop("rendition", None)
+        extensions.update(corrected.extensions)
+        extensions["correction_display_head"] = {
+            "operation_id": head.operation_id,
+            "output_artifact_id": corrected.key.artifact_id,
+            "root_source_revision": head.root_source_revision,
+            "root_source_sha256": head.root_source_sha256,
+        }
+        return replace(
+            base,
+            revision=_CorrectionProjectionUnion._display_head_revision(
+                "correction-display",
+                base.revision,
+                corrected.revision,
+            ),
+            kind="captured-image",
+            media_type=corrected.media_type,
+            content_sha256=corrected.content_sha256,
+            dimensions=corrected.dimensions,
+            source=corrected.source,
+            resource_state=ResourceState.AVAILABLE,
+            resource=corrected.resource,
+            freshness=base.freshness,
+            provenance=corrected.provenance,
+            extensions=extensions,
+        )
+
+    @staticmethod
+    def _display_head_revision(prefix: str, *parts: str) -> str:
+        digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+        return f"{prefix}:{digest}"
 
     def get_spatial_annotation(
         self,

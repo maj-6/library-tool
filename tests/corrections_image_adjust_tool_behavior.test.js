@@ -1005,14 +1005,20 @@ test("a reopened window may commit from a persisted job command without pending 
 
 test("a command adapter observes an immediately returned terminal result", () => {
   const profileEvents = [];
+  const queueEvents = [];
   const tool = createImageAdjustTool({
     onProfileChange: (profile) => profileEvents.push(profile),
   });
-  const composed = composeImageAdjustRendererOptions(tool);
+  const composed = composeImageAdjustRendererOptions(tool, {
+    onQueueResult(...args) { queueEvents.push(args); },
+  });
+  const result = committedResult("adjust-immediate", "succeeded");
+  const queuedCommand = command("adjust-immediate", -24, true);
+  const resource = { id: "a" };
   composed.onQueueResult(
-    committedResult("adjust-immediate", "succeeded"),
-    command("adjust-immediate", -24, true),
-    { id: "capture-7" },
+    result,
+    queuedCommand,
+    resource,
   );
   assert.deepEqual(tool.serializeProfile(), {
     lastAppliedBrightness: -24,
@@ -1020,6 +1026,13 @@ test("a command adapter observes an immediately returned terminal result", () =>
   assert.equal(profileEvents.length, 1);
   assert.equal(tool.getState().pendingOperationIds.length, 0);
   assert.equal(tool.getState().lastOcrOutcome.state, "succeeded");
+  assert.equal(queueEvents.length, 1);
+  assert.equal(queueEvents[0][0], result);
+  assert.equal(queueEvents[0][1], queuedCommand);
+  assert.equal(queueEvents[0][2], resource);
+  assert.equal(queueEvents[0][3].operationId, "adjust-immediate");
+  assert.equal(queueEvents[0][3].imageCommitted, true,
+    "the shell receives the immediate terminal observation for repaint");
 });
 
 

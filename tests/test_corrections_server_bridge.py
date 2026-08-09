@@ -1662,6 +1662,90 @@ def test_uncorrected_build_index_never_reads_capture_or_layout_bytes(
     assert books[0]["latest_imported_at"] == "2026-08-04T12:34:56Z"
 
 
+def test_corrected_capture_head_stays_stable_in_lazy_index_and_hydration(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    engine = server._library_engine()
+    rasters = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in rasters.list_raster_artifacts(BOOK_ID)
+        if value.key.artifact_id.endswith(":display")
+    )
+    before_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert before_response.status_code == 200
+    before = before_response.get_json()["books"][0]["captures"][0]
+
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    command = _transform_command(source, "bridge-lazy-capture-display-head")
+    assert transforms.queue(command).created is True
+    result = transforms.execute_queued(command)
+    assert result.image_commit is not None
+    corrected = result.image_commit.output("corrected-display")
+
+    lazy_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert lazy_response.status_code == 200, lazy_response.get_json()
+    lazy_book = lazy_response.get_json()["books"][0]
+    assert len(lazy_book["captures"]) == 1
+    lazy = lazy_book["captures"][0]
+    assert lazy["artifact_id"] == source.key.artifact_id
+    assert lazy["revision"].startswith("index:")
+    assert lazy["revision"] != before["revision"]
+    assert lazy["capture_order"] == before["capture_order"] == 1
+    assert lazy["imported_at"] == before["imported_at"] == (
+        "2026-08-04T12:34:56Z"
+    )
+
+    detail_response = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/{source.key.artifact_id}"
+    )
+    assert detail_response.status_code == 200, detail_response.get_json()
+    artifact = detail_response.get_json()["artifact"]
+    assert artifact["key"]["artifact_id"] == source.key.artifact_id
+    assert artifact["revision"] != lazy["revision"]
+    assert artifact["kind"] == "captured-image"
+    assert artifact["content_sha256"] == corrected.content_sha256
+    assert artifact["extensions"]["capture_order"] == 1
+    assert artifact["extensions"]["imported_at"] == lazy["imported_at"]
+    assert artifact["extensions"]["correction_transform"]["operation_id"] == (
+        command.operation_id
+    )
+    resource = artifact["resource"]
+    resource_response = client.get(
+        f"/api/v1/items/{BOOK_ID}/raster-artifacts/"
+        f"{source.key.artifact_id}/resource?"
+        + urlencode({"revision": resource["revision"]})
+    )
+    assert resource_response.status_code == 200
+    assert hashlib.sha256(resource_response.data).hexdigest() == (
+        corrected.content_sha256
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_corrections_uses_lazy_capture_index",
+        lambda _item_id: False,
+    )
+    full_response = client.get(
+        "/api/v1/corrections/index?workspace_id=local-library"
+    )
+    assert full_response.status_code == 200, full_response.get_json()
+    full = full_response.get_json()["books"][0]["captures"]
+    assert len(full) == 1
+    assert full[0]["artifact_id"] == lazy["artifact_id"]
+    assert full[0]["capture_order"] == lazy["capture_order"]
+    assert full[0]["imported_at"] == lazy["imported_at"]
+
+
 def test_lazy_and_full_indexes_match_missing_original_and_import_time(
     client,
     corrections_workspace,
@@ -2355,7 +2439,7 @@ def test_capture_promotion_preserves_human_corrections_and_one_identity(
     assert {
         value.kind for value in correction_outputs
     } == {
-        "corrected-image",
+        "captured-image",
         "processed-image",
         "processed-source",
     }

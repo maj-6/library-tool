@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14400,15 +14400,511 @@ def _ocr_apply_decode_figures(raw_images) -> list[dict] | None:
     return figures
 
 
+_CORRECTION_TRANSFORM_POINTER_SCHEMA = (
+    "librarytool.correction-transform-item-pointer"
+)
+_CORRECTION_TRANSFORM_PUBLICATION_SCHEMA = (
+    "librarytool.correction-transform-publication"
+)
+_CORRECTION_TRANSFORM_RECEIPT_SCHEMA = (
+    "librarytool.correction-transform-receipt"
+)
+_CORRECTION_DISPLAY_HEAD_SCHEMA = "librarytool.correction-display-head"
+_CORRECTION_TRANSFORM_POINTER_FIELDS = frozenset({
+    "schema", "version", "item_id", "operation_id", "command_sha256",
+    "publication_sha256",
+})
+_CORRECTION_TRANSFORM_RECEIPT_FIELDS = frozenset({
+    "schema", "version", "operation_id", "command_sha256",
+    "publication_sha256", "result",
+})
+_CORRECTION_DISPLAY_HEAD_FIELDS = frozenset({
+    "schema", "version", "item_id", "artifact_id", "operation_id",
+    "command_sha256", "publication_sha256",
+})
+
+
+def _correction_transform_canonical_json(value) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def _correction_transform_bounded_bytes(path: Path, maximum: int) -> bytes:
+    """Snapshot one private transform document without following redirects."""
+
+    if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+        raise ValueError("transform document byte limit is invalid")
+
+    def identity(value) -> tuple[int, int, int, int, int]:
+        return (
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_mode),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+        )
+
+    named = path.lstat()
+    if (
+        not stat.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+        or named.st_size < 1
+        or named.st_size > maximum
+    ):
+        raise ValueError("transform document is not a bounded regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or identity(opened) != identity(named)
+        ):
+            raise ValueError("transform document changed before it was opened")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            block = os.read(descriptor, min(1 << 20, maximum + 1 - size))
+            if not block:
+                break
+            chunks.append(block)
+            size += len(block)
+            if size > maximum:
+                raise ValueError("transform document exceeds its byte limit")
+        opened_after = os.fstat(descriptor)
+        named_after = path.lstat()
+        if (
+            identity(opened_after) != identity(opened)
+            or identity(named_after) != identity(opened)
+        ):
+            raise ValueError("transform document changed while it was read")
+        return b"".join(chunks)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _correction_transform_output_descriptor(value) -> dict | None:
+    if not isinstance(value, Mapping):
+        return None
+    kind = value.get("kind")
+    artifact_id = value.get("artifact_id")
+    revision = value.get("artifact_revision")
+    checksum = value.get("content_sha256")
+    if (
+        not isinstance(kind, str)
+        or not kind
+        or not isinstance(artifact_id, str)
+        or not artifact_id
+        or not isinstance(revision, str)
+        or not revision
+        or not isinstance(checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+    ):
+        return None
+    return {
+        "kind": kind,
+        "artifact_id": artifact_id,
+        "artifact_revision": revision,
+        "content_sha256": checksum,
+    }
+
+
+def _validated_correction_transform_publications(
+        item_id: str, engine_root: Path) -> tuple[Path, tuple[dict, ...]]:
+    """Return only receipt-witnessed, mutually bound transform documents."""
+
+    transforms = engine_root / ".engine" / "correction-transforms"
+    pointer_dir = transforms / "by-item" / hashlib.sha256(
+        item_id.encode("utf-8")).hexdigest()
+    publications: list[dict] = []
+    paths = sorted(pointer_dir.glob("*.json")) \
+        if pointer_dir.is_dir() else ()
+    for pointer_path in paths:
+        try:
+            pointer_payload = _correction_transform_bounded_bytes(
+                pointer_path,
+                64 * 1024,
+            )
+            pointer = json.loads(pointer_payload.decode("utf-8"))
+            if (
+                not isinstance(pointer, dict)
+                or frozenset(pointer) != _CORRECTION_TRANSFORM_POINTER_FIELDS
+                or pointer.get("schema") != _CORRECTION_TRANSFORM_POINTER_SCHEMA
+                or type(pointer.get("version")) is not int
+                or pointer["version"] != 1
+                or pointer.get("item_id") != item_id
+            ):
+                raise ValueError("item pointer is invalid")
+            operation_id = pointer.get("operation_id")
+            command_sha256 = pointer.get("command_sha256")
+            publication_sha256 = pointer.get("publication_sha256")
+            if (
+                not isinstance(operation_id, str)
+                or not operation_id
+                or not isinstance(command_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", command_sha256) is None
+                or not isinstance(publication_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", publication_sha256) is None
+            ):
+                raise ValueError("item pointer bindings are invalid")
+            operation_digest = hashlib.sha256(
+                operation_id.encode("utf-8")).hexdigest()
+            if pointer_path.name != f"{operation_digest}.json":
+                raise ValueError("item pointer path is invalid")
+
+            publication_path = (
+                transforms / "publications" / f"{operation_digest}.json"
+            )
+            publication_payload = _correction_transform_bounded_bytes(
+                publication_path,
+                128 * 1024 * 1024,
+            )
+            if hashlib.sha256(publication_payload).hexdigest() != (
+                publication_sha256
+            ):
+                raise ValueError("publication digest is invalid")
+            publication = json.loads(publication_payload.decode("utf-8"))
+            if (
+                not isinstance(publication, dict)
+                or publication.get("schema")
+                != _CORRECTION_TRANSFORM_PUBLICATION_SCHEMA
+                or type(publication.get("version")) is not int
+                or publication["version"] != 2
+                or publication.get("operation_id") != operation_id
+                or publication.get("command_sha256") != command_sha256
+            ):
+                raise ValueError("publication envelope is invalid")
+            command = publication.get("command")
+            outputs = publication.get("outputs")
+            if (
+                not isinstance(command, dict)
+                or command.get("item_id") != item_id
+                or command.get("operation_id") != operation_id
+                or not isinstance(command.get("artifact_id"), str)
+                or not command["artifact_id"]
+                or not isinstance(outputs, list)
+                or not outputs
+                or hashlib.sha256(
+                    _correction_transform_canonical_json(command)
+                ).hexdigest() != command_sha256
+            ):
+                raise ValueError("publication command is invalid")
+            pin_fields = frozenset(command) & {
+                "source_revision", "source_sha256",
+            }
+            if pin_fields:
+                if pin_fields != {"source_revision", "source_sha256"}:
+                    raise ValueError("publication source pin is incomplete")
+                parsed_command = CorrectionTransformCommand.from_dict(command)
+                if parsed_command.as_dict() != command:
+                    raise ValueError("publication command is not canonical")
+            elif (
+                command.get("schema") != "org.whl.correction-transform-command"
+                or type(command.get("version")) is not int
+                or command["version"] != 1
+            ):
+                raise ValueError("legacy publication command is invalid")
+            descriptors = tuple(
+                _correction_transform_output_descriptor(value)
+                for value in outputs
+            )
+            if any(value is None for value in descriptors):
+                raise ValueError("publication outputs are invalid")
+
+            receipt_path = (
+                engine_root / ".engine" / "receipts"
+                / "correction-transforms" / f"{operation_digest}.json"
+            )
+            receipt_payload = _correction_transform_bounded_bytes(
+                receipt_path,
+                1024 * 1024,
+            )
+            receipt = json.loads(receipt_payload.decode("utf-8"))
+            if (
+                not isinstance(receipt, dict)
+                or frozenset(receipt) != _CORRECTION_TRANSFORM_RECEIPT_FIELDS
+                or receipt.get("schema") != _CORRECTION_TRANSFORM_RECEIPT_SCHEMA
+                or type(receipt.get("version")) is not int
+                or receipt["version"] != 1
+                or receipt.get("operation_id") != operation_id
+                or receipt.get("command_sha256") != command_sha256
+                or receipt.get("publication_sha256") != publication_sha256
+            ):
+                raise ValueError("receipt envelope is invalid")
+            result = receipt.get("result")
+            result_outputs = result.get("outputs") \
+                if isinstance(result, Mapping) else None
+            receipt_descriptors = tuple(
+                _correction_transform_output_descriptor(value)
+                for value in result_outputs
+            ) if isinstance(result_outputs, list) else ()
+            if (
+                not isinstance(result, Mapping)
+                or result.get("operation_id") != operation_id
+                or receipt_descriptors != descriptors
+            ):
+                raise ValueError("receipt result is not bound to publication")
+            publications.append({
+                "order": pointer_path.stat().st_mtime,
+                "operation_id": operation_id,
+                "command": command,
+                "outputs": outputs,
+                "command_sha256": command_sha256,
+                "publication_sha256": publication_sha256,
+            })
+        except (
+            EngineError,
+            KeyError,
+            OSError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ):
+            # A torn, in-flight, or foreign document is not committed state.
+            continue
+    return transforms, tuple(publications)
+
+
+def _validated_correction_display_head(
+        item_id: str, artifact_id: str, transforms: Path,
+        publications: Mapping[str, dict],
+        ) -> tuple[bool, dict | None]:
+    """Return (present, publication); a present invalid head fails closed."""
+
+    item_digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+    artifact_digest = hashlib.sha256(artifact_id.encode("utf-8")).hexdigest()
+    path = (
+        transforms / "display-heads" / item_digest
+        / f"{artifact_digest}.json"
+    )
+    if not os.path.lexists(path):
+        return False, None
+    try:
+        payload = _correction_transform_bounded_bytes(path, 64 * 1024)
+        head = json.loads(payload.decode("utf-8"))
+        if (
+            not isinstance(head, dict)
+            or frozenset(head) != _CORRECTION_DISPLAY_HEAD_FIELDS
+            or head.get("schema") != _CORRECTION_DISPLAY_HEAD_SCHEMA
+            or type(head.get("version")) is not int
+            or head["version"] != 1
+            or head.get("item_id") != item_id
+            or head.get("artifact_id") != artifact_id
+            or payload != _correction_transform_canonical_json(head)
+        ):
+            raise ValueError("display head envelope is invalid")
+        operation_id = head.get("operation_id")
+        publication = publications.get(operation_id)
+        if (
+            not isinstance(operation_id, str)
+            or publication is None
+            or head.get("command_sha256")
+            != publication["command_sha256"]
+            or head.get("publication_sha256")
+            != publication["publication_sha256"]
+        ):
+            raise ValueError("display head is not bound to its publication")
+        return True, publication
+    except (
+        KeyError,
+        OSError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        return True, None
+
+
+def _correction_transform_source_pin(value) -> tuple[str, str] | None:
+    """Return one exact immutable-raster pin from a command/output mapping."""
+
+    if not isinstance(value, Mapping):
+        return None
+    revision = value.get("source_revision")
+    checksum = value.get("source_sha256")
+    if (
+        not isinstance(revision, str)
+        or not revision
+        or not isinstance(checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+    ):
+        return None
+    return revision, checksum
+
+
+def _correction_transform_committed_pin(value) -> tuple[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    revision = value.get("artifact_revision")
+    checksum = value.get("content_sha256")
+    if (
+        not isinstance(revision, str)
+        or not revision
+        or not isinstance(checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+    ):
+        return None
+    return revision, checksum
+
+
+def _correction_transform_output_pin(value) -> tuple[str, str] | None:
+    """Return the immutable pin for a committed corrected-display output."""
+
+    if not isinstance(value, Mapping) or value.get("kind") != "corrected-display":
+        return None
+    return _correction_transform_committed_pin(value)
+
+
+def _correction_transform_ancestry_indexes(
+        publications: Sequence[dict]) -> tuple[dict, dict]:
+    """Index both legacy output identities and immutable display pins.
+
+    Values remain tuples instead of last-write-wins mappings so a torn or
+    foreign duplicate makes the corresponding edge ambiguous and therefore
+    unusable.
+    """
+
+    by_output: dict[str, list[tuple[dict, Mapping]]] = {}
+    by_display_pin: dict[tuple[str, str], list[dict]] = {}
+    for entry in publications:
+        outputs = entry.get("outputs") if isinstance(entry, Mapping) else None
+        for output in outputs if isinstance(outputs, list) else ():
+            if not isinstance(output, Mapping):
+                continue
+            artifact_id = output.get("artifact_id")
+            if isinstance(artifact_id, str) and artifact_id:
+                by_output.setdefault(artifact_id.casefold(), []).append(
+                    (entry, output)
+                )
+            pin = _correction_transform_output_pin(output)
+            if pin is not None:
+                by_display_pin.setdefault(pin, []).append(entry)
+    return (
+        {key: tuple(values) for key, values in by_output.items()},
+        {key: tuple(values) for key, values in by_display_pin.items()},
+    )
+
+
+def _correction_transform_parent(
+        entry: dict, by_output: Mapping, by_display_pin: Mapping,
+        ) -> tuple[dict | None, bool]:
+    """Resolve one unambiguous parent; the bool reports invalid ambiguity."""
+
+    command = entry.get("command") if isinstance(entry, Mapping) else None
+    if not isinstance(command, Mapping):
+        return None, True
+    matches: list[dict] = []
+    artifact_id = command.get("artifact_id")
+    declared_root = _capture_correction_artifact_root(artifact_id)
+    # Stable-slot reruns keep addressing ``capture:<ns>:display``. Their
+    # immutable source pin, rather than a ctr output identity, is the parent
+    # edge. Other transform sources retain the legacy output-id contract.
+    has_source_pin = (
+        "source_revision" in command or "source_sha256" in command
+    )
+    source_pin = _correction_transform_source_pin(command)
+    if has_source_pin and source_pin is None:
+        return None, True
+    if (
+        source_pin is not None
+        and declared_root is not None
+        and declared_root[1] == "display"
+    ):
+        pinned = by_display_pin.get(source_pin, ())
+        if len(pinned) > 1:
+            return None, True
+        matches.extend(pinned)
+    if isinstance(artifact_id, str) and artifact_id:
+        identified = by_output.get(artifact_id.casefold(), ())
+        if len(identified) > 1:
+            return None, True
+        if identified:
+            identified_entry, identified_output = identified[0]
+            if (
+                has_source_pin
+                and _correction_transform_committed_pin(identified_output)
+                != source_pin
+            ):
+                return None, True
+            matches.append(identified_entry)
+    unique = {id(value): value for value in matches}
+    if len(unique) > 1:
+        # Both edges existed but disagreed, so neither is authoritative.
+        return None, True
+    return (next(iter(unique.values())) if unique else None), False
+
+
+def _capture_correction_artifact_root(
+        artifact_id) -> tuple[str, str] | None:
+    if not isinstance(artifact_id, str):
+        return None
+    namespace, separator, rendition = artifact_id.rpartition(":")
+    if separator and namespace and rendition in {"display", "original"}:
+        return namespace, rendition
+    return None
+
+
+def _capture_correction_chain(
+        entry: dict, by_output: Mapping, by_display_pin: Mapping,
+        ) -> tuple[tuple[str, str], tuple[dict, ...]] | None:
+    """Walk one transform leaf-first to a consistent capture rendition root."""
+
+    chain: list[dict] = []
+    expected_root: tuple[str, str] | None = None
+    seen: set[int] = set()
+    current = entry
+    while True:
+        marker = id(current)
+        if marker in seen:
+            return None
+        seen.add(marker)
+        command = current.get("command") \
+            if isinstance(current, Mapping) else None
+        if not isinstance(command, Mapping):
+            return None
+        declared_root = _capture_correction_artifact_root(
+            command.get("artifact_id"))
+        if declared_root is not None:
+            if expected_root is not None and declared_root != expected_root:
+                return None
+            expected_root = declared_root
+        chain.append(current)
+        parent, ambiguous = _correction_transform_parent(
+            current, by_output, by_display_pin)
+        if ambiguous:
+            return None
+        if parent is not None:
+            current = parent
+            continue
+        if declared_root is None or expected_root is None:
+            return None
+        return expected_root, tuple(chain)
+
+
 def _ocr_apply_capture_asset(
         item_id: str, capture_id: str, source_artifact_id: str,
         engine_root: Path) -> tuple[str, int, str, list] | None:
     """Chain a committed OCR-ready output back to its capture photo page.
 
     Same tolerant publication scan as ``_capture_correction_targets``: the
-    output's owning publication names its input artifact, and following those
-    inputs transitively lands on the capture's ``capture:<ns>:display`` /
-    ``:original`` artifact whose namespace the photo contract can invert.
+    output's owning publication names its input artifact. Legacy output-id
+    edges and same-display-slot immutable revision/checksum edges both lead
+    transitively to the capture artifact whose namespace the photo contract
+    can invert.
     Pages are the desktop import's photo numbering (``order`` + 1). Returns
     ``(asset_id, page, rendition, quads)``: the rendition names which capture
     artifact roots the chain, and quads carries each traversed publication's
@@ -14422,7 +14918,24 @@ def _ocr_apply_capture_asset(
         if isinstance(photo_assets, Mapping) else None
     rows = desktop_import.get("assets") \
         if isinstance(desktop_import, Mapping) else None
-    asset_by_namespace: dict[str, tuple[str, int]] = {}
+    raw_display_sha: dict[str, str] = {}
+    raw_rows = photo_assets.get("assets") \
+        if isinstance(photo_assets, Mapping) else None
+    for raw in raw_rows if isinstance(raw_rows, list) else []:
+        if not isinstance(raw, Mapping):
+            continue
+        raw_asset_id = raw.get("asset_id")
+        display = raw.get("display")
+        checksum = str(display.get("sha256") or "").strip().lower() \
+            if isinstance(display, Mapping) else ""
+        if (
+            isinstance(raw_asset_id, str)
+            and raw_asset_id not in raw_display_sha
+            and _CAPTURE_CORRECTION_ASSET_ID_RE.fullmatch(raw_asset_id)
+            and _CAPTURE_CORRECTION_SHA256_RE.fullmatch(checksum)
+        ):
+            raw_display_sha[raw_asset_id] = checksum
+    asset_by_namespace: dict[str, tuple[str, int, str]] = {}
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, Mapping):
             continue
@@ -14433,62 +14946,48 @@ def _ocr_apply_capture_asset(
                 or isinstance(order, bool) or not isinstance(order, int)
                 or order < 0 or row.get("lifecycle") == "failed"):
             continue
+        display_sha256 = str(
+            row.get("derivative_checksum")
+            or raw_display_sha.get(asset_id)
+            or ""
+        ).strip().lower()
+        if not _CAPTURE_CORRECTION_SHA256_RE.fullmatch(display_sha256):
+            continue
         asset_by_namespace[
             _capture_artifact_namespace(capture_id, asset_id)
-        ] = (asset_id, order + 1)
+        ] = (asset_id, order + 1, display_sha256)
     if not asset_by_namespace:
         return None
 
-    transforms = engine_root / ".engine" / "correction-transforms"
-    pointer_dir = transforms / "by-item" / hashlib.sha256(
-        item_id.encode("utf-8")).hexdigest()
-    parent_by_output: dict[str, dict] = {}
-    for pointer_path in (
-            sorted(pointer_dir.glob("*.json"))
-            if pointer_dir.is_dir() else ()):
-        try:
-            pointer = json.loads(pointer_path.read_text("utf-8"))
-            operation_id = str(pointer["operation_id"])
-            publication = json.loads(
-                (transforms / "publications" /
-                 (hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
-                  + ".json")).read_text("utf-8"))
-        except (OSError, KeyError, TypeError, ValueError, UnicodeError):
-            continue    # a torn or foreign document must not block the pass
-        if not isinstance(publication, dict):
-            continue
-        command = publication.get("command")
-        outputs = publication.get("outputs")
-        if (not isinstance(command, dict)
-                or not isinstance(outputs, list)
-                or publication.get("version") != 2
-                or command.get("item_id") != item_id
-                or not isinstance(command.get("artifact_id"), str)):
-            continue
-        for output in outputs:
-            if isinstance(output, dict) and isinstance(
-                    output.get("artifact_id"), str):
-                parent_by_output[output["artifact_id"].casefold()] = command
+    _transforms, publications = _validated_correction_transform_publications(
+        item_id, engine_root)
 
-    current = str(source_artifact_id)
-    seen: set[str] = set()
-    quads: list = []
-    while True:
-        key = current.casefold()
-        if key in seen:
+    by_output, by_display_pin = _correction_transform_ancestry_indexes(
+        publications)
+    leaves = by_output.get(str(source_artifact_id).casefold(), ())
+    if len(leaves) != 1:
+        return None
+    resolved = _capture_correction_chain(
+        leaves[0][0], by_output, by_display_pin)
+    if resolved is None:
+        return None
+    (namespace, rendition), chain = resolved
+    located = asset_by_namespace.get(namespace)
+    if located is None:
+        return None
+    if rendition == "display":
+        root_pin = _correction_transform_source_pin(chain[-1]["command"])
+        if root_pin is None or root_pin[1] != located[2]:
+            # A missing same-slot ancestor otherwise makes the surviving child
+            # look like a root and silently drops part of the inverse mapping.
+            # The live capture display checksum is the root authority pin.
             return None
-        seen.add(key)
-        parent = parent_by_output.get(key)
-        if parent is None:
-            return None
-        quads.append(parent.get("quad"))
-        parent_id = parent["artifact_id"]
-        namespace, _, rendition = parent_id.rpartition(":")
-        if rendition in ("display", "original"):
-            located = asset_by_namespace.get(namespace)
-            if located is not None:
-                return located[0], located[1], rendition, quads
-        current = parent_id
+    return (
+        located[0],
+        located[1],
+        rendition,
+        [entry["command"].get("quad") for entry in chain],
+    )
 
 
 @app.route("/api/v1/items/<item_id>/ocr-proposals/<proposal_ref>/apply",
@@ -27117,11 +27616,12 @@ def _capture_correction_targets(
         engine_root: Path) -> dict[str, dict]:
     """Map committed correction-transform publications onto capture assets.
 
-    A publication counts only when its ``command.artifact_id`` resolves —
-    transitively through earlier publications' output ids — to this capture's
-    ``capture:<ns>:display``/``:original`` artifact. Per asset, chain order
-    is authoritative: a publication whose resolution passes through another
-    candidate's outputs supersedes it. That signal is content-derived — the
+    A publication counts only when its command resolves to this capture's
+    ``capture:<ns>:display``/``:original`` artifact. Legacy chains follow
+    earlier output ids; same-display-slot reruns follow an exact immutable
+    revision/checksum match to an earlier corrected display. Per asset, chain
+    order is authoritative: a publication whose resolution passes through
+    another candidate supersedes it. That signal is content-derived — the
     engine never stamps ``generated_at`` on these outputs, and pointer
     mtimes do not survive index backfills or DATA_ROOT restores. Chain-
     unrelated siblings order by recorded output timestamps when present,
@@ -27131,7 +27631,25 @@ def _capture_correction_targets(
 
     asset_by_namespace: dict[str, str] = {}
     source_sha: dict[str, str] = {}
+    display_source_sha: dict[str, str] = {}
     failed: set[str] = set()
+    raw_display_sha: dict[str, str] = {}
+    raw_rows = photo_assets.get("assets") \
+        if isinstance(photo_assets, Mapping) else None
+    for raw in raw_rows if isinstance(raw_rows, list) else []:
+        if not isinstance(raw, Mapping):
+            continue
+        raw_asset_id = raw.get("asset_id")
+        display = raw.get("display")
+        checksum = str(display.get("sha256") or "").strip().lower() \
+            if isinstance(display, Mapping) else ""
+        if (
+            isinstance(raw_asset_id, str)
+            and raw_asset_id not in raw_display_sha
+            and _CAPTURE_CORRECTION_ASSET_ID_RE.fullmatch(raw_asset_id)
+            and _CAPTURE_CORRECTION_SHA256_RE.fullmatch(checksum)
+        ):
+            raw_display_sha[raw_asset_id] = checksum
     desktop_import = photo_assets.get("desktop_import") \
         if isinstance(photo_assets, Mapping) else None
     rows = desktop_import.get("assets") \
@@ -27149,80 +27667,57 @@ def _capture_correction_targets(
         asset_by_namespace[
             _capture_artifact_namespace(capture_id, asset_id)] = asset_id
         source_sha[asset_id] = checksum
+        display_checksum = str(
+            row.get("derivative_checksum")
+            or raw_display_sha.get(asset_id)
+            or ""
+        ).strip().lower()
+        if _CAPTURE_CORRECTION_SHA256_RE.fullmatch(display_checksum):
+            display_source_sha[asset_id] = display_checksum
         if row.get("lifecycle") == "failed":
             failed.add(asset_id)
     if not asset_by_namespace:
         return {}
 
-    transforms = engine_root / ".engine" / "correction-transforms"
-    pointer_dir = transforms / "by-item" / hashlib.sha256(
-        item_id.encode("utf-8")).hexdigest()
-    publications: list[dict] = []
-    for pointer_path in (
-            sorted(pointer_dir.glob("*.json"))
-            if pointer_dir.is_dir() else ()):
-        try:
-            pointer = json.loads(pointer_path.read_text("utf-8"))
-            operation_id = str(pointer["operation_id"])
-            publication = json.loads(
-                (transforms / "publications" /
-                 (hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
-                  + ".json")).read_text("utf-8"))
-        except (OSError, KeyError, TypeError, ValueError, UnicodeError):
-            continue    # a torn or foreign document must not block the pass
-        if not isinstance(publication, dict):
-            continue
-        command = publication.get("command")
-        outputs = publication.get("outputs")
-        correction_id = str(publication.get("command_sha256") or "").lower()
-        if (not isinstance(command, dict)
-                or not isinstance(outputs, list)
-                or publication.get("version") != 2
-                or command.get("item_id") != item_id
-                or not _CAPTURE_CORRECTION_SHA256_RE.fullmatch(correction_id)):
-            continue
-        recorded = _capture_correction_recorded(outputs)
-        publications.append({
-            "order": recorded if recorded is not None
-            else pointer_path.stat().st_mtime,
-            "operation_id": operation_id,
-            "command": command,
-            "outputs": outputs,
-            "correction_id": correction_id,
-        })
-
-    by_output: dict[str, dict] = {}
+    transforms, validated = _validated_correction_transform_publications(
+        item_id, engine_root)
+    publications = list(validated)
     for entry in publications:
-        for output in entry["outputs"]:
-            if isinstance(output, dict) and isinstance(
-                    output.get("artifact_id"), str):
-                by_output[output["artifact_id"].casefold()] = entry
+        recorded = _capture_correction_recorded(entry["outputs"])
+        if recorded is not None:
+            entry["order"] = recorded
+        entry["correction_id"] = entry["command_sha256"]
 
-    def resolve(entry: dict) -> tuple[str | None, frozenset[str]]:
-        ancestors: set[str] = set()
-        seen: set[str] = set()
-        while True:
-            artifact_id = str(entry["command"].get("artifact_id") or "")
-            namespace, _, rendition = artifact_id.rpartition(":")
-            if rendition in ("display", "original"):
-                asset_id = asset_by_namespace.get(namespace)
-                if asset_id is not None:
-                    return asset_id, frozenset(ancestors)
-            key = artifact_id.casefold()
-            if key in seen:
-                return None, frozenset()
-            seen.add(key)
-            parent = by_output.get(key)
-            if parent is None:
-                return None, frozenset()
-            ancestors.add(parent["correction_id"])
-            entry = parent
+    by_operation = {
+        entry["operation_id"]: entry for entry in publications
+    }
+    heads: dict[str, tuple[bool, dict | None]] = {}
+    display_slots: dict[str, str] = {}
+    for namespace, asset_id in asset_by_namespace.items():
+        display_slot = f"{namespace}:display"
+        display_slots[asset_id] = display_slot
+        heads[asset_id] = _validated_correction_display_head(
+            item_id,
+            display_slot,
+            transforms,
+            by_operation,
+        )
+
+    by_output, by_display_pin = _correction_transform_ancestry_indexes(
+        publications)
 
     candidates: dict[str, list[dict]] = {}
     for entry in publications:
-        asset_id, ancestors = resolve(entry)
+        resolved = _capture_correction_chain(
+            entry, by_output, by_display_pin)
+        if resolved is None:
+            continue
+        (namespace, _rendition), chain = resolved
+        asset_id = asset_by_namespace.get(namespace)
         if asset_id is None or asset_id in failed:
             continue
+        ancestors = frozenset(
+            parent["correction_id"] for parent in chain[1:])
         display = next((
             output for output in entry["outputs"]
             if isinstance(output, dict)
@@ -27240,24 +27735,47 @@ def _capture_correction_targets(
             "ancestors": ancestors,
             "display_id": display_id,
             "display_sha256": display_sha,
+            "root_artifact_id": f"{namespace}:{_rendition}",
+            "root_source_sha256": str(
+                chain[-1]["command"].get("source_sha256") or ""
+            ).strip().lower(),
         })
 
     winners: dict[str, dict] = {}
     for asset_id, entries in candidates.items():
         entries.sort(
             key=lambda value: (value["order"], value["operation_id"]))
-        superseded = frozenset().union(
-            *(entry["ancestors"] for entry in entries))
-        # Chain order first: anything another candidate derives from lost
-        # already, whatever its clock signals say.
-        current = [entry for entry in entries
-                   if entry["correction_id"] not in superseded]
-        winner = (current or entries)[-1]
+        head_present, head = heads.get(asset_id, (False, None))
+        if head_present:
+            if head is None:
+                continue
+            current = [
+                entry for entry in entries
+                if entry["operation_id"] == head["operation_id"]
+                and entry["root_artifact_id"].casefold()
+                == display_slots[asset_id].casefold()
+                and entry["root_source_sha256"]
+                == display_source_sha.get(asset_id)
+            ]
+            if len(current) != 1:
+                # The head is durable but its ancestry/output is not safe to
+                # publish. Never replace it with an unrelated history leaf.
+                continue
+            winner = current[0]
+        else:
+            superseded = frozenset().union(
+                *(entry["ancestors"] for entry in entries))
+            # Pre-head histories retain their content-derived ancestry, then
+            # their legacy recorded-time/pointer-mtime sibling fallback.
+            current = [entry for entry in entries
+                       if entry["correction_id"] not in superseded]
+            winner = (current or entries)[-1]
         winners[asset_id] = {
             "asset_id": asset_id,
             "source_original_sha256": source_sha[asset_id],
             "correction_id": winner["correction_id"],
             "display_sha256": winner["display_sha256"],
+            "authoritative_display_head": head_present,
             "display_object": transforms / "objects" / (
                 hashlib.sha256(
                     winner["display_id"].encode("utf-8")).hexdigest()
@@ -27399,6 +27917,99 @@ def _capture_corrections_relation_missing(owner_cfg: dict,
             or message.startswith("HTTP 404 "))
 
 
+def _capture_correction_prepared_token(
+        item_id: str, asset_id: str, target: Mapping) -> tuple:
+    """Pin every local value a prepared cloud row depends on."""
+
+    return (
+        item_id,
+        asset_id,
+        target["correction_id"],
+        target["source_original_sha256"],
+        target["display_sha256"],
+        target["display_object"],
+        target.get("authoritative_display_head") is True,
+    )
+
+
+@contextlib.contextmanager
+def _capture_correction_revalidate_prepared(
+        prepared: Sequence[dict], engine_root: Path,
+        ) -> Iterator[tuple[list[dict], list[str]]]:
+    """Retain rows whose complete local-authority token is still current.
+
+    One capture's writers are excluded first, then the Corrections workspace
+    snapshot is held while associations, manifests, transform heads, immutable
+    output bytes, and the yielded cloud row CAS are checked as one authority
+    interval. Uploads happen before this context and remain intentionally
+    unlocked; their content-addressed orphan objects are harmless.
+    """
+
+    if not prepared:
+        yield [], []
+        return
+    capture_ids = tuple(sorted({entry["capture_id"] for entry in prepared}))
+    if len(capture_ids) != 1:
+        raise ValueError("prepared correction rows must belong to one capture")
+    capture_id = capture_ids[0]
+    retained: list[dict] = []
+    notices: list[str] = []
+    with _capture_archive_backfill_capture_guard(capture_ids):
+        with _corrections_index_authority_context():
+            item_by_capture = {
+                target.capture_id: item_id
+                for item_id, target in
+                _corrections_targets_for_context().items()
+                if target.capture_id
+            }
+            expected_items = {entry["token"][0] for entry in prepared}
+            item_id = item_by_capture.get(capture_id)
+            targets: dict | None = None
+            if len(expected_items) == 1 and item_id in expected_items:
+                try:
+                    photo_assets = lib.load_json(
+                        CAPTURES_DIR / capture_id / "photo_assets.json",
+                        {},
+                    ) or {}
+                    targets = _capture_correction_targets(
+                        capture_id,
+                        photo_assets,
+                        item_id,
+                        engine_root,
+                    )
+                except Exception:
+                    # Local capture damage is a fail-closed per-row skip, just
+                    # like an association or transform-head token mismatch.
+                    targets = None
+
+            for entry in prepared:
+                token = entry["token"]
+                asset_id = token[1]
+                current = targets.get(asset_id) \
+                    if isinstance(targets, Mapping) else None
+                matches = (
+                    isinstance(current, Mapping)
+                    and _capture_correction_prepared_token(
+                        token[0], asset_id, current
+                    ) == token
+                )
+                if matches:
+                    try:
+                        payload = current["display_object"].read_bytes()
+                        matches = hashlib.sha256(payload).hexdigest() == token[4]
+                    except (OSError, TypeError):
+                        matches = False
+                if matches:
+                    retained.append(entry["row"])
+                else:
+                    notices.append(
+                        f"capture {capture_id[:8]}: asset {asset_id}: "
+                        "skipped a stale local correction whose authority "
+                        "changed before publication"
+                    )
+            yield retained, notices
+
+
 def _publish_capture_corrections(owner_cfg: dict) -> dict:
     """Stateless diff-and-publish of corrected capture display renditions.
 
@@ -27487,7 +28098,7 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
         for row in (existing_rows if isinstance(existing_rows, list) else [])
         if isinstance(row, dict)
     }
-    rows: list[dict] = []
+    prepared: list[dict] = []
     for capture_id in sorted(pending):
         owner_id = owner_ids.get(capture_id)
         if not owner_id:
@@ -27521,12 +28132,15 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                     candidate = target["candidates"].get(row_correction)
                     if candidate is not None:
                         # Downgrade guard: replacing a row this desktop also
-                        # holds locally needs proof of newness. A tie means
-                        # the pointer mtimes are disturbed (index backfill,
-                        # DATA_ROOT restore, exFAT granularity) — keep the
-                        # cloud row rather than reinstall old pixels.
+                        # holds locally needs proof of newness. The validated
+                        # mutable display head is that proof; pre-head history
+                        # still relies on ancestry and the legacy order signal.
+                        # A legacy tie means the pointer mtimes are disturbed
+                        # (index backfill, DATA_ROOT restore, exFAT granularity)
+                        # — keep the cloud row rather than reinstall old pixels.
                         newer = (
-                            row_correction in target["ancestors"]
+                            target.get("authoritative_display_head") is True
+                            or row_correction in target["ancestors"]
                             or (target["correction_id"]
                                 not in candidate["ancestors"]
                                 and target["order"] > candidate["order"]))
@@ -27560,7 +28174,7 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                 sbase.upload_object(
                     owner_cfg, _CAPTURE_CORRECTION_BUCKET, thumbnail_path,
                     thumbnail["data"], "image/jpeg")
-                rows.append({
+                row = {
                     "capture_id": capture_id,
                     "asset_id": asset_id,
                     "correction_id": target["correction_id"],
@@ -27570,18 +28184,50 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                         target, display=display, thumbnail=thumbnail,
                         display_path=display_path,
                         thumbnail_path=thumbnail_path),
+                }
+                prepared.append({
+                    "capture_id": capture_id,
+                    "token": _capture_correction_prepared_token(
+                        item_by_capture[capture_id], asset_id, target),
+                    "row": row,
                 })
         except Exception as exc:
             result["errors"].append(f"capture {capture_id[:8]}: {exc}")
-    if rows:
+    prepared_by_capture: dict[str, list[dict]] = {}
+    for entry in prepared:
+        prepared_by_capture.setdefault(entry["capture_id"], []).append(entry)
+    relation_missing = False
+    for capture_id in sorted(prepared_by_capture):
         try:
-            result["pushed"] = int(
-                sbase.publish_capture_corrections(owner_cfg, rows) or 0)
+            with _capture_correction_revalidate_prepared(
+                    prepared_by_capture[capture_id], engine_root,
+                    ) as (rows, notices):
+                result["notices"].extend(notices)
+                if not rows:
+                    continue
+                try:
+                    result["pushed"] += int(
+                        sbase.publish_capture_corrections(
+                            owner_cfg,
+                            rows,
+                        ) or 0
+                    )
+                except Exception as exc:
+                    if _capture_corrections_relation_missing(owner_cfg, exc):
+                        result["skipped"] = (
+                            _CAPTURE_CORRECTION_MISSING_NOTICE
+                        )
+                        relation_missing = True
+                    else:
+                        result["errors"].append(
+                            f"corrections rows: {exc}"
+                        )
         except Exception as exc:
-            if _capture_corrections_relation_missing(owner_cfg, exc):
-                result["skipped"] = _CAPTURE_CORRECTION_MISSING_NOTICE
-            else:
-                result["errors"].append(f"corrections rows: {exc}")
+            result["errors"].append(
+                f"corrections authority revalidation: {exc}"
+            )
+        if relation_missing:
+            break
     return result
 
 

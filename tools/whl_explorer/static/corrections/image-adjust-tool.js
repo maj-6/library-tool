@@ -1643,15 +1643,16 @@
       },
       onQueueResult(result, command, resource) {
         tool.handleQueueAccepted(result, command, resource);
+        let observation = null;
         if (isPlainObject(result) && (
           Object.prototype.hasOwnProperty.call(result, "image_commit") ||
           Object.prototype.hasOwnProperty.call(result, "cancelled_before_commit") ||
           Object.prototype.hasOwnProperty.call(result, "ocr_followup")
         )) {
-          tool.observeTransformResult(result, command);
+          observation = tool.observeTransformResult(result, command);
         }
         if (typeof base.onQueueResult === "function") {
-          base.onQueueResult(result, command, resource);
+          base.onQueueResult(result, command, resource, observation);
         }
       },
       onCommandError(error, resource) {

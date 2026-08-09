@@ -311,6 +311,7 @@
         this.context = null;
         this.contextGeneration = 0;
         this.selectionGeneration = 0;
+        this.selectionReloadGeneration = 0;
         this.contextAbort = null;
         this.selectionAbort = null;
         this.listeners = [];
@@ -577,6 +578,78 @@
         }
       }
 
+      async loadGroupSnapshot(group, minimumItems) {
+        const generation = this.contextGeneration;
+        const targetCount = Math.max(1, Number(minimumItems) || 0);
+        const maximumPages = Math.max(
+          1,
+          Math.ceil(targetCount / this.pageLimit) + 1,
+        );
+        const seenCursors = new Set();
+        let cursor = null;
+        let items = Object.freeze([]);
+        let nextCursor = null;
+        let revision = "";
+        let total = null;
+        for (let pageIndex = 0; pageIndex < maximumPages; pageIndex += 1) {
+          const response = await this.catalog.list({
+            context: this.context,
+            group,
+            cursor,
+            limit: this.pageLimit,
+            signal: this.contextAbort && this.contextAbort.signal,
+          });
+          if (generation !== this.contextGeneration || this.destroyed) {
+            const error = new Error("Artifact group snapshot response is stale");
+            error.name = "AbortError";
+            throw error;
+          }
+          const page = deps.decodeArtifactPage(response, group);
+          if (revision && page.revision && revision !== page.revision) {
+            throw new TypeError("artifact group snapshot revision changed while paging");
+          }
+          revision = page.revision || revision;
+          items = deps.mergeArtifactItems(items, page.items);
+          if (Number.isSafeInteger(response.total)) total = response.total;
+          nextCursor = page.nextCursor === cursor ? null : page.nextCursor;
+          const cursorIdentity = nextCursor == null ? "" : String(nextCursor);
+          if (!nextCursor || items.length >= targetCount) break;
+          if (seenCursors.has(cursorIdentity)) {
+            throw new TypeError("artifact group snapshot cursor did not advance");
+          }
+          seenCursors.add(cursorIdentity);
+          cursor = nextCursor;
+        }
+        return Object.freeze({
+          items,
+          nextCursor,
+          revision,
+          total: total == null ? items.length : total,
+        });
+      }
+
+      replaceGroupSnapshot(group, snapshot) {
+        const previous = this.groupState(group);
+        const nextKeys = new Set(snapshot.items.map((item) => item.key));
+        for (const item of previous.items) {
+          if (!nextKeys.has(item.key)) this.items.delete(item.key);
+        }
+        this.replaceGroupState(group, {
+          items: snapshot.items,
+          loaded: true,
+          loading: false,
+          error: null,
+          nextCursor: snapshot.nextCursor,
+          revision: snapshot.revision,
+          total: snapshot.total,
+        });
+        for (const item of snapshot.items) this.items.set(item.key, item);
+        if (this.hotKey && !this.items.has(this.hotKey)) {
+          this.hotKey = "";
+          this.emitHotTarget(null);
+        }
+      }
+
       async openDeepLink(key) {
         if (!this.context || !key) return null;
         try {
@@ -653,6 +726,69 @@
         });
         if (detail) this.mergeDetail(detail);
         return detail;
+      }
+
+      async reloadSelection(key = this.selectedKey) {
+        if (!key || key !== this.selectedKey || this.destroyed) return null;
+        const contextGeneration = this.contextGeneration;
+        const selectionGeneration = this.selectionGeneration;
+        const reloadGeneration = ++this.selectionReloadGeneration;
+        const summary = this.items.get(key);
+        const reloadIsCurrent = () => (
+          contextGeneration === this.contextGeneration &&
+          selectionGeneration === this.selectionGeneration &&
+          reloadGeneration === this.selectionReloadGeneration &&
+          key === this.selectedKey && !this.destroyed
+        );
+        // A repaint is context-owned, not selection-request-owned. select()
+        // aborts the latter while replacing the raster lease, so sharing that
+        // signal lets an older completed repaint cancel a newer one.
+        let detail = await this.loadDetail(key, {
+          force: true,
+          signal: this.contextAbort && this.contextAbort.signal,
+        });
+        if (!detail || !reloadIsCurrent()) return null;
+        const groupState = this.groupState(detail.group);
+        const groupWasPaginated = groupState.loaded && Boolean(
+          groupState.nextCursor ||
+          Number.isSafeInteger(groupState.total) &&
+            groupState.total > groupState.items.length,
+        );
+        if (groupWasPaginated && summary && summary.revision !== detail.revision) {
+          let rebased = false;
+          for (let attempt = 0; attempt < 3 && !rebased; attempt += 1) {
+            const expectedState = this.groupState(detail.group);
+            const snapshot = await this.loadGroupSnapshot(
+              detail.group,
+              expectedState.items.length,
+            );
+            if (!reloadIsCurrent()) return null;
+            if (this.groupState(detail.group) !== expectedState) continue;
+            const listed = snapshot.items.find((item) => item.key === key);
+            if (listed && listed.revision !== detail.revision) {
+              detail = await this.loadDetail(key, {
+                force: true,
+                signal: this.contextAbort && this.contextAbort.signal,
+              });
+              if (!detail || !reloadIsCurrent()) return null;
+              if (listed.revision !== detail.revision) continue;
+            }
+            this.replaceGroupSnapshot(detail.group, snapshot);
+            rebased = true;
+          }
+          if (!rebased) return null;
+        }
+        const preservedActiveKey = this.activeKey;
+        const preservedScrollTop = Number(this.treeRoot.scrollTop) || 0;
+        this.mergeDetail(detail);
+        if (this.selectedKey === key && this.activeKey === preservedActiveKey) {
+          this.treeRoot.scrollTop = preservedScrollTop;
+        }
+        // select() reuses the just-refreshed revision from the detail cache,
+        // releases the old raster lease, and routes the new display bytes.
+        // Expanded groups, keyboard cursor, scroll, and stable artifact key
+        // remain untouched.
+        return this.select(key, { preserveTreeNavigation: true });
       }
 
       mergeDetail(detail) {
@@ -964,6 +1100,16 @@
       async select(key, options = {}) {
         const summary = this.items.get(key);
         if (!summary || this.destroyed) return null;
+        const preserveTreeNavigation = options.preserveTreeNavigation === true &&
+          key === this.selectedKey;
+        const preservedActiveKey = preserveTreeNavigation ? this.activeKey : "";
+        const preservedScrollTop = preserveTreeNavigation
+          ? Number(this.treeRoot.scrollTop) || 0 : 0;
+        const restoreTreeNavigation = () => {
+          if (!preserveTreeNavigation || this.selectedKey !== key ||
+              this.activeKey !== preservedActiveKey) return;
+          this.treeRoot.scrollTop = preservedScrollTop;
+        };
         const navigationPreview = this.currentResource &&
           this.currentResource.navigationOnly === true &&
           this.currentResource.id === summary.id &&
@@ -971,15 +1117,16 @@
           summary.family === "image"
           ? this.currentResource : null;
         this.selectedKey = key;
-        this.activeKey = key;
+        if (!preserveTreeNavigation) this.activeKey = key;
         this.relatedKeys = new Set(this.linkIndex.get(key) || []);
-        this.ensureActiveVisible();
+        if (!preserveTreeNavigation) this.ensureActiveVisible();
         this.abortSelectionWork();
         const selectionGeneration = this.selectionGeneration;
         this.emitSelection(summary);
         if (this.properties) this.properties.setSelection(summary, { loading: true });
         this.publishResource(navigationPreview || this.loadingResource(summary));
         this.render();
+        restoreTreeNavigation();
         if (options.focus && typeof this.treeRoot.focus === "function") this.treeRoot.focus();
         try {
           const detail = await this.loadDetail(key, {
@@ -988,6 +1135,7 @@
           if (!detail || selectionGeneration !== this.selectionGeneration ||
               this.selectedKey !== key || this.destroyed) return null;
           this.mergeDetail(detail);
+          restoreTreeNavigation();
           if (this.properties) this.properties.setSelection(detail);
           this.emitSelection(detail);
           await this.routeResource(detail, selectionGeneration);

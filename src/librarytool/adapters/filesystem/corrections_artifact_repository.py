@@ -998,6 +998,7 @@ class FilesystemCorrectionsArtifactRepository(
                 bytes,
                 tuple[tuple[Path, tuple[int, ...] | None], ...],
                 tuple[Mapping[str, Any], ...],
+                Mapping[str, Mapping[str, Any]],
             ],
         ] = {}
         self._capture_hint_stat_collector: (
@@ -1151,7 +1152,16 @@ class FilesystemCorrectionsArtifactRepository(
         self,
         item_id: str,
     ) -> tuple[Mapping[str, Any], ...]:
-        """Return bounded capture navigation hints without reading image bytes.
+        """Return bounded capture navigation hints without reading image bytes."""
+
+        snapshot = self.capture_index_hint_snapshot(item_id)
+        return tuple(snapshot["hints"])
+
+    def capture_index_hint_snapshot(
+        self,
+        item_id: str,
+    ) -> Mapping[str, Any]:
+        """Return navigation hints plus private manifest-only display pins.
 
         These hints are deliberately not raster artifact views and their
         ``index:`` revisions must never be used as mutation preconditions.
@@ -1167,7 +1177,7 @@ class FilesystemCorrectionsArtifactRepository(
         try:
             with self._write_set.workspace_lease():
                 with self._lock_context_for():
-                    return self._capture_index_hints_locked(item)
+                    return self._capture_index_hint_snapshot_locked(item)
         except EngineError:
             raise
         except Exception as exc:
@@ -1191,6 +1201,18 @@ class FilesystemCorrectionsArtifactRepository(
         first item that would raise from the single-item read raises here.
         """
 
+        snapshots = self.capture_index_hint_snapshots_many(item_ids)
+        return {
+            item_id: tuple(snapshot["hints"])
+            for item_id, snapshot in snapshots.items()
+        }
+
+    def capture_index_hint_snapshots_many(
+        self,
+        item_ids: Sequence[str],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        """Return batched hints and private pins under one authority lease."""
+
         items = tuple(
             _identifier(value, item_id=str(value or ""), field="item_id")
             for value in item_ids
@@ -1199,10 +1221,12 @@ class FilesystemCorrectionsArtifactRepository(
         try:
             with self._write_set.workspace_lease():
                 with self._lock_context_for():
-                    results: dict[str, tuple[Mapping[str, Any], ...]] = {}
+                    results: dict[str, Mapping[str, Any]] = {}
                     for item in items:
                         current = item
-                        results[item] = self._capture_index_hints_locked(item)
+                        results[item] = (
+                            self._capture_index_hint_snapshot_locked(item)
+                        )
                     return results
         except EngineError:
             raise
@@ -1218,6 +1242,13 @@ class FilesystemCorrectionsArtifactRepository(
         self,
         item: str,
     ) -> tuple[Mapping[str, Any], ...]:
+        snapshot = self._capture_index_hint_snapshot_locked(item)
+        return tuple(snapshot["hints"])
+
+    def _capture_index_hint_snapshot_locked(
+        self,
+        item: str,
+    ) -> Mapping[str, Any]:
         if not self._live_item_exists(item):
             raise NotFoundError(
                 "the item does not exist",
@@ -1226,7 +1257,7 @@ class FilesystemCorrectionsArtifactRepository(
             )
         capture_id = self._live_capture_id(item)
         if not capture_id:
-            return ()
+            return {"hints": (), "authorities": {}}
         directory = self._managed_directory(
             self._capture_directory_for,
             capture_id,
@@ -1249,23 +1280,29 @@ class FilesystemCorrectionsArtifactRepository(
                     directory=directory,
                 )
                 if manifest is None:
-                    return (
-                        self._capture_inventory_index_hint(
-                            capture_id,
-                            state=ResourceState.MISSING,
-                            diagnostic_code="capture_manifest_missing",
+                    return {
+                        "hints": (
+                            self._capture_inventory_index_hint(
+                                capture_id,
+                                state=ResourceState.MISSING,
+                                diagnostic_code="capture_manifest_missing",
+                            ),
                         ),
-                    )
+                        "authorities": {},
+                    }
                 # Legacy manifests derive from files this cache does not
                 # fingerprint; build them fresh every time.
-                return self._capture_index_hints(
+                authorities: dict[str, Mapping[str, Any]] = {}
+                hints = self._capture_index_hints(
                     item,
                     capture_id=capture_id,
                     directory=directory,
                     manifest=manifest,
+                    authority_hints=authorities,
                 )
+                return {"hints": hints, "authorities": authorities}
             digest = hashlib.sha256(encoded).digest()
-            cached = self._cached_capture_hints(capture_id, digest)
+            cached = self._cached_capture_hint_snapshot(capture_id, digest)
             if cached is not None:
                 return cached
             manifest = self._decode_sidecar_json(
@@ -1274,6 +1311,7 @@ class FilesystemCorrectionsArtifactRepository(
                 section="capture",
             )
             collector: list[tuple[Path, tuple[int, ...] | None]] = []
+            authorities = {}
             self._capture_hint_stat_collector = collector
             try:
                 hints = self._capture_index_hints(
@@ -1281,6 +1319,7 @@ class FilesystemCorrectionsArtifactRepository(
                     capture_id=capture_id,
                     directory=directory,
                     manifest=manifest,
+                    authority_hints=authorities,
                 )
             finally:
                 self._capture_hint_stat_collector = None
@@ -1288,25 +1327,29 @@ class FilesystemCorrectionsArtifactRepository(
                 digest,
                 tuple(collector),
                 hints,
+                authorities,
             )
-            return hints
+            return {"hints": hints, "authorities": authorities}
         except RepositoryError as error:
             if not self._recoverable_capture_manifest_error(error):
                 raise
             self._capture_hint_cache.pop(capture_id, None)
-            return (
-                self._capture_inventory_index_hint(
-                    capture_id,
-                    state=ResourceState.UNAVAILABLE,
-                    diagnostic_code=error.code,
+            return {
+                "hints": (
+                    self._capture_inventory_index_hint(
+                        capture_id,
+                        state=ResourceState.UNAVAILABLE,
+                        diagnostic_code=error.code,
+                    ),
                 ),
-            )
+                "authorities": {},
+            }
 
-    def _cached_capture_hints(
+    def _cached_capture_hint_snapshot(
         self,
         capture_id: str,
         digest: bytes,
-    ) -> tuple[Mapping[str, Any], ...] | None:
+    ) -> Mapping[str, Any] | None:
         """Serve cached hints only when every input is verifiably unchanged.
 
         The manifest is compared by CONTENT: the caller hands in the sha256
@@ -1323,7 +1366,7 @@ class FilesystemCorrectionsArtifactRepository(
         entry = self._capture_hint_cache.get(capture_id)
         if entry is None:
             return None
-        cached_digest, rendition_stats, hints = entry
+        cached_digest, rendition_stats, hints, authorities = entry
         if not hmac.compare_digest(cached_digest, digest):
             self._capture_hint_cache.pop(capture_id, None)
             return None
@@ -1345,7 +1388,7 @@ class FilesystemCorrectionsArtifactRepository(
             if observed != identity:
                 self._capture_hint_cache.pop(capture_id, None)
                 return None
-        return hints
+        return {"hints": hints, "authorities": authorities}
 
     def resolve_capture_preview(
         self,
@@ -3132,7 +3175,15 @@ class FilesystemCorrectionsArtifactRepository(
         display_revision = _positive_integer(record.display.get("revision"))
         if original_revision is None or display_revision is None:
             return True
-        original_sha256 = _sha256(record.original.get("sha256"))
+        original_sha256 = _sha256(
+            record.imported.get("source_checksum")
+            or record.original.get("sha256")
+        )
+        display_sha256 = _sha256(
+            record.imported.get("derivative_checksum")
+            or record.display.get("sha256")
+        )
+        phone_display_sha256 = _sha256(record.display.get("sha256"))
         display_width = _non_negative_integer(record.display.get("width")) or 0
         display_height = (
             _non_negative_integer(record.display.get("height")) or 0
@@ -3142,33 +3193,73 @@ class FilesystemCorrectionsArtifactRepository(
             if record.imported
             else _orientation(record.display.get("orientation"))
         )
+        geometries = tuple(raw_geometry)
+        if any(not isinstance(geometry, Mapping) for geometry in geometries):
+            return True
+        matching_pins = tuple(
+            geometry
+            for geometry in geometries
+            if (
+                display_sha256
+                and _sha256(geometry.get("display_sha256"))
+                == display_sha256
+            )
+        )
+        phone_frame_records = tuple(
+            geometry
+            for geometry in geometries
+            if not _sha256(geometry.get("display_sha256"))
+        )
+        if record.imported:
+            if matching_pins:
+                candidates = matching_pins
+            elif (
+                display_sha256
+                and phone_display_sha256 == display_sha256
+            ):
+                candidates = phone_frame_records
+            else:
+                candidates = ()
+        else:
+            candidates = (*matching_pins, *phone_frame_records)
+        if not candidates:
+            return True
         seen_regions: set[tuple[str, str, str]] = set()
-        for geometry in raw_geometry:
-            if not isinstance(geometry, Mapping):
-                return True
+        for geometry in candidates:
             geometry_width = _non_negative_integer(geometry.get("width")) or 0
             geometry_height = (
                 _non_negative_integer(geometry.get("height")) or 0
             )
+            geometry_display_sha256 = _sha256(
+                geometry.get("display_sha256")
+            )
             if (
                 geometry.get("asset_id") != record.asset_id
                 or geometry.get("coordinate_space") != "display_normalized"
-                or _positive_integer(geometry.get("source_revision"))
-                != original_revision
-                or _positive_integer(geometry.get("display_revision"))
-                != display_revision
+                or (
+                    not geometry_display_sha256
+                    and _positive_integer(geometry.get("source_revision"))
+                    != original_revision
+                )
+                or (
+                    not geometry_display_sha256
+                    and _positive_integer(geometry.get("display_revision"))
+                    != display_revision
+                )
                 or (
                     original_sha256
                     and _sha256(geometry.get("source_sha256"))
                     != original_sha256
                 )
                 or (
-                    display_width
+                    (not geometry_display_sha256 or not record.imported)
+                    and display_width
                     and geometry_width
                     and geometry_width != display_width
                 )
                 or (
-                    display_height
+                    (not geometry_display_sha256 or not record.imported)
+                    and display_height
                     and geometry_height
                     and geometry_height != display_height
                 )
@@ -3267,8 +3358,9 @@ class FilesystemCorrectionsArtifactRepository(
         capture_id: str,
         directory: Path,
         manifest: Mapping[str, Any],
+        authority_hints: dict[str, Mapping[str, Any]] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
-        records, _representation_revision, legacy = (
+        records, representation_revision, legacy = (
             self._capture_manifest_records(item_id, capture_id, manifest)
         )
         hints: list[Mapping[str, Any]] = []
@@ -3341,6 +3433,19 @@ class FilesystemCorrectionsArtifactRepository(
                 import_state = "ready"
             namespace = record.namespace
             artifact_id = record.display_id
+            display_sha256 = _sha256(
+                imported.get("derivative_checksum")
+                or display.get("sha256")
+            )
+            if authority_hints is not None and display_sha256:
+                authority_hints[artifact_id.casefold()] = {
+                    "artifact_id": artifact_id,
+                    "source_revision": f"bytes:{display_sha256}",
+                    "source_sha256": display_sha256,
+                    "representation_id": "capture",
+                    "representation_revision": representation_revision,
+                    "canvas_id": namespace,
+                }
             assignments = self._capture_assignments(
                 item_id,
                 raw.get("role"),
@@ -3844,18 +3949,10 @@ class FilesystemCorrectionsArtifactRepository(
             display_view = self._capture_view(
                 item_id,
                 artifact_id=display_id,
-                kind=(
-                    "processed-image"
-                    if (
-                        imported
-                        or recipe != "camera-original"
-                        or (
-                            display_observation.content_sha256
-                            != original_observation.content_sha256
-                        )
-                    )
-                    else "captured-image"
-                ),
+                # The display is the stable, user-facing capture slot. Its
+                # recipe/provenance may advance, but moving it between public
+                # buckets would invalidate navigation and editor deep links.
+                kind="captured-image",
                 observation=display_observation,
                 source=display_source,
                 label=f"Capture {order} display",

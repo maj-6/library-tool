@@ -74,6 +74,7 @@
   const PRESET_BATCH_MAX_TARGETS = 4096;
   const PRESET_BATCH_RETRY_LIMIT = 4096;
   const PRESET_BATCH_CONTEXT_CHANGED = "preset-batch-context-changed";
+  const MAX_CAPTURE_DISPLAY_REFRESHES = 256;
 
   function isPlainObject(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -376,6 +377,11 @@
       ? `annotation:${id}` : `artifact:${id}`;
   }
 
+  function isCaptureDisplayArtifactId(value) {
+    return typeof value === "string" && value.startsWith("capture:") &&
+      value.endsWith(":display") && value.length > "capture::display".length;
+  }
+
   function navigationOnlyTarget(value) {
     if (!value || typeof value !== "object") return false;
     const revision = value.revision || value.artifactRevision ||
@@ -434,6 +440,7 @@
       this.featureContextGeneration = 0;
       this.unsubscribeContext = null;
       this.unsubscribeTransformResults = null;
+      this.captureDisplayRefreshes = new Map();
       this.unsubscribeClassificationBindings = null;
       this.externalRefreshPromise = null;
       this.restoringProfile = false;
@@ -545,10 +552,9 @@
         clearSelection: () => this.clearResourceSelection(),
         onCommandError: (error) => this.setStatus(
           error && error.message || "The transform could not be queued", true),
-        onQueueResult: (_result, command) => this.setStatus(
-          command && (command.adjustment || command.operations)
-            ? "Image processing queued"
-            : "Perspective transform queued"),
+        onQueueResult: (result, command, resource, observation) =>
+          this.handleQueuedTransformResult(
+            result, command, resource, observation),
         onStateChange: (state) => {
           if (!this.classificationController ||
               typeof this.classificationController.setCanvasOwner !== "function") {
@@ -1931,6 +1937,85 @@
       return () => this.selectionListeners.delete(listener);
     }
 
+    handleQueuedTransformResult(_result, command, _resource, observation = null) {
+      this.setStatus(
+        command && (command.adjustment || command.operations)
+          ? "Image processing queued"
+          : "Perspective transform queued",
+      );
+      return this.refreshCommittedCaptureDisplay(observation, command);
+    }
+
+    async refreshCommittedCaptureDisplay(observation, command = null) {
+      if (!observation || observation.imageCommitted !== true ||
+          !command || typeof command !== "object") return null;
+      const operationId = command.operation_id || command.operationId || "";
+      if (typeof operationId !== "string" || !operationId ||
+          observation.operationId !== operationId) return null;
+      const artifactId = command.artifact_id || command.artifactId || "";
+      const itemId = command.item_id || command.itemId || "";
+      if (!isCaptureDisplayArtifactId(artifactId)) return null;
+      const selection = this.state && this.state.selection || {};
+      if (selection.artifactId !== artifactId ||
+          (itemId && selection.itemId !== itemId)) return null;
+      const feature = this.artifactsFeature;
+      const key = `artifact:${artifactId}`;
+      if (!feature || feature.selectedKey !== key ||
+          typeof feature.reloadSelection !== "function") return null;
+      const selected = feature.items && feature.items.get(key);
+      if (selected && selected.family && selected.family !== "image") return null;
+      const refreshes = this.captureDisplayRefreshes instanceof Map
+        ? this.captureDisplayRefreshes
+        : (this.captureDisplayRefreshes = new Map());
+      const contextGeneration = feature.contextGeneration;
+      const selectionGeneration = feature.selectionGeneration;
+      const existing = refreshes.get(operationId);
+      if (existing && existing.key === key &&
+          existing.contextGeneration === contextGeneration &&
+          existing.selectionGeneration === selectionGeneration) {
+        return existing.promise;
+      }
+      const record = {
+        key,
+        contextGeneration,
+        selectionGeneration,
+        promise: null,
+      };
+      const refresh = (async () => {
+        try {
+          return await feature.reloadSelection(key);
+        } catch (error) {
+          if (!this.destroyed && feature.selectedKey === key &&
+              (!error || error.name !== "AbortError")) {
+            this.setStatus(
+              error && error.message || "The corrected display could not be refreshed",
+              true,
+            );
+          }
+          return null;
+        }
+      })();
+      record.promise = refresh;
+      refreshes.set(operationId, record);
+      void refresh.then((value) => {
+        if (refreshes.get(operationId) !== record) return;
+        if (!value) {
+          refreshes.delete(operationId);
+          return;
+        }
+        // A successful reload routes the replacement through select(), which
+        // advances the selection generation. Rebase the dedupe record onto
+        // that completed epoch; navigation away and back advances it again and
+        // deliberately makes a later durable result replay retryable.
+        record.contextGeneration = feature.contextGeneration;
+        record.selectionGeneration = feature.selectionGeneration;
+      });
+      while (refreshes.size > MAX_CAPTURE_DISPLAY_REFRESHES) {
+        refreshes.delete(refreshes.keys().next().value);
+      }
+      return refresh;
+    }
+
     connectTransformResults() {
       if (!this.imageAdjustTool || !this.subscribeTransformResults ||
           this.unsubscribeTransformResults) return;
@@ -1938,7 +2023,8 @@
         const release = this.subscribeTransformResults((result, command = null) => {
           if (this.destroyed ||
               typeof this.imageAdjustTool.observeTransformResult !== "function") return;
-          this.imageAdjustTool.observeTransformResult(result, command);
+          const observation = this.imageAdjustTool.observeTransformResult(result, command);
+          void this.refreshCommittedCaptureDisplay(observation, command);
         });
         if (typeof release === "function") this.unsubscribeTransformResults = release;
       } catch (error) {
@@ -2453,6 +2539,7 @@
         this.unsubscribeTransformResults();
       }
       this.unsubscribeTransformResults = null;
+      if (this.captureDisplayRefreshes) this.captureDisplayRefreshes.clear();
       if (typeof this.unsubscribeClassificationBindings === "function") {
         this.unsubscribeClassificationBindings();
       }

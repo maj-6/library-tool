@@ -54,6 +54,7 @@ from librarytool.processing.raster import ManualBinaryAdjustRecipe
 
 
 FULL_FRAME = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+CAPTURE_DISPLAY_ID = f"capture:{'a' * 40}:display"
 
 
 def _png(width: int = 40, height: int = 30) -> bytes:
@@ -180,6 +181,21 @@ def _source_with_changed_scope() -> CorrectionSourceSnapshot:
     )
 
 
+def _capture_display_source() -> CorrectionSourceSnapshot:
+    source = _source()
+    return replace(
+        source,
+        artifact=replace(
+            source.artifact,
+            key=RasterArtifactKey("book-1", CAPTURE_DISPLAY_ID),
+            resource=RasterResourceRef(
+                "resource:capture-display",
+                source.source_revision,
+            ),
+        ),
+    )
+
+
 def _command(
     source: CorrectionSourceSnapshot,
     **changes,
@@ -275,6 +291,19 @@ def _item_index_marker_path(root: Path) -> Path:
         / ".engine"
         / "correction-transforms"
         / "item-index-v1.json"
+    )
+
+
+def _display_head_path(root: Path) -> Path:
+    item_digest = hashlib.sha256(b"book-1").hexdigest()
+    artifact_digest = hashlib.sha256(CAPTURE_DISPLAY_ID.encode("utf-8")).hexdigest()
+    return (
+        root
+        / ".engine"
+        / "correction-transforms"
+        / "display-heads"
+        / item_digest
+        / f"{artifact_digest}.json"
     )
 
 
@@ -1167,8 +1196,8 @@ def test_interrupted_publication_recovers_all_outputs_before_retry(
     authority = _Authority(source)
     draft = _draft(source)
 
-    def interrupt_before_receipt(index: int, _target: Path) -> None:
-        if index == 5:
+    def interrupt_before_receipt(_index: int, target: Path) -> None:
+        if target == _receipt_path(tmp_path):
             raise SystemExit("simulated process loss")
 
     crashing_write_set = RecoverableWriteSet(
@@ -1194,6 +1223,218 @@ def test_interrupted_publication_recovers_all_outputs_before_retry(
     result = recovered.commit_transform(draft)
     assert len(result.outputs) == 4
     assert _receipt_path(tmp_path).is_file()
+
+
+def test_interrupted_capture_display_head_rolls_back_with_publication(
+    tmp_path: Path,
+) -> None:
+    source = _capture_display_source()
+    authority = _Authority(source)
+    draft = _draft(source)
+    head_path = _display_head_path(tmp_path)
+
+    def interrupt_before_receipt(_index: int, target: Path) -> None:
+        if target == _receipt_path(tmp_path):
+            raise SystemExit("simulated process loss")
+
+    crashing = _store(
+        tmp_path,
+        authority,
+        write_set=RecoverableWriteSet(
+            tmp_path,
+            publish_hook=interrupt_before_receipt,
+        ),
+    )
+    with pytest.raises(SystemExit):
+        crashing.commit_transform(draft)
+
+    assert head_path.is_file()
+    assert _publication_path(tmp_path).is_file()
+    assert not _receipt_path(tmp_path).exists()
+
+    recovered = _store(tmp_path, authority)
+    assert not head_path.exists()
+    assert not _publication_path(tmp_path).exists()
+    assert not _receipt_path(tmp_path).exists()
+
+    committed = recovered.commit_transform(draft)
+    assert head_path.is_file()
+    assert _receipt_path(tmp_path).is_file()
+    head = json.loads(head_path.read_text("ascii"))
+    assert head["artifact_id"] == CAPTURE_DISPLAY_ID
+    assert head["operation_id"] == draft.command.operation_id
+    assert (
+        recovered.project_item("book-1").display_heads[0].artifact.key.artifact_id
+        == committed.output("corrected-display").artifact_id
+    )
+
+
+def test_interrupted_rerun_restores_the_previous_capture_display_head(
+    tmp_path: Path,
+) -> None:
+    source = _capture_display_source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    first_draft = _draft(source)
+    first = store.commit_transform(first_draft)
+    first_head = store.project_item("book-1").display_heads[0]
+    assert first_head.artifact.resource is not None
+    head_path = _display_head_path(tmp_path)
+    head_before = head_path.read_bytes()
+
+    corrected_content = first_draft.output("corrected-display").content
+    current = replace(
+        source,
+        artifact=replace(
+            source.artifact,
+            revision=first_head.artifact.revision,
+            media_type=first_head.artifact.media_type,
+            content_sha256=first_head.artifact.content_sha256,
+            dimensions=first_head.artifact.dimensions,
+            source=first_head.artifact.source,
+            resource=first_head.artifact.resource,
+            freshness=ArtifactFreshness.CURRENT,
+            provenance=first_head.artifact.provenance,
+        ),
+        source_revision=first_head.artifact.resource.revision,
+        content=corrected_content,
+        annotations=first_head.spatial_annotations,
+    )
+    authority.source = current
+    second_command = _command(
+        current,
+        operation_id="transform-op-2",
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=-20),
+    )
+    second_draft = _draft(current, second_command)
+
+    def interrupt_before_receipt(_index: int, target: Path) -> None:
+        if target == _receipt_path(tmp_path, "transform-op-2"):
+            raise SystemExit("simulated process loss")
+
+    crashing = _store(
+        tmp_path,
+        authority,
+        write_set=RecoverableWriteSet(
+            tmp_path,
+            publish_hook=interrupt_before_receipt,
+        ),
+    )
+    with pytest.raises(SystemExit):
+        crashing.commit_transform(second_draft)
+    assert json.loads(head_path.read_text("ascii"))["operation_id"] == (
+        "transform-op-2"
+    )
+
+    recovered = _store(tmp_path, authority)
+    assert head_path.read_bytes() == head_before
+    assert recovered.project_item("book-1").display_heads[0].artifact.key.artifact_id == (
+        first.output("corrected-display").artifact_id
+    )
+    assert not _receipt_path(tmp_path, "transform-op-2").exists()
+
+    recovered.commit_transform(second_draft)
+    head_path.write_bytes(head_before)
+    with pytest.raises(RepositoryError) as stale:
+        recovered.project_item("book-1")
+    assert stale.value.code == "invalid_correction_transform_storage"
+    assert stale.value.details["artifact"] == "correction_display_head"
+
+
+def test_transforming_the_physical_corrected_output_advances_the_logical_head(
+    tmp_path: Path,
+) -> None:
+    source = _capture_display_source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    first_draft = _draft(source)
+    first = store.commit_transform(first_draft)
+    first_head = store.project_item("book-1").display_heads[0]
+    assert first_head.artifact.resource is not None
+
+    physical = replace(
+        source,
+        artifact=replace(
+            first_head.artifact,
+            freshness=ArtifactFreshness.CURRENT,
+        ),
+        source_revision=first_head.artifact.resource.revision,
+        content=first_draft.output("corrected-display").content,
+        annotations=first_head.spatial_annotations,
+    )
+    authority.source = physical
+    second_command = _command(
+        physical,
+        operation_id="transform-physical-descendant",
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=-20),
+    )
+    second = store.commit_transform(_draft(physical, second_command))
+
+    projected = store.project_item("book-1")
+    assert len(projected.display_heads) == 1
+    head = projected.display_heads[0]
+    assert head.logical_key.artifact_id == CAPTURE_DISPLAY_ID
+    assert head.operation_id == second_command.operation_id
+    assert head.artifact.key.artifact_id == second.output(
+        "corrected-display"
+    ).artifact_id
+    assert first.output("corrected-display").artifact_id != (
+        head.artifact.key.artifact_id
+    )
+
+
+def test_changed_live_capture_replaces_an_inactive_head_with_a_new_root(
+    tmp_path: Path,
+) -> None:
+    source = _capture_display_source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+    store.commit_transform(_draft(source))
+
+    replacement_content = _png(32, 24)
+    replacement = replace(
+        source,
+        artifact=replace(
+            source.artifact,
+            revision="artifact-r2",
+            content_sha256=hashlib.sha256(replacement_content).hexdigest(),
+            dimensions=RasterDimensions(32, 24),
+            source=RasterSourceRef(
+                "capture",
+                "representation-r2",
+                "canvas-1",
+                "canvas-r2",
+            ),
+            resource=RasterResourceRef(
+                "resource:capture-display-r2",
+                "bytes-r2",
+            ),
+        ),
+        source_revision="bytes-r2",
+        content=replacement_content,
+        annotations=(),
+    )
+    authority.source = replacement
+    replacement_command = _command(
+        replacement,
+        operation_id="transform-new-capture-root",
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=20),
+    )
+
+    committed = store.commit_transform(
+        _draft(replacement, replacement_command)
+    )
+
+    projected = store.project_item("book-1")
+    assert len(projected.display_heads) == 1
+    head = projected.display_heads[0]
+    assert head.operation_id == replacement_command.operation_id
+    assert head.root_source_revision == replacement.source_revision
+    assert head.root_source_sha256 == replacement.source_sha256
+    assert head.root_source == replacement.artifact.source
+    assert head.artifact.key.artifact_id == committed.output(
+        "corrected-display"
+    ).artifact_id
 
 
 def test_replay_refuses_a_missing_or_modified_immutable_object(
