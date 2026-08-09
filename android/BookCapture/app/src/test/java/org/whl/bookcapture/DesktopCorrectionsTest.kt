@@ -20,6 +20,7 @@ class DesktopCorrectionsTest {
 
     private fun localContract(
         appliedCorrectionId: String = "",
+        appliedCorrectionRevision: Long = 0L,
     ): CapturePhotoAssets {
         val geometry = PhotoOcrGeometry(
             assetId = "asset-1",
@@ -64,6 +65,7 @@ class DesktopCorrectionsTest {
             ),
             geometries = listOf(geometry),
             appliedDesktopCorrectionId = appliedCorrectionId,
+            appliedDesktopCorrectionRevision = appliedCorrectionRevision,
         )))
     }
 
@@ -112,6 +114,7 @@ class DesktopCorrectionsTest {
         artifact: CloudDisplayArtifact = artifact(),
         result: JSONObject? = correctionResult(correctionId, artifact),
         sourceOriginalSha256: String = originalHash,
+        revision: Long = 1L,
     ) = CaptureCorrectionRow(
         captureId = "capture-1",
         assetId = "asset-1",
@@ -119,7 +122,7 @@ class DesktopCorrectionsTest {
         correctionId = correctionId,
         sourceOriginalSha256 = sourceOriginalSha256,
         result = result,
-        revision = 1,
+        revision = revision,
         updatedAt = "2026-08-01T00:00:00Z",
     )
 
@@ -161,6 +164,8 @@ class DesktopCorrectionsTest {
         val plan = (decision as DesktopCorrectionDecision.Ready).plan
         assertEquals(displayHash, plan.baseDisplaySha256)
         assertEquals(1, plan.baseDisplayRevision)
+        assertEquals("", plan.baseAppliedCorrectionId)
+        assertEquals(0L, plan.baseAppliedCorrectionRevision)
         assertEquals(2, plan.targetRevision)
         assertEquals(artifact(), plan.artifact)
         assertEquals(
@@ -239,37 +244,134 @@ class DesktopCorrectionsTest {
                 ownerId,
             ),
         )
-        assertEquals(
-            DesktopCorrectionDecision.AlreadyApplied,
-            validateDesktopCorrection(
-                localContract(appliedCorrectionId = correctionA),
-                correctionRow(),
-                ownerId,
-            ),
-        )
+        // The id alone is not a no-op: this contract still names the original
+        // phone display, so the same-id row must repair it.
+        val sameIdMismatch = validateDesktopCorrection(
+            localContract(appliedCorrectionId = correctionA),
+            correctionRow(),
+            ownerId,
+        ) as DesktopCorrectionDecision.Ready
+        assertEquals(2, sameIdMismatch.plan.targetRevision)
+        assertEquals(artifact().sha256, sameIdMismatch.plan.artifact.sha256)
+        assertTrue(validateDesktopCorrection(
+            localContract(appliedCorrectionId = correctionA),
+            correctionRow(result = null),
+            ownerId,
+        ) is DesktopCorrectionDecision.Rejected)
     }
 
     @Test
-    fun appliedCorrectionIdIsOptionalInTheContractAndRoundTrips() {
+    fun appliedCorrectionOrderingIsBackwardCompatibleAndRoundTrips() {
         val without = localContract().toJson()
         assertFalse(without.toString().contains("applied_desktop_correction_id"))
+        assertFalse(without.toString().contains("applied_desktop_correction_revision"))
         assertEquals(
             "",
             capturePhotoAssetsFromJson(without, "capture-1")!!
                 .assets.single().appliedDesktopCorrectionId,
         )
+        assertEquals(
+            0L,
+            capturePhotoAssetsFromJson(without, "capture-1")!!
+                .assets.single().appliedDesktopCorrectionRevision,
+        )
 
-        val with = localContract(appliedCorrectionId = correctionA).toJson()
+        // Existing installs have the id but predate the persisted row
+        // revision. They remain readable and migrate on the next install.
+        val legacy = localContract(appliedCorrectionId = correctionA).toJson()
+        assertFalse(legacy.toString().contains("applied_desktop_correction_revision"))
         assertEquals(
             correctionA,
-            capturePhotoAssetsFromJson(with, "capture-1")!!
+            capturePhotoAssetsFromJson(legacy, "capture-1")!!
                 .assets.single().appliedDesktopCorrectionId,
         )
+        assertEquals(
+            0L,
+            capturePhotoAssetsFromJson(legacy, "capture-1")!!
+                .assets.single().appliedDesktopCorrectionRevision,
+        )
+
+        val withOrdering = localContract(
+            appliedCorrectionId = correctionA,
+            appliedCorrectionRevision = 7L,
+        ).toJson()
+        val ordered = capturePhotoAssetsFromJson(withOrdering, "capture-1")!!
+            .assets.single()
+        assertEquals(correctionA, ordered.appliedDesktopCorrectionId)
+        assertEquals(7L, ordered.appliedDesktopCorrectionRevision)
 
         val corrupt = localContract(appliedCorrectionId = correctionA).toJson()
         corrupt.getJSONArray("assets").getJSONObject(0)
             .put("applied_desktop_correction_id", "not-hex")
         assertNull(capturePhotoAssetsFromJson(corrupt, "capture-1"))
+
+        val invalidRevision = JSONObject(withOrdering.toString())
+        invalidRevision.getJSONArray("assets").getJSONObject(0)
+            .put("applied_desktop_correction_revision", 0)
+        assertNull(capturePhotoAssetsFromJson(invalidRevision, "capture-1"))
+
+        val orphanRevision = localContract().toJson()
+        orphanRevision.getJSONArray("assets").getJSONObject(0)
+            .put("applied_desktop_correction_revision", 7)
+        assertNull(capturePhotoAssetsFromJson(orphanRevision, "capture-1"))
+    }
+
+    @Test
+    fun acknowledgingALegacyRevisionPreservesAssetOrder() {
+        withEntryDir { dir ->
+            val bytes = jpeg(12, 18)
+            val artifact = artifact(sha256(bytes), bytes.size.toLong(), 12, 18)
+            val firstRow = correctionRow(artifact = artifact)
+            val firstPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), firstRow, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                firstPlan,
+                File(dir, ".legacy-first.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+
+            val current = PhotoAssetStore.read(dir)
+            val first = current.assets.single().copy(
+                appliedDesktopCorrectionRevision = 0L,
+            )
+            val second = first.copy(
+                assetId = "asset-2",
+                captureOrder = 2,
+                captureFile = "photo_2.jpg",
+                original = first.original.copy(reference = "original_asset-2.jpg"),
+                display = PhotoDisplayDerivative(
+                    reference = "photo_2.jpg",
+                    sha256 = displayHash,
+                    revision = 1,
+                    width = 100,
+                    height = 200,
+                ),
+                geometries = emptyList(),
+                appliedDesktopCorrectionId = "",
+                appliedDesktopCorrectionRevision = 0L,
+            )
+            File(dir, "photo_2.jpg").writeText("second-display")
+            File(dir, "original_asset-2.jpg").writeText("second-original")
+            File(dir, PHOTO_ASSETS_FILE).writeText(
+                current.copy(assets = listOf(first, second)).toJson().toString(),
+            )
+
+            val currentRow = correctionRow(artifact = artifact, revision = 7L)
+            val alreadyApplied = validateDesktopCorrection(
+                PhotoAssetStore.read(dir), currentRow, ownerId,
+            ) as DesktopCorrectionDecision.AlreadyApplied
+            assertTrue(PhotoAssetStore.acknowledgeDesktopCorrectionRow(
+                dir,
+                alreadyApplied.plan,
+            ))
+
+            val upgraded = PhotoAssetStore.read(dir).assets
+            assertEquals(listOf("asset-1", "asset-2"), upgraded.map { it.assetId })
+            assertEquals(7L, upgraded[0].appliedDesktopCorrectionRevision)
+            assertEquals(0L, upgraded[1].appliedDesktopCorrectionRevision)
+        }
     }
 
     @Test
@@ -304,6 +406,7 @@ class DesktopCorrectionsTest {
             assertEquals(DESKTOP_CORRECTION_RECIPE, installed.display.recipe)
             assertNull(installed.display.sourceToDisplayHomography)
             assertEquals(correctionA, installed.appliedDesktopCorrectionId)
+            assertEquals(1L, installed.appliedDesktopCorrectionRevision)
             assertFalse(installed.geometries.any { it.displayRevision == 2 })
             assertTrue(PhotoAssetStore.descriptors(dir).single().geometry.isEmpty())
 
@@ -323,14 +426,23 @@ class DesktopCorrectionsTest {
                 PhotoAssetStore.cloudDisplayReocrFile(dir, target)?.canonicalFile,
             )
 
-            // The same row is now a no-op regardless of its server revision.
+            // Same pixels stay a no-op, while their newer cloud ordering
+            // evidence is persisted so an older in-flight row cannot follow.
+            val alreadyApplied = validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row.copy(revision = 9),
+                ownerId,
+            ) as DesktopCorrectionDecision.AlreadyApplied
+            assertEquals(2, alreadyApplied.plan.targetRevision)
+            assertEquals(artifact, alreadyApplied.plan.artifact)
+            assertTrue(PhotoAssetStore.acknowledgeDesktopCorrectionRow(
+                dir,
+                alreadyApplied.plan,
+            ))
             assertEquals(
-                DesktopCorrectionDecision.AlreadyApplied,
-                validateDesktopCorrection(
-                    PhotoAssetStore.read(dir),
-                    row.copy(revision = 9),
-                    ownerId,
-                ),
+                9L,
+                PhotoAssetStore.read(dir).assets.single()
+                    .appliedDesktopCorrectionRevision,
             )
 
             val correctedGeometry = OcrGeometryDraft(
@@ -365,6 +477,90 @@ class DesktopCorrectionsTest {
     }
 
     @Test
+    fun sameIdDamagedDisplayCanRepairWithoutAdvancingTheRevision() {
+        withEntryDir { dir ->
+            val bytes = jpeg(12, 18)
+            val artifact = artifact(sha256(bytes), bytes.size.toLong(), 12, 18)
+            val row = correctionRow(artifact = artifact)
+            val firstPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row,
+                ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                firstPlan,
+                File(dir, ".first.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+
+            val installed = PhotoAssetStore.read(dir).assets.single()
+            val installedFile = File(dir, installed.display.reference)
+            installedFile.writeBytes(jpeg(12, 19))
+            val repairPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row.copy(revision = 8),
+                ownerId,
+            ) as DesktopCorrectionDecision.AlreadyApplied).plan
+
+            assertEquals(2, repairPlan.targetRevision)
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                repairPlan,
+                File(dir, ".repair.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+            val repaired = PhotoAssetStore.read(dir).assets.single()
+            assertEquals(2, repaired.display.revision)
+            assertEquals(correctionA, repaired.appliedDesktopCorrectionId)
+            assertEquals(8L, repaired.appliedDesktopCorrectionRevision)
+            assertEquals(bytes.toList(), installedFile.readBytes().toList())
+        }
+    }
+
+    @Test
+    fun downloadedCorrectionRestagesAfterConcurrentNonDesktopDisplayInstall() {
+        withEntryDir { dir ->
+            val bytes = jpeg(12, 18)
+            val artifact = artifact(sha256(bytes), bytes.size.toLong(), 12, 18)
+            val row = correctionRow(artifact = artifact)
+            val staged = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row,
+                ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+
+            val concurrent = PhotoAssetStore.read(dir)
+            val concurrentAsset = concurrent.assets.single()
+            val concurrentReference = "cloud_display_r2.jpg"
+            File(dir, concurrentReference).writeText("concurrent-cloud-display")
+            File(dir, PHOTO_ASSETS_FILE).writeText(concurrent.copy(assets = listOf(
+                concurrentAsset.copy(display = concurrentAsset.display.copy(
+                    reference = concurrentReference,
+                    sha256 = "d".repeat(64),
+                    revision = 2,
+                )),
+            )).toJson().toString())
+
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                staged,
+                File(dir, ".downloaded-before-race.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+
+            val installed = PhotoAssetStore.read(dir).assets.single()
+            assertEquals(3, installed.display.revision)
+            assertEquals(correctionA, installed.appliedDesktopCorrectionId)
+            assertEquals(
+                "desktop_asset-1_r3_${artifact.sha256.take(20)}.jpg",
+                installed.display.reference,
+            )
+            assertEquals("concurrent-cloud-display", File(dir, concurrentReference).readText())
+        }
+    }
+
+    @Test
     fun aDifferentCorrectionIdSupersedesAndBumpsTheRevisionAgain() {
         withEntryDir { dir ->
             val firstBytes = jpeg(12, 18)
@@ -389,7 +585,11 @@ class DesktopCorrectionsTest {
                 14,
                 correctionId = correctionB,
             )
-            val secondRow = correctionRow(correctionId = correctionB, artifact = second)
+            val secondRow = correctionRow(
+                correctionId = correctionB,
+                artifact = second,
+                revision = 2L,
+            )
             val secondPlan = (validateDesktopCorrection(
                 PhotoAssetStore.read(dir),
                 secondRow,
@@ -407,6 +607,7 @@ class DesktopCorrectionsTest {
             val installed = PhotoAssetStore.read(dir).assets.single()
             assertEquals(3, installed.display.revision)
             assertEquals(correctionB, installed.appliedDesktopCorrectionId)
+            assertEquals(2L, installed.appliedDesktopCorrectionRevision)
             assertEquals(
                 "desktop_asset-1_r3_${second.sha256.take(20)}.jpg",
                 installed.display.reference,
@@ -421,6 +622,159 @@ class DesktopCorrectionsTest {
                 File(dir, ".stale.part").apply { writeBytes(firstBytes) },
                 PrivateObjectDownload("image/jpeg", firstBytes.size.toLong()),
             ))
+        }
+    }
+
+    @Test
+    fun newerStagedRowReplacesAnInterveningOlderInstall() {
+        withEntryDir { dir ->
+            val oldBytes = jpeg(12, 18)
+            val oldArtifact = artifact(
+                sha256(oldBytes), oldBytes.size.toLong(), 12, 18, correctionA,
+            )
+            val oldRow = correctionRow(
+                correctionId = correctionA,
+                artifact = oldArtifact,
+                revision = 4L,
+            )
+            val newBytes = jpeg(10, 14)
+            val newArtifact = artifact(
+                sha256(newBytes), newBytes.size.toLong(), 10, 14, correctionB,
+            )
+            val newRow = correctionRow(
+                correctionId = correctionB,
+                artifact = newArtifact,
+                revision = 5L,
+            )
+            // Pull A and explicit-sync B both release the entry lock while
+            // downloading, so both plans can legitimately name the same base.
+            val oldPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), oldRow, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+            val newPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), newRow, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                oldPlan,
+                File(dir, ".old-race.part").apply { writeBytes(oldBytes) },
+                PrivateObjectDownload("image/jpeg", oldBytes.size.toLong()),
+            ))
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                newPlan,
+                File(dir, ".new-race.part").apply { writeBytes(newBytes) },
+                PrivateObjectDownload("image/jpeg", newBytes.size.toLong()),
+            ))
+
+            val installed = PhotoAssetStore.read(dir).assets.single()
+            assertEquals(correctionB, installed.appliedDesktopCorrectionId)
+            assertEquals(5L, installed.appliedDesktopCorrectionRevision)
+            assertEquals(3, installed.display.revision)
+            assertEquals(newArtifact.sha256, installed.display.sha256)
+        }
+    }
+
+    @Test
+    fun olderStagedRowCannotDowngradeAnInterveningNewerInstall() {
+        withEntryDir { dir ->
+            val oldBytes = jpeg(12, 18)
+            val oldArtifact = artifact(
+                sha256(oldBytes), oldBytes.size.toLong(), 12, 18, correctionA,
+            )
+            val oldRow = correctionRow(
+                correctionId = correctionA,
+                artifact = oldArtifact,
+                revision = 4L,
+            )
+            val newBytes = jpeg(10, 14)
+            val newArtifact = artifact(
+                sha256(newBytes), newBytes.size.toLong(), 10, 14, correctionB,
+            )
+            val newRow = correctionRow(
+                correctionId = correctionB,
+                artifact = newArtifact,
+                revision = 5L,
+            )
+            val oldPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), oldRow, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+            val newPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), newRow, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                newPlan,
+                File(dir, ".new-first.part").apply { writeBytes(newBytes) },
+                PrivateObjectDownload("image/jpeg", newBytes.size.toLong()),
+            ))
+            assertFalse(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                oldPlan,
+                File(dir, ".old-last.part").apply { writeBytes(oldBytes) },
+                PrivateObjectDownload("image/jpeg", oldBytes.size.toLong()),
+            ))
+
+            val installed = PhotoAssetStore.read(dir).assets.single()
+            assertEquals(correctionB, installed.appliedDesktopCorrectionId)
+            assertEquals(5L, installed.appliedDesktopCorrectionRevision)
+            assertEquals(2, installed.display.revision)
+            assertEquals(newArtifact.sha256, installed.display.sha256)
+            assertTrue(validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                oldRow.copy(revision = newRow.revision),
+                ownerId,
+            ) is DesktopCorrectionDecision.Rejected)
+        }
+    }
+
+    @Test
+    fun olderSameIdRowCannotDowngradeANewerSemanticRepair() {
+        withEntryDir { dir ->
+            val oldBytes = jpeg(12, 18)
+            val oldArtifact = artifact(
+                sha256(oldBytes), oldBytes.size.toLong(), 12, 18, correctionA,
+            )
+            val oldRow = correctionRow(
+                correctionId = correctionA,
+                artifact = oldArtifact,
+                revision = 4L,
+            )
+            val newBytes = jpeg(10, 14)
+            val newArtifact = artifact(
+                sha256(newBytes), newBytes.size.toLong(), 10, 14, correctionA,
+            )
+            val newRow = correctionRow(
+                correctionId = correctionA,
+                artifact = newArtifact,
+                revision = 5L,
+            )
+            val oldPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), oldRow, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+            val newPlan = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir), newRow, ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                newPlan,
+                File(dir, ".same-id-new.part").apply { writeBytes(newBytes) },
+                PrivateObjectDownload("image/jpeg", newBytes.size.toLong()),
+            ))
+            assertFalse(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                oldPlan,
+                File(dir, ".same-id-old.part").apply { writeBytes(oldBytes) },
+                PrivateObjectDownload("image/jpeg", oldBytes.size.toLong()),
+            ))
+
+            val installed = PhotoAssetStore.read(dir).assets.single()
+            assertEquals(correctionA, installed.appliedDesktopCorrectionId)
+            assertEquals(5L, installed.appliedDesktopCorrectionRevision)
+            assertEquals(newArtifact.sha256, installed.display.sha256)
         }
     }
 
@@ -474,9 +828,9 @@ class DesktopCorrectionsTest {
             // is still discoverable — exactly the pair the sync worker keys
             // its enqueuePending re-arm off, so Ready is not the only trigger.
             assertFalse(shouldRetryCloudDisplayReocr(MAX_CLOUD_DISPLAY_REOCR_ATTEMPTS - 1))
-            assertEquals(
-                DesktopCorrectionDecision.AlreadyApplied,
-                validateDesktopCorrection(PhotoAssetStore.read(dir), row, ownerId),
+            assertTrue(
+                validateDesktopCorrection(PhotoAssetStore.read(dir), row, ownerId) is
+                    DesktopCorrectionDecision.AlreadyApplied,
             )
             val target = PhotoAssetStore.pendingCloudDisplayReocrTargets(dir).single()
             assertEquals(2, target.displayRevision)
@@ -502,6 +856,11 @@ class DesktopCorrectionsTest {
         // fresh Ready install — so a terminally failed re-OCR is re-armed by
         // every later pull (the marker-side behavior is covered above).
         assertTrue(workerSource.contains("DesktopCorrectionDecision.AlreadyApplied"))
+        val alreadyAppliedBranch = workerSource
+            .substringAfter("is DesktopCorrectionDecision.AlreadyApplied")
+            .substringBefore("is DesktopCorrectionDecision.Ready")
+        assertTrue(alreadyAppliedBranch.contains("verifyCloudDisplayDownload("))
+        assertTrue(alreadyAppliedBranch.contains("download(decision.plan)"))
         // Not push-gated: corrections must flow on plain pulls (Home resume),
         // not only explicit syncs. The first `if (!pushReviews` in the worker
         // opens the push-only tail of doWork, so the corrections fetch and the

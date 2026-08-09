@@ -55,6 +55,7 @@ from librarytool.processing.raster import ManualBinaryAdjustRecipe
 
 FULL_FRAME = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
 CAPTURE_DISPLAY_ID = f"capture:{'a' * 40}:display"
+CAPTURE_ORIGINAL_ID = f"capture:{'a' * 40}:original"
 
 
 def _png(width: int = 40, height: int = 30) -> bytes:
@@ -190,6 +191,21 @@ def _capture_display_source() -> CorrectionSourceSnapshot:
             key=RasterArtifactKey("book-1", CAPTURE_DISPLAY_ID),
             resource=RasterResourceRef(
                 "resource:capture-display",
+                source.source_revision,
+            ),
+        ),
+    )
+
+
+def _capture_original_source() -> CorrectionSourceSnapshot:
+    source = _source()
+    return replace(
+        source,
+        artifact=replace(
+            source.artifact,
+            key=RasterArtifactKey("book-1", CAPTURE_ORIGINAL_ID),
+            resource=RasterResourceRef(
+                "resource:capture-original",
                 source.source_revision,
             ),
         ),
@@ -1339,6 +1355,106 @@ def test_interrupted_rerun_restores_the_previous_capture_display_head(
         recovered.project_item("book-1")
     assert stale.value.code == "invalid_correction_transform_storage"
     assert stale.value.details["artifact"] == "correction_display_head"
+
+
+def test_capture_original_transform_replaces_only_the_logical_display_head(
+    tmp_path: Path,
+) -> None:
+    source = _capture_original_source()
+    authority = _Authority(source)
+    store = _store(tmp_path, authority)
+
+    committed = store.commit_transform(_draft(source))
+
+    projected = store.project_item("book-1")
+    assert len(projected.display_heads) == 1
+    head = projected.display_heads[0]
+    assert head.logical_key == RasterArtifactKey("book-1", CAPTURE_DISPLAY_ID)
+    assert head.root_key == source.artifact.key
+    assert head.root_source_revision == source.source_revision
+    assert head.root_source_sha256 == source.source_sha256
+    assert head.root_source == source.artifact.source
+    assert head.artifact.key.artifact_id == committed.output(
+        "corrected-display"
+    ).artifact_id
+
+    reopened = _store(tmp_path, authority)
+    hint = reopened.project_display_head_hints("book-1")[0]
+    assert hint.logical_key == head.logical_key
+    assert hint.root_key == source.artifact.key
+
+
+def test_capture_rendition_branches_converge_by_successful_commit_order(
+    tmp_path: Path,
+) -> None:
+    original = _capture_original_source()
+    authority = _Authority(original)
+    store = _store(tmp_path, authority)
+    # Model an original-root job whose immutable source was captured before a
+    # separate display-root job finishes.
+    original_command = _command(
+        original,
+        operation_id="transform-original-finishes-last",
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=-15),
+    )
+    queued_original = _draft(original, original_command)
+
+    display = _capture_display_source()
+    authority.source = display
+    display_command = _command(
+        display,
+        operation_id="transform-display-finishes-first",
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=15),
+    )
+    store.commit_transform(_draft(display, display_command))
+    assert store.project_item("book-1").display_heads[0].operation_id == (
+        display_command.operation_id
+    )
+
+    authority.source = original
+    store.commit_transform(queued_original)
+
+    head = store.project_item("book-1").display_heads[0]
+    assert head.operation_id == original_command.operation_id
+    assert head.root_key == original.artifact.key
+    assert head.logical_key == RasterArtifactKey("book-1", CAPTURE_DISPLAY_ID)
+
+
+def test_capture_original_heads_are_isolated_per_asset_display_slot(
+    tmp_path: Path,
+) -> None:
+    first = _capture_original_source()
+    second_original_id = f"capture:{'b' * 40}:original"
+    second = replace(
+        first,
+        artifact=replace(
+            first.artifact,
+            key=RasterArtifactKey("book-1", second_original_id),
+            resource=RasterResourceRef(
+                "resource:capture-original-b",
+                first.source_revision,
+            ),
+        ),
+    )
+    authority = _Authority(first)
+    store = _store(tmp_path, authority)
+    first_command = _command(first, operation_id="transform-original-a")
+    store.commit_transform(_draft(first, first_command))
+
+    authority.source = second
+    second_command = _command(second, operation_id="transform-original-b")
+    store.commit_transform(_draft(second, second_command))
+
+    heads = {
+        head.logical_key.artifact_id: head
+        for head in store.project_item("book-1").display_heads
+    }
+    assert set(heads) == {
+        CAPTURE_DISPLAY_ID,
+        f"capture:{'b' * 40}:display",
+    }
+    assert heads[CAPTURE_DISPLAY_ID].root_key == first.artifact.key
+    assert heads[f"capture:{'b' * 40}:display"].root_key == second.artifact.key
 
 
 def test_transforming_the_physical_corrected_output_advances_the_logical_head(

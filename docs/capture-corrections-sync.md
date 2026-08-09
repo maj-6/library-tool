@@ -37,17 +37,15 @@ the backup key is desktop-private and is stripped from `.lib` projections.
 The verified camera bytes are stored below
 `output/backups/originals/v1/sha256/`, split into a two-hex directory and a
 62-hex filename, in the same recoverable transaction that publishes the
-transform receipt, display head when applicable, active
-operation, capture manifest, and item timestamp. Normal display corrections
-leave the base `photo_N.jpg` and capture geometry unchanged; the validated
-display head supplies corrected pixels and mapped geometry. A transform begun
-from the separately exposed original uses a deterministic JPEG promotion
-because that source cannot be represented by the display-head root contract.
-Restore verifies and copies the cold object into the stable display slot,
-clears active geometry, deletes the display head, and retains the shared backup
-object. Routine index, detail, preview, and editor reads never stat or open the
-cold object; only View original, Restore original, and an explicit archive
-build may resolve it.
+transform receipt, logical display head, active operation, capture manifest,
+and item timestamp. Transforms begun from either the display or the separately
+exposed original leave the base `photo_N.jpg` and capture geometry unchanged;
+the validated logical display head supplies corrected pixels and mapped
+geometry while the original remains immutable evidence. Restore verifies and
+copies the cold object into the stable display slot, clears active geometry,
+deletes the display head, and retains the shared backup object. Routine index,
+detail, preview, and editor reads never stat or open the cold object; only View
+original, Restore original, and an explicit archive build may resolve it.
 
 ## Cloud: table `capture_corrections` (migration 024)
 
@@ -142,11 +140,18 @@ Stateless diff-and-publish (no local outbox):
    `original_backup` marker, its `active_desktop_correction_id` is the current
    state authority: only that exact receipt-witnessed operation may publish,
    and a backed-up row without an active operation is restored and produces no
-   candidate. For an ordinary display correction, the active operation must
-   also match the validated `correction-display-head`; an invalid or stale
-   head fails closed. Legacy rows without the marker use the validated display
-   head when present and otherwise retain the history-derived winner behavior.
-   Publications for lifecycle-failed assets are skipped.
+   candidate. The active operation must also match the validated
+   `correction-display-head`. That head is authoritative only if its ancestry
+   roots at the current authority of the selected capture rendition: the
+   derivative checksum for a `:display` root or the immutable source checksum
+   for an `:original` root. Either source replaces only the sibling logical
+   `:display` slot; the original remains immutable history. An invalid or stale
+   head fails closed, and the publisher never substitutes an unrelated history
+   leaf. Legacy rows without the backup marker use the validated display head
+   when present and otherwise retain the history-derived winner behavior.
+   Publications for lifecycle-failed assets are skipped. Independent
+   original/display branches converge on the last transform that commits
+   successfully to their shared logical display head.
 
    Histories without a current-state marker or display head use this ordering
    signal: **chain ancestry** — a publication
@@ -158,10 +163,14 @@ Stateless diff-and-publish (no local outbox):
    when non-empty (future-proofing), else by the by-item pointer mtime.
 3. Transcode the committed `corrected-display` PNG → JPEG: RGB, long edge
    ≤ 1600 px, quality 90, no EXIF. Thumbnail: long edge ≤ 512 px, quality 80.
-4. Read existing `capture_corrections` rows for the candidates; skip any
-   `(capture_id, asset_id)` whose `correction_id` and display sha256 already
-   match. Skip captures with no cloud row (FK would fail; LAN-only captures).
-   When the row differs, two overwrite guards apply before publishing:
+4. Read existing `capture_corrections` rows for the candidates; skip an
+   `(capture_id, asset_id)` only when its complete writable row/result contract
+   matches (the original anchor and both artifact envelopes included).
+   `result.generated_at`, the server revision, and trigger-derived fields are
+   intentionally ignored. A malformed or incomplete same-id row is therefore
+   republished instead of remaining permanently un-installable on Android.
+   Skip captures with no cloud row (FK would fail; LAN-only captures). When the
+   row differs, two overwrite guards apply before publishing:
    - **Downgrade guard** — if the row's `correction_id` is one of this
      desktop's own candidate publications for the asset, a different local
      winner selected by a validated display head replaces it regardless of
@@ -205,8 +214,6 @@ Validation (all must hold, else the row is ignored):
   `result.correction_id == row.correction_id`.
 - Local asset found by `asset_id`; `asset.original.sha256 ==
   source_original_sha256`.
-- Not already applied: the asset's persisted applied correction id differs
-  from `correction_id`.
 - `artifacts.display`: bucket `capture-derivatives`; path is exactly
   `<owner_id>/<capture_id>/<asset_id>/desktop-<correction_id[:20]>/display-<sha256[:20]>.jpg`
   for the row's own ids; `bytes` ≤ 32 MiB.
@@ -216,15 +223,31 @@ Install (mirrors `installCloudDisplayDerivative`):
   JPEG structure, dimensions, sha256.
 - Write `desktop_<assetId>_r<newRevision>_<sha256[:20]>.jpg` in the entry
   directory; bump `display.revision` by 1; set display recipe
-  `whl-desktop-correction-v1`; record the applied `correction_id` on the
-  asset (new optional contract field — absent for older entries).
+  `whl-desktop-correction-v1`; record the applied `correction_id` and last
+  acknowledged server row `revision` on the asset (optional contract fields;
+  the revision is absent on older entries).
 - Drop OCR geometry and write the re-OCR pending marker so
   `CloudDisplayReocrWorker` re-runs OCR against the corrected pixels.
 - Never overwrite `photo_N.jpg` or `original_<assetId>.jpg`.
 
-A row whose `correction_id` matches the applied one is a no-op regardless of
-`revision`. A newer row (different `correction_id`) supersedes: install again,
-bumping the display revision.
+A row whose `correction_id` matches the applied one is a no-op only after the
+full row/artifact contract and installed display metadata validate and the
+installed file's bytes, dimensions, and sha256 match the artifact envelope.
+Missing or damaged same-id pixels are downloaded and replaced at the existing
+display revision; a mismatched display contract is reinstalled at a new local
+revision. A newer valid row with unchanged pixels only advances the persisted
+ordering evidence. Overlapping pull and explicit-sync workers compare that
+server revision under the entry lock so a newer row may replace an intervening
+older install, while an older download can never roll it back. A newer row with
+a different `correction_id` supersedes and bumps the display revision; the
+server row revision alone never forces a pixel reinstall.
+
+Curated title, author, and year do not ride inside `capture_corrections`.
+They continue through the existing `capture_book_metadata` projection. The
+capture list overlays any bibliography present there field by field on the
+phone's extracted text. This includes live imported-but-unregistered captures,
+whose projection intentionally has an empty `book_id`; an empty deletion
+tombstone naturally falls back to the phone values.
 
 ## Known limits (acceptable pre-1.0)
 
@@ -234,8 +257,9 @@ bumping the display revision.
   (Home resume / explicit sync), not in realtime.
 - Page reorder/removal is not expressible in the corrections transport yet,
   so it cannot round-trip.
-- Metadata corrections (categories, roles, captions) stay desktop-local;
-  only corrected pixels round-trip in v1.
+- Metadata corrections outside the existing `capture_book_metadata`
+  bibliography (categories, roles, captions) stay desktop-local; the
+  corrections transport itself only round-trips corrected pixels in v1.
 - Existing sealed `.lib` source packages remain immutable and may retain their
   embedded camera representation. Rebuilding one explicitly reads and verifies
   the cold object, then strips the desktop-private backup locator from the

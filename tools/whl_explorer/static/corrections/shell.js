@@ -377,9 +377,14 @@
       ? `annotation:${id}` : `artifact:${id}`;
   }
 
+  function captureLogicalDisplayArtifactId(value) {
+    if (typeof value !== "string") return "";
+    const match = /^capture:([^:]+):(display|original)$/.exec(value);
+    return match ? `capture:${match[1]}:display` : "";
+  }
+
   function isCaptureDisplayArtifactId(value) {
-    return typeof value === "string" && value.startsWith("capture:") &&
-      value.endsWith(":display") && value.length > "capture::display".length;
+    return captureLogicalDisplayArtifactId(value) === value;
   }
 
   function navigationOnlyTarget(value) {
@@ -2005,55 +2010,163 @@
           observation.operationId !== operationId) return null;
       const artifactId = command.artifact_id || command.artifactId || "";
       const itemId = command.item_id || command.itemId || "";
-      if (!isCaptureDisplayArtifactId(artifactId)) return null;
+      const displayArtifactId = captureLogicalDisplayArtifactId(artifactId);
+      if (!displayArtifactId) return null;
       const selection = this.state && this.state.selection || {};
-      if (selection.artifactId !== artifactId ||
-          (itemId && selection.itemId !== itemId)) return null;
       const feature = this.artifactsFeature;
-      const key = `artifact:${artifactId}`;
-      if (!feature || feature.selectedKey !== key ||
-          typeof feature.reloadSelection !== "function") return null;
-      const selected = feature.items && feature.items.get(key);
-      if (selected && selected.family && selected.family !== "image") return null;
+      const key = `artifact:${displayArtifactId}`;
+      const refreshBooks = this.booksFeature &&
+        typeof this.booksFeature.refresh === "function";
+      const selectionMatches =
+        [artifactId, displayArtifactId].includes(selection.artifactId) &&
+        (!itemId || selection.itemId === itemId);
+      const selectionKey = selectionMatches
+        ? `artifact:${selection.artifactId}` : "";
+      const selected = selectionMatches && feature && feature.items &&
+        feature.items.get(selectionKey);
+      const imageSelected = selectionMatches && feature &&
+        feature.selectedKey === selectionKey &&
+        (!selected || !selected.family || selected.family === "image");
+      const reloadDisplay = imageSelected &&
+        isCaptureDisplayArtifactId(selection.artifactId) &&
+        typeof feature.reloadSelection === "function";
+      const refreshOriginal = imageSelected && artifactId !== displayArtifactId &&
+        selection.artifactId === artifactId &&
+        typeof feature.refresh === "function" &&
+        (typeof feature.select === "function" ||
+          typeof feature.openDeepLink === "function");
       const refreshes = this.captureDisplayRefreshes instanceof Map
         ? this.captureDisplayRefreshes
         : (this.captureDisplayRefreshes = new Map());
-      const contextGeneration = feature.contextGeneration;
-      const selectionGeneration = feature.selectionGeneration;
       const existing = refreshes.get(operationId);
+      if (existing && existing.originalArtifactId === artifactId &&
+          artifactId !== displayArtifactId && selectionMatches &&
+          selection.artifactId === artifactId && feature &&
+          feature.selectedKey === "" &&
+          existing.key === key && existing.selectionKey === selectionKey &&
+          existing.contextGeneration === feature.contextGeneration &&
+          existing.selectionGeneration === feature.selectionGeneration) {
+        // refresh({preserveSelection:false}) clears the feature selection and
+        // advances both epochs synchronously. The shell selection deliberately
+        // remains on the original until its replacement display is ready, so
+        // an event replay in that interval must share the exact in-flight
+        // convergence instead of replacing it with a Books-only refresh.
+        return existing.promise;
+      }
+      if (!reloadDisplay && !refreshOriginal && !refreshBooks) return null;
+      const repaintRequested = reloadDisplay || refreshOriginal;
+      const repaintSelectionKey = repaintRequested ? selectionKey : "";
+      const contextGeneration = repaintRequested ? feature.contextGeneration : -1;
+      const selectionGeneration = repaintRequested ? feature.selectionGeneration : -1;
       if (existing && existing.key === key &&
+          existing.selectionKey === repaintSelectionKey &&
           existing.contextGeneration === contextGeneration &&
           existing.selectionGeneration === selectionGeneration) {
         return existing.promise;
       }
       const record = {
         key,
+        selectionKey: repaintSelectionKey,
         contextGeneration,
         selectionGeneration,
+        originalArtifactId: refreshOriginal ? artifactId : "",
         promise: null,
       };
       const refresh = (async () => {
-        try {
-          const tasks = [Promise.resolve(feature.reloadSelection(key))];
-          if (this.booksFeature &&
-              typeof this.booksFeature.refresh === "function") {
-            tasks.push(Promise.resolve(
-              this.booksFeature.refresh("transform-committed")));
-          }
-          const settled = await Promise.allSettled(tasks);
-          const failure = settled.find((value) => value.status === "rejected");
-          if (failure) throw failure.reason;
-          return settled[0].value;
-        } catch (error) {
-          if (!this.destroyed && feature.selectedKey === key &&
-              (!error || error.name !== "AbortError")) {
-            this.setStatus(
-              error && error.message || "The corrected display could not be refreshed",
-              true,
-            );
-          }
-          return null;
+        let refreshed = null;
+        let succeeded = true;
+        const tasks = [];
+        if (reloadDisplay || refreshOriginal) {
+          tasks.push((async () => {
+            try {
+              const pending = reloadDisplay
+                ? feature.reloadSelection(key)
+                : (async () => {
+                    // #297 moves a transformed original into the private cold
+                    // store in the same commit. Rebuild the tree without
+                    // reopening that now-absent key, then route the editor and
+                    // shell selection through the corrected sibling display.
+                    const treeRefresh = feature.refresh({
+                      preserveSelection: false,
+                      reason: "capture-transform",
+                    });
+                    const refreshContextGeneration = feature.contextGeneration;
+                    await treeRefresh;
+                    const currentSelection = this.state &&
+                      this.state.selection || {};
+                    if (this.destroyed ||
+                        feature.contextGeneration !== refreshContextGeneration ||
+                        currentSelection.artifactId !== artifactId ||
+                        (itemId && currentSelection.itemId !== itemId)) {
+                      return null;
+                    }
+                    const displayIsLoaded = feature.items &&
+                      typeof feature.items.has === "function" &&
+                      feature.items.has(key);
+                    let selectedDisplay = null;
+                    if (displayIsLoaded && typeof feature.select === "function") {
+                      const displaySelection = feature.select(key);
+                      if (feature.selectedKey === key) {
+                        // select() changes this epoch synchronously before it
+                        // awaits detail/resource routing. A streamed result in
+                        // that interval must still share this refresh.
+                        record.selectionKey = key;
+                        record.contextGeneration = feature.contextGeneration;
+                        record.selectionGeneration = feature.selectionGeneration;
+                      }
+                      selectedDisplay = await displaySelection;
+                    } else if (typeof feature.openDeepLink === "function") {
+                      selectedDisplay = await feature.openDeepLink(key);
+                    }
+                    if (feature.selectedKey === key) {
+                      // A streamed replay observes the post-selection epoch;
+                      // rebase the in-flight record now so it dedupes against
+                      // this successful original-to-display convergence.
+                      record.selectionKey = key;
+                    }
+                    return selectedDisplay;
+                  })();
+              record.contextGeneration = feature.contextGeneration;
+              record.selectionGeneration = feature.selectionGeneration;
+              refreshed = await pending;
+            } catch (error) {
+              succeeded = false;
+              if (!this.destroyed &&
+                  [repaintSelectionKey, key].includes(feature.selectedKey) &&
+                  (!error || error.name !== "AbortError")) {
+                this.setStatus(
+                  error && error.message ||
+                    "The corrected display could not be refreshed",
+                  true,
+                );
+              }
+            } finally {
+              record.contextGeneration = feature.contextGeneration;
+              record.selectionGeneration = feature.selectionGeneration;
+            }
+          })());
         }
+        if (refreshBooks) {
+          tasks.push((async () => {
+            try {
+              await this.booksFeature.refresh("transform-committed");
+            } catch (error) {
+              succeeded = false;
+              if (!this.destroyed && (!error || error.name !== "AbortError")) {
+                this.setStatus(
+                  error && error.message ||
+                    "The captures list could not be refreshed",
+                  true,
+                );
+              }
+            }
+          })());
+        }
+        await Promise.all(tasks);
+        if (!succeeded) return null;
+        if (repaintRequested) return refreshed || null;
+        if (refreshBooks) return true;
+        return null;
       })();
       record.promise = refresh;
       refreshes.set(operationId, record);
@@ -2063,12 +2176,14 @@
           refreshes.delete(operationId);
           return;
         }
-        // A successful reload routes the replacement through select(), which
-        // advances the selection generation. Rebase the dedupe record onto
-        // that completed epoch; navigation away and back advances it again and
-        // deliberately makes a later durable result replay retryable.
-        record.contextGeneration = feature.contextGeneration;
-        record.selectionGeneration = feature.selectionGeneration;
+        if (repaintRequested) {
+          // A successful reload routes the replacement through select(), which
+          // advances the selection generation. Rebase the dedupe record onto
+          // that completed epoch; navigation away and back advances it again
+          // and deliberately makes a later durable result replay retryable.
+          record.contextGeneration = feature.contextGeneration;
+          record.selectionGeneration = feature.selectionGeneration;
+        }
       });
       while (refreshes.size > MAX_CAPTURE_DISPLAY_REFRESHES) {
         refreshes.delete(refreshes.keys().next().value);

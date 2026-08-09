@@ -301,6 +301,8 @@ internal data class DesktopCorrectionInstallPlan(
     val artifact: CloudDisplayArtifact,
     val baseDisplaySha256: String,
     val baseDisplayRevision: Int,
+    val baseAppliedCorrectionId: String,
+    val baseAppliedCorrectionRevision: Long,
     val targetRevision: Int,
 )
 
@@ -308,9 +310,13 @@ internal sealed interface DesktopCorrectionDecision {
     /** The row is valid but names no asset this handset holds. */
     data object NotApplicable : DesktopCorrectionDecision
 
-    /** The asset's persisted correction id already matches; a no-op regardless
-     * of the row's server revision. */
-    data object AlreadyApplied : DesktopCorrectionDecision
+    /** The fully validated row already matches the installed display contract.
+     * The plan retains the immutable artifact envelope so the worker can still
+     * verify and repair missing/damaged local bytes without advancing the
+     * display revision. */
+    data class AlreadyApplied(
+        val plan: DesktopCorrectionInstallPlan,
+    ) : DesktopCorrectionDecision
 
     data class Rejected(val reason: String) : DesktopCorrectionDecision
 
@@ -361,9 +367,6 @@ internal fun validateDesktopCorrection(
         asset.original.sha256 != row.sourceOriginalSha256) {
         return DesktopCorrectionDecision.Rejected("original anchor")
     }
-    if (asset.appliedDesktopCorrectionId == row.correctionId) {
-        return DesktopCorrectionDecision.AlreadyApplied
-    }
     val result = row.result ?: return DesktopCorrectionDecision.Rejected("missing result")
 
     if (result.strictCloudString("schema") != DESKTOP_CORRECTION_RESULT_SCHEMA ||
@@ -401,11 +404,35 @@ internal fun validateDesktopCorrection(
         return DesktopCorrectionDecision.Rejected("display artifact path")
     }
 
-    return DesktopCorrectionDecision.Ready(DesktopCorrectionInstallPlan(
+    val installedPlan = DesktopCorrectionInstallPlan(
         row = row,
         artifact = artifact,
         baseDisplaySha256 = asset.display.sha256,
         baseDisplayRevision = asset.display.revision,
+        baseAppliedCorrectionId = asset.appliedDesktopCorrectionId,
+        baseAppliedCorrectionRevision = asset.appliedDesktopCorrectionRevision,
+        targetRevision = asset.display.revision,
+    )
+    if (asset.appliedDesktopCorrectionRevision > 0L &&
+        (row.revision < asset.appliedDesktopCorrectionRevision ||
+            row.revision == asset.appliedDesktopCorrectionRevision &&
+            asset.appliedDesktopCorrectionId != row.correctionId)) {
+        return DesktopCorrectionDecision.Rejected("stale correction revision")
+    }
+    val display = asset.display
+    if (asset.appliedDesktopCorrectionId == row.correctionId &&
+        display.reference == desktopCorrectionDisplayFileName(installedPlan) &&
+        display.sha256 == artifact.sha256 &&
+        display.width == artifact.width &&
+        display.height == artifact.height &&
+        display.orientationDegrees == 0 &&
+        display.recipe == DESKTOP_CORRECTION_RECIPE &&
+        display.recipeVersion == "1" &&
+        display.sourceToDisplayHomography == null) {
+        return DesktopCorrectionDecision.AlreadyApplied(installedPlan)
+    }
+
+    return DesktopCorrectionDecision.Ready(installedPlan.copy(
         targetRevision = asset.display.revision + 1,
     ))
 }

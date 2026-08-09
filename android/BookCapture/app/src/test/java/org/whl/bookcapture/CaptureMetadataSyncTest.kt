@@ -107,6 +107,55 @@ class CaptureMetadataSyncTest {
     }
 
     @Test
+    fun captureListUsesPulledBibliographyAndTombstoneFallsBackToPhoneText() {
+        val dir = temporary.newFolder(captureId)
+        val pulled = desktopBookMetadataFromJson(desktopRow(
+            revision = 1,
+            // A live imported capture publishes bibliography before it is
+            // registered, so an empty book id must not suppress the overlay.
+            bookId = "",
+            data = JSONObject().put("bibliography", JSONObject()
+                .put("title", "Corrected title")
+                .put("author", "Corrected author")
+                .put("year", "1907")),
+        ))!!
+        assertEquals(
+            DesktopMetadataApplyResult.APPLIED,
+            CaptureMetadataStore.applyDesktopBook(dir, pulled),
+        )
+
+        val afterPull = Entries.captureListBibliography(
+            title = "Phone title",
+            author = "Phone author",
+            year = "1901",
+            desktopBook = CaptureMetadataStore.readDesktopBook(dir),
+        )
+        assertEquals(
+            DesktopBibliography("Corrected title", "Corrected author", "1907"),
+            afterPull,
+        )
+
+        val tombstone = desktopBookMetadataFromJson(desktopRow(
+            revision = 2,
+            bookId = "",
+            data = JSONObject().put("registered", false),
+        ))!!
+        assertEquals(
+            DesktopMetadataApplyResult.APPLIED,
+            CaptureMetadataStore.applyDesktopBook(dir, tombstone),
+        )
+        assertEquals(
+            DesktopBibliography("Phone title", "Phone author", "1901"),
+            Entries.captureListBibliography(
+                "Phone title",
+                "Phone author",
+                "1901",
+                CaptureMetadataStore.readDesktopBook(dir),
+            ),
+        )
+    }
+
+    @Test
     fun desktopProjectionRetainsUnknownDataButDoesNotExposeMutableStoreJson() {
         val parsed = desktopBookMetadataFromJson(
             desktopRow(data = JSONObject().put("future", JSONObject().put("shelf", 3))),

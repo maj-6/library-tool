@@ -621,9 +621,37 @@ object Entries {
         else -> "no details read"
     }
 
-    /** Title cell: the book record once extraction lands, progress before. */
-    fun titleLabel(ctx: Context, e: Entry): String = when {
-        e.title.isNotEmpty() -> e.title
+    /** Bibliography shown by the capture list after a metadata pull.
+     *
+     * A desktop projection is the curator-authored overlay. Imported captures
+     * intentionally carry bibliography before registration (with an empty book
+     * id), so registration status must not gate it. Each absent projected field
+     * falls back independently to the phone extraction; a deletion tombstone's
+     * empty data therefore falls back cleanly instead of erasing useful text. */
+    internal fun captureListBibliography(
+        title: String,
+        author: String,
+        year: String,
+        desktopBook: DesktopBookMetadata?,
+    ): DesktopBibliography {
+        val desktop = desktopBook?.bibliography ?: DesktopBibliography.EMPTY
+        return DesktopBibliography(
+            title = desktop.title.ifEmpty { title },
+            author = desktop.author.ifEmpty { author },
+            year = desktop.year.ifEmpty { year },
+        )
+    }
+
+    internal fun captureListBibliography(entry: Entry): DesktopBibliography =
+        captureListBibliography(entry.title, entry.author, entry.year, entry.desktopBook)
+
+    /** Title cell: the curated desktop title once pulled, then local progress. */
+    fun titleLabel(
+        ctx: Context,
+        e: Entry,
+        bibliography: DesktopBibliography = captureListBibliography(e),
+    ): String = when {
+        bibliography.title.isNotEmpty() -> bibliography.title
         e.meta != null -> metadataFallbackLabel(e.meta)
         e.processing.status == ProcessingStatus.FAILED && e.processing.lastError.isNotEmpty() ->
             "Processing failed \u2014 ${e.processing.lastError.take(120)}"

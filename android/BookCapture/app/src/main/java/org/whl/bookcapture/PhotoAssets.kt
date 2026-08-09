@@ -190,9 +190,11 @@ internal data class CapturePhotoAsset(
     val geometries: List<PhotoOcrGeometry> = emptyList(),
     val processingRequest: PhotoProcessingRequest? = null,
     /** Fingerprint of the last installed desktop correction. Empty (and absent
-     * from serialized contracts) until one lands; a capture_corrections row
-     * carrying this id is a no-op, any other id supersedes. */
+     * from serialized contracts) until one lands. */
     val appliedDesktopCorrectionId: String = "",
+    /** Monotonic `capture_corrections.revision` installed with [appliedDesktopCorrectionId].
+     * Zero means a contract written before this ordering field existed. */
+    val appliedDesktopCorrectionRevision: Long = 0L,
 )
 
 internal data class PhotoSelectionChoice(
@@ -1211,18 +1213,32 @@ internal object PhotoAssetStore {
     ): Boolean = synchronized(monitorFor(dir)) {
         if (!dir.isDirectory || downloaded.parentFile != dir) return@synchronized false
         val current = readCurrent(dir) ?: return@synchronized false
+        val asset = current.assets.firstOrNull { it.assetId == proposed.row.assetId }
+            ?: return@synchronized false
+        val appliedCorrectionChanged =
+            asset.appliedDesktopCorrectionId != proposed.baseAppliedCorrectionId ||
+                asset.appliedDesktopCorrectionRevision !=
+                    proposed.baseAppliedCorrectionRevision
+        if (appliedCorrectionChanged &&
+            asset.appliedDesktopCorrectionRevision > 0L &&
+            (proposed.row.revision < asset.appliedDesktopCorrectionRevision ||
+                proposed.row.revision == asset.appliedDesktopCorrectionRevision &&
+                asset.appliedDesktopCorrectionId != proposed.row.correctionId)) {
+            // Pull and explicit-sync workers may download concurrently. Let a
+            // newly fetched cloud revision replace an intervening older one,
+            // but never let a stale download downgrade the local winner.
+            return@synchronized false
+        }
         val checked = when (val decision = validateDesktopCorrection(
             current,
             proposed.row,
             proposed.row.ownerId,
         )) {
+            is DesktopCorrectionDecision.AlreadyApplied -> decision.plan
             is DesktopCorrectionDecision.Ready -> decision.plan
             else -> return@synchronized false
         }
-        if (checked.artifact != proposed.artifact ||
-            checked.targetRevision != proposed.targetRevision ||
-            checked.baseDisplaySha256 != proposed.baseDisplaySha256 ||
-            checked.baseDisplayRevision != proposed.baseDisplayRevision) {
+        if (checked.artifact != proposed.artifact) {
             return@synchronized false
         }
         if (verifyCloudDisplayDownload(
@@ -1232,8 +1248,6 @@ internal object PhotoAssetStore {
                 receipt.bytes,
             ) != null) return@synchronized false
 
-        val asset = current.assets.firstOrNull { it.assetId == checked.row.assetId }
-            ?: return@synchronized false
         val destination = File(dir, desktopCorrectionDisplayFileName(checked))
         if (destination.name == asset.original.reference ||
             destination.name == asset.captureFile) return@synchronized false
@@ -1255,6 +1269,10 @@ internal object PhotoAssetStore {
             // for the new revision comes only from the queued re-OCR.
             geometries = asset.geometries.filterNot { it.displayRevision == display.revision },
             appliedDesktopCorrectionId = checked.row.correctionId,
+            appliedDesktopCorrectionRevision = if (
+                asset.appliedDesktopCorrectionId == checked.row.correctionId
+            ) maxOf(asset.appliedDesktopCorrectionRevision, checked.row.revision)
+            else checked.row.revision,
         )
         commitVerifiedDisplayInstall(
             dir,
@@ -1272,6 +1290,39 @@ internal object PhotoAssetStore {
                 displaySha256 = display.sha256,
                 displayRevision = display.revision,
             ),
+        )
+    }
+
+    /** Persist the ordering evidence carried by a fully installed same-ID row.
+     * This keeps a later no-op pull from being downgraded by an older download
+     * that was already in flight. Legacy id-only contracts migrate here. */
+    fun acknowledgeDesktopCorrectionRow(
+        dir: File,
+        proposed: DesktopCorrectionInstallPlan,
+    ): Boolean = synchronized(monitorFor(dir)) {
+        if (!dir.isDirectory) return@synchronized false
+        val current = readCurrent(dir) ?: return@synchronized false
+        val checked = when (val decision = validateDesktopCorrection(
+            current,
+            proposed.row,
+            proposed.row.ownerId,
+        )) {
+            is DesktopCorrectionDecision.AlreadyApplied -> decision.plan
+            else -> return@synchronized false
+        }
+        if (checked.artifact != proposed.artifact) return@synchronized false
+        val asset = current.assets.firstOrNull { it.assetId == checked.row.assetId }
+            ?: return@synchronized false
+        if (asset.appliedDesktopCorrectionRevision == checked.row.revision) {
+            return@synchronized true
+        }
+        persistCurrent(
+            dir,
+            current.copy(assets = current.assets.map { existing ->
+                if (existing.assetId == asset.assetId) asset.copy(
+                    appliedDesktopCorrectionRevision = checked.row.revision,
+                ) else existing
+            }),
         )
     }
 
@@ -1758,6 +1809,9 @@ private fun CapturePhotoAsset.toJson(): JSONObject = JSONObject()
     .apply {
         if (appliedDesktopCorrectionId.isNotEmpty()) {
             put("applied_desktop_correction_id", appliedDesktopCorrectionId)
+            if (appliedDesktopCorrectionRevision > 0L) {
+                put("applied_desktop_correction_revision", appliedDesktopCorrectionRevision)
+            }
         }
     }
 
@@ -1778,6 +1832,12 @@ private fun JSONObject.toPhotoAsset(): CapturePhotoAsset? {
         }
         val appliedCorrection = optString("applied_desktop_correction_id").trim().lowercase()
         if (appliedCorrection.isNotEmpty() && !appliedCorrection.matches(SHA256_HEX)) return null
+        val appliedCorrectionRevision = when {
+            !has("applied_desktop_correction_revision") -> 0L
+            else -> strictLong("applied_desktop_correction_revision")
+                ?.takeIf { it > 0L } ?: return null
+        }
+        if (appliedCorrection.isEmpty() && appliedCorrectionRevision != 0L) return null
         CapturePhotoAsset(
             id,
             order,
@@ -1791,6 +1851,7 @@ private fun JSONObject.toPhotoAsset(): CapturePhotoAsset? {
             }.orEmpty(),
             processingRequest,
             appliedCorrection,
+            appliedCorrectionRevision,
         )
     } catch (_: Exception) {
         null

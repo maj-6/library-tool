@@ -500,6 +500,165 @@ def test_mapping_validated_display_head_beats_restored_newer_sibling(tmp_path):
     assert winner["display_sha256"] == hashlib.sha256(head_png).hexdigest()
 
 
+def test_mapping_validated_original_root_head_uses_current_original_authority(
+    tmp_path,
+):
+    capture_id = "c1212121-1212-4212-8212-121212121212"
+    item_id = "b-" + "d" * 32
+    original_sha = "6" * 64
+    photo_assets = _photo_assets(
+        capture_id,
+        [("asset-01", original_sha, "completed")],
+    )
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    original_slot = f"{namespace}:original"
+    head_png = _png(10, 6, color=(12, 13, 14))
+    head_id = _publish_transform(
+        tmp_path,
+        item_id,
+        "op-original-head",
+        original_slot,
+        "ctr-" + "3" * 40,
+        head_png,
+        source_revision="capture-original-r1",
+        source_sha256=original_sha,
+        pointer_mtime=1_000_000.0,
+        display_head=True,
+        display_head_artifact_id=display_slot,
+    )
+    sibling_id = _publish_transform(
+        tmp_path,
+        item_id,
+        "op-restored-display-sibling",
+        display_slot,
+        "ctr-" + "4" * 40,
+        _png(10, 6, color=(22, 23, 24)),
+        pointer_mtime=3_000_000.0,
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path
+    )
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == head_id
+    assert winner["correction_id"] != sibling_id
+    assert winner["authoritative_display_head"] is True
+
+    photo_assets["desktop_import"]["assets"][0]["source_checksum"] = (
+        "7" * 64
+    )
+    assert server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path
+    ) == {}
+
+
+def test_mapping_keeps_original_authority_through_logical_display_child(
+    tmp_path,
+):
+    capture_id = "c13131313-1313-4313-8313-131313131313"
+    item_id = "b-" + "e" * 32
+    original_sha = "8" * 64
+    photo_assets = _photo_assets(
+        capture_id,
+        [("asset-01", original_sha, "completed")],
+    )
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    original_slot = f"{namespace}:original"
+    original_correction = _png(10, 6, color=(31, 32, 33))
+    original_output_revision = "ctr:" + "4" * 64
+    parent_id = _publish_transform(
+        tmp_path,
+        item_id,
+        "op-original-parent",
+        original_slot,
+        "ctr-" + "5" * 40,
+        original_correction,
+        source_revision="capture-original-r1",
+        source_sha256=original_sha,
+        output_revision=original_output_revision,
+        pointer_mtime=1_000_000.0,
+    )
+    child_correction = _png(10, 6, color=(41, 42, 43))
+    child_id = _publish_transform(
+        tmp_path,
+        item_id,
+        "op-logical-display-child",
+        display_slot,
+        "ctr-" + "6" * 40,
+        child_correction,
+        source_revision=original_output_revision,
+        source_sha256=hashlib.sha256(original_correction).hexdigest(),
+        pointer_mtime=2_000_000.0,
+        display_head=True,
+        display_head_artifact_id=display_slot,
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path
+    )
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == child_id
+    assert winner["display_sha256"] == hashlib.sha256(
+        child_correction
+    ).hexdigest()
+    assert winner["ancestors"] == frozenset({parent_id})
+    assert winner["source_original_sha256"] == original_sha
+    assert winner["authoritative_display_head"] is True
+
+
+def test_mapping_rejects_rendition_alias_across_capture_namespaces(tmp_path):
+    capture_id = "c14141414-1414-4414-8414-141414141414"
+    item_id = "b-" + "f" * 32
+    photo_assets = _photo_assets(
+        capture_id,
+        [
+            ("asset-01", "9" * 64, "completed"),
+            ("asset-02", "a" * 64, "completed"),
+        ],
+    )
+    first_namespace = server._capture_artifact_namespace(
+        capture_id, "asset-01"
+    )
+    second_namespace = server._capture_artifact_namespace(
+        capture_id, "asset-02"
+    )
+    parent_png = _png(10, 6, color=(51, 52, 53))
+    parent_revision = "ctr:" + "7" * 64
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-first-original",
+        f"{first_namespace}:original",
+        "ctr-" + "8" * 40,
+        parent_png,
+        source_revision="capture-original-r1",
+        source_sha256="9" * 64,
+        output_revision=parent_revision,
+    )
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-cross-namespace-child",
+        f"{second_namespace}:display",
+        "ctr-" + "9" * 40,
+        _png(10, 6, color=(61, 62, 63)),
+        source_revision=parent_revision,
+        source_sha256=hashlib.sha256(parent_png).hexdigest(),
+        display_head=True,
+        display_head_artifact_id=f"{second_namespace}:display",
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path
+    )
+
+    assert "asset-02" not in targets
+
+
 def test_mapping_rejects_display_head_from_replaced_capture_authority(tmp_path):
     capture_id = "c1111111-2222-4333-8444-555555555555"
     item_id = "b-" + "c" * 32
@@ -730,6 +889,80 @@ def test_mapping_backed_up_asset_publishes_only_active_operation(tmp_path):
         hashlib.sha256(active_png).hexdigest()
     assert targets["asset-01"]["manifest_authoritative"] is True
     assert set(targets["asset-01"]["candidates"]) == {active_id, later_id}
+
+
+def test_publish_backed_up_original_root_head_without_physical_promotion(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch)
+    capture_id = seeded["capture_id"]
+    asset_id = seeded["asset_id"]
+    source_sha = seeded["source_sha"]
+    namespace = seeded["namespace"]
+    item_id = seeded["item_id"]
+    engine_root = server._ensure_engine_session().write_set.root
+    corrected_png = _png(63, 47, color=(33, 66, 99))
+    operation_id = "op-original-head"
+    correction_id = _publish_transform(
+        engine_root,
+        item_id,
+        operation_id,
+        f"{namespace}:original",
+        "ctr-" + "3" * 40,
+        corrected_png,
+        source_revision="capture-original-r1",
+        source_sha256=source_sha,
+        display_head=True,
+        display_head_artifact_id=f"{namespace}:display",
+    )
+    manifest_path = server.CAPTURES_DIR / capture_id / "photo_assets.json"
+    photo_assets = json.loads(manifest_path.read_text("utf-8"))
+    physical_display_sha = "e" * 64
+    photo_assets["assets"] = [{
+        "asset_id": asset_id,
+        "original": {"sha256": source_sha},
+        "display": {"sha256": physical_display_sha},
+    }]
+    _mark_original_backed_up(
+        photo_assets,
+        asset_id,
+        source_sha,
+        active_operation_id=operation_id,
+    )
+    manifest_path.write_text(json.dumps(photo_assets), encoding="utf-8")
+    assert server._capture_correction_promoted_display_sha256(
+        corrected_png
+    ) != physical_display_sha
+
+    targets = server._capture_correction_targets(
+        capture_id,
+        photo_assets,
+        item_id,
+        engine_root,
+    )
+
+    target = targets[asset_id]
+    assert target["correction_id"] == correction_id
+    assert target["authoritative_display_head"] is True
+    assert target["promoted_display_sha256"] == ""
+    assert server._capture_correction_source_bytes(
+        target,
+        engine_root=engine_root,
+    ) == corrected_png
+
+    calls = _stub_cloud(
+        monkeypatch,
+        capture_id,
+        owner_rows=[{"id": capture_id, "created_by": OWNER_ID}],
+        existing=[],
+    )
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"}
+    )
+
+    assert outcome["pushed"] == 1
+    assert outcome["errors"] == []
+    assert len(calls["uploads"]) == 2
+    assert calls["published"][0][0]["correction_id"] == correction_id
 
 
 def test_mapping_backed_up_original_source_allows_pinned_physical_promotion(
@@ -1083,7 +1316,7 @@ def _stub_cloud(monkeypatch, capture_id: str, *, owner_rows, existing):
         "rest": [],
         "uploads": [],
         "published": [],
-        "expected_revisions": [],
+        "publish_expected": [],
         "listed": [],
         "photo_deletes": [],
     }
@@ -1109,10 +1342,10 @@ def _stub_cloud(monkeypatch, capture_id: str, *, owner_rows, existing):
             (bucket, path, hashlib.sha256(data).hexdigest(), content_type)
         ) or path,
     )
-    def publish(cfg, rows, *, expected_revisions=None):
+    def publish(cfg, rows, *, expected_existing=None):
         del cfg
         calls["published"].append(rows)
-        calls["expected_revisions"].append(expected_revisions)
+        calls["publish_expected"].append(expected_existing)
         return len(rows)
 
     monkeypatch.setattr(
@@ -1162,13 +1395,13 @@ def test_publish_uploads_objects_and_rows_per_contract(
     assert calls["listed"] == [[capture_id]]
     (rows,) = calls["published"]
     (row,) = rows
+    assert calls["publish_expected"] == [{
+        (capture_id, seeded["asset_id"]): None,
+    }]
     assert row["capture_id"] == capture_id
     assert row["asset_id"] == seeded["asset_id"]
     assert row["correction_id"] == seeded["correction_id"]
     assert row["source_original_sha256"] == seeded["source_sha"]
-    assert calls["expected_revisions"] == [{
-        (capture_id, seeded["asset_id"]): None,
-    }]
     doc = row["result"]
     assert doc["schema"] == "org.whl.capture-correction-result"
     assert doc["version"] == 1
@@ -1193,6 +1426,109 @@ def test_publish_uploads_objects_and_rows_per_contract(
     assert doc["artifacts"]["thumbnail"]["path"] == thumbnail_path
     assert doc["artifacts"]["thumbnail"]["content_type"] == "image/jpeg"
     assert doc["generated_at"]
+
+
+def test_publish_includes_every_corrected_asset_in_one_capture_refresh(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch)
+    second_asset_id = "asset-02"
+    second_source_sha = hashlib.sha256(b"second original").hexdigest()
+    (server.CAPTURES_DIR / seeded["capture_id"] / "photo_assets.json").write_text(
+        json.dumps(_photo_assets(seeded["capture_id"], [
+            (seeded["asset_id"], seeded["source_sha"], "completed"),
+            (second_asset_id, second_source_sha, "completed"),
+        ])),
+        encoding="utf-8",
+    )
+    second_namespace = server._capture_artifact_namespace(
+        seeded["capture_id"], second_asset_id)
+    second_correction_id = _publish_transform(
+        server._ensure_engine_session().write_set.root,
+        seeded["item_id"],
+        "op-second-asset",
+        f"{second_namespace}:display",
+        "ctr-" + "a" * 40,
+        _png(48, 64, color=(40, 120, 200)),
+    )
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["candidates"] == 1
+    assert outcome["pushed"] == 2
+    assert len(calls["uploads"]) == 4
+    (rows,) = calls["published"]
+    assert {
+        (row["asset_id"], row["correction_id"],
+         row["source_original_sha256"])
+        for row in rows
+    } == {
+        (seeded["asset_id"], seeded["correction_id"], seeded["source_sha"]),
+        (second_asset_id, second_correction_id, second_source_sha),
+    }
+
+
+def test_publish_damaged_asset_does_not_starve_capture_sibling(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch)
+    second_asset_id = "asset-02"
+    second_source_sha = hashlib.sha256(b"second original").hexdigest()
+    photo_assets = _photo_assets(seeded["capture_id"], [
+        (seeded["asset_id"], seeded["source_sha"], "completed"),
+        (second_asset_id, second_source_sha, "completed"),
+    ])
+    (server.CAPTURES_DIR / seeded["capture_id"] / "photo_assets.json").write_text(
+        json.dumps(photo_assets),
+        encoding="utf-8",
+    )
+    second_namespace = server._capture_artifact_namespace(
+        seeded["capture_id"], second_asset_id)
+    second_correction_id = _publish_transform(
+        server._ensure_engine_session().write_set.root,
+        seeded["item_id"],
+        "op-second-asset-after-damage",
+        f"{second_namespace}:display",
+        "ctr-" + "b" * 40,
+        _png(48, 64, color=(90, 130, 210)),
+    )
+    targets = server._capture_correction_targets(
+        seeded["capture_id"],
+        photo_assets,
+        seeded["item_id"],
+        server._ensure_engine_session().write_set.root,
+    )
+    targets[seeded["asset_id"]]["display_object"].write_bytes(b"damaged")
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["pushed"] == 1
+    assert len(outcome["errors"]) == 1
+    assert "asset asset-01: committed display object could not be read safely" in \
+        outcome["errors"][0]
+    assert len(calls["uploads"]) == 2
+    (rows,) = calls["published"]
+    assert [(row["asset_id"], row["correction_id"]) for row in rows] == [
+        (second_asset_id, second_correction_id),
+    ]
 
 
 def test_publish_holds_local_authority_through_cloud_row_cas(
@@ -1232,13 +1568,14 @@ def test_publish_holds_local_authority_through_cloud_row_cas(
             finally:
                 authority_depth -= 1
 
-    def publish(_cfg, rows, *, expected_revisions=None):
-        assert expected_revisions == {
+    def publish(_cfg, rows, *, expected_existing=None):
+        assert expected_existing == {
             (seeded["capture_id"], seeded["asset_id"]): None,
         }
         assert capture_depth == 1
         assert authority_depth == 1
         calls["published"].append(rows)
+        calls["publish_expected"].append(expected_existing)
         return len(rows)
 
     monkeypatch.setattr(
@@ -1688,19 +2025,44 @@ def test_publish_revalidates_capture_state_before_cloud_row_publication(
     } == first_call_counts
 
 
+def _complete_cloud_row(seeded) -> dict:
+    display = server._capture_correction_jpeg(
+        seeded["png"], long_edge=1600, quality=90)
+    thumbnail = server._capture_correction_jpeg(
+        seeded["png"], long_edge=512, quality=80)
+    base = (
+        f"{OWNER_ID}/{seeded['capture_id']}/{seeded['asset_id']}/"
+        f"desktop-{seeded['correction_id'][:20]}"
+    )
+    target = {
+        "correction_id": seeded["correction_id"],
+        "source_original_sha256": seeded["source_sha"],
+        "display_sha256": hashlib.sha256(seeded["png"]).hexdigest(),
+    }
+    return {
+        "capture_id": seeded["capture_id"],
+        "asset_id": seeded["asset_id"],
+        "correction_id": seeded["correction_id"],
+        "source_original_sha256": seeded["source_sha"],
+        "revision": 1,
+        "result": server._capture_correction_result_doc(
+            target,
+            display=display,
+            thumbnail=thumbnail,
+            display_path=f"{base}/display-{display['sha256'][:20]}.jpg",
+            thumbnail_path=(
+                f"{base}/thumbnail-{thumbnail['sha256'][:20]}.jpg"
+            ),
+        ),
+    }
+
+
 def test_publish_diff_short_circuits_matching_rows(
         monkeypatch, capture_workspace):
     seeded = _seed_corrected_capture(monkeypatch)
     capture_id = seeded["capture_id"]
-    display = server._capture_correction_jpeg(
-        seeded["png"], long_edge=1600, quality=90)
-    existing_row = {
-        "capture_id": capture_id,
-        "asset_id": seeded["asset_id"],
-        "correction_id": seeded["correction_id"],
-        "source_original_sha256": seeded["source_sha"],
-        "result": {"artifacts": {"display": {"sha256": display["sha256"]}}},
-    }
+    existing_row = _complete_cloud_row(seeded)
+    existing_row["result"]["generated_at"] = "2026-08-01T00:00:00Z"
     calls = _stub_cloud(
         monkeypatch, capture_id,
         owner_rows=[{"id": capture_id, "created_by": OWNER_ID}],
@@ -1715,6 +2077,95 @@ def test_publish_diff_short_circuits_matching_rows(
                        "notices": [], "errors": []}
     assert calls["uploads"] == []
     assert calls["published"] == []
+
+
+def test_publish_repairs_same_id_row_with_incomplete_result_contract(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch)
+    capture_id = seeded["capture_id"]
+    display = server._capture_correction_jpeg(
+        seeded["png"], long_edge=1600, quality=90)
+    # Same winner and display digest, but Android cannot validate or install
+    # this incomplete result. The publisher must not call it up to date.
+    incomplete = {
+        "capture_id": capture_id,
+        "asset_id": seeded["asset_id"],
+        "correction_id": seeded["correction_id"],
+        "source_original_sha256": seeded["source_sha"],
+        "revision": 1,
+        "result": {
+            "schema": "org.whl.capture-correction-result",
+            "version": 1,
+            "processor": "whl-desktop-corrections",
+            "recipe": "whl-desktop-correction-v1",
+            "correction_id": seeded["correction_id"],
+            "source": {"original_sha256": seeded["source_sha"]},
+            "geometry_strategy": "replace_and_reocr",
+            "artifacts": {"display": {"sha256": display["sha256"]}},
+            "generated_at": "2026-08-01T00:00:00Z",
+        },
+    }
+    calls = _stub_cloud(
+        monkeypatch,
+        capture_id,
+        owner_rows=[{"id": capture_id, "created_by": OWNER_ID}],
+        existing=[incomplete],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["pushed"] == 1
+    assert outcome["up_to_date"] == 0
+    assert len(calls["uploads"]) == 2
+    (rows,) = calls["published"]
+    assert rows[0]["result"]["artifacts"]["display"]["sha256"] == \
+        display["sha256"]
+    assert "thumbnail" in rows[0]["result"]["artifacts"]
+
+
+def test_publish_conflicts_when_cloud_row_changes_after_initial_guard(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch)
+    initial = _cloud_row(
+        seeded, correction_id="0" * 64, display_sha256="1" * 64)
+    initial.update({"revision": 4, "updated_at": "2026-08-01T00:00:00Z"})
+    newer = _cloud_row(
+        seeded, correction_id="f" * 64, display_sha256="2" * 64)
+    newer.update({"revision": 5, "updated_at": "2026-08-01T00:01:00Z"})
+    correction_reads = 0
+    writes = []
+    uploads = []
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        nonlocal correction_reads
+        del prefer
+        if path.startswith("captures?id=in.("):
+            return [{"id": seeded["capture_id"], "created_by": OWNER_ID}]
+        if method == "GET" and path.startswith("capture_corrections?"):
+            correction_reads += 1
+            return [initial if correction_reads == 1 else newer]
+        writes.append((method, path, payload))
+        raise AssertionError("a changed guarded row must not be written")
+
+    monkeypatch.setattr(server.sbase, "_rest", rest)
+    monkeypatch.setattr(
+        server.sbase,
+        "upload_object",
+        lambda _cfg, bucket, path, data, content_type, upsert=True:
+            uploads.append((bucket, path, len(data), content_type, upsert))
+            or path,
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert correction_reads == 2
+    assert len(uploads) == 2
+    assert writes == []
+    assert outcome["pushed"] == 0
+    assert len(outcome["errors"]) == 1
+    assert "changed since candidate selection" in outcome["errors"][0]
 
 
 def test_publish_skips_captures_without_a_cloud_row(
@@ -2163,7 +2614,7 @@ def test_publish_replaces_lesser_foreign_correction_id(
     assert outcome["errors"] == []
     (rows,) = calls["published"]
     assert rows[0]["correction_id"] == seeded["correction_id"]
-    assert calls["expected_revisions"] == [{
+    assert calls["publish_expected"] == [{
         (seeded["capture_id"], seeded["asset_id"]): 7,
     }]
 
@@ -2208,7 +2659,8 @@ def test_publish_row_write_tolerates_missing_migration_too(
         existing=[],
     )
 
-    def missing(_cfg, _rows, **_kwargs):
+    def missing(_cfg, _rows, *, expected_existing=None):
+        del expected_existing
         raise server.sbase.SyncError(_MISSING_RELATION_ERROR)
 
     monkeypatch.setattr(

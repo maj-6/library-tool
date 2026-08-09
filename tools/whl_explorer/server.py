@@ -14967,10 +14967,19 @@ def _capture_correction_artifact_root(
 def _capture_correction_chain(
         entry: dict, by_output: Mapping, by_display_pin: Mapping,
         ) -> tuple[tuple[str, str], tuple[dict, ...]] | None:
-    """Walk one transform leaf-first to a consistent capture rendition root."""
+    """Walk one transform leaf-first to one authoritative capture root.
+
+    A correction rooted at the immutable capture original is projected through
+    the sibling logical display slot. A later transform can therefore address
+    ``:display`` while its validated parent chain still terminates at
+    ``:original``. The namespace must stay exact across that alias boundary;
+    the oldest publication's declared rendition remains the authority returned
+    to geometry and cloud-publication callers.
+    """
 
     chain: list[dict] = []
-    expected_root: tuple[str, str] | None = None
+    expected_namespace = ""
+    root: tuple[str, str] | None = None
     seen: set[int] = set()
     current = entry
     while True:
@@ -14985,9 +14994,10 @@ def _capture_correction_chain(
         declared_root = _capture_correction_artifact_root(
             command.get("artifact_id"))
         if declared_root is not None:
-            if expected_root is not None and declared_root != expected_root:
+            if expected_namespace and declared_root[0] != expected_namespace:
                 return None
-            expected_root = declared_root
+            expected_namespace = declared_root[0]
+            root = declared_root
         chain.append(current)
         parent, ambiguous = _correction_transform_parent(
             current, by_output, by_display_pin)
@@ -14996,9 +15006,9 @@ def _capture_correction_chain(
         if parent is not None:
             current = parent
             continue
-        if declared_root is None or expected_root is None:
+        if declared_root is None or root is None:
             return None
-        return expected_root, tuple(chain)
+        return root, tuple(chain)
 
 
 def _ocr_apply_capture_asset(
@@ -28316,6 +28326,7 @@ def _capture_correction_targets(
             key=lambda value: (value["order"], value["operation_id"]))
         head_present, head = heads.get(asset_id, (False, None))
         marker_authoritative = asset_id in active_operation_by_asset
+        original_head_match = False
         promoted_original_match = False
         if marker_authoritative:
             active_operation = active_operation_by_asset[asset_id]
@@ -28340,32 +28351,53 @@ def _capture_correction_targets(
                 and winner["root_source_sha256"]
                 == display_source_sha.get(asset_id)
             )
-            promoted_original_match = (
+            original_root_match = (
                 winner["root_artifact_id"].casefold()
                 == f"{display_slots[asset_id].rsplit(':', 1)[0]}:original".casefold()
                 and winner["root_source_sha256"] == source_sha.get(asset_id)
+            )
+            original_head_match = head_bound and original_root_match
+            promoted_original_match = (
+                not head_present
+                and original_root_match
                 and bool(desktop_display_sha.get(asset_id))
                 and desktop_display_sha.get(asset_id)
                 == raw_display_sha.get(asset_id)
-                and (not head_present or head_bound)
             )
-            if not (normal_head_match or promoted_original_match):
-                # Normal display transforms remain receipt/head bound. The
-                # only headless exception is physical promotion from the cold
-                # original when both live manifest display pins name this
-                # operation's exact committed output.
+            if not (
+                    normal_head_match
+                    or original_head_match
+                    or promoted_original_match):
+                # Display- and original-root heads remain receipt/head bound.
+                # The only headless exception is legacy physical promotion
+                # from the cold original when both live manifest display pins
+                # name this operation's exact committed output.
                 continue
             authoritative_display_head = head_bound
         elif head_present:
             if head is None:
                 continue
+            display_root = display_slots[asset_id]
+            original_root = (
+                f"{display_root[:-len(':display')]}:original"
+            )
             current = [
                 entry for entry in entries
                 if entry["operation_id"] == head["operation_id"]
-                and entry["root_artifact_id"].casefold()
-                == display_slots[asset_id].casefold()
-                and entry["root_source_sha256"]
-                == display_source_sha.get(asset_id)
+                and (
+                    (
+                        entry["root_artifact_id"].casefold()
+                        == display_root.casefold()
+                        and entry["root_source_sha256"]
+                        == display_source_sha.get(asset_id)
+                    )
+                    or (
+                        entry["root_artifact_id"].casefold()
+                        == original_root.casefold()
+                        and entry["root_source_sha256"]
+                        == source_sha.get(asset_id)
+                    )
+                )
             ]
             if len(current) != 1:
                 # The head is durable but its ancestry/output is not safe to
@@ -28579,15 +28611,6 @@ def _capture_correction_result_doc(target: dict, *, display: dict,
         "generated_at": datetime.now(timezone.utc).isoformat(
             timespec="seconds"),
     }
-
-
-def _capture_correction_row_display_sha(row) -> str:
-    result_doc = row.get("result") if isinstance(row, dict) else None
-    artifacts = result_doc.get("artifacts") \
-        if isinstance(result_doc, dict) else None
-    display = artifacts.get("display") if isinstance(artifacts, dict) else None
-    return str(display.get("sha256") or "").lower() \
-        if isinstance(display, dict) else ""
 
 
 _CAPTURE_CORRECTION_MISSING_NOTICE = (
@@ -28822,8 +28845,8 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
         if not owner_id:
             result["no_cloud_row"] += 1
             continue
-        try:
-            for asset_id in sorted(pending[capture_id]):
+        for asset_id in sorted(pending[capture_id]):
+            try:
                 target = pending[capture_id][asset_id]
                 png = _capture_correction_source_bytes(
                     target,
@@ -28834,13 +28857,6 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                     long_edge=_CAPTURE_CORRECTION_DISPLAY_EDGE,
                     quality=_CAPTURE_CORRECTION_DISPLAY_QUALITY)
                 previous = existing.get((capture_id, asset_id))
-                if (previous is not None
-                        and str(previous.get("correction_id") or "").lower()
-                        == target["correction_id"]
-                        and _capture_correction_row_display_sha(previous)
-                        == display["sha256"]):
-                    result["up_to_date"] += 1
-                    continue
                 row_correction = str(
                     (previous or {}).get("correction_id") or "").lower()
                 if row_correction \
@@ -28895,12 +28911,6 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                 display_path = f"{base}/display-{display['sha256'][:20]}.jpg"
                 thumbnail_path = \
                     f"{base}/thumbnail-{thumbnail['sha256'][:20]}.jpg"
-                sbase.upload_object(
-                    owner_cfg, _CAPTURE_CORRECTION_BUCKET, display_path,
-                    display["data"], "image/jpeg")
-                sbase.upload_object(
-                    owner_cfg, _CAPTURE_CORRECTION_BUCKET, thumbnail_path,
-                    thumbnail["data"], "image/jpeg")
                 row = {
                     "capture_id": capture_id,
                     "asset_id": asset_id,
@@ -28912,6 +28922,16 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                         display_path=display_path,
                         thumbnail_path=thumbnail_path),
                 }
+                if previous is not None and \
+                        sbase._capture_correction_writable_equal(previous, row):
+                    result["up_to_date"] += 1
+                    continue
+                sbase.upload_object(
+                    owner_cfg, _CAPTURE_CORRECTION_BUCKET, display_path,
+                    display["data"], "image/jpeg")
+                sbase.upload_object(
+                    owner_cfg, _CAPTURE_CORRECTION_BUCKET, thumbnail_path,
+                    thumbnail["data"], "image/jpeg")
                 prepared.append({
                     "capture_id": capture_id,
                     "token": _capture_correction_prepared_token(
@@ -28919,8 +28939,10 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                     "expected_revision": expected_revision,
                     "row": row,
                 })
-        except Exception as exc:
-            result["errors"].append(f"capture {capture_id[:8]}: {exc}")
+            except Exception as exc:
+                result["errors"].append(
+                    f"capture {capture_id[:8]}: asset {asset_id}: {exc}"
+                )
     prepared_by_capture: dict[str, list[dict]] = {}
     for entry in prepared:
         prepared_by_capture.setdefault(entry["capture_id"], []).append(entry)
@@ -28934,7 +28956,7 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                 if not rows:
                     continue
                 try:
-                    revisions = {
+                    expected_existing = {
                         (entry["row"]["capture_id"],
                          entry["row"]["asset_id"]):
                             entry["expected_revision"]
@@ -28944,9 +28966,9 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                         sbase.publish_capture_corrections(
                             owner_cfg,
                             rows,
-                            expected_revisions={
+                            expected_existing={
                                 (row["capture_id"], row["asset_id"]):
-                                    revisions[(
+                                    expected_existing[(
                                         row["capture_id"], row["asset_id"])]
                                 for row in rows
                             },

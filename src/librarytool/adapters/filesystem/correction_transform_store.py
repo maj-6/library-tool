@@ -172,11 +172,24 @@ _MAX_ITEM_TRANSFORMS = 10_000
 _MAX_LEGACY_MIGRATION_DOCUMENTS = 100_000
 _TRANSFORM_DOCUMENT_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
 _CAPTURE_DISPLAY_ID_RE = re.compile(r"^capture:[0-9a-f]{40}:display$")
+_CAPTURE_ORIGINAL_ID_RE = re.compile(r"^capture:[0-9a-f]{40}:original$")
 _PROJECTED_RASTER_OUTPUTS = {
     "corrected-display": ("corrected-image", "Corrected display", "display"),
     "ocr-ready": ("processed-source", "OCR-ready image", "ocr"),
     "thumbnail": ("processed-image", "Correction thumbnail", "thumbnail"),
 }
+
+
+def _capture_logical_display_id(artifact_id: str) -> str:
+    """Return the stable display slot for one capture source rendition."""
+
+    if _CAPTURE_DISPLAY_ID_RE.fullmatch(artifact_id) is not None:
+        return artifact_id
+    if _CAPTURE_ORIGINAL_ID_RE.fullmatch(artifact_id) is not None:
+        return f"{artifact_id[:-len(':original')]}:display"
+    return ""
+
+
 _RECEIPT_FIELDS = frozenset(
     {
         "schema",
@@ -361,6 +374,7 @@ class _TransformProjection:
 @dataclass(frozen=True, slots=True)
 class _CorrectionDisplayHead:
     logical_key: RasterArtifactKey
+    root_key: RasterArtifactKey
     operation_id: str
     root_source_revision: str
     root_source_sha256: str
@@ -374,6 +388,7 @@ class _CorrectionDisplayHeadHint:
     """Metadata-only binding for one validated logical display head."""
 
     logical_key: RasterArtifactKey
+    root_key: RasterArtifactKey
     operation_id: str
     publication_sha256: str
     root_source_revision: str
@@ -1365,6 +1380,7 @@ class FilesystemCorrectionTransformStore:
             )
             return _CorrectionDisplayHead(
                 logical_key=hint.logical_key,
+                root_key=hint.root_key,
                 operation_id=hint.operation_id,
                 root_source_revision=hint.root_source_revision,
                 root_source_sha256=hint.root_source_sha256,
@@ -1483,6 +1499,7 @@ class FilesystemCorrectionTransformStore:
             root_source = root.document["source"]
             return _CorrectionDisplayHeadHint(
                 logical_key=RasterArtifactKey(item_id, artifact_id),
+                root_key=root.command.key,
                 operation_id=operation_id,
                 publication_sha256=publication.pointer.publication_sha256,
                 root_source_revision=root_source["source_revision"],
@@ -1536,10 +1553,9 @@ class FilesystemCorrectionTransformStore:
             if len(candidates) > 1:
                 raise ValueError("display head ancestry is ambiguous")
             if not candidates:
-                if (
-                    command.artifact_id.casefold()
-                    != logical_artifact_id.casefold()
-                ):
+                if _capture_logical_display_id(
+                    command.artifact_id
+                ).casefold() != logical_artifact_id.casefold():
                     raise ValueError("display head ancestry has no logical root")
                 return current
             current = candidates[0]
@@ -2920,15 +2936,26 @@ class FilesystemCorrectionTransformStore:
 
         logical_artifact_id = ""
         existing: _CorrectionDisplayHead | None = None
-        if _CAPTURE_DISPLAY_ID_RE.fullmatch(command.artifact_id) is not None:
-            logical_artifact_id = command.artifact_id
+        capture_display_id = _capture_logical_display_id(command.artifact_id)
+        if capture_display_id:
+            # Both public capture renditions are valid transform sources. The
+            # camera original remains immutable evidence, while its committed
+            # correction replaces only the sibling logical display slot.
+            # Independent original/display branches deliberately converge by
+            # commit order: every command is still pinned to its exact source
+            # rendition, and the last transaction that successfully commits
+            # becomes the head. There is no hidden queue-time display CAS.
+            logical_artifact_id = capture_display_id
             path = self._display_head_path(command.item_id, logical_artifact_id)
             if self._path_exists(path, artifact="correction_display_head"):
                 existing = next(
                     (
                         value
                         for value in self._project_locked(command.item_id).display_heads
-                        if value.logical_key == command.key
+                        if value.logical_key == RasterArtifactKey(
+                            command.item_id,
+                            logical_artifact_id,
+                        )
                     ),
                     None,
                 )
@@ -2957,6 +2984,7 @@ class FilesystemCorrectionTransformStore:
 
         if (
             existing is not None
+            and not capture_display_id
             and command.artifact_id.casefold() != logical_artifact_id.casefold()
             and (
                 existing.artifact.resource is None

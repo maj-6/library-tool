@@ -709,9 +709,20 @@ def test_raster_preview_uses_bytes_only_resolver_without_artifact_projection():
     assert response.cache_control.no_cache is True
     assert resolver.calls == [("book-1", "image-a")]
 
+    versioned = client.get(f"{endpoint}?v={'a' * 64}")
+    assert versioned.status_code == 200
+    assert versioned.data == content
+
     rejected = client.get(f"{endpoint}?revision=not-accepted")
     assert rejected.status_code == 400
-    assert resolver.calls == [("book-1", "image-a")]
+    malformed = client.get(f"{endpoint}?v=short")
+    assert malformed.status_code == 400
+    repeated = client.get(f"{endpoint}?v={'a' * 64}&v={'b' * 64}")
+    assert repeated.status_code == 400
+    assert resolver.calls == [
+        ("book-1", "image-a"),
+        ("book-1", "image-a"),
+    ]
 
 
 def test_invalid_preview_resolution_closes_its_owned_stream():
@@ -1576,6 +1587,10 @@ def test_books_index_and_review_detail_project_one_engine_snapshot(tmp_path):
     assert capture["thumbnail"]["url"].startswith(
         "/api/v1/items/book-1/raster-artifacts/"
     )
+    assert capture["thumbnail"]["url"].endswith(
+        "?v="
+        + hashlib.sha256(capture["revision"].encode("utf-8")).hexdigest()
+    )
     assert "workspace" not in initial.get_data(as_text=True).casefold()
 
     detail = client.get("/api/v1/items/book-1/corrections/review")
@@ -1711,7 +1726,10 @@ def test_lazy_index_returns_capture_shell_before_preview_bytes_are_resolved():
     capture = index.get_json()["books"][0]["captures"][0]
     assert capture["artifact_id"] == "capture:asset-1:display"
     assert capture["revision"].startswith("index:")
-    assert capture["thumbnail"]["url"].endswith("/preview")
+    assert capture["thumbnail"]["url"].endswith(
+        "?v="
+        + hashlib.sha256(capture["revision"].encode("utf-8")).hexdigest()
+    )
     assert resolver.calls == []
     assert reviews.calls == []
 

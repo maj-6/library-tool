@@ -1152,6 +1152,46 @@ def test_capture_hints_do_not_open_or_hash_image_bytes(tmp_path, monkeypatch):
     assert hints[0]["resource_state"] == "available"
 
 
+def test_capture_hint_snapshot_privately_pins_both_transformable_renditions(
+    tmp_path,
+):
+    root = tmp_path / "library"
+    display = _jpeg_bytes((40, 50, 60), (19, 29))
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(display)
+    _write_photo_manifest(root, _photo_manifest(original, display))
+    repository = _repository(root)
+
+    snapshot = repository.capture_index_hint_snapshot(ITEM_ID)
+    authorities = snapshot["authorities"]
+
+    assert set(authorities) == {
+        CAPTURE_DISPLAY_ID.casefold(),
+        CAPTURE_ORIGINAL_ID.casefold(),
+    }
+    for artifact_id in (CAPTURE_DISPLAY_ID, CAPTURE_ORIGINAL_ID):
+        artifact = repository.get_raster_artifact(
+            RasterArtifactKey(ITEM_ID, artifact_id)
+        )
+        assert artifact is not None and artifact.resource is not None
+        authority = authorities[artifact_id.casefold()]
+        assert authority == {
+            "artifact_id": artifact_id,
+            "source_revision": artifact.resource.revision,
+            "source_sha256": artifact.content_sha256,
+            "representation_id": artifact.source.representation_id,
+            "representation_revision": (
+                artifact.source.representation_revision
+            ),
+            "canvas_id": artifact.source.canvas_id,
+            "original_backed_up": False,
+            "active_operation_id": "",
+        }
+
+
 def test_capture_hints_match_rendition_group_state_and_import_timestamp(tmp_path):
     root = tmp_path / "library"
     display = _jpeg_bytes((40, 50, 60), (19, 29))

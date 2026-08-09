@@ -1526,11 +1526,59 @@ def _capture_correction_write_row(raw: dict) -> dict:
     }
 
 
-def _correction_display_sha256(result) -> str:
-    artifacts = result.get("artifacts") if isinstance(result, dict) else None
-    display = artifacts.get("display") if isinstance(artifacts, dict) else None
-    sha256 = display.get("sha256") if isinstance(display, dict) else None
-    return sha256 if isinstance(sha256, str) else ""
+def _capture_correction_semantic_row(raw: dict) -> dict | None:
+    """Normalize the writable correction contract for equality checks.
+
+    ``revision``, ``updated_at``, and the trigger-derived ``owner_id`` are not
+    writable.  ``result.generated_at`` records when an otherwise immutable
+    payload was assembled, so its value is volatile too; its non-empty
+    presence remains part of the v1 result shape.  Everything else is compared
+    exactly, including the original anchor and both artifact envelopes.  This
+    prevents a same-id row with damaged paths, dimensions, byte counts, or
+    thumbnail metadata from permanently suppressing a repair publication that
+    Android would otherwise reject.
+    """
+
+    try:
+        normalized = _capture_correction_write_row(raw)
+    except SyncError:
+        return None
+    result = normalized["result"]
+    generated_at = result.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at.strip():
+        return None
+    normalized["result"] = {
+        **result,
+        "generated_at": "<generated-at>",
+    }
+    return normalized
+
+
+def _capture_correction_writable_equal(left: dict, right: dict) -> bool:
+    """Whether two rows carry the same complete writable v1 semantics."""
+
+    normalized_left = _capture_correction_semantic_row(left)
+    normalized_right = _capture_correction_semantic_row(right)
+    if normalized_left is None or normalized_right is None:
+        return False
+    try:
+        canonical_left = json.dumps(
+            normalized_left,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        canonical_right = json.dumps(
+            normalized_right,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return False
+    return canonical_left == canonical_right
 
 
 def publish_capture_corrections(
@@ -1538,6 +1586,7 @@ def publish_capture_corrections(
         rows: list[dict],
         *,
         expected_revisions: Mapping[tuple[str, str], int | None] | None = None,
+        expected_existing: Mapping[tuple[str, str], int | None] | None = None,
 ) -> int:
     """CAS-publish desktop corrections, one row per (capture_id, asset_id).
 
@@ -1545,10 +1594,14 @@ def publish_capture_corrections(
     under the owner service credential is the sole writer, so CAS on
     ``revision`` alone guards against a concurrent desktop run. Invalid rows
     and revision conflicts are reported after unrelated valid rows have had an
-    opportunity to publish. A caller that already compared cloud state may
-    supply ``expected_revisions``; those exact observations drive the INSERT
-    or revision-filtered PATCH without a second read that could silently
-    authorize a newer concurrent row.
+    opportunity to publish. A caller that needs a single exact CAS may supply
+    ``expected_revisions``; those observations drive the INSERT or
+    revision-filtered PATCH without a second read. A caller that can accept a
+    concurrent semantically identical repair may instead supply
+    ``expected_existing``. In that mode, every desired key maps to the revision
+    observed while selecting its winner (or ``None`` when absent); the current
+    row is reread and accepted only when it is already completely equal, else
+    any revision change forces the caller to reselect against the new state.
     """
     desired: dict[tuple[str, str], dict] = {}
     failures: list[str] = []
@@ -1566,9 +1619,15 @@ def publish_capture_corrections(
             failures.append(f"{label}: {exc}")
             continue
         desired[(normalized["capture_id"], normalized["asset_id"])] = normalized
+    if expected_revisions is not None and expected_existing is not None:
+        raise SyncError(
+            "capture correction expected state modes are mutually exclusive")
     if expected_revisions is not None and not isinstance(
             expected_revisions, Mapping):
         raise SyncError("capture correction expected revisions are invalid")
+    if expected_existing is not None and not isinstance(
+            expected_existing, Mapping):
+        raise SyncError("capture correction expected state is invalid")
     existing = ({
         (str(row.get("capture_id")), str(row.get("asset_id"))): row
         for row in list_capture_corrections(
@@ -1581,11 +1640,8 @@ def publish_capture_corrections(
     for (capture_id, asset_id), row in desired.items():
         key = (capture_id, asset_id)
         previous = existing.get(key)
-        if (previous is not None and
-                str(previous.get("correction_id") or "") ==
-                row["correction_id"] and
-                _correction_display_sha256(previous.get("result")) ==
-                _correction_display_sha256(row["result"])):
+        if previous is not None and _capture_correction_writable_equal(
+                previous, row):
             continue
         try:
             if expected_revisions is not None:
@@ -1602,7 +1658,27 @@ def publish_capture_corrections(
             else:
                 revision = previous.get("revision") \
                     if previous is not None else None
-            if revision is None:
+                if expected_existing is not None:
+                    if key not in expected_existing:
+                        raise SyncError(
+                            "capture correction expected state is missing")
+                    expected_previous_revision = expected_existing[key]
+                    if (expected_previous_revision is not None and
+                            (isinstance(expected_previous_revision, bool) or
+                             not isinstance(expected_previous_revision, int) or
+                             expected_previous_revision < 1)):
+                        raise SyncError(
+                            "capture correction expected revision is invalid")
+                    if revision != expected_previous_revision:
+                        raise SyncError(
+                            "cloud correction changed since candidate "
+                            "selection")
+            insert = (
+                revision is None
+                if expected_revisions is not None
+                else previous is None
+            )
+            if insert:
                 response = _rest(
                     cfg, "POST",
                     f"{table}?on_conflict=capture_id,asset_id"

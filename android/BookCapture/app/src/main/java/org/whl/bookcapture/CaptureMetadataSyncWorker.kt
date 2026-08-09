@@ -404,10 +404,10 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
     }
 
     /** Validate, download, and install one published desktop correction,
-     * mirroring UploadWorker's cloud-display install choreography. True when
-     * the row addressed this handset's asset lineage — a fresh install
-     * (Ready) or one recorded by an earlier pull (AlreadyApplied) — exactly
-     * the cases whose durable re-OCR marker may still be pending. */
+     * mirroring UploadWorker's cloud-display install choreography. True only
+     * when the exact row is already valid locally or its verified bytes were
+     * installed successfully — exactly the cases whose durable re-OCR marker
+     * may still be pending. */
     private suspend fun applyDesktopCorrection(
         ctx: Context,
         client: SupabaseClient,
@@ -422,21 +422,40 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                 ) != CloudUploadOwnership.ALLOWED || !entry.dir.isDirectory) {
                 return@withLock null
             }
-            when (val decision = validateDesktopCorrection(
-                PhotoAssetStore.read(entry.dir),
-                row,
-                owner,
-            )) {
-                DesktopCorrectionDecision.AlreadyApplied ->
-                    DesktopCorrectionStage.AlreadyApplied
-                is DesktopCorrectionDecision.Ready -> DesktopCorrectionStage.Download(
-                    decision.plan,
+            val contract = PhotoAssetStore.read(entry.dir)
+            fun download(plan: DesktopCorrectionInstallPlan) =
+                DesktopCorrectionStage.Download(
+                    plan,
                     File.createTempFile(
                         ".desktop-${row.correctionId.take(12)}-",
                         ".part",
                         entry.dir,
                     ),
                 )
+            when (val decision = validateDesktopCorrection(
+                contract,
+                row,
+                owner,
+            )) {
+                is DesktopCorrectionDecision.AlreadyApplied -> {
+                    val asset = contract.assets.firstOrNull { it.assetId == row.assetId }
+                        ?: return@withLock null
+                    val installed = File(entry.dir, asset.display.reference)
+                    if (verifyCloudDisplayDownload(
+                            installed,
+                            decision.plan.artifact,
+                            decision.plan.artifact.mime,
+                            installed.length(),
+                        ) == null && PhotoAssetStore.acknowledgeDesktopCorrectionRow(
+                            entry.dir,
+                            decision.plan,
+                        )) {
+                        DesktopCorrectionStage.AlreadyApplied
+                    } else {
+                        download(decision.plan)
+                    }
+                }
+                is DesktopCorrectionDecision.Ready -> download(decision.plan)
                 else -> null
             }
         } ?: return false
@@ -457,23 +476,19 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                     plan.artifact,
                     receipt.contentType,
                     receipt.bytes,
-                ) == null) {
-                if (Prefs.userId(ctx) != owner) throw SupabaseClient.AccountChanged()
-                EntryOperationLocks.withLock(row.captureId) {
-                    val entry = Entries.find(ctx, row.captureId) ?: return@withLock
-                    if (entry.dir.isDirectory) {
-                        PhotoAssetStore.installDesktopCorrectionDisplay(
-                            entry.dir,
-                            plan,
-                            temporary,
-                            receipt,
-                        )
-                    }
-                }
+                ) != null) return false
+            if (Prefs.userId(ctx) != owner) throw SupabaseClient.AccountChanged()
+            return EntryOperationLocks.withLock(row.captureId) {
+                val entry = Entries.find(ctx, row.captureId)
+                    ?: return@withLock false
+                entry.dir.isDirectory &&
+                    PhotoAssetStore.installDesktopCorrectionDisplay(
+                        entry.dir,
+                        plan,
+                        temporary,
+                        receipt,
+                    )
             }
-            // A failed byte verification leaves the row unapplied for the
-            // next pull, but the lineage matched, so re-arming stays correct.
-            return true
         } finally {
             temporary.delete()
         }
