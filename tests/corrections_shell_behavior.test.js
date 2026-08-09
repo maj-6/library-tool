@@ -5316,7 +5316,7 @@ test("capture geometry is drawn without re-applying the display orientation", ()
 });
 
 
-function editorGateHarness() {
+function editorGateHarness(options = {}) {
   const documentRef = fakeDocument();
   const windowRef = {
     localStorage: new MemoryStorage(),
@@ -5343,6 +5343,7 @@ function editorGateHarness() {
     itemProperties: false,
     ocrProposalsFeature: false,
     chPanelFeature: false,
+    ...options,
   });
   return { documentRef, host, rootElement, shell };
 }
@@ -5397,25 +5398,62 @@ function overlayRegionRow(id) {
 }
 
 
-test("an equivalent republish updates the mounted image editor in place", () => {
-  const { host, shell } = editorGateHarness();
+test("a metadata revision silently advances the mounted editor contract", async () => {
+  const invocations = [];
+  const { documentRef, host, shell } = editorGateHarness({
+    invokeCommand: async (_commandId, payload) => {
+      invocations.push(payload);
+      return { job_id: "metadata-rebase-job" };
+    },
+  });
   shell.setResource(editableImageResource("r1"));
   const surface = host.querySelector(".perspective-editor");
+  const toolbar = host.querySelector(".perspective-toolbar");
+  const queue = host.querySelector(".perspective-queue-button");
   assert.ok(surface, "the perspective editor mounts for the image resource");
   assert.equal(host.querySelectorAll("[data-overlay-key]").length, 0);
+  queue.focus();
+  assert.equal(documentRef.activeElement, queue);
 
-  shell.setResource(editableImageResource("r1", {
+  shell.setResource(editableImageResource("r2", {
     url: "/capture-9-r1-second-lease.jpg",
+    resourceRef: {
+      id: "capture-9-display",
+      revision: "display-r1",
+      variant: "display",
+    },
     regions: [overlayRegionRow("region-1")],
   }));
 
   assert.equal(host.querySelector(".perspective-editor"), surface,
     "an equivalent republish must not remount the editor");
+  assert.equal(host.querySelector(".perspective-toolbar"), toolbar,
+    "metadata convergence keeps the existing toolbar node");
+  assert.equal(host.querySelector(".perspective-queue-button"), queue,
+    "metadata convergence keeps the existing Queue node");
+  assert.equal(documentRef.activeElement, queue,
+    "the silent update does not steal focus from Queue");
   assert.equal(host.querySelector(".perspective-image").src,
     "/capture-9-r1.jpg",
-    "the mounted image keeps the URL it is already displaying");
+    "equal bytes keep the already-decoded image and its lease");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg",
+    "the unused renewed lease does not become the displayed resource");
+  assert.deepEqual(shell.displayedEditorUrls(), ["/capture-9-r1.jpg"],
+    "only the lease actually backing the mounted image stays retained");
+  assert.equal(shell.editorCanvasController.getPins().artifact_revision,
+    "artifact-r2", "the optimistic transform pin advances in place");
+  assert.equal(shell.state.resource.summary.revision, "artifact-r2");
+  assert.equal(shell.pendingResource, null);
+  assert.equal(host.querySelector("[data-editor-refresh-affordance]"), null);
   assert.equal(host.querySelectorAll("[data-overlay-key]").length, 1,
     "arriving regions land on the mounted overlay without a remount");
+  assert.equal(queue.disabled, false,
+    "background metadata convergence never greys the toolbar action");
+  queue.emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].command.artifact_revision, "artifact-r2",
+    "Queue uses the silently refreshed precondition");
   host.querySelector("[data-image-tool='polygon']").emit("click");
   assert.equal(surface.dataset.activeTool, "polygon",
     "the original editor's listeners remain live");
@@ -5492,9 +5530,52 @@ test("a transient loading republish keeps the current image on screen", () => {
 });
 
 
-test("a newer revision defers behind a reload affordance while the editor is dirty", () => {
-  const { host, shell } = editorGateHarness();
+test("a failed background resolution keeps the confirmed editor usable", () => {
+  const { host, shell } = editorGateHarness({
+    invokeCommand: async () => ({ job_id: "confirmed-raster-job" }),
+  });
   shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  const queue = host.querySelector(".perspective-queue-button");
+
+  shell.setResource({
+    id: "capture-9",
+    label: "capture 9",
+    kind: "captured-image",
+    family: "image",
+    media_type: "image/jpeg",
+    missing: true,
+    error: { message: "The newer raster could not be resolved" },
+    summary: { itemId: "book-1", revision: "artifact-r2" },
+  });
+
+  assert.equal(host.querySelector(".perspective-editor"), surface,
+    "a resolution error is not navigation and cannot destroy the draft");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg");
+  assert.equal(host.querySelector(".perspective-image").src,
+    "/capture-9-r1.jpg");
+  assert.doesNotMatch(host.textContent, /Image unavailable/);
+  assert.equal(queue.disabled, false,
+    "the last confirmed raster remains queueable after a refresh error");
+  shell.destroy();
+});
+
+
+test("a newer raster rebases invisibly without greying Queue or losing edits", async () => {
+  const invocations = [];
+  const { host, shell } = editorGateHarness({
+    invokeCommand: async (_commandId, payload) => {
+      invocations.push(payload);
+      return { job_id: "display-rebase-job" };
+    },
+  });
+  shell.setResource(editableImageResource("r1"));
+  const retainedUrls = [];
+  shell.artifactsFeature = {
+    sweepRasterLeases() {
+      retainedUrls.push(shell.displayedEditorUrls().slice().sort());
+    },
+  };
   const surface = host.querySelector(".perspective-editor");
   const canvas = host.querySelector("[data-classification-canvas]");
   canvas.getBoundingClientRect = () => ({
@@ -5505,43 +5586,189 @@ test("a newer revision defers behind a reload affordance while the editor is dir
   canvas.emit("pointerdown", {
     pointerId: 3, button: 0, clientX: 12, clientY: 10,
   });
-  assert.ok(shell.editorCanvasState && shell.editorCanvasState.gesture,
-    "a corner drag is in progress");
+  canvas.emit("pointerup", {
+    pointerId: 3, button: 0, clientX: 36, clientY: 24,
+  });
+  assert.equal(shell.editorCanvasState.gesture, null);
+  assert.equal(shell.editorCanvasState.undoStack.length, 1,
+    "the local corner edit is committed but not queued");
+  const editedQuad = shell.editorCanvasState.quad.map((point) => [...point]);
+  const queue = host.querySelector(".perspective-queue-button");
+  assert.equal(queue.disabled, false);
 
-  shell.setResource(editableImageResource("r2"));
+  shell.setResource(editableImageResource("r2", {
+    correction: {
+      ...editableImageResource("r2").correction,
+      source_revision: "source-r2",
+      source_sha256: "b".repeat(64),
+    },
+  }));
 
   assert.equal(host.querySelector(".perspective-editor"), surface,
-    "a non-equivalent refresh must not destroy in-progress work");
-  assert.ok(shell.editorCanvasState.gesture, "the drag survives the publish");
-  const affordance = host.querySelector("[data-editor-refresh-affordance]");
-  assert.ok(affordance, "a compact newer-revision affordance is surfaced");
-  assert.equal(shell.pendingResource.url, "/capture-9-r2.jpg");
-  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg",
-    "commands keep operating on the mounted revision until reload");
-
-  affordance.querySelector("[data-editor-refresh-reload]").emit("click");
-  const replacement = host.querySelector(".perspective-editor");
-  assert.ok(replacement, "reload mounts an editor");
-  assert.notEqual(replacement, surface, "reload swaps in the newer revision");
+    "the display refresh stays inside the mounted editor");
+  assert.deepEqual(shell.editorCanvasState.quad, editedQuad);
   assert.equal(host.querySelector("[data-editor-refresh-affordance]"), null,
-    "the affordance clears once the newer revision is mounted");
+    "background convergence has no visible reload UI");
+  assert.equal(shell.pendingResource.url, "/capture-9-r2.jpg");
+  assert.equal(shell.editorCanvasController.getDisplayedUrl(),
+    "/capture-9-r1.jpg", "old pixels remain visible during preload");
+  assert.equal(shell.editorCanvasController.getPendingResourceUrl(),
+    "/capture-9-r2.jpg", "the incoming lease stays retained during preload");
+  assert.deepEqual(retainedUrls.at(-1), [
+    "/capture-9-r1.jpg",
+    "/capture-9-r2.jpg",
+  ], "both raster leases remain live until the swap");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg",
+    "shell state advances only with the atomic pixel/pin swap");
+  assert.equal(shell.editorCanvasController.getPins().artifact_revision,
+    "artifact-r1", "transform authority stays on the displayed raster");
+  assert.equal(queue.disabled, false,
+    "Queue stays actionable while the replacement raster preloads");
+
+  shell.editorCanvasController.getPendingResourceImage().emit("load");
+
+  assert.equal(host.querySelector(".perspective-image").src, "/capture-9-r2.jpg",
+    "the mounted image starts decoding only after the off-screen preload");
+  assert.equal(shell.editorCanvasController.getDisplayedUrl(),
+    "/capture-9-r1.jpg", "the old raster remains authoritative until mounted load");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg");
+  assert.equal(shell.editorCanvasController.getPins().artifact_revision,
+    "artifact-r1", "pins cannot advance ahead of the mounted pixels");
+  assert.equal(shell.pendingResource.url, "/capture-9-r2.jpg");
+  assert.deepEqual(shell.displayedEditorUrls().slice().sort(), [
+    "/capture-9-r1.jpg",
+    "/capture-9-r2.jpg",
+  ], "both leases remain protected during the mounted-image decode");
+  assert.equal(queue.disabled, false,
+    "Queue stays actionable between preload and mounted-image load");
+
+  host.querySelector(".perspective-image").emit("load");
+
+  assert.equal(host.querySelector(".perspective-editor"), surface);
   assert.equal(shell.pendingResource, null);
+  assert.equal(shell.state.resource.url, "/capture-9-r2.jpg");
+  assert.equal(host.querySelector(".perspective-image").src, "/capture-9-r2.jpg");
+  assert.deepEqual(retainedUrls.at(-1), ["/capture-9-r2.jpg"],
+    "the old raster lease becomes releasable only after the swap");
+  assert.deepEqual(shell.editorCanvasState.quad, editedQuad,
+    "normalized user intent survives the display generation change");
+  assert.equal(shell.editorCanvasState.undoStack.length, 1);
+  assert.equal(shell.editorCanvasController.getPins().source_revision, "source-r2");
+  assert.equal(shell.editorCanvasController.getPins().source_sha256, "b".repeat(64));
+  assert.equal(queue.disabled, false,
+    "Queue remains actionable after the background swap");
+
+  queue.emit("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].command.artifact_revision, "artifact-r2");
+  assert.equal(invocations[0].command.source_revision, "source-r2");
+  assert.equal(invocations[0].command.source_sha256, "b".repeat(64));
+  shell.destroy();
+});
+
+
+test("a mounted-image error after preload keeps the old raster usable", () => {
+  const { host, shell } = editorGateHarness({
+    invokeCommand: async () => ({ job_id: "unused-error-job" }),
+  });
+  shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  const image = host.querySelector(".perspective-image");
+  const queue = host.querySelector(".perspective-queue-button");
+  const retainedUrls = [];
+  shell.artifactsFeature = {
+    sweepRasterLeases() {
+      retainedUrls.push(shell.displayedEditorUrls().slice().sort());
+    },
+  };
+
+  shell.setResource(editableImageResource("r2", {
+    correction: {
+      ...editableImageResource("r2").correction,
+      source_revision: "source-r2",
+      source_sha256: "b".repeat(64),
+    },
+  }));
+  shell.editorCanvasController.getPendingResourceImage().emit("load");
+  assert.equal(image.src, "/capture-9-r2.jpg",
+    "the successful preload advances only the mounted decode candidate");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg");
+  assert.equal(shell.editorCanvasController.getPins().source_revision, "source-r1");
+
+  image.emit("error");
+
+  assert.equal(host.querySelector(".perspective-editor"), surface,
+    "a failed mounted decode does not remount the editor");
+  assert.equal(image.src, "/capture-9-r1.jpg",
+    "the mounted image returns to the last confirmed raster");
+  assert.equal(shell.pendingResource, null);
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg");
+  assert.equal(shell.editorCanvasController.getDisplayedUrl(), "/capture-9-r1.jpg");
+  assert.equal(shell.editorCanvasController.getPins().artifact_revision, "artifact-r1");
+  assert.equal(shell.editorCanvasController.getPins().source_revision, "source-r1");
+  assert.deepEqual(retainedUrls.at(-1), ["/capture-9-r1.jpg"],
+    "the failed replacement lease is released after rollback");
+  assert.equal(queue.disabled, false,
+    "Queue remains usable against the confirmed old raster");
+  shell.destroy();
+});
+
+
+test("a loaded background raster waits for an active gesture boundary", () => {
+  const { host, shell } = editorGateHarness();
+  shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  const canvas = host.querySelector("[data-classification-canvas]");
+  canvas.getBoundingClientRect = () => ({
+    left: 0, top: 0, width: 400, height: 300,
+  });
+  canvas.setPointerCapture = () => {};
+  host.querySelector("[data-image-tool='perspective']").emit("click");
+  canvas.emit("pointerdown", {
+    pointerId: 7, button: 0, clientX: 16, clientY: 12,
+  });
+  assert.ok(shell.editorCanvasState.gesture);
+
+  shell.setResource(editableImageResource("r2"));
+  shell.editorCanvasController.getPendingResourceImage().emit("load");
+
+  assert.ok(shell.editorCanvasState.gesture,
+    "the pixel preload does not interrupt the active pointer owner");
+  assert.equal(host.querySelector(".perspective-editor"), surface);
+  assert.equal(host.querySelector(".perspective-image").src, "/capture-9-r1.jpg");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg");
+  assert.equal(host.querySelector("[data-editor-refresh-affordance]"), null);
+
+  canvas.emit("pointerup", {
+    pointerId: 7, button: 0, clientX: 48, clientY: 30,
+  });
+  host.querySelector(".perspective-image").emit("load");
+
+  assert.equal(shell.editorCanvasState.gesture, null);
+  assert.equal(shell.editorCanvasState.undoStack.length, 1);
+  assert.equal(host.querySelector(".perspective-editor"), surface);
+  assert.equal(host.querySelector(".perspective-image").src, "/capture-9-r2.jpg");
   assert.equal(shell.state.resource.url, "/capture-9-r2.jpg");
   shell.destroy();
 });
 
 
-test("a newer revision remounts immediately when nothing is at risk", () => {
-  const { host, shell } = editorGateHarness();
+test("a clean editor also follows a newer raster in place", () => {
+  const { host, shell } = editorGateHarness({
+    invokeCommand: async () => ({ job_id: "clean-rebase-job" }),
+  });
   shell.setResource(editableImageResource("r1"));
   const surface = host.querySelector(".perspective-editor");
   shell.setResource(editableImageResource("r2"));
-  const replacement = host.querySelector(".perspective-editor");
-  assert.ok(replacement);
-  assert.notEqual(replacement, surface,
-    "a clean editor follows the newer revision without deferring");
+  shell.editorCanvasController.getPendingResourceImage().emit("load");
+  host.querySelector(".perspective-image").emit("load");
+  assert.equal(host.querySelector(".perspective-editor"), surface,
+    "a clean convergence does not remount or reset the toolbar");
   assert.equal(host.querySelector("[data-editor-refresh-affordance]"), null);
   assert.equal(host.querySelector(".perspective-image").src,
     "/capture-9-r2.jpg");
+  assert.equal(host.querySelector(".perspective-queue-button").disabled, false,
+    "Select mode keeps the valid toolbar queue action available");
   shell.destroy();
 });

@@ -509,12 +509,6 @@
       summary.itemId || summary.item_id || "");
   }
 
-  function resourceRevisionToken(resource) {
-    if (!resource || typeof resource !== "object") return "";
-    const summary = resource.summary || {};
-    return String(summary.revision || resource.revision || "");
-  }
-
   function resourceBytesIdentity(resource) {
     const ref = resource && resource.resourceRef;
     if (!ref || typeof ref !== "object") return "";
@@ -594,8 +588,9 @@
       // publishes against these instead of remounting on every publish.
       this.renderedResource = null;
       this.renderedEditorId = null;
-      // A newer non-equivalent resource held back because the mounted editor
-      // carries uncommitted user state; applied via the reload affordance.
+      // A newer display generation being preloaded by the mounted editor. It
+      // remains here only to retain the incoming raster lease until the
+      // editor atomically swaps pixels and correction pins in the background.
       this.pendingResource = null;
       // Latest image-editor state, mirrored through onStateChange, so the
       // gate can tell whether a remount would destroy in-progress work.
@@ -759,6 +754,10 @@
               : null,
           );
         },
+        onResourceChange: (resource) =>
+          this.commitMountedEditorResource(resource),
+        onResourceUpdateError: (error, resource) =>
+          this.failMountedEditorResourceUpdate(error, resource),
         onMount: (controller, resource) =>
           this.mountArtifactOverlay(controller, resource),
       };
@@ -3535,21 +3534,17 @@
       if (status === "queued" || status === "complete") return false;
       return Boolean(
         Array.isArray(state.undoStack) && state.undoStack.length ||
+        Array.isArray(state.redoStack) && state.redoStack.length ||
         Array.isArray(state.operations) && state.operations.length ||
         state.maskPolygon,
       );
     }
 
     // Decides what a newly published resource means for the mounted editor:
-    // - "render": mount or replace the editor (identity/family change, or a
-    //   genuinely new revision with no uncommitted work at risk);
-    // - "update": the resource is equivalent for editing purposes (same
-    //   artifact, revision, and underlying bytes) — apply metadata in place;
-    // - "hold": a transient loading placeholder for the artifact already on
-    //   screen — keep showing the current image;
-    // - "defer": a non-equivalent replacement while the editor holds
-    //   uncommitted user state — keep the editor and surface a reload
-    //   affordance instead of destroying the work.
+    // - "render": mount or replace after an identity or family change;
+    // - "update": advance metadata and correction pins over identical bytes;
+    // - "rebase": preload a newer raster for an atomic in-place swap;
+    // - "hold": keep the current image through a loading placeholder.
     classifyResourceUpdate(next) {
       const rendered = this.renderedResource;
       if (!rendered || !this.renderedEditorId) return "render";
@@ -3558,50 +3553,91 @@
       if (!next || typeof next !== "object") return "render";
       if (!sameEditResourceIdentity(rendered, next)) return "render";
       if (next.loading === true && !next.url) return "hold";
-      if (deps.resourceFamily(next) === "image" &&
-          typeof next.url === "string" && next.url &&
-          resourceRevisionToken(rendered) === resourceRevisionToken(next) &&
-          resourceBytesIdentity(rendered) === resourceBytesIdentity(next)) {
-        return "update";
+      if (deps.resourceFamily(rendered) === "image" && !next.url &&
+          (next.missing === true || next.error)) {
+        // A failed background resolution is not navigation. Keep the last
+        // confirmed raster and draft mounted; the artifact feature already
+        // reports the error through the ordinary status surface.
+        return "hold";
       }
-      return this.editorHoldsDirtyState() ? "defer" : "render";
+      if (deps.resourceFamily(next) === "image" &&
+          typeof next.url === "string" && next.url) {
+        const renderedBytes = resourceBytesIdentity(rendered);
+        if (renderedBytes && renderedBytes === resourceBytesIdentity(next)) {
+          return "update";
+        }
+        if (this.editorCanvasController &&
+            typeof this.editorCanvasController.updateResource === "function") {
+          return "rebase";
+        }
+      }
+      return "render";
     }
 
     setResource(resource) {
       const verdict = this.classifyResourceUpdate(resource);
       if (verdict === "hold") return;
-      if (verdict === "defer") {
+      if (["update", "rebase"].includes(verdict) &&
+          this.editorRegistry.selectedEditorId === this.renderedEditorId &&
+          this.editorCanvasController &&
+          typeof this.editorCanvasController.updateResource === "function") {
         this.pendingResource = resource;
-        this.showEditorRefreshAffordance();
-        this.sweepArtifactRasterLeases();
-        return;
+        if (this.editorCanvasController.updateResource(resource)) {
+          // Equal-byte updates commit synchronously. A changed raster remains
+          // retained here while the mounted editor preloads it off-screen.
+          this.refreshEditorSelector();
+          this.sweepArtifactRasterLeases();
+          return;
+        }
+        this.pendingResource = null;
       }
       this.state.setResource(resource);
       this.editorRegistry.setResource(resource);
-      if (verdict === "update" &&
-          this.editorRegistry.selectedEditorId === this.renderedEditorId) {
-        // renderedResource deliberately keeps describing what the DOM shows
-        // (including the blob URL the mounted <img> still points at); only
-        // the metadata travels into the live editor.
-        this.refreshEditorSelector();
-        this.syncMountedEditorMetadata(resource);
-        this.sweepArtifactRasterLeases();
-        if (!this.artifactsFeature) this.renderProperties();
-        return;
-      }
       this.refreshEditorSelector();
       this.renderEditor();
       if (!this.artifactsFeature) this.renderProperties();
     }
 
-    syncMountedEditorMetadata(resource) {
+    commitMountedEditorResource(resource) {
+      if (this.destroyed || !resource ||
+          !sameEditResourceIdentity(this.renderedResource, resource) ||
+          this.editorRegistry.selectedEditorId !== this.renderedEditorId) {
+        return false;
+      }
+      this.pendingResource = null;
+      this.state.setResource(resource);
+      this.editorRegistry.setResource(resource);
+      this.renderedResource = resource;
+      this.refreshEditorSelector();
+      replaceText(this.root.querySelector("[data-editor-resource-label]"),
+        deps.resourceLabel(resource));
       if (typeof this.activeOverlayUpdate === "function") {
         this.activeOverlayUpdate(resource);
       }
+      if (!this.artifactsFeature) this.renderProperties();
+      this.sweepArtifactRasterLeases();
+      return true;
+    }
+
+    failMountedEditorResourceUpdate(error, resource) {
+      if (this.pendingResource === resource) this.pendingResource = null;
+      this.setStatus(
+        error && error.message || "The newer image revision could not be loaded",
+        true,
+      );
+      this.sweepArtifactRasterLeases();
+      return false;
     }
 
     displayedEditorUrls() {
       const urls = [];
+      if (this.editorCanvasController) {
+        for (const method of ["getDisplayedUrl", "getPendingResourceUrl"]) {
+          if (typeof this.editorCanvasController[method] !== "function") continue;
+          const value = this.editorCanvasController[method]();
+          if (typeof value === "string" && value) urls.push(value);
+        }
+      }
       for (const value of [
         this.renderedResource,
         this.pendingResource,
@@ -3611,7 +3647,7 @@
           urls.push(value.url);
         }
       }
-      return urls;
+      return Array.from(new Set(urls));
     }
 
     sweepArtifactRasterLeases() {
@@ -3619,40 +3655,6 @@
       if (feature && typeof feature.sweepRasterLeases === "function") {
         feature.sweepRasterLeases();
       }
-    }
-
-    showEditorRefreshAffordance() {
-      const host = this.root.querySelector("[data-editor-host]");
-      if (!host || !this.documentRef) return null;
-      let bar = host.querySelector("[data-editor-refresh-affordance]");
-      if (bar) return bar;
-      bar = this.documentRef.createElement("div");
-      bar.className = "editor-refresh-affordance";
-      bar.setAttribute("data-editor-refresh-affordance", "");
-      bar.setAttribute("role", "status");
-      const label = this.documentRef.createElement("span");
-      label.textContent = "Newer revision available";
-      const reload = this.documentRef.createElement("button");
-      reload.type = "button";
-      reload.className = "editor-refresh-reload";
-      reload.setAttribute("data-editor-refresh-reload", "");
-      reload.textContent = "Reload";
-      this.listen(reload, "click", () => this.applyPendingResource());
-      bar.append(label, reload);
-      host.append(bar);
-      return bar;
-    }
-
-    applyPendingResource() {
-      const pending = this.pendingResource;
-      if (!pending) return null;
-      this.pendingResource = null;
-      this.state.setResource(pending);
-      this.editorRegistry.setResource(pending);
-      this.refreshEditorSelector();
-      this.renderEditor();
-      if (!this.artifactsFeature) this.renderProperties();
-      return pending;
     }
 
     refreshEditorSelector() {

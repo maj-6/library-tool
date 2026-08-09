@@ -172,6 +172,30 @@
       ? "Edited auto proposal" : "Edited full-image fallback";
   }
 
+  function rasterResourceIdentity(resource) {
+    const ref = resource && isPlainObject(resource.resourceRef)
+      ? resource.resourceRef : null;
+    if (!ref) return "";
+    return [
+      String(ref.id || ref.resource_id || ""),
+      String(ref.revision || ""),
+      String(ref.variant || ""),
+    ].join("|");
+  }
+
+  function stateHoldsGeometryIntent(state) {
+    if (!state) return false;
+    if (state.gesture || state.maskDraft) return true;
+    const status = state.submission && state.submission.status;
+    if (status === "submitting" || status === "retryable") return true;
+    if (status === "queued" || status === "complete") return false;
+    return Boolean(
+      Array.isArray(state.undoStack) && state.undoStack.length ||
+      Array.isArray(state.redoStack) && state.redoStack.length ||
+      state.maskPolygon,
+    );
+  }
+
   function addListener(removers, target, type, handler, options) {
     if (!target || typeof target.addEventListener !== "function") return;
     target.addEventListener(type, handler, options);
@@ -310,10 +334,12 @@
       let destroyed = false;
       let observer = null;
       let mountCleanup = null;
+      let pendingResourceUpdate = null;
       const instanceId = `perspective-editor-${++rendererSequence}`;
-      const url = safeRasterUrl(resource);
+      let activeResource = resource;
+      let activeUrl = safeRasterUrl(activeResource);
 
-      if (!url) {
+      if (!activeUrl) {
         const unavailable = element(documentRef, "section", "editor-unsupported");
         unavailable.append(
           element(documentRef, "h2", "", "Image unavailable"),
@@ -328,7 +354,7 @@
         return () => {};
       }
 
-      const contract = correctionResourceContract(resource);
+      let contract = correctionResourceContract(activeResource);
       let state = createImageEditorState({
         proposal: contract.proposal,
         sourceRevision: contract.pins && contract.pins.source_revision,
@@ -344,7 +370,7 @@
       surface.setAttribute("role", "region");
       surface.setAttribute(
         "aria-label",
-        `Perspective correction editor for ${resourceLabel(resource)}`,
+        `Perspective correction editor for ${resourceLabel(activeResource)}`,
       );
 
       const toolbar = element(documentRef, "header", "perspective-toolbar");
@@ -376,7 +402,7 @@
       redoButton.setAttribute("aria-keyshortcuts", "Control+Shift+Z");
       historyGroup.append(undoButton, redoButton);
 
-      const originalBackup = originalBackupContract(resource);
+      let originalBackup = originalBackupContract(activeResource);
       let originalActions = null;
       let viewOriginalButton = null;
       let restoreOriginalButton = null;
@@ -429,8 +455,8 @@
       const viewport = element(documentRef, "div", "perspective-viewport");
       const imageStage = element(documentRef, "div", "perspective-image-stage");
       const image = element(documentRef, "img", "perspective-image");
-      image.src = url;
-      image.alt = resourceLabel(resource);
+      image.src = activeUrl;
+      image.alt = resourceLabel(activeResource);
       image.decoding = "async";
       image.draggable = false;
       const canvas = element(documentRef, "canvas", "perspective-overlay-canvas");
@@ -513,7 +539,7 @@
       const queueStatus = element(documentRef, "p", "perspective-queue-status");
       queueStatus.setAttribute("role", "status");
       queueStatus.setAttribute("aria-live", "polite");
-      const originalStatus = originalBackup
+      let originalStatus = originalBackup
         ? element(documentRef, "p", "perspective-original-status") : null;
       if (originalStatus) {
         originalStatus.setAttribute("role", "status");
@@ -536,7 +562,7 @@
         ? options.isModalOpen(documentRef) === true
         : visibleModal(documentRef);
       const hostHasSelection = () => typeof options.hasSelection === "function"
-        ? options.hasSelection(resource) === true
+        ? options.hasSelection(activeResource) === true
         : state.selectionPresent;
       let originalBusy = "";
       let originalStatusText = "";
@@ -545,18 +571,59 @@
       let originalPreviewImage = null;
       let originalPreviewUrl = "";
       let originalPreviewUrlApi = null;
-      let restoreOperationId = "";
+      let originalResourceEpoch = 0;
+      let originalActionToken = null;
+      let restoreAttempt = null;
 
       function originalIdentity() {
         const pins = contract.pins || {};
         return {
-          itemId: String(pins.item_id || resource.itemId || ""),
-          artifactId: String(pins.artifact_id || resource.id || ""),
+          itemId: String(pins.item_id || activeResource.itemId || ""),
+          artifactId: String(pins.artifact_id || activeResource.id || ""),
           revision: String(
             pins.artifact_revision ||
-            resource.summary && resource.summary.revision || "",
+            activeResource.summary && activeResource.summary.revision || "",
           ),
         };
+      }
+
+      function originalIdentityKey(identity = originalIdentity()) {
+        return JSON.stringify([
+          String(identity && identity.itemId || ""),
+          String(identity && identity.artifactId || ""),
+          String(identity && identity.revision || ""),
+        ]);
+      }
+
+      function originalAuthorityKey() {
+        const backup = originalBackup || {};
+        return JSON.stringify([
+          originalIdentityKey(),
+          backup.available === true,
+          backup.restore_available === true,
+          String(backup.sha256 || ""),
+          Number(backup.bytes) || 0,
+          String(backup.media_type || ""),
+        ]);
+      }
+
+      function originalActionIsCurrent(token, epoch, identity) {
+        return !destroyed && originalActionToken === token &&
+          originalResourceEpoch === epoch &&
+          originalIdentityKey() === originalIdentityKey(identity);
+      }
+
+      function advanceOriginalResourceEpoch() {
+        originalResourceEpoch += 1;
+        originalActionToken = null;
+        originalBusy = "";
+        originalStatusText = "";
+        originalStatusError = false;
+        closeOriginalPreview();
+        if (restoreAttempt &&
+            restoreAttempt.identityKey !== originalIdentityKey()) {
+          restoreAttempt = null;
+        }
       }
 
       function originalApi() {
@@ -612,7 +679,7 @@
           "img",
           "perspective-original-preview",
         );
-        preview.alt = `Original capture for ${resourceLabel(resource)}`;
+        preview.alt = `Original capture for ${resourceLabel(activeResource)}`;
         const closeButton = element(
           documentRef,
           "button",
@@ -667,11 +734,13 @@
         originalStatusText = error && error.message || fallback;
         originalStatusError = true;
         if (typeof options.onCommandError === "function") {
-          options.onCommandError(error, resource);
+          options.onCommandError(error, activeResource);
         }
       }
 
       async function requestViewOriginal() {
+        if (destroyed || originalBusy) return null;
+        if (!await waitForResourceUpdate()) return null;
         const identity = originalIdentity();
         const api = originalApi();
         if (destroyed || originalBusy || !originalBackup || !api ||
@@ -679,6 +748,9 @@
             !identity.itemId || !identity.artifactId || !identity.revision) {
           return null;
         }
+        const epoch = originalResourceEpoch;
+        const token = { kind: "view", epoch };
+        originalActionToken = token;
         originalBusy = "view";
         originalStatusText = "Retrieving and verifying the original…";
         originalStatusError = false;
@@ -689,23 +761,26 @@
             artifactId: identity.artifactId,
             revision: identity.revision,
           });
-          if (destroyed) return null;
+          if (!originalActionIsCurrent(token, epoch, identity)) return null;
           presentOriginal(resolved);
           originalStatusText = "Verified original opened from backup.";
           return resolved;
         } catch (error) {
-          if (!destroyed) reportOriginalError(
+          if (originalActionIsCurrent(token, epoch, identity)) reportOriginalError(
             error,
             "The original backup could not be opened",
           );
           return null;
         } finally {
-          originalBusy = "";
-          update();
+          if (originalActionToken === token) {
+            originalActionToken = null;
+            originalBusy = "";
+            update();
+          }
         }
       }
 
-      async function confirmOriginalRestore(identity) {
+      async function confirmOriginalRestore(identity, resource) {
         const message =
           "Restore the original camera image? This will replace the corrected " +
           "display while keeping its correction history.";
@@ -721,7 +796,11 @@
       }
 
       async function requestRestoreOriginal() {
+        if (destroyed || originalBusy) return null;
+        if (!await waitForResourceUpdate()) return null;
         const identity = originalIdentity();
+        const identityKey = originalIdentityKey(identity);
+        const requestResource = activeResource;
         const api = originalApi();
         if (destroyed || originalBusy || !originalBackup ||
             originalBackup.restore_available !== true || !api ||
@@ -729,23 +808,40 @@
             !identity.itemId || !identity.artifactId || !identity.revision) {
           return null;
         }
+        const epoch = originalResourceEpoch;
+        const token = { kind: "restore", epoch };
+        originalActionToken = token;
         originalBusy = "confirm";
         update();
         let confirmed = false;
         try {
-          confirmed = await confirmOriginalRestore(identity);
+          confirmed = await confirmOriginalRestore(identity, requestResource);
         } catch (error) {
-          originalBusy = "";
-          reportOriginalError(error, "The restore confirmation failed");
-          update();
+          if (originalActionIsCurrent(token, epoch, identity)) {
+            reportOriginalError(error, "The restore confirmation failed");
+          }
+          if (originalActionToken === token) {
+            originalActionToken = null;
+            originalBusy = "";
+            update();
+          }
           return null;
         }
-        if (!confirmed || destroyed) {
-          originalBusy = "";
-          update();
+        if (!confirmed || !originalActionIsCurrent(token, epoch, identity)) {
+          if (originalActionToken === token) {
+            originalActionToken = null;
+            originalBusy = "";
+            update();
+          }
           return null;
         }
-        if (!restoreOperationId) restoreOperationId = operationId();
+        if (!restoreAttempt || restoreAttempt.identityKey !== identityKey) {
+          restoreAttempt = {
+            identityKey,
+            operationId: operationId(),
+          };
+        }
+        const attempt = restoreAttempt;
         originalBusy = "restore";
         originalStatusText = "Restoring the original display…";
         originalStatusError = false;
@@ -755,10 +851,10 @@
             itemId: identity.itemId,
             artifactId: identity.artifactId,
             expectedArtifactRevision: identity.revision,
-            idempotencyKey: restoreOperationId,
+            idempotencyKey: attempt.operationId,
           });
-          restoreOperationId = "";
-          if (destroyed) return receipt;
+          if (restoreAttempt === attempt) restoreAttempt = null;
+          if (!originalActionIsCurrent(token, epoch, identity)) return receipt;
           closeOriginalPreview();
           originalStatusText = "Original display restored.";
           if (typeof options.refreshAfterOriginalRestore === "function") {
@@ -768,10 +864,10 @@
                 artifactId: identity.artifactId,
                 preserveSelection: true,
                 receipt,
-                resource,
+                resource: requestResource,
               });
             } catch (refreshError) {
-              reportOriginalError(
+              if (originalActionIsCurrent(token, epoch, identity)) reportOriginalError(
                 refreshError,
                 "The original was restored, but the artifact could not be refreshed",
               );
@@ -779,17 +875,23 @@
           }
           return receipt;
         } catch (error) {
-          if (!(error && (error.retryable === true || error.ambiguous === true))) {
-            restoreOperationId = "";
+          const retryable = Boolean(
+            error && (error.retryable === true || error.ambiguous === true),
+          );
+          if (!retryable || originalIdentityKey() !== attempt.identityKey) {
+            if (restoreAttempt === attempt) restoreAttempt = null;
           }
-          if (!destroyed) reportOriginalError(
+          if (originalActionIsCurrent(token, epoch, identity)) reportOriginalError(
             error,
             "The original display could not be restored",
           );
           return null;
         } finally {
-          originalBusy = "";
-          update();
+          if (originalActionToken === token) {
+            originalActionToken = null;
+            originalBusy = "";
+            update();
+          }
         }
       }
 
@@ -816,15 +918,91 @@
         return "Quadrilateral geometry is valid.";
       }
 
+      function syncOriginalBackupControls() {
+        if (!originalBackup) {
+          if (originalActions) originalActions.hidden = true;
+          if (originalStatus) originalStatus.hidden = true;
+          return;
+        }
+        let insertActions = false;
+        if (!originalActions) {
+          originalActions = element(
+            documentRef,
+            "div",
+            "perspective-original-actions",
+          );
+          originalActions.setAttribute("role", "group");
+          originalActions.setAttribute("aria-label", "Original capture backup");
+          insertActions = true;
+        }
+        originalActions.hidden = false;
+        if (!viewOriginalButton) {
+          viewOriginalButton = element(
+            documentRef,
+            "button",
+            "perspective-view-original",
+            "View original",
+          );
+          viewOriginalButton.type = "button";
+          setData(viewOriginalButton, "originalAction", "view");
+          addListener(removers, viewOriginalButton, "click", () => {
+            void requestViewOriginal();
+          });
+          originalActions.append(viewOriginalButton);
+        }
+        if (originalBackup.restore_available === true && !restoreOriginalButton) {
+          restoreOriginalButton = element(
+            documentRef,
+            "button",
+            "perspective-restore-original",
+            "Restore original",
+          );
+          restoreOriginalButton.type = "button";
+          setData(restoreOriginalButton, "originalAction", "restore");
+          addListener(removers, restoreOriginalButton, "click", () => {
+            void requestRestoreOriginal();
+          });
+          originalActions.append(restoreOriginalButton);
+        }
+        if (restoreOriginalButton) {
+          restoreOriginalButton.hidden = originalBackup.restore_available !== true;
+        }
+        if (!originalStatus) {
+          originalStatus = element(
+            documentRef,
+            "p",
+            "perspective-original-status",
+          );
+          originalStatus.setAttribute("role", "status");
+          originalStatus.setAttribute("aria-live", "polite");
+          inspector.append(originalStatus);
+        }
+        originalStatus.hidden = false;
+        if (insertActions) {
+          if (typeof toolbar.insertBefore === "function") {
+            toolbar.insertBefore(originalActions, proposalBadge);
+          } else {
+            // The production DOM supports insertBefore. This bounded fallback
+            // keeps minimal test DOMs functional without replacing/focusing
+            // any existing toolbar control.
+            toolbar.append(originalActions);
+          }
+        }
+      }
+
       function queueAllowed() {
         if (!state || state.gesture || state.maskDraft || !state.validation.valid ||
             !sourcePinsValid(contract.pins) ||
             ["submitting", "queued", "complete"].includes(
               state.submission && state.submission.status,
             )) return false;
+        // Select controls overlay interaction, not transform validity. Keep
+        // the toolbar action available there; the Space shortcut remains
+        // deliberately scoped to Perspective mode.
+        if (state.tool === TOOLS.SELECT) return true;
         if (canQueueTransform(state, contract.pins)) return true;
         return typeof options.canQueue === "function" &&
-          options.canQueue({ state, resource, pins: contract.pins }) === true;
+          options.canQueue({ state, resource: activeResource, pins: contract.pins }) === true;
       }
 
       function toolInstruction() {
@@ -915,12 +1093,29 @@
         }
         draw();
         if (typeof options.onStateChange === "function") {
-          options.onStateChange(state, resource);
+          options.onStateChange(state, activeResource);
         }
       }
 
       function dispatch(action) {
         if (destroyed) return state;
+        const pending = pendingResourceUpdate;
+        const beginsBlockingIntent = action && (
+          action.type === "BEGIN_GESTURE" ||
+          action.type === "MASK_BEGIN" && state.tool === TOOLS.POLYGON
+        );
+        if (beginsBlockingIntent && pending && pending.bound &&
+            !pending.mountedLoaded) {
+          // A preloaded candidate may already be decoding in the mounted
+          // image. If editing begins in that narrow window, put the confirmed
+          // raster back before accepting the gesture. The loaded candidate is
+          // retained off-screen and will bind again at the edit boundary.
+          image.removeEventListener("load", pending.onMountedLoad);
+          image.removeEventListener("error", pending.onMountedError);
+          pending.mountedDecodeAttempt += 1;
+          pending.bound = false;
+          if (image.src !== activeUrl) image.src = activeUrl;
+        }
         if (action && action.type === "SET_TOOL" &&
             action.tool !== TOOLS.POLYGON && maskPointerId !== null) {
           const pointerId = maskPointerId;
@@ -930,7 +1125,268 @@
         }
         state = reduceImageEditorState(state, action);
         update();
+        commitPendingResourceIfReady();
         return state;
+      }
+
+      function resourceCommitBlocked() {
+        const status = state.submission && state.submission.status;
+        return Boolean(
+          state.gesture || state.maskDraft ||
+          status === "submitting" || status === "retryable"
+        );
+      }
+
+      function resetForRebasedDisplay(nextContract) {
+        if (stateHoldsGeometryIntent(state)) return;
+        const status = state.submission && state.submission.status;
+        // A processing recipe is user intent, but it is independent of the
+        // page-boundary proposal. Carry the recipe onto the new display while
+        // allowing untouched geometry to follow that display's proposal.
+        const operations = status === "queued" || status === "complete"
+          ? [] : state.operations;
+        state = createImageEditorState({
+          proposal: nextContract.proposal,
+          sourceRevision: nextContract.pins && nextContract.pins.source_revision,
+          tool: state.tool,
+          hasSelection: state.selectionPresent,
+          operations,
+        });
+      }
+
+      function finishResourceUpdate(record, applied) {
+        if (!record || record.settled) return;
+        record.settled = true;
+        record.loader.removeEventListener("load", record.onPreloadLoad);
+        record.loader.removeEventListener("error", record.onPreloadError);
+        image.removeEventListener("load", record.onMountedLoad);
+        image.removeEventListener("error", record.onMountedError);
+        record.resolve(applied === true);
+      }
+
+      function cancelPendingResourceUpdate(applied = false) {
+        const record = pendingResourceUpdate;
+        if (!record) return;
+        pendingResourceUpdate = null;
+        if (record.bound && image.src !== activeUrl) image.src = activeUrl;
+        finishResourceUpdate(record, applied);
+      }
+
+      function reportResourceUpdateError(error, resource) {
+        if (typeof options.onResourceUpdateError !== "function") return;
+        try {
+          options.onResourceUpdateError(error, resource);
+        } catch {
+          // Host diagnostics must never strand or roll back the editor's own
+          // resource state machine.
+        }
+      }
+
+      function failResourceUpdate(record) {
+        if (!record || record !== pendingResourceUpdate || destroyed) return;
+        pendingResourceUpdate = null;
+        if (record.bound && image.src !== activeUrl) image.src = activeUrl;
+        finishResourceUpdate(record, false);
+        reportResourceUpdateError(
+          new Error("The newer image revision could not be loaded"),
+          record.resource,
+        );
+        update();
+      }
+
+      function applyResourceUpdate(record) {
+        if (!record || record !== pendingResourceUpdate || destroyed) return false;
+        if (!record.mountedLoaded || resourceCommitBlocked()) return false;
+        pendingResourceUpdate = null;
+        const previous = activeResource;
+        const previousOriginalAuthority = originalAuthorityKey();
+        resetForRebasedDisplay(record.contract);
+        activeResource = record.resource;
+        activeUrl = record.loadUrl;
+        contract = record.contract;
+        originalBackup = originalBackupContract(activeResource);
+        if (originalAuthorityKey() !== previousOriginalAuthority) {
+          advanceOriginalResourceEpoch();
+        }
+        syncOriginalBackupControls();
+        image.alt = resourceLabel(activeResource);
+        surface.setAttribute(
+          "aria-label",
+          `Perspective correction editor for ${resourceLabel(activeResource)}`,
+        );
+        let callbackError = null;
+        try {
+          if (typeof options.onResourceChange === "function") {
+            options.onResourceChange(activeResource, previous, controller);
+          }
+        } catch (error) {
+          callbackError = error;
+        } finally {
+          // Resource-change callbacks belong to the host. Even if one throws,
+          // the already-rendered generation must settle its waiter and remove
+          // its temporary listeners rather than leaving Queue hung forever.
+          finishResourceUpdate(record, true);
+          update();
+        }
+        if (callbackError) {
+          reportResourceUpdateError(callbackError, activeResource);
+        }
+        return true;
+      }
+
+      function bindPendingResourceIfReady(record) {
+        if (!record || record !== pendingResourceUpdate || destroyed ||
+            !record.preloaded || record.bound || resourceCommitBlocked()) {
+          return false;
+        }
+        record.bound = true;
+        image.src = record.loadUrl;
+        if (typeof image.decode === "function") {
+          const attempt = ++record.mountedDecodeAttempt;
+          let decoded;
+          try {
+            decoded = image.decode();
+          } catch (error) {
+            failResourceUpdate(record);
+            return false;
+          }
+          Promise.resolve(decoded).then(() => {
+            if (record !== pendingResourceUpdate || destroyed ||
+                !record.bound || attempt !== record.mountedDecodeAttempt) return;
+            record.mountedLoaded = true;
+            commitPendingResourceIfReady();
+          }, () => {
+            if (record !== pendingResourceUpdate || destroyed ||
+                !record.bound || attempt !== record.mountedDecodeAttempt) return;
+            failResourceUpdate(record);
+          });
+        } else {
+          // Compatibility fallback for minimal/older DOMs. Electron and
+          // supported browsers use decode(), whose promise is tied to the
+          // exact source generation and cannot consume a stale load event.
+          image.addEventListener("load", record.onMountedLoad);
+          image.addEventListener("error", record.onMountedError);
+          if (image.complete === true && Number(image.naturalWidth) > 0) {
+            record.onMountedLoad();
+          }
+        }
+        return true;
+      }
+
+      function commitPendingResourceIfReady() {
+        const record = pendingResourceUpdate;
+        if (!record) return false;
+        if (record.mountedLoaded) return applyResourceUpdate(record);
+        return bindPendingResourceIfReady(record);
+      }
+
+      function applyEquivalentResource(nextResource, nextContract) {
+        cancelPendingResourceUpdate(true);
+        const previous = activeResource;
+        const previousOriginalAuthority = originalAuthorityKey();
+        resetForRebasedDisplay(nextContract);
+        // The current image has already decoded these exact bytes. Keep its
+        // actual lease URL instead of retaining an unused republished lease.
+        activeResource = nextResource.url === activeUrl
+          ? nextResource : { ...nextResource, url: activeUrl };
+        contract = nextContract;
+        originalBackup = originalBackupContract(activeResource);
+        if (originalAuthorityKey() !== previousOriginalAuthority) {
+          advanceOriginalResourceEpoch();
+        }
+        syncOriginalBackupControls();
+        image.alt = resourceLabel(activeResource);
+        surface.setAttribute(
+          "aria-label",
+          `Perspective correction editor for ${resourceLabel(activeResource)}`,
+        );
+        let callbackError = null;
+        try {
+          if (typeof options.onResourceChange === "function") {
+            options.onResourceChange(activeResource, previous, controller);
+          }
+        } catch (error) {
+          callbackError = error;
+        } finally {
+          update();
+        }
+        if (callbackError) {
+          reportResourceUpdateError(callbackError, activeResource);
+        }
+        return true;
+      }
+
+      function updateResource(nextResource) {
+        if (destroyed || !nextResource || typeof nextResource !== "object") return false;
+        const nextUrl = safeRasterUrl(nextResource);
+        if (!nextUrl) return false;
+        const nextContract = correctionResourceContract(nextResource);
+        const activeIdentity = rasterResourceIdentity(activeResource);
+        const nextIdentity = rasterResourceIdentity(nextResource);
+        if (activeIdentity && nextIdentity && activeIdentity === nextIdentity) {
+          return applyEquivalentResource(nextResource, nextContract);
+        }
+        if (pendingResourceUpdate &&
+            pendingResourceUpdate.identity &&
+            pendingResourceUpdate.identity === nextIdentity) {
+          if (pendingResourceUpdate.loadUrl === nextUrl) {
+            pendingResourceUpdate.resource = nextResource;
+            pendingResourceUpdate.contract = nextContract;
+            return true;
+          }
+        }
+        cancelPendingResourceUpdate();
+        const loader = element(documentRef, "img");
+        loader.decoding = "async";
+        let resolve;
+        const promise = new Promise((done) => { resolve = done; });
+        const record = {
+          resource: nextResource,
+          contract: nextContract,
+          identity: nextIdentity,
+          loadUrl: nextUrl,
+          loader,
+          preloaded: false,
+          bound: false,
+          mountedLoaded: false,
+          mountedDecodeAttempt: 0,
+          settled: false,
+          promise,
+          resolve,
+          onPreloadLoad: null,
+          onPreloadError: null,
+          onMountedLoad: null,
+          onMountedError: null,
+        };
+        record.onPreloadLoad = () => {
+          if (record !== pendingResourceUpdate || destroyed) return;
+          record.preloaded = true;
+          commitPendingResourceIfReady();
+        };
+        record.onPreloadError = () => failResourceUpdate(record);
+        record.onMountedLoad = () => {
+          if (record !== pendingResourceUpdate || destroyed) return;
+          record.mountedLoaded = true;
+          commitPendingResourceIfReady();
+        };
+        record.onMountedError = () => failResourceUpdate(record);
+        loader.addEventListener("load", record.onPreloadLoad);
+        loader.addEventListener("error", record.onPreloadError);
+        pendingResourceUpdate = record;
+        loader.src = nextUrl;
+        if (loader.complete === true && Number(loader.naturalWidth) > 0) {
+          record.onPreloadLoad();
+        }
+        return true;
+      }
+
+      async function waitForResourceUpdate() {
+        while (pendingResourceUpdate) {
+          const record = pendingResourceUpdate;
+          const applied = await record.promise;
+          if (!applied && !pendingResourceUpdate) return false;
+        }
+        return true;
       }
 
       function coordinateForEvent(event) {
@@ -1099,7 +1555,7 @@
         operationSequence += 1;
         if (typeof options.createOperationId === "function") {
           return options.createOperationId({
-            resource,
+            resource: activeResource,
             sequence: operationSequence,
           });
         }
@@ -1109,14 +1565,24 @@
       async function requestQueue(trigger = "toolbar") {
         if (destroyed || !invokeCommand || numericInvalid.size ||
             !queueAllowed()) return null;
+        const retrying = state.submission.status === "retryable" &&
+          state.submission.command;
+        if (!retrying) {
+          // A load failure leaves the last confirmed pixels and pins mounted.
+          // Keep the user's click meaningful against that confirmed resource;
+          // disposal/navigation is still rejected by the destroyed check.
+          await waitForResourceUpdate();
+        }
+        if (destroyed || numericInvalid.size || !queueAllowed()) return null;
+        const queuedResource = activeResource;
         let command;
-        if (state.submission.status === "retryable" && state.submission.command) {
+        if (retrying) {
           command = state.submission.command;
         } else {
           const adjustment = typeof options.getAdjustment === "function"
-            ? options.getAdjustment({ state, resource }) : null;
+            ? options.getAdjustment({ state, resource: queuedResource }) : null;
           const rerunOcr = typeof options.getRerunOcr === "function"
-            ? options.getRerunOcr({ state, resource }) : false;
+            ? options.getRerunOcr({ state, resource: queuedResource }) : false;
           try {
             command = serializeCorrectionTransformCommand({
               pins: contract.pins,
@@ -1129,21 +1595,25 @@
             });
           } catch (error) {
             if (typeof options.onCommandError === "function") {
-              options.onCommandError(error, resource);
+              options.onCommandError(error, queuedResource);
             }
             return null;
           }
         }
         dispatch({ type: "QUEUE_STARTED", command });
         try {
-          const result = await invokeCommand(commandId, { command, trigger, resource });
+          const result = await invokeCommand(commandId, {
+            command,
+            trigger,
+            resource: queuedResource,
+          });
           if (destroyed) return result;
           dispatch({
             type: "QUEUE_ACCEPTED",
             jobId: result && (result.job_id || result.jobId),
           });
           if (typeof options.onQueueResult === "function") {
-            options.onQueueResult(result, command, resource);
+            options.onQueueResult(result, command, queuedResource);
           }
           return result;
         } catch (error) {
@@ -1156,7 +1626,7 @@
             error: error && error.message || String(error || "Queue failed"),
           });
           if (typeof options.onCommandError === "function") {
-            options.onCommandError(error, resource);
+            options.onCommandError(error, queuedResource);
           }
           return null;
         }
@@ -1184,7 +1654,7 @@
           dispatch(resolution.action);
           if (resolution.clearHostSelection &&
               typeof options.clearSelection === "function") {
-            options.clearSelection(resource);
+            options.clearSelection(activeResource);
           }
           if (typeof event.preventDefault === "function") event.preventDefault();
           if (typeof event.stopPropagation === "function") event.stopPropagation();
@@ -1225,7 +1695,7 @@
           numericInvalid.clear();
           dispatch({ type: "SET_TOOL", tool: toolId });
           if (typeof options.onToolChange === "function") {
-            options.onToolChange(toolId, resource);
+            options.onToolChange(toolId, activeResource);
           }
         });
       }
@@ -1356,6 +1826,13 @@
       const controller = {
         canvas,
         dispatch,
+        getDisplayedUrl: () => activeUrl,
+        getPendingResource: () => pendingResourceUpdate &&
+          pendingResourceUpdate.resource || null,
+        getPendingResourceImage: () => pendingResourceUpdate &&
+          pendingResourceUpdate.loader || null,
+        getPendingResourceUrl: () => pendingResourceUpdate &&
+          pendingResourceUpdate.loadUrl || "",
         getState: () => state,
         getPins: () => contract.pins && { ...contract.pins },
         image,
@@ -1363,20 +1840,23 @@
         requestQueue,
         requestRestoreOriginal,
         requestViewOriginal,
-        resource,
+        get resource() { return activeResource; },
         surface,
         syncCanvas: draw,
         toolbar,
+        updateResource,
         viewport,
+        waitForResourceUpdate,
       };
       if (typeof options.onMount === "function") {
-        mountCleanup = options.onMount(controller, resource);
+        mountCleanup = options.onMount(controller, activeResource);
       }
       update();
 
       const dispose = () => {
         if (destroyed) return;
         destroyed = true;
+        cancelPendingResourceUpdate();
         if (observer && typeof observer.disconnect === "function") observer.disconnect();
         observer = null;
         closeOriginalPreview();
@@ -1384,7 +1864,7 @@
         if (typeof mountCleanup === "function") mountCleanup();
         mountCleanup = null;
         if (typeof options.onStateChange === "function") {
-          options.onStateChange(null, resource);
+          options.onStateChange(null, activeResource);
         }
       };
       dispose.controller = controller;

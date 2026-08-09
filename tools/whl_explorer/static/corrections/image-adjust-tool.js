@@ -1002,7 +1002,7 @@
 
       const handleKeyDown = (event) => {
         const state = controller.getState();
-        const context = this.eventContext(event, controller, resource);
+        const context = this.eventContext(event, controller, record.resource);
         if (canEnterImageAdjust(context, state)) {
           controller.dispatch({ type: "SET_TOOL", tool: TOOLS.IMAGE_ADJUST });
           if (typeof event.preventDefault === "function") event.preventDefault();
@@ -1021,7 +1021,7 @@
       addListener(removers, controller.canvas, "wheel", (event) => {
         const state = controller.getState();
         if (!canApplyWheel(
-          this.eventContext(event, controller, resource),
+          this.eventContext(event, controller, record.resource),
           state,
         )) return;
         const step = event.shiftKey === true ? 5 : 1;
@@ -1113,6 +1113,15 @@
       if (!this.mountRecord) return;
       if (resource && resource !== this.mountRecord.resource) return;
       this.refreshMount(false, state);
+    }
+
+    syncEditorResource(controller, resource) {
+      const record = this.mountRecord;
+      if (!record || record.disposed || record.controller !== controller ||
+          !resource || typeof resource !== "object") return false;
+      record.resource = resource;
+      this.refreshMount(false);
+      return true;
     }
 
     refreshMount(announce = false, suppliedState = null) {
@@ -1394,19 +1403,32 @@
           typeof this.options.requestReocr !== "function" ||
           !this.reocrCapability ||
           !reocrEligibleResource(record.resource)) return null;
-      const summary = record.resource &&
-        (record.resource.summary || record.resource);
-      const request = {
-        operationId: this.reocrOperationIdFactory(),
-        itemId: summary.itemId,
-        artifactId: summary.id,
-        expectedArtifactRevision: summary.revision,
-      };
       this.reocrBusy = true;
       this.refreshMount(false);
       try {
+        if (record.controller &&
+            typeof record.controller.waitForResourceUpdate === "function") {
+          const ready = await record.controller.waitForResourceUpdate();
+          if (ready === false) return null;
+        }
+        if (record.disposed || this.mountRecord !== record ||
+            typeof this.options.requestReocr !== "function" ||
+            !this.reocrCapability ||
+            !reocrEligibleResource(record.resource)) return null;
+
+        // A background raster rebase updates the mounted record before its
+        // waiter settles. Snapshot only after that boundary so the request and
+        // its context carry the same, currently displayed revision.
+        const resource = record.resource;
+        const summary = resource.summary || resource;
+        const request = {
+          operationId: this.reocrOperationIdFactory(),
+          itemId: summary.itemId,
+          artifactId: summary.id,
+          expectedArtifactRevision: summary.revision,
+        };
         const receipt = await this.options.requestReocr(request, {
-          resource: record.resource,
+          resource,
         });
         if (!record.disposed && this.mountRecord === record) {
           record.jobStatus.textContent = receipt && receipt.replayed === true
@@ -1655,6 +1677,27 @@
           if (typeof toolCleanup === "function") toolCleanup();
           if (typeof baseCleanup === "function") baseCleanup();
         };
+      },
+      onResourceChange(resource, previous, controller) {
+        let callbackError = null;
+        try {
+          if (typeof base.onResourceChange === "function") {
+            base.onResourceChange(resource, previous, controller);
+          }
+        } catch (error) {
+          callbackError = error;
+        }
+        try {
+          tool.syncEditorResource(controller, resource);
+        } catch (error) {
+          if (!callbackError) callbackError = error;
+        }
+        if (callbackError) throw callbackError;
+      },
+      onResourceUpdateError(error, resource) {
+        if (typeof base.onResourceUpdateError === "function") {
+          base.onResourceUpdateError(error, resource);
+        }
       },
       onStateChange(state, resource) {
         tool.syncEditorState(state, resource);
