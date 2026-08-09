@@ -1858,7 +1858,7 @@
   // features existed. See _COMMAND_OPTIONAL_FIELDS in
   // librarytool/engine/correction_transforms.py for the full rationale.
   const CORRECTION_TRANSFORM_COMMAND_OPTIONAL_FIELDS = [
-    "mask_polygon", "operations",
+    "mask_polygon", "operations", "extraction",
   ];
   const CORRECTION_TRANSFORM_COMMAND_ALLOWED_FIELDS = [
     ...CORRECTION_TRANSFORM_COMMAND_FIELDS,
@@ -2023,6 +2023,19 @@
       (value.operations.length > 0 || value.adjustment !== null);
   }
 
+  function isCorrectionExtraction(value) {
+    if (hasExactKeys(value, ["annotation_id", "annotation_revision", "label"])) {
+      return isPortableIdentifier(value.annotation_id) &&
+        isArtifactRevision(value.annotation_revision) &&
+        typeof value.label === "string" && value.label.trim().length > 0 &&
+        value.label.length <= 512;
+    }
+    return hasExactKeys(value, ["source_kind", "label"]) &&
+      value.source_kind === "committed-mask" &&
+      typeof value.label === "string" && value.label.trim().length > 0 &&
+      value.label.length <= 512;
+  }
+
   function isCorrectionTransformCommand(value) {
     return hasAllowedKeys(
       value,
@@ -2031,6 +2044,12 @@
     ) &&
       isCorrectionMaskPolygon(value.mask_polygon) &&
       isCorrectionOperations(value.operations) &&
+      (value.extraction === undefined ||
+        isCorrectionExtraction(value.extraction)) &&
+      !(value.extraction && value.extraction.source_kind === undefined &&
+        value.mask_polygon !== undefined) &&
+      !(value.extraction && value.extraction.source_kind === "committed-mask" &&
+        value.mask_polygon === undefined) &&
       value.schema === "org.whl.correction-transform-command" &&
       value.version === 1 && Number.isSafeInteger(value.version) &&
       isPortableIdentifier(value.item_id) &&
@@ -2073,13 +2092,89 @@
       });
   }
 
+  function isCaptureAssetMembership(value, optional = false) {
+    if (value === null) return optional;
+    return hasExactKeys(value, ["state", "revision", "updated_at"]) &&
+      ["active", "deleted"].includes(value.state) &&
+      Number.isSafeInteger(value.revision) && value.revision >= 1 &&
+      Number.isSafeInteger(value.updated_at) && value.updated_at >= 1;
+  }
+
+  function isCaptureAssetLifecycleInverse(value, expected) {
+    return hasExactKeys(value, [
+      "schema", "action", "source_operation_id", "item_id", "capture_id",
+      "asset_id", "artifact_id", "artifact_revision", "capture_order",
+      "expected_lifecycle",
+    ]) && value.schema === "librarytool.capture-asset-lifecycle-inverse/1" &&
+      value.action === "restore" &&
+      value.source_operation_id === expected.operationId &&
+      value.item_id === expected.itemId &&
+      value.artifact_id === expected.artifactId &&
+      value.artifact_revision === expected.artifactRevision &&
+      value.capture_id === expected.captureId &&
+      value.asset_id === expected.assetId &&
+      value.capture_order === expected.captureOrder &&
+      isCaptureAssetMembership(value.expected_lifecycle) &&
+      value.expected_lifecycle.state === expected.expectedLifecycle.state &&
+      value.expected_lifecycle.revision === expected.expectedLifecycle.revision &&
+      value.expected_lifecycle.updated_at === expected.expectedLifecycle.updated_at;
+  }
+
+  function isCaptureAssetLifecycleResult(value, expected) {
+    return hasExactKeys(value, [
+      "operation_id", "action", "item_id", "capture_id", "asset_id",
+      "artifact_id", "artifact_revision", "capture_order",
+      "before_lifecycle", "after_lifecycle", "item_updated_at", "inverse",
+      "replayed",
+    ]) && value.operation_id === expected.operationId &&
+      value.action === "delete" && value.item_id === expected.itemId &&
+      value.artifact_id === expected.artifactId &&
+      value.artifact_revision === expected.artifactRevision &&
+      isPortableIdentifier(value.capture_id) &&
+      isPortableIdentifier(value.asset_id) &&
+      Number.isSafeInteger(value.capture_order) && value.capture_order >= 1 &&
+      isCaptureAssetMembership(value.before_lifecycle, true) &&
+      (!value.before_lifecycle || value.before_lifecycle.state === "active") &&
+      isCaptureAssetMembership(value.after_lifecycle) &&
+      value.after_lifecycle.state === "deleted" &&
+      isLifecycleRevision(value.item_updated_at) &&
+      isCaptureAssetLifecycleInverse(value.inverse, {
+        ...expected,
+        captureId: value.capture_id,
+        assetId: value.asset_id,
+        captureOrder: value.capture_order,
+        expectedLifecycle: value.after_lifecycle,
+      }) &&
+      typeof value.replayed === "boolean";
+  }
+
+  function sameCorrectionExtraction(actual, expected) {
+    if (expected === undefined || expected === null) {
+      return actual === undefined;
+    }
+    if (!isCorrectionExtraction(actual) || !isCorrectionExtraction(expected)) {
+      return false;
+    }
+    if (expected.source_kind === "committed-mask") {
+      return actual.source_kind === expected.source_kind &&
+        actual.label === expected.label;
+    }
+    return actual.annotation_id === expected.annotation_id &&
+      actual.annotation_revision === expected.annotation_revision &&
+      actual.label === expected.label;
+  }
+
   function isCorrectionTransformInput(value, command) {
     if (!hasAllowedKeys(
       value,
-      ["quad", "adjustment", "rerun_ocr", "mask_polygon", "operations"],
+      [
+        "quad", "adjustment", "rerun_ocr", "mask_polygon", "operations",
+        "extraction",
+      ],
       ["quad", "adjustment", "rerun_ocr"],
     ) ||
         !sameCorrectionOperations(value.operations, command.operations) ||
+        !sameCorrectionExtraction(value.extraction, command.extraction) ||
         value.rerun_ocr !== command.rerun_ocr ||
         !Array.isArray(value.quad) ||
         value.quad.length !== command.quad.length ||
@@ -2306,6 +2401,8 @@
           this._rasterArtifactResolveOriginalBackup(args),
         restoreOriginalBackup: (args) =>
           this._rasterArtifactRestoreOriginalBackup(args),
+        trashCaptureAsset: (args) =>
+          this._rasterArtifactTrashCaptureAsset(args),
         resourceUrl: (args) => this._rasterArtifactResourceUrl(args),
       });
       this.documentArtifacts = Object.freeze({
@@ -3479,8 +3576,48 @@
       return body;
     }
 
+    async _rasterArtifactTrashCaptureAsset({ itemId, artifactId,
+      expectedArtifactRevision, idempotencyKey, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const artifact = portableIdentifier(artifactId, "artifactId");
+      if (!isArtifactRevision(expectedArtifactRevision)) {
+        throw new TypeError(
+          "expectedArtifactRevision is not a valid correction revision");
+      }
+      const operationId = operationKey(idempotencyKey, "idempotencyKey");
+      const path = `/v1/items/${encodePart(item)}/raster-artifacts/` +
+        `${encodePart(artifact)}/trash`;
+      const { body, status } = await this._requestJson("POST", path, {
+        headers: {
+          "Idempotency-Key": operationId,
+          "If-Artifact-Match": quoteRevision(
+            expectedArtifactRevision, "expectedArtifactRevision"),
+        },
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+        ambiguousOnSuccessJsonFailure: true,
+      });
+      const expected = {
+        operationId,
+        itemId: item,
+        artifactId: artifact,
+        artifactRevision: expectedArtifactRevision,
+      };
+      if (status !== 200 || !hasExactKeys(body, ["ok", "schema", "result"]) ||
+          body.ok !== true ||
+          body.schema !== "librarytool.capture-asset-lifecycle-result/1" ||
+          !isCaptureAssetLifecycleResult(body.result, expected) ||
+          containsCommandFingerprint(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid capture-asset Trash receipt",
+          "POST", path, null, undefined, status);
+      }
+      return body.result;
+    }
+
     _spatialAnnotationList({ itemId, representationId, canvasId,
-      canvasRevision, cursor, limit = 100, signal } = {}) {
+      canvasRevision, visibility, cursor, limit = 100, signal } = {}) {
       const item = portableIdentifier(itemId, "itemId");
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 512) {
         throw new TypeError("limit must be an integer from 1 to 512");
@@ -3496,6 +3633,10 @@
         throw new TypeError(
           "canvasRevision is not a valid canvas revision");
       }
+      if (visibility != null && visibility !== "" &&
+          visibility !== "tree" && visibility !== "overlay") {
+        throw new TypeError("visibility must be tree or overlay");
+      }
       if (cursor != null && cursor !== "" &&
           (typeof cursor !== "string" || cursor.length > 2048)) {
         throw new TypeError("cursor must be a bounded opaque string");
@@ -3506,6 +3647,7 @@
           representation_id: representationId,
           canvas_id: canvasId,
           canvas_revision: canvasRevision,
+          visibility,
           cursor,
           limit,
         },

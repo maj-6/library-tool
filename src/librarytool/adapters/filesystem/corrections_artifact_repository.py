@@ -1052,6 +1052,49 @@ class FilesystemCorrectionsArtifactRepository(
             raise TypeError("key must be RasterArtifactKey")
         return self._project_raster_key(key, capture_only=True)
 
+    def capture_deleted_artifact_ids(self, item_id: str) -> tuple[str, ...]:
+        """Return private capture identities suppressed by desktop lifecycle."""
+
+        item = _identifier(
+            item_id,
+            item_id=str(item_id or ""),
+            field="item_id",
+        )
+        with self._write_set.workspace_lease():
+            with self._lock_context_for():
+                if not self._live_item_exists(item):
+                    raise NotFoundError(
+                        "the item does not exist",
+                        code="item_not_found",
+                        details={"item_id": item},
+                    )
+                capture_id = self._live_capture_id(item)
+                if not capture_id:
+                    return ()
+                directory = self._managed_directory(
+                    self._capture_directory_for,
+                    capture_id,
+                    item_id=item,
+                    section="capture",
+                    authority_root=self._capture_authority_root,
+                )
+                manifest = self._read_json(
+                    directory / PHOTO_ASSETS_NAME,
+                    item_id=item,
+                    section="capture",
+                    maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
+                )
+                if manifest is None:
+                    return ()
+                _records, _revision, _legacy, deleted = (
+                    self._capture_manifest_records(
+                        item,
+                        capture_id,
+                        manifest,
+                    )
+                )
+                return deleted
+
     def list_capture_import_marks(
         self,
         item_ids: Sequence[str],
@@ -1126,7 +1169,7 @@ class FilesystemCorrectionsArtifactRepository(
                 )
             if manifest is None:
                 return unavailable
-            records, _representation_revision, legacy = (
+            records, _representation_revision, legacy, _deleted = (
                 self._capture_manifest_records(
                     item_id,
                     capture_id,
@@ -1442,7 +1485,7 @@ class FilesystemCorrectionsArtifactRepository(
                         )
                     if manifest is None:
                         return None
-                    records, _revision_value, _legacy = (
+                    records, _revision_value, _legacy, _deleted = (
                         self._capture_manifest_records(
                             item,
                             capture_id,
@@ -3366,7 +3409,7 @@ class FilesystemCorrectionsArtifactRepository(
         manifest: Mapping[str, Any],
         authority_hints: dict[str, Mapping[str, Any]] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
-        records, representation_revision, legacy = (
+        records, representation_revision, legacy, _deleted = (
             self._capture_manifest_records(item_id, capture_id, manifest)
         )
         hints: list[Mapping[str, Any]] = []
@@ -3623,6 +3666,7 @@ class FilesystemCorrectionsArtifactRepository(
         tuple[_CaptureAssetRecord, ...],
         str,
         bool,
+        tuple[str, ...],
     ]:
         """Validate the complete identity catalogue without reading rasters."""
 
@@ -3671,6 +3715,7 @@ class FilesystemCorrectionsArtifactRepository(
                         import_rows[imported_id] = row
 
         records: list[_CaptureAssetRecord] = []
+        deleted_artifact_ids: list[str] = []
         seen_assets: set[str] = set()
         seen_orders: set[int] = set()
         manifest_source: list[Mapping[str, Any]] = []
@@ -3712,29 +3757,56 @@ class FilesystemCorrectionsArtifactRepository(
                 original=original,
                 imported=imported,
             )
+            desktop_lifecycle = raw.get("desktop_lifecycle")
+            if desktop_lifecycle is None:
+                desktop_state = "active"
+            elif (
+                not isinstance(desktop_lifecycle, Mapping)
+                or set(desktop_lifecycle)
+                != {"state", "revision", "updated_at"}
+                or desktop_lifecycle.get("state") not in {"active", "deleted"}
+                or isinstance(desktop_lifecycle.get("revision"), bool)
+                or not isinstance(desktop_lifecycle.get("revision"), int)
+                or desktop_lifecycle["revision"] <= 0
+                or isinstance(desktop_lifecycle.get("updated_at"), bool)
+                or not isinstance(desktop_lifecycle.get("updated_at"), int)
+                or desktop_lifecycle["updated_at"] <= 0
+            ):
+                raise _repository_error(
+                    "a desktop capture lifecycle is invalid",
+                    code="invalid_capture_photo_assets",
+                    item_id=item_id,
+                    section="capture",
+                    field="assets.desktop_lifecycle",
+                )
+            else:
+                desktop_state = str(desktop_lifecycle["state"])
             seen_assets.add(asset_id)
             seen_orders.add(order)
             namespace = _opaque_identity("capture", capture_id, asset_id)
-            records.append(
-                _CaptureAssetRecord(
-                    raw=raw,
-                    asset_id=asset_id,
-                    order=order,
-                    original=original,
-                    display=display,
-                    imported=imported,
-                    namespace=namespace,
-                    original_id=f"{namespace}:original",
-                    display_id=f"{namespace}:display",
-                    original_valid=original_valid,
-                    display_valid=display_valid,
-                    imported_at=imported_at,
-                    original_backup=original_backup,
-                )
+            record = _CaptureAssetRecord(
+                raw=raw,
+                asset_id=asset_id,
+                order=order,
+                original=original,
+                display=display,
+                imported=imported,
+                namespace=namespace,
+                original_id=f"{namespace}:original",
+                display_id=f"{namespace}:display",
+                original_valid=original_valid,
+                display_valid=display_valid,
+                imported_at=imported_at,
+                original_backup=original_backup,
             )
+            if desktop_state == "active":
+                records.append(record)
+            else:
+                deleted_artifact_ids.extend((record.original_id, record.display_id))
             manifest_source.append(
                 {
                     "asset_id": asset_id,
+                    "desktop_lifecycle": desktop_lifecycle,
                     "original": {
                         "sha256": original.get("sha256"),
                         "revision": original.get("revision"),
@@ -3765,6 +3837,7 @@ class FilesystemCorrectionsArtifactRepository(
                 {"capture_id": capture_id, "originals": manifest_source},
             ),
             manifest.get("legacy_fallback") is True,
+            tuple(deleted_artifact_ids),
         )
 
     def _project_capture(
@@ -3783,7 +3856,7 @@ class FilesystemCorrectionsArtifactRepository(
         tuple[SpatialAnnotationView, ...],
         Mapping[tuple[str, str, str], _ResolvedRasterCandidate],
     ]:
-        records, representation_revision, legacy_capture = (
+        records, representation_revision, legacy_capture, _deleted = (
             self._capture_manifest_records(item_id, capture_id, manifest)
         )
         if artifact_id:

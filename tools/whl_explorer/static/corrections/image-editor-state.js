@@ -549,6 +549,33 @@
   }
 
 
+  function sameMaskPolygon(actual, expected) {
+    return Array.isArray(actual) && Array.isArray(expected) &&
+      actual.length === expected.length && actual.every((point, index) =>
+        Array.isArray(point) && Array.isArray(expected[index]) &&
+        point.length === 2 && expected[index].length === 2 &&
+        point[0] === expected[index][0] && point[1] === expected[index][1]);
+  }
+
+
+  function historyAfterMaskExtraction(entries, currentQuad) {
+    const scrubbed = [];
+    for (const entry of entries) {
+      const withoutMask = { ...entry, maskPolygon: null };
+      const prior = scrubbed[scrubbed.length - 1];
+      if (prior && sameQuad(prior.quad, withoutMask.quad)) continue;
+      scrubbed.push(withoutMask);
+    }
+    // Committing a mask records the otherwise-identical pre-mask state. Once
+    // the mask is durable that entry is no longer an undo step.
+    while (scrubbed.length &&
+        sameQuad(scrubbed[scrubbed.length - 1].quad, currentQuad)) {
+      scrubbed.pop();
+    }
+    return scrubbed;
+  }
+
+
   function normalizedPoint(point) {
     if (!Array.isArray(point) || point.length !== 2 ||
         point.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
@@ -775,6 +802,28 @@
           submission: resetSubmissionAfterEdit(state),
         };
       }
+      case "MASK_EXTRACTION_COMMITTED": {
+        if (state.maskPolygon === null && !state.maskDraft) return state;
+        if (action.maskPolygon != null &&
+            (state.maskDraft ||
+             !sameMaskPolygon(state.maskPolygon, action.maskPolygon))) {
+          // The user drew another mask while this extraction was in flight.
+          // Its transient state belongs to a later intent and must survive.
+          return state;
+        }
+        // The transform result has made this geometry durable as an
+        // overlay-only source marker. Scrub it from every history snapshot,
+        // collapse the now-redundant mask transitions, and retain each
+        // distinct perspective step.
+        return {
+          ...state,
+          maskPolygon: null,
+          maskDraft: null,
+          maskFreehand: false,
+          undoStack: historyAfterMaskExtraction(state.undoStack, state.quad),
+          redoStack: [],
+        };
+      }
       case "SET_PROCESSING_OPERATIONS": {
         const operations = action.operations == null ||
             Array.isArray(action.operations) && action.operations.length === 0
@@ -966,6 +1015,39 @@
     };
   }
 
+
+  function normalizeExtraction(value) {
+    if (!isPlainObject(value)) {
+      throw new TypeError("extraction must be an object");
+    }
+    const fields = Object.keys(value).sort();
+    const annotationFields = ["annotation_id", "annotation_revision", "label"];
+    const maskFields = ["label", "source_kind"];
+    const annotation = fields.length === annotationFields.length &&
+      fields.every((field, index) => field === annotationFields[index]);
+    const committedMask = fields.length === maskFields.length &&
+      fields.every((field, index) => field === maskFields[index]) &&
+      value.source_kind === "committed-mask";
+    if (!annotation && !committedMask) {
+      throw new TypeError("extraction fields must match one exact source schema");
+    }
+    if (typeof value.label !== "string" || !value.label.trim() ||
+        value.label.length > 512 ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value.label)) {
+      throw new TypeError("extraction label must be non-empty bounded text");
+    }
+    if (committedMask) {
+      return { source_kind: "committed-mask", label: value.label };
+    }
+    return {
+      annotation_id: portableIdentifier(
+        value.annotation_id, "extraction.annotation_id"),
+      annotation_revision: revisionToken(
+        value.annotation_revision, "extraction.annotation_revision"),
+      label: value.label,
+    };
+  }
+
   function sourcePinsValid(pins) {
     try {
       normalizeSourcePins(pins);
@@ -1138,6 +1220,22 @@
     }
     if (options.operations != null) {
       command.operations = normalizeProcessingOperations(options.operations);
+    }
+    // Like mask_polygon and operations, extraction is additive-optional: an
+    // ordinary correction must retain the exact canonical bytes and engine
+    // fingerprint it had before region extraction became a transform profile.
+    if (options.extraction != null) {
+      command.extraction = normalizeExtraction(options.extraction);
+      if (command.extraction.source_kind !== "committed-mask" &&
+          command.mask_polygon) {
+        throw new TypeError(
+          "an annotation extraction must not carry a committed mask polygon");
+      }
+      if (command.extraction.source_kind === "committed-mask" &&
+          !command.mask_polygon) {
+        throw new TypeError(
+          "a committed-mask extraction requires a committed mask polygon");
+      }
     }
     return command;
   }

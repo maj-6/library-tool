@@ -240,6 +240,8 @@
         this.serializeTransformCommand =
           typeof options.serializeTransformCommand === "function"
             ? options.serializeTransformCommand : null;
+        this.extractionTarget = typeof options.extractionTarget === "function"
+          ? options.extractionTarget : null;
         this.refreshTarget = typeof options.refreshTarget === "function"
           ? options.refreshTarget : null;
         this.refreshBookTarget = typeof options.refreshBookTarget === "function"
@@ -398,6 +400,8 @@
           focusedTarget: this.selectionFocused ? this.selectionTarget : null,
           selectionTarget: this.selectionTarget,
           softTarget: this.hotTarget,
+          extractionTarget: this.extractionTarget
+            ? this.extractionTarget(event, command) : null,
           resolveLinkedArtifact: this.resolveLinkedArtifact,
           transformContract: this.transformContract,
           serializeTransformCommand: this.serializeTransformCommand,

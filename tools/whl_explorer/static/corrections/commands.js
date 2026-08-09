@@ -132,6 +132,11 @@
         targetKind: TARGET_KINDS.ANNOTATION,
         action: "region.extract",
         value: "",
+        // A hovered region is the crop instruction. Focusing it through the
+        // Artifacts tree would replace the capture editor before the transform
+        // is even queued, so extraction deliberately keeps the soft target in
+        // place while ordinary classification commands still promote theirs.
+        preserveView: true,
       }),
       // Archive is a durable metadata assertion, not a delete: the image
       // leaves the capture's working set but stays stored and linked for
@@ -263,7 +268,7 @@
       const raw = String(value).split("+").map(normalizeKeyName).filter(Boolean);
       const modifiers = new Set(raw.filter((part) => MODIFIER_ORDER.includes(part)));
       const keys = raw.filter((part) => !MODIFIER_ORDER.includes(part));
-      if (keys.length !== 1 || !/^(?:[a-z0-9]|escape|space|enter|f(?:[1-9]|1[0-2]))$/
+      if (keys.length !== 1 || !/^(?:[a-z0-9]|backspace|escape|space|enter|f(?:[1-9]|1[0-2]))$/
         .test(keys[0])) {
         throw new CorrectionCommandError(
           "A shortcut must contain one portable key",
@@ -306,7 +311,10 @@
     function ariaKeyBinding(value) {
       const normalized = normalizeKeyBinding(value);
       if (!normalized) return "";
-      const labels = { ctrl: "Control", alt: "Alt", shift: "Shift", meta: "Meta" };
+      const labels = {
+        ctrl: "Control", alt: "Alt", shift: "Shift", meta: "Meta",
+        backspace: "Backspace", escape: "Escape", space: "Space", enter: "Enter",
+      };
       return normalized.split("+").map((part) => labels[part] ||
         (part.length === 1 ? part.toUpperCase() : part)).join("+");
     }
@@ -532,6 +540,12 @@
       );
     }
 
+    function committedMaskTarget(target) {
+      if (!target || typeof target !== "object") return false;
+      return targetObjectType(target) === "committed-mask" ||
+        text(read(target, "kind"), 64).toLowerCase() === "committed-mask";
+    }
+
     function regionSelectorPoints(target) {
       const selector = read(target, "selector");
       const points = (selector && typeof selector === "object" &&
@@ -619,6 +633,9 @@
       if (command.targetKind === TARGET_KINDS.BOOK) return bookTarget(target);
       const revision = commandRevision(target);
       if (!revision || revision.startsWith("index:")) return false;
+      if (command.action === "region.extract" && committedMaskTarget(target)) {
+        return regionSelectorPoints(target) !== null;
+      }
       return command.targetKind === TARGET_KINDS.IMAGE
         ? imageTarget(target) : annotationTarget(target);
     }
@@ -640,11 +657,14 @@
       const focused = candidateValue(context, "focusedTarget");
       const selected = candidateValue(context, "selectionTarget", "selectedTarget");
       const soft = candidateValue(context, "softTarget", "hotTarget");
+      const extraction = command.action === "region.extract"
+        ? candidateValue(context, "extractionTarget") : null;
       // A hovered target outranks the selection so hover-hotkeys act on the
       // box under the pointer; kind acceptance below keeps incompatible
       // commands on the focused or selected target instead.
       const candidates = [
         ["soft", soft],
+        ["extraction", extraction],
         ["focused", focused],
         ["selection", selected],
       ];
@@ -731,6 +751,23 @@
         result.push(key);
       }
       return Object.freeze(result);
+    }
+
+    function roleSourceArtifactKeys(target) {
+      const linked = linkedArtifactKeys(target);
+      const extensions = read(target, "extensions");
+      const extraction = extensions && typeof extensions === "object"
+        ? extensions.correction_extraction : null;
+      const artifactIds = extraction && Array.isArray(extraction.artifact_ids)
+        ? extraction.artifact_ids : null;
+      if (!artifactIds || artifactIds.some((value) =>
+        typeof value !== "string" || !PORTABLE_ID.test(value))) {
+        // Fail closed: malformed extraction metadata cannot suppress a real
+        // source/foreign-link ambiguity.
+        return linked;
+      }
+      const extracted = new Set(artifactIds.map((value) => `artifact:${value}`));
+      return Object.freeze(linked.filter((key) => !extracted.has(key)));
     }
 
     function normalizeLinkedArtifact(value, itemId, expectedKey = "") {
@@ -968,7 +1005,7 @@
       }
 
       async resolveLinkedArtifact(target, context, identifiers, command) {
-        const keys = linkedArtifactKeys(target);
+        const keys = roleSourceArtifactKeys(target);
         if (keys.length > 1) {
           throw new CorrectionCommandError(
             "This region has more than one linked image; select one in Properties",
@@ -998,7 +1035,8 @@
       async targetBeforeMutation(resolved, context, command) {
         let target = resolved.target;
         let source = resolved.source;
-        if (source === "soft" && typeof context.promoteSoftTarget === "function") {
+        if (source === "soft" && command.preserveView !== true &&
+            typeof context.promoteSoftTarget === "function") {
           const promoted = await context.promoteSoftTarget(target, command);
           if (promoted === false || promoted == null) {
             throw new CorrectionCommandError(
@@ -1110,7 +1148,7 @@
               payload,
             );
           } else {
-            const linkedKeys = linkedArtifactKeys(resolved.target);
+            const linkedKeys = roleSourceArtifactKeys(resolved.target);
             if (linkedKeys.length === 1) {
               mutationTargets = Object.freeze([
                 ...mutationTargets,
@@ -1346,6 +1384,7 @@
         }
         let wire;
         try {
+          const committedMask = committedMaskTarget(resolved.target);
           wire = context.serializeTransformCommand({
             pins: contract,
             quad,
@@ -1355,6 +1394,21 @@
             rerunOcr: true,
             operationId: operationId(
               this.operationIdFactory, "extract", command, resolved.target),
+            ...(committedMask ? { maskPolygon: regionSelectorPoints(resolved.target) } : {}),
+            extraction: committedMask
+              ? {
+                  source_kind: "committed-mask",
+                  label: text(read(
+                    resolved.target, "label", "name", "caption", "title",
+                  ), 512) || "Extracted user mask",
+                }
+              : {
+                  annotation_id: identifiers.id,
+                  annotation_revision: identifiers.revision,
+                  label: text(read(
+                    resolved.target, "label", "name", "caption", "title",
+                  ), 512) || `Extracted region ${identifiers.id}`,
+                },
           });
         } catch (error) {
           throw new CorrectionCommandError(
@@ -1531,7 +1585,9 @@
       imageTarget,
       annotationTarget,
       bookTarget,
+      committedMaskTarget,
       linkedArtifactKeys,
+      roleSourceArtifactKeys,
       normalizeKeyBinding,
       regionExtractQuad,
       registerClassificationCommands,

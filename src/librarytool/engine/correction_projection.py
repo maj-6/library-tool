@@ -136,6 +136,37 @@ def _link_authority(
     }
 
 
+def _extraction_artifact_ids(
+    annotation: SpatialAnnotationView,
+) -> tuple[str, ...] | None:
+    extraction = annotation.extensions.get("correction_extraction")
+    if not isinstance(extraction, Mapping):
+        return None
+    artifact_ids = extraction.get("artifact_ids")
+    if (
+        isinstance(artifact_ids, (str, bytes))
+        or not isinstance(artifact_ids, Sequence)
+        or any(not isinstance(value, str) or not value for value in artifact_ids)
+    ):
+        return None
+    return tuple(artifact_ids)
+
+
+def _role_source_links(annotation: SpatialAnnotationView) -> tuple[str, ...]:
+    """Exclude durable extraction products from the region's source links."""
+
+    artifact_ids = _extraction_artifact_ids(annotation)
+    if artifact_ids is None:
+        # A malformed marker must never hide a genuinely ambiguous link.
+        return annotation.linked_artifact_ids
+    extracted = set(artifact_ids)
+    return tuple(
+        value
+        for value in annotation.linked_artifact_ids
+        if value not in extracted
+    )
+
+
 class CorrectionAggregateProjector:
     """Project current machine evidence into the correction aggregate shape."""
 
@@ -235,7 +266,7 @@ class CorrectionAggregateProjector:
         spatial = []
         for value in annotations:
             linked_artifact_id, link_authority = _link_authority(
-                value.linked_artifact_ids,
+                _role_source_links(value),
                 known_artifacts,
             )
             spatial.append(
@@ -857,6 +888,21 @@ class CorrectionProjectionService(
                 )
             )
         if correction.linked_artifact_id:
+            extracted = _extraction_artifact_ids(value)
+            if extracted is not None:
+                extracted_ids = set(extracted)
+                return tuple(
+                    dict.fromkeys(
+                        (
+                            correction.linked_artifact_id,
+                            *(
+                                artifact_id
+                                for artifact_id in value.linked_artifact_ids
+                                if artifact_id in extracted_ids
+                            ),
+                        )
+                    )
+                )
             return (correction.linked_artifact_id,)
         return value.linked_artifact_ids
 
@@ -940,6 +986,58 @@ class CorrectionProjectionService(
             item_id,
             artifact_id,
             expected_revision,
+            operation_id,
+        )
+
+    def delete_capture_asset(
+        self,
+        item_id: str,
+        artifact_id: str,
+        expected_revision: str,
+        operation_id: str,
+    ) -> Mapping[str, Any]:
+        delete = getattr(
+            self._raster_artifacts,
+            "delete_capture_asset",
+            None,
+        )
+        if not callable(delete):
+            raise RepositoryError(
+                "the capture asset lifecycle store is unavailable",
+                code="capture_asset_lifecycle_unavailable",
+                retryable=True,
+            )
+        return delete(
+            item_id,
+            artifact_id,
+            expected_revision,
+            operation_id,
+        )
+
+    def restore_capture_asset(
+        self,
+        item_id: str,
+        artifact_id: str,
+        inverse: Mapping[str, Any],
+        operation_id: str,
+    ) -> Mapping[str, Any]:
+        if not isinstance(inverse, Mapping):
+            raise TypeError("inverse must be a mapping")
+        restore = getattr(
+            self._raster_artifacts,
+            "restore_capture_asset",
+            None,
+        )
+        if not callable(restore):
+            raise RepositoryError(
+                "the capture asset lifecycle store is unavailable",
+                code="capture_asset_lifecycle_unavailable",
+                retryable=True,
+            )
+        return restore(
+            item_id,
+            artifact_id,
+            inverse,
             operation_id,
         )
 

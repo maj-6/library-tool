@@ -277,6 +277,8 @@
           };
         this.onStatus = typeof options.onStatus === "function"
           ? options.onStatus : () => {};
+        this.onPreview = typeof options.onPreview === "function"
+          ? options.onPreview : () => {};
         // The host reports which raster URLs are still bound to mounted
         // <img> elements. A lease for a displayed URL must never be revoked
         // out from under the DOM (that is the "Image unavailable" flash);
@@ -325,6 +327,8 @@
         this.detailCache = new Map();
         this.detailInflight = new Map();
         this.resourceReleases = [];
+        this.previewGeneration = 0;
+        this.previewRelease = null;
         this.currentResource = null;
         this.destroyed = false;
         this.mounted = false;
@@ -406,6 +410,7 @@
       }
 
       abortContextWork() {
+        this.closePreview();
         if (this.contextAbort) this.contextAbort.abort();
         this.contextAbort = typeof AbortController === "function"
           ? new AbortController() : null;
@@ -493,11 +498,18 @@
 
       async refresh(options = {}) {
         if (!this.context || this.destroyed) return null;
-        const selectedKey = options.preserveSelection === false ? "" : this.selectedKey;
+        const forgetSelectionKey = String(options.forgetSelectionKey || "");
+        const selectedKey = options.preserveSelection === false ||
+          forgetSelectionKey === this.selectedKey ? "" : this.selectedKey;
         const expanded = new Set(this.expandedGroups);
         this.contextGeneration += 1;
         this.abortContextWork();
         this.abortSelectionWork();
+        const contextGeneration = this.contextGeneration;
+        const selectionGeneration = this.selectionGeneration;
+        const refreshIsCurrent = () => !this.destroyed &&
+          contextGeneration === this.contextGeneration &&
+          selectionGeneration === this.selectionGeneration;
         this.detailCache.clear();
         this.detailInflight.clear();
         this.resetGroups();
@@ -506,9 +518,10 @@
         this.relatedKeys.clear();
         this.render();
         await Promise.allSettled(Array.from(expanded, (group) => this.loadGroup(group)));
+        if (!refreshIsCurrent()) return null;
         if (selectedKey) {
           if (this.items.has(selectedKey)) await this.select(selectedKey);
-          else await this.openDeepLink(selectedKey);
+          else await this.openDeepLink(selectedKey, { isCurrent: refreshIsCurrent });
         }
         return this.context;
       }
@@ -657,12 +670,15 @@
         }
       }
 
-      async openDeepLink(key) {
+      async openDeepLink(key, options = {}) {
         if (!this.context || !key) return null;
         try {
           const detail = await this.loadDetail(key, { force: true,
             signal: this.contextAbort && this.contextAbort.signal });
-          if (!detail || this.destroyed) return null;
+          if (!detail || this.destroyed ||
+              typeof options.isCurrent === "function" && !options.isCurrent()) {
+            return null;
+          }
           this.mergeDetail(detail);
           this.expandedGroups.add(detail.group);
           this.render();
@@ -838,7 +854,8 @@
         if (row.type === "group") await this.toggleGroup(row.group);
         else if (row.type === "more") await this.loadGroup(row.group);
         else if (row.type === "archived") this.toggleArchived(row.group);
-        else if (row.type === "item") await this.select(row.key, { focus: true });
+        else if (row.type === "item") await this.activateItem(
+          row.key, { focus: true, source: "tree" });
         this.render();
       }
 
@@ -942,8 +959,17 @@
           if (row.type === "group") await this.toggleGroup(row.group);
           else if (row.type === "more") await this.loadGroup(row.group);
           else if (row.type === "archived") this.toggleArchived(row.group);
-          else if (row.type === "item") await this.select(row.key);
+          else if (row.type === "item") await this.activateItem(
+            row.key, { source: "tree-keyboard" });
         }
+      }
+
+      async activateItem(key, options = {}) {
+        const summary = this.items.get(key);
+        if (summary && summary.group === "extracted-figures") {
+          return this.preview(key, options);
+        }
+        return this.select(key, options);
       }
 
       async toggleGroup(group, force) {
@@ -1160,6 +1186,88 @@
           }
           this.publishResource(this.unavailableResource(summary, summaryError));
           this.onStatus(summaryError.message, true, error);
+          return null;
+        }
+      }
+
+      closePreview() {
+        this.previewGeneration += 1;
+        const release = this.previewRelease;
+        this.previewRelease = null;
+        if (typeof release === "function") {
+          try { release(); } catch (error) { /* best-effort lease cleanup */ }
+        }
+      }
+
+      async preview(key, options = {}) {
+        if (!this.context || !key || this.destroyed) return null;
+        const generation = ++this.previewGeneration;
+        const contextGeneration = this.contextGeneration;
+        try {
+          const detail = await this.loadDetail(key, {
+            signal: this.contextAbort && this.contextAbort.signal,
+          });
+          if (!detail || detail.group !== "extracted-figures" ||
+              detail.family !== "image" ||
+              detail.resourceState !== "available" || !detail.resourceRef) {
+            throw capabilityError("extracted figure preview");
+          }
+          const resolved = await this.resources.resolveRaster({
+            itemId: detail.itemId || this.context.itemId,
+            artifactId: detail.id,
+            resourceRef: detail.resourceRef,
+            variant: "display",
+            signal: this.contextAbort && this.contextAbort.signal,
+          });
+          if (generation !== this.previewGeneration ||
+              contextGeneration !== this.contextGeneration || this.destroyed) {
+            if (resolved && typeof resolved.revoke === "function") {
+              resolved.revoke();
+            }
+            return null;
+          }
+          let url = "";
+          let release = null;
+          if (typeof resolved === "string") url = safeRasterUrl(resolved);
+          else if (resolved && typeof resolved === "object") {
+            url = safeRasterUrl(resolved.url);
+            if (typeof resolved.revoke === "function") {
+              release = () => resolved.revoke();
+            } else if (!url && resolved.blob) {
+              url = safeRasterUrl(this.objectUrls.create(resolved.blob));
+              if (url) release = () => this.objectUrls.revoke(url);
+            }
+          }
+          if (!url) throw new TypeError(
+            "raster resolver returned no safe preview resource");
+          const previousRelease = this.previewRelease;
+          this.previewRelease = release;
+          if (typeof previousRelease === "function") {
+            try { previousRelease(); } catch (error) { /* best effort */ }
+          }
+          const preview = Object.freeze({
+            key,
+            label: resourceLabel(detail),
+            url,
+            detail,
+            source: options.source || "artifacts",
+            close: () => {
+              if (generation === this.previewGeneration) this.closePreview();
+            },
+          });
+          this.onPreview(preview);
+          if (options.focus && typeof this.treeRoot.focus === "function") {
+            this.treeRoot.focus();
+          }
+          return preview;
+        } catch (error) {
+          if (generation !== this.previewGeneration || isAbort(error) ||
+              this.destroyed) return null;
+          this.onStatus(
+            error && error.message || "The extracted figure is unavailable",
+            true,
+            error,
+          );
           return null;
         }
       }
@@ -1609,6 +1717,7 @@
         this.contextGeneration += 1;
         this.abortContextWork();
         this.abortSelectionWork();
+        this.closePreview();
         this.releaseAllRasterLeases();
         for (const remove of this.listeners.splice(0)) remove();
         if (this.properties && typeof this.properties.destroy === "function") {

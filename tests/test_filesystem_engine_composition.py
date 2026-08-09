@@ -65,8 +65,10 @@ from librarytool.engine.correction_ocr import (
 )
 from librarytool.engine.corrections import CorrectionService
 from librarytool.engine.correction_transforms import (
+    CorrectionExtractionDescriptor,
     CorrectionTransformCommand,
     CorrectionTransformService,
+    canonical_extraction_quad,
 )
 from librarytool.engine.errors import ConflictError, RepositoryError, ValidationError
 from librarytool.engine.interchange import (
@@ -679,6 +681,11 @@ def _composition(
     workspace_lock_context_for=_workspace_lock,
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
+    corrections_write_set = (
+        None
+        if corrections is None or corrections.transaction_root is None
+        else RecoverableWriteSet(corrections.transaction_root)
+    )
     if unfinished:
         transaction = write_set.begin(scope="unfinished-test")
         transaction.stage_write("pending.json", b"{}")
@@ -720,6 +727,7 @@ def _composition(
             jobs=jobs,
             provenance=provenance,
             workspace_lock_context_for=workspace_lock_context_for,
+            corrections_write_set=corrections_write_set,
         ),
         catalogue=CatalogueBindings(
             load_snapshot=(
@@ -1047,6 +1055,240 @@ def _write_composition_capture(capture_root: Path) -> None:
     (directory / "photo_assets.json").write_text(
         json.dumps(manifest),
         encoding="utf-8",
+    )
+
+
+def test_composed_capture_lifecycle_is_cas_idempotent_and_recoverable(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    catalogue_path = tmp_path / "workspace" / "whl_builds.json"
+    update_revision = 1
+
+    def publish_item_updated_at(item_id):
+        nonlocal update_revision
+        assert item_id == "book-one"
+        update_revision += 1
+        revision = f"item-r{update_revision}"
+        return (
+            catalogue_path,
+            json.dumps(
+                {"book-one": {"title": "Herbal", "updated_at": revision}}
+            ).encode("utf-8"),
+            revision,
+        )
+
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+        transaction_root=tmp_path,
+        original_backup_root=tmp_path / "backups" / "originals",
+        item_updated_at_publication_for=publish_item_updated_at,
+    )
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.key.artifact_id.endswith(":display")
+    )
+
+    with pytest.raises(ConflictError) as stale:
+        raster.delete_capture_asset(
+            "book-one",
+            source.key.artifact_id,
+            "stale-artifact-revision",
+            "composition-capture-delete-stale",
+        )
+
+    deleted = raster.delete_capture_asset(
+        "book-one",
+        source.key.artifact_id,
+        source.revision,
+        "composition-capture-delete-1",
+    )
+    replay = raster.delete_capture_asset(
+        "book-one",
+        source.key.artifact_id,
+        source.revision,
+        "composition-capture-delete-1",
+    )
+
+    assert stale.value.code == "raster_resource_revision_conflict"
+    assert deleted["action"] == "delete"
+    assert deleted["replayed"] is False
+    assert replay == {**deleted, "replayed": True}
+    assert raster.list_raster_artifacts("book-one") == ()
+    manifest_path = capture_root / "capture-1" / "photo_assets.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["assets"][0]["desktop_lifecycle"] == {
+        "state": "deleted",
+        "revision": 1,
+        "updated_at": deleted["after_lifecycle"]["updated_at"],
+    }
+    assert manifest["assets"][0]["capture_order"] == 1
+    assert manifest["desktop_import"]["assets"][0]["asset_id"] == "asset-1"
+
+    restored = raster.restore_capture_asset(
+        "book-one",
+        source.key.artifact_id,
+        deleted["inverse"],
+        "composition-capture-restore-1",
+    )
+
+    assert restored["action"] == "restore"
+    assert restored["after_lifecycle"]["state"] == "active"
+    assert restored["after_lifecycle"]["revision"] == 2
+    assert [
+        value.key.artifact_id
+        for value in raster.list_raster_artifacts("book-one")
+        if value.key.artifact_id.endswith(":display")
+    ] == [source.key.artifact_id]
+    catalogue = json.loads(catalogue_path.read_text(encoding="utf-8"))
+    assert catalogue["book-one"]["updated_at"] == "item-r3"
+
+
+def test_deleted_corrected_capture_does_not_reappear_from_its_display_head(
+    tmp_path,
+):
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    catalogue_path = tmp_path / "workspace" / "whl_builds.json"
+    update_revision = 1
+
+    def publish_item_updated_at(item_id):
+        nonlocal update_revision
+        assert item_id == "book-one"
+        update_revision += 1
+        revision = f"item-r{update_revision}"
+        return (
+            catalogue_path,
+            json.dumps(
+                {"book-one": {"title": "Herbal", "updated_at": revision}}
+            ).encode("utf-8"),
+            revision,
+        )
+
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+        transaction_root=tmp_path,
+        original_backup_root=tmp_path / "backups" / "originals",
+        item_updated_at_publication_for=publish_item_updated_at,
+    )
+
+    def composed_engine():
+        return _composition(
+            tmp_path,
+            contribution_factory=first_party_module_contributions,
+            corrections=bindings,
+        )["engine"]
+
+    engine = composed_engine()
+    raster = engine.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    transforms = engine.require_service(CORRECTION_TRANSFORM_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.key.artifact_id.endswith(":display")
+    )
+    assert source.resource is not None
+    correction = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        adjustment=ManualBinaryAdjustRecipe(contrast=100, brightness=20),
+        rerun_ocr=False,
+        operation_id="composition-correct-before-delete",
+    )
+    transforms.queue(correction)
+    correction_run = transforms.execute_queued(correction)
+    assert correction_run.image_commit is not None
+    display_output = correction_run.image_commit.output("corrected-display")
+
+    corrected = raster.get_raster_artifact(source.key)
+    assert corrected is not None
+    assert corrected.resource is not None
+    mask = ((0.15, 0.2), (0.75, 0.25), (0.55, 0.8))
+    extraction = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=corrected.key.artifact_id,
+        artifact_revision=corrected.revision,
+        source_revision=corrected.resource.revision,
+        source_sha256=corrected.content_sha256,
+        quad=canonical_extraction_quad(mask),
+        adjustment=None,
+        rerun_ocr=False,
+        mask_polygon=mask,
+        operation_id="composition-extract-before-delete",
+        extraction=CorrectionExtractionDescriptor(
+            label="Pressed leaf",
+            source_kind="committed-mask",
+        ),
+    )
+    transforms.queue(extraction)
+    extraction_run = transforms.execute_queued(extraction)
+    assert extraction_run.image_commit is not None
+    figure_id = extraction_run.image_commit.output("extracted-figure").artifact_id
+    history_ids = {
+        value.key.artifact_id
+        for value in raster.list_raster_artifacts("book-one")
+        if value.extensions.get("correction_transform", {}).get("output_kind")
+        in {"ocr-ready", "thumbnail"}
+    }
+    assert len(history_ids) == 2
+
+    raster.delete_capture_asset(
+        "book-one",
+        corrected.key.artifact_id,
+        corrected.revision,
+        "composition-delete-corrected-capture",
+    )
+
+    reopened = composed_engine()
+    reopened_raster = reopened.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    projected = reopened_raster.list_raster_artifacts("book-one")
+    projected_ids = {value.key.artifact_id for value in projected}
+    assert source.key.artifact_id not in projected_ids
+    assert display_output.artifact_id not in projected_ids
+    assert history_ids.issubset(projected_ids)
+    assert figure_id in projected_ids
+
+    reopened_spatial = reopened.require_service(
+        SPATIAL_ANNOTATION_QUERY_SERVICE
+    )
+    annotations = reopened_spatial.list_spatial_annotations("book-one")
+    markers = [
+        value
+        for value in annotations
+        if value.extensions.get("corrections_ui", {}).get("overlay_only") is True
+    ]
+    assert len(markers) == 1
+    assert figure_id in markers[0].linked_artifact_ids
+    assert not any(
+        value.extensions.get("correction_transform", {}).get("operation_id")
+        == correction.operation_id
+        for value in annotations
     )
 
 
@@ -1409,6 +1651,189 @@ def test_production_composition_reopens_projected_transform_outputs(
         "provider_type": "image",
         "engine_version": "composition-test",
     }
+
+
+def test_extraction_reopens_as_one_figure_and_links_the_unchanged_source_region(
+    tmp_path,
+) -> None:
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    manifest_path = capture_root / "capture-1" / "photo_assets.json"
+    manifest_before = manifest_path.read_bytes()
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+    first = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    raster = first.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    spatial = first.require_service(SPATIAL_ANNOTATION_QUERY_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.key.artifact_id.endswith(":display")
+        and "capture_order" in value.extensions
+    )
+    assert source.resource is not None
+    source_region = spatial.list_spatial_annotations("book-one")[0]
+    command = CorrectionTransformCommand(
+        item_id="book-one",
+        artifact_id=source.key.artifact_id,
+        artifact_revision=source.revision,
+        source_revision=source.resource.revision,
+        source_sha256=source.content_sha256,
+        quad=canonical_extraction_quad(source_region.selector.points),
+        adjustment=None,
+        rerun_ocr=False,
+        operation_id="composition-extraction-1",
+        extraction=CorrectionExtractionDescriptor(
+            source_region.key.annotation_id,
+            source_region.revision,
+            "Botanical plate",
+        ),
+    )
+    transforms = first.require_service(CORRECTION_TRANSFORM_SERVICE)
+    transforms.queue(command)
+    run = transforms.execute_queued(command)
+    assert run.image_commit is not None
+    figure_id = run.image_commit.output("extracted-figure").artifact_id
+    assert manifest_path.read_bytes() == manifest_before
+
+    reopened = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    reopened_raster = reopened.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    projected = [
+        value
+        for value in reopened_raster.list_raster_artifacts("book-one")
+        if "correction_transform" in value.extensions
+    ]
+    assert len(projected) == 1
+    assert projected[0].key.artifact_id == figure_id
+    assert projected[0].kind == "extracted-figure"
+    assert projected[0].label == "Botanical plate"
+    assert projected[0].lineage[0].relation == "cropped_from"
+
+    reopened_source = reopened_raster.get_raster_artifact(source.key)
+    assert reopened_source is not None
+    assert reopened_source.content_sha256 == source.content_sha256
+    assert "correction_display_head" not in reopened_source.extensions
+
+    reopened_spatial = reopened.require_service(
+        SPATIAL_ANNOTATION_QUERY_SERVICE
+    )
+    annotations = reopened_spatial.list_spatial_annotations("book-one")
+    assert len(annotations) == 1
+    linked = annotations[0]
+    assert linked.key == source_region.key
+    assert linked.selector == source_region.selector
+    assert linked.revision.startswith("correction-extraction:")
+    assert linked.revision != source_region.revision
+    assert figure_id in linked.linked_artifact_ids
+    assert set(source_region.linked_artifact_ids).issubset(
+        linked.linked_artifact_ids
+    )
+    assert linked.extensions["correction_extraction"] == {
+        "artifact_ids": (figure_id,),
+    }
+    assert "correction_transform" not in linked.extensions
+
+
+def test_repeated_committed_mask_extractions_reopen_as_one_dashed_source_marker(
+    tmp_path,
+) -> None:
+    capture_root = tmp_path / "captures"
+    _write_composition_capture(capture_root)
+    manifest_path = capture_root / "capture-1" / "photo_assets.json"
+    manifest_before = manifest_path.read_bytes()
+    bindings = CorrectionsBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        capture_id_for=lambda item_id: (
+            "capture-1" if item_id == "book-one" else None
+        ),
+        capture_directory_for=lambda capture_id: capture_root / capture_id,
+        capture_authority_root=capture_root,
+        representation_revision_for=lambda _item_id, _source_id: None,
+        lock_context_for=_catalogue_lock,
+    )
+    first = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    raster = first.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    source = next(
+        value
+        for value in raster.list_raster_artifacts("book-one")
+        if value.key.artifact_id.endswith(":display")
+        and "capture_order" in value.extensions
+    )
+    assert source.resource is not None
+    mask = ((0.15, 0.2), (0.75, 0.25), (0.55, 0.8))
+    figure_ids = []
+    transforms = first.require_service(CORRECTION_TRANSFORM_SERVICE)
+    for index in (1, 2):
+        command = CorrectionTransformCommand(
+            item_id="book-one",
+            artifact_id=source.key.artifact_id,
+            artifact_revision=source.revision,
+            source_revision=source.resource.revision,
+            source_sha256=source.content_sha256,
+            quad=canonical_extraction_quad(mask),
+            adjustment=None,
+            rerun_ocr=True,
+            mask_polygon=mask,
+            operation_id=f"composition-mask-extraction-{index}",
+            extraction=CorrectionExtractionDescriptor(
+                label="Pressed leaf",
+                source_kind="committed-mask",
+            ),
+        )
+        transforms.queue(command)
+        run = transforms.execute_queued(command)
+        assert run.image_commit is not None
+        figure_ids.append(run.image_commit.output("extracted-figure").artifact_id)
+
+    assert manifest_path.read_bytes() == manifest_before
+    reopened = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+        corrections=bindings,
+    )["engine"]
+    reopened_raster = reopened.require_service(RASTER_ARTIFACT_QUERY_SERVICE)
+    extracted = [
+        value
+        for value in reopened_raster.list_raster_artifacts("book-one")
+        if value.kind == "extracted-figure"
+    ]
+    assert {value.key.artifact_id for value in extracted} == set(figure_ids)
+
+    reopened_spatial = reopened.require_service(
+        SPATIAL_ANNOTATION_QUERY_SERVICE
+    )
+    markers = [
+        value
+        for value in reopened_spatial.list_spatial_annotations("book-one")
+        if value.extensions.get("corrections_ui", {}).get("overlay_only") is True
+    ]
+    assert len(markers) == 1
+    marker = markers[0]
+    assert tuple((point.x, point.y) for point in marker.selector.points) == mask
+    assert marker.extensions["correction_extraction"] == {
+        "artifact_ids": tuple(figure_ids),
+    }
+    assert set(figure_ids).issubset(marker.linked_artifact_ids)
 
 
 def test_capture_display_slot_tracks_the_latest_transform_across_reopen(

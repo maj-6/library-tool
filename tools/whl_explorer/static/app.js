@@ -1270,8 +1270,10 @@ function renderTrash() {
         `${done ? " · restored" : ""}${it.note ? " · " + esc(it.note) : ""}</span>` +
       `<span class="trash-acts">` +
         (canRestore ? `<button class="cad-btn tiny" type="button" data-trash-restore="${esc(it.id)}">Restore</button>` : "") +
-        `<button class="cad-btn tiny" type="button" data-trash-download="${esc(it.id)}" ` +
-          `data-tip="Download the trashed payload">Download</button>` +
+        ((it.files || []).length
+          ? `<button class="cad-btn tiny" type="button" data-trash-download="${esc(it.id)}" ` +
+            `data-tip="Download the trashed payload">Download</button>`
+          : "") +
         `<button class="cad-btn tiny danger" type="button" data-trash-forget="${esc(it.id)}" ` +
           `data-tip="Discard this item for good">Forget</button>` +
       `</span></div>`;
@@ -1339,6 +1341,18 @@ async function trashAct(id, what) {
       const kind = (row || {}).kind || "";
       if (kind === "manual_entry") await loadManual();
       if (kind === "build") { await loadBuilds(); renderBuildsList(); }
+      if (kind === "capture_asset") {
+        try {
+          localStorage.setItem("librarytool.capture-assets.changed", JSON.stringify({
+            action: "restore",
+            itemId: data.item_id || "",
+            artifactId: data.artifact_id || "",
+            changedAt: Date.now(),
+          }));
+        } catch (error) {
+          // A focused Corrections window also polls on activation.
+        }
+      }
       if (bid) {
         ocrState.pdfInfo = {};
         ocrState.wordsCache.clear();
@@ -1375,6 +1389,11 @@ async function trashAct(id, what) {
 }
 
 function initInfoSections() {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== "librarytool.capture-assets.changed") return;
+    trashState.loadedAt = 0;
+    if (activeInfoSection() === "info-trash") loadTrash(true);
+  });
   for (const tab of document.querySelectorAll("#info-section-tabs [data-info-section]")) {
     tab.addEventListener("click", () => switchInfoSection(tab.dataset.infoSection));
   }

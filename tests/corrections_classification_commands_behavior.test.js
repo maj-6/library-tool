@@ -10,7 +10,11 @@ const {
   CLASSIFICATION_COMMAND_IDS,
   CorrectionCommandRegistry,
   KeyBindingConflictError,
+  ariaKeyBinding,
   bindCommandControl,
+  displayKeyBinding,
+  eventKeyBinding,
+  normalizeKeyBinding,
   registerClassificationCommands,
 } = require("../tools/whl_explorer/static/corrections/commands");
 const {
@@ -35,6 +39,14 @@ function image(overrides = {}) {
     ...overrides,
   };
 }
+
+
+test("Backspace is a portable, accessible command binding", () => {
+  assert.equal(normalizeKeyBinding("Backspace"), "backspace");
+  assert.equal(eventKeyBinding({ key: "Backspace" }), "backspace");
+  assert.equal(displayKeyBinding("backspace"), "Backspace");
+  assert.equal(ariaKeyBinding("backspace"), "Backspace");
+});
 
 
 function annotation(overrides = {}) {
@@ -137,6 +149,7 @@ function harness(options = {}) {
     history: options.history,
     resolveLinkedArtifact: options.resolveLinkedArtifact,
     transformContract: options.transformContract,
+    extractionTarget: options.extractionTarget,
     serializeTransformCommand: options.serializeTransformCommand,
     refreshTarget: options.refreshTarget,
     refreshBookTarget: options.refreshBookTarget,
@@ -572,6 +585,55 @@ test("raw spatial annotation link ids resolve the linked artifact transaction", 
 });
 
 
+test("role resolution ignores extracted crops but preserves foreign ambiguity", async () => {
+  const requests = [];
+  const { calls, controller } = harness({
+    resolveLinkedArtifact(_target, request) {
+      requests.push(request);
+      return {
+        key: "artifact:source-1",
+        objectType: "raster-artifact",
+        itemId: "book-1",
+        id: "source-1",
+        revision: "source-r4",
+      };
+    },
+  });
+  controller.setSelectionTarget(annotation({
+    linkedKeys: ["artifact:source-1", "artifact:crop-1"],
+    extensions: {
+      correction_extraction: { artifact_ids: ["crop-1"] },
+    },
+  }));
+
+  await controller.invoke(CLASSIFICATION_COMMAND_IDS.marginalia);
+
+  assert.equal(requests[0].linkedKey, "artifact:source-1");
+  assert.equal(calls[0][1].linkedArtifactId, "source-1");
+  assert.equal(calls[0][1].expectedLinkedArtifactRevision, "source-r4");
+
+  controller.setSelectionTarget(annotation({
+    key: "annotation:region-foreign",
+    id: "region-foreign",
+    revision: "region-foreign-r1",
+    linkedKeys: [
+      "artifact:source-1",
+      "artifact:crop-1",
+      "artifact:foreign-1",
+    ],
+    extensions: {
+      correction_extraction: { artifact_ids: ["crop-1"] },
+    },
+  }));
+  await assert.rejects(
+    controller.invoke(CLASSIFICATION_COMMAND_IDS.marginalia),
+    (error) => error && error.code === "linked_target_ambiguous",
+  );
+  assert.equal(calls.length, 1,
+    "a non-extraction foreign link must still block the role mutation");
+});
+
+
 test("a hovered compatible target wins over the selection and is promoted first", async () => {
   const order = [];
   const { calls, controller } = harness({
@@ -952,6 +1014,7 @@ test("x extracts the hovered region through the transform queue", async () => {
     source_sha256: "ab".repeat(32),
   };
   const calls = [];
+  const promotions = [];
   const port = {
     async queueTransform({ command }) {
       calls.push(command);
@@ -971,6 +1034,10 @@ test("x extracts the hovered region through the transform queue", async () => {
       return pins;
     },
     serializeTransformCommand: serializeCorrectionTransformCommand,
+    promoteSoftTarget(target) {
+      promotions.push(target.key);
+      return target;
+    },
     onError(error) {
       throw error;
     },
@@ -997,12 +1064,76 @@ test("x extracts the hovered region through the transform queue", async () => {
   assert.equal(wire.source_sha256, "ab".repeat(32));
   assert.equal(wire.rerun_ocr, true);
   assert.equal(wire.adjustment, null);
+  assert.deepEqual(wire.extraction, {
+    annotation_id: "region-1",
+    annotation_revision: "region-r1",
+    label: "Handwritten note",
+  });
+  assert.deepEqual(promotions, [], "extraction must not replace the open capture");
   assert.ok(wire.operation_id.startsWith("op-extract-"));
   assert.deepEqual(wire.quad, [
     [0.23, 0.38],
     [0.5700000000000001, 0.38],
     [0.5700000000000001, 0.52],
     [0.23, 0.52],
+  ]);
+});
+
+
+test("x extracts a committed editor mask through the same one-figure profile", async () => {
+  const {
+    serializeCorrectionTransformCommand,
+  } = require("../tools/whl_explorer/static/corrections/image-editor-state");
+  const mask = [[0.15, 0.2], [0.75, 0.25], [0.55, 0.8]];
+  const target = {
+    key: "mask:figure-1",
+    objectType: "committed-mask",
+    kind: "committed-mask",
+    itemId: "book-1",
+    annotationId: "mask-figure-1",
+    revision: "artifact:r1",
+    label: "User mask",
+    linkedKeys: ["artifact:figure-1"],
+    selector: { points: mask },
+  };
+  const calls = [];
+  const { controller } = harness({
+    port: {
+      async queueTransform({ command }) {
+        calls.push(command);
+        return { operation_id: command.operation_id, job: { state: "queued" } };
+      },
+    },
+    transformContract: (value) => {
+      assert.equal(value, target);
+      return {
+        item_id: "book-1",
+        artifact_id: "figure-1",
+        artifact_revision: "artifact:r1",
+        source_revision: "bytes:r1",
+        source_sha256: "ab".repeat(32),
+      };
+    },
+    serializeTransformCommand: serializeCorrectionTransformCommand,
+  });
+
+  await controller.invoke("corrections.region.extract", {
+    source: "test",
+    context: { extractionTarget: target },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].mask_polygon, mask);
+  assert.deepEqual(calls[0].extraction, {
+    source_kind: "committed-mask",
+    label: "User mask",
+  });
+  assert.equal(calls[0].rerun_ocr, true);
+  assert.deepEqual(calls[0].quad, [
+    [0.13, 0.18000000000000002],
+    [0.77, 0.18000000000000002],
+    [0.77, 0.8200000000000001],
+    [0.13, 0.8200000000000001],
   ]);
 });
 

@@ -44,6 +44,7 @@ const {
 } = require("../tools/whl_explorer/static/corrections/layout-controller");
 const {
   BOOKS_NAVIGATION_COMMANDS,
+  CAPTURE_TRASH_COMMAND,
   CONTEXT_SCHEMA,
   CorrectionsShell,
   CorrectionsWindowState,
@@ -2378,6 +2379,262 @@ test("window activation refreshes shared corrections state once", async () => {
   ]);
 });
 
+
+test("a cross-window capture delete advances only its matching selection", async () => {
+  const sourceWindow = new FakeEventTarget();
+  const receiverWindow = new FakeEventTarget();
+  const receiverDocument = new FakeEventTarget();
+  sourceWindow.localStorage = {
+    setItem(key, value) {
+      receiverWindow.emit("storage", {
+        key,
+        newValue: String(value),
+        storageArea: receiverWindow.localStorage,
+      });
+    },
+  };
+  const calls = [];
+  let releaseFirstBooksRefresh;
+  let holdBooksRefresh = true;
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    windowRef: receiverWindow,
+    documentRef: receiverDocument,
+    listeners: [],
+    destroyed: false,
+    externalRefreshPromise: null,
+    state: {
+      selection: {
+        itemId: "book-1",
+        representationId: "scan-1",
+        canvasId: "page-1",
+        artifactId: "capture-deleted",
+        annotationId: null,
+      },
+      resource: { id: "capture-deleted" },
+    },
+    classificationController: {
+      setHotTarget(value) { calls.push(["hot", value]); },
+    },
+    booksFeature: {
+      books: {
+        stepSelection() { return null; },
+        captureDeletionFallback(selection) {
+          calls.push(["fallback", { ...selection }]);
+          return {
+            address: {
+              itemId: "book-1",
+              representationId: "scan-1",
+              canvasId: "page-2",
+              artifactId: "capture-next",
+              annotationId: null,
+            },
+            navigationPreview: { url: "/thumb-next" },
+          };
+        },
+      },
+      refresh(reason) {
+        calls.push(["books-refresh", reason]);
+        if (!holdBooksRefresh) return Promise.resolve();
+        return new Promise((resolve) => { releaseFirstBooksRefresh = resolve; });
+      },
+    },
+    artifactsFeature: {
+      refresh(options) {
+        calls.push(["artifacts-refresh", options]);
+        return Promise.resolve();
+      },
+    },
+    itemProperties: {
+      refresh(reason) {
+        calls.push(["metadata-refresh", reason]);
+        return Promise.resolve();
+      },
+    },
+    setResource(value) {
+      calls.push(["resource", value]);
+      this.state.resource = value;
+    },
+    selectAddress(address, metadata) {
+      calls.push(["select", address, metadata]);
+      this.state.selection = { ...address };
+      return this.state.selection;
+    },
+    setStatus(message, error) { calls.push(["status", message, error]); },
+  });
+  shell.bindExternalRefresh();
+
+  sourceWindow.localStorage.setItem(
+    "librarytool.capture-assets.changed",
+    JSON.stringify({
+      action: "delete",
+      itemId: "book-1",
+      artifactId: "capture-deleted",
+      changedAt: 1234,
+    }),
+  );
+  await Promise.resolve();
+
+  assert.equal(shell.state.selection.artifactId, "capture-next",
+    "the receiving window advances before its stale index refreshes");
+  assert.equal(shell.state.resource, null,
+    "the deleted resource is immediately removed from the editor host");
+  assert.deepEqual(calls.find((entry) => entry[0] === "fallback")[1], {
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "page-1",
+    artifactId: "capture-deleted",
+    annotationId: null,
+  });
+
+  shell.state.selection = {
+    itemId: "book-1",
+    representationId: "scan-1",
+    canvasId: "page-9",
+    artifactId: "capture-newer",
+    annotationId: null,
+  };
+  shell.setResource({ id: "capture-newer" });
+  await Promise.resolve();
+  holdBooksRefresh = false;
+  releaseFirstBooksRefresh();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(shell.state.selection.artifactId, "capture-newer",
+    "the completion of the stale refresh cannot replace a newer selection");
+  assert.equal(shell.state.resource.id, "capture-newer");
+  assert.deepEqual(
+    calls.find((entry) => entry[0] === "artifacts-refresh")[1],
+    {
+      preserveSelection: true,
+      forgetSelectionKey: "artifact:capture-deleted",
+      reason: "capture-lifecycle",
+    },
+  );
+
+  const selectionCalls = calls.filter((entry) => entry[0] === "select").length;
+  sourceWindow.localStorage.setItem(
+    "librarytool.capture-assets.changed",
+    JSON.stringify({
+      action: "delete",
+      itemId: "book-1",
+      artifactId: "capture-deleted",
+      changedAt: 1235,
+    }),
+  );
+  await Promise.resolve();
+  await shell.externalRefreshPromise;
+
+  assert.equal(shell.state.selection.artifactId, "capture-newer",
+    "an unrelated current selection is preserved");
+  assert.equal(shell.state.resource.id, "capture-newer");
+  assert.equal(calls.filter((entry) => entry[0] === "select").length,
+    selectionCalls, "an unrelated lifecycle event never navigates the host");
+  assert.deepEqual(calls.filter((entry) => entry[0] === "artifacts-refresh").at(-1)[1], {
+    preserveSelection: true,
+    reason: "capture-lifecycle",
+    forgetSelectionKey: "artifact:capture-deleted",
+  });
+
+  holdBooksRefresh = true;
+  receiverWindow.emit("focus");
+  await Promise.resolve();
+  const focusRefresh = shell.externalRefreshPromise;
+  const refreshCount = calls.filter((entry) =>
+    entry[0] === "artifacts-refresh").length;
+  sourceWindow.localStorage.setItem(
+    "librarytool.capture-assets.changed",
+    JSON.stringify({
+      action: "delete",
+      itemId: "book-1",
+      artifactId: "capture-deleted",
+      changedAt: 1236,
+    }),
+  );
+  await Promise.resolve();
+  assert.equal(calls.filter((entry) => entry[0] === "artifacts-refresh").length,
+    refreshCount, "the target-aware refresh waits for the focus refresh");
+
+  holdBooksRefresh = false;
+  releaseFirstBooksRefresh();
+  await focusRefresh;
+  await new Promise((resolve) => setImmediate(resolve));
+  if (shell.externalRefreshPromise) await shell.externalRefreshPromise;
+  assert.deepEqual(calls.filter((entry) => entry[0] === "artifacts-refresh").at(-1)[1], {
+    preserveSelection: true,
+    reason: "capture-lifecycle",
+    forgetSelectionKey: "artifact:capture-deleted",
+  }, "an in-flight generic refresh cannot swallow the exact forget key");
+});
+
+
+test("cross-window capture lifecycle events reject malformed payloads", async () => {
+  const windowRef = new FakeEventTarget();
+  const documentRef = new FakeEventTarget();
+  const refreshes = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    windowRef,
+    documentRef,
+    listeners: [],
+    destroyed: false,
+    externalRefreshPromise: null,
+    refreshCaptureLifecycleChange(change) {
+      refreshes.push(change);
+      return Promise.resolve();
+    },
+  });
+  shell.bindExternalRefresh();
+
+  for (const newValue of [
+    null,
+    "{bad json",
+    JSON.stringify({
+      action: "purge",
+      itemId: "book-1",
+      artifactId: "capture-1",
+      changedAt: 1,
+    }),
+    JSON.stringify({
+      action: "delete",
+      itemId: "../book-1",
+      artifactId: "capture-1",
+      changedAt: 1,
+    }),
+    JSON.stringify({
+      action: "delete",
+      itemId: "book-1",
+      artifactId: "capture-1",
+      changedAt: 1,
+      unexpected: true,
+    }),
+  ]) {
+    windowRef.emit("storage", {
+      key: "librarytool.capture-assets.changed",
+      newValue,
+    });
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(refreshes, []);
+
+  windowRef.emit("storage", {
+    key: "librarytool.capture-assets.changed",
+    newValue: JSON.stringify({
+      action: "restore",
+      itemId: "book-1",
+      artifactId: "capture-1",
+      changedAt: 2,
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(refreshes, [{
+    action: "restore",
+    itemId: "book-1",
+    artifactId: "capture-1",
+    changedAt: 2,
+  }]);
+});
+
 test("external index convergence refreshes selected detail panels without a second Books load",
   async () => {
     let releaseArtifacts;
@@ -4356,6 +4613,408 @@ test("Books navigation commands register on j/k without classification conflicts
   });
 
 
+test("Backspace moves only the selected capture to Trash and advances in-book",
+  async () => {
+    const registry = new CorrectionCommandRegistry();
+    for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
+      registry.register({ ...command, execute: async () => null });
+    }
+    const calls = [];
+    const target = {
+      key: "artifact:capture-title",
+      itemId: "book-1",
+      artifactId: "capture-title",
+      revision: "capture-r7",
+    };
+    const fallback = {
+      address: {
+        itemId: "book-1",
+        representationId: "rep-1",
+        canvasId: "canvas-2",
+        artifactId: "capture-next",
+        annotationId: null,
+      },
+      navigationPreview: { url: "/thumb-next" },
+    };
+    const shell = Object.create(CorrectionsShell.prototype);
+    shell.state = { selection: {
+      itemId: "book-1",
+      artifactId: "capture-title",
+    } };
+    shell.classificationController = {
+      registry,
+      selectionTarget: target,
+      setHotTarget(value) { calls.push(["hot", value]); },
+    };
+    shell.booksFeature = {
+      books: {
+        stepSelection: () => null,
+        captureForSelection: () => ({
+          book: { id: "book-1" },
+          capture: {
+            artifact_id: "capture-title",
+            revision: "index:navigation-only",
+            capture_order: 0,
+            label: "Title leaf",
+          },
+        }),
+        captureDeletionFallback(selection) {
+          calls.push(["fallback", { ...selection }]);
+          return fallback;
+        },
+      },
+      async refresh(reason) { calls.push(["books-refresh", reason]); },
+    };
+    shell.artifactsFeature = {
+      items: new Map([["artifact:capture-title", target]]),
+      selectedKey: "artifact:capture-title",
+      async refresh(options) { calls.push(["artifacts-refresh", options]); },
+    };
+    const mutations = [];
+    shell.artifactPorts = { commands: {
+      async trashCaptureAsset(payload) {
+        mutations.push(payload);
+        return { operation_id: payload.operationId };
+      },
+    } };
+    shell.captureAssetOperationIdFactory = () => "capture-trash-op-1";
+    shell.captureAssetDeletionPromise = null;
+    shell.captureAssetDeleteAttempts = new Map();
+    shell.editorCanvasState = null;
+    shell.windowRef = { localStorage: { setItem() {} } };
+    shell.setResource = (value) => calls.push(["resource", value]);
+    shell.selectAddress = (address, metadata) => {
+      calls.push(["select", address, metadata]);
+      return address;
+    };
+    shell.setStatus = (message, error) => calls.push(["status", message, error]);
+    shell.registerCaptureTrashCommand();
+
+    assert.equal(normalizeKeyBinding(CAPTURE_TRASH_COMMAND.defaultBinding),
+      "backspace");
+    assert.equal(registry.commandForBinding("backspace").id,
+      CAPTURE_TRASH_COMMAND.id);
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), true);
+    await registry.invoke(CAPTURE_TRASH_COMMAND.id, {});
+
+    assert.deepEqual(mutations, [{
+      itemId: "book-1",
+      artifactId: "capture-title",
+      expectedArtifactRevision: "capture-r7",
+      label: "Title leaf",
+      operationId: "capture-trash-op-1",
+    }]);
+    assert.equal(calls[0][0], "fallback",
+      "the next address is captured before membership changes");
+    assert.ok(calls.some((entry) => entry[0] === "select" &&
+      entry[1].artifactId === "capture-next"));
+    assert.ok(calls.some((entry) => entry[0] === "books-refresh"));
+    assert.ok(calls.some((entry) => entry[0] === "artifacts-refresh"));
+    assert.deepEqual(
+      calls.find((entry) => entry[0] === "artifacts-refresh")[1],
+      {
+        preserveSelection: true,
+        forgetSelectionKey: "artifact:capture-title",
+        reason: "capture-deleted",
+      },
+    );
+    assert.match(calls.find((entry) => entry[0] === "status")[1],
+      /Info > Trash/);
+
+    shell.editorCanvasState = { maskDraft: { points: [] } };
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), false,
+      "a mask draft owns Backspace and protects the capture");
+  });
+
+
+test("Backspace waits for extraction success or failure on its source capture",
+  async () => {
+    const registry = new CorrectionCommandRegistry();
+    const target = Object.freeze({
+      itemId: "book-1",
+      artifactId: "capture-source",
+      expectedArtifactRevision: "capture-r1",
+      label: "Source leaf",
+    });
+    const queued = [];
+    const shell = Object.create(CorrectionsShell.prototype);
+    shell.state = { selection: {
+      itemId: target.itemId,
+      artifactId: target.artifactId,
+    } };
+    shell.classificationController = { registry };
+    shell.currentCaptureDeletionTarget = () => target;
+    shell.editorCanvasState = null;
+    shell.captureAssetDeletionPromise = null;
+    shell.captureExtractionOperations = new Map();
+    shell.destroyed = false;
+    shell.unsubscribeTransformResults = null;
+    shell.refreshCommittedCaptureDisplay = () => null;
+    let terminalResult;
+    shell.imageAdjustTool = {
+      observeTransformResult(result) {
+        return {
+          operationId: result.operation_id,
+          terminalState: result.terminal_state,
+          imageCommitted: result.terminal_state === "done",
+        };
+      },
+    };
+    shell.subscribeTransformResults = (listener) => {
+      terminalResult = listener;
+      return () => {};
+    };
+    shell.artifactPorts = { commands: {
+      queueTransform(payload) {
+        return new Promise((resolve, reject) => {
+          queued.push({ payload, resolve, reject });
+        });
+      },
+      async trashCaptureAsset() {
+        throw new Error("Backspace must stay unavailable");
+      },
+    } };
+    shell.registerCaptureTrashCommand();
+    shell.connectTransformResults();
+    const port = shell.classificationCommandPort();
+    const extraction = (operationId) => ({
+      operation_id: operationId,
+      item_id: target.itemId,
+      artifact_id: target.artifactId,
+      extraction: {
+        annotation_id: "region-1",
+        annotation_revision: "region-r1",
+        label: "Figure",
+      },
+    });
+
+    const successfulCommand = extraction("extract-success");
+    const successfulQueue = port.queueTransform({ command: successfulCommand });
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), false,
+      "the source is protected while the X request itself is pending");
+    queued.shift().resolve({ job_id: "job-success" });
+    await successfulQueue;
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), false,
+      "an accepted queue receipt is not a terminal extraction outcome");
+    terminalResult(
+      { operation_id: "extract-success", terminal_state: "done" },
+      successfulCommand,
+    );
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), true,
+      "terminal extraction success releases Backspace");
+
+    const failedCommand = extraction("extract-failed");
+    const failedQueue = port.queueTransform({ command: failedCommand });
+    queued.shift().resolve({ job_id: "job-failed" });
+    await failedQueue;
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), false);
+    terminalResult(
+      {
+        operation_id: "extract-failed",
+        terminal_state: "failed",
+        failure: { code: "worker_failed" },
+      },
+      failedCommand,
+    );
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), true,
+      "terminal extraction failure also releases Backspace");
+
+    const rejectedCommand = extraction("extract-rejected");
+    const rejectedQueue = port.queueTransform({ command: rejectedCommand });
+    queued.shift().reject(new Error("queue unavailable"));
+    await assert.rejects(rejectedQueue, /queue unavailable/);
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), true,
+      "a definite queue rejection leaves no in-flight extraction");
+
+    const ambiguousCommand = extraction("extract-ambiguous");
+    const ambiguousQueue = port.queueTransform({ command: ambiguousCommand });
+    const ambiguousError = new Error("response was lost");
+    ambiguousError.ambiguous = true;
+    queued.shift().reject(ambiguousError);
+    await assert.rejects(ambiguousQueue, /response was lost/);
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), false,
+      "an ambiguous rejection may still have queued the worker");
+    terminalResult(
+      { operation_id: "extract-ambiguous", terminal_state: "failed" },
+      ambiguousCommand,
+    );
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), true);
+  });
+
+
+test("successful committed-mask extraction converges to the durable overlay in place",
+  async () => {
+    const canvas = { dataset: { classificationCanvas: "true" } };
+    const mask = [[0.15, 0.2], [0.75, 0.25], [0.55, 0.8]];
+    const resource = {
+      correction: {
+        item_id: "book-1",
+        artifact_id: "capture-source",
+        artifact_revision: "capture-r1",
+      },
+    };
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      destroyed: false,
+      documentRef: { activeElement: canvas },
+      state: { resource },
+      editorCanvasState: {
+        gesture: null,
+        maskDraft: null,
+        maskPolygon: mask,
+        undoStack: [{ quad: [[0, 0], [1, 0], [1, 1], [0, 1]] }],
+        operations: [],
+        submission: { status: "idle" },
+      },
+      artifactsFeature: {
+        async refresh(options) {
+          assert.deepEqual(options, {
+            preserveSelection: true,
+            reason: "region-extraction",
+          });
+          return true;
+        },
+      },
+      setStatus() {},
+    });
+    const command = {
+      operation_id: "mask-extract-success",
+      mask_polygon: mask,
+      extraction: { source_kind: "committed-mask", label: "User mask" },
+    };
+    const target = shell.committedMaskExtractionTarget(
+      { target: canvas },
+      { action: "region.extract" },
+    );
+    assert.equal(target.objectType, "committed-mask");
+    assert.deepEqual(target.selector.points, mask);
+    assert.deepEqual(target.linkedKeys, ["artifact:capture-source"]);
+
+    const dispatched = [];
+    shell.editorCanvasController = {
+      dispatch(action) {
+        dispatched.push(action);
+        shell.editorCanvasState = {
+          ...shell.editorCanvasState,
+          maskPolygon: null,
+          undoStack: [],
+        };
+      },
+    };
+    const result = await shell.refreshCommittedCaptureDisplay({
+      operationId: command.operation_id,
+      imageCommitted: true,
+    }, command);
+
+    assert.equal(result, true);
+    assert.deepEqual(dispatched, [{
+      type: "MASK_EXTRACTION_COMMITTED",
+      maskPolygon: mask,
+    }]);
+    assert.equal(shell.state.resource, resource,
+      "the capture editor resource is never replaced by the extracted crop");
+    assert.equal(shell.editorHoldsDirtyState(), false,
+      "the durable marker releases the transient mask's Backspace guard");
+
+    shell.editorCanvasState = {
+      ...shell.editorCanvasState,
+      maskPolygon: mask,
+      undoStack: [{ maskPolygon: mask }],
+    };
+    shell.artifactsFeature.refresh = async () => {
+      throw new Error("refresh unavailable");
+    };
+    const refreshFailure = await shell.refreshCommittedCaptureDisplay({
+      operationId: command.operation_id,
+      imageCommitted: true,
+    }, command);
+    assert.equal(refreshFailure, null);
+    assert.equal(shell.editorHoldsDirtyState(), false,
+      "a confirmed commit releases the transient mask before refresh");
+  });
+
+
+test("an extraction guard does not block Backspace on another capture", async () => {
+  const registry = new CorrectionCommandRegistry();
+  const targets = {
+    "capture-a": Object.freeze({
+      itemId: "book-1",
+      artifactId: "capture-a",
+      expectedArtifactRevision: "capture-a-r1",
+      label: "Capture A",
+    }),
+    "capture-b": Object.freeze({
+      itemId: "book-1",
+      artifactId: "capture-b",
+      expectedArtifactRevision: "capture-b-r1",
+      label: "Capture B",
+    }),
+  };
+  let selected = "capture-a";
+  const deleted = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  shell.state = { selection: { itemId: "book-1", artifactId: selected } };
+  shell.classificationController = { registry };
+  shell.currentCaptureDeletionTarget = () => targets[selected];
+  shell.editorCanvasState = null;
+  shell.captureAssetDeletionPromise = null;
+  shell.captureAssetDeleteAttempts = new Map();
+  shell.captureExtractionOperations = new Map();
+  shell.captureAssetOperationIdFactory = () => "trash-capture-b";
+  shell.booksFeature = { books: {
+    stepSelection: () => null,
+    captureDeletionFallback: () => ({ address: {
+      itemId: "book-1",
+      artifactId: "capture-a",
+      annotationId: null,
+    } }),
+  } };
+  shell.refreshDeletedCapture = async () => null;
+  shell.setStatus = () => {};
+  shell.windowRef = { localStorage: { setItem() {} } };
+  shell.artifactPorts = { commands: {
+    async queueTransform() { return { job_id: "job-a" }; },
+    async trashCaptureAsset(payload) {
+      deleted.push(payload);
+      return { operation_id: payload.operationId };
+    },
+  } };
+  shell.registerCaptureTrashCommand();
+  const command = {
+    operation_id: "extract-a",
+    item_id: "book-1",
+    artifact_id: "capture-a",
+    extraction: {
+      annotation_id: "region-a",
+      annotation_revision: "region-a-r1",
+      label: "Figure A",
+    },
+  };
+  await shell.classificationCommandPort().queueTransform({ command });
+
+  assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), false,
+    "the extraction source remains protected after its queue receipt");
+  selected = "capture-b";
+  shell.state.selection.artifactId = selected;
+  assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), true,
+    "the independent capture remains eligible");
+  await registry.invoke(CAPTURE_TRASH_COMMAND.id, {});
+  assert.equal(deleted.length, 1);
+  assert.equal(deleted[0].artifactId, "capture-b");
+
+  selected = "capture-a";
+  shell.state.selection.artifactId = selected;
+  assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), false,
+    "returning to the source sees its still-active guard");
+  shell.captureExtractionTerminal(
+    { operation_id: "extract-a", terminal_state: "done" },
+    command,
+    { operationId: "extract-a", terminalState: "done" },
+  );
+  assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {}), true);
+});
+
+
 test("stored classification remaps cannot claim the Books navigation keys", () => {
   const registry = new CorrectionCommandRegistry();
   for (const command of DEFAULT_CLASSIFICATION_COMMANDS) {
@@ -4549,6 +5208,28 @@ test("region extraction refuses a region linked to another open image", () => {
     }),
     shell.state.resource.correction,
     "a link-free legacy region still uses the open resource",
+  );
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-3",
+      linkedKeys: Object.freeze(["artifact:crop-1", "artifact:crop-2"]),
+      extensions: {
+        correction_extraction: { artifact_ids: ["crop-1", "crop-2"] },
+      },
+    }),
+    shell.state.resource.correction,
+    "repeat X remains available when a legacy region has only crop links",
+  );
+  assert.equal(
+    shell.classificationTransformContract({
+      key: "spatial-annotation:region-3",
+      linkedKeys: Object.freeze(["artifact:crop-1", "artifact:figure-2"]),
+      extensions: {
+        correction_extraction: { artifact_ids: ["crop-1"] },
+      },
+    }),
+    null,
+    "subtracting crop links must not hide a real cross-image source link",
   );
 
   // The raw wire shapes the overlay publishes keep working.

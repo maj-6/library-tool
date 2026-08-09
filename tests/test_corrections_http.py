@@ -617,6 +617,41 @@ def test_raster_and_spatial_details_are_conditional_and_missing_is_explicit():
     ).status_code == 404
 
 
+def test_overlay_only_mask_markers_are_excluded_from_tree_count_but_not_editor() -> None:
+    ordinary = _annotation("region-a")
+    marker = replace(
+        _annotation("user-mask-a"),
+        extensions={
+            "corrections_ui": {"overlay_only": True},
+            "correction_extraction": {"artifact_ids": ["figure-a"]},
+        },
+    )
+    client = _app(
+        _Engine(_RasterProjector(()), _SpatialProjector((ordinary, marker)))
+    ).test_client()
+    endpoint = "/api/v1/items/book-1/spatial-annotations"
+
+    tree = client.get(f"{endpoint}?visibility=tree")
+    assert tree.status_code == 200
+    assert tree.get_json()["total"] == 1
+    assert [
+        value["key"]["annotation_id"]
+        for value in tree.get_json()["annotations"]
+    ] == ["region-a"]
+
+    overlay = client.get(f"{endpoint}?visibility=overlay")
+    assert overlay.status_code == 200
+    assert overlay.get_json()["total"] == 2
+    assert {
+        value["key"]["annotation_id"]
+        for value in overlay.get_json()["annotations"]
+    } == {"region-a", "user-mask-a"}
+
+    invalid = client.get(f"{endpoint}?visibility=menu")
+    assert invalid.status_code == 400
+    assert invalid.get_json()["code"] == "invalid_spatial_annotation_visibility"
+
+
 def test_raster_resource_requires_its_pin_and_never_serializes_a_path(tmp_path):
     content = b"\x89PNG\r\n\x1a\nprivate-raster"
     artifact = _raster("image-a", content=content)
@@ -2893,6 +2928,58 @@ def test_transform_queue_accepts_a_mask_polygon_and_rejects_unknown_fields():
     )
     assert degenerate.status_code == 400
     assert degenerate.get_json()["code"] == "invalid_correction_mask_polygon"
+
+
+def test_transform_queue_accepts_only_the_exact_extraction_descriptor():
+    artifact = _raster("image-a")
+    jobs = JobManager(checkpoint_interval=0)
+    transforms = CorrectionTransformService(jobs)
+    client = _app(
+        _Engine(
+            _RasterProjector((artifact,)),
+            _SpatialProjector(()),
+            transforms=transforms,
+        ),
+        transform_submitter=lambda service, command, queued: None,
+    ).test_client()
+    command = _transform_command(artifact)
+    path = "/api/v1/items/book-1/raster-artifacts/image-a/transforms"
+    headers = {
+        "Idempotency-Key": command.operation_id,
+        "If-Artifact-Match": f'"{artifact.revision}"',
+    }
+    extraction = {
+        "annotation_id": "region-1",
+        "annotation_revision": "region-r1",
+        "label": "Botanical plate",
+    }
+
+    accepted = client.post(
+        path,
+        json=dict(command.as_dict(), extraction=extraction),
+        headers=headers,
+    )
+
+    assert accepted.status_code == 202
+    assert accepted.get_json()["job"]["input_revisions"]["transform"][
+        "extraction"
+    ] == extraction
+
+    malformed_command = _transform_command(artifact, "transform-op-2")
+    malformed = client.post(
+        path,
+        json=dict(
+            malformed_command.as_dict(),
+            extraction={**extraction, "future": True},
+        ),
+        headers={
+            "Idempotency-Key": malformed_command.operation_id,
+            "If-Artifact-Match": f'"{artifact.revision}"',
+        },
+    )
+    assert malformed.status_code == 400
+    assert malformed.get_json()["code"] == "invalid_correction_transform"
+    assert malformed.get_json()["details"] == {"field": "extraction"}
 
 
 def test_transform_queue_rejects_an_operation_missing_its_canonical_rule():

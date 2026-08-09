@@ -335,12 +335,28 @@
       return id || `overlay:${index}`;
     }
 
-    function normalizeOverlayRegion(value, index = 0, options = {}) {
+  function normalizeOverlayRegion(value, index = 0, options = {}) {
       const points = selectorPoints(value, options);
       if (points.length < 3) return null;
       const code = artifactCode(value);
       const label = text(value && (value.label || value.name ||
         value.caption || value.text || value.id), 512) || `Region ${index + 1}`;
+      const extensions = value && value.extensions || {};
+      const extraction = extensions && extensions.correction_extraction;
+      const extractionIds = extraction &&
+        Array.isArray(extraction.artifact_ids)
+        ? extraction.artifact_ids : [];
+      const extractedArtifactKeys = extractionIds
+        .map((value) => `artifact:${text(value, 256)}`)
+        .filter((value) =>
+          /^artifact:[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/.test(value));
+      const explicitExtractedKey = text(value && (
+        value.extractedArtifactKey || value.extracted_artifact_key
+      ), 520);
+      const extractedArtifactKey = explicitExtractedKey || (
+        extractedArtifactKeys.length
+          ? extractedArtifactKeys[extractedArtifactKeys.length - 1] : ""
+      );
       return Object.freeze({
         key: overlayKey(value, index),
         label,
@@ -349,6 +365,11 @@
         category: effectiveCategory(value),
         points,
         metadata: artifactPresentationMetadata(value),
+        extracted: extractionIds.length > 0,
+        extractedArtifactKey:
+          /^artifact:[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/.test(
+            extractedArtifactKey,
+          ) ? extractedArtifactKey : "",
         target: value,
       });
     }
@@ -549,6 +570,12 @@
           "corrections-artifact-overlay-region",
         );
         wrapper.dataset.overlayKey = region.key;
+        if (region.extracted) {
+          wrapper.dataset.extraction = "extracted";
+        }
+        if (region.extractedArtifactKey) {
+          wrapper.dataset.extractedArtifactKey = region.extractedArtifactKey;
+        }
         wrapper.style.left = px(bounds.left);
         wrapper.style.top = px(bounds.top);
         wrapper.style.width = px(Math.max(1, bounds.width));
@@ -562,7 +589,8 @@
         marker.type = "button";
         marker.style.clipPath = localClipPath(points, bounds);
         marker.setAttribute("aria-label",
-          `${region.code}, ${region.label}, artifact region`);
+          `${region.code}, ${region.label}, artifact region` +
+          (region.extractedArtifactKey ? ", extracted crop available" : ""));
         marker.title = `${region.code} — ${region.label}`;
         marker.addEventListener("pointerenter", () =>
           this.setHotTarget(region.key));
@@ -577,7 +605,12 @@
           }
         });
         marker.addEventListener("click", () =>
-          this.onActivate(region.target, { key: region.key, element: wrapper }));
+          this.onActivate(region.target, {
+            key: region.key,
+            element: wrapper,
+            extractedArtifactKey: region.extractedArtifactKey,
+            preview: Boolean(region.extractedArtifactKey),
+          }));
 
         const centroid = polygonCentroid(points);
         const badge = element(

@@ -331,6 +331,135 @@ internal fun collectionCloudBody(
         if (includeUpdatedAt && row.updatedAt.isNotEmpty()) put("updated_at", row.updatedAt)
     }
 
+internal const val CAPTURE_ASSET_LIFECYCLE_PAGE_SIZE = 500
+internal const val CAPTURE_ASSET_LIFECYCLE_MAX_ROWS = 50_000
+
+internal data class CaptureAssetLifecycleCursor(
+    val captureId: String,
+    val assetId: String,
+)
+
+private fun safeCaptureAssetLifecycleCursor(cursor: CaptureAssetLifecycleCursor): Boolean =
+    SAFE_CAPTURE_SYNC_ID.matches(cursor.captureId) &&
+        cursor.assetId.length in 1..160 &&
+        SAFE_CLOUD_FILTER_TOKEN.matches(cursor.assetId) &&
+        cursor.assetId != "." && cursor.assetId != ".."
+
+private fun postgrestFilterLiteral(value: String): String {
+    val encoded = URLEncoder.encode(value, Charsets.UTF_8.name())
+    return if (value.any { it in ",.:()" }) "%22$encoded%22" else encoded
+}
+
+/** One owner-scoped lifecycle page. Both primary-key columns participate in
+ * the cursor, so inserting another asset cannot shift a later page. */
+internal fun captureAssetLifecyclePath(
+    captureIds: List<String>,
+    after: CaptureAssetLifecycleCursor? = null,
+    pageSize: Int = CAPTURE_ASSET_LIFECYCLE_PAGE_SIZE,
+): String {
+    require(pageSize in 1..CAPTURE_ASSET_LIFECYCLE_PAGE_SIZE) {
+        "invalid capture asset lifecycle page size"
+    }
+    val ids = safeCaptureSyncIds(captureIds).sorted()
+    require(ids.isNotEmpty() && ids.size == captureIds.distinct().size) {
+        "invalid capture asset lifecycle scope"
+    }
+    val filter = ids.joinToString(",") {
+        URLEncoder.encode(it, Charsets.UTF_8.name())
+    }
+    val cursor = after?.let {
+        require(safeCaptureAssetLifecycleCursor(it)) {
+            "invalid capture asset lifecycle cursor"
+        }
+        val captureId = URLEncoder.encode(it.captureId, Charsets.UTF_8.name())
+        val assetId = postgrestFilterLiteral(it.assetId)
+        "&or=(capture_id.gt.$captureId," +
+            "and(capture_id.eq.$captureId,asset_id.gt.$assetId))"
+    }.orEmpty()
+    return "/rest/v1/capture_asset_lifecycle" +
+        "?capture_id=in.($filter)&select=" +
+        "capture_id,asset_id,owner_id,source_original_sha256," +
+        "result,revision,updated_at" + cursor +
+        "&order=capture_id.asc,asset_id.asc&limit=$pageSize"
+}
+
+private fun lifecycleCursorAdvances(
+    candidate: CaptureAssetLifecycleCursor,
+    previous: CaptureAssetLifecycleCursor,
+): Boolean = candidate.captureId > previous.captureId ||
+    (candidate.captureId == previous.captureId && candidate.assetId > previous.assetId)
+
+/** Consume all stable keyset pages, even when PostgREST returns fewer rows
+ * than requested because the project has a lower `max_rows` setting.
+ *
+ * A malformed page never escapes as a partial snapshot. The caller can retain
+ * the existing batch-isolation behavior by catching [SupabaseClient.InvalidResponse].
+ */
+internal fun collectCaptureAssetLifecyclePages(
+    expectedOwnerId: String,
+    expectedCaptureIds: Collection<String>,
+    maximumRows: Int = CAPTURE_ASSET_LIFECYCLE_MAX_ROWS,
+    fetchPage: (CaptureAssetLifecycleCursor?, Int) -> JSONArray,
+): List<CaptureAssetLifecycleRow> {
+    require(maximumRows in 1..1_000_000) {
+        "maximum rows must be between 1 and 1000000"
+    }
+    val requested = expectedCaptureIds.toList()
+    val expected = safeCaptureSyncIds(requested).sorted().toSet()
+    require(expected.size == requested.distinct().size) {
+        "invalid capture asset lifecycle scope"
+    }
+    if (expected.isEmpty()) return emptyList()
+
+    val accepted = mutableListOf<CaptureAssetLifecycleRow>()
+    var after: CaptureAssetLifecycleCursor? = null
+    var observedRows = 0
+    while (true) {
+        // Fetch one sentinel beyond the safety boundary. Exactly-at-limit is
+        // accepted only after the next page proves that the snapshot is done.
+        val requestLimit = minOf(
+            CAPTURE_ASSET_LIFECYCLE_PAGE_SIZE,
+            maximumRows + 1 - observedRows,
+        )
+        val rows = fetchPage(after, requestLimit)
+        if (rows.length() > maximumRows - observedRows) {
+            throw SupabaseClient.InvalidResponse(
+                "capture asset lifecycle exceeds the $maximumRows-row safety limit",
+            )
+        }
+        observedRows += rows.length()
+        if (rows.length() == 0) return accepted
+
+        var previous = after
+        for (index in 0 until rows.length()) {
+            val row = rows.optJSONObject(index)
+                ?: throw SupabaseClient.InvalidResponse(
+                    "invalid capture asset lifecycle row",
+                )
+            val captureId = (row.opt("capture_id") as? String)
+                ?.trim()?.lowercase().orEmpty()
+            val assetId = (row.opt("asset_id") as? String)?.trim().orEmpty()
+            val candidate = CaptureAssetLifecycleCursor(captureId, assetId)
+            if (!safeCaptureAssetLifecycleCursor(candidate) ||
+                (previous != null && !lifecycleCursorAdvances(candidate, previous))
+            ) {
+                throw SupabaseClient.InvalidResponse(
+                    "capture asset lifecycle pagination did not advance",
+                )
+            }
+            previous = candidate
+
+            val parsed = captureAssetLifecycleRowFromJson(row) ?: continue
+            if (parsed.ownerId == expectedOwnerId && parsed.captureId in expected) {
+                accepted += parsed
+            }
+        }
+        after = previous ?: throw SupabaseClient.InvalidResponse(
+            "capture asset lifecycle pagination did not advance",
+        )
+    }
+}
+
 /**
  * Supabase REST for the capture flow, authorized as the signed-in USER: the
  * apikey header carries the public anon key and the bearer token is the
@@ -749,6 +878,51 @@ class SupabaseClient(
             fetchCaptureCorrectionsIsolated(batch, out)
         }
         return out
+    }
+
+    /** Desktop-authored delete/restore tombstones. Absence is intentionally
+     * not synthesized as active: only an explicit monotonic row may change a
+     * handset's persisted asset visibility. */
+    internal fun captureAssetLifecycles(
+        ids: List<String>,
+    ): Map<String, List<CaptureAssetLifecycleRow>> {
+        val out = linkedMapOf<String, MutableList<CaptureAssetLifecycleRow>>()
+        for (batch in safeCaptureSyncIds(ids).sorted().chunked(CAPTURE_METADATA_BATCH_SIZE)) {
+            fetchCaptureAssetLifecyclesIsolated(batch, out)
+        }
+        return out
+    }
+
+    private fun fetchCaptureAssetLifecyclesIsolated(
+        batch: List<String>,
+        out: MutableMap<String, MutableList<CaptureAssetLifecycleRow>>,
+    ) {
+        if (batch.isEmpty()) return
+        try {
+            val rows = collectCaptureAssetLifecyclePages(ownerId, batch) { after, limit ->
+                val conn = open(
+                    "GET",
+                    baseUrl + captureAssetLifecyclePath(batch, after, limit),
+                    null,
+                )
+                try {
+                    JSONArray(finish(conn).ifEmpty { "[]" })
+                } catch (e: org.json.JSONException) {
+                    throw InvalidResponse("invalid capture asset lifecycle response")
+                }
+            }
+            for (parsed in rows) {
+                val forCapture = out.getOrPut(parsed.captureId, ::mutableListOf)
+                // The page collector already rejects duplicate/non-advancing
+                // keys; keep this defensive guard across isolated batches.
+                if (forCapture.none { it.assetId == parsed.assetId }) forCapture += parsed
+            }
+        } catch (e: InvalidResponse) {
+            if (batch.size == 1) return
+            val midpoint = batch.size / 2
+            fetchCaptureAssetLifecyclesIsolated(batch.subList(0, midpoint), out)
+            fetchCaptureAssetLifecyclesIsolated(batch.subList(midpoint, batch.size), out)
+        }
     }
 
     /** Split only malformed/oversized responses down to one capture, like the

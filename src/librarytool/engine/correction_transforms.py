@@ -3,7 +3,7 @@
 This module owns portable commands, job registration, worker-facing ports, and
 pure draft construction.  Persistence adapters must atomically compare the
 source pins carried by :class:`CorrectionTransformCommitDraft` before
-publishing its four immutable outputs.  OCR is deliberately a second outcome:
+publishing one complete immutable output profile. OCR is deliberately a second outcome:
 it can propose machine data after the image commit, but it cannot mutate the
 human assertions carried in that commit.
 """
@@ -79,6 +79,17 @@ CORRECTION_OUTPUT_KINDS = (
     "thumbnail",
     "transform-manifest",
 )
+EXTRACTION_OUTPUT_KINDS = (
+    "extracted-figure",
+    # The OCR rendition is committed so the asynchronous follow-up remains
+    # pinned to immutable bytes, but persistence adapters keep it internal.
+    "ocr-ready",
+    "transform-manifest",
+)
+OUTPUT_PROFILES = frozenset({CORRECTION_OUTPUT_KINDS, EXTRACTION_OUTPUT_KINDS})
+_ALL_OUTPUT_KINDS = frozenset(CORRECTION_OUTPUT_KINDS) | frozenset(
+    EXTRACTION_OUTPUT_KINDS
+)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _COMMAND_FIELDS = frozenset(
@@ -121,8 +132,17 @@ _COMMAND_FIELDS = frozenset(
 # set is now "every required key, plus any subset of the known optional keys"
 # instead of one frozen set. The store already validates several documents this
 # way (see `_RASTER_SOURCE_FIELDS` vs `_RASTER_CANVAS_SOURCE_FIELDS`).
-_COMMAND_OPTIONAL_FIELDS = frozenset({"mask_polygon", "operations"})
+_COMMAND_OPTIONAL_FIELDS = frozenset(
+    {"mask_polygon", "operations", "extraction"}
+)
 _COMMAND_KNOWN_FIELDS = _COMMAND_FIELDS | _COMMAND_OPTIONAL_FIELDS
+_ANNOTATION_EXTRACTION_FIELDS = frozenset(
+    {"annotation_id", "annotation_revision", "label"}
+)
+_MASK_EXTRACTION_FIELDS = frozenset({"source_kind", "label"})
+_COMMITTED_MASK_SOURCE_KIND = "committed-mask"
+EXTRACTION_REGION_PADDING = 0.02
+EXTRACTION_REGION_MIN_EXTENT = 0.004
 _MANUAL_ADJUSTMENT_FIELDS = frozenset(
     {
         "schema",
@@ -205,6 +225,108 @@ def _canonical_json(payload: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def output_profile_for(extraction: bool) -> tuple[str, ...]:
+    """Return the ordered immutable outputs for one transform profile."""
+
+    if not isinstance(extraction, bool):
+        raise TypeError("extraction profile selector must be boolean")
+    return EXTRACTION_OUTPUT_KINDS if extraction else CORRECTION_OUTPUT_KINDS
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionExtractionDescriptor:
+    """The durable source marker whose crop becomes an extracted figure.
+
+    Annotation extractions retain their original three-field wire document.
+    A committed editor mask uses a separate, exact two-field shape and carries
+    its authoritative polygon in the command's existing ``mask_polygon`` slot.
+    """
+
+    annotation_id: str = ""
+    annotation_revision: str = ""
+    label: str = ""
+    source_kind: str = "annotation"
+
+    def __post_init__(self) -> None:
+        if self.source_kind == "annotation":
+            object.__setattr__(
+                self,
+                "annotation_id",
+                _identifier(self.annotation_id, "extraction.annotation_id"),
+            )
+            object.__setattr__(
+                self,
+                "annotation_revision",
+                _revision(
+                    self.annotation_revision,
+                    "extraction.annotation_revision",
+                ),
+            )
+        elif self.source_kind == _COMMITTED_MASK_SOURCE_KIND:
+            if self.annotation_id or self.annotation_revision:
+                raise _validation(
+                    "a committed-mask extraction must not carry annotation pins",
+                    code="invalid_correction_transform",
+                    field_name="extraction",
+                )
+        else:
+            raise _validation(
+                "extraction.source_kind must be committed-mask",
+                code="invalid_correction_transform",
+                field_name="extraction.source_kind",
+            )
+        label = _bounded_text(self.label, "extraction.label", maximum=512)
+        if not label.strip():
+            raise _validation(
+                "extraction.label must contain visible text",
+                code="invalid_correction_transform",
+                field_name="extraction.label",
+            )
+        object.__setattr__(self, "label", label)
+
+    @property
+    def is_committed_mask(self) -> bool:
+        return self.source_kind == _COMMITTED_MASK_SOURCE_KIND
+
+    def as_dict(self) -> dict[str, str]:
+        if self.is_committed_mask:
+            return {"source_kind": self.source_kind, "label": self.label}
+        return {
+            "annotation_id": self.annotation_id,
+            "annotation_revision": self.annotation_revision,
+            "label": self.label,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "CorrectionExtractionDescriptor":
+        if not isinstance(payload, Mapping):
+            raise _validation(
+                "extraction must be an object",
+                code="invalid_correction_transform",
+                field_name="extraction",
+            )
+        fields = frozenset(payload)
+        if fields == _MASK_EXTRACTION_FIELDS:
+            return cls(
+                label=payload["label"],
+                source_kind=payload["source_kind"],
+            )
+        if fields != _ANNOTATION_EXTRACTION_FIELDS:
+            raise _validation(
+                "extraction must match one exact source descriptor",
+                code="invalid_correction_transform",
+                field_name="extraction",
+            )
+        return cls(
+            annotation_id=payload["annotation_id"],
+            annotation_revision=payload["annotation_revision"],
+            label=payload["label"],
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class CorrectionTransformCommand:
     """A serializable correction request pinned to immutable source state."""
@@ -220,6 +342,7 @@ class CorrectionTransformCommand:
     rerun_ocr: bool = False
     mask_polygon: tuple[tuple[float, float], ...] | None = None
     operations: tuple[ProcessingOperation, ...] = ()
+    extraction: CorrectionExtractionDescriptor | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "item_id", _identifier(self.item_id, "item_id"))
@@ -289,6 +412,39 @@ class CorrectionTransformCommand:
                 field_name="operations",
             ) from exc
         object.__setattr__(self, "operations", operations)
+        extraction = self.extraction
+        if isinstance(extraction, Mapping):
+            extraction = CorrectionExtractionDescriptor.from_dict(extraction)
+        elif extraction is not None and not isinstance(
+            extraction,
+            CorrectionExtractionDescriptor,
+        ):
+            raise _validation(
+                "extraction must be an extraction descriptor or null",
+                code="invalid_correction_transform",
+                field_name="extraction",
+            )
+        object.__setattr__(self, "extraction", extraction)
+        if (
+            extraction is not None
+            and not extraction.is_committed_mask
+            and self.mask_polygon is not None
+        ):
+            raise _validation(
+                "an annotation extraction must not carry mask_polygon",
+                code="invalid_correction_transform",
+                field_name="mask_polygon",
+            )
+        if (
+            extraction is not None
+            and extraction.is_committed_mask
+            and self.mask_polygon is None
+        ):
+            raise _validation(
+                "a committed-mask extraction requires mask_polygon",
+                code="invalid_correction_transform",
+                field_name="mask_polygon",
+            )
         if not isinstance(self.rerun_ocr, bool):
             raise _validation(
                 "rerun_ocr must be boolean",
@@ -330,6 +486,8 @@ class CorrectionTransformCommand:
             payload["mask_polygon"] = [[x, y] for x, y in self.mask_polygon]
         if self.operations:
             payload["operations"] = [value.as_dict() for value in self.operations]
+        if self.extraction is not None:
+            payload["extraction"] = self.extraction.as_dict()
         return payload
 
     @property
@@ -474,6 +632,12 @@ class CorrectionTransformCommand:
                     code="invalid_correction_operations",
                     field_name="operations",
                 ) from exc
+        extraction_payload = payload.get("extraction")
+        extraction = None
+        if extraction_payload is not None:
+            extraction = CorrectionExtractionDescriptor.from_dict(
+                extraction_payload
+            )
         try:
             return cls(
                 item_id=payload["item_id"],
@@ -487,6 +651,7 @@ class CorrectionTransformCommand:
                 rerun_ocr=payload["rerun_ocr"],
                 mask_polygon=mask_polygon,
                 operations=operations,
+                extraction=extraction,
             )
         except KeyError as exc:
             raise _validation(
@@ -752,7 +917,7 @@ class CorrectionOutputDraft:
     content_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.kind not in CORRECTION_OUTPUT_KINDS:
+        if self.kind not in _ALL_OUTPUT_KINDS:
             raise ValueError(f"unsupported correction output kind: {self.kind}")
         if not isinstance(self.media_type, str) or "/" not in self.media_type:
             raise ValueError("media_type must be a MIME type")
@@ -820,10 +985,14 @@ class CorrectionTransformCommitDraft:
         if not isinstance(self.human_assertions, CorrectionHumanAssertions):
             raise TypeError("human_assertions must be CorrectionHumanAssertions")
         kinds = tuple(value.kind for value in outputs)
-        if len(kinds) != len(CORRECTION_OUTPUT_KINDS) or set(kinds) != set(
-            CORRECTION_OUTPUT_KINDS
-        ):
-            raise ValueError("commit draft must contain each correction output exactly once")
+        if kinds not in OUTPUT_PROFILES:
+            raise ValueError(
+                "commit draft outputs must form one complete output profile"
+            )
+        if kinds != output_profile_for(self.command.extraction is not None):
+            raise ValueError(
+                "commit draft output profile must match its command"
+            )
 
     def output(self, kind: str) -> CorrectionOutputDraft:
         return next(value for value in self.outputs if value.kind == kind)
@@ -837,7 +1006,7 @@ class CommittedCorrectionOutput:
     content_sha256: str
 
     def __post_init__(self) -> None:
-        if self.kind not in CORRECTION_OUTPUT_KINDS:
+        if self.kind not in _ALL_OUTPUT_KINDS:
             raise ValueError(f"unsupported correction output kind: {self.kind}")
         object.__setattr__(
             self,
@@ -882,10 +1051,10 @@ class CorrectionTransformCommitResult:
             )
         object.__setattr__(self, "outputs", outputs)
         kinds = tuple(value.kind for value in outputs)
-        if len(kinds) != len(CORRECTION_OUTPUT_KINDS) or set(kinds) != set(
-            CORRECTION_OUTPUT_KINDS
-        ):
-            raise ValueError("commit result must contain each correction output exactly once")
+        if kinds not in OUTPUT_PROFILES:
+            raise ValueError(
+                "commit result outputs must form one complete output profile"
+            )
 
     def output(self, kind: str) -> CommittedCorrectionOutput:
         return next(value for value in self.outputs if value.kind == kind)
@@ -1291,6 +1460,8 @@ class CorrectionTransformService:
             transform["operations"] = [
                 value.as_dict() for value in command.operations
             ]
+        if command.extraction is not None:
+            transform["extraction"] = command.extraction.as_dict()
         return {
             "id": job_id,
             "kind": CORRECTION_TRANSFORM_JOB_KIND,
@@ -1853,24 +2024,228 @@ def _thumbnail_png(content: bytes, *, maximum_edge: int) -> tuple[bytes, RasterD
     return output.getvalue(), RasterDimensions(image.width, image.height)
 
 
+def canonical_extraction_quad(
+    points: Sequence[NormalizedPoint | Sequence[float]],
+) -> tuple[tuple[float, float], ...]:
+    """Build the one canonical padded extraction bbox for a source polygon."""
+
+    coordinates: list[tuple[float, float]] = []
+    for point in points:
+        if isinstance(point, NormalizedPoint):
+            x, y = point.x, point.y
+        else:
+            try:
+                x, y = point
+            except (TypeError, ValueError) as exc:
+                raise _validation(
+                    "extraction geometry must contain coordinate pairs",
+                    code="invalid_correction_extraction_geometry",
+                    field_name="extraction",
+                ) from exc
+        if (
+            isinstance(x, bool)
+            or isinstance(y, bool)
+            or not isinstance(x, (int, float))
+            or not isinstance(y, (int, float))
+            or not math.isfinite(float(x))
+            or not math.isfinite(float(y))
+            or x < 0
+            or x > 1
+            or y < 0
+            or y > 1
+        ):
+            raise _validation(
+                "extraction geometry must use finite normalized coordinates",
+                code="invalid_correction_extraction_geometry",
+                field_name="extraction",
+            )
+        coordinates.append((float(x), float(y)))
+    if len(coordinates) < 3:
+        raise _validation(
+            "extraction geometry requires at least three points",
+            code="invalid_correction_extraction_geometry",
+            field_name="extraction",
+        )
+
+    minimum_x = max(0.0, min(x for x, _ in coordinates) - EXTRACTION_REGION_PADDING)
+    minimum_y = max(0.0, min(y for _, y in coordinates) - EXTRACTION_REGION_PADDING)
+    maximum_x = min(1.0, max(x for x, _ in coordinates) + EXTRACTION_REGION_PADDING)
+    maximum_y = min(1.0, max(y for _, y in coordinates) + EXTRACTION_REGION_PADDING)
+
+    if maximum_x - minimum_x < EXTRACTION_REGION_MIN_EXTENT:
+        center = (minimum_x + maximum_x) / 2
+        minimum_x = max(
+            0.0,
+            min(
+                center - EXTRACTION_REGION_MIN_EXTENT / 2,
+                1.0 - EXTRACTION_REGION_MIN_EXTENT,
+            ),
+        )
+        maximum_x = minimum_x + EXTRACTION_REGION_MIN_EXTENT
+    if maximum_y - minimum_y < EXTRACTION_REGION_MIN_EXTENT:
+        center = (minimum_y + maximum_y) / 2
+        minimum_y = max(
+            0.0,
+            min(
+                center - EXTRACTION_REGION_MIN_EXTENT / 2,
+                1.0 - EXTRACTION_REGION_MIN_EXTENT,
+            ),
+        )
+        maximum_y = minimum_y + EXTRACTION_REGION_MIN_EXTENT
+    return validate_normalized_quad(
+        (
+            (minimum_x, minimum_y),
+            (maximum_x, minimum_y),
+            (maximum_x, maximum_y),
+            (minimum_x, maximum_y),
+        )
+    )
+
+
+def committed_mask_annotation_identity(
+    command: CorrectionTransformCommand,
+) -> tuple[str, str]:
+    """Return the stable projected marker identity for one committed mask."""
+
+    if (
+        command.extraction is None
+        or not command.extraction.is_committed_mask
+        or command.mask_polygon is None
+    ):
+        raise ValueError("command must extract a committed mask")
+    digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "item_id": command.item_id,
+                "artifact_id": command.artifact_id,
+                "source_revision": command.source_revision,
+                "mask_polygon": [list(point) for point in command.mask_polygon],
+            }
+        )
+    ).hexdigest()
+    return f"user-mask-{digest[:32]}", f"user-mask:{digest}"
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedExtractionSource:
+    annotation: SpatialAnnotationView | None
+    points: tuple[NormalizedPoint | tuple[float, float], ...]
+
+
+def _bind_extraction_quad(
+    command: CorrectionTransformCommand,
+    source: _ValidatedExtractionSource,
+) -> _ValidatedExtractionSource:
+    expected = canonical_extraction_quad(source.points)
+    if any(
+        not math.isclose(actual, canonical, rel_tol=0.0, abs_tol=1e-12)
+        for actual_point, expected_point in zip(command.quad, expected, strict=True)
+        for actual, canonical in zip(actual_point, expected_point, strict=True)
+    ):
+        raise _validation(
+            "extraction quad must match the canonical padded source bounds",
+            code="invalid_correction_extraction_quad",
+            field_name="quad",
+        )
+    return source
+
+
+def _validate_extraction_source(
+    command: CorrectionTransformCommand,
+    source: CorrectionSourceSnapshot,
+) -> _ValidatedExtractionSource | None:
+    extraction = command.extraction
+    if extraction is None:
+        return None
+    if extraction.is_committed_mask:
+        source_ref = source.artifact.source
+        if not source_ref.canvas_id or not source_ref.canvas_revision:
+            raise ConflictError(
+                "a committed mask requires a canvas-scoped correction source",
+                code="correction_annotation_source_mismatch",
+                details={"artifact_id": command.artifact_id},
+            )
+        assert command.mask_polygon is not None
+        return _bind_extraction_quad(
+            command,
+            _ValidatedExtractionSource(None, command.mask_polygon),
+        )
+    annotation = next(
+        (
+            value
+            for value in source.annotations
+            if value.key.annotation_id == extraction.annotation_id
+        ),
+        None,
+    )
+    if annotation is None or annotation.revision != extraction.annotation_revision:
+        raise ConflictError(
+            "the extraction source annotation changed before rendering",
+            code="correction_extraction_source_stale",
+            details={
+                "annotation_id": extraction.annotation_id,
+                "expected_revision": extraction.annotation_revision,
+                "actual_revision": annotation.revision if annotation is not None else "",
+            },
+        )
+    source_ref = source.artifact.source
+    annotation_ref = annotation.source
+    if (
+        not source_ref.canvas_revision
+        or annotation_ref.representation_id != source_ref.representation_id
+        or annotation_ref.representation_revision
+        != source_ref.representation_revision
+        or annotation_ref.canvas_id != source_ref.canvas_id
+        or annotation_ref.canvas_revision != source_ref.canvas_revision
+        or annotation.selector.coordinate_space_revision
+        != source_ref.canvas_revision
+    ):
+        raise ConflictError(
+            "the extraction annotation does not belong to the correction source",
+            code="correction_annotation_source_mismatch",
+            details={"annotation_id": extraction.annotation_id},
+        )
+    if len(annotation.linked_artifact_ids) >= 64:
+        raise ConflictError(
+            "the extraction annotation cannot accept another artifact link",
+            code="correction_extraction_link_limit",
+            details={"annotation_id": extraction.annotation_id},
+        )
+    return _bind_extraction_quad(
+        command,
+        _ValidatedExtractionSource(annotation, annotation.selector.points),
+    )
+
+
 def _build_commit_draft(
     command: CorrectionTransformCommand,
     source: CorrectionSourceSnapshot,
     *,
     thumbnail_max_edge: int,
 ) -> CorrectionTransformCommitDraft:
+    extraction_source = _validate_extraction_source(command, source)
+    extraction_quad = (
+        canonical_extraction_quad(extraction_source.points)
+        if extraction_source is not None
+        else command.quad
+    )
     transformed = apply_perspective_transform(
         source.content,
-        command.quad,
+        extraction_quad,
         source_revision=command.source_revision,
         adjustment=command.adjustment,
         operations=command.operations,
         mask_polygon=command.mask_polygon,
     )
-    mapped, dropped = _map_annotations(
-        source,
-        transformed.source_to_output_homography,
-    )
+    if extraction_source is None:
+        mapped, dropped = _map_annotations(
+            source,
+            transformed.source_to_output_homography,
+        )
+    else:
+        # Page regions do not become regions inside the extracted crop. The
+        # source region is linked to the figure during projection instead.
+        mapped, dropped = (), ()
     human = CorrectionHumanAssertions.from_source(source)
     provenance = ArtifactProvenance(
         origin="transform",
@@ -1880,17 +2255,6 @@ def _build_commit_draft(
     display_dimensions = RasterDimensions(
         transformed.output_width,
         transformed.output_height,
-    )
-    thumbnail, thumbnail_dimensions = _thumbnail_png(
-        transformed.output_png,
-        maximum_edge=thumbnail_max_edge,
-    )
-    display = CorrectionOutputDraft(
-        "corrected-display",
-        "image/png",
-        transformed.output_png,
-        display_dimensions,
-        provenance,
     )
     # Without a mask these are the same bytes and therefore the same checksum,
     # exactly as before. A mask makes them diverge: display keeps alpha, OCR-ready
@@ -1902,13 +2266,35 @@ def _build_commit_draft(
         display_dimensions,
         provenance,
     )
-    thumbnail_draft = CorrectionOutputDraft(
-        "thumbnail",
-        "image/png",
-        thumbnail,
-        thumbnail_dimensions,
-        provenance,
-    )
+    if extraction_source is not None:
+        figure = CorrectionOutputDraft(
+            "extracted-figure",
+            "image/png",
+            transformed.output_png,
+            display_dimensions,
+            provenance,
+        )
+        image_outputs = (figure, ocr_ready)
+    else:
+        thumbnail, thumbnail_dimensions = _thumbnail_png(
+            transformed.output_png,
+            maximum_edge=thumbnail_max_edge,
+        )
+        display = CorrectionOutputDraft(
+            "corrected-display",
+            "image/png",
+            transformed.output_png,
+            display_dimensions,
+            provenance,
+        )
+        thumbnail_draft = CorrectionOutputDraft(
+            "thumbnail",
+            "image/png",
+            thumbnail,
+            thumbnail_dimensions,
+            provenance,
+        )
+        image_outputs = (display, ocr_ready, thumbnail_draft)
     correction_manifest = {
         "schema": "org.whl.correction-transform",
         "version": 1,
@@ -1916,15 +2302,15 @@ def _build_commit_draft(
         "command": command.as_dict(),
         "dependent_revision_pins": source.dependent_revision_pins,
         "raster_transform": transformed.transform_manifest,
-        "outputs": [
-            display.as_dict(),
-            ocr_ready.as_dict(),
-            thumbnail_draft.as_dict(),
-        ],
+        "outputs": [value.as_dict() for value in image_outputs],
         "annotation_mapping": {
             "mapped": len(mapped),
             "dropped_annotation_ids": list(dropped),
-            "policy": "projective-map-and-unit-square-clip",
+            "policy": (
+                "source-region-link-only"
+                if command.extraction is not None
+                else "projective-map-and-unit-square-clip"
+            ),
         },
         "human_assertions": {
             "artifact_categories": len(human.artifact_categories),
@@ -1936,6 +2322,10 @@ def _build_commit_draft(
         "rerun_ocr": command.rerun_ocr,
         "ocr_publication_policy": "machine-proposal-only",
     }
+    if command.extraction is not None:
+        correction_manifest["extraction"] = command.extraction.as_dict()
+        correction_manifest["output_profile"] = list(EXTRACTION_OUTPUT_KINDS)
+        correction_manifest["lineage_relation"] = "cropped_from"
     manifest = CorrectionOutputDraft(
         "transform-manifest",
         "application/json",
@@ -1946,7 +2336,7 @@ def _build_commit_draft(
     return CorrectionTransformCommitDraft(
         command,
         source,
-        (display, ocr_ready, thumbnail_draft, manifest),
+        (*image_outputs, manifest),
         mapped,
         dropped,
         human,
@@ -2300,8 +2690,12 @@ class CorrectionTransformWorker:
 __all__ = [
     "CORRECTION_OUTPUT_KINDS",
     "CORRECTION_TRANSFORM_JOB_KIND",
+    "EXTRACTION_REGION_MIN_EXTENT",
+    "EXTRACTION_REGION_PADDING",
+    "EXTRACTION_OUTPUT_KINDS",
     "CommittedCorrectionOutput",
     "CommittedCorrectionTransform",
+    "CorrectionExtractionDescriptor",
     "CorrectionHumanAssertions",
     "CorrectionOutputDraft",
     "CorrectionSourceSnapshot",
@@ -2329,4 +2723,7 @@ __all__ = [
     "OcrFollowupState",
     "PreservedSpatialAssertions",
     "QueuedCorrectionTransform",
+    "canonical_extraction_quad",
+    "committed_mask_annotation_identity",
+    "output_profile_for",
 ]

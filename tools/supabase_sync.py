@@ -12,8 +12,9 @@ Authenticated-user calls also carry ``access_token``; the project key stays in
 user. Owner-only calls omit ``access_token`` and continue to use the service
 credential as their bearer. Optional keys "table" (default "captures"),
 "bucket" (default "captures"), "books_table" (default "books"),
-"capture_book_metadata_table", "capture_reviews_table", and
-"capture_corrections_table" (the latter three use same-named defaults).
+"capture_book_metadata_table", "capture_reviews_table",
+"capture_corrections_table", and "capture_asset_lifecycle_table" (the latter
+four use same-named defaults).
 Errors raise
 SyncError with a readable message — callers report, they don't crash.
 """
@@ -67,6 +68,44 @@ CAPTURE_CORRECTION_RECIPE = "whl-desktop-correction-v1"
 CAPTURE_CORRECTION_RESULT_MAX_BYTES = 64 * 1024
 _CAPTURE_CORRECTION_ASSET_ID = re.compile(r"[A-Za-z0-9._-]{1,160}")
 _CAPTURE_CORRECTION_DIGEST = re.compile(r"[0-9a-f]{64}")
+CAPTURE_ASSET_LIFECYCLE_SCHEMA = "org.whl.capture-asset-lifecycle"
+CAPTURE_ASSET_LIFECYCLE_VERSION = 1
+CAPTURE_ASSET_LIFECYCLE_RESULT_MAX_BYTES = 64 * 1024
+CAPTURE_ASSET_LIFECYCLE_PAGE_SIZE = 500
+CAPTURE_ASSET_LIFECYCLE_MAX_ROWS = 50_000
+_CAPTURE_ASSET_LIFECYCLE_FIELDS = frozenset({
+    "schema",
+    "version",
+    "capture_id",
+    "asset_id",
+    "source_original_sha256",
+    "state",
+    "capture_order",
+    "lifecycle_revision",
+    "changed_at",
+})
+
+
+def _postgrest_filter_literal(value: str) -> str:
+    """Encode one trusted text value for PostgREST's filter grammar.
+
+    Percent-encoding alone is insufficient for grammar characters such as a
+    dot: URL parsers decode them before PostgREST parses ``column.op.value``.
+    Quoted filter values keep legal dotted capture asset identifiers scalar.
+    """
+
+    encoded = urllib.parse.quote(value, safe="")
+    if any(character in value for character in ",.:()"):
+        return f"%22{encoded}%22"
+    return encoded
+
+
+def _valid_capture_asset_lifecycle_asset_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value not in {".", ".."}
+        and _CAPTURE_CORRECTION_ASSET_ID.fullmatch(value) is not None
+    )
 
 
 class SyncError(Exception):
@@ -1691,7 +1730,7 @@ def publish_capture_corrections(
                         not isinstance(revision, int) or revision < 1):
                     raise SyncError("cloud correction has an invalid revision")
                 encoded_capture = urllib.parse.quote(capture_id, safe="")
-                encoded_asset = urllib.parse.quote(asset_id, safe="")
+                encoded_asset = _postgrest_filter_literal(asset_id)
                 response = _rest(
                     cfg, "PATCH",
                     f"{table}?capture_id=eq.{encoded_capture}"
@@ -1727,6 +1766,316 @@ def publish_capture_corrections(
             detail += f"; +{len(failures) - 10} more"
         raise SyncError(
             f"{len(failures)} capture correction row(s) failed "
+            f"({pushed} succeeded): {detail}")
+    return pushed
+
+
+# --- capture asset lifecycle: explicit desktop membership tombstones ------------
+
+def list_capture_asset_lifecycle(
+    cfg: dict,
+    capture_ids,
+    chunk: int = 40,
+    *,
+    page_size: int = CAPTURE_ASSET_LIFECYCLE_PAGE_SIZE,
+    maximum_rows: int = CAPTURE_ASSET_LIFECYCLE_MAX_ROWS,
+) -> list[dict]:
+    """Read the complete lifecycle snapshot in bounded, stable pages.
+
+    Owner credentials can span accounts, so the explicit capture-id scope is
+    part of the authorization boundary even though the service role bypasses
+    RLS.  Continue until an empty page rather than treating a short response as
+    complete: a project's PostgREST ``max_rows`` may be lower than
+    ``page_size``.  The compound keyset cursor also avoids offset drift while a
+    different asset is inserted concurrently.
+    """
+
+    if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 1:
+        raise ValueError("capture asset lifecycle chunk must be positive")
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= 1000
+    ):
+        raise ValueError(
+            "capture asset lifecycle page_size must be between 1 and 1000"
+        )
+    if (
+        isinstance(maximum_rows, bool)
+        or not isinstance(maximum_rows, int)
+        or not 1 <= maximum_rows <= 1_000_000
+    ):
+        raise ValueError(
+            "capture asset lifecycle maximum_rows must be between 1 and 1000000"
+        )
+
+    out: list[dict] = []
+    ids = sorted(_capture_sync_ids(capture_ids))
+    table = (cfg.get("capture_asset_lifecycle_table")
+             or "capture_asset_lifecycle")
+    observed_rows = 0
+    for i in range(0, len(ids), chunk):
+        batch = ids[i:i + chunk]
+        encoded = ",".join(
+            urllib.parse.quote(value, safe="") for value in batch)
+        cursor: tuple[str, str] | None = None
+        while True:
+            # Probe one sentinel beyond the safety bound.  Exactly-at-limit is
+            # valid only once the following keyset page proves exhaustion.
+            request_limit = min(
+                page_size,
+                maximum_rows + 1 - observed_rows,
+            )
+            cursor_filter = ""
+            if cursor is not None:
+                capture_cursor = urllib.parse.quote(cursor[0], safe="")
+                asset_cursor = _postgrest_filter_literal(cursor[1])
+                cursor_filter = (
+                    "&or=(capture_id.gt."
+                    f"{capture_cursor},and(capture_id.eq.{capture_cursor},"
+                    f"asset_id.gt.{asset_cursor}))"
+                )
+            rows = _rest(
+                cfg,
+                "GET",
+                f"{table}?capture_id=in.({encoded})"
+                "&select=capture_id,asset_id,owner_id,source_original_sha256,"
+                "result,revision,updated_at"
+                f"{cursor_filter}&order=capture_id.asc,asset_id.asc"
+                f"&limit={request_limit}",
+            )
+            if not isinstance(rows, list):
+                raise SyncError(
+                    "capture asset lifecycle returned an invalid collection"
+                )
+            if len(rows) > maximum_rows - observed_rows:
+                raise SyncError(
+                    "capture asset lifecycle exceeds the "
+                    f"{maximum_rows}-row safety limit"
+                )
+            observed_rows += len(rows)
+            if not rows:
+                break
+
+            previous = cursor
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise SyncError(
+                        "capture asset lifecycle returned an invalid row"
+                    )
+                capture_id = row.get("capture_id")
+                asset_id = row.get("asset_id")
+                if (
+                    not isinstance(capture_id, str)
+                    or not _capture_sync_ids((capture_id,))
+                    or not _valid_capture_asset_lifecycle_asset_id(asset_id)
+                ):
+                    raise SyncError(
+                        "capture asset lifecycle returned an invalid cursor"
+                    )
+                key = (capture_id, asset_id)
+                if previous is not None and key <= previous:
+                    raise SyncError(
+                        "capture asset lifecycle pagination did not advance"
+                    )
+                previous = key
+                if capture_id in batch:
+                    out.append(row)
+            cursor = previous
+            if cursor is None:
+                raise SyncError(
+                    "capture asset lifecycle pagination did not advance"
+                )
+    return out
+
+
+def _capture_asset_lifecycle_write_row(raw: dict) -> dict:
+    """Validate one complete writable lifecycle row and its bound result."""
+
+    if not isinstance(raw, dict):
+        raise SyncError("capture asset lifecycle row must be an object")
+    normalized = _capture_sync_ids((raw.get("capture_id"),))
+    asset_id = raw.get("asset_id")
+    source_sha256 = raw.get("source_original_sha256")
+    result = raw.get("result")
+    if (
+        not normalized
+        or not _valid_capture_asset_lifecycle_asset_id(asset_id)
+        or not isinstance(source_sha256, str)
+        or not _CAPTURE_CORRECTION_DIGEST.fullmatch(source_sha256)
+        or not isinstance(result, dict)
+        or frozenset(result) != _CAPTURE_ASSET_LIFECYCLE_FIELDS
+    ):
+        raise SyncError("capture asset lifecycle row is invalid")
+    for field in ("capture_order", "lifecycle_revision", "changed_at"):
+        value = result.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise SyncError("capture asset lifecycle result is invalid")
+    if (
+        result.get("schema") != CAPTURE_ASSET_LIFECYCLE_SCHEMA
+        or result.get("version") != CAPTURE_ASSET_LIFECYCLE_VERSION
+        or isinstance(result.get("version"), bool)
+        or result.get("capture_id") != normalized[0]
+        or result.get("asset_id") != asset_id
+        or result.get("source_original_sha256") != source_sha256
+        or result.get("state") not in {"active", "deleted"}
+    ):
+        raise SyncError("capture asset lifecycle result contradicts its row")
+    try:
+        result_size = len(json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise SyncError("capture asset lifecycle result is not JSON") from exc
+    if result_size > CAPTURE_ASSET_LIFECYCLE_RESULT_MAX_BYTES:
+        raise SyncError("capture asset lifecycle result exceeds 64 KiB")
+    return {
+        "capture_id": normalized[0],
+        "asset_id": asset_id,
+        "source_original_sha256": source_sha256,
+        "result": result,
+    }
+
+
+def _capture_asset_lifecycle_writable_equal(left: dict, right: dict) -> bool:
+    """Whether two rows carry exactly the same portable lifecycle state."""
+
+    try:
+        normalized_left = _capture_asset_lifecycle_write_row(left)
+        normalized_right = _capture_asset_lifecycle_write_row(right)
+        return json.dumps(
+            normalized_left,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ) == json.dumps(
+            normalized_right,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+    except (SyncError, TypeError, ValueError):
+        return False
+
+
+def publish_capture_asset_lifecycle(
+        cfg: dict,
+        rows: list[dict],
+        *,
+        expected_revisions: Mapping[tuple[str, str], int | None] | None = None,
+) -> int:
+    """CAS-publish explicit active/deleted capture-asset memberships.
+
+    The desktop manifest owns the lifecycle revision. The cloud row's
+    trigger-derived revision is a separate compare-and-set clock that prevents
+    concurrent desktop writers from silently replacing one another.
+    """
+
+    desired: dict[tuple[str, str], dict] = {}
+    failures: list[str] = []
+    for raw in rows:
+        label = "<unknown>"
+        if isinstance(raw, dict):
+            label = "/".join((
+                str(raw.get("capture_id") or "").strip() or "<unknown>",
+                str(raw.get("asset_id") or "").strip() or "<unknown>",
+            ))
+        try:
+            normalized = _capture_asset_lifecycle_write_row(raw)
+        except SyncError as exc:
+            failures.append(f"{label}: {exc}")
+            continue
+        desired[(normalized["capture_id"], normalized["asset_id"])] = normalized
+    if expected_revisions is not None and not isinstance(
+            expected_revisions, Mapping):
+        raise SyncError("capture asset lifecycle expected revisions are invalid")
+    existing = ({
+        (str(row.get("capture_id")), str(row.get("asset_id"))): row
+        for row in list_capture_asset_lifecycle(
+            cfg, (key[0] for key in desired))
+    } if expected_revisions is None else {})
+    table = (cfg.get("capture_asset_lifecycle_table")
+             or "capture_asset_lifecycle")
+    selected = (
+        "capture_id,asset_id,source_original_sha256,result,revision,updated_at"
+    )
+    pushed = 0
+    for (capture_id, asset_id), row in desired.items():
+        key = (capture_id, asset_id)
+        previous = existing.get(key)
+        if previous is not None and _capture_asset_lifecycle_writable_equal(
+                previous, row):
+            continue
+        try:
+            if expected_revisions is not None:
+                if key not in expected_revisions:
+                    raise SyncError(
+                        "capture asset lifecycle expected revision is missing")
+                revision = expected_revisions[key]
+            else:
+                revision = previous.get("revision") \
+                    if previous is not None else None
+            if revision is not None and (
+                    isinstance(revision, bool)
+                    or not isinstance(revision, int)
+                    or revision < 1):
+                raise SyncError(
+                    "capture asset lifecycle expected revision is invalid")
+            if revision is None:
+                response = _rest(
+                    cfg,
+                    "POST",
+                    f"{table}?on_conflict=capture_id,asset_id"
+                    f"&select={selected}",
+                    [row],
+                    prefer="resolution=ignore-duplicates,return=representation",
+                )
+                accepted_revision = 1
+            else:
+                encoded_capture = urllib.parse.quote(capture_id, safe="")
+                encoded_asset = _postgrest_filter_literal(asset_id)
+                response = _rest(
+                    cfg,
+                    "PATCH",
+                    f"{table}?capture_id=eq.{encoded_capture}"
+                    f"&asset_id=eq.{encoded_asset}&revision=eq.{revision}"
+                    f"&select={selected}",
+                    {
+                        "source_original_sha256":
+                            row["source_original_sha256"],
+                        "result": row["result"],
+                    },
+                    prefer="return=representation",
+                )
+                accepted_revision = revision + 1
+            if not isinstance(response, list) or len(response) != 1:
+                raise SyncError(
+                    "capture asset lifecycle compare-and-set conflict")
+            accepted = response[0]
+            if (
+                not isinstance(accepted, dict)
+                or not _capture_asset_lifecycle_writable_equal(accepted, row)
+                or accepted.get("revision") != accepted_revision
+                or not isinstance(accepted.get("updated_at"), str)
+                or not accepted.get("updated_at")
+            ):
+                raise SyncError(
+                    "capture asset lifecycle write returned an invalid row")
+            pushed += 1
+        except SyncError as exc:
+            failures.append(f"{capture_id}/{asset_id}: {exc}")
+    if failures:
+        detail = "; ".join(failures[:10])
+        if len(failures) > 10:
+            detail += f"; +{len(failures) - 10} more"
+        raise SyncError(
+            f"{len(failures)} capture asset lifecycle row(s) failed "
             f"({pushed} succeeded): {detail}")
     return pushed
 

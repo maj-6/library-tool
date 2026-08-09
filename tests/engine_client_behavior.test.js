@@ -367,6 +367,9 @@ function correctionTransformQueueResult(command, overrides = {}) {
           ...(command.mask_polygon
             ? { mask_polygon: command.mask_polygon.map((point) => [...point]) }
             : {}),
+          ...(command.extraction
+            ? { extraction: { ...command.extraction } }
+            : {}),
         },
       },
       outputs: [],
@@ -807,6 +810,7 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
     representationId: "capture:one",
     canvasId: "page:one",
     canvasRevision: "page-r1",
+    visibility: "overlay",
     limit: 200,
   })).annotations[0].key.annotation_id, "region:one");
   assert.equal((await client.spatialAnnotations.get({
@@ -820,7 +824,7 @@ test("EngineClient validates versioned Corrections artifact reads", async () => 
     "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone",
     "/api/v1/items/book%3Aone/spatial-annotations" +
       "?representation_id=capture%3Aone&canvas_id=page%3Aone" +
-      "&canvas_revision=page-r1&limit=200",
+      "&canvas_revision=page-r1&visibility=overlay&limit=200",
     "/api/v1/items/book%3Aone/spatial-annotations/region%3Aone",
   ]);
   assert.equal(client.rasterArtifacts.resourceUrl({
@@ -1103,6 +1107,89 @@ test("original-backup client rejects unsafe inputs and invalid receipts",
   });
 
 
+test("capture Trash mutation owns exact CAS, idempotency, and restore inverse",
+  async () => {
+    const operationId = "capture-trash-1";
+    const lifecycle = {
+      state: "deleted",
+      revision: 1,
+      updated_at: 1786320000000,
+    };
+    const result = {
+      operation_id: operationId,
+      action: "delete",
+      item_id: "book:one",
+      capture_id: "capture-one",
+      asset_id: "asset-one",
+      artifact_id: "image:one",
+      artifact_revision: "artifact-r1",
+      capture_order: 2,
+      before_lifecycle: null,
+      after_lifecycle: lifecycle,
+      item_updated_at: "item-r2",
+      inverse: {
+        schema: "librarytool.capture-asset-lifecycle-inverse/1",
+        action: "restore",
+        source_operation_id: operationId,
+        item_id: "book:one",
+        capture_id: "capture-one",
+        asset_id: "asset-one",
+        artifact_id: "image:one",
+        artifact_revision: "artifact-r1",
+        capture_order: 2,
+        expected_lifecycle: { ...lifecycle },
+      },
+      replayed: false,
+    };
+    const { client, calls } = harness({
+      ok: true,
+      schema: "librarytool.capture-asset-lifecycle-result/1",
+      result,
+    });
+
+    assert.deepEqual(await client.rasterArtifacts.trashCaptureAsset({
+      itemId: "book:one",
+      artifactId: "image:one",
+      expectedArtifactRevision: "artifact-r1",
+      idempotencyKey: operationId,
+    }), result);
+    assert.equal(calls[0].url,
+      "/api/v1/items/book%3Aone/raster-artifacts/image%3Aone/trash");
+    assert.equal(calls[0].init.method, "POST");
+    assert.equal(calls[0].init.headers["Idempotency-Key"], operationId);
+    assert.equal(calls[0].init.headers["If-Artifact-Match"], '"artifact-r1"');
+    assert.equal(Object.hasOwn(calls[0].init, "body"), false);
+    assert.equal(Object.hasOwn(
+      calls[0].init.headers, "Content-Type"), false);
+    assert.equal(calls[0].init.cache, "no-store");
+
+    for (const mutateInverse of [
+      (inverse) => { inverse.capture_id = "capture-other"; },
+      (inverse) => { inverse.asset_id = "asset-other"; },
+      (inverse) => { inverse.capture_order = 3; },
+      (inverse) => { inverse.expected_lifecycle.revision = 2; },
+    ]) {
+      const invalidResult = JSON.parse(JSON.stringify(result));
+      mutateInverse(invalidResult.inverse);
+      const { client: invalidClient } = harness({
+        ok: true,
+        schema: "librarytool.capture-asset-lifecycle-result/1",
+        result: invalidResult,
+      });
+      await assert.rejects(
+        invalidClient.rasterArtifacts.trashCaptureAsset({
+          itemId: "book:one",
+          artifactId: "image:one",
+          expectedArtifactRevision: "artifact-r1",
+          idempotencyKey: operationId,
+        }),
+        (error) => error instanceof EngineClientError &&
+          error.code === "invalid-response",
+      );
+    }
+  });
+
+
 test("raster resources reject oversized and mismatched bodies", async () => {
   let blobRead = false;
   const oversized = new EngineClient({
@@ -1364,6 +1451,10 @@ test("EngineClient rejects malformed or path-leaking Corrections views", async (
   assert.throws(() => client.spatialAnnotations.list({
     itemId: "book:one",
     canvasRevision: "bad revision",
+  }), TypeError);
+  assert.throws(() => client.spatialAnnotations.list({
+    itemId: "book:one",
+    visibility: "properties",
   }), TypeError);
 });
 
@@ -6318,7 +6409,7 @@ this.createBuild = createBuild;`, context);
 });
 
 
-test("transform commands accept an optional mask polygon and still reject unknown fields", async () => {
+test("transform commands accept strict extraction sources and still reject unknown fields", async () => {
   const mask = [[0.1, 0.1], [0.9, 0.2], [0.5, 0.9]];
   const masked = correctionTransformCommand({ mask_polygon: mask });
   const calls = [];
@@ -6332,6 +6423,23 @@ test("transform commands accept an optional mask polygon and still reject unknow
   await client.corrections.queueTransform({ command: masked });
   assert.deepEqual(calls[0].mask_polygon, mask);
 
+  const maskExtraction = correctionTransformCommand({
+    mask_polygon: mask,
+    extraction: { source_kind: "committed-mask", label: "Pressed leaf" },
+  });
+  const extractionCalls = [];
+  const extractionClient = new EngineClient({
+    transport: async (url, init) => {
+      extractionCalls.push(JSON.parse(init.body));
+      return response(202, correctionTransformQueueResult(maskExtraction));
+    },
+  });
+  await extractionClient.corrections.queueTransform({ command: maskExtraction });
+  assert.deepEqual(extractionCalls[0].extraction, {
+    source_kind: "committed-mask",
+    label: "Pressed leaf",
+  });
+
   // A mask-less command must stay exactly eleven keys: the engine hashes this
   // document, so an added null would move every stored command_sha256.
   const plain = correctionTransformCommand();
@@ -6344,6 +6452,29 @@ test("transform commands accept an optional mask polygon and still reject unknow
     [correctionTransformCommand({ mask_polygon: [[0.1, 0.1], [0.9, 0.2], [2, 9]] }),
       "an out-of-bounds point"],
     [correctionTransformCommand({ mask_polygon: "triangle" }), "a non-array mask"],
+    [correctionTransformCommand({
+      extraction: { source_kind: "committed-mask", label: "Pressed leaf" },
+    }), "a committed-mask extraction without a committed mask"],
+    [correctionTransformCommand({
+      mask_polygon: mask,
+      extraction: {
+        source_kind: "committed-mask",
+        annotation_id: "region:one",
+        label: "Pressed leaf",
+      },
+    }), "a mixed extraction source descriptor"],
+    [correctionTransformCommand({
+      mask_polygon: mask,
+      extraction: { source_kind: "freehand", label: "Pressed leaf" },
+    }), "an unknown extraction source"],
+    [correctionTransformCommand({
+      mask_polygon: mask,
+      extraction: {
+        annotation_id: "region:one",
+        annotation_revision: "region-r1",
+        label: "Figure 1",
+      },
+    }), "an annotation extraction carrying an unrelated mask"],
   ]) {
     await assert.rejects(
       () => new EngineClient({ transport: async () => response(202, {}) })

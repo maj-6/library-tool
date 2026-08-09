@@ -374,6 +374,74 @@ test("region labels toggle at the layer without changing markers or handlers", (
 });
 
 
+test("durable extraction links render dashed preview targets across rerenders", () => {
+  const documentRef = focusAwareDocument();
+  const root = new FakeNode("div", documentRef);
+  root.clientWidth = 200;
+  root.clientHeight = 100;
+  const activations = [];
+  const linked = region({
+    linkedKeys: ["artifact:capture-1", "artifact:crop-1"],
+    extensions: {
+      correction_extraction: { artifact_ids: ["crop-1"] },
+    },
+  });
+  const overlay = createArtifactOverlay({
+    root,
+    documentRef,
+    onActivate: (target, detail) => activations.push({ target, detail }),
+  });
+  overlay.setView({ sourceWidth: 400, sourceHeight: 200 });
+  overlay.setRegions([linked]);
+  overlay.mount();
+
+  let wrapper = root.querySelector("[data-overlay-key]");
+  let marker = wrapper.querySelector(".corrections-artifact-overlay-shape");
+  assert.equal(wrapper.dataset.extraction, "extracted");
+  assert.equal(wrapper.dataset.extractedArtifactKey, "artifact:crop-1");
+  assert.match(marker.getAttribute("aria-label"), /extracted crop available/);
+  marker.emit("click");
+  assert.equal(activations[0].target, linked);
+  assert.equal(activations[0].detail.preview, true);
+  assert.equal(
+    activations[0].detail.extractedArtifactKey,
+    "artifact:crop-1",
+  );
+
+  overlay.setRegionLabels(false);
+  overlay.setView({ zoom: 1.5, panX: 2, panY: 3 });
+  wrapper = root.querySelector("[data-overlay-key]");
+  assert.equal(wrapper.dataset.extraction, "extracted",
+    "persistent link state survives label and geometry rerenders");
+
+  const repeated = region({
+    extensions: {
+      correction_extraction: {
+        artifact_ids: ["crop-1", "crop-3", "crop-2"],
+      },
+    },
+  });
+  overlay.setRegions([repeated]);
+  wrapper = root.querySelector("[data-overlay-key]");
+  marker = wrapper.querySelector(".corrections-artifact-overlay-shape");
+  assert.equal(wrapper.dataset.extraction, "extracted",
+    "multiple durable links remain a dashed source marker");
+  assert.equal(wrapper.dataset.extractedArtifactKey, "artifact:crop-2",
+    "preview follows the final projected extraction link without reordering it");
+  marker.emit("click");
+  assert.equal(activations.at(-1).detail.extractedArtifactKey, "artifact:crop-2");
+  assert.equal(activations.at(-1).detail.preview, true);
+
+  overlay.setRegions([region()]);
+  wrapper = root.querySelector("[data-overlay-key]");
+  marker = wrapper.querySelector(".corrections-artifact-overlay-shape");
+  assert.equal(wrapper.dataset.extraction, undefined);
+  marker.emit("click");
+  assert.equal(activations.at(-1).detail.preview, false);
+  overlay.destroy();
+});
+
+
 test("destroying the overlay releases a live hot target", () => {
   const documentRef = focusAwareDocument();
   const root = new FakeNode("div", documentRef);

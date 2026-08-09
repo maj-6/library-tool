@@ -21,8 +21,10 @@ from librarytool.engine.correction_ocr import (
 from librarytool.engine.correction_transforms import (
     CORRECTION_OUTPUT_KINDS,
     CORRECTION_TRANSFORM_JOB_KIND,
+    EXTRACTION_OUTPUT_KINDS,
     CommittedCorrectionOutput,
     CommittedCorrectionTransform,
+    CorrectionExtractionDescriptor,
     CorrectionSourceSnapshot,
     CorrectionTransformCommand,
     CorrectionTransformCommitDraft,
@@ -38,6 +40,7 @@ from librarytool.engine.correction_transforms import (
     OcrFollowupPort,
     OcrFollowupState,
     _build_commit_draft,
+    canonical_extraction_quad,
 )
 from librarytool.engine.errors import ConflictError, ValidationError
 from librarytool.engine.jobs import JobManager, JobOutput, JobProgress, JobState
@@ -1398,6 +1401,212 @@ def test_mask_polygon_round_trips_and_changes_the_fingerprint() -> None:
     assert CorrectionTransformCommand.from_dict(masked.as_dict()) == masked
     assert CorrectionTransformCommand.from_dict(plain.as_dict()) == plain
     assert masked.fingerprint != plain.fingerprint
+
+
+def test_extraction_descriptor_is_additive_strict_and_canonical() -> None:
+    plain = _command()
+    extracted = _command(
+        extraction=CorrectionExtractionDescriptor(
+            "region-1",
+            "region-1-r1",
+            "Figure 1",
+        )
+    )
+
+    assert "extraction" not in plain.as_dict()
+    assert extracted.as_dict()["extraction"] == {
+        "annotation_id": "region-1",
+        "annotation_revision": "region-1-r1",
+        "label": "Figure 1",
+    }
+    assert CorrectionTransformCommand.from_dict(extracted.as_dict()) == extracted
+    assert extracted.fingerprint != plain.fingerprint
+
+    malformed = extracted.as_dict()
+    malformed["extraction"] = {
+        **malformed["extraction"],
+        "future": True,
+    }
+    with pytest.raises(ValidationError) as unknown:
+        CorrectionTransformCommand.from_dict(malformed)
+    assert unknown.value.details == {"field": "extraction"}
+
+    with pytest.raises(ValidationError) as blank:
+        _command(
+            extraction={
+                "annotation_id": "region-1",
+                "annotation_revision": "region-1-r1",
+                "label": "   ",
+            }
+        )
+    assert blank.value.details == {"field": "extraction.label"}
+
+
+def test_extraction_geometry_is_bound_to_annotation_or_committed_mask() -> None:
+    source = _source()
+    descriptor = CorrectionExtractionDescriptor(
+        "region-1",
+        "region-1-r1",
+        "Botanical figure",
+    )
+    with pytest.raises(ValidationError) as arbitrary:
+        _build_commit_draft(
+            _command(source, quad=FULL_FRAME, extraction=descriptor),
+            source,
+            thumbnail_max_edge=64,
+        )
+    assert arbitrary.value.code == "invalid_correction_extraction_quad"
+    assert arbitrary.value.details == {"field": "quad"}
+
+    with pytest.raises(ValidationError) as masked_annotation:
+        _command(
+            source,
+            quad=canonical_extraction_quad(
+                source.annotations[0].selector.points
+            ),
+            mask_polygon=((0.1, 0.1), (0.8, 0.2), (0.5, 0.8)),
+            extraction=descriptor,
+        )
+    assert masked_annotation.value.code == "invalid_correction_transform"
+    assert masked_annotation.value.details == {"field": "mask_polygon"}
+
+    mask = ((0.1, 0.15), (0.7, 0.2), (0.55, 0.75))
+    mask_quad = canonical_extraction_quad(mask)
+    command = _command(
+        source,
+        quad=mask_quad,
+        adjustment=None,
+        mask_polygon=mask,
+        rerun_ocr=True,
+        extraction=CorrectionExtractionDescriptor(
+            label="Pressed leaf",
+            source_kind="committed-mask",
+        ),
+    )
+    assert command.as_dict()["extraction"] == {
+        "source_kind": "committed-mask",
+        "label": "Pressed leaf",
+    }
+    draft = _build_commit_draft(command, source, thumbnail_max_edge=64)
+    manifest = json.loads(draft.output("transform-manifest").content)
+    assert manifest["raster_transform"]["quad"] == [list(point) for point in mask_quad]
+    assert tuple(value.kind for value in draft.outputs) == EXTRACTION_OUTPUT_KINDS
+
+    with pytest.raises(ValidationError) as missing_mask:
+        _command(
+            source,
+            extraction=CorrectionExtractionDescriptor(
+                label="Pressed leaf",
+                source_kind="committed-mask",
+            ),
+        )
+    assert missing_mask.value.details == {"field": "mask_polygon"}
+
+
+def test_extraction_profile_commits_one_figure_and_internal_ocr_without_regions() -> None:
+    source = _source()
+    command = _command(
+        source,
+        quad=canonical_extraction_quad(source.annotations[0].selector.points),
+        rerun_ocr=True,
+        extraction=CorrectionExtractionDescriptor(
+            "region-1",
+            "region-1-r1",
+            "Botanical figure",
+        ),
+    )
+    ocr = SuccessfulOcr()
+    jobs, _queue, store, worker = _queued(source, command, ocr=ocr)
+
+    result = worker.run(command)
+
+    assert result.image_commit is not None
+    assert tuple(value.kind for value in result.image_commit.outputs) == (
+        EXTRACTION_OUTPUT_KINDS
+    )
+    draft = store.commits[0]
+    assert tuple(value.kind for value in draft.outputs) == EXTRACTION_OUTPUT_KINDS
+    assert draft.mapped_annotations == ()
+    assert draft.dropped_annotation_ids == ()
+    assert draft.output("extracted-figure").dimensions == draft.output(
+        "ocr-ready"
+    ).dimensions
+    assert ocr.requests[0].source == result.image_commit.output("ocr-ready")
+    assert result.ocr_followup.state is OcrFollowupState.SUCCEEDED
+    manifest = json.loads(draft.output("transform-manifest").content)
+    assert manifest["extraction"] == command.extraction.as_dict()
+    assert manifest["output_profile"] == list(EXTRACTION_OUTPUT_KINDS)
+    assert manifest["annotation_mapping"] == {
+        "mapped": 0,
+        "dropped_annotation_ids": [],
+        "policy": "source-region-link-only",
+    }
+    assert jobs.get(CorrectionTransformService.job_id_for(command.operation_id))[
+        "state"
+    ] == "done"
+
+
+def test_extraction_requires_the_exact_source_annotation_revision_and_capacity() -> None:
+    source = _source()
+    stale = _command(
+        source,
+        extraction=CorrectionExtractionDescriptor(
+            "region-1",
+            "region-1-r2",
+            "Figure",
+        ),
+    )
+    with pytest.raises(ConflictError) as changed:
+        _build_commit_draft(stale, source, thumbnail_max_edge=64)
+    assert changed.value.code == "correction_extraction_source_stale"
+
+    full = replace(
+        source,
+        annotations=(
+            replace(
+                source.annotations[0],
+                linked_artifact_ids=tuple(f"linked-{index}" for index in range(64)),
+            ),
+        ),
+    )
+    command = _command(
+        full,
+        extraction=CorrectionExtractionDescriptor(
+            "region-1",
+            "region-1-r1",
+            "Figure",
+        ),
+    )
+    with pytest.raises(ConflictError) as bounded:
+        _build_commit_draft(command, full, thumbnail_max_edge=64)
+    assert bounded.value.code == "correction_extraction_link_limit"
+
+    foreign_annotation = replace(
+        source.annotations[0],
+        source=SpatialSourceRef(
+            "other-capture",
+            "other-representation-r1",
+            "other-canvas",
+            "other-canvas-r1",
+        ),
+        selector=NormalizedPolygonSelector(
+            "canvas-normalized",
+            "other-canvas-r1",
+            source.annotations[0].selector.points,
+        ),
+    )
+    foreign = replace(source, annotations=(foreign_annotation,))
+    command = _command(
+        foreign,
+        extraction=CorrectionExtractionDescriptor(
+            "region-1",
+            "region-1-r1",
+            "Figure",
+        ),
+    )
+    with pytest.raises(ConflictError) as wrong_canvas:
+        _build_commit_draft(command, foreign, thumbnail_max_edge=64)
+    assert wrong_canvas.value.code == "correction_annotation_source_mismatch"
 
 
 def test_from_dict_accepts_an_absent_mask_and_still_rejects_unknown_fields() -> None:
