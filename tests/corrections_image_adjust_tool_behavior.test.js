@@ -813,6 +813,37 @@ test("renderer composition serializes brightness and visible OCR choice", () => 
 });
 
 
+test("resource convergence updates the host before synchronizing Image Adjust", () => {
+  const harness = mountedHarness();
+  const order = [];
+  const originalSync = harness.tool.syncEditorResource.bind(harness.tool);
+  harness.tool.syncEditorResource = (...args) => {
+    order.push("tool");
+    return originalSync(...args);
+  };
+  const composed = composeImageAdjustRendererOptions(harness.tool, {
+    onResourceChange() {
+      order.push("host");
+      throw new Error("host callback failed");
+    },
+  });
+  const updated = { ...harness.controller.resource, label: "updated" };
+
+  assert.throws(
+    () => composed.onResourceChange(
+      updated,
+      harness.controller.resource,
+      harness.controller,
+    ),
+    /host callback failed/,
+  );
+  assert.deepEqual(order, ["host", "tool"]);
+  assert.equal(harness.tool.mountRecord.resource, updated,
+    "tool state cannot remain pinned to the old resource if the host reports");
+  harness.cleanup();
+});
+
+
 test("remembered brightness changes only after a real committed image result", () => {
   const profileEvents = [];
   const ocrEvents = [];
@@ -1446,6 +1477,96 @@ test("a queued Re-OCR reports its receipt and stays single-flight", async () => 
   );
   harness.tool.destroy();
 });
+
+
+test("Re-OCR waits for a background resource update and uses its revision",
+  async () => {
+    let releaseUpdate;
+    const requests = [];
+    const contexts = [];
+    const harness = mountedHarness({
+      requestReocr(request, context) {
+        requests.push(request);
+        contexts.push(context);
+        return Promise.resolve({ replayed: false });
+      },
+    });
+    const updated = reocrResource();
+    updated.summary.revision = "corrected-display-r3";
+    harness.controller.waitForResourceUpdate = () =>
+      new Promise((resolve) => { releaseUpdate = resolve; });
+    harness.tool.mount(harness.controller, reocrResource());
+    harness.tool.setReocrCapability(true);
+    const controls = reocrControls(harness);
+
+    controls.button.emit("click");
+    assert.equal(requests.length, 0, "queueing waits for the raster swap");
+    assert.equal(controls.button.disabled, true,
+      "the standalone action remains single-flight while waiting");
+
+    harness.tool.syncEditorResource(harness.controller, updated);
+    releaseUpdate(true);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(requests.length, 1);
+    assert.equal(
+      requests[0].expectedArtifactRevision,
+      "corrected-display-r3",
+    );
+    assert.equal(contexts[0].resource, updated);
+    harness.tool.destroy();
+  });
+
+
+test("Re-OCR sends nothing when the background resource update fails",
+  async () => {
+    for (const waitForResourceUpdate of [
+      () => Promise.resolve(false),
+      () => Promise.reject(new Error("background load failed")),
+    ]) {
+      const requests = [];
+      const harness = mountedHarness({
+        requestReocr(request) {
+          requests.push(request);
+          return Promise.resolve({ replayed: false });
+        },
+      });
+      harness.controller.waitForResourceUpdate = waitForResourceUpdate;
+      harness.tool.mount(harness.controller, reocrResource());
+      harness.tool.setReocrCapability(true);
+
+      reocrControls(harness).button.emit("click");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(requests.length, 0);
+      assert.equal(harness.tool.getState().reocrBusy, false);
+      harness.tool.destroy();
+    }
+  });
+
+
+test("Re-OCR sends nothing when its editor is disposed during an update",
+  async () => {
+    let releaseUpdate;
+    const requests = [];
+    const harness = mountedHarness({
+      requestReocr(request) {
+        requests.push(request);
+        return Promise.resolve({ replayed: false });
+      },
+    });
+    harness.controller.waitForResourceUpdate = () =>
+      new Promise((resolve) => { releaseUpdate = resolve; });
+    harness.tool.mount(harness.controller, reocrResource());
+    harness.tool.setReocrCapability(true);
+
+    reocrControls(harness).button.emit("click");
+    harness.tool.destroy();
+    releaseUpdate(true);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(requests.length, 0);
+  });
 
 
 test("a failed Re-OCR queue keeps the panel usable and reports the error", async () => {

@@ -346,6 +346,436 @@ test("renderer exposes strict resource pins, safe raster URLs, and accessible nu
 });
 
 
+test("the valid toolbar Queue action stays available in Select mode", () => {
+  const { container, controller, dispose } = renderHarness({
+    invokeCommand: async () => ({ job_id: "select-toolbar-job" }),
+  });
+  assert.equal(controller.getState().tool, TOOLS.SELECT);
+  assert.equal(byClass(container, "perspective-queue-button")[0].disabled, false);
+  dispose();
+});
+
+
+test("Queue waits for the latest background raster rebase without greying", async () => {
+  const invocations = [];
+  const initial = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r1",
+      variant: "display",
+    },
+  });
+  const revised = (revision, digest) => fixtureResource({
+    url: `/api/v1/artifacts/capture-7/${revision}`,
+    resourceRef: {
+      id: "capture-7-display",
+      revision: `bytes:${revision}`,
+      variant: "display",
+    },
+    correction: {
+      ...initial.correction,
+      artifact_revision: `artifact-${revision}`,
+      source_revision: `source-${revision}`,
+      source_sha256: digest.repeat(64),
+      proposal: fixtureProposal({ source_revision: `source-${revision}` }),
+    },
+  });
+  const { container, controller, dispose } = renderHarness({
+    initialTool: TOOLS.PERSPECTIVE,
+    invokeCommand: async (_commandId, payload) => {
+      invocations.push(payload);
+      return { job_id: "rebased-queue-job" };
+    },
+  }, initial);
+  const queue = byClass(container, "perspective-queue-button")[0];
+
+  assert.equal(controller.updateResource(revised("r2", "b")), true);
+  const staleLoader = controller.getPendingResourceImage();
+  queue.emit("click");
+  await nextTurn();
+  assert.equal(invocations.length, 0, "serialization waits for the pixel/pin swap");
+  assert.equal(queue.disabled, false,
+    "a background preload never makes the valid action look unavailable");
+
+  assert.equal(controller.updateResource(revised("r3", "c")), true);
+  const currentLoader = controller.getPendingResourceImage();
+  assert.notEqual(currentLoader, staleLoader);
+  staleLoader.emit("load");
+  await nextTurn();
+  assert.equal(invocations.length, 0, "an out-of-order older preload cannot win");
+
+  currentLoader.emit("load");
+  controller.image.emit("load");
+  await nextTurn();
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].command.artifact_revision, "artifact-r3");
+  assert.equal(invocations[0].command.source_revision, "source-r3");
+  assert.equal(invocations[0].command.source_sha256, "c".repeat(64));
+  assert.equal(invocations[0].resource, controller.resource);
+  dispose();
+});
+
+
+test("mounted decode completion is generation-safe after supersession", async () => {
+  const initial = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r1",
+      variant: "display",
+    },
+  });
+  const revised = (revision, digest) => fixtureResource({
+    url: `/api/v1/artifacts/capture-7/${revision}`,
+    resourceRef: {
+      id: "capture-7-display",
+      revision: `bytes:${revision}`,
+      variant: "display",
+    },
+    correction: {
+      ...initial.correction,
+      artifact_revision: `artifact-display-${revision}`,
+      source_revision: `source-${revision}`,
+      source_sha256: digest.repeat(64),
+      proposal: fixtureProposal({ source_revision: `source-${revision}` }),
+    },
+  });
+  const { controller, dispose } = renderHarness({}, initial);
+  const decodes = [];
+  controller.image.decode = () => new Promise((resolve, reject) => {
+    decodes.push({ resolve, reject });
+  });
+
+  controller.updateResource(revised("r2", "b"));
+  controller.getPendingResourceImage().emit("load");
+  assert.equal(decodes.length, 1);
+  controller.updateResource(revised("r3", "c"));
+  controller.getPendingResourceImage().emit("load");
+  assert.equal(decodes.length, 2);
+
+  decodes[0].resolve();
+  await nextTurn();
+  assert.equal(controller.getPins().artifact_revision, "artifact-r3",
+    "a superseded mounted decode cannot commit through the latest record");
+  assert.equal(controller.getPendingResource().correction.artifact_revision,
+    "artifact-display-r3");
+
+  decodes[1].resolve();
+  await nextTurn();
+  assert.equal(controller.getPins().artifact_revision, "artifact-display-r3");
+  assert.equal(controller.resource.url, "/api/v1/artifacts/capture-7/r3");
+  assert.equal(controller.getPendingResource(), null);
+  dispose();
+});
+
+
+test("a failed background preload leaves the mounted resource usable", async () => {
+  const errors = [];
+  const initial = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r1",
+      variant: "display",
+    },
+  });
+  const { container, controller, dispose } = renderHarness({
+    invokeCommand: async () => ({ job_id: "unused" }),
+    onResourceUpdateError: (error) => errors.push(error.message),
+  }, initial);
+  controller.updateResource(fixtureResource({
+    url: "/api/v1/artifacts/capture-7/r2",
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r2",
+      variant: "display",
+    },
+    correction: {
+      ...initial.correction,
+      artifact_revision: "artifact-r4",
+      source_revision: "source-r18",
+      source_sha256: "b".repeat(64),
+    },
+  }));
+  const waiting = controller.waitForResourceUpdate();
+  controller.getPendingResourceImage().emit("error");
+
+  assert.equal(await waiting, false);
+  assert.deepEqual(errors, ["The newer image revision could not be loaded"]);
+  assert.equal(controller.resource, initial);
+  assert.equal(controller.image.src, initial.url);
+  assert.equal(controller.getPins().artifact_revision, "artifact-r3");
+  assert.equal(byClass(container, "perspective-queue-button")[0].disabled, false);
+  dispose();
+});
+
+
+test("Queue falls back to the confirmed raster when background loading fails",
+  async () => {
+    const initial = fixtureResource({
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "bytes:r1",
+        variant: "display",
+      },
+    });
+    const invocations = [];
+    const { container, controller, dispose } = renderHarness({
+      invokeCommand: async (_commandId, payload) => {
+        invocations.push(payload);
+        return { job_id: "confirmed-raster-job" };
+      },
+    }, initial);
+    controller.updateResource(fixtureResource({
+      url: "/api/v1/artifacts/capture-7/r2",
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "bytes:r2",
+        variant: "display",
+      },
+    }));
+
+    byClass(container, "perspective-queue-button")[0].emit("click");
+    await nextTurn();
+    assert.equal(invocations.length, 0);
+    controller.getPendingResourceImage().emit("error");
+    await nextTurn();
+
+    assert.equal(invocations.length, 1,
+      "the click remains meaningful against the last confirmed display");
+    assert.equal(invocations[0].command.artifact_revision, "artifact-r3");
+    assert.equal(invocations[0].resource, initial);
+    dispose();
+  });
+
+
+test("equal-byte convergence releases queued state and keeps Queue available",
+  async () => {
+    const initial = fixtureResource({
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "bytes:stable",
+        variant: "display",
+      },
+    });
+    const { container, controller, dispose } = renderHarness({
+      initialTool: TOOLS.PERSPECTIVE,
+      invokeCommand: async () => ({ job_id: "equal-byte-job" }),
+    }, initial);
+    const queue = byClass(container, "perspective-queue-button")[0];
+
+    queue.emit("click");
+    await nextTurn();
+    assert.equal(controller.getState().submission.status, "queued");
+    assert.equal(queue.disabled, true, "one submitted command remains single-flight");
+
+    controller.updateResource({
+      ...initial,
+      url: "/api/v1/artifacts/capture-7/renewed-lease",
+      correction: {
+        ...initial.correction,
+        artifact_revision: "artifact-r4",
+      },
+    });
+
+    assert.equal(controller.getState().submission.status, "idle",
+      "convergence opens a fresh command boundary");
+    assert.equal(controller.getPins().artifact_revision, "artifact-r4");
+    assert.equal(controller.image.src, initial.url);
+    assert.equal(controller.resource.url, initial.url,
+      "an unused equivalent lease is not made authoritative");
+    assert.equal(queue.disabled, false,
+      "metadata convergence cannot leave Queue greyed out");
+    dispose();
+  });
+
+
+test("a raster rebase preserves redo history", () => {
+  const initial = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r1",
+      variant: "display",
+    },
+  });
+  const { controller, dispose } = renderHarness({}, initial);
+  const originalQuad = controller.getState().quad.map((point) => [...point]);
+  controller.dispatch({
+    type: "BEGIN_GESTURE",
+    kind: "pointer",
+    cornerIndex: 0,
+    pointerId: 9,
+  });
+  controller.dispatch({
+    type: "MOVE_CORNER",
+    cornerIndex: 0,
+    point: [0.2, 0.22],
+  });
+  controller.dispatch({ type: "COMMIT_GESTURE" });
+  const editedQuad = controller.getState().quad.map((point) => [...point]);
+  controller.dispatch({ type: "UNDO" });
+  assert.deepEqual(controller.getState().quad, originalQuad);
+  assert.equal(controller.getState().redoStack.length, 1);
+
+  controller.updateResource(fixtureResource({
+    url: "/api/v1/artifacts/capture-7/r2",
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r2",
+      variant: "display",
+    },
+    correction: {
+      ...initial.correction,
+      artifact_revision: "artifact-r4",
+      source_revision: "source-r18",
+      source_sha256: "b".repeat(64),
+      proposal: fixtureProposal({ source_revision: "source-r18" }),
+    },
+  }));
+  controller.getPendingResourceImage().emit("load");
+  controller.image.emit("load");
+
+  assert.equal(controller.getState().redoStack.length, 1,
+    "an invisible swap cannot erase an undo-then-redo workflow");
+  controller.dispatch({ type: "REDO" });
+  assert.deepEqual(controller.getState().quad, editedQuad);
+  dispose();
+});
+
+
+test("a gesture that starts during mounted decode keeps confirmed pixels", () => {
+  const initial = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r1",
+      variant: "display",
+    },
+  });
+  const { controller, dispose } = renderHarness({}, initial);
+  controller.updateResource(fixtureResource({
+    url: "/api/v1/artifacts/capture-7/r2",
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r2",
+      variant: "display",
+    },
+    correction: {
+      ...initial.correction,
+      artifact_revision: "artifact-r4",
+      source_revision: "source-r18",
+      source_sha256: "b".repeat(64),
+      proposal: fixtureProposal({ source_revision: "source-r18" }),
+    },
+  }));
+  const loader = controller.getPendingResourceImage();
+  loader.emit("load");
+  assert.equal(controller.image.src, "/api/v1/artifacts/capture-7/r2");
+  assert.equal(controller.getPins().artifact_revision, "artifact-r3");
+
+  controller.dispatch({
+    type: "BEGIN_GESTURE",
+    kind: "pointer",
+    cornerIndex: 0,
+    pointerId: 12,
+  });
+  assert.equal(controller.image.src, initial.url,
+    "starting an edit restores the confirmed raster before it can paint");
+  controller.image.emit("load");
+  assert.equal(controller.getPins().artifact_revision, "artifact-r3",
+    "a stale candidate load cannot advance pins during the gesture");
+
+  controller.dispatch({
+    type: "MOVE_CORNER",
+    cornerIndex: 0,
+    point: [0.21, 0.23],
+  });
+  controller.dispatch({ type: "COMMIT_GESTURE" });
+  assert.equal(controller.image.src, "/api/v1/artifacts/capture-7/r2",
+    "the retained candidate binds again after the edit boundary");
+  controller.image.emit("load");
+  assert.equal(controller.getPins().artifact_revision, "artifact-r4");
+  assert.deepEqual(controller.getState().quad[0], [0.21, 0.23]);
+  dispose();
+});
+
+
+test("processing operations rebase onto the newer untouched proposal", () => {
+  const initial = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r1",
+      variant: "display",
+    },
+  });
+  const nextProposal = fixtureProposal({
+    source_revision: "source-r18",
+    quad: [[0.15, 0.14], [0.82, 0.11], [0.84, 0.86], [0.17, 0.88]],
+  });
+  const { controller, dispose } = renderHarness({}, initial);
+  controller.dispatch({
+    type: "SET_PROCESSING_OPERATIONS",
+    operations: [gammaOperation()],
+  });
+
+  controller.updateResource(fixtureResource({
+    url: "/api/v1/artifacts/capture-7/r2",
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r2",
+      variant: "display",
+    },
+    correction: {
+      ...initial.correction,
+      artifact_revision: "artifact-r4",
+      source_revision: "source-r18",
+      source_sha256: "b".repeat(64),
+      proposal: nextProposal,
+    },
+  }));
+  controller.getPendingResourceImage().emit("load");
+  controller.image.emit("load");
+
+  assert.deepEqual(controller.getState().operations, [gammaOperation()]);
+  assert.deepEqual(controller.getState().quad, nextProposal.quad,
+    "a processing-only draft does not pin untouched geometry to old pixels");
+  dispose();
+});
+
+
+test("a host callback error is contained after the resource commit", async () => {
+  const initial = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r1",
+      variant: "display",
+    },
+  });
+  const errors = [];
+  const { controller, dispose } = renderHarness({
+    onResourceChange() {
+      throw new Error("host convergence failed");
+    },
+    onResourceUpdateError(error) {
+      errors.push(error.message);
+    },
+  }, initial);
+  controller.updateResource(fixtureResource({
+    url: "/api/v1/artifacts/capture-7/r2",
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "bytes:r2",
+      variant: "display",
+    },
+  }));
+  const waiting = controller.waitForResourceUpdate();
+  controller.getPendingResourceImage().emit("load");
+  controller.image.emit("load");
+  assert.equal(await waiting, true);
+  assert.equal(controller.getPendingResource(), null);
+  assert.equal(controller.resource.url, "/api/v1/artifacts/capture-7/r2");
+  assert.deepEqual(errors, ["host convergence failed"]);
+  dispose();
+});
+
+
 test("verified original actions appear only on backed-up display artifacts",
   async () => {
     const marker = {
@@ -443,6 +873,149 @@ test("verified original actions appear only on backed-up display artifacts",
   });
 
 
+test("background convergence can add original-backup actions without a remount", () => {
+  const resourceRef = {
+    id: "capture-7-display",
+    revision: "bytes:stable-display",
+    variant: "display",
+  };
+  const { container, controller, dispose } = renderHarness({}, fixtureResource({
+    resourceRef,
+  }));
+  const surface = controller.surface;
+  assert.equal(byClass(container, "perspective-view-original").length, 0);
+
+  controller.updateResource(fixtureResource({
+    resourceRef,
+    correction: {
+      ...fixtureResource().correction,
+      artifact_revision: "artifact-r4",
+    },
+    extensions: {
+      original_backup: {
+        available: true,
+        restore_available: true,
+        sha256: "b".repeat(64),
+        bytes: 7,
+        media_type: "image/jpeg",
+      },
+    },
+  }));
+
+  assert.equal(controller.surface, surface);
+  assert.equal(byClass(container, "perspective-view-original").length, 1);
+  assert.equal(byClass(container, "perspective-restore-original").length, 1);
+  assert.equal(controller.getPins().artifact_revision, "artifact-r4");
+  dispose();
+});
+
+
+test("same-authority metadata convergence keeps an original preview open",
+  async () => {
+    const marker = {
+      available: true,
+      restore_available: true,
+      sha256: "b".repeat(64),
+      bytes: 7,
+      media_type: "image/jpeg",
+    };
+    const display = fixtureResource({
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "display-bytes-stable",
+        variant: "display",
+      },
+      extensions: { original_backup: marker },
+    });
+    const revoked = [];
+    const { container, controller, dispose } = renderHarness({
+      engine: {
+        rasterArtifacts: {
+          async resolveOriginalBackup() {
+            return {
+              blob: new Blob([new Uint8Array([1, 2, 3])], {
+                type: "image/jpeg",
+              }),
+            };
+          },
+        },
+      },
+      objectUrls: {
+        createObjectURL: () => "blob:verified-original",
+        revokeObjectURL: (url) => revoked.push(url),
+      },
+    }, display);
+
+    await controller.requestViewOriginal();
+    const dialog = byClass(container, "perspective-original-dialog")[0];
+    assert.equal(dialog.getAttribute("open"), "");
+    controller.updateResource({
+      ...display,
+      label: "Folio 7 recto, metadata refreshed",
+      url: "/api/v1/artifacts/capture-7/renewed-lease",
+    });
+
+    assert.equal(dialog.getAttribute("open"), "",
+      "unrelated metadata cannot visibly close the verified preview");
+    assert.deepEqual(revoked, []);
+    dispose();
+  });
+
+
+test("same-authority convergence cannot duplicate an in-flight restore",
+  async () => {
+    const marker = {
+      available: true,
+      restore_available: true,
+      sha256: "b".repeat(64),
+      bytes: 7,
+      media_type: "image/jpeg",
+    };
+    const display = fixtureResource({
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "display-bytes-stable",
+        variant: "display",
+      },
+      extensions: { original_backup: marker },
+    });
+    let settleRestore;
+    const restores = [];
+    const { container, controller, dispose } = renderHarness({
+      engine: {
+        rasterArtifacts: {
+          restoreOriginalBackup(args) {
+            restores.push(args);
+            return new Promise((resolve) => { settleRestore = resolve; });
+          },
+        },
+      },
+      confirmRestoreOriginal: () => true,
+      createOperationId: () => "same-authority-restore",
+    }, display);
+
+    const restoring = controller.requestRestoreOriginal();
+    await nextTurn();
+    assert.equal(restores.length, 1);
+    const restoreButton = byClass(container, "perspective-restore-original")[0];
+    assert.equal(restoreButton.disabled, true);
+
+    controller.updateResource({
+      ...display,
+      label: "Folio 7 recto, metadata refreshed",
+      url: "/api/v1/artifacts/capture-7/renewed-lease",
+    });
+    assert.equal(restoreButton.disabled, true,
+      "the same backend action remains visibly single-flight");
+    assert.equal(await controller.requestRestoreOriginal(), null);
+    assert.equal(restores.length, 1);
+
+    settleRestore({ operation_id: "same-authority-restore" });
+    assert.deepEqual(await restoring, { operation_id: "same-authority-restore" });
+    dispose();
+  });
+
+
 test("restore original confirms, uses current CAS, and refreshes the same selection",
   async () => {
     const display = fixtureResource({
@@ -520,6 +1093,270 @@ test("restore original confirms, uses current CAS, and refreshes the same select
     );
     dispose();
   });
+
+
+test("restore retries reuse an operation id only for the exact pinned revision",
+  async () => {
+    const marker = {
+      available: true,
+      restore_available: true,
+      sha256: "b".repeat(64),
+      bytes: 7,
+      media_type: "image/jpeg",
+    };
+    const display = fixtureResource({
+      resourceRef: {
+        id: "capture-7-display",
+        revision: "display-bytes-stable",
+        variant: "display",
+      },
+      extensions: { original_backup: marker },
+    });
+    const restores = [];
+    const { container, controller, dispose } = renderHarness({
+      engine: {
+        rasterArtifacts: {
+          async restoreOriginalBackup(args) {
+            restores.push(args);
+            if (restores.length < 3) {
+              const error = new Error("Restore outcome is not known yet");
+              error.ambiguous = true;
+              throw error;
+            }
+            return { operation_id: args.idempotencyKey };
+          },
+        },
+      },
+      confirmRestoreOriginal: () => true,
+      createOperationId: ({ sequence }) => `restore-attempt-${sequence}`,
+    }, display);
+
+    assert.equal(await controller.requestRestoreOriginal(), null);
+    assert.equal(await controller.requestRestoreOriginal(), null);
+    assert.deepEqual(restores.map((call) => call.idempotencyKey), [
+      "restore-attempt-1",
+      "restore-attempt-1",
+    ], "an exact ambiguous retry must replay its original idempotency key");
+
+    controller.updateResource({
+      ...display,
+      correction: {
+        ...display.correction,
+        artifact_revision: "artifact-r4",
+      },
+    });
+    assert.equal(controller.getPins().artifact_revision, "artifact-r4");
+    assert.equal(
+      byClass(container, "perspective-original-status")[0].textContent,
+      "",
+      "background convergence clears status from the prior revision",
+    );
+
+    assert.deepEqual(await controller.requestRestoreOriginal(), {
+      operation_id: "restore-attempt-2",
+    });
+    assert.deepEqual(restores.map((call) => ({
+      revision: call.expectedArtifactRevision,
+      key: call.idempotencyKey,
+    })), [
+      { revision: "artifact-r3", key: "restore-attempt-1" },
+      { revision: "artifact-r3", key: "restore-attempt-1" },
+      { revision: "artifact-r4", key: "restore-attempt-2" },
+    ]);
+    dispose();
+  });
+
+
+test("a resource rebase during restore confirmation cannot send stale CAS", async () => {
+  const marker = {
+    available: true,
+    restore_available: true,
+    sha256: "b".repeat(64),
+    bytes: 7,
+    media_type: "image/jpeg",
+  };
+  const display = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "display-bytes-stable",
+      variant: "display",
+    },
+    extensions: { original_backup: marker },
+  });
+  let settleConfirmation;
+  const confirmation = new Promise((resolve) => { settleConfirmation = resolve; });
+  const restores = [];
+  const operationIds = [];
+  const { container, controller, dispose } = renderHarness({
+    engine: {
+      rasterArtifacts: {
+        async restoreOriginalBackup(args) {
+          restores.push(args);
+          return { operation_id: args.idempotencyKey };
+        },
+      },
+    },
+    confirmRestoreOriginal: () => confirmation,
+    createOperationId({ sequence }) {
+      operationIds.push(sequence);
+      return `restore-confirm-${sequence}`;
+    },
+  }, display);
+
+  const restoring = controller.requestRestoreOriginal();
+  await nextTurn();
+  controller.updateResource({
+    ...display,
+    correction: {
+      ...display.correction,
+      artifact_revision: "artifact-r4",
+    },
+  });
+  settleConfirmation(true);
+
+  assert.equal(await restoring, null);
+  assert.deepEqual(restores, []);
+  assert.deepEqual(operationIds, [], "no operation id is minted for stale CAS");
+  assert.equal(
+    byClass(container, "perspective-original-status")[0].textContent,
+    "",
+  );
+  assert.equal(
+    byClass(container, "perspective-restore-original")[0].disabled,
+    false,
+  );
+  dispose();
+});
+
+
+test("a resolved original view is discarded when its resource rebases", async () => {
+  const marker = {
+    available: true,
+    restore_available: true,
+    sha256: "b".repeat(64),
+    bytes: 7,
+    media_type: "image/jpeg",
+  };
+  const display = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "display-bytes-stable",
+      variant: "display",
+    },
+    extensions: { original_backup: marker },
+  });
+  let settleView;
+  const response = new Promise((resolve) => { settleView = resolve; });
+  const createdUrls = [];
+  const { container, controller, dispose } = renderHarness({
+    engine: {
+      rasterArtifacts: {
+        resolveOriginalBackup: () => response,
+      },
+    },
+    objectUrls: {
+      createObjectURL(blob) {
+        createdUrls.push(blob);
+        return "blob:stale-original";
+      },
+      revokeObjectURL() {},
+    },
+  }, display);
+
+  const viewing = controller.requestViewOriginal();
+  await nextTurn();
+  controller.updateResource({
+    ...display,
+    correction: {
+      ...display.correction,
+      artifact_revision: "artifact-r4",
+    },
+  });
+  settleView({
+    blob: new Blob([new Uint8Array([1, 2, 3])], { type: "image/jpeg" }),
+  });
+
+  assert.equal(await viewing, null);
+  assert.deepEqual(createdUrls, [], "stale bytes never reach a preview URL");
+  assert.equal(byClass(container, "perspective-original-dialog").length, 0);
+  assert.equal(
+    byClass(container, "perspective-original-status")[0].textContent,
+    "",
+  );
+  dispose();
+});
+
+
+test("restore waits for a pending raster rebase before snapshotting CAS", async () => {
+  const marker = {
+    available: true,
+    restore_available: true,
+    sha256: "b".repeat(64),
+    bytes: 7,
+    media_type: "image/jpeg",
+  };
+  const display = fixtureResource({
+    resourceRef: {
+      id: "capture-7-display",
+      revision: "display-bytes-r3",
+      variant: "display",
+    },
+    extensions: { original_backup: marker },
+  });
+  const confirmations = [];
+  const restores = [];
+  const { controller, dispose } = renderHarness({
+    engine: {
+      rasterArtifacts: {
+        async restoreOriginalBackup(args) {
+          restores.push(args);
+          return { operation_id: args.idempotencyKey };
+        },
+      },
+    },
+    confirmRestoreOriginal(detail) {
+      confirmations.push(detail);
+      return true;
+    },
+    createOperationId: () => "restore-after-raster-rebase",
+  }, display);
+  const revised = {
+    ...display,
+    url: "/api/v1/artifacts/capture-7/r4",
+    resourceRef: {
+      ...display.resourceRef,
+      revision: "display-bytes-r4",
+    },
+    correction: {
+      ...display.correction,
+      artifact_revision: "artifact-r4",
+      source_revision: "source-r18",
+      source_sha256: "c".repeat(64),
+    },
+  };
+
+  controller.updateResource(revised);
+  const restoring = controller.requestRestoreOriginal();
+  await nextTurn();
+  assert.deepEqual(confirmations, []);
+  assert.deepEqual(restores, []);
+
+  controller.getPendingResourceImage().emit("load");
+  await nextTurn();
+  assert.deepEqual(confirmations, [], "preloading alone cannot expose new CAS");
+  controller.image.emit("load");
+  assert.deepEqual(await restoring, { operation_id: "restore-after-raster-rebase" });
+  assert.equal(confirmations.length, 1);
+  assert.equal(confirmations[0].revision, "artifact-r4");
+  assert.equal(confirmations[0].resource, revised);
+  assert.deepEqual(restores, [{
+    itemId: "book-1",
+    artifactId: "capture-7",
+    expectedArtifactRevision: "artifact-r4",
+    idempotencyKey: "restore-after-raster-rebase",
+  }]);
+  dispose();
+});
 
 
 test("preset command serialization derives fresh pins and quad from its target resource", () => {
