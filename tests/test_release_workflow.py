@@ -53,6 +53,27 @@ def test_release_tag_version_preflight_gates_every_publish_path():
     )
 
 
+def test_release_preflight_verifies_the_complete_production_cloud_setup():
+    preflight = _job("preflight", "validation")
+    start = preflight.index("      - name: Verify production cloud setup")
+    end = preflight.index("      # A desktop tag drives", start)
+    cloud_step = preflight[start:end]
+
+    secret_expression = (
+        "${{ secrets.SUPABASE_RELEASE_SECRET_KEY || "
+        "secrets.SUPABASE_SERVICE_ROLE_KEY }}"
+    )
+    assert "SUPABASE_URL: ${{ vars.SUPABASE_URL }}" in cloud_step
+    assert f"SUPABASE_KEY: {secret_expression}" in cloud_step
+    assert "SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}" in cloud_step
+    assert 'if [ -z "$SUPABASE_KEY" ]; then' in cloud_step
+    assert "No Supabase cloud-check credential is configured" in cloud_step
+    assert "SUPABASE_RELEASE_SECRET_KEY (preferred)" in cloud_step
+    assert "SUPABASE_SERVICE_ROLE_KEY under Settings" in cloud_step
+    assert "exit 1" in cloud_step
+    assert "python3 tools/cloud_setup.py check" in cloud_step
+
+
 def test_android_is_released_only_after_its_version_identity_changes():
     preflight = _job("preflight", "validation")
     android = _job("android", "desktop")
