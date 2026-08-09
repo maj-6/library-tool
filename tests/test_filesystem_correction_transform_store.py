@@ -23,6 +23,8 @@ from librarytool.adapters.filesystem import (
 )
 from librarytool.engine.correction_transforms import (
     CORRECTION_OUTPUT_KINDS,
+    EXTRACTION_OUTPUT_KINDS,
+    CorrectionExtractionDescriptor,
     CorrectionHumanAssertions,
     CorrectionSourceSnapshot,
     CorrectionTransformCommand,
@@ -30,6 +32,7 @@ from librarytool.engine.correction_transforms import (
     CorrectionTransformStorePort,
     HumanTextAssertion,
     _build_commit_draft,
+    canonical_extraction_quad,
 )
 from librarytool.engine.errors import ConflictError, RepositoryError
 from librarytool.engine.raster_artifacts import (
@@ -262,11 +265,13 @@ def _store(
     authority: _Authority,
     *,
     write_set: RecoverableWriteSet | None = None,
+    publication_plan_for=None,
 ) -> FilesystemCorrectionTransformStore:
     return FilesystemCorrectionTransformStore(
         write_set or RecoverableWriteSet(root),
         source_snapshot_for=authority,
         lock_context_for=nullcontext,
+        publication_plan_for=publication_plan_for,
     )
 
 
@@ -444,6 +449,174 @@ def test_store_publishes_four_immutable_outputs_and_full_human_assertions(
         ).hexdigest(),
     }
     assert source.content == _png()
+
+
+def test_extraction_projects_one_figure_keeps_ocr_internal_and_never_heads_display(
+    tmp_path: Path,
+) -> None:
+    source = _capture_display_source()
+    authority = _Authority(source)
+    plan_calls = []
+
+    def publication_plan(*args):
+        plan_calls.append(args)
+        raise AssertionError("an extraction must not invoke capture promotion")
+
+    command = _command(
+        source,
+        quad=canonical_extraction_quad(source.annotations[0].selector.points),
+        rerun_ocr=True,
+        extraction=CorrectionExtractionDescriptor(
+            "region-1",
+            "region-r1",
+            "Botanical plate",
+        ),
+    )
+    draft = _draft(source, command)
+    store = _store(
+        tmp_path,
+        authority,
+        publication_plan_for=publication_plan,
+    )
+
+    result = store.commit_transform(draft)
+    projection = store.project_item("book-1")
+
+    assert tuple(value.kind for value in result.outputs) == EXTRACTION_OUTPUT_KINDS
+    assert draft.mapped_annotations == ()
+    assert draft.dropped_annotation_ids == ()
+    assert len(projection.raster_artifacts) == 1
+    figure = projection.raster_artifacts[0]
+    assert figure.key.artifact_id == result.output("extracted-figure").artifact_id
+    assert figure.kind == "extracted-figure"
+    assert figure.label == "Botanical plate"
+    assert figure.lineage[0].relation == "cropped_from"
+    assert figure.extensions["correction_extraction"]["annotation_id"] == (
+        "region-1"
+    )
+    assert projection.spatial_annotations == ()
+    assert projection.display_heads == ()
+    assert len(projection.extraction_links) == 1
+    assert projection.extraction_links[0].annotation_id == "region-1"
+    assert projection.extraction_links[0].artifact_id == figure.key.artifact_id
+    assert store.list_spatial_annotations("book-1") == ()
+    assert plan_calls == []
+    assert not _display_head_path(tmp_path).exists()
+
+    internal = result.output("ocr-ready")
+    assert internal.artifact_id not in {
+        value.key.artifact_id for value in projection.raster_artifacts
+    }
+    resolved = store.resolve_committed_output(
+        "book-1",
+        command.operation_id,
+        internal,
+    )
+    assert resolved is not None
+    try:
+        assert resolved.stream.read() == draft.output("ocr-ready").content
+    finally:
+        resolved.stream.close()
+
+    publication = json.loads(_publication_path(tmp_path).read_text("ascii"))
+    assert publication["mapped_annotations"] == []
+    assert publication["dropped_annotation_ids"] == []
+    assert [value["kind"] for value in publication["outputs"]] == list(
+        EXTRACTION_OUTPUT_KINDS
+    )
+
+
+def test_committed_mask_projects_one_overlay_only_marker_and_one_figure(
+    tmp_path: Path,
+) -> None:
+    source = _capture_display_source()
+    mask = ((0.15, 0.2), (0.75, 0.25), (0.55, 0.8))
+    command = _command(
+        source,
+        quad=canonical_extraction_quad(mask),
+        adjustment=None,
+        mask_polygon=mask,
+        rerun_ocr=True,
+        extraction=CorrectionExtractionDescriptor(
+            label="Pressed leaf",
+            source_kind="committed-mask",
+        ),
+    )
+    store = _store(tmp_path, _Authority(source))
+
+    result = store.commit_transform(_draft(source, command))
+    projection = store.project_item("book-1")
+
+    assert len(projection.raster_artifacts) == 1
+    figure = projection.raster_artifacts[0]
+    assert figure.key.artifact_id == result.output("extracted-figure").artifact_id
+    assert figure.kind == "extracted-figure"
+    assert figure.extensions["correction_extraction"] == {
+        "source_kind": "committed-mask",
+        "label": "Pressed leaf",
+        "artifact_id": figure.key.artifact_id,
+    }
+    assert len(projection.spatial_annotations) == 1
+    marker = projection.spatial_annotations[0]
+    assert marker.selector.points == tuple(NormalizedPoint(*point) for point in mask)
+    assert marker.extensions["corrections_ui"] == {"overlay_only": True}
+    assert marker.extensions["correction_extraction"] == {
+        "artifact_ids": (figure.key.artifact_id,),
+    }
+    assert marker.linked_artifact_ids == (figure.key.artifact_id,)
+    assert len(projection.extraction_links) == 1
+    assert projection.extraction_links[0].annotation_id == marker.key.annotation_id
+    assert projection.display_heads == ()
+
+
+def test_extraction_from_a_corrected_output_does_not_advance_its_display_head(
+    tmp_path: Path,
+) -> None:
+    base = _capture_display_source()
+    authority = _Authority(base)
+    store = _store(tmp_path, authority)
+    correction_draft = _draft(base)
+    correction = store.commit_transform(correction_draft)
+    original_head = store.project_item("book-1").display_heads[0]
+    assert original_head.operation_id == correction.operation_id
+    assert original_head.artifact.resource is not None
+
+    corrected_source = CorrectionSourceSnapshot(
+        original_head.artifact,
+        original_head.artifact.resource.revision,
+        correction_draft.output("corrected-display").content,
+        annotations=original_head.spatial_annotations,
+    )
+    authority.source = corrected_source
+    target = corrected_source.annotations[0]
+    extraction = _command(
+        corrected_source,
+        operation_id="extract-after-display-head",
+        quad=canonical_extraction_quad(target.selector.points),
+        adjustment=None,
+        rerun_ocr=True,
+        extraction=CorrectionExtractionDescriptor(
+            target.key.annotation_id,
+            target.revision,
+            "Crop after correction",
+        ),
+    )
+
+    store.commit_transform(_draft(corrected_source, extraction))
+    reopened = _store(tmp_path, authority).project_item("book-1")
+
+    assert len(reopened.display_heads) == 1
+    assert reopened.display_heads[0].operation_id == correction.operation_id
+    assert reopened.display_heads[0].artifact.key == original_head.artifact.key
+    assert {
+        value.extensions["correction_transform"]["output_kind"]
+        for value in reopened.raster_artifacts
+    } == {
+        "corrected-display",
+        "ocr-ready",
+        "thumbnail",
+        "extracted-figure",
+    }
 
 
 def test_committed_transform_query_uses_original_pins_after_live_drift(

@@ -47,6 +47,32 @@ internal enum class PhotoAssetLifecycle(val wireValue: String) {
     }
 }
 
+/** Desktop-authored visibility for one stable capture asset.
+ *
+ * This is deliberately separate from [PhotoAssetLifecycle], which describes
+ * Android/cloud image-processing work. Older manifests omit the object and
+ * therefore read as active revision zero. Once present, revisions are
+ * monotonic so a delayed sync cannot resurrect a deleted page (or delete a
+ * page that has since been restored).
+ */
+internal enum class DesktopPhotoAssetState(val wireValue: String) {
+    ACTIVE("active"),
+    DELETED("deleted");
+
+    companion object {
+        fun fromWire(value: String): DesktopPhotoAssetState? =
+            values().firstOrNull { it.wireValue == value.trim().lowercase() }
+    }
+}
+
+internal data class DesktopPhotoAssetLifecycle(
+    val state: DesktopPhotoAssetState = DesktopPhotoAssetState.ACTIVE,
+    val revision: Long = 0L,
+    val updatedAt: Long = 0L,
+) {
+    val deleted: Boolean get() = state == DesktopPhotoAssetState.DELETED
+}
+
 /** Requested post-capture outcomes. These are recipe intentions, not claims
  * that Android or a remote service has produced a derivative. */
 internal enum class PhotoProcessingOutcome(val wireValue: String) {
@@ -195,6 +221,9 @@ internal data class CapturePhotoAsset(
     /** Monotonic `capture_corrections.revision` installed with [appliedDesktopCorrectionId].
      * Zero means a contract written before this ordering field existed. */
     val appliedDesktopCorrectionRevision: Long = 0L,
+    /** Additive desktop tombstone. Kept on the asset so delete/restore never
+     * removes immutable originals, display history, OCR, or capture order. */
+    val desktopLifecycle: DesktopPhotoAssetLifecycle = DesktopPhotoAssetLifecycle(),
 )
 
 internal data class PhotoSelectionChoice(
@@ -216,7 +245,10 @@ internal data class CapturePhotoAssets(
     val legacyFallback: Boolean = false,
 ) {
     fun orderedAssets(): List<CapturePhotoAsset> =
-        assets.sortedWith(compareBy<CapturePhotoAsset> { it.captureOrder }.thenBy { it.assetId })
+        assets.asSequence()
+            .filterNot { it.desktopLifecycle.deleted }
+            .sortedWith(compareBy<CapturePhotoAsset> { it.captureOrder }.thenBy { it.assetId })
+            .toList()
 
     fun resolvedPrimaryTitleAsset(): CapturePhotoAsset? {
         val usable = orderedAssets()
@@ -788,7 +820,8 @@ internal object PhotoAssetStore {
         val current = readCurrent(dir) ?: return@synchronized false
         val asset = current.assets.firstOrNull { it.assetId == target.assetId }
             ?: return@synchronized false
-        if (!cloudDisplayReocrTargetMatches(current, asset, target) ||
+        if (asset.desktopLifecycle.deleted ||
+            !cloudDisplayReocrTargetMatches(current, asset, target) ||
             asset.display.width > 0 && draft.width != asset.display.width ||
             asset.display.height > 0 && draft.height != asset.display.height) {
             return@synchronized false
@@ -972,6 +1005,28 @@ internal object PhotoAssetStore {
         persistCurrent(dir, merged)
     }
 
+    /** Apply one authenticated desktop delete/restore row without touching any
+     * photo, derivative, OCR, correction marker, or order metadata. */
+    fun applyDesktopLifecycle(
+        dir: File,
+        row: CaptureAssetLifecycleRow,
+        expectedOwnerId: String,
+    ): Boolean = synchronized(monitorFor(dir)) {
+        val current = readCurrent(dir) ?: return@synchronized false
+        when (val decision = validateCaptureAssetLifecycle(current, row, expectedOwnerId)) {
+            CaptureAssetLifecycleDecision.AlreadyApplied -> true
+            is CaptureAssetLifecycleDecision.Ready -> persistCurrent(
+                dir,
+                current.copy(assets = current.assets.map { asset ->
+                    if (asset.assetId == decision.assetId) {
+                        asset.copy(desktopLifecycle = decision.lifecycle)
+                    } else asset
+                }),
+            )
+            else -> false
+        }
+    }
+
     /** Mirror a live or terminal server job state without ever treating a
      * completed row as installed. Completion is written only by
      * [installCloudDisplayDerivative] after byte verification. */
@@ -1059,7 +1114,8 @@ internal object PhotoAssetStore {
         val current = readCurrent(dir) ?: return@synchronized null
         val asset = current.assets.firstOrNull { it.assetId == target.assetId }
             ?: return@synchronized null
-        if (!cloudDisplayReocrTargetMatches(current, asset, target) ||
+        if (asset.desktopLifecycle.deleted ||
+            !cloudDisplayReocrTargetMatches(current, asset, target) ||
             hasCurrentDisplayGeometry(asset) ||
             !cloudDisplayReocrMarker(dir, target).isFile) return@synchronized null
         val file = File(dir, asset.display.reference).takeIf { it.isFile }
@@ -1075,7 +1131,8 @@ internal object PhotoAssetStore {
     ): Boolean {
         val current = readCurrent(dir) ?: return false
         val asset = current.assets.firstOrNull { it.assetId == job.assetId } ?: return false
-        if (!cloudJobMatchesAsset(current.captureId, asset, job)) return false
+        if (asset.desktopLifecycle.deleted ||
+            !cloudJobMatchesAsset(current.captureId, asset, job)) return false
         val terminal = setOf(
             PhotoAssetLifecycle.COMPLETED,
             PhotoAssetLifecycle.FAILED,
@@ -1656,6 +1713,22 @@ internal fun mergePhotoAssetContracts(
         if (existing.original.sha256.isNotEmpty() && candidate.original.sha256.isNotEmpty() &&
             existing.original.sha256 != candidate.original.sha256) return@map existing
 
+        // Visibility is its own monotonic stream. It may advance without a
+        // display derivative changing, and an omitted/default lifecycle is
+        // never evidence that a newer tombstone should be cleared.
+        val lifecycleAnchorMatches = candidate.captureOrder == existing.captureOrder &&
+            (existing.original.sha256.isEmpty() ||
+                candidate.original.sha256 == existing.original.sha256)
+        val desktopLifecycle = if (lifecycleAnchorMatches) {
+            mergeDesktopLifecycle(existing.desktopLifecycle, candidate.desktopLifecycle)
+        } else existing.desktopLifecycle
+        // A tombstone hides the stable asset but retains every prior fact.
+        // In particular, a correction payload arriving after deletion cannot
+        // alter the hidden display or processing history.
+        if (desktopLifecycle.deleted) {
+            return@map existing.copy(desktopLifecycle = desktopLifecycle)
+        }
+
         val acceptDisplay = when {
             candidate.display.revision > existing.display.revision &&
                 candidate.display.sha256.isNotEmpty() -> true
@@ -1716,6 +1789,7 @@ internal fun mergePhotoAssetContracts(
             role = role,
             geometries = geometry,
             processingRequest = processingRequest,
+            desktopLifecycle = desktopLifecycle,
         )
     }
     return local.copy(
@@ -1726,6 +1800,16 @@ internal fun mergePhotoAssetContracts(
         ),
         legacyFallback = local.legacyFallback && incoming.legacyFallback,
     )
+}
+
+private fun mergeDesktopLifecycle(
+    local: DesktopPhotoAssetLifecycle,
+    incoming: DesktopPhotoAssetLifecycle,
+): DesktopPhotoAssetLifecycle = when {
+    incoming.revision > local.revision -> incoming
+    // Equal-revision collisions are not ordered. Retaining the durable local
+    // value fails closed and makes replay idempotent.
+    else -> local
 }
 
 private fun mergeProcessingRequest(
@@ -1758,7 +1842,13 @@ internal fun CapturePhotoAssets.toJson(): JSONObject = JSONObject()
     .put("version", PHOTO_ASSETS_VERSION)
     .put("capture_id", captureId)
     .put("legacy_fallback", legacyFallback)
-    .put("assets", JSONArray().apply { orderedAssets().forEach { put(it.toJson()) } })
+    // Tombstoned rows must remain in the portable contract. `orderedAssets()`
+    // is the visible/UI view, so serialize the complete stable record set.
+    .put("assets", JSONArray().apply {
+        assets.sortedWith(
+            compareBy<CapturePhotoAsset> { it.captureOrder }.thenBy { it.assetId },
+        ).forEach { put(it.toJson()) }
+    })
     .put("selections", JSONObject()
         .put("primary_title", selections.primaryTitle.toJson())
         .put("thumbnail", selections.thumbnail.toJson()))
@@ -1807,6 +1897,9 @@ private fun CapturePhotoAsset.toJson(): JSONObject = JSONObject()
     .put("geometry", JSONArray().apply { geometries.forEach { put(it.toJson()) } })
     .put("processing_request", processingRequest?.toJson() ?: JSONObject.NULL)
     .apply {
+        if (desktopLifecycle.revision > 0L) {
+            put("desktop_lifecycle", desktopLifecycle.toJson())
+        }
         if (appliedDesktopCorrectionId.isNotEmpty()) {
             put("applied_desktop_correction_id", appliedDesktopCorrectionId)
             if (appliedDesktopCorrectionRevision > 0L) {
@@ -1838,6 +1931,11 @@ private fun JSONObject.toPhotoAsset(): CapturePhotoAsset? {
                 ?.takeIf { it > 0L } ?: return null
         }
         if (appliedCorrection.isEmpty() && appliedCorrectionRevision != 0L) return null
+        val desktopLifecycle = when (val lifecycleValue = opt("desktop_lifecycle")) {
+            null, JSONObject.NULL -> DesktopPhotoAssetLifecycle()
+            is JSONObject -> lifecycleValue.toDesktopLifecycle() ?: return null
+            else -> return null
+        }
         CapturePhotoAsset(
             id,
             order,
@@ -1852,6 +1950,7 @@ private fun JSONObject.toPhotoAsset(): CapturePhotoAsset? {
             processingRequest,
             appliedCorrection,
             appliedCorrectionRevision,
+            desktopLifecycle,
         )
     } catch (_: Exception) {
         null
@@ -2081,6 +2180,21 @@ private fun JSONObject.toLifecycle(): PhotoLifecycleState = PhotoLifecycleState(
     optLong("updated_at", 0L).coerceAtLeast(0L),
 )
 
+private fun DesktopPhotoAssetLifecycle.toJson(): JSONObject = JSONObject()
+    .put("state", state.wireValue)
+    .put("revision", revision)
+    .put("updated_at", updatedAt)
+
+private fun JSONObject.toDesktopLifecycle(): DesktopPhotoAssetLifecycle? {
+    if (keys().asSequence().toSet() != setOf("state", "revision", "updated_at")) return null
+    val stateValue = opt("state") as? String ?: return null
+    val state = DesktopPhotoAssetState.fromWire(stateValue)
+        ?.takeIf { it.wireValue == stateValue } ?: return null
+    val revision = strictLong("revision")?.takeIf { it > 0L } ?: return null
+    val updatedAt = strictLong("updated_at")?.takeIf { it > 0L } ?: return null
+    return DesktopPhotoAssetLifecycle(state, revision, updatedAt)
+}
+
 private fun PhotoRoleAssignment.toJson(): JSONObject = JSONObject()
     .put("suggested", suggestedRole.wireValue).put("confidence", confidence)
     .put("reason", reason).put("algorithm", algorithm)
@@ -2195,7 +2309,12 @@ private fun legacyAsset(captureId: String, photo: File, order: Int): CapturePhot
 private fun reconcileContract(dir: File, contract: CapturePhotoAssets): CapturePhotoAssets {
     val captureNames = dir.listFiles { file -> file.isFile && file.name.matches(PHOTO_NAME) }
         ?.map { it.name }?.toSet().orEmpty()
-    val assets = contract.assets.filter { it.captureFile in captureNames }
+    // Retain an explicit tombstone even during a partial/local file restore;
+    // otherwise merely observing a missing byte would erase the only state
+    // that prevents stale sync data from resurrecting the page.
+    val assets = contract.assets.filter {
+        it.desktopLifecycle.deleted || it.captureFile in captureNames
+    }
         .sortedWith(compareBy<CapturePhotoAsset> { it.captureOrder }.thenBy { it.assetId })
     val ids = assets.map { it.assetId }.toSet()
     fun validChoice(choice: PhotoSelectionChoice): PhotoSelectionChoice =

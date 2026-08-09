@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -232,6 +233,158 @@ def test_list_and_forget(data_root, client):
     assert client.post("/api/trash/forget", json={"id": tid}).get_json()["ok"]
     assert not (server.TRASH_DIR / tid).exists()
     assert tid not in server.lib.load_json(server.TRASH_PATH, {})["items"]
+
+
+def _seed_capture_asset_delete_receipt(
+    *, fingerprint: str, capture_id: str, asset_id: str
+) -> tuple[str, dict, dict]:
+    lifecycle = {
+        "state": "deleted",
+        "revision": 1,
+        "updated_at": 1_786_320_000_000,
+    }
+    operation_id = f"delete-{asset_id}"
+    artifact_id = f"capture:{capture_id}:asset:{asset_id}:display"
+    result = {
+        "operation_id": operation_id,
+        "action": "delete",
+        "item_id": f"item:{capture_id}",
+        "capture_id": capture_id,
+        "asset_id": asset_id,
+        "artifact_id": artifact_id,
+        "artifact_revision": "artifact-r1",
+        "capture_order": 2,
+        "before_lifecycle": None,
+        "after_lifecycle": lifecycle,
+        "item_updated_at": "item-r2",
+        "inverse": {
+            "schema": "librarytool.capture-asset-lifecycle-inverse/1",
+            "action": "restore",
+            "source_operation_id": operation_id,
+            "item_id": f"item:{capture_id}",
+            "capture_id": capture_id,
+            "asset_id": asset_id,
+            "artifact_id": artifact_id,
+            "artifact_revision": "artifact-r1",
+            "capture_order": 2,
+            "expected_lifecycle": dict(lifecycle),
+        },
+        "replayed": False,
+    }
+    capture_dir = server.CAPTURES_DIR / capture_id
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    (capture_dir / "photo_assets.json").write_text(json.dumps({
+        "capture_id": capture_id,
+        "assets": [{
+            "asset_id": asset_id,
+            "capture_order": 2,
+            "desktop_lifecycle": lifecycle,
+        }],
+    }), encoding="utf-8")
+    server._CAPTURE_ASSET_RECEIPT_DIR.mkdir(parents=True, exist_ok=True)
+    (server._CAPTURE_ASSET_RECEIPT_DIR / f"{fingerprint}.json").write_text(
+        json.dumps({
+            "schema": "librarytool.capture-asset-lifecycle-receipt",
+            "version": 1,
+            "operation_id": operation_id,
+            "action": "delete",
+            "command_sha256": "d" * 64,
+            "result": result,
+        }),
+        encoding="ascii",
+    )
+    return f"capture-asset-{fingerprint[:40]}", result, lifecycle
+
+
+def test_capture_asset_receipt_projects_once_and_forget_is_durable(client):
+    fingerprint = "a" * 64
+    tid, result, _ = _seed_capture_asset_delete_receipt(
+        fingerprint=fingerprint,
+        capture_id="capture-trash-list",
+        asset_id="asset-trash-list",
+    )
+
+    rows = client.get("/api/trash").get_json()["items"]
+    row = next(item for item in rows if item["id"] == tid)
+    assert row["kind"] == "capture_asset"
+    assert row["origin"]["artifact_id"] == result["artifact_id"]
+    assert row["files"] == []
+    assert row["bytes"] == 0
+    assert row["restore"]["inverse"] == result["inverse"]
+
+    # An unreadable/missing live manifest is not evidence of a restore. Keep
+    # the recovery affordance available so the authoritative store can return
+    # a precise conflict instead of silently greying out the only inverse.
+    (server.CAPTURES_DIR / result["capture_id"] / "photo_assets.json").unlink()
+    row = next(
+        item for item in client.get("/api/trash").get_json()["items"]
+        if item["id"] == tid
+    )
+    assert row["restored_at"] == ""
+
+    forgotten = client.post("/api/trash/forget", json={"id": tid}).get_json()
+    assert forgotten["ok"] and forgotten["forgotten"] == 1
+    assert tid not in {
+        item["id"] for item in client.get("/api/trash").get_json()["items"]
+    }
+    index = server.lib.load_json(server.TRASH_PATH, {})
+    assert index["capture_asset_receipts"][fingerprint] == tid
+
+
+def test_capture_asset_restore_passes_the_exact_durable_inverse(
+    client, monkeypatch
+):
+    fingerprint = "b" * 64
+    tid, deleted, lifecycle = _seed_capture_asset_delete_receipt(
+        fingerprint=fingerprint,
+        capture_id="capture-trash-restore",
+        asset_id="asset-trash-restore",
+    )
+    assert any(
+        item["id"] == tid for item in client.get("/api/trash").get_json()["items"]
+    )
+    calls = []
+
+    class Resolver:
+        def restore_capture_asset(
+            self, item_id, artifact_id, inverse, operation_id
+        ):
+            calls.append((item_id, artifact_id, inverse, operation_id))
+            active = {
+                "state": "active",
+                "revision": lifecycle["revision"] + 1,
+                "updated_at": lifecycle["updated_at"] + 1,
+            }
+            return {
+                **deleted,
+                "operation_id": operation_id,
+                "action": "restore",
+                "before_lifecycle": dict(lifecycle),
+                "after_lifecycle": active,
+                "item_updated_at": "item-r3",
+                "inverse": {
+                    "schema": "librarytool.capture-asset-lifecycle-inverse/1",
+                    "action": "delete",
+                },
+            }
+
+    monkeypatch.setattr(
+        server,
+        "_ensure_engine_session",
+        lambda: SimpleNamespace(raster_resource_resolver=Resolver()),
+    )
+
+    response = client.post("/api/trash/restore", json={"id": tid})
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["kind"] == "capture_asset"
+    row = server.lib.load_json(server.TRASH_PATH, {})["items"][tid]
+    assert row["restored_at"]
+    assert calls == [(
+        deleted["item_id"],
+        deleted["artifact_id"],
+        deleted["inverse"],
+        row["restore"]["operation_id"],
+    )]
 
 
 def test_prune_drops_old_items_but_never_the_fresh_one(data_root):

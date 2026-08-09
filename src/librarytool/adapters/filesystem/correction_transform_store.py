@@ -3,7 +3,7 @@
 The transform worker builds a complete, immutable commit draft in memory.  This
 adapter owns the last concurrency boundary: it reloads the source under the
 workspace and catalogue locks, compares every command and assertion revision
-pin, and publishes four new object files, their publication envelope, the
+pin, and publishes one complete output profile, its publication envelope, the
 item-scoped immutable pointer, an optional capture-display head, and the
 idempotency receipt in one :class:`RecoverableWriteSet` transaction.
 
@@ -31,7 +31,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, ContextManager, Protocol, TypeAlias, runtime_checkable
 
 from ...engine.correction_transforms import (
-    CORRECTION_OUTPUT_KINDS,
     CommittedCorrectionOutput,
     CommittedCorrectionTransform,
     CorrectionHumanAssertions,
@@ -40,6 +39,8 @@ from ...engine.correction_transforms import (
     CorrectionTransformCommitDraft,
     CorrectionTransformCommitResult,
     CorrectionTransformDependencyPins,
+    committed_mask_annotation_identity,
+    output_profile_for,
 )
 from ...engine.errors import (
     ConflictError,
@@ -177,6 +178,7 @@ _PROJECTED_RASTER_OUTPUTS = {
     "corrected-display": ("corrected-image", "Corrected display", "display"),
     "ocr-ready": ("processed-source", "OCR-ready image", "ocr"),
     "thumbnail": ("processed-image", "Correction thumbnail", "thumbnail"),
+    "extracted-figure": ("extracted-figure", "Extracted figure", "figure"),
 }
 
 
@@ -361,9 +363,19 @@ class _TransformResourceCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _ExtractionAnnotationLink:
+    annotation_id: str
+    annotation_revision: str
+    artifact_id: str
+    artifact_revision: str
+    operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class _TransformProjection:
     raster_artifacts: tuple[RasterArtifactView, ...]
     spatial_annotations: tuple[SpatialAnnotationView, ...]
+    extraction_links: tuple[_ExtractionAnnotationLink, ...]
     resources: Mapping[
         tuple[str, str, str],
         _TransformResourceCandidate,
@@ -561,7 +573,7 @@ def _commit_result_for(
 ) -> CorrectionTransformCommitResult:
     reserved = {draft.command.artifact_id.casefold()}
     outputs: list[CommittedCorrectionOutput] = []
-    for kind in CORRECTION_OUTPUT_KINDS:
+    for kind in output_profile_for(draft.command.extraction is not None):
         output = draft.output(kind)
         artifact_id = _output_identity(
             draft.command.fingerprint,
@@ -1099,6 +1111,7 @@ class FilesystemCorrectionTransformStore:
         RasterArtifactKey(item_id, "correction-transform-projection")
         values: list[RasterArtifactView] = []
         spatial: list[SpatialAnnotationView] = []
+        extraction_links: list[_ExtractionAnnotationLink] = []
         resources: dict[
             tuple[str, str, str],
             _TransformResourceCandidate,
@@ -1127,10 +1140,22 @@ class FilesystemCorrectionTransformStore:
                 publication["outputs"],
                 strict=True,
             ):
+                if (
+                    command.extraction is not None
+                    and committed.kind == "ocr-ready"
+                ):
+                    # The immutable OCR rendition exists only to pin the OCR
+                    # follow-up. It is not a second public crop artifact.
+                    continue
                 public = _PROJECTED_RASTER_OUTPUTS.get(committed.kind)
                 if public is None:
                     continue
                 kind, label, variant = public
+                if (
+                    committed.kind == "extracted-figure"
+                    and command.extraction is not None
+                ):
+                    label = command.extraction.label
                 artifact_identity = committed.artifact_id.casefold()
                 if artifact_identity in identities:
                     raise _repository_error(
@@ -1174,6 +1199,11 @@ class FilesystemCorrectionTransformStore:
                         "source_scope": source_scope.as_dict(),
                     }
                 }
+                if command.extraction is not None:
+                    extensions["correction_extraction"] = {
+                        **command.extraction.as_dict(),
+                        "artifact_id": committed.artifact_id,
+                    }
                 if committed.kind == "corrected-display" and source.canvas_id:
                     extensions["corrections_ui"] = {
                         "annotation_frame": "canvas",
@@ -1197,7 +1227,11 @@ class FilesystemCorrectionTransformStore:
                         RasterLineageRef(
                             command.artifact_id,
                             command.artifact_revision,
-                            "processed_from",
+                            (
+                                "cropped_from"
+                                if command.extraction is not None
+                                else "processed_from"
+                            ),
                         ),
                     ),
                     provenance=provenance,
@@ -1224,6 +1258,74 @@ class FilesystemCorrectionTransformStore:
                 )
                 values.append(view)
                 views_by_id[artifact_identity] = view
+            if command.extraction is not None:
+                figure = result.output("extracted-figure")
+                if command.extraction.is_committed_mask:
+                    annotation_id, annotation_revision = (
+                        committed_mask_annotation_identity(command)
+                    )
+                    identity = annotation_id.casefold()
+                    if identity not in spatial_identities:
+                        if (
+                            not source_scope.canvas_id
+                            or not source_scope.canvas_revision
+                            or command.mask_polygon is None
+                        ):
+                            raise _repository_error(
+                                "a committed mask has no source canvas",
+                                code="invalid_correction_transform_storage",
+                                artifact="correction_transform_publication",
+                            )
+                        spatial_identities.add(identity)
+                        spatial.append(
+                            SpatialAnnotationView(
+                                key=SpatialAnnotationKey(item_id, annotation_id),
+                                revision=annotation_revision,
+                                source=SpatialSourceRef(
+                                    source_scope.representation_id,
+                                    source_scope.representation_revision,
+                                    source_scope.canvas_id,
+                                    source_scope.canvas_revision,
+                                ),
+                                selector=NormalizedPolygonSelector(
+                                    "canvas-normalized",
+                                    source_scope.canvas_revision,
+                                    tuple(
+                                        NormalizedPoint(x, y)
+                                        for x, y in command.mask_polygon
+                                    ),
+                                ),
+                                label=command.extraction.label,
+                                linked_artifact_ids=(figure.artifact_id,),
+                                provenance=ArtifactProvenance(
+                                    origin="transform",
+                                    recipe_revision="correction-transform-v1",
+                                    operation_id=command.operation_id,
+                                ),
+                                extensions={
+                                    "corrections_ui": {"overlay_only": True},
+                                    "correction_extraction": {
+                                        "artifact_ids": [figure.artifact_id],
+                                    },
+                                    "correction_transform": {
+                                        "operation_id": command.operation_id,
+                                        "source_kind": "committed-mask",
+                                    },
+                                },
+                            )
+                        )
+                else:
+                    annotation_id = command.extraction.annotation_id
+                    annotation_revision = command.extraction.annotation_revision
+                extraction_links.append(
+                    _ExtractionAnnotationLink(
+                        annotation_id,
+                        annotation_revision,
+                        figure.artifact_id,
+                        figure.artifact_revision,
+                        command.operation_id,
+                    )
+                )
             for annotation in self._mapped_annotation_views(
                 command,
                 result,
@@ -1251,6 +1353,15 @@ class FilesystemCorrectionTransformStore:
                 sorted(
                     spatial,
                     key=lambda value: value.key.annotation_id,
+                )
+            ),
+            tuple(
+                sorted(
+                    extraction_links,
+                    key=lambda value: (
+                        value.annotation_id,
+                        value.operation_id,
+                    ),
                 )
             ),
             resources,
@@ -1481,6 +1592,10 @@ class FilesystemCorrectionTransformStore:
                 if candidate.command.operation_id == operation_id:
                     continue
                 command = candidate.command
+                if command.extraction is not None:
+                    # A crop may read the current display, but it never
+                    # advances or invalidates that display's correction head.
+                    continue
                 if (
                     command.source_revision == corrected.artifact_revision
                     and command.source_sha256 == corrected.content_sha256
@@ -1536,6 +1651,8 @@ class FilesystemCorrectionTransformStore:
             candidates: list[_ProjectedTransformPublication] = []
             for candidate in publications.values():
                 if candidate.command.operation_id == operation_id:
+                    continue
+                if candidate.command.extraction is not None:
                     continue
                 corrected = candidate.result.output("corrected-display")
                 if (
@@ -2387,6 +2504,27 @@ class FilesystemCorrectionTransformStore:
         preserved_assertions = self._preserved_spatial_assertions(
             publication
         )
+        if command.extraction is not None:
+            if raw_values or dropped:
+                raise ValueError(
+                    "an extraction must not publish mapped annotations"
+                )
+            if (
+                not command.extraction.is_committed_mask
+                and pins.get(command.extraction.annotation_id)
+                != command.extraction.annotation_revision
+            ):
+                raise ValueError(
+                    "the extraction annotation is not bound to its source pin"
+                )
+            if any(
+                pins.get(annotation_id) != preserved[0]
+                for annotation_id, preserved in preserved_assertions.items()
+            ):
+                raise ValueError(
+                    "preserved human assertions are not bound to source pins"
+                )
+            return ()
         if raw_values and not source_scope.canvas_id:
             raise ValueError(
                 "mapped correction annotations require a source canvas"
@@ -2787,7 +2925,10 @@ class FilesystemCorrectionTransformStore:
                 result,
                 logical_display_artifact_id,
             )
-            if self._publication_plan_for is not None
+            if (
+                self._publication_plan_for is not None
+                and draft.command.extraction is None
+            )
             else None
         )
         if additional is not None and not isinstance(
@@ -2801,7 +2942,7 @@ class FilesystemCorrectionTransformStore:
             )
 
         targets: list[tuple[Path, bytes, str, bool]] = []
-        for kind in CORRECTION_OUTPUT_KINDS:
+        for kind in output_profile_for(draft.command.extraction is not None):
             output = draft.output(kind)
             if len(output.content) > _MAX_OUTPUT_BYTES:
                 raise _repository_error(
@@ -2922,6 +3063,8 @@ class FilesystemCorrectionTransformStore:
         publication_sha256: str,
     ) -> tuple[str, bytes] | None:
         command = draft.command
+        if command.extraction is not None:
+            return None
         if (
             live.artifact.key != command.key
             or live.artifact.revision != command.artifact_revision
@@ -3131,7 +3274,7 @@ class FilesystemCorrectionTransformStore:
         result: CorrectionTransformCommitResult,
     ) -> dict[str, Any]:
         outputs: list[dict[str, Any]] = []
-        for kind in CORRECTION_OUTPUT_KINDS:
+        for kind in output_profile_for(draft.command.extraction is not None):
             staged = draft.output(kind)
             committed = result.output(kind)
             outputs.append(
@@ -3241,7 +3384,9 @@ class FilesystemCorrectionTransformStore:
             )
             for value in result_raw["outputs"]
         )
-        if tuple(output.kind for output in outputs) != CORRECTION_OUTPUT_KINDS:
+        if tuple(output.kind for output in outputs) != output_profile_for(
+            any(output.kind == "extracted-figure" for output in outputs)
+        ):
             raise ValueError(f"{artifact} output order is invalid")
         return CorrectionTransformCommitResult(operation_id, outputs)
 
@@ -3379,6 +3524,10 @@ class FilesystemCorrectionTransformStore:
         stored_command = CorrectionTransformCommand.from_dict(publication["command"])
         if stored_command != command or stored_command.fingerprint != command.fingerprint:
             raise ValueError("publication command is not bound to its receipt")
+        if tuple(value.kind for value in result.outputs) != output_profile_for(
+            command.extraction is not None
+        ):
+            raise ValueError("publication output profile does not match its command")
 
         source = _strict_object(
             publication["source"],

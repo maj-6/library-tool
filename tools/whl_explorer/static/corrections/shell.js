@@ -44,9 +44,8 @@
     "item_id", "representation_id", "canvas_id", "artifact_id", "annotation_id",
   ];
   const TRAY_TABS = Object.freeze(["reviews", "jobs"]);
-  // The command registry's binding grammar accepts single letters only, so
-  // the bracket-style previous/next keys land on j/k (both unclaimed by the
-  // default classification bindings t/c/s/e/m/i/n/p/d).
+  // The previous/next keys land on j/k (both unclaimed by the default
+  // classification bindings t/c/s/e/m/i/n/p/d).
   const BOOKS_NAVIGATION_COMMANDS = Object.freeze([
     Object.freeze({
       id: "corrections.books.previous-item",
@@ -69,12 +68,32 @@
   ]);
   const BOOKS_NAVIGATION_IDS = new Set(
     BOOKS_NAVIGATION_COMMANDS.map((command) => command.id));
+  const CAPTURE_TRASH_COMMAND = Object.freeze({
+    id: "corrections.capture.move-to-trash",
+    label: "Move the current capture page to Trash",
+    shortLabel: "Move capture to Trash",
+    code: "DEL",
+    defaultBinding: "backspace",
+    targetKind: "capture-page",
+  });
+  const VIEW_SELECTION_COMMAND_IDS = new Set([
+    ...BOOKS_NAVIGATION_IDS,
+    CAPTURE_TRASH_COMMAND.id,
+  ]);
   const PRESET_BATCH_PAGE_LIMIT = 100;
   const PRESET_BATCH_MAX_PAGES = 64;
   const PRESET_BATCH_MAX_TARGETS = 4096;
   const PRESET_BATCH_RETRY_LIMIT = 4096;
   const PRESET_BATCH_CONTEXT_CHANGED = "preset-batch-context-changed";
   const MAX_CAPTURE_DISPLAY_REFRESHES = 256;
+  const CAPTURE_LIFECYCLE_CHANGE_KEY = "librarytool.capture-assets.changed";
+  const MAX_CAPTURE_LIFECYCLE_CHANGE_BYTES = 2048;
+  const CAPTURE_LIFECYCLE_CHANGE_FIELDS = new Set([
+    "action", "itemId", "artifactId", "changedAt",
+  ]);
+  const CAPTURE_EXTRACTION_TERMINAL_STATES = new Set([
+    "cancelled", "failed", "done", "interrupted",
+  ]);
 
   function isPlainObject(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -319,6 +338,40 @@
     try { return windowRef && windowRef.localStorage || null; } catch (error) { return null; }
   }
 
+  function parseCaptureLifecycleChange(value) {
+    if (typeof value !== "string" || !value ||
+        utf8ByteLength(value) > MAX_CAPTURE_LIFECYCLE_CHANGE_BYTES) return null;
+    try {
+      const parsed = JSON.parse(value);
+      if (!isPlainObject(parsed) ||
+          Object.keys(parsed).some((key) =>
+            !CAPTURE_LIFECYCLE_CHANGE_FIELDS.has(key)) ||
+          !["delete", "restore"].includes(parsed.action) ||
+          !Number.isSafeInteger(parsed.changedAt) || parsed.changedAt <= 0) {
+        return null;
+      }
+      return Object.freeze({
+        action: parsed.action,
+        itemId: contextIdentifier(parsed.itemId, "itemId", true),
+        artifactId: contextIdentifier(parsed.artifactId, "artifactId", true),
+        changedAt: parsed.changedAt,
+      });
+    } catch (error) {
+      return null;
+    }
+  }
+
+  let captureAssetOperationSequence = 0;
+  function captureAssetOperationId() {
+    const cryptoRef = typeof globalThis !== "undefined" && globalThis.crypto;
+    if (cryptoRef && typeof cryptoRef.randomUUID === "function") {
+      return `capture-trash-${cryptoRef.randomUUID()}`;
+    }
+    captureAssetOperationSequence += 1;
+    return `capture-trash-${Date.now().toString(36)}-${captureAssetOperationSequence
+      .toString(36)}`;
+  }
+
   function replaceText(node, value) {
     if (node) node.textContent = String(value);
   }
@@ -327,10 +380,13 @@
     const source = isPlainObject(value) && isPlainObject(value.bindings)
       ? value.bindings : {};
     const bindings = {};
-    // The Books previous/next keys are fixed, so a stored classification
-    // remap can never claim them; the colliding remap is dropped instead.
+    // Shell navigation and capture lifecycle keys are fixed, so a stored
+    // classification remap can never claim them.
     const occupied = new Set(
-      BOOKS_NAVIGATION_COMMANDS.map((command) => command.defaultBinding));
+      [
+        ...BOOKS_NAVIGATION_COMMANDS.map((command) => command.defaultBinding),
+        CAPTURE_TRASH_COMMAND.defaultBinding,
+      ]);
     const definitions = Array.isArray(deps.DEFAULT_CLASSIFICATION_COMMANDS)
       ? deps.DEFAULT_CLASSIFICATION_COMMANDS : [];
     for (const command of definitions) {
@@ -478,8 +534,10 @@
       this.captureDisplayRefreshes = new Map();
       this.unsubscribeClassificationBindings = null;
       this.externalRefreshPromise = null;
+      this.captureLifecycleChanges = new Map();
       this.restoringProfile = false;
       this.artifactOverlays = new Set();
+      this.extractedPreviewCleanup = null;
       // Resource the mounted editor was actually rendered with, and the
       // editor id that rendered it. The equivalence gate compares incoming
       // publishes against these instead of remounting on every publish.
@@ -491,6 +549,7 @@
       // Latest image-editor state, mirrored through onStateChange, so the
       // gate can tell whether a remount would destroy in-progress work.
       this.editorCanvasState = null;
+      this.editorCanvasController = null;
       // In-place region/metadata updater for the mounted editor overlay.
       this.activeOverlayUpdate = null;
       this.artifactOverlayProfile = typeof deps.normalizeArtifactOverlayProfile === "function"
@@ -525,6 +584,16 @@
       this.presetBatchOperationIdFactory =
         typeof options.presetBatchOperationIdFactory === "function"
           ? options.presetBatchOperationIdFactory : null;
+      this.captureAssetOperationIdFactory =
+        typeof options.captureAssetOperationIdFactory === "function"
+          ? options.captureAssetOperationIdFactory : captureAssetOperationId;
+      this.captureAssetDeletionPromise = null;
+      this.captureAssetDeleteAttempts = new Map();
+      // Region extraction is queued independently of the mounted image
+      // editor's submission state. Keep its source capture alive until the
+      // worker reports a terminal outcome; otherwise a rapid X, Backspace can
+      // hide the bytes before the worker has taken its source snapshot.
+      this.captureExtractionOperations = new Map();
       this.presetBatchSequence = 0;
       this.presetBatchRetryCommands = new Map();
       this.presetBatchRuns = new Map();
@@ -721,6 +790,7 @@
       this.registerBooksNavigationCommands();
       this.artifactsFeature = options.artifactsFeature === false ? null :
         options.artifactsFeature || this.createArtifactsFeature(options);
+      this.registerCaptureTrashCommand();
       this.itemProperties = options.itemProperties === false ? null :
         options.itemProperties || this.createItemPropertiesFeature(options);
       this.capabilitiesPromise = null;
@@ -739,7 +809,7 @@
         scope: this.root,
         documentRef: this.documentRef,
         windowRef: this.windowRef,
-        port: this.artifactPorts && this.artifactPorts.commands,
+        port: this.classificationCommandPort(),
         bindings: classification.bindings,
         history: options.correctionHistory,
         operationIdFactory: options.correctionOperationIdFactory,
@@ -749,6 +819,8 @@
           this.resolveLinkedArtifact(detail.linkedKey),
         transformContract: (target) =>
           this.classificationTransformContract(target),
+        extractionTarget: (event, command) =>
+          this.committedMaskExtractionTarget(event, command),
         serializeTransformCommand: (value) =>
           typeof deps.serializeCorrectionTransformCommand === "function"
             ? deps.serializeCorrectionTransformCommand(value)
@@ -774,7 +846,7 @@
     classificationEventEligible(event, command, context = {}) {
       // Books navigation acts on the panel, not the hovered target, so a
       // hover must not widen its gate beyond the browsable surfaces.
-      if (!(command && BOOKS_NAVIGATION_IDS.has(command.id)) &&
+      if (!(command && VIEW_SELECTION_COMMAND_IDS.has(command.id)) &&
           this.classificationHoverEligible(command, context)) return true;
       return this.classificationSurfaceEligible(event, [
         "booksList",
@@ -824,6 +896,244 @@
           registry.register({ ...command, defaultBinding: "" });
         }
       }
+    }
+
+    captureTrashPort() {
+      const commands = this.artifactPorts && this.artifactPorts.commands;
+      return commands && typeof commands.trashCaptureAsset === "function"
+        ? commands.trashCaptureAsset : null;
+    }
+
+    currentCaptureDeletionTarget() {
+      const books = this.booksPanel();
+      const selection = this.state && this.state.selection || {};
+      if (!books || typeof books.captureForSelection !== "function") return null;
+      const match = books.captureForSelection(selection);
+      if (!match) return null;
+      const key = `artifact:${match.capture.artifact_id}`;
+      const loaded = this.artifactsFeature && this.artifactsFeature.items &&
+        this.artifactsFeature.items.get(key);
+      const selected = this.classificationController &&
+        this.classificationController.selectionTarget;
+      const candidate = loaded && loaded.itemId === match.book.id
+        ? loaded
+        : selected && targetKey(selected) === key &&
+            String(selected.itemId || selected.item_id || "") === match.book.id
+          ? selected : match.capture;
+      const revision = String(candidate && (
+        candidate.revision || candidate.artifactRevision ||
+        candidate.artifact_revision) || "");
+      if (!revision || revision.startsWith("index:")) return null;
+      return Object.freeze({
+        itemId: match.book.id,
+        artifactId: match.capture.artifact_id,
+        expectedArtifactRevision: revision,
+        label: String(match.capture.label ||
+          `Capture ${match.capture.capture_order + 1}`),
+      });
+    }
+
+    classificationCommandPort() {
+      const port = this.artifactPorts && this.artifactPorts.commands;
+      if (!port || typeof port.queueTransform !== "function") return port;
+      const queueTransform = port.queueTransform.bind(port);
+      const shell = this;
+      // Bind non-transform methods back to the real adapter as well. This
+      // keeps class-backed/injected ports working while only interposing on
+      // the extraction queue lifecycle.
+      return new Proxy(port, {
+        get(target, property) {
+          if (property === "queueTransform") {
+            return (payload) => shell.queueClassificationTransform(
+              queueTransform, payload);
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }
+
+    captureExtractionStart(command) {
+      if (!isPlainObject(command) || !isPlainObject(command.extraction)) return "";
+      const operationId = String(command.operation_id || command.operationId || "");
+      const target = this.currentCaptureDeletionTarget();
+      if (!operationId || !target) return "";
+      const operations = this.captureExtractionOperations instanceof Map
+        ? this.captureExtractionOperations
+        : (this.captureExtractionOperations = new Map());
+      operations.set(operationId, Object.freeze({
+        itemId: target.itemId,
+        artifactId: target.artifactId,
+      }));
+      return operationId;
+    }
+
+    captureExtractionFinish(operationId) {
+      if (!operationId || !(this.captureExtractionOperations instanceof Map)) {
+        return false;
+      }
+      return this.captureExtractionOperations.delete(String(operationId));
+    }
+
+    captureExtractionTerminal(result, command = null, observation = null) {
+      const terminalState = observation && observation.terminalState ||
+        result && result.terminal_state || "";
+      if (!CAPTURE_EXTRACTION_TERMINAL_STATES.has(terminalState) && !(result && (
+        result.cancelled_before_commit === true ||
+        Object.prototype.hasOwnProperty.call(result, "image_commit") ||
+        isPlainObject(result.failure)
+      ))) return false;
+      const operationId = observation && observation.operationId ||
+        result && (result.operation_id ||
+          result.image_commit && result.image_commit.operation_id) ||
+        command && (command.operation_id || command.operationId) || "";
+      return this.captureExtractionFinish(operationId);
+    }
+
+    async queueClassificationTransform(queueTransform, payload) {
+      const command = payload && payload.command;
+      const operationId = this.captureExtractionStart(command);
+      try {
+        const result = await queueTransform(payload);
+        this.captureExtractionTerminal(result, command);
+        return result;
+      } catch (error) {
+        // An ambiguous transport failure may still have queued the job. Keep
+        // the source protected until a durable terminal event settles it.
+        if (!(error && (error.ambiguous === true || error.retryable === true))) {
+          this.captureExtractionFinish(operationId);
+        }
+        throw error;
+      }
+    }
+
+    captureExtractionInFlight(target) {
+      if (!target || !(this.captureExtractionOperations instanceof Map)) return false;
+      for (const operation of this.captureExtractionOperations.values()) {
+        if (operation.itemId === target.itemId &&
+            operation.artifactId === target.artifactId) return true;
+      }
+      return false;
+    }
+
+    registerCaptureTrashCommand() {
+      const registry = this.classificationController &&
+        this.classificationController.registry;
+      if (!registry || typeof registry.register !== "function") return;
+      if (typeof registry.get === "function" &&
+          registry.get(CAPTURE_TRASH_COMMAND.id)) return;
+      registry.register({
+        ...CAPTURE_TRASH_COMMAND,
+        available: () => {
+          const target = this.currentCaptureDeletionTarget();
+          return Boolean(
+            this.captureTrashPort() && !this.captureAssetDeletionPromise &&
+            !this.editorHoldsDirtyState() && target &&
+            !this.captureExtractionInFlight(target));
+        },
+        execute: () => this.moveCurrentCaptureToTrash(),
+      });
+    }
+
+    selectCaptureDeletionFallback(fallback) {
+      if (!fallback || !fallback.address) return null;
+      if (this.classificationController &&
+          typeof this.classificationController.setHotTarget === "function") {
+        this.classificationController.setHotTarget(null);
+      }
+      this.setResource(null);
+      const selection = this.selectAddress(fallback.address, {
+        source: "books",
+        forceContext: true,
+        navigationPreview: fallback.navigationPreview || null,
+      });
+      return selection;
+    }
+
+    async refreshDeletedCapture(
+      fallback,
+      removedKey = "",
+      reason = "capture-deleted",
+    ) {
+      const selection = this.selectCaptureDeletionFallback(fallback);
+      if (!selection) return null;
+      if (this.booksFeature && typeof this.booksFeature.refresh === "function") {
+        await this.booksFeature.refresh(reason);
+      }
+      if (this.artifactsFeature &&
+          typeof this.artifactsFeature.refresh === "function") {
+        await this.artifactsFeature.refresh({
+          preserveSelection: true,
+          forgetSelectionKey: removedKey,
+          reason,
+        });
+      }
+      return selection;
+    }
+
+    moveCurrentCaptureToTrash() {
+      if (this.captureAssetDeletionPromise) {
+        return this.captureAssetDeletionPromise;
+      }
+      const port = this.captureTrashPort();
+      const target = this.currentCaptureDeletionTarget();
+      const books = this.booksPanel();
+      const fallback = target && books &&
+        typeof books.captureDeletionFallback === "function"
+        ? books.captureDeletionFallback(this.state.selection) : null;
+      if (!port || !target || !fallback || this.editorHoldsDirtyState() ||
+          this.captureExtractionInFlight(target)) {
+        return Promise.reject(new Error(
+          "The current capture page cannot be moved to Trash"));
+      }
+      const attemptKey = [
+        target.itemId, target.artifactId, target.expectedArtifactRevision,
+      ].join("\u0000");
+      let operationId = this.captureAssetDeleteAttempts.get(attemptKey);
+      if (!operationId) {
+        operationId = this.captureAssetOperationIdFactory(target);
+        this.captureAssetDeleteAttempts.set(attemptKey, operationId);
+      }
+      const run = (async () => {
+        const receipt = await port({ ...target, operationId });
+        this.captureAssetDeleteAttempts.delete(attemptKey);
+        try {
+          safeStorage(this.windowRef).setItem(
+            CAPTURE_LIFECYCLE_CHANGE_KEY,
+            JSON.stringify({
+              action: "delete",
+              itemId: target.itemId,
+              artifactId: target.artifactId,
+              changedAt: Date.now(),
+            }),
+          );
+        } catch (error) {
+          // Cross-window refresh is advisory; the durable receipt is complete.
+        }
+        try {
+          await this.refreshDeletedCapture(
+            fallback,
+            `artifact:${target.artifactId}`,
+          );
+          this.setStatus(
+            `${target.label} moved to Trash. Restore it from Info > Trash.`,
+          );
+        } catch (error) {
+          this.setStatus(
+            error && error.message ||
+              "The capture was moved to Trash, but the view could not refresh",
+            true,
+          );
+        }
+        return receipt;
+      })();
+      this.captureAssetDeletionPromise = run;
+      void run.finally(() => {
+        if (this.captureAssetDeletionPromise === run) {
+          this.captureAssetDeletionPromise = null;
+        }
+      }).catch(() => {});
+      return run;
     }
 
     // A hovered target keeps its hotkeys wherever document focus sits;
@@ -1049,6 +1359,7 @@
           "source-images",
         ],
         onResource: (resource) => this.setResource(resource),
+        onPreview: (preview) => this.showExtractedFigurePreview(preview),
         displayedRasterUrls: () => this.displayedEditorUrls(),
         onSelection: (item) => this.selectArtifactItem(item),
         onHotTarget: (item) => {
@@ -1652,11 +1963,47 @@
       // ``linked_artifact_ids`` wire names saw no links at all on a decoded
       // target and waved every cross-image extraction through.
       const links = deps.linkedArtifactKeys(target);
-      if (links.length &&
-          !links.includes(`artifact:${correction.artifact_id}`)) {
+      const extensions = target && target.extensions || {};
+      const extraction = extensions && extensions.correction_extraction;
+      const cropLinks = new Set(
+        extraction && Array.isArray(extraction.artifact_ids)
+          ? extraction.artifact_ids.map((value) => `artifact:${String(value)}`)
+          : [],
+      );
+      const sourceLinks = links.filter((key) => !cropLinks.has(key));
+      if (sourceLinks.length &&
+          !sourceLinks.includes(`artifact:${correction.artifact_id}`)) {
         return null;
       }
       return correction;
+    }
+
+    committedMaskExtractionTarget(event, command) {
+      if (!command || command.action !== "region.extract") return null;
+      const state = this.editorCanvasState;
+      const resource = this.state && this.state.resource;
+      const correction = resource && resource.correction;
+      if (!state || !Array.isArray(state.maskPolygon) || state.maskDraft ||
+          !correction || !correction.artifact_id) return null;
+      const eventTarget = event && event.target;
+      const active = this.documentRef && this.documentRef.activeElement;
+      const ownsCanvas = (value) => Boolean(
+        value && value.dataset && value.dataset.classificationCanvas === "true");
+      if (!ownsCanvas(eventTarget) && !ownsCanvas(active)) return null;
+      return Object.freeze({
+        key: `mask:${correction.artifact_id}`,
+        objectType: "committed-mask",
+        kind: "committed-mask",
+        itemId: correction.item_id,
+        annotationId: `mask-${correction.artifact_id}`,
+        revision: correction.artifact_revision,
+        label: "User mask",
+        linkedKeys: Object.freeze([`artifact:${correction.artifact_id}`]),
+        selector: Object.freeze({
+          points: Object.freeze(state.maskPolygon.map((point) =>
+            Object.freeze([point[0], point[1]]))),
+        }),
+      });
     }
 
     categoryInventoryRefresh(_target, detail = {}) {
@@ -1745,6 +2092,7 @@
       // the mounted editor without a remount, so everything the overlay
       // derives from the resource is read through this mutable reference.
       let activeResource = resource;
+      this.editorCanvasController = controller;
       const normalizedRegions = () => {
         const summary = activeResource && activeResource.summary || {};
         const rawRegions = Array.isArray(activeResource && activeResource.regions)
@@ -1801,7 +2149,11 @@
             this.demoteClassificationFocus();
           }
         },
-        onActivate: (target) => {
+        onActivate: (target, detail = {}) => {
+          if (detail.preview && detail.extractedArtifactKey) {
+            void this.previewExtractedArtifact(detail.extractedArtifactKey);
+            return;
+          }
           void this.promoteClassificationTarget(target);
         },
       }).mount();
@@ -1853,6 +2205,9 @@
       return () => {
         controller.image.removeEventListener("load", sync);
         if (this.activeOverlayUpdate === update) this.activeOverlayUpdate = null;
+        if (this.editorCanvasController === controller) {
+          this.editorCanvasController = null;
+        }
         if (this.artifactOverlays) this.artifactOverlays.delete(overlay);
         overlay.destroy();
         // The overlay releases its own soft target on destroy; this covers
@@ -1863,6 +2218,59 @@
           this.classificationController.setHotTarget(null);
         }
       };
+    }
+
+    async previewExtractedArtifact(key) {
+      if (!key || !this.artifactsFeature ||
+          typeof this.artifactsFeature.preview !== "function") return null;
+      return this.artifactsFeature.preview(key, { source: "region-overlay" });
+    }
+
+    showExtractedFigurePreview(preview) {
+      if (!preview || !preview.url || !this.documentRef) return null;
+      if (typeof this.extractedPreviewCleanup === "function") {
+        this.extractedPreviewCleanup();
+      }
+      const dialog = this.documentRef.createElement("dialog");
+      dialog.className = "corrections-extracted-preview";
+      dialog.setAttribute("aria-label", "Extracted figure preview");
+      const header = this.documentRef.createElement("header");
+      const heading = this.documentRef.createElement("strong");
+      heading.textContent = preview.label || "Extracted figure";
+      const closeButton = this.documentRef.createElement("button");
+      closeButton.type = "button";
+      closeButton.textContent = "Close";
+      const image = this.documentRef.createElement("img");
+      image.src = preview.url;
+      image.alt = preview.label || "Extracted figure preview";
+      header.append(heading, closeButton);
+      dialog.append(header, image);
+      this.root.append(dialog);
+      let closed = false;
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        if (typeof preview.close === "function") preview.close();
+        if (dialog.parentNode) dialog.parentNode.removeChild(dialog);
+        if (this.extractedPreviewCleanup === cleanup) {
+          this.extractedPreviewCleanup = null;
+        }
+      };
+      closeButton.addEventListener("click", cleanup);
+      dialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        cleanup();
+      });
+      dialog.addEventListener("close", cleanup);
+      this.extractedPreviewCleanup = cleanup;
+      if (typeof dialog.showModal === "function") {
+        try { dialog.showModal(); } catch (error) {
+          dialog.setAttribute("open", "");
+        }
+      } else {
+        dialog.setAttribute("open", "");
+      }
+      return dialog;
     }
 
     demoteClassificationFocus() {
@@ -1934,11 +2342,16 @@
       }
       if (this.artifactsFeature &&
           typeof this.artifactsFeature.refresh === "function") {
-        tasks.push(Promise.resolve().then(() =>
-          this.artifactsFeature.refresh({
+        tasks.push(Promise.resolve().then(() => {
+          const refreshOptions = {
             preserveSelection: true,
             reason,
-          })));
+          };
+          if (options.forgetSelectionKey) {
+            refreshOptions.forgetSelectionKey = String(options.forgetSelectionKey);
+          }
+          return this.artifactsFeature.refresh(refreshOptions);
+        }));
       }
       if (this.itemProperties &&
           typeof this.itemProperties.refresh === "function") {
@@ -1957,6 +2370,101 @@
       });
       this.externalRefreshPromise = refresh;
       return refresh;
+    }
+
+    captureLifecycleSelectionMatches(change) {
+      const selection = this.state && this.state.selection || {};
+      return selection.itemId === change.itemId &&
+        selection.artifactId === change.artifactId;
+    }
+
+    captureLifecycleChangeKey(change) {
+      return `${change.itemId}\u0000${change.artifactId}`;
+    }
+
+    rememberCaptureLifecycleChange(change) {
+      const changes = this.captureLifecycleChanges instanceof Map
+        ? this.captureLifecycleChanges
+        : (this.captureLifecycleChanges = new Map());
+      const key = this.captureLifecycleChangeKey(change);
+      const previous = changes.get(key);
+      if (previous && change.changedAt < previous.changedAt) return false;
+      changes.set(key, change);
+      return true;
+    }
+
+    captureLifecycleChangeIsCurrent(change) {
+      const changes = this.captureLifecycleChanges;
+      return changes instanceof Map &&
+        changes.get(this.captureLifecycleChangeKey(change)) === change;
+    }
+
+    refreshCaptureLifecycleInventory(change, options = {}) {
+      const refreshWhenIdle = () => {
+        if (this.destroyed || !this.captureLifecycleChangeIsCurrent(change)) {
+          return [];
+        }
+        const inFlight = this.externalRefreshPromise;
+        if (inFlight) {
+          return Promise.resolve(inFlight).then(refreshWhenIdle);
+        }
+        return this.refreshExternalState("capture-lifecycle", options);
+      };
+      return refreshWhenIdle();
+    }
+
+    refreshCaptureLifecycleChange(change) {
+      if (change.action !== "delete") {
+        return this.refreshCaptureLifecycleInventory(change);
+      }
+      const removedKey = `artifact:${change.artifactId}`;
+      if (!this.captureLifecycleSelectionMatches(change)) {
+        return this.refreshCaptureLifecycleInventory(change, {
+          forgetSelectionKey: removedKey,
+        });
+      }
+      const books = this.booksPanel();
+      const fallback = books &&
+        typeof books.captureDeletionFallback === "function"
+        ? books.captureDeletionFallback(this.state.selection) : null;
+      // The fallback calculation is synchronous, but keep the exact identity
+      // check beside the mutation so future refactors cannot let a delayed
+      // lifecycle event replace a newer selection.
+      if (!this.captureLifecycleSelectionMatches(change)) {
+        return this.refreshCaptureLifecycleInventory(change, {
+          forgetSelectionKey: removedKey,
+        });
+      }
+      if (fallback && fallback.address) {
+        this.selectCaptureDeletionFallback(fallback);
+        return this.refreshCaptureLifecycleInventory(change, {
+          forgetSelectionKey: removedKey,
+        });
+      }
+      if (this.classificationController &&
+          typeof this.classificationController.setHotTarget === "function") {
+        this.classificationController.setHotTarget(null);
+      }
+      this.clearResourceSelection();
+      return this.refreshCaptureLifecycleInventory(change, {
+        forgetSelectionKey: removedKey,
+      });
+    }
+
+    handleCaptureLifecycleStorageEvent(event) {
+      if (!event || event.key !== CAPTURE_LIFECYCLE_CHANGE_KEY) return null;
+      const change = parseCaptureLifecycleChange(event.newValue);
+      if (!change || !this.rememberCaptureLifecycleChange(change)) return null;
+      return Promise.resolve()
+        .then(() => this.refreshCaptureLifecycleChange(change))
+        .catch((error) => {
+          if (!this.destroyed) this.setStatus(
+            error && error.message ||
+              "Capture lifecycle changes could not be refreshed",
+            true,
+          );
+          return null;
+        });
     }
 
     async refreshCaptureMutationState(reason, options = {}) {
@@ -1989,6 +2497,9 @@
         if (this.documentRef.visibilityState === "visible") {
           void this.refreshExternalState("window-visible");
         }
+      });
+      this.listen(this.windowRef, "storage", (event) => {
+        void this.handleCaptureLifecycleStorageEvent(event);
       });
     }
 
@@ -2053,6 +2564,7 @@
     }
 
     handleQueuedTransformResult(_result, command, _resource, observation = null) {
+      this.captureExtractionTerminal(_result, command, observation);
       this.setStatus(
         command && (command.adjustment || command.operations)
           ? "Image processing queued"
@@ -2067,6 +2579,42 @@
       const operationId = command.operation_id || command.operationId || "";
       if (typeof operationId !== "string" || !operationId ||
           observation.operationId !== operationId) return null;
+      if (isPlainObject(command.extraction)) {
+        if (command.extraction.source_kind === "committed-mask" &&
+            this.editorCanvasController &&
+            typeof this.editorCanvasController.dispatch === "function") {
+          // The engine commit is already authoritative at this point. Clear
+          // the transient editor mask even if the inventory refresh fails;
+          // the durable overlay will arrive on this or the next refresh.
+          this.editorCanvasController.dispatch({
+            type: "MASK_EXTRACTION_COMMITTED",
+            maskPolygon: command.mask_polygon,
+          });
+        }
+        const feature = this.artifactsFeature;
+        if (!feature || typeof feature.refresh !== "function") return null;
+        try {
+          // Extraction adds a sibling artifact and a durable link to the open
+          // region. Refresh the inventory/region projection, but preserve the
+          // selected capture so the equivalent resource update is applied to
+          // its mounted editor instead of routing to the crop.
+          const refreshed = await feature.refresh({
+            preserveSelection: true,
+            reason: "region-extraction",
+          });
+          this.setStatus("Region extracted");
+          return refreshed || true;
+        } catch (error) {
+          if (!this.destroyed && (!error || error.name !== "AbortError")) {
+            this.setStatus(
+              error && error.message ||
+                "The extracted figure could not be refreshed",
+              true,
+            );
+          }
+          return null;
+        }
+      }
       const artifactId = command.artifact_id || command.artifactId || "";
       const itemId = command.item_id || command.itemId || "";
       const displayArtifactId = captureLogicalDisplayArtifactId(artifactId);
@@ -2258,6 +2806,7 @@
           if (this.destroyed ||
               typeof this.imageAdjustTool.observeTransformResult !== "function") return;
           const observation = this.imageAdjustTool.observeTransformResult(result, command);
+          this.captureExtractionTerminal(result, command, observation);
           void this.refreshCommittedCaptureDisplay(observation, command);
         });
         if (typeof release === "function") this.unsubscribeTransformResults = release;
@@ -2947,6 +3496,9 @@
         this.unsubscribeTransformResults();
       }
       this.unsubscribeTransformResults = null;
+      if (typeof this.extractedPreviewCleanup === "function") {
+        this.extractedPreviewCleanup();
+      }
       if (this.captureDisplayRefreshes) this.captureDisplayRefreshes.clear();
       if (typeof this.unsubscribeClassificationBindings === "function") {
         this.unsubscribeClassificationBindings();
@@ -2989,6 +3541,15 @@
         this.presetBatchRetryCommands.clear();
       }
       if (this.presetBatchRuns) this.presetBatchRuns.clear();
+      if (this.captureAssetDeleteAttempts) {
+        this.captureAssetDeleteAttempts.clear();
+      }
+      if (this.captureLifecycleChanges) {
+        this.captureLifecycleChanges.clear();
+      }
+      if (this.captureExtractionOperations) {
+        this.captureExtractionOperations.clear();
+      }
       if (this.selectionListeners) this.selectionListeners.clear();
       if (this.editorRegistry && typeof this.editorRegistry.destroy === "function") {
         this.editorRegistry.destroy();
@@ -3004,6 +3565,7 @@
       this.renderedEditorId = null;
       this.pendingResource = null;
       this.editorCanvasState = null;
+      this.editorCanvasController = null;
       this.layout.destroy();
       for (const remove of this.listeners.splice(0)) remove();
     }
@@ -3028,6 +3590,7 @@
 
   return {
     BOOKS_NAVIGATION_COMMANDS,
+    CAPTURE_TRASH_COMMAND,
     CONTEXT_SCHEMA,
     CorrectionsShell,
     CorrectionsWindowState,

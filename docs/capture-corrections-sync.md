@@ -1,10 +1,91 @@
-# Capture corrections sync — desktop → cloud → Android
+# Capture corrections and asset lifecycle sync — desktop → cloud → Android
 
 The Corrections manager cleans up photo data from phone captures that were
 synced down from the cloud. This document pins the contract by which those
 desktop corrections are published back to the cloud and reflected on Android.
 All three legs (SQL migration, desktop publisher, Android consumer) implement
 this contract; do not diverge from it without updating this file.
+
+## Page deletion and restore
+
+A desktop page delete is a reversible visibility change, not destruction of a
+capture asset. The matching `photo_assets.json` asset stays in `assets[]` with
+its stable `asset_id`, original `capture_order`, processing `lifecycle`,
+original/display records, OCR geometry, and correction history. Desktop adds
+this separate object:
+
+```json
+{
+  "desktop_lifecycle": {
+    "state": "deleted",
+    "revision": 4,
+    "updated_at": 1722000000123
+  }
+}
+```
+
+The object has exactly `state`, `revision`, and `updated_at`. `state` is
+`active` or `deleted`; `revision` is a positive monotonic integer; and
+`updated_at` is a positive Unix epoch millisecond. An older asset with no
+`desktop_lifecycle` is active at revision zero. Missing data is never treated
+as a restore operation. Deleting an interior page does not renumber later
+`capture_order` values, remove its camera/display bytes, or erase its
+correction and OCR records. Restoring writes `active` at the next revision and
+therefore exposes the same asset at the same order.
+
+### Cloud: table `capture_asset_lifecycle` (migration 027)
+
+One current row per `(capture_id, asset_id)`, CAS-updated on the table's
+server-monotonic `revision`. Its owner/FK/RLS/trigger rules mirror
+`capture_corrections`.
+
+| column | type | notes |
+|---|---|---|
+| `capture_id` | uuid, FK `captures(id)` on delete cascade | PK part |
+| `asset_id` | text, `^[A-Za-z0-9._-]{1,160}$`, excluding `.` / `..` | PK part |
+| `owner_id` | uuid, FK `auth.users` | trigger-derived owner |
+| `source_original_sha256` | text, `^[0-9a-f]{64}$` | immutable camera anchor |
+| `result` | jsonb | `org.whl.capture-asset-lifecycle` v1 |
+| `revision` | bigint | server-monotonic row CAS clock |
+| `created_at` / `updated_at` | timestamptz | trigger-maintained |
+
+The result document is exact (no additional v1 fields):
+
+```json
+{
+  "schema": "org.whl.capture-asset-lifecycle",
+  "version": 1,
+  "capture_id": "<capture uuid>",
+  "asset_id": "<stable asset id>",
+  "source_original_sha256": "<64 hex>",
+  "state": "deleted",
+  "capture_order": 2,
+  "lifecycle_revision": 4,
+  "changed_at": 1722000000123
+}
+```
+
+`lifecycle_revision` is the semantic clock copied from
+`desktop_lifecycle.revision`; the table `revision` only orders CAS writes.
+The publisher emits an explicit row for both delete and restore. A capture
+with no row for an asset produces no Android mutation.
+
+### Android lifecycle consumer
+
+Android fetches lifecycle rows alongside corrections and applies lifecycle
+rows first. It revalidates row and result identities, authenticated owner,
+original sha256, and the unchanged
+`capture_order`. Only a strictly greater `lifecycle_revision` changes the
+persisted `desktop_lifecycle`; a lower revision is a no-op and a same-revision
+collision fails closed. A missing incoming asset or missing cloud row is also
+a no-op.
+
+Deleted records remain serialized but are excluded from ordered assets,
+detail/thumbnail descriptors, page counts, and later OCR/reprocessing. Their
+files and all nested history remain on disk. A newer `active` record makes the
+same stable asset visible again. Both cloud-processing results and desktop
+correction installs treat a currently deleted asset as not applicable, so
+pixel updates cannot override its visibility.
 
 ## Shape
 
@@ -229,6 +310,8 @@ Install (mirrors `installCloudDisplayDerivative`):
 - Drop OCR geometry and write the re-OCR pending marker so
   `CloudDisplayReocrWorker` re-runs OCR against the corrected pixels.
 - Never overwrite `photo_N.jpg` or `original_<assetId>.jpg`.
+- Treat a currently deleted asset as not applicable; lifecycle rows are
+  applied before correction rows in each pull.
 
 A row whose `correction_id` matches the applied one is a no-op only after the
 full row/artifact contract and installed display metadata validate and the
@@ -255,8 +338,8 @@ tombstone naturally falls back to the phone values.
   (`Entries.recent()` boundary); archived or deleted entries ignore them.
 - Poll-driven: the phone notices corrections on its next metadata pull
   (Home resume / explicit sync), not in realtime.
-- Page reorder/removal is not expressible in the corrections transport yet,
-  so it cannot round-trip.
+- Page reorder is not expressible. Removal and restoration round-trip through
+  the separate lifecycle transport and deliberately preserve order gaps.
 - Metadata corrections outside the existing `capture_book_metadata`
   bibliography (categories, roles, captions) stay desktop-local; the
   corrections transport itself only round-trips corrected pixels in v1.

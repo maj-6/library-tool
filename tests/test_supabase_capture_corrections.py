@@ -155,6 +155,31 @@ def test_correction_publish_updates_via_revision_cas(monkeypatch):
     }
 
 
+def test_correction_publish_quotes_dotted_asset_in_cas_filter(monkeypatch):
+    dotted_asset = "asset.page-2"
+    desired = correction_row(asset_id=dotted_asset)
+    calls = []
+
+    def rest(_cfg, method, path, payload=None, prefer=""):
+        calls.append((method, path, deepcopy(payload), prefer))
+        return [{
+            **deepcopy(payload),
+            "capture_id": CAPTURE_ID,
+            "asset_id": dotted_asset,
+            "revision": 7,
+            "updated_at": "2026-08-01T12:00:02Z",
+        }]
+
+    monkeypatch.setattr(supabase_sync, "_rest", rest)
+
+    assert supabase_sync.publish_capture_corrections(
+        {"url": "test"},
+        [desired],
+        expected_revisions={(CAPTURE_ID, dotted_asset): 6},
+    ) == 1
+    assert "asset_id=eq.%22asset.page-2%22" in calls[0][1]
+
+
 def test_correction_publish_uses_callers_observed_revision_without_reread(
         monkeypatch):
     new_correction = "4b" * 32

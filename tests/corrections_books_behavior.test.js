@@ -663,6 +663,57 @@ test("navigation-only capture revisions cannot become correction targets", () =>
 });
 
 
+test("capture deletion fallback prefers the next page, then previous, then book",
+  async () => {
+    const store = new CorrectionsIndexStore({
+      api: { loadIndex: async () => fixture() },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+    });
+    await store.openWorkspace("workspace-1");
+
+    assert.deepEqual(controller.captureDeletionFallback({
+      itemId: "book-herbarium",
+      artifactId: "capture-title",
+    }), {
+      address: {
+        itemId: "book-herbarium",
+        representationId: "scan-herbarium",
+        canvasId: "canvas-cover",
+        artifactId: "capture-cover",
+        annotationId: null,
+      },
+      navigationPreview: null,
+    });
+    assert.equal(controller.captureDeletionFallback({
+      itemId: "book-herbarium",
+      artifactId: "capture-cover",
+    }).address.artifactId, "capture-title",
+    "the last page falls back to its previous sibling");
+    assert.deepEqual(controller.captureDeletionFallback({
+      itemId: "book-pending",
+      artifactId: "capture-pending",
+    }), {
+      address: {
+        itemId: "book-pending",
+        representationId: null,
+        canvasId: null,
+        artifactId: null,
+        annotationId: null,
+      },
+      navigationPreview: null,
+    });
+    assert.equal(controller.captureDeletionFallback({
+      itemId: "book-empty",
+      artifactId: "missing",
+    }), null);
+  });
+
+
 test("index-only capture clicks carry a validated thumbnail navigation preview",
   async () => {
     const value = fixture();

@@ -30,8 +30,20 @@
     const CORRECTION_IMAGE_OUTPUT_KINDS = Object.freeze([
       "corrected-display", "ocr-ready", "thumbnail", "transform-manifest",
     ]);
+    const EXTRACTION_IMAGE_OUTPUT_KINDS = Object.freeze([
+      "extracted-figure", "ocr-ready", "transform-manifest",
+    ]);
     const CORRECTION_JOB_OUTPUT_KINDS =
-      new Set([...CORRECTION_IMAGE_OUTPUT_KINDS, "ocr-proposal"]);
+      new Set([
+        ...CORRECTION_IMAGE_OUTPUT_KINDS,
+        ...EXTRACTION_IMAGE_OUTPUT_KINDS,
+        "ocr-proposal",
+      ]);
+
+    function transformOutputKinds(command) {
+      return isPlainObject(command && command.extraction)
+        ? EXTRACTION_IMAGE_OUTPUT_KINDS : CORRECTION_IMAGE_OUTPUT_KINDS;
+    }
     // Standalone re-OCR shares the "correction.ocr-followup" job kind with
     // the transform rider; the operation namespace is what tells the tracked
     // command apart, so the rider's whitelist and guards stay untouched.
@@ -438,7 +450,7 @@
       const inputs = value.input_revisions;
       const inputKeys = Object.keys(inputs);
       const transformKeys = ["quad", "adjustment", "rerun_ocr"];
-      for (const field of ["mask_polygon", "operations"]) {
+      for (const field of ["mask_polygon", "operations", "extraction"]) {
         if (Object.hasOwn(command, field)) transformKeys.push(field);
       }
       const allowedInputKeys = new Set([
@@ -468,6 +480,11 @@
             !sameJsonValue(
               inputs.transform.operations,
               command.operations,
+            )) ||
+          (Object.hasOwn(command, "extraction") &&
+            !sameJsonValue(
+              inputs.transform.extraction,
+              command.extraction,
             )) ||
           (Object.hasOwn(inputs, "command_sha256") &&
             (typeof inputs.command_sha256 !== "string" ||
@@ -632,11 +649,12 @@
         }
         byKind.set(output.kind, output);
       }
-      const presentImageKinds = CORRECTION_IMAGE_OUTPUT_KINDS.filter(
+      const imageOutputKinds = transformOutputKinds(command);
+      const presentImageKinds = imageOutputKinds.filter(
         (kind) => byKind.has(kind),
       );
       const imageCommitted =
-        presentImageKinds.length === CORRECTION_IMAGE_OUTPUT_KINDS.length;
+        presentImageKinds.length === imageOutputKinds.length;
       if (presentImageKinds.length > 0 && !imageCommitted) {
         throw invalidTransformResult(
           "the correction transform job has an incomplete image commit",
@@ -647,7 +665,7 @@
           "a completed correction transform has no image outputs",
         );
       }
-      if (imageCommitted && CORRECTION_IMAGE_OUTPUT_KINDS.some(
+      if (imageCommitted && imageOutputKinds.some(
         (kind) => byKind.get(kind).partial === true,
       )) {
         throw invalidTransformResult(
@@ -748,7 +766,7 @@
           ? Object.freeze({
               operation_id: command.operation_id,
               outputs: Object.freeze(
-                CORRECTION_IMAGE_OUTPUT_KINDS.map((kind) => Object.freeze({
+                imageOutputKinds.map((kind) => Object.freeze({
                   kind,
                   artifact_id: byKind.get(kind).ref,
                 })),
@@ -1100,8 +1118,8 @@
     }
 
     function correctionCommandPort(client, transformPolling = null) {
-      const corrections = client && client.corrections;
-      if (!corrections || typeof corrections !== "object") return null;
+      const corrections = client && client.corrections &&
+        typeof client.corrections === "object" ? client.corrections : {};
       const commands = {};
       if (typeof corrections.assignImageCategory === "function") {
         commands.assignImageCategory = ({
@@ -1215,6 +1233,15 @@
         commands.reopenCorrections = ({
           operationId, actorId: _ignoredActorId, ...payload
         } = {}) => corrections.reopenCorrections({
+          ...payload,
+          idempotencyKey: operationId,
+        });
+      }
+      const raster = client && client.rasterArtifacts;
+      if (raster && typeof raster.trashCaptureAsset === "function") {
+        commands.trashCaptureAsset = ({
+          operationId, ...payload
+        } = {}) => raster.trashCaptureAsset({
           ...payload,
           idempotencyKey: operationId,
         });
@@ -1832,6 +1859,7 @@
       async function listSpatial({ context, cursor, limit, signal }) {
         const response = await client.spatialAnnotations.list({
           ...engineQuery(context, signal),
+          visibility: "tree",
           cursor: cursor || null,
           limit,
         });
@@ -1874,6 +1902,7 @@
           representationId: representationId || query.representationId,
           canvasId: canvasId || query.canvasId,
           canvasRevision,
+          visibility: "overlay",
           cursor: cursor || null,
           limit,
         });

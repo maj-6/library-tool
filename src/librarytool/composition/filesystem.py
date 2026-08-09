@@ -32,6 +32,7 @@ from ..adapters.filesystem import (
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
+    FilesystemCaptureAssetLifecycleStore,
     FilesystemCaptureDocumentArtifactRepository,
     FilesystemCaptureOriginalBackupStore,
     FilesystemCorrectionOcrProposalRepository,
@@ -771,6 +772,7 @@ class _CorrectionProjectionUnion:
         *,
         write_set: RecoverableWriteSet,
         lock_context_for: CatalogueLockFactory,
+        capture_asset_lifecycle: FilesystemCaptureAssetLifecycleStore | None = None,
         original_backups: FilesystemCaptureOriginalBackupStore | None = None,
     ) -> None:
         if not isinstance(write_set, RecoverableWriteSet):
@@ -781,6 +783,7 @@ class _CorrectionProjectionUnion:
         self._transforms = transforms
         self._write_set = write_set
         self._lock_context_for = lock_context_for
+        self._capture_asset_lifecycle = capture_asset_lifecycle
         self._original_backups = original_backups
 
     @contextmanager
@@ -812,10 +815,20 @@ class _CorrectionProjectionUnion:
                 projection,
                 base_values=base,
             )
+            deleted = self._capture_deleted_artifact_ids(item_id)
+            # A display-head output is represented by its stable capture slot,
+            # never as a second raster card while active. A lifecycle-deleted
+            # root must not resurrect it either; other inactive heads remain
+            # visible as immutable stale/replaced-source history.
             hidden = {
-                value.artifact.key.artifact_id.casefold()
-                for value in heads.values()
+                head.artifact.key.artifact_id.casefold()
+                for head in heads.values()
             }
+            hidden.update(
+                head.artifact.key.artifact_id.casefold()
+                for head in projection.display_heads
+                if head.root_key.artifact_id.casefold() in deleted
+            )
             values = (
                 *(
                     self._display_alias(value, heads.get(value.key.artifact_id.casefold()))
@@ -1189,6 +1202,46 @@ class _CorrectionProjectionUnion:
             operation_id,
         )
 
+    def delete_capture_asset(
+        self,
+        item_id: str,
+        artifact_id: str,
+        expected_revision: str,
+        operation_id: str,
+    ) -> Mapping[str, Any]:
+        if self._capture_asset_lifecycle is None:
+            raise RepositoryError(
+                "the capture asset lifecycle store is unavailable",
+                code="capture_asset_lifecycle_unavailable",
+                retryable=True,
+            )
+        return self._capture_asset_lifecycle.delete_capture_asset(
+            item_id,
+            artifact_id,
+            expected_revision,
+            operation_id,
+        )
+
+    def restore_capture_asset(
+        self,
+        item_id: str,
+        artifact_id: str,
+        inverse: Mapping[str, Any],
+        operation_id: str,
+    ) -> Mapping[str, Any]:
+        if self._capture_asset_lifecycle is None:
+            raise RepositoryError(
+                "the capture asset lifecycle store is unavailable",
+                code="capture_asset_lifecycle_unavailable",
+                retryable=True,
+            )
+        return self._capture_asset_lifecycle.restore_capture_asset(
+            item_id,
+            artifact_id,
+            inverse,
+            operation_id,
+        )
+
     def list_spatial_annotations(
         self,
         item_id: str,
@@ -1207,10 +1260,19 @@ class _CorrectionProjectionUnion:
             projection = self._transforms.project_item(item_id)
             heads = self._active_display_heads(item_id, projection)
             logical_ids = set(heads)
+            deleted = self._capture_deleted_artifact_ids(item_id)
+            # Do not let an inactive display head reappear through its mapped
+            # annotations when its capture root is lifecycle-deleted. Stale
+            # history and extraction annotations remain independently visible.
             physical_ids = {
                 head.artifact.key.artifact_id.casefold()
                 for head in heads.values()
             }
+            physical_ids.update(
+                head.artifact.key.artifact_id.casefold()
+                for head in projection.display_heads
+                if head.root_key.artifact_id.casefold() in deleted
+            )
             base_by_annotation_id = {
                 value.key.annotation_id.casefold(): value
                 for value in base
@@ -1318,6 +1380,23 @@ class _CorrectionProjectionUnion:
                             extensions=extensions,
                         )
                     )
+            extraction_links: dict[str, list[Any]] = {}
+            for link in projection.extraction_links:
+                extraction_links.setdefault(
+                    link.annotation_id.casefold(),
+                    [],
+                ).append(link)
+            if extraction_links:
+                values = [
+                    self._with_extraction_links(
+                        value,
+                        extraction_links.get(
+                            value.key.annotation_id.casefold(),
+                            (),
+                        ),
+                    )
+                    for value in values
+                ]
         identities = [value.key.annotation_id.casefold() for value in values]
         if len(identities) != len(set(identities)):
             raise RepositoryError(
@@ -1462,6 +1541,30 @@ class _CorrectionProjectionUnion:
             )
         return self._validated_capture_authorities(item_id, authorities)
 
+    def _capture_deleted_artifact_ids(self, item_id: str) -> frozenset[str]:
+        deleted_for = getattr(self._base, "capture_deleted_artifact_ids", None)
+        if not callable(deleted_for):
+            return frozenset()
+        values = deleted_for(item_id)
+        if (
+            isinstance(values, (str, bytes))
+            or not isinstance(values, Sequence)
+            or any(not isinstance(value, str) or not value for value in values)
+        ):
+            raise RepositoryError(
+                "the correction capture index returned invalid lifecycle pins",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item_id},
+            )
+        identities = tuple(value.casefold() for value in values)
+        if len(identities) != len(set(identities)):
+            raise RepositoryError(
+                "the correction capture index returned aliased lifecycle pins",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item_id},
+            )
+        return frozenset(identities)
+
     def _active_display_heads(
         self,
         item_id: str,
@@ -1597,6 +1700,99 @@ class _CorrectionProjectionUnion:
     def _display_head_revision(prefix: str, *parts: str) -> str:
         digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
         return f"{prefix}:{digest}"
+
+    @staticmethod
+    def _with_extraction_links(
+        annotation: SpatialAnnotationView,
+        links: Sequence[Any],
+    ) -> SpatialAnnotationView:
+        if not links:
+            return annotation
+        ordered = tuple(
+            sorted(
+                links,
+                key=lambda value: (
+                    value.operation_id,
+                    value.artifact_id,
+                ),
+            )
+        )
+
+        artifact_ids = tuple(
+            dict.fromkeys(
+                (
+                    *annotation.linked_artifact_ids,
+                    *(value.artifact_id for value in ordered),
+                )
+            )
+        )
+        if len(artifact_ids) > 64:
+            raise RepositoryError(
+                "a correction extraction exceeds the annotation link limit",
+                code="invalid_correction_transform_storage",
+                details={"annotation_id": annotation.key.annotation_id},
+            )
+
+        extensions = dict(annotation.extensions)
+        existing = extensions.get("correction_extraction")
+        existing_ids: tuple[str, ...] = ()
+        if existing is not None:
+            if not isinstance(existing, Mapping):
+                raise RepositoryError(
+                    "a correction extraction marker is invalid",
+                    code="invalid_correction_transform_storage",
+                    details={"annotation_id": annotation.key.annotation_id},
+                )
+            raw_ids = existing.get("artifact_ids")
+            if (
+                isinstance(raw_ids, (str, bytes))
+                or not isinstance(raw_ids, Sequence)
+                or any(not isinstance(value, str) for value in raw_ids)
+            ):
+                raise RepositoryError(
+                    "a correction extraction marker is invalid",
+                    code="invalid_correction_transform_storage",
+                    details={"annotation_id": annotation.key.annotation_id},
+                )
+            existing_ids = tuple(raw_ids)
+        extraction_ids = tuple(
+            dict.fromkeys(
+                (
+                    *existing_ids,
+                    *(value.artifact_id for value in ordered),
+                )
+            )
+        )
+        if len(extraction_ids) > 64:
+            raise RepositoryError(
+                "a correction extraction marker exceeds its link limit",
+                code="invalid_correction_transform_storage",
+                details={"annotation_id": annotation.key.annotation_id},
+            )
+        extensions["correction_extraction"] = {
+            "artifact_ids": list(extraction_ids),
+        }
+        revision_parts = tuple(
+            "\0".join(
+                (
+                    value.operation_id,
+                    value.annotation_revision,
+                    value.artifact_id,
+                    value.artifact_revision,
+                )
+            )
+            for value in ordered
+        )
+        return replace(
+            annotation,
+            revision=_CorrectionProjectionUnion._display_head_revision(
+                "correction-extraction",
+                annotation.revision,
+                *revision_parts,
+            ),
+            linked_artifact_ids=artifact_ids,
+            extensions=extensions,
+        )
 
     def get_spatial_annotation(
         self,
@@ -2022,6 +2218,7 @@ def compose_filesystem_engine(
                 return corrections_base.get_raster_artifact(key)
             return correction_projection_service.get_raster_artifact(key)
 
+        capture_asset_lifecycle = None
         original_backups = None
         transform_write_set = resources.write_set
         if corrections.transaction_root is not None:
@@ -2058,6 +2255,24 @@ def compose_filesystem_engine(
                     corrections.item_updated_at_publication_for
                 ),
             )
+            # Membership changes must advance the enclosing item timestamp.
+            # Older read/backup-only hosts may omit that mutation authority;
+            # they keep Corrections available but do not expose lifecycle
+            # commands.
+            if corrections.item_updated_at_publication_for is not None:
+                capture_asset_lifecycle = FilesystemCaptureAssetLifecycleStore(
+                    transform_write_set,
+                    coordination_write_set=resources.write_set,
+                    storage_root=resources.write_set.root,
+                    capture_authority_root=corrections.capture_authority_root,
+                    capture_id_for=corrections.capture_id_for,
+                    capture_directory_for=corrections.capture_directory_for,
+                    artifact_for=correction_artifact_for,
+                    lock_context_for=corrections_lock,
+                    item_updated_at_publication_for=(
+                        corrections.item_updated_at_publication_for
+                    ),
+                )
 
         correction_transform_store = FilesystemCorrectionTransformStore(
             transform_write_set,
@@ -2077,6 +2292,7 @@ def compose_filesystem_engine(
             correction_transform_store,
             write_set=resources.write_set,
             lock_context_for=corrections_lock,
+            capture_asset_lifecycle=capture_asset_lifecycle,
             original_backups=original_backups,
         )
         aggregate_projector = CorrectionAggregateProjector(
