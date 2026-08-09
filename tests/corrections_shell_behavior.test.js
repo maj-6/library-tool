@@ -4432,6 +4432,51 @@ test("an equivalent republish updates the mounted image editor in place", () => 
 });
 
 
+test("a publish for a different artifact always remounts the editor", () => {
+  // Review of the equivalence gate found no test pinning the negative:
+  // reducing sameEditResourceIdentity to "both exist" survived the suite.
+  // A different artifact must never be held, deferred, or updated in place
+  // — that would leave the old image on screen while the selection moved on.
+  const { host, shell } = editorGateHarness();
+  shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  const canvas = host.querySelector("[data-classification-canvas]");
+  canvas.getBoundingClientRect = () => ({
+    left: 0, top: 0, width: 400, height: 300,
+  });
+  canvas.setPointerCapture = () => {};
+  host.querySelector("[data-image-tool='perspective']").emit("click");
+  canvas.emit("pointerdown", {
+    pointerId: 3, button: 0, clientX: 12, clientY: 10,
+  });
+  assert.ok(shell.editorCanvasState && shell.editorCanvasState.gesture,
+    "a corner drag is in progress");
+
+  shell.setResource(editableImageResource("r1", {
+    id: "capture-10",
+    label: "capture 10",
+    url: "/capture-10-r1.jpg",
+    resourceRef: {
+      id: "capture-10-display",
+      revision: "display-r1",
+      variant: "display",
+    },
+    correction: null,
+  }));
+
+  const replacement = host.querySelector(".perspective-editor");
+  assert.ok(replacement, "an editor is mounted for the new artifact");
+  assert.notEqual(replacement, surface,
+    "a different artifact replaces the editor even mid-gesture");
+  assert.equal(host.querySelector(".perspective-image").src,
+    "/capture-10-r1.jpg",
+    "the new artifact's image is what renders");
+  assert.doesNotMatch(host.textContent, /Newer revision available/,
+    "navigation is not a deferral case");
+  shell.destroy();
+});
+
+
 test("a transient loading republish keeps the current image on screen", () => {
   const { host, shell } = editorGateHarness();
   shell.setResource(editableImageResource("r1"));
