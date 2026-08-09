@@ -26,6 +26,7 @@ CAPTURE_ID = "c7777777-7777-4777-8777-777777777777"
 BUILD_ID = "build-apply-1"
 OCR_READY_ID = "ctr-" + "b" * 40
 DISPLAY_ID = "ctr-" + "a" * 40
+DISPLAY_SOURCE_SHA256 = "e" * 64
 RECOGNITION = {
     "text": "Corrected page text",
     "words": [{"t": "Corrected", "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.05}],
@@ -110,14 +111,18 @@ def _publish(engine_root, operation_id, source_artifact_id, outputs,
         if len(parent_outputs) == 1:
             source_revision = parent_outputs[0]["artifact_revision"]
             source_sha256 = parent_outputs[0]["content_sha256"]
-    source_revision = source_revision or (
-        "source:" + hashlib.sha256(
-            f"source-revision:{operation_id}".encode("utf-8")
+    if not source_revision and source_artifact_id.endswith(":display"):
+        source_revision = f"bytes:{DISPLAY_SOURCE_SHA256}"
+        source_sha256 = DISPLAY_SOURCE_SHA256
+    else:
+        source_revision = source_revision or (
+            "source:" + hashlib.sha256(
+                f"source-revision:{operation_id}".encode("utf-8")
+            ).hexdigest()
+        )
+        source_sha256 = source_sha256 or hashlib.sha256(
+            f"source-content:{operation_id}".encode("utf-8")
         ).hexdigest()
-    )
-    source_sha256 = source_sha256 or hashlib.sha256(
-        f"source-content:{operation_id}".encode("utf-8")
-    ).hexdigest()
     command = CorrectionTransformCommand(
         item_id=ITEM_ID,
         artifact_id=source_artifact_id,
@@ -235,8 +240,12 @@ def apply_workspace(monkeypatch, tmp_path):
             "version": 1,
             "assets": [
                 {"order": 0, "asset_id": "asset-01",
+                 "source_checksum": "d" * 64,
+                 "derivative_checksum": DISPLAY_SOURCE_SHA256,
                  "lifecycle": "completed"},
                 {"order": 1, "asset_id": "asset-02",
+                 "source_checksum": "c" * 64,
+                 "derivative_checksum": DISPLAY_SOURCE_SHA256,
                  "lifecycle": "completed"},
             ],
         },
@@ -626,7 +635,7 @@ def test_apply_composes_same_slot_transform_inverses_from_source_pin(
 
 
 def test_ocr_capture_chain_rejects_ambiguous_same_slot_source_pin(
-    apply_workspace,
+        apply_workspace,
 ) -> None:
     display_slot = (
         server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
@@ -659,8 +668,82 @@ def test_ocr_capture_chain_rejects_ambiguous_same_slot_source_pin(
     assert located is None
 
 
+def test_ocr_capture_chain_rejects_missing_same_slot_parent(
+        apply_workspace,
+) -> None:
+    display_slot = (
+        server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+        + ":display"
+    )
+    parent_operation = "op-missing-parent"
+    parent_display = "ctr-" + "3" * 40
+    parent_revision = "ctr:" + "4" * 64
+    parent_sha = "5" * 64
+    _publish(
+        apply_workspace.engine_root,
+        parent_operation,
+        display_slot,
+        (("corrected-display", parent_display, parent_revision, parent_sha),),
+    )
+    ocr_ready = "ctr-" + "6" * 40
+    _publish(
+        apply_workspace.engine_root,
+        "op-orphaned-child",
+        display_slot,
+        (("corrected-display", "ctr-" + "7" * 40),
+         ("ocr-ready", ocr_ready)),
+        source_revision=parent_revision,
+        source_sha256=parent_sha,
+    )
+    pointer = (
+        apply_workspace.engine_root
+        / ".engine" / "correction-transforms" / "by-item"
+        / hashlib.sha256(ITEM_ID.encode("utf-8")).hexdigest()
+        / (
+            hashlib.sha256(parent_operation.encode("utf-8")).hexdigest()
+            + ".json"
+        )
+    )
+    pointer.unlink()
+
+    located = server._ocr_apply_capture_asset(
+        ITEM_ID, CAPTURE_ID, ocr_ready, apply_workspace.engine_root)
+
+    assert located is None
+
+
+def test_ocr_capture_chain_rejects_replaced_display_authority(
+        apply_workspace,
+) -> None:
+    display_slot = (
+        server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+        + ":display"
+    )
+    ocr_ready = "ctr-" + "8" * 40
+    _publish(
+        apply_workspace.engine_root,
+        "op-replaced-display",
+        display_slot,
+        (("corrected-display", "ctr-" + "9" * 40),
+         ("ocr-ready", ocr_ready)),
+    )
+    manifest_path = (
+        server.CAPTURES_DIR / CAPTURE_ID / "photo_assets.json"
+    )
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["desktop_import"]["assets"][0][
+        "derivative_checksum"
+    ] = "a" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    located = server._ocr_apply_capture_asset(
+        ITEM_ID, CAPTURE_ID, ocr_ready, apply_workspace.engine_root)
+
+    assert located is None
+
+
 def test_ocr_capture_chain_skips_in_flight_publication_without_receipt(
-    apply_workspace,
+        apply_workspace,
 ) -> None:
     display_slot = (
         server._capture_artifact_namespace(CAPTURE_ID, "asset-01")

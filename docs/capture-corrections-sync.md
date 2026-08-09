@@ -115,9 +115,16 @@ Stateless diff-and-publish (no local outbox):
    corrections artifact repository's `_opaque_identity` math: the first 40 hex
    of sha256 over the canonical JSON array
    `json.dumps((capture_id, asset_id), sort_keys=True, separators=(",", ":"))`
-   — i.e. `["<capture_id>","<asset_id>"]`. Latest committed transform
-   per asset wins; publications for lifecycle-failed assets are skipped.
-   Ordering signal, in priority order: **chain ancestry** — a publication
+   — i.e. `["<capture_id>","<asset_id>"]`. Item pointers, publications,
+   and receipts must bind to one another exactly before a publication
+   participates. When a receipt-witnessed `correction-display-head` exists
+   for the logical display slot, that head is authoritative only if its
+   ancestry roots at the capture's current derivative checksum. An invalid or
+   stale head fails closed; the publisher never substitutes an unrelated
+   history leaf. Publications for lifecycle-failed assets are skipped.
+
+   Histories created before display heads use this ordering signal: **chain
+   ancestry** — a publication
    whose resolution chain passes through another candidate's outputs
    supersedes it (content-derived; the engine never stamps
    `outputs[].provenance.generated_at` for correction transforms, and
@@ -132,8 +139,10 @@ Stateless diff-and-publish (no local outbox):
    When the row differs, two overwrite guards apply before publishing:
    - **Downgrade guard** — if the row's `correction_id` is one of this
      desktop's own candidate publications for the asset, a different local
-     winner publishes only when it sorts strictly newer under the step-2
-     order (chain ancestry, else a strictly later order signal). A tie —
+     winner selected by a validated display head replaces it regardless of
+     disturbed history mtimes. A pre-head winner publishes only when it sorts
+     strictly newer under the step-2 order (chain ancestry, else a strictly
+     later order signal). A legacy tie —
      e.g. equal or disturbed pointer mtimes — skips the asset with a
      per-capture notice instead of overwriting, so mtime damage becomes a
      no-op rather than a downgrade the phone would reinstall.
@@ -142,8 +151,12 @@ Stateless diff-and-publish (no local outbox):
      `correction_id` is lexicographically greater; otherwise skip with a
      notice. Every desktop applying the same rule converges on one stable
      winner instead of ping-ponging the row.
-5. Upload objects (`x-upsert`), then CAS-write the row
-   (insert `on_conflict` ignore → PATCH `revision=eq.N`, mirroring
+5. Upload objects (`x-upsert`), then re-resolve the capture association,
+   manifest, display head, complete local authority token, and immutable object
+   checksum. Content-addressed uploads that lose this race are harmless orphan
+   objects. For each capture whose token remains exact, hold its capture stripe
+   and the Corrections authority lease through the row CAS (insert
+   `on_conflict` ignore → PATCH `revision=eq.N`, mirroring
    `push_capture_book_metadata`).
 
 Failures are reported per capture in the sync summary and never abort the

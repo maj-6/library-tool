@@ -1692,7 +1692,10 @@ def test_capture_display_slot_tracks_the_latest_transform_across_reopen(
     assert diagnostic_hint["diagnostic_scopes"] == ("capture_geometry",)
 
 
-def test_capture_hint_overlay_holds_one_authority_snapshot(tmp_path):
+def test_capture_hint_overlay_holds_one_authority_snapshot(
+    tmp_path,
+    monkeypatch,
+):
     capture_root = tmp_path / "captures"
     _write_composition_capture(capture_root)
     manifest_path = capture_root / "capture-1" / "photo_assets.json"
@@ -1765,18 +1768,52 @@ def test_capture_hint_overlay_holds_one_authority_snapshot(tmp_path):
 
     entries_before = lock_state["entries"]
     lock_state["mutate_on_exit"] = True
-    first = query.list_capture_index_hints("book-one")[0]
+    projection_union = query._raster_artifacts
+    transform_store = projection_union._transforms
+    read_regular = transform_store._read_regular
+    object_root = (
+        tmp_path / ".engine" / "correction-transforms" / "objects"
+    ).resolve()
 
-    assert lock_state["entries"] == entries_before + 1
-    assert first["revision"].startswith("index:")
-    assert first["capture_order"] == 1
-    assert first["imported_at"] == "2026-08-04T12:34:56Z"
+    def metadata_read_only(path, **kwargs):
+        try:
+            Path(path).resolve().relative_to(object_root)
+        except ValueError:
+            return read_regular(path, **kwargs)
+        pytest.fail("capture index hint projection read a transform object")
 
-    second = query.list_capture_index_hints("book-one")[0]
-    assert second["revision"].startswith("index:")
-    assert second["revision"] != first["revision"]
-    assert second["capture_order"] == 2
-    assert second["imported_at"] == "2026-08-05T12:34:56Z"
+    with monkeypatch.context() as hint_guard:
+        hint_guard.setattr(
+            projection_union._base,
+            "get_raster_artifact",
+            lambda _key: pytest.fail(
+                "capture index hint projection hydrated a keyed raster"
+            ),
+        )
+        hint_guard.setattr(
+            projection_union._base,
+            "_observe_resource",
+            lambda *_args, **_kwargs: pytest.fail(
+                "capture index hint projection read capture image bytes"
+            ),
+        )
+        hint_guard.setattr(
+            transform_store,
+            "_read_regular",
+            metadata_read_only,
+        )
+        first = query.list_capture_index_hints("book-one")[0]
+
+        assert lock_state["entries"] == entries_before + 1
+        assert first["revision"].startswith("index:")
+        assert first["capture_order"] == 1
+        assert first["imported_at"] == "2026-08-04T12:34:56Z"
+
+        second = query.list_capture_index_hints("book-one")[0]
+        assert second["revision"].startswith("index:")
+        assert second["revision"] != first["revision"]
+        assert second["capture_order"] == 2
+        assert second["imported_at"] == "2026-08-05T12:34:56Z"
     alias = query.get_raster_artifact(source.key)
     assert alias is not None
     assert alias.content_sha256 == corrected.content_sha256

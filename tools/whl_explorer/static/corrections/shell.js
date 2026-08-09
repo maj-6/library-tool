@@ -1958,7 +1958,20 @@
       const refreshes = this.captureDisplayRefreshes instanceof Map
         ? this.captureDisplayRefreshes
         : (this.captureDisplayRefreshes = new Map());
-      if (refreshes.has(operationId)) return refreshes.get(operationId);
+      const contextGeneration = feature.contextGeneration;
+      const selectionGeneration = feature.selectionGeneration;
+      const existing = refreshes.get(operationId);
+      if (existing && existing.key === key &&
+          existing.contextGeneration === contextGeneration &&
+          existing.selectionGeneration === selectionGeneration) {
+        return existing.promise;
+      }
+      const record = {
+        key,
+        contextGeneration,
+        selectionGeneration,
+        promise: null,
+      };
       const refresh = (async () => {
         try {
           return await feature.reloadSelection(key);
@@ -1973,7 +1986,21 @@
           return null;
         }
       })();
-      refreshes.set(operationId, refresh);
+      record.promise = refresh;
+      refreshes.set(operationId, record);
+      void refresh.then((value) => {
+        if (refreshes.get(operationId) !== record) return;
+        if (!value) {
+          refreshes.delete(operationId);
+          return;
+        }
+        // A successful reload routes the replacement through select(), which
+        // advances the selection generation. Rebase the dedupe record onto
+        // that completed epoch; navigation away and back advances it again and
+        // deliberately makes a later durable result replay retryable.
+        record.contextGeneration = feature.contextGeneration;
+        record.selectionGeneration = feature.selectionGeneration;
+      });
       while (refreshes.size > MAX_CAPTURE_DISPLAY_REFRESHES) {
         refreshes.delete(refreshes.keys().next().value);
       }

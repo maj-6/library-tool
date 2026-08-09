@@ -624,6 +624,91 @@ test("selected capture display reload preserves its group and tree cursor", asyn
 });
 
 
+test("capture display reload rebases a paginated group cursor", async () => {
+  const artifactId = "capture:stable-paged:display";
+  const key = `artifact:${artifactId}`;
+  const siblingKey = "artifact:capture-paged-sibling";
+  const finalKey = "artifact:capture-paged-final";
+  const listCursors = [];
+  let revision = 1;
+  const display = () => raster(artifactId, "captured-image", {
+    revision: `capture-display-r${revision}`,
+    resource: {
+      resource_id: "capture-display-resource",
+      revision: `capture-display-resource-r${revision}`,
+      variant: "display",
+    },
+  });
+  const { feature, treeRoot } = harness({
+    initialExpandedGroups: ["source-images"],
+    pageLimit: 2,
+    catalog: {
+      async list({ cursor }) {
+        listCursors.push(cursor);
+        if (listCursors.length === 1) {
+          assert.equal(cursor, null);
+          return {
+            revision: "source-index-r1",
+            items: [display(), raster("capture-paged-sibling")],
+            nextCursor: "source-cursor-r1-page-2",
+            total: 3,
+          };
+        }
+        if (cursor == null) {
+          return {
+            revision: "source-index-r2",
+            items: [display(), raster("capture-paged-sibling")],
+            nextCursor: "source-cursor-r2-page-2",
+            total: 3,
+          };
+        }
+        assert.equal(cursor, "source-cursor-r2-page-2",
+          "the old revision-bound cursor must not be reused");
+        return {
+          revision: "source-index-r2",
+          items: [raster("capture-paged-final")],
+          nextCursor: null,
+          total: 3,
+        };
+      },
+      async get() { return display(); },
+    },
+    resources: {
+      async resolveRaster({ resourceRef }) {
+        return { url: `/safe/${resourceRef.revision}.jpg` };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select(key);
+  feature.activeKey = siblingKey;
+  treeRoot.scrollTop = 91;
+
+  revision = 2;
+  await feature.reloadSelection(key);
+
+  const rebased = feature.groupState("source-images");
+  assert.equal(rebased.revision, "source-index-r2");
+  assert.equal(rebased.nextCursor, "source-cursor-r2-page-2");
+  assert.equal(feature.selectedKey, key);
+  assert.equal(feature.activeKey, siblingKey);
+  assert.equal(treeRoot.scrollTop, 91);
+  assert.equal(feature.expandedGroups.has("source-images"), true);
+  assert.equal(feature.currentResource.summary.revision, "capture-display-r2");
+
+  await feature.loadGroup("source-images");
+  assert.deepEqual(listCursors, [
+    null,
+    null,
+    "source-cursor-r2-page-2",
+  ]);
+  assert.equal(feature.items.has(finalKey), true,
+    "the next page remains reachable after the display replacement");
+  assert.equal(feature.groupState("source-images").error, null);
+});
+
+
 test("newest capture display reload wins when older detail resolves first", async () => {
   const artifactId = "capture:stable-race:display";
   const key = `artifact:${artifactId}`;

@@ -533,6 +533,45 @@ def test_mapping_skips_in_flight_publication_without_receipt(tmp_path):
     assert in_flight_id not in winner["candidates"]
 
 
+def test_mapping_skips_oversized_sparse_item_pointer(tmp_path):
+    capture_id = "c1414141-1414-4414-8414-141414141414"
+    item_id = "b-" + "4" * 32
+    photo_assets = _photo_assets(
+        capture_id,
+        [("asset-01", "5" * 64, "completed")],
+    )
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    operation_id = "op-oversized-pointer"
+    _publish_transform(
+        tmp_path,
+        item_id,
+        operation_id,
+        f"{namespace}:display",
+        "ctr-" + "7" * 40,
+        _png(12, 6),
+    )
+    pointer = (
+        tmp_path / ".engine" / "correction-transforms" / "by-item"
+        / hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+        / (
+            hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+            + ".json"
+        )
+    )
+    with pointer.open("wb") as stream:
+        stream.seek(1024 * 1024)
+        stream.write(b"{}")
+
+    targets = server._capture_correction_targets(
+        capture_id,
+        photo_assets,
+        item_id,
+        tmp_path,
+    )
+
+    assert targets == {}
+
+
 def test_mapping_legacy_id_edge_rejects_present_mismatched_pins(tmp_path):
     capture_id = "c3030303-3030-4030-8030-303030303030"
     item_id = "b-" + "a" * 32
@@ -813,6 +852,75 @@ def test_publish_uploads_objects_and_rows_per_contract(
     assert doc["generated_at"]
 
 
+def test_publish_holds_local_authority_through_cloud_row_cas(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch, display_head=True)
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+    capture_depth = 0
+    authority_depth = 0
+    capture_guard = server._capture_archive_backfill_capture_guard
+    authority_context = server._corrections_index_authority_context
+
+    @contextlib.contextmanager
+    def observed_capture_guard(capture_ids):
+        nonlocal capture_depth
+        with capture_guard(capture_ids):
+            capture_depth += 1
+            try:
+                yield
+            finally:
+                capture_depth -= 1
+
+    @contextlib.contextmanager
+    def observed_authority_context():
+        nonlocal authority_depth
+        with authority_context():
+            authority_depth += 1
+            try:
+                yield
+            finally:
+                authority_depth -= 1
+
+    def publish(_cfg, rows):
+        assert capture_depth == 1
+        assert authority_depth == 1
+        calls["published"].append(rows)
+        return len(rows)
+
+    monkeypatch.setattr(
+        server,
+        "_capture_archive_backfill_capture_guard",
+        observed_capture_guard,
+    )
+    monkeypatch.setattr(
+        server,
+        "_corrections_index_authority_context",
+        observed_authority_context,
+    )
+    monkeypatch.setattr(
+        server.sbase,
+        "publish_capture_corrections",
+        publish,
+    )
+
+    result = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert result["pushed"] == 1
+    assert result["errors"] == []
+    assert len(calls["published"]) == 1
+    assert capture_depth == 0
+    assert authority_depth == 0
+
+
 def test_publish_revalidates_local_authority_after_uploads(
         monkeypatch, capture_workspace):
     seeded = _seed_corrected_capture(monkeypatch, display_head=True)
@@ -851,6 +959,78 @@ def test_publish_revalidates_local_authority_after_uploads(
         {"url": "cloud", "key": "service"})
 
     assert changed is True
+    assert len(calls["uploads"]) == 2
+    assert calls["published"] == []
+    assert result["pushed"] == 0
+    assert result["errors"] == []
+    assert len(result["notices"]) == 1
+    assert "authority changed before publication" in result["notices"][0]
+
+
+def test_publish_revalidation_detects_removed_display_head_policy(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(
+        monkeypatch,
+        pointer_mtime=1_000_000.0,
+        display_head=True,
+    )
+    sibling_png = _png(64, 48, color=(5, 100, 200))
+    sibling_id = _publish_transform(
+        server._ensure_engine_session().write_set.root,
+        seeded["item_id"],
+        "op-a-restored-sibling",
+        f"{seeded['namespace']}:display",
+        "ctr-" + "2" * 40,
+        sibling_png,
+        pointer_mtime=1_000_000.0,
+    )
+    sibling_display = server._capture_correction_jpeg(
+        sibling_png,
+        long_edge=1600,
+        quality=90,
+    )
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[_cloud_row(
+            seeded,
+            correction_id=sibling_id,
+            display_sha256=sibling_display["sha256"],
+        )],
+    )
+    engine_root = server._ensure_engine_session().write_set.root
+    display_slot = f"{seeded['namespace']}:display"
+    head_path = (
+        engine_root / ".engine" / "correction-transforms" / "display-heads"
+        / hashlib.sha256(seeded["item_id"].encode("utf-8")).hexdigest()
+        / (hashlib.sha256(display_slot.encode("utf-8")).hexdigest() + ".json")
+    )
+    assert head_path.is_file()
+    upload = server.sbase.upload_object
+    removed = False
+
+    def upload_then_remove_head(*args, **kwargs):
+        nonlocal removed
+        outcome = upload(*args, **kwargs)
+        if not removed:
+            head_path.unlink()
+            removed = True
+        return outcome
+
+    monkeypatch.setattr(
+        server.sbase,
+        "upload_object",
+        upload_then_remove_head,
+    )
+
+    result = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert removed is True
     assert len(calls["uploads"]) == 2
     assert calls["published"] == []
     assert result["pushed"] == 0
@@ -1056,6 +1236,56 @@ def test_publish_holds_asset_when_cloud_row_ties_on_disturbed_mtimes(
     assert "does not sort strictly newer" in notice
     assert calls["uploads"] == []
     assert calls["published"] == []
+
+
+def test_publish_display_head_replaces_restored_newer_cloud_sibling(
+        monkeypatch, capture_workspace):
+    """The mutable display head, not restored pointer mtimes, owns the slot."""
+
+    seeded = _seed_corrected_capture(
+        monkeypatch,
+        pointer_mtime=1_000_000.0,
+        display_head=True,
+    )
+    sibling_png = _png(64, 48, color=(5, 100, 200))
+    sibling_id = _publish_transform(
+        server._ensure_engine_session().write_set.root,
+        seeded["item_id"],
+        "op-restored-sibling",
+        f"{seeded['namespace']}:display",
+        "ctr-" + "1" * 40,
+        sibling_png,
+        pointer_mtime=3_000_000.0,
+    )
+    sibling_display = server._capture_correction_jpeg(
+        sibling_png,
+        long_edge=1600,
+        quality=90,
+    )
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[_cloud_row(
+            seeded,
+            correction_id=sibling_id,
+            display_sha256=sibling_display["sha256"],
+        )],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["pushed"] == 1
+    assert outcome["notices"] == []
+    assert outcome["errors"] == []
+    (rows,) = calls["published"]
+    (row,) = rows
+    assert row["correction_id"] == seeded["correction_id"]
+    assert row["correction_id"] != sibling_id
 
 
 def test_publish_replaces_local_row_when_winner_descends_from_it(

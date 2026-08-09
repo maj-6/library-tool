@@ -326,6 +326,21 @@ class _CorrectionDisplayHead:
 
 
 @dataclass(frozen=True, slots=True)
+class _CorrectionDisplayHeadHint:
+    """Metadata-only binding for one validated logical display head."""
+
+    logical_key: RasterArtifactKey
+    operation_id: str
+    publication_sha256: str
+    root_source_revision: str
+    root_source_sha256: str
+    root_source: RasterSourceRef
+    output_artifact_id: str
+    output_artifact_revision: str
+    output_content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ItemPublicationPointer:
     item_id: str
     operation_id: str
@@ -714,6 +729,35 @@ class FilesystemCorrectionTransformStore:
                 retryable=True,
             ) from exc
 
+    def project_display_head_hints(
+        self,
+        item_id: str,
+    ) -> tuple[_CorrectionDisplayHeadHint, ...]:
+        """Validate logical heads without reading immutable raster objects."""
+
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    return self._display_head_hints_projection_locked(item_id)
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction transform workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except (NotFoundError, RepositoryError):
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction display-head hints are unavailable",
+                code="correction_transform_projection_unavailable",
+                cause=exc,
+                retryable=True,
+            ) from exc
+
     def get_raster_artifact(
         self,
         key: RasterArtifactKey,
@@ -1068,6 +1112,69 @@ class FilesystemCorrectionTransformStore:
             display_heads,
         )
 
+    def _display_head_hints_projection_locked(
+        self,
+        item_id: str,
+    ) -> tuple[_CorrectionDisplayHeadHint, ...]:
+        # Validate the public scope even when no publication exists.
+        RasterArtifactKey(item_id, "correction-transform-projection")
+        publications: dict[str, _ProjectedTransformPublication] = {}
+        for pointer in self._projection_item_pointers_locked(item_id):
+            command, result, publication = self._validated_publication(
+                pointer,
+                verify_objects=False,
+            )
+            if command.operation_id in publications:
+                raise _repository_error(
+                    "a correction transform operation is duplicated",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_item_pointer",
+                )
+            publications[command.operation_id] = _ProjectedTransformPublication(
+                pointer,
+                command,
+                result,
+                publication,
+            )
+        return self._display_head_hints_locked(
+            item_id,
+            publications=publications,
+        )
+
+    def _display_head_paths(self, item_id: str) -> Mapping[str, Path]:
+        return self._authority_document_paths(
+            _DISPLAY_HEAD_ROOT / _digest_text(item_id),
+            artifact="correction_display_head",
+            maximum_entries=_MAX_ITEM_TRANSFORMS,
+        )
+
+    def _display_head_hints_locked(
+        self,
+        item_id: str,
+        *,
+        publications: Mapping[str, _ProjectedTransformPublication],
+    ) -> tuple[_CorrectionDisplayHeadHint, ...]:
+        hints: list[_CorrectionDisplayHeadHint] = []
+        logical_identities: set[str] = set()
+        for _name, path in sorted(self._display_head_paths(item_id).items()):
+            hint = self._validated_display_head_hint(
+                path,
+                item_id=item_id,
+                publications=publications,
+            )
+            identity = hint.logical_key.artifact_id.casefold()
+            if identity in logical_identities:
+                raise _repository_error(
+                    "a correction display head identity is duplicated",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_display_head",
+                )
+            logical_identities.add(identity)
+            hints.append(hint)
+        return tuple(
+            sorted(hints, key=lambda value: value.logical_key.artifact_id)
+        )
+
     def _display_heads_locked(
         self,
         item_id: str,
@@ -1076,15 +1183,9 @@ class FilesystemCorrectionTransformStore:
         views_by_id: Mapping[str, RasterArtifactView],
         spatial: Sequence[SpatialAnnotationView],
     ) -> tuple[_CorrectionDisplayHead, ...]:
-        relative = _DISPLAY_HEAD_ROOT / _digest_text(item_id)
-        paths = self._authority_document_paths(
-            relative,
-            artifact="correction_display_head",
-            maximum_entries=_MAX_ITEM_TRANSFORMS,
-        )
         heads: list[_CorrectionDisplayHead] = []
         logical_identities: set[str] = set()
-        for _name, path in sorted(paths.items()):
+        for _name, path in sorted(self._display_head_paths(item_id).items()):
             head = self._validated_display_head(
                 path,
                 item_id=item_id,
@@ -1114,6 +1215,50 @@ class FilesystemCorrectionTransformStore:
         views_by_id: Mapping[str, RasterArtifactView],
         spatial: Sequence[SpatialAnnotationView],
     ) -> _CorrectionDisplayHead:
+        hint = self._validated_display_head_hint(
+            path,
+            item_id=item_id,
+            publications=publications,
+        )
+        try:
+            artifact = views_by_id.get(hint.output_artifact_id.casefold())
+            if (
+                artifact is None
+                or artifact.revision != hint.output_artifact_revision
+                or artifact.content_sha256 != hint.output_content_sha256
+            ):
+                raise ValueError("display head corrected output is unavailable")
+            annotations = tuple(
+                value
+                for value in spatial
+                if hint.output_artifact_id in value.linked_artifact_ids
+            )
+            return _CorrectionDisplayHead(
+                logical_key=hint.logical_key,
+                operation_id=hint.operation_id,
+                root_source_revision=hint.root_source_revision,
+                root_source_sha256=hint.root_source_sha256,
+                root_source=hint.root_source,
+                artifact=artifact,
+                spatial_annotations=annotations,
+            )
+        except RepositoryError:
+            raise
+        except (EngineError, KeyError, OSError, TypeError, ValueError) as exc:
+            raise _repository_error(
+                "the correction display head is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_display_head",
+                cause=exc,
+            ) from exc
+
+    def _validated_display_head_hint(
+        self,
+        path: Path,
+        *,
+        item_id: str,
+        publications: Mapping[str, _ProjectedTransformPublication],
+    ) -> _CorrectionDisplayHeadHint:
         payload, _digest, _byte_count = self._read_regular(
             path,
             maximum=_MAX_DISPLAY_HEAD_BYTES,
@@ -1163,13 +1308,29 @@ class FilesystemCorrectionTransformStore:
             ):
                 raise ValueError("display head is not bound to its publication")
             corrected = publication.result.output("corrected-display")
-            artifact = views_by_id.get(corrected.artifact_id.casefold())
-            if (
-                artifact is None
-                or artifact.revision != corrected.artifact_revision
-                or artifact.content_sha256 != corrected.content_sha256
+            descriptor = next(
+                (
+                    raw_output
+                    for committed, raw_output in zip(
+                        publication.result.outputs,
+                        publication.document["outputs"],
+                        strict=True,
+                    )
+                    if committed == corrected
+                ),
+                None,
+            )
+            if not isinstance(descriptor, Mapping):
+                raise ValueError("display head output descriptor is unavailable")
+            object_path = self._object_path(corrected.artifact_id)
+            if not self._path_exists(
+                object_path,
+                artifact="corrected-display",
             ):
                 raise ValueError("display head corrected output is unavailable")
+            object_info = object_path.stat(follow_symlinks=False)
+            if object_info.st_size != descriptor["bytes"]:
+                raise ValueError("display head corrected output size is invalid")
             for candidate in publications.values():
                 if candidate.command.operation_id == operation_id:
                     continue
@@ -1190,23 +1351,20 @@ class FilesystemCorrectionTransformStore:
                 publications,
             )
             root_source = root.document["source"]
-            annotations = tuple(
-                value
-                for value in spatial
-                if corrected.artifact_id in value.linked_artifact_ids
-            )
-            return _CorrectionDisplayHead(
+            return _CorrectionDisplayHeadHint(
                 logical_key=RasterArtifactKey(item_id, artifact_id),
                 operation_id=operation_id,
+                publication_sha256=publication.pointer.publication_sha256,
                 root_source_revision=root_source["source_revision"],
                 root_source_sha256=root_source["source_sha256"],
                 root_source=self._raster_source_from_publication(root.document),
-                artifact=artifact,
-                spatial_annotations=annotations,
+                output_artifact_id=corrected.artifact_id,
+                output_artifact_revision=corrected.artifact_revision,
+                output_content_sha256=corrected.content_sha256,
             )
         except RepositoryError:
             raise
-        except (EngineError, KeyError, TypeError, ValueError) as exc:
+        except (EngineError, KeyError, OSError, TypeError, ValueError) as exc:
             raise _repository_error(
                 "the correction display head is invalid",
                 code="invalid_correction_transform_storage",
@@ -1759,6 +1917,8 @@ class FilesystemCorrectionTransformStore:
     def _validated_publication(
         self,
         pointer: _ItemPublicationPointer,
+        *,
+        verify_objects: bool = True,
     ) -> tuple[
         CorrectionTransformCommand,
         CorrectionTransformCommitResult,
@@ -1767,6 +1927,7 @@ class FilesystemCorrectionTransformStore:
         validated = self._validated_operation_publication(
             pointer.item_id,
             pointer.operation_id,
+            verify_objects=verify_objects,
         )
         if validated is None:
             raise _repository_error(

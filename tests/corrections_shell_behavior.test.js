@@ -889,6 +889,154 @@ test("immediate terminal repaint is deduplicated against its streamed result", a
 });
 
 
+test("streamed terminal repaint retries after an away-and-back selection epoch", async () => {
+  const artifactId = "capture:stable-epoch:display";
+  const key = `artifact:${artifactId}`;
+  const reloadEpochs = [];
+  let listener = null;
+  let finishFirstReload;
+  let finishSecondReload;
+  const firstReload = new Promise((resolve) => { finishFirstReload = resolve; });
+  const secondReload = new Promise((resolve) => { finishSecondReload = resolve; });
+  const selected = {
+    key,
+    id: artifactId,
+    itemId: "book-1",
+    family: "image",
+  };
+  const feature = {
+    contextGeneration: 4,
+    selectionGeneration: 9,
+    selectedKey: key,
+    items: new Map([[key, selected]]),
+    async reloadSelection(value) {
+      reloadEpochs.push([value, this.contextGeneration, this.selectionGeneration]);
+      if (reloadEpochs.length === 1) return firstReload;
+      this.selectionGeneration += 1;
+      finishSecondReload();
+      return selected;
+    },
+  };
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    destroyed: false,
+    unsubscribeTransformResults: null,
+    state: {
+      selection: { itemId: "book-1", artifactId },
+    },
+    imageAdjustTool: {
+      observeTransformResult(result) {
+        return {
+          operationId: result.operation_id,
+          imageCommitted: true,
+        };
+      },
+    },
+    artifactsFeature: feature,
+    subscribeTransformResults(callback) {
+      listener = callback;
+      return () => {};
+    },
+    setStatus() {},
+  });
+  shell.connectTransformResults();
+
+  const command = {
+    item_id: "book-1",
+    artifact_id: artifactId,
+    operation_id: "display-transform-epoch",
+    adjustment: { brightness_percent: 5 },
+  };
+  const result = {
+    operation_id: command.operation_id,
+    terminal_state: "done",
+    image_commit: { operation_id: command.operation_id, outputs: [] },
+  };
+  const observation = shell.imageAdjustTool.observeTransformResult(result, command);
+  const immediate = shell.handleQueuedTransformResult(
+    result, command, selected, observation);
+  assert.equal(reloadEpochs.length, 1);
+
+  // Two intervening selections model navigating away and then returning to
+  // the same stable display before the first detail request finishes.
+  feature.selectionGeneration += 2;
+  listener(result, command);
+  await secondReload;
+  await Promise.resolve();
+
+  assert.deepEqual(reloadEpochs, [
+    [key, 4, 9],
+    [key, 4, 11],
+  ], "the streamed copy starts a repaint in the new selection epoch");
+  assert.equal(feature.selectionGeneration, 12);
+
+  finishFirstReload(null);
+  assert.equal(await immediate, null);
+  await Promise.resolve();
+
+  listener(result, command);
+  await Promise.resolve();
+  assert.equal(reloadEpochs.length, 2,
+    "a successful repaint remains deduplicated within its completed epoch");
+  shell.unsubscribeTransformResults();
+});
+
+
+test("a failed terminal repaint remains retryable in the same selection epoch", async () => {
+  const artifactId = "capture:stable-retry:display";
+  const key = `artifact:${artifactId}`;
+  const selected = {
+    key,
+    id: artifactId,
+    itemId: "book-1",
+    family: "image",
+  };
+  let reloads = 0;
+  const statuses = [];
+  const feature = {
+    contextGeneration: 2,
+    selectionGeneration: 6,
+    selectedKey: key,
+    items: new Map([[key, selected]]),
+    async reloadSelection() {
+      reloads += 1;
+      if (reloads === 1) throw new Error("temporary detail failure");
+      this.selectionGeneration += 1;
+      return selected;
+    },
+  };
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    destroyed: false,
+    state: {
+      selection: { itemId: "book-1", artifactId },
+    },
+    artifactsFeature: feature,
+    setStatus(message, error) { statuses.push([message, error]); },
+  });
+  const command = {
+    item_id: "book-1",
+    artifact_id: artifactId,
+    operation_id: "display-transform-retry",
+  };
+  const observation = {
+    operationId: command.operation_id,
+    imageCommitted: true,
+  };
+
+  assert.equal(
+    await shell.refreshCommittedCaptureDisplay(observation, command),
+    null,
+  );
+  assert.equal(
+    await shell.refreshCommittedCaptureDisplay(observation, command),
+    selected,
+  );
+  assert.equal(reloads, 2);
+  assert.deepEqual(statuses, [["temporary detail failure", true]]);
+});
+
+
 test("classification shortcuts stay scoped and context menus use exact event targets", () => {
   const shell = Object.create(CorrectionsShell.prototype);
   shell.root = { dataset: {} };

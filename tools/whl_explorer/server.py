@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14434,6 +14434,67 @@ def _correction_transform_canonical_json(value) -> bytes:
     ).encode("ascii")
 
 
+def _correction_transform_bounded_bytes(path: Path, maximum: int) -> bytes:
+    """Snapshot one private transform document without following redirects."""
+
+    if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+        raise ValueError("transform document byte limit is invalid")
+
+    def identity(value) -> tuple[int, int, int, int, int]:
+        return (
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_mode),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+        )
+
+    named = path.lstat()
+    if (
+        not stat.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+        or named.st_size < 1
+        or named.st_size > maximum
+    ):
+        raise ValueError("transform document is not a bounded regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or identity(opened) != identity(named)
+        ):
+            raise ValueError("transform document changed before it was opened")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            block = os.read(descriptor, min(1 << 20, maximum + 1 - size))
+            if not block:
+                break
+            chunks.append(block)
+            size += len(block)
+            if size > maximum:
+                raise ValueError("transform document exceeds its byte limit")
+        opened_after = os.fstat(descriptor)
+        named_after = path.lstat()
+        if (
+            identity(opened_after) != identity(opened)
+            or identity(named_after) != identity(opened)
+        ):
+            raise ValueError("transform document changed while it was read")
+        return b"".join(chunks)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _correction_transform_output_descriptor(value) -> dict | None:
     if not isinstance(value, Mapping):
         return None
@@ -14472,9 +14533,10 @@ def _validated_correction_transform_publications(
         if pointer_dir.is_dir() else ()
     for pointer_path in paths:
         try:
-            pointer_payload = pointer_path.read_bytes()
-            if len(pointer_payload) > 64 * 1024:
-                raise ValueError("item pointer is too large")
+            pointer_payload = _correction_transform_bounded_bytes(
+                pointer_path,
+                64 * 1024,
+            )
             pointer = json.loads(pointer_payload.decode("utf-8"))
             if (
                 not isinstance(pointer, dict)
@@ -14505,9 +14567,10 @@ def _validated_correction_transform_publications(
             publication_path = (
                 transforms / "publications" / f"{operation_digest}.json"
             )
-            publication_payload = publication_path.read_bytes()
-            if len(publication_payload) > 128 * 1024 * 1024:
-                raise ValueError("publication is too large")
+            publication_payload = _correction_transform_bounded_bytes(
+                publication_path,
+                128 * 1024 * 1024,
+            )
             if hashlib.sha256(publication_payload).hexdigest() != (
                 publication_sha256
             ):
@@ -14564,9 +14627,10 @@ def _validated_correction_transform_publications(
                 engine_root / ".engine" / "receipts"
                 / "correction-transforms" / f"{operation_digest}.json"
             )
-            receipt_payload = receipt_path.read_bytes()
-            if len(receipt_payload) > 1024 * 1024:
-                raise ValueError("receipt is too large")
+            receipt_payload = _correction_transform_bounded_bytes(
+                receipt_path,
+                1024 * 1024,
+            )
             receipt = json.loads(receipt_payload.decode("utf-8"))
             if (
                 not isinstance(receipt, dict)
@@ -14629,9 +14693,7 @@ def _validated_correction_display_head(
     if not os.path.lexists(path):
         return False, None
     try:
-        payload = path.read_bytes()
-        if len(payload) > 64 * 1024:
-            raise ValueError("display head is too large")
+        payload = _correction_transform_bounded_bytes(path, 64 * 1024)
         head = json.loads(payload.decode("utf-8"))
         if (
             not isinstance(head, dict)
@@ -14856,7 +14918,24 @@ def _ocr_apply_capture_asset(
         if isinstance(photo_assets, Mapping) else None
     rows = desktop_import.get("assets") \
         if isinstance(desktop_import, Mapping) else None
-    asset_by_namespace: dict[str, tuple[str, int]] = {}
+    raw_display_sha: dict[str, str] = {}
+    raw_rows = photo_assets.get("assets") \
+        if isinstance(photo_assets, Mapping) else None
+    for raw in raw_rows if isinstance(raw_rows, list) else []:
+        if not isinstance(raw, Mapping):
+            continue
+        raw_asset_id = raw.get("asset_id")
+        display = raw.get("display")
+        checksum = str(display.get("sha256") or "").strip().lower() \
+            if isinstance(display, Mapping) else ""
+        if (
+            isinstance(raw_asset_id, str)
+            and raw_asset_id not in raw_display_sha
+            and _CAPTURE_CORRECTION_ASSET_ID_RE.fullmatch(raw_asset_id)
+            and _CAPTURE_CORRECTION_SHA256_RE.fullmatch(checksum)
+        ):
+            raw_display_sha[raw_asset_id] = checksum
+    asset_by_namespace: dict[str, tuple[str, int, str]] = {}
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, Mapping):
             continue
@@ -14867,9 +14946,16 @@ def _ocr_apply_capture_asset(
                 or isinstance(order, bool) or not isinstance(order, int)
                 or order < 0 or row.get("lifecycle") == "failed"):
             continue
+        display_sha256 = str(
+            row.get("derivative_checksum")
+            or raw_display_sha.get(asset_id)
+            or ""
+        ).strip().lower()
+        if not _CAPTURE_CORRECTION_SHA256_RE.fullmatch(display_sha256):
+            continue
         asset_by_namespace[
             _capture_artifact_namespace(capture_id, asset_id)
-        ] = (asset_id, order + 1)
+        ] = (asset_id, order + 1, display_sha256)
     if not asset_by_namespace:
         return None
 
@@ -14889,6 +14975,13 @@ def _ocr_apply_capture_asset(
     located = asset_by_namespace.get(namespace)
     if located is None:
         return None
+    if rendition == "display":
+        root_pin = _correction_transform_source_pin(chain[-1]["command"])
+        if root_pin is None or root_pin[1] != located[2]:
+            # A missing same-slot ancestor otherwise makes the surviving child
+            # look like a root and silently drops part of the inverse mapping.
+            # The live capture display checksum is the root authority pin.
+            return None
     return (
         located[0],
         located[1],
@@ -27682,6 +27775,7 @@ def _capture_correction_targets(
             "source_original_sha256": source_sha[asset_id],
             "correction_id": winner["correction_id"],
             "display_sha256": winner["display_sha256"],
+            "authoritative_display_head": head_present,
             "display_object": transforms / "objects" / (
                 hashlib.sha256(
                     winner["display_id"].encode("utf-8")).hexdigest()
@@ -27834,23 +27928,30 @@ def _capture_correction_prepared_token(
         target["source_original_sha256"],
         target["display_sha256"],
         target["display_object"],
+        target.get("authoritative_display_head") is True,
     )
 
 
+@contextlib.contextmanager
 def _capture_correction_revalidate_prepared(
         prepared: Sequence[dict], engine_root: Path,
-        ) -> tuple[list[dict], list[str]]:
+        ) -> Iterator[tuple[list[dict], list[str]]]:
     """Retain rows whose complete local-authority token is still current.
 
-    Capture writers are excluded first, in deterministic stripe order, then
-    the Corrections workspace snapshot is held while associations, manifests,
-    transform heads, and immutable output bytes are checked together. The
-    caller performs every cloud operation after these local locks are released.
+    One capture's writers are excluded first, then the Corrections workspace
+    snapshot is held while associations, manifests, transform heads, immutable
+    output bytes, and the yielded cloud row CAS are checked as one authority
+    interval. Uploads happen before this context and remain intentionally
+    unlocked; their content-addressed orphan objects are harmless.
     """
 
     if not prepared:
-        return [], []
+        yield [], []
+        return
     capture_ids = tuple(sorted({entry["capture_id"] for entry in prepared}))
+    if len(capture_ids) != 1:
+        raise ValueError("prepared correction rows must belong to one capture")
+    capture_id = capture_ids[0]
     retained: list[dict] = []
     notices: list[str] = []
     with _capture_archive_backfill_capture_guard(capture_ids):
@@ -27861,40 +27962,29 @@ def _capture_correction_revalidate_prepared(
                 _corrections_targets_for_context().items()
                 if target.capture_id
             }
-            current_by_capture: dict[str, dict | None] = {}
-            for capture_id in capture_ids:
-                expected_items = {
-                    entry["token"][0]
-                    for entry in prepared
-                    if entry["capture_id"] == capture_id
-                }
-                item_id = item_by_capture.get(capture_id)
-                if len(expected_items) != 1 or item_id not in expected_items:
-                    current_by_capture[capture_id] = None
-                    continue
+            expected_items = {entry["token"][0] for entry in prepared}
+            item_id = item_by_capture.get(capture_id)
+            targets: dict | None = None
+            if len(expected_items) == 1 and item_id in expected_items:
                 try:
                     photo_assets = lib.load_json(
                         CAPTURES_DIR / capture_id / "photo_assets.json",
                         {},
                     ) or {}
-                    current_by_capture[capture_id] = (
-                        _capture_correction_targets(
-                            capture_id,
-                            photo_assets,
-                            item_id,
-                            engine_root,
-                        )
+                    targets = _capture_correction_targets(
+                        capture_id,
+                        photo_assets,
+                        item_id,
+                        engine_root,
                     )
                 except Exception:
                     # Local capture damage is a fail-closed per-row skip, just
                     # like an association or transform-head token mismatch.
-                    current_by_capture[capture_id] = None
+                    targets = None
 
             for entry in prepared:
-                capture_id = entry["capture_id"]
                 token = entry["token"]
                 asset_id = token[1]
-                targets = current_by_capture.get(capture_id)
                 current = targets.get(asset_id) \
                     if isinstance(targets, Mapping) else None
                 matches = (
@@ -27917,7 +28007,7 @@ def _capture_correction_revalidate_prepared(
                         "skipped a stale local correction whose authority "
                         "changed before publication"
                     )
-    return retained, notices
+            yield retained, notices
 
 
 def _publish_capture_corrections(owner_cfg: dict) -> dict:
@@ -28042,12 +28132,15 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                     candidate = target["candidates"].get(row_correction)
                     if candidate is not None:
                         # Downgrade guard: replacing a row this desktop also
-                        # holds locally needs proof of newness. A tie means
-                        # the pointer mtimes are disturbed (index backfill,
-                        # DATA_ROOT restore, exFAT granularity) — keep the
-                        # cloud row rather than reinstall old pixels.
+                        # holds locally needs proof of newness. The validated
+                        # mutable display head is that proof; pre-head history
+                        # still relies on ancestry and the legacy order signal.
+                        # A legacy tie means the pointer mtimes are disturbed
+                        # (index backfill, DATA_ROOT restore, exFAT granularity)
+                        # — keep the cloud row rather than reinstall old pixels.
                         newer = (
-                            row_correction in target["ancestors"]
+                            target.get("authoritative_display_head") is True
+                            or row_correction in target["ancestors"]
                             or (target["correction_id"]
                                 not in candidate["ancestors"]
                                 and target["order"] > candidate["order"]))
@@ -28100,24 +28193,41 @@ def _publish_capture_corrections(owner_cfg: dict) -> dict:
                 })
         except Exception as exc:
             result["errors"].append(f"capture {capture_id[:8]}: {exc}")
-    rows: list[dict] = []
-    if prepared:
+    prepared_by_capture: dict[str, list[dict]] = {}
+    for entry in prepared:
+        prepared_by_capture.setdefault(entry["capture_id"], []).append(entry)
+    relation_missing = False
+    for capture_id in sorted(prepared_by_capture):
         try:
-            rows, notices = _capture_correction_revalidate_prepared(
-                prepared, engine_root)
-            result["notices"].extend(notices)
+            with _capture_correction_revalidate_prepared(
+                    prepared_by_capture[capture_id], engine_root,
+                    ) as (rows, notices):
+                result["notices"].extend(notices)
+                if not rows:
+                    continue
+                try:
+                    result["pushed"] += int(
+                        sbase.publish_capture_corrections(
+                            owner_cfg,
+                            rows,
+                        ) or 0
+                    )
+                except Exception as exc:
+                    if _capture_corrections_relation_missing(owner_cfg, exc):
+                        result["skipped"] = (
+                            _CAPTURE_CORRECTION_MISSING_NOTICE
+                        )
+                        relation_missing = True
+                    else:
+                        result["errors"].append(
+                            f"corrections rows: {exc}"
+                        )
         except Exception as exc:
             result["errors"].append(
-                f"corrections authority revalidation: {exc}")
-    if rows:
-        try:
-            result["pushed"] = int(
-                sbase.publish_capture_corrections(owner_cfg, rows) or 0)
-        except Exception as exc:
-            if _capture_corrections_relation_missing(owner_cfg, exc):
-                result["skipped"] = _CAPTURE_CORRECTION_MISSING_NOTICE
-            else:
-                result["errors"].append(f"corrections rows: {exc}")
+                f"corrections authority revalidation: {exc}"
+            )
+        if relation_missing:
+            break
     return result
 
 

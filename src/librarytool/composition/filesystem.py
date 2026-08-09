@@ -831,44 +831,69 @@ class _CorrectionProjectionUnion:
         if not callable(hints):
             return ()
         with self._read_context():
-            values = hints(item_id)
+            snapshotter = getattr(
+                self._base,
+                "capture_index_hint_snapshot",
+                None,
+            )
+            if callable(snapshotter):
+                snapshot = snapshotter(item_id)
+                if not isinstance(snapshot, Mapping):
+                    raise RepositoryError(
+                        "the correction capture index returned an invalid snapshot",
+                        code="invalid_corrections_index_projection",
+                        details={"item_id": item_id},
+                    )
+                values = snapshot.get("hints")
+                authorities = snapshot.get("authorities")
+            else:
+                values = hints(item_id)
+                authorities = {}
             if (
                 isinstance(values, (str, bytes))
                 or not isinstance(values, Sequence)
                 or any(not isinstance(value, Mapping) for value in values)
+                or not isinstance(authorities, Mapping)
+                or any(
+                    not isinstance(identity, str)
+                    or not isinstance(authority, Mapping)
+                    for identity, authority in authorities.items()
+                )
             ):
                 raise RepositoryError(
                     "the correction capture index returned invalid hints",
                     code="invalid_corrections_index_projection",
                     details={"item_id": item_id},
                 )
-            projection = self._transforms.project_item(item_id)
-            heads = self._active_display_heads(item_id, projection)
-            head_aliases: dict[str, RasterArtifactView] = {}
-            for identity, head in heads.items():
-                base = self._base.get_raster_artifact(head.logical_key)
-                if base is not None:
-                    head_aliases[identity] = self._display_alias(
-                        base,
-                        head,
-                    )
+            head_hints = self._transforms.project_display_head_hints(item_id)
+            heads = self._active_display_head_hints(
+                item_id,
+                head_hints,
+                values=values,
+                authorities=authorities,
+            )
             return tuple(
                 {
                     **value,
                     "revision": self._display_head_revision(
                         "index",
                         authority_revision,
-                        head_aliases[identity].revision,
+                        self._display_head_revision(
+                            "correction-display-hint",
+                            heads[identity].operation_id,
+                            heads[identity].publication_sha256,
+                            heads[identity].output_artifact_revision,
+                            heads[identity].output_content_sha256,
+                        ),
                     ),
                     "resource_state": ResourceState.AVAILABLE.value,
-                    "freshness": head_aliases[identity].freshness.value,
                 }
                 if (
                     isinstance(
                         (artifact_id := value.get("artifact_id")),
                         str,
                     )
-                    and (identity := artifact_id.casefold()) in head_aliases
+                    and (identity := artifact_id.casefold()) in heads
                     and isinstance(
                         (authority_revision := value.get("revision")),
                         str,
@@ -1132,6 +1157,77 @@ class _CorrectionProjectionUnion:
                 details={"item_id": item_id},
             )
         return tuple(sorted(values, key=lambda value: value.key.annotation_id))
+
+    @staticmethod
+    def _active_display_head_hints(
+        item_id: str,
+        head_hints: Sequence[Any],
+        *,
+        values: Sequence[Mapping[str, Any]],
+        authorities: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        hints_by_id = {
+            artifact_id.casefold(): value
+            for value in values
+            if isinstance((artifact_id := value.get("artifact_id")), str)
+        }
+        active: dict[str, Any] = {}
+        authority_fields = frozenset(
+            {
+                "artifact_id",
+                "source_revision",
+                "source_sha256",
+                "representation_id",
+                "representation_revision",
+                "canvas_id",
+            }
+        )
+        for identity, authority in authorities.items():
+            if frozenset(authority) != authority_fields:
+                raise RepositoryError(
+                    "the correction capture index returned invalid authority pins",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item_id},
+                )
+            artifact_id = authority["artifact_id"]
+            if (
+                not isinstance(artifact_id, str)
+                or identity != artifact_id.casefold()
+                or any(
+                    not isinstance(authority[field], str)
+                    or not authority[field]
+                    for field in authority_fields - {"artifact_id"}
+                )
+            ):
+                raise RepositoryError(
+                    "the correction capture index returned invalid authority pins",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item_id},
+                )
+        for head in head_hints:
+            identity = head.logical_key.artifact_id.casefold()
+            authority = authorities.get(identity)
+            hint = hints_by_id.get(identity)
+            source = head.root_source
+            if (
+                authority is None
+                or hint is None
+                or head.logical_key.item_id != item_id
+                or hint.get("resource_state")
+                != ResourceState.AVAILABLE.value
+                or authority["artifact_id"].casefold() != identity
+                or authority["source_revision"]
+                != head.root_source_revision
+                or authority["source_sha256"] != head.root_source_sha256
+                or authority["representation_id"]
+                != source.representation_id
+                or authority["representation_revision"]
+                != source.representation_revision
+                or authority["canvas_id"] != source.canvas_id
+            ):
+                continue
+            active[identity] = head
+        return active
 
     def _active_display_heads(
         self,

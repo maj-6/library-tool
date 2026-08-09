@@ -1132,7 +1132,16 @@ class FilesystemCorrectionsArtifactRepository(
         self,
         item_id: str,
     ) -> tuple[Mapping[str, Any], ...]:
-        """Return bounded capture navigation hints without reading image bytes.
+        """Return bounded capture navigation hints without reading image bytes."""
+
+        snapshot = self.capture_index_hint_snapshot(item_id)
+        return tuple(snapshot["hints"])
+
+    def capture_index_hint_snapshot(
+        self,
+        item_id: str,
+    ) -> Mapping[str, Any]:
+        """Return navigation hints plus private manifest-only display pins.
 
         These hints are deliberately not raster artifact views and their
         ``index:`` revisions must never be used as mutation preconditions.
@@ -1156,7 +1165,7 @@ class FilesystemCorrectionsArtifactRepository(
                         )
                     capture_id = self._live_capture_id(item)
                     if not capture_id:
-                        return ()
+                        return {"hints": (), "authorities": {}}
                     directory = self._managed_directory(
                         self._capture_directory_for,
                         capture_id,
@@ -1178,29 +1187,41 @@ class FilesystemCorrectionsArtifactRepository(
                                 directory=directory,
                             )
                         if manifest is None:
-                            return (
-                                self._capture_inventory_index_hint(
-                                    capture_id,
-                                    state=ResourceState.MISSING,
-                                    diagnostic_code="capture_manifest_missing",
+                            return {
+                                "hints": (
+                                    self._capture_inventory_index_hint(
+                                        capture_id,
+                                        state=ResourceState.MISSING,
+                                        diagnostic_code="capture_manifest_missing",
+                                    ),
                                 ),
-                            )
-                        return self._capture_index_hints(
+                                "authorities": {},
+                            }
+                        authorities: dict[str, Mapping[str, Any]] = {}
+                        hints = self._capture_index_hints(
                             item,
                             capture_id=capture_id,
                             directory=directory,
                             manifest=manifest,
+                            authority_hints=authorities,
                         )
+                        return {
+                            "hints": hints,
+                            "authorities": authorities,
+                        }
                     except RepositoryError as error:
                         if not self._recoverable_capture_manifest_error(error):
                             raise
-                        return (
-                            self._capture_inventory_index_hint(
-                                capture_id,
-                                state=ResourceState.UNAVAILABLE,
-                                diagnostic_code=error.code,
+                        return {
+                            "hints": (
+                                self._capture_inventory_index_hint(
+                                    capture_id,
+                                    state=ResourceState.UNAVAILABLE,
+                                    diagnostic_code=error.code,
+                                ),
                             ),
-                        )
+                            "authorities": {},
+                        }
         except EngineError:
             raise
         except Exception as exc:
@@ -3122,8 +3143,9 @@ class FilesystemCorrectionsArtifactRepository(
         capture_id: str,
         directory: Path,
         manifest: Mapping[str, Any],
+        authority_hints: dict[str, Mapping[str, Any]] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
-        records, _representation_revision, legacy = (
+        records, representation_revision, legacy = (
             self._capture_manifest_records(item_id, capture_id, manifest)
         )
         hints: list[Mapping[str, Any]] = []
@@ -3196,6 +3218,19 @@ class FilesystemCorrectionsArtifactRepository(
                 import_state = "ready"
             namespace = record.namespace
             artifact_id = record.display_id
+            display_sha256 = _sha256(
+                imported.get("derivative_checksum")
+                or display.get("sha256")
+            )
+            if authority_hints is not None and display_sha256:
+                authority_hints[artifact_id.casefold()] = {
+                    "artifact_id": artifact_id,
+                    "source_revision": f"bytes:{display_sha256}",
+                    "source_sha256": display_sha256,
+                    "representation_id": "capture",
+                    "representation_revision": representation_revision,
+                    "canvas_id": namespace,
+                }
             assignments = self._capture_assignments(
                 item_id,
                 raw.get("role"),
