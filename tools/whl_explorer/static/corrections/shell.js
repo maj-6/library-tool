@@ -444,6 +444,9 @@
       this.unsubscribeClassificationBindings = null;
       this.externalRefreshPromise = null;
       this.restoringProfile = false;
+      this.artifactOverlays = new Set();
+      this.artifactOverlayProfile = typeof deps.normalizeArtifactOverlayProfile === "function"
+        ? deps.normalizeArtifactOverlayProfile(null) : { regionLabels: true };
       this.destroyed = false;
       this.activeTrayTab = "reviews";
       const desktopCorrections = this.desktop && this.desktop.corrections || null;
@@ -605,9 +608,18 @@
             : {},
           classification: normalizeClassificationProfile(
             isPlainObject(value) ? value.classification : null),
+          artifactOverlay: typeof deps.normalizeArtifactOverlayProfile === "function"
+            ? deps.normalizeArtifactOverlayProfile(
+              isPlainObject(value) ? value.artifactOverlay : null)
+            : { regionLabels: !isPlainObject(value) ||
+                !isPlainObject(value.artifactOverlay) ||
+                value.artifactOverlay.regionLabels !== false },
         }),
       });
       const profile = this.profileStore.load(this.profileKey);
+      this.restoreArtifactOverlayProfile(
+        profile.tools && profile.tools.artifactOverlay,
+      );
       if (this.imageAdjustTool &&
           typeof this.imageAdjustTool.restoreProfile === "function") {
         this.imageAdjustTool.restoreProfile(profile.tools && profile.tools.imageAdjust);
@@ -1691,6 +1703,8 @@
         root: stage,
         documentRef: this.documentRef,
         ResizeObserver: this.windowRef && this.windowRef.ResizeObserver,
+        regionLabels: this.artifactOverlayProfile &&
+          this.artifactOverlayProfile.regionLabels !== false,
         // The overlay layer is positioned inset:0 in the stage, whose box is
         // the image box by CSS invariant. Measure the image first anyway: if
         // the stage ever diverges again (the alpha.11 clamp bug), regions
@@ -1724,6 +1738,7 @@
           void this.promoteClassificationTarget(target);
         },
       }).mount();
+      if (this.artifactOverlays) this.artifactOverlays.add(overlay);
       const sync = () => {
         const sourceWidth = Number(
           dimensions.width || dimensions.pixel_width ||
@@ -1762,6 +1777,7 @@
       sync();
       return () => {
         controller.image.removeEventListener("load", sync);
+        if (this.artifactOverlays) this.artifactOverlays.delete(overlay);
         overlay.destroy();
         // The overlay releases its own soft target on destroy; this covers
         // hot targets that reached the controller from any other surface the
@@ -1886,6 +1902,7 @@
 
     mount() {
       this.bindEditorSelector();
+      this.bindRegionLabelsToggle();
       this.bindLayoutReset();
       this.bindWindowControls();
       this.bindTrayTabs();
@@ -2136,6 +2153,44 @@
       this.refreshEditorSelector();
     }
 
+    bindRegionLabelsToggle() {
+      const toggle = this.root.querySelector("[data-region-labels-toggle]");
+      this.listen(toggle, "click", () => {
+        const visible = !(this.artifactOverlayProfile &&
+          this.artifactOverlayProfile.regionLabels !== false);
+        this.restoreArtifactOverlayProfile({ regionLabels: visible });
+        this.persistProfile({
+          toolUpdates: { artifactOverlay: this.artifactOverlayProfile },
+        });
+      });
+      this.updateRegionLabelsToggle();
+    }
+
+    updateRegionLabelsToggle() {
+      const toggle = this.root &&
+        this.root.querySelector("[data-region-labels-toggle]");
+      if (!toggle) return;
+      const visible = !this.artifactOverlayProfile ||
+        this.artifactOverlayProfile.regionLabels !== false;
+      toggle.setAttribute("aria-pressed", String(visible));
+      toggle.title = visible ? "Hide region labels" : "Show region labels";
+    }
+
+    restoreArtifactOverlayProfile(value) {
+      this.artifactOverlayProfile =
+        typeof deps.normalizeArtifactOverlayProfile === "function"
+          ? deps.normalizeArtifactOverlayProfile(value)
+          : { regionLabels: !isPlainObject(value) || value.regionLabels !== false };
+      const visible = this.artifactOverlayProfile.regionLabels;
+      for (const overlay of this.artifactOverlays || []) {
+        if (overlay && typeof overlay.setRegionLabels === "function") {
+          overlay.setRegionLabels(visible);
+        }
+      }
+      this.updateRegionLabelsToggle();
+      return this.artifactOverlayProfile;
+    }
+
     bindLayoutReset() {
       const reset = this.root.querySelector("[data-layout-action='reset']");
       this.listen(reset, "click", () => {
@@ -2146,6 +2201,7 @@
             typeof this.imageAdjustTool.restoreProfile === "function") {
           this.imageAdjustTool.restoreProfile(null);
         }
+        this.restoreArtifactOverlayProfile(null);
         this.restoreClassificationProfile(null);
         this.refreshEditorSelector();
         this.renderEditor();
@@ -2345,6 +2401,9 @@
           typeof this.imageAdjustTool.restoreProfile === "function") {
         this.imageAdjustTool.restoreProfile(profile.tools && profile.tools.imageAdjust);
       }
+      this.restoreArtifactOverlayProfile(
+        profile.tools && profile.tools.artifactOverlay,
+      );
       this.restoreClassificationProfile(
         profile.tools && profile.tools.classification,
       );
@@ -2390,6 +2449,9 @@
         this.imageAdjustTool.restoreProfile(
           profile.tools && profile.tools.imageAdjust);
       }
+      this.restoreArtifactOverlayProfile(
+        profile.tools && profile.tools.artifactOverlay,
+      );
       return true;
     }
 
@@ -2401,6 +2463,8 @@
           ? this.imageAdjustTool.serializeProfile()
           : {},
         classification: classificationProfile(this.classificationController),
+        artifactOverlay: this.artifactOverlayProfile ||
+          { regionLabels: true },
       };
       let tools = currentTools;
       if (this.profileStore && typeof this.profileStore.load === "function") {
@@ -2590,6 +2654,7 @@
         this.imageAdjustTool.destroy();
       }
       this.imageAdjustTool = null;
+      if (this.artifactOverlays) this.artifactOverlays.clear();
       this.layout.destroy();
       for (const remove of this.listeners.splice(0)) remove();
     }
