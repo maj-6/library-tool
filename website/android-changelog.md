@@ -3,6 +3,24 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.14 — 2026-08-09
+
+Android version code: `45`.
+
+### Additions
+
+- Capture pages removed on the desktop now disappear from the phone without
+  losing their camera image, corrected display, OCR history, or original page
+  order. Restoring the page on the desktop reveals that same retained page on
+  the next sync.
+
+### Bugfixes
+
+- Removed pages stay out of photo counts, browsing, OCR, and later correction
+  work, even when an older queued job finishes after the removal.
+- Large batches fetch every page-removal update in stable order, and stale or
+  incomplete updates cannot revive a hidden page.
+
 ## 0.5.2-alpha.13 — 2026-08-08
 
 Android version code: `44`.

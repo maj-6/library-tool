@@ -33,11 +33,13 @@ as a restore operation. Deleting an interior page does not renumber later
 correction and OCR records. Restoring writes `active` at the next revision and
 therefore exposes the same asset at the same order.
 
-### Cloud: table `capture_asset_lifecycle` (migration 027)
+### Cloud: table `capture_asset_lifecycle` (migrations 027–028)
 
 One current row per `(capture_id, asset_id)`, CAS-updated on the table's
 server-monotonic `revision`. Its owner/FK/RLS/trigger rules mirror
-`capture_corrections`.
+`capture_corrections`. Migration 027 creates the contract; migration 028
+removes default table privileges and restores only authenticated reads plus
+publisher select/insert/update access.
 
 | column | type | notes |
 |---|---|---|
