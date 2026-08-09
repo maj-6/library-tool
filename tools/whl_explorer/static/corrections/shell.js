@@ -1068,6 +1068,15 @@
         fetchImpl,
         operationIdFactory: options.chOperationIdFactory,
         onChanged: () => this.refreshChMergeTargets(),
+        // Item properties previews provisional blank-fill from the same
+        // /ch/state body the panel fetched — one request per selection, no
+        // duplicate fetch from the metadata editor.
+        onState: (state) => {
+          if (this.itemProperties &&
+              typeof this.itemProperties.setChState === "function") {
+            this.itemProperties.setChState(state);
+          }
+        },
       });
     }
 

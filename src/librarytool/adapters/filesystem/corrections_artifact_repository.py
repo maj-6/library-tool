@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -984,6 +985,25 @@ class FilesystemCorrectionsArtifactRepository(
         self._resource_candidate_cache: OrderedDict[
             tuple[str, str, str, str], _CachedResourceCandidate
         ] = OrderedDict()
+        # Capture navigation hints are a pure function of the manifest bytes
+        # and each referenced rendition's lstat identity. The cache keys the
+        # manifest by CONTENT digest (stat identity alone is defeated by an
+        # in-place, mtime-preserving rewrite) and stores the rendition stat
+        # identities alongside the hints, re-checking all of them on every
+        # hit — well under a millisecond against several milliseconds for
+        # the full hint rebuild. All access happens under the workspace lease.
+        self._capture_hint_cache: dict[
+            str,
+            tuple[
+                bytes,
+                tuple[tuple[Path, tuple[int, ...] | None], ...],
+                tuple[Mapping[str, Any], ...],
+                Mapping[str, Mapping[str, Any]],
+            ],
+        ] = {}
+        self._capture_hint_stat_collector: (
+            list[tuple[Path, tuple[int, ...] | None]] | None
+        ) = None
 
     def list_raster_artifacts(
         self,
@@ -1157,71 +1177,7 @@ class FilesystemCorrectionsArtifactRepository(
         try:
             with self._write_set.workspace_lease():
                 with self._lock_context_for():
-                    if not self._live_item_exists(item):
-                        raise NotFoundError(
-                            "the item does not exist",
-                            code="item_not_found",
-                            details={"item_id": item},
-                        )
-                    capture_id = self._live_capture_id(item)
-                    if not capture_id:
-                        return {"hints": (), "authorities": {}}
-                    directory = self._managed_directory(
-                        self._capture_directory_for,
-                        capture_id,
-                        item_id=item,
-                        section="capture",
-                        authority_root=self._capture_authority_root,
-                    )
-                    try:
-                        manifest = self._read_json(
-                            directory / PHOTO_ASSETS_NAME,
-                            item_id=item,
-                            section="capture",
-                            maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
-                        )
-                        if manifest is None:
-                            manifest = self._legacy_capture_manifest(
-                                item,
-                                capture_id=capture_id,
-                                directory=directory,
-                            )
-                        if manifest is None:
-                            return {
-                                "hints": (
-                                    self._capture_inventory_index_hint(
-                                        capture_id,
-                                        state=ResourceState.MISSING,
-                                        diagnostic_code="capture_manifest_missing",
-                                    ),
-                                ),
-                                "authorities": {},
-                            }
-                        authorities: dict[str, Mapping[str, Any]] = {}
-                        hints = self._capture_index_hints(
-                            item,
-                            capture_id=capture_id,
-                            directory=directory,
-                            manifest=manifest,
-                            authority_hints=authorities,
-                        )
-                        return {
-                            "hints": hints,
-                            "authorities": authorities,
-                        }
-                    except RepositoryError as error:
-                        if not self._recoverable_capture_manifest_error(error):
-                            raise
-                        return {
-                            "hints": (
-                                self._capture_inventory_index_hint(
-                                    capture_id,
-                                    state=ResourceState.UNAVAILABLE,
-                                    diagnostic_code=error.code,
-                                ),
-                            ),
-                            "authorities": {},
-                        }
+                    return self._capture_index_hint_snapshot_locked(item)
         except EngineError:
             raise
         except Exception as exc:
@@ -1231,6 +1187,208 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item,
                 cause_type=type(exc).__name__,
             ) from exc
+
+    def list_capture_index_hints_many(
+        self,
+        item_ids: Sequence[str],
+    ) -> Mapping[str, tuple[Mapping[str, Any], ...]]:
+        """Return capture hints for many items under ONE workspace lease.
+
+        The index projection needs hints for every book; taking the lease and
+        lock chain once per item made the whole build O(items) in lock
+        traffic. Per-item semantics are identical to
+        :meth:`list_capture_index_hints` — including the error surface: the
+        first item that would raise from the single-item read raises here.
+        """
+
+        snapshots = self.capture_index_hint_snapshots_many(item_ids)
+        return {
+            item_id: tuple(snapshot["hints"])
+            for item_id, snapshot in snapshots.items()
+        }
+
+    def capture_index_hint_snapshots_many(
+        self,
+        item_ids: Sequence[str],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        """Return batched hints and private pins under one authority lease."""
+
+        items = tuple(
+            _identifier(value, item_id=str(value or ""), field="item_id")
+            for value in item_ids
+        )
+        current = ""
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    results: dict[str, Mapping[str, Any]] = {}
+                    for item in items:
+                        current = item
+                        results[item] = (
+                            self._capture_index_hint_snapshot_locked(item)
+                        )
+                    return results
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the Corrections capture index is unavailable",
+                code="corrections_artifact_repository_unavailable",
+                item_id=current,
+                cause_type=type(exc).__name__,
+            ) from exc
+
+    def _capture_index_hints_locked(
+        self,
+        item: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        snapshot = self._capture_index_hint_snapshot_locked(item)
+        return tuple(snapshot["hints"])
+
+    def _capture_index_hint_snapshot_locked(
+        self,
+        item: str,
+    ) -> Mapping[str, Any]:
+        if not self._live_item_exists(item):
+            raise NotFoundError(
+                "the item does not exist",
+                code="item_not_found",
+                details={"item_id": item},
+            )
+        capture_id = self._live_capture_id(item)
+        if not capture_id:
+            return {"hints": (), "authorities": {}}
+        directory = self._managed_directory(
+            self._capture_directory_for,
+            capture_id,
+            item_id=item,
+            section="capture",
+            authority_root=self._capture_authority_root,
+        )
+        try:
+            manifest_path = directory / PHOTO_ASSETS_NAME
+            encoded = self._read_verified_bytes(
+                manifest_path,
+                item_id=item,
+                section="capture",
+                maximum_bytes=_MAX_PHOTO_MANIFEST_BYTES,
+            )
+            if encoded is None:
+                manifest = self._legacy_capture_manifest(
+                    item,
+                    capture_id=capture_id,
+                    directory=directory,
+                )
+                if manifest is None:
+                    return {
+                        "hints": (
+                            self._capture_inventory_index_hint(
+                                capture_id,
+                                state=ResourceState.MISSING,
+                                diagnostic_code="capture_manifest_missing",
+                            ),
+                        ),
+                        "authorities": {},
+                    }
+                # Legacy manifests derive from files this cache does not
+                # fingerprint; build them fresh every time.
+                authorities: dict[str, Mapping[str, Any]] = {}
+                hints = self._capture_index_hints(
+                    item,
+                    capture_id=capture_id,
+                    directory=directory,
+                    manifest=manifest,
+                    authority_hints=authorities,
+                )
+                return {"hints": hints, "authorities": authorities}
+            digest = hashlib.sha256(encoded).digest()
+            cached = self._cached_capture_hint_snapshot(capture_id, digest)
+            if cached is not None:
+                return cached
+            manifest = self._decode_sidecar_json(
+                encoded,
+                item_id=item,
+                section="capture",
+            )
+            collector: list[tuple[Path, tuple[int, ...] | None]] = []
+            authorities = {}
+            self._capture_hint_stat_collector = collector
+            try:
+                hints = self._capture_index_hints(
+                    item,
+                    capture_id=capture_id,
+                    directory=directory,
+                    manifest=manifest,
+                    authority_hints=authorities,
+                )
+            finally:
+                self._capture_hint_stat_collector = None
+            self._capture_hint_cache[capture_id] = (
+                digest,
+                tuple(collector),
+                hints,
+                authorities,
+            )
+            return {"hints": hints, "authorities": authorities}
+        except RepositoryError as error:
+            if not self._recoverable_capture_manifest_error(error):
+                raise
+            self._capture_hint_cache.pop(capture_id, None)
+            return {
+                "hints": (
+                    self._capture_inventory_index_hint(
+                        capture_id,
+                        state=ResourceState.UNAVAILABLE,
+                        diagnostic_code=error.code,
+                    ),
+                ),
+                "authorities": {},
+            }
+
+    def _cached_capture_hint_snapshot(
+        self,
+        capture_id: str,
+        digest: bytes,
+    ) -> Mapping[str, Any] | None:
+        """Serve cached hints only when every input is verifiably unchanged.
+
+        The manifest is compared by CONTENT: the caller hands in the sha256
+        of the bytes it just read through the guarded descriptor, so an
+        in-place rewrite that preserves inode, size, and mtime still misses
+        (stat identity alone was rejected for exactly that hole — see
+        test_capture_manifest_rewritten_in_place_is_not_served_stale).
+        Rendition files are compared by lstat identity, which is the same
+        trust the uncached build places in them; the authoritative artifact
+        detail re-hashes bytes on selection either way. Any mismatch or stat
+        surprise silently falls back to a full rebuild.
+        """
+
+        entry = self._capture_hint_cache.get(capture_id)
+        if entry is None:
+            return None
+        cached_digest, rendition_stats, hints, authorities = entry
+        if not hmac.compare_digest(cached_digest, digest):
+            self._capture_hint_cache.pop(capture_id, None)
+            return None
+        for path, identity in rendition_stats:
+            observed: tuple[int, ...] | None
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                observed = None
+            except OSError:
+                self._capture_hint_cache.pop(capture_id, None)
+                return None
+            else:
+                observed = (
+                    _stable_stat_identity(info)
+                    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                    else None
+                )
+            if observed != identity:
+                self._capture_hint_cache.pop(capture_id, None)
+                return None
+        return {"hints": hints, "authorities": authorities}
 
     def resolve_capture_preview(
         self,
@@ -2398,6 +2556,28 @@ class FilesystemCorrectionsArtifactRepository(
         section: str,
         maximum_bytes: int,
     ) -> Mapping[str, Any] | None:
+        encoded = self._read_verified_bytes(
+            path,
+            item_id=item_id,
+            section=section,
+            maximum_bytes=maximum_bytes,
+        )
+        if encoded is None:
+            return None
+        return self._decode_sidecar_json(
+            encoded,
+            item_id=item_id,
+            section=section,
+        )
+
+    def _read_verified_bytes(
+        self,
+        path: Path,
+        *,
+        item_id: str,
+        section: str,
+        maximum_bytes: int,
+    ) -> bytes | None:
         authority = self._assert_safe_path(
             path,
             item_id=item_id,
@@ -2451,12 +2631,7 @@ class FilesystemCorrectionsArtifactRepository(
             self._assert_safe_path(path, item_id=item_id, section=section)
             if len(encoded) > maximum_bytes:
                 raise ValueError("sidecar exceeds its size limit")
-            value = json.loads(
-                encoded.decode("utf-8"),
-                object_pairs_hook=_unique_object,
-                parse_constant=_reject_constant,
-            )
-        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        except (OSError, ValueError) as exc:
             raise _repository_error(
                 "a Corrections sidecar cannot be decoded",
                 code=(
@@ -2467,13 +2642,39 @@ class FilesystemCorrectionsArtifactRepository(
                 item_id=item_id,
                 section=section,
                 cause_type=type(exc).__name__,
-                failure_kind=(
-                    "read" if isinstance(exc, OSError) else "decode"
-                ),
+                failure_kind="read",
             ) from exc
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+        return encoded
+
+    def _decode_sidecar_json(
+        self,
+        encoded: bytes,
+        *,
+        item_id: str,
+        section: str,
+    ) -> Mapping[str, Any]:
+        try:
+            value = json.loads(
+                encoded.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+        except (UnicodeError, ValueError, RecursionError) as exc:
+            raise _repository_error(
+                "a Corrections sidecar cannot be decoded",
+                code=(
+                    "invalid_capture_photo_assets"
+                    if section == "capture"
+                    else "invalid_mistral_layout"
+                ),
+                item_id=item_id,
+                section=section,
+                cause_type=type(exc).__name__,
+                failure_kind="decode",
+            ) from exc
         if not isinstance(value, Mapping):
             raise _repository_error(
                 "a Corrections sidecar must contain an object",
@@ -2926,8 +3127,10 @@ class FilesystemCorrectionsArtifactRepository(
             )
             info = path.lstat()
         except FileNotFoundError:
+            self._collect_capture_hint_stat(path, None)
             return ResourceState.MISSING, None
         except (OSError, RepositoryError):
+            self._collect_capture_hint_stat(path, None)
             return ResourceState.UNAVAILABLE, None
         if (
             _is_redirecting_path(path)
@@ -2936,8 +3139,20 @@ class FilesystemCorrectionsArtifactRepository(
             or info.st_size < 1
             or info.st_size > _MAX_RASTER_RESOURCE_BYTES
         ):
+            self._collect_capture_hint_stat(path, None)
             return ResourceState.UNAVAILABLE, None
-        return ResourceState.AVAILABLE, _stable_stat_identity(info)
+        identity = _stable_stat_identity(info)
+        self._collect_capture_hint_stat(path, identity)
+        return ResourceState.AVAILABLE, identity
+
+    def _collect_capture_hint_stat(
+        self,
+        path: Path,
+        identity: tuple[int, ...] | None,
+    ) -> None:
+        collector = self._capture_hint_stat_collector
+        if collector is not None:
+            collector.append((path, identity))
 
     @staticmethod
     def _capture_index_geometry_is_incomplete(

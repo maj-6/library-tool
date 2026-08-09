@@ -758,6 +758,47 @@ class FilesystemCorrectionTransformStore:
                 retryable=True,
             ) from exc
 
+    def project_display_head_hints_many(
+        self,
+        item_ids: Sequence[str],
+    ) -> Mapping[str, tuple[_CorrectionDisplayHeadHint, ...]]:
+        """Validate many logical display heads under one workspace lease."""
+
+        items = tuple(str(item_id) for item_id in item_ids)
+        current = ""
+        try:
+            with self._write_set.workspace_lease():
+                with self._lock_context_for():
+                    projected: dict[
+                        str,
+                        tuple[_CorrectionDisplayHeadHint, ...],
+                    ] = {}
+                    for item_id in items:
+                        current = item_id
+                        projected[item_id] = (
+                            self._display_head_hints_projection_locked(item_id)
+                        )
+                    return projected
+        except WriteSetError as exc:
+            raise _repository_error(
+                "the correction transform workspace is unavailable",
+                code=exc.code,
+                cause=exc,
+                retryable=True,
+            ) from exc
+        except (NotFoundError, RepositoryError):
+            raise
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise _repository_error(
+                "the correction display-head hints are unavailable",
+                code="correction_transform_projection_unavailable",
+                item_id=current,
+                cause=exc,
+                retryable=True,
+            ) from exc
+
     def get_raster_artifact(
         self,
         key: RasterArtifactKey,

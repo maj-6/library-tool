@@ -844,64 +844,162 @@ class _CorrectionProjectionUnion:
                         code="invalid_corrections_index_projection",
                         details={"item_id": item_id},
                     )
-                values = snapshot.get("hints")
-                authorities = snapshot.get("authorities")
             else:
-                values = hints(item_id)
-                authorities = {}
-            if (
-                isinstance(values, (str, bytes))
-                or not isinstance(values, Sequence)
-                or any(not isinstance(value, Mapping) for value in values)
-                or not isinstance(authorities, Mapping)
-                or any(
-                    not isinstance(identity, str)
-                    or not isinstance(authority, Mapping)
-                    for identity, authority in authorities.items()
-                )
+                snapshot = {
+                    "hints": hints(item_id),
+                    "authorities": {},
+                }
+            head_hints = self._transforms.project_display_head_hints(item_id)
+            return self._project_capture_index_hint_snapshot(
+                item_id,
+                snapshot,
+                head_hints,
+            )
+
+    def list_capture_index_hints_many(
+        self,
+        item_ids: Sequence[str],
+    ) -> Mapping[str, tuple[Mapping[str, Any], ...]]:
+        """Batch capture hints under one lease instead of one per item."""
+
+        items = tuple(item_ids)
+        snapshots_many = getattr(
+            self._base,
+            "capture_index_hint_snapshots_many",
+            None,
+        )
+        snapshotter = getattr(
+            self._base,
+            "capture_index_hint_snapshot",
+            None,
+        )
+        many = getattr(self._base, "list_capture_index_hints_many", None)
+        single = getattr(self._base, "list_capture_index_hints", None)
+        with self._read_context():
+            if callable(snapshots_many):
+                snapshots = snapshots_many(items)
+            elif callable(snapshotter):
+                snapshots = {
+                    item_id: snapshotter(item_id) for item_id in items
+                }
+            elif callable(many):
+                rows_by_item = many(items)
+                if not isinstance(rows_by_item, Mapping):
+                    raise RepositoryError(
+                        "the correction capture index returned invalid hints",
+                        code="invalid_corrections_index_projection",
+                    )
+                snapshots = {
+                    item_id: {"hints": rows, "authorities": {}}
+                    for item_id, rows in rows_by_item.items()
+                }
+            elif callable(single):
+                snapshots = {
+                    item_id: {
+                        "hints": single(item_id),
+                        "authorities": {},
+                    }
+                    for item_id in items
+                }
+            else:
+                return {str(item_id): () for item_id in items}
+            if not isinstance(snapshots, Mapping) or any(
+                not isinstance(item_id, str)
+                or not isinstance(snapshot, Mapping)
+                for item_id, snapshot in snapshots.items()
             ):
                 raise RepositoryError(
                     "the correction capture index returned invalid hints",
                     code="invalid_corrections_index_projection",
-                    details={"item_id": item_id},
                 )
-            head_hints = self._transforms.project_display_head_hints(item_id)
-            heads = self._active_display_head_hints(
-                item_id,
-                head_hints,
-                values=values,
-                authorities=authorities,
+            project_many = getattr(
+                self._transforms,
+                "project_display_head_hints_many",
+                None,
             )
-            return tuple(
-                {
-                    **value,
-                    "revision": self._display_head_revision(
-                        "index",
-                        authority_revision,
-                        self._display_head_revision(
-                            "correction-display-hint",
-                            heads[identity].operation_id,
-                            heads[identity].publication_sha256,
-                            heads[identity].output_artifact_revision,
-                            heads[identity].output_content_sha256,
-                        ),
-                    ),
-                    "resource_state": ResourceState.AVAILABLE.value,
+            if callable(project_many):
+                heads_by_item = project_many(tuple(snapshots))
+            else:
+                heads_by_item = {
+                    item_id: self._transforms.project_display_head_hints(
+                        item_id
+                    )
+                    for item_id in snapshots
                 }
-                if (
-                    isinstance(
-                        (artifact_id := value.get("artifact_id")),
-                        str,
-                    )
-                    and (identity := artifact_id.casefold()) in heads
-                    and isinstance(
-                        (authority_revision := value.get("revision")),
-                        str,
-                    )
+            if not isinstance(heads_by_item, Mapping):
+                raise RepositoryError(
+                    "the correction capture index returned invalid hints",
+                    code="invalid_corrections_index_projection",
                 )
-                else value
-                for value in values
+            return {
+                item_id: self._project_capture_index_hint_snapshot(
+                    item_id,
+                    snapshot,
+                    heads_by_item.get(item_id, ()),
+                )
+                for item_id, snapshot in snapshots.items()
+            }
+
+    def _project_capture_index_hint_snapshot(
+        self,
+        item_id: str,
+        snapshot: Mapping[str, Any],
+        head_hints: Sequence[Any],
+    ) -> tuple[Mapping[str, Any], ...]:
+        values = snapshot.get("hints")
+        authorities = snapshot.get("authorities")
+        if (
+            isinstance(values, (str, bytes))
+            or not isinstance(values, Sequence)
+            or any(not isinstance(value, Mapping) for value in values)
+            or not isinstance(authorities, Mapping)
+            or any(
+                not isinstance(identity, str)
+                or not isinstance(authority, Mapping)
+                for identity, authority in authorities.items()
             )
+        ):
+            raise RepositoryError(
+                "the correction capture index returned invalid hints",
+                code="invalid_corrections_index_projection",
+                details={"item_id": item_id},
+            )
+        heads = self._active_display_head_hints(
+            item_id,
+            head_hints,
+            values=values,
+            authorities=authorities,
+        )
+        return tuple(
+            {
+                **value,
+                "revision": self._display_head_revision(
+                    "index",
+                    authority_revision,
+                    self._display_head_revision(
+                        "correction-display-hint",
+                        heads[identity].operation_id,
+                        heads[identity].publication_sha256,
+                        heads[identity].output_artifact_revision,
+                        heads[identity].output_content_sha256,
+                    ),
+                ),
+                "resource_state": ResourceState.AVAILABLE.value,
+            }
+            if (
+                isinstance(
+                    (artifact_id := value.get("artifact_id")),
+                    str,
+                )
+                and (identity := artifact_id.casefold()) in heads
+                and isinstance(
+                    (authority_revision := value.get("revision")),
+                    str,
+                )
+            )
+            else value
+            for value in values
+        )
 
     def get_raster_artifact(
         self,

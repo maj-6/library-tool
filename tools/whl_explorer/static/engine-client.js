@@ -1208,6 +1208,9 @@
   const CORRECTION_REVIEW_STATES =
     new Set(["clear", "needs_attention", "resolved"]);
   const CORRECTION_REVIEW_HISTORY_PAGE_LIMIT = 100;
+  // Mirrors the server's CORRECTIONS_INDEX_DETAIL_ITEM_LIMIT: a detail window
+  // larger than this is rejected before it is ever sent.
+  const CORRECTIONS_INDEX_DETAIL_ITEM_LIMIT = 256;
   const CORRECTION_OCR_PROPOSAL_PAGE_LIMIT = 256;
   const CORRECTION_OCR_PROPOSAL_SNAPSHOT_RE = /^cops-[0-9a-f]{64}$/;
   const CORRECTION_REOCR_OPERATION_RE = /^correction-reocr:[0-9a-f]{48}$/;
@@ -1476,32 +1479,64 @@
       value.review.state !== "clear";
   }
 
-  function isCorrectionsIndex(value) {
-    if (!hasExactKeys(value, [
-      "schema", "revision", "books", "attention",
-    ]) || value.schema !== "librarytool.corrections-index/2" ||
-        !isArtifactRevision(value.revision) ||
-        !Array.isArray(value.books) || value.books.length > 100000 ||
-        !value.books.every(isCorrectionsBook) ||
-        !Array.isArray(value.attention) ||
-        value.attention.length > 1000000 ||
-        !value.attention.every(isCorrectionsAttentionEntry)) return false;
-    const books = new Map(value.books.map((book) => [book.id, book]));
-    const attentionByBook = new Map(value.attention.map((entry) =>
+  function correctionsAttentionConsistent(books, attention) {
+    const byId = new Map(books.map((book) => [book.id, book]));
+    const attentionByBook = new Map(attention.map((entry) =>
       [entry.target.item_id, entry]));
-    const bookIds = value.books.map((book) => book.id.toLowerCase());
-    const keys = value.attention.map((entry) => entry.key.toLowerCase());
-    const targets = value.attention.map((entry) => entry.target.item_id);
+    const bookIds = books.map((book) => book.id.toLowerCase());
+    const keys = attention.map((entry) => entry.key.toLowerCase());
+    const targets = attention.map((entry) => entry.target.item_id);
     return new Set(bookIds).size === bookIds.length &&
       new Set(keys).size === keys.length &&
       new Set(targets).size === targets.length &&
-      targets.every((itemId) => books.has(itemId)) &&
-      value.books.every((book) => {
+      targets.every((itemId) => byId.has(itemId)) &&
+      books.every((book) => {
         const entry = attentionByBook.get(book.id);
         if (book.review.state === "clear") return entry === undefined;
         return entry !== undefined &&
           sameCorrectionsIndexReview(book.review, entry.review);
       });
+  }
+
+  function isCorrectionsIndex(value) {
+    return hasExactKeys(value, [
+      "schema", "revision", "books", "attention",
+    ]) && value.schema === "librarytool.corrections-index/2" &&
+      isArtifactRevision(value.revision) &&
+      Array.isArray(value.books) && value.books.length <= 100000 &&
+      value.books.every(isCorrectionsBook) &&
+      Array.isArray(value.attention) &&
+      value.attention.length <= 1000000 &&
+      value.attention.every(isCorrectionsAttentionEntry) &&
+      correctionsAttentionConsistent(value.books, value.attention);
+  }
+
+  // A summary book carries the free half of an index row: everything except
+  // what a capture manifest read would have paid for. The shapes mirror the
+  // server's summary projection exactly (hasExactKeys, so an added or
+  // dropped field is a contract violation, never a silent pass-through).
+  function isCorrectionsIndexSummaryBook(value) {
+    return hasExactKeys(value, [
+      "id", "revision", "kind", "title", "review",
+    ]) &&
+      isPortableIdentifier(value.id) &&
+      isArtifactRevision(value.revision) &&
+      ["book", "capture"].includes(value.kind) &&
+      isCorrectionsText(value.title, 2048) &&
+      isCorrectionsIndexReview(value.review);
+  }
+
+  function isCorrectionsIndexSummary(value) {
+    return hasExactKeys(value, [
+      "schema", "revision", "books", "attention",
+    ]) && value.schema === "librarytool.corrections-index-summary/1" &&
+      isArtifactRevision(value.revision) &&
+      Array.isArray(value.books) && value.books.length <= 100000 &&
+      value.books.every(isCorrectionsIndexSummaryBook) &&
+      Array.isArray(value.attention) &&
+      value.attention.length <= 1000000 &&
+      value.attention.every(isCorrectionsAttentionEntry) &&
+      correctionsAttentionConsistent(value.books, value.attention);
   }
 
   function isPolygonSelector(value, canvasRevision) {
@@ -2275,6 +2310,10 @@
           this._correctionsIndex(args),
         indexProbe: (args) =>
           this._correctionsIndexProbe(args),
+        indexSummary: (args) =>
+          this._correctionsIndexSummary(args),
+        indexDetails: (args) =>
+          this._correctionsIndexDetails(args),
         assignImageCategory: (args) =>
           this._correctionAssignImageCategory(args),
         clearImageCategory: (args) =>
@@ -3638,6 +3677,93 @@
             "GET", path, body, undefined, status);
         }
         return { schema: body.schema, revision: body.revision };
+      });
+    }
+
+    _correctionsIndexSummary({ workspaceId, signal } = {}) {
+      const workspace = portableIdentifier(workspaceId, "workspaceId");
+      const path = "/v1/corrections/index/summary";
+      return this._requestJson("GET", path, {
+        query: { workspace_id: workspace },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const summary = body && {
+          schema: body.schema,
+          revision: body.revision,
+          books: body.books,
+          attention: body.attention,
+        };
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "revision", "books", "attention",
+        ]) || body.ok !== true || !isCorrectionsIndexSummary(summary) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid Corrections index summary",
+            "GET", path, body, undefined, status);
+        }
+        return summary;
+      });
+    }
+
+    _correctionsIndexDetails({ workspaceId, itemIds, signal } = {}) {
+      const workspace = portableIdentifier(workspaceId, "workspaceId");
+      if (!Array.isArray(itemIds) || itemIds.length < 1 ||
+          itemIds.length > CORRECTIONS_INDEX_DETAIL_ITEM_LIMIT) {
+        throw new TypeError(
+          `itemIds must name 1 to ${
+            CORRECTIONS_INDEX_DETAIL_ITEM_LIMIT} items`);
+      }
+      const items = itemIds.map((value) =>
+        portableIdentifier(value, "itemIds[]"));
+      if (new Set(items).size !== items.length) {
+        throw new TypeError("itemIds must be unique");
+      }
+      const path = "/v1/corrections/index/details";
+      return this._requestJson("POST", path, {
+        query: { workspace_id: workspace },
+        body: {
+          schema: "librarytool.corrections-index-detail-request/1",
+          item_ids: items,
+        },
+        signal,
+        cache: "no-cache",
+        includeStatus: true,
+      }).then(({ body, status }) => {
+        const details = body && {
+          schema: body.schema,
+          revision: body.revision,
+          books: withDegradedImportTimestamps(body.books),
+          missing: body.missing,
+        };
+        const requested = new Set(items);
+        // Every requested id must come back exactly once, as either a row or
+        // a missing report; the union check also rejects duplicates and rows
+        // for books this window never asked about.
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "revision", "books", "missing",
+        ]) && body.ok === true &&
+          details.schema === "librarytool.corrections-index-detail/1" &&
+          isArtifactRevision(details.revision) &&
+          Array.isArray(details.books) &&
+          details.books.every(isCorrectionsBook) &&
+          Array.isArray(details.missing) &&
+          details.missing.every((value) => typeof value === "string") &&
+          details.books.length + details.missing.length === items.length &&
+          details.books.every((book) => requested.has(book.id)) &&
+          details.missing.every((value) => requested.has(value)) &&
+          new Set([
+            ...details.books.map((book) => book.id),
+            ...details.missing,
+          ]).size === items.length &&
+          !containsCommandFingerprint(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid Corrections index detail",
+            "POST", path, body, undefined, status);
+        }
+        return details;
       });
     }
 

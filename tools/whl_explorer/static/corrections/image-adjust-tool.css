@@ -52,6 +52,96 @@
   grid-template-columns: auto 1fr;
 }
 
+.image-adjust-operations {
+  display: grid;
+  gap: 0.35rem;
+  min-inline-size: 0;
+}
+
+.image-adjust-operations-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.image-adjust-operations-label {
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.image-adjust-operation-add-select {
+  flex: 1;
+  min-inline-size: 0;
+}
+
+.image-adjust-operation-add {
+  padding: 0.1rem 0.5rem;
+}
+
+.image-adjust-operation-list {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.image-adjust-operation {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.3rem 0.4rem;
+  border: var(--border-w, 1px) solid var(--corrections-border, #3b463b);
+  border-radius: calc(var(--radius, 6px) / 2);
+  font-size: 0.82rem;
+}
+
+.image-adjust-operation-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.image-adjust-operation-name {
+  font-variant-numeric: tabular-nums;
+}
+
+.image-adjust-operation-actions {
+  display: inline-flex;
+  gap: 0.2rem;
+}
+
+.image-adjust-operation-actions button {
+  padding: 0 0.35rem;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.image-adjust-operation-params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.55rem;
+}
+
+.image-adjust-operation-param {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--corrections-muted, #a9b3a9);
+  font-size: 0.78rem;
+}
+
+.image-adjust-operation-param input {
+  inline-size: 3.8rem;
+}
+
+.image-adjust-operations-hint {
+  margin: 0;
+  color: var(--corrections-muted, #a9b3a9);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
 .image-adjust-reocr-control {
   display: flex;
   align-items: baseline;

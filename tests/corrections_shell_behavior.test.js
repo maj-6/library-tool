@@ -2803,6 +2803,33 @@ test("standalone shell resolves reviews through the real engine client adapter",
         review: reviewSummary(),
       }],
     });
+    const summaryBody = () => {
+      const index = indexBody();
+      return {
+        ok: true,
+        schema: "librarytool.corrections-index-summary/1",
+        revision: index.revision,
+        books: index.books.map((book) => ({
+          id: book.id,
+          revision: `summary-${book.revision}`,
+          kind: book.kind,
+          title: book.title,
+          review: book.review,
+        })),
+        attention: index.attention,
+      };
+    };
+    const detailBody = (itemIds) => {
+      const index = indexBody();
+      return {
+        ok: true,
+        schema: "librarytool.corrections-index-detail/1",
+        revision: `detail-${index.revision}`,
+        books: index.books.filter((book) => itemIds.includes(book.id)),
+        missing: itemIds.filter((id) =>
+          !index.books.some((book) => book.id === id)),
+      };
+    };
     const response = (body) => ({
       ok: true,
       status: 200,
@@ -2811,6 +2838,12 @@ test("standalone shell resolves reviews through the real engine client adapter",
     const engineClient = new EngineClient({
       transport: async (url, init) => {
         calls.push({ url, init });
+        if (url.startsWith("/api/v1/corrections/index/summary")) {
+          return response(summaryBody());
+        }
+        if (url.startsWith("/api/v1/corrections/index/details")) {
+          return response(detailBody(JSON.parse(init.body).item_ids));
+        }
         if (url.startsWith("/api/v1/corrections/index")) {
           return response(indexBody());
         }
@@ -2894,6 +2927,9 @@ test("standalone shell resolves reviews through the real engine client adapter",
 
     assert.equal(result.entry.review.state, "resolved");
     assert.equal(store.index.books[0].review.state, "resolved");
+    // The cutover contract: the monolithic /corrections/index is never
+    // fetched. A load is one summary plus bounded detail windows, and a
+    // review mutation converges through one single-item detail window.
     assert.deepEqual(calls.map(({ url, init }) => [
       init.method,
       url,
@@ -2901,8 +2937,16 @@ test("standalone shell resolves reviews through the real engine client adapter",
     ]), [
       [
         "GET",
-        "/api/v1/corrections/index?workspace_id=workspace-1",
+        "/api/v1/corrections/index/summary?workspace_id=workspace-1",
         null,
+      ],
+      [
+        "POST",
+        "/api/v1/corrections/index/details?workspace_id=workspace-1",
+        {
+          schema: "librarytool.corrections-index-detail-request/1",
+          item_ids: ["book-1"],
+        },
       ],
       [
         "POST",
@@ -2910,9 +2954,12 @@ test("standalone shell resolves reviews through the real engine client adapter",
         { comment: "Verified" },
       ],
       [
-        "GET",
-        "/api/v1/corrections/index?workspace_id=workspace-1",
-        null,
+        "POST",
+        "/api/v1/corrections/index/details?workspace_id=workspace-1",
+        {
+          schema: "librarytool.corrections-index-detail-request/1",
+          item_ids: ["book-1"],
+        },
       ],
     ]);
   });
@@ -3337,7 +3384,20 @@ test("the shell wires the CH panel to selection, metadata saves, and refreshes",
         item_id: "book-1",
         list_available: true,
         match: null,
-        candidates: [],
+        candidates: [{
+          index: 0,
+          key: "6e805628-39",
+          title: "Captured Herbal",
+          author: "Greene, R.",
+          year: "1901",
+          score: 0.91,
+          fields: {
+            title: "Captured Herbal",
+            author: "Greene, R.",
+            year: "1901",
+            publisher: "Field Press",
+          },
+        }],
         rejected: null,
       }),
     };
@@ -3409,6 +3469,17 @@ test("the shell wires the CH panel to selection, metadata saves, and refreshes",
   assert.equal(chHost.hidden, false);
   assert.deepEqual(loadCalls, ["book-1"],
     "item selection also loads the metadata editor");
+  assert.equal(fetchCalls.length, 1,
+    "item properties consumes the CH panel's state body — one request " +
+    "per selection, no duplicate fetch");
+  const yearInput = propertiesHost.querySelector('[data-item-field="year"]');
+  assert.equal(yearInput.getAttribute("data-item-provisional"), "ch",
+    "the shared state body provisionally fills the empty year field");
+  assert.equal(yearInput.getAttribute("placeholder"), "1901");
+  assert.equal(yearInput.getAttribute("title"), "CH candidate: 6e805628-39");
+  assert.equal(propertiesHost.querySelector("[data-item-title]")
+    .getAttribute("data-item-provisional"), null,
+  "the real capture title never shows a provisional value");
 
   const beforeSave = fetchCalls.length;
   shell.itemProperties.onChanged(item, { replayed: false });

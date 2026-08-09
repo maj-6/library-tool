@@ -88,6 +88,7 @@ function harness(handler, options = {}) {
   root.hidden = true;
   const calls = [];
   const changed = [];
+  const states = [];
   let operationCounter = 0;
   const panel = createChPanel({
     root,
@@ -104,8 +105,9 @@ function harness(handler, options = {}) {
     operationIdFactory: options.operationIdFactory ||
       (() => `ch-op-${++operationCounter}`),
     onChanged: (body) => changed.push(body),
+    onState: (state) => states.push(state),
   }).mount();
-  return { calls, changed, documentRef, panel, root };
+  return { calls, changed, documentRef, panel, root, states };
 }
 
 
@@ -506,6 +508,45 @@ test("a vanished master-list row surfaces the server's reason and reloads", asyn
     "the key does not resolve to a current CH row");
   assert.equal(message.getAttribute("role"), "alert");
   assert.deepEqual(harnessed.changed, []);
+});
+
+
+test("every installed state announces through onState for fetch sharing", async () => {
+  const proposed = statePayload({ candidates: [candidate()] });
+  const harnessed = harness((call) => call.init.method === "GET"
+    ? response(200, proposed)
+    : response(200, {
+      ok: true,
+      replayed: false,
+      adopted: ["author"],
+      conflicts: [],
+      match: keyMatch({ adopted: ["author"], conflicts: [] }),
+    }));
+
+  await harnessed.panel.setItem("book-1");
+  assert.deepEqual(harnessed.states, [null, proposed],
+    "selection clears the previous body, then announces the loaded one");
+
+  await harnessed.panel.approve(ROW_KEY);
+  const announced = harnessed.states.at(-1);
+  assert.equal(announced.item_id, "book-1");
+  assert.ok(announced.match,
+    "an approval announces the stamped post-decision state");
+  assert.deepEqual(announced.candidates, [],
+    "the post-approval announcement carries no further candidates");
+
+  await harnessed.panel.setItem(null);
+  assert.equal(harnessed.states.at(-1), null,
+    "clearing the selection announces null so consumers reset");
+
+  const hidden = harness(() => response(422, {
+    ok: false,
+    error: "the Corrections item is not capture-backed",
+    code: "not_capture_backed",
+  }));
+  await hidden.panel.setItem("book-1");
+  assert.deepEqual(hidden.states, [null, null],
+    "a hidden-panel failure still announces that no state is current");
 });
 
 

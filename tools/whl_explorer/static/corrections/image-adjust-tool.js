@@ -11,6 +11,10 @@
   "use strict";
 
   const {
+    MAX_OPERATIONS_PER_RECIPE,
+    PROCESSING_OPERATION_PARAMETERS,
+    PROCESSING_OPERATION_SCHEMA,
+    PROCESSING_OPERATION_VERSION,
     TOOLS,
     isFormControlTarget,
     normalizeManualAdjustment,
@@ -25,9 +29,123 @@
   const BRIGHTNESS_MIN = -100;
   const BRIGHTNESS_MAX = 100;
   const DEFAULT_CONTRAST = 100;
+  const CONTRAST_MIN = 0;
+  const CONTRAST_MAX = 100;
   const THRESHOLD_RULE =
     "round_half_up(127.5 - brightness_percent * 1.275), clamped_0_255";
   const BINARY_ALGORITHM = "grayscale-threshold-blend-v1";
+
+  // Authoring catalog for the six engine processing operations. Defaults and
+  // rule strings mirror librarytool/processing/operations.py exactly: the
+  // transform command is content-addressed, so the engine only accepts a
+  // document that byte-matches its own canonical serialization — including
+  // the human-readable rule. tests/fixtures/processing_operations_canonical
+  // .json (generated from the Python module) pins this parity.
+  const PROCESSING_OPERATION_DEFAULTS = Object.freeze({
+    "white-balance-v1": Object.freeze({
+      mode: "gray_world", strength_percent: 100, temperature: 0, tint: 0,
+    }),
+    "channel-gain-v1": Object.freeze({
+      red_percent: 100, green_percent: 100, blue_percent: 100,
+    }),
+    "gamma-v1": Object.freeze({ gamma_hundredths: 100 }),
+    "contrast-v1": Object.freeze({ contrast_percent: 0 }),
+    "unsharp-mask-v1": Object.freeze({
+      radius_tenths: 10, amount_percent: 150, threshold: 3,
+    }),
+    "kernel-sharpen-v1": Object.freeze({ strength_percent: 50 }),
+  });
+  const PROCESSING_OPERATION_LABELS = Object.freeze({
+    "white-balance-v1": "White balance",
+    "channel-gain-v1": "Channel gain",
+    "gamma-v1": "Gamma",
+    "contrast-v1": "Contrast",
+    "unsharp-mask-v1": "Unsharp mask",
+    "kernel-sharpen-v1": "Kernel sharpen",
+  });
+  const PROCESSING_PARAMETER_LABELS = Object.freeze({
+    radius_tenths: "Radius ×0.1",
+    amount_percent: "Amount %",
+    threshold: "Threshold",
+    strength_percent: "Strength %",
+    gamma_hundredths: "Gamma ×100",
+    contrast_percent: "Contrast %",
+    red_percent: "R %",
+    green_percent: "G %",
+    blue_percent: "B %",
+    temperature: "Temp",
+    tint: "Tint",
+  });
+  const PROCESSING_OPERATION_RULES = Object.freeze({
+    "unsharp-mask-v1": () =>
+      "pillow_unsharp_mask(radius=radius_tenths/10, " +
+      "percent=amount_percent, threshold=threshold)",
+    "kernel-sharpen-v1": () =>
+      "3x3 kernel [[0,-1,0],[-1,5,-1],[0,-1,0]] blended with identity at " +
+      "strength_percent/100",
+    "gamma-v1": () =>
+      "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), " +
+      "clamped_0_255",
+    "contrast-v1": () =>
+      "factor = 1 + contrast_percent/100 when positive else " +
+      "1 + contrast_percent/100 toward 127.5; " +
+      "round_half_up(127.5 + (value - 127.5) * factor), clamped_0_255",
+    "channel-gain-v1": () =>
+      "round_half_up(value * channel_percent/100), clamped_0_255",
+    "white-balance-v1": (parameters) => parameters.mode === "manual"
+      ? "red gain = 1 + strength_percent/100 * temperature/200; " +
+        "blue gain = 1 - strength_percent/100 * temperature/200; " +
+        "green gain = 1 + strength_percent/100 * tint/200; " +
+        "round_half_up(value * gain), clamped_0_255"
+      : "per-channel gain = 1 + strength_percent/100 * " +
+        "(mean_of_all_channels/channel_mean - 1); " +
+        "round_half_up(value * gain), clamped_0_255",
+  });
+
+  function clampOperationParameter(algorithm, name, value) {
+    const bounds = Object.prototype.hasOwnProperty.call(
+      PROCESSING_OPERATION_PARAMETERS, algorithm,
+    ) ? PROCESSING_OPERATION_PARAMETERS[algorithm][name] : null;
+    const fallback = PROCESSING_OPERATION_DEFAULTS[algorithm][name];
+    if (!bounds) return fallback;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    const [minimum, maximum] = bounds;
+    return Math.max(minimum, Math.min(maximum, Math.round(numeric)));
+  }
+
+  function createProcessingOperation(algorithm, parameters = {}) {
+    const defaults = Object.prototype.hasOwnProperty.call(
+      PROCESSING_OPERATION_DEFAULTS, algorithm,
+    ) ? PROCESSING_OPERATION_DEFAULTS[algorithm] : null;
+    if (!defaults) {
+      throw new TypeError(
+        `unsupported processing algorithm: ${String(algorithm)}`);
+    }
+    const source = isPlainObject(parameters) ? parameters : {};
+    const resolved = {};
+    for (const name of Object.keys(defaults)) {
+      if (name === "mode") {
+        resolved.mode = source.mode === "manual" ? "manual" : "gray_world";
+        continue;
+      }
+      resolved[name] = clampOperationParameter(
+        algorithm, name, source[name] == null ? defaults[name] : source[name]);
+    }
+    if (resolved.mode === "gray_world") {
+      // The engine rejects a gray_world document carrying temperature or
+      // tint; zeroing on mode switch keeps the authored recipe canonical.
+      if ("temperature" in resolved) resolved.temperature = 0;
+      if ("tint" in resolved) resolved.tint = 0;
+    }
+    return {
+      schema: PROCESSING_OPERATION_SCHEMA,
+      version: PROCESSING_OPERATION_VERSION,
+      algorithm,
+      rule: PROCESSING_OPERATION_RULES[algorithm](resolved),
+      ...resolved,
+    };
+  }
   const TERMINAL_OCR_STATES = new Set([
     "not_requested", "succeeded", "failed", "cancelled",
   ]);
@@ -89,6 +207,15 @@
   function validBrightness(value) {
     return Number.isInteger(value) &&
       value >= BRIGHTNESS_MIN && value <= BRIGHTNESS_MAX;
+  }
+
+  function clampContrast(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return DEFAULT_CONTRAST;
+    return Math.max(
+      CONTRAST_MIN,
+      Math.min(CONTRAST_MAX, Math.round(numeric)),
+    );
   }
 
   function normalizeImageAdjustProfile(value) {
@@ -680,12 +807,29 @@
       activeTool.setAttribute("role", "status");
       activeTool.setAttribute("aria-live", "polite");
 
+      // The wire field is named contrast_percent, but it is a binary blend
+      // weight: 0 keeps the grayscale image, 100 is fully thresholded.
+      // Label it for what it does rather than repeating the wire name; the
+      // real linear-contrast dial is the contrast-v1 processing operation.
       const contrastRow = element(documentRef, "div", "image-adjust-control");
-      const contrastLabel = element(documentRef, "span", "", "Contrast");
-      const contrastOutput = element(documentRef, "output", "", "100");
-      contrastOutput.setAttribute("aria-label", "Contrast percent");
-      contrastOutput.setAttribute("aria-live", "off");
-      contrastRow.append(contrastLabel, contrastOutput);
+      const contrastId = `${instanceId}-contrast`;
+      const contrastLabel = element(documentRef, "label", "", "Binarize");
+      contrastLabel.htmlFor = contrastId;
+      const contrastInput = element(documentRef, "input");
+      contrastInput.id = contrastId;
+      contrastInput.type = "number";
+      contrastInput.min = String(CONTRAST_MIN);
+      contrastInput.max = String(CONTRAST_MAX);
+      contrastInput.step = "1";
+      contrastInput.inputMode = "numeric";
+      contrastInput.title =
+        "Binary blend weight: 0 keeps the grayscale image, " +
+        "100 is fully thresholded.";
+      contrastInput.setAttribute(
+        "aria-label",
+        "Binarize percent: blend weight toward the binary threshold image",
+      );
+      contrastRow.append(contrastLabel, contrastInput);
 
       const brightnessRow = element(documentRef, "div", "image-adjust-control");
       const brightnessId = `${instanceId}-brightness`;
@@ -707,6 +851,53 @@
       brightnessHint.id = `${instanceId}-brightness-hint`;
       brightnessInput.setAttribute("aria-describedby", brightnessHint.id);
       brightnessRow.append(brightnessLabel, brightnessInput);
+
+      const operationsBlock = element(
+        documentRef, "div", "image-adjust-operations",
+      );
+      const operationsHead = element(
+        documentRef, "div", "image-adjust-operations-head",
+      );
+      const operationsLabel = element(
+        documentRef, "span", "image-adjust-operations-label", "Processing",
+      );
+      const operationsAddSelect = element(
+        documentRef, "select", "image-adjust-operation-add-select",
+      );
+      operationsAddSelect.setAttribute(
+        "aria-label", "Processing operation to add",
+      );
+      for (const algorithm of Object.keys(PROCESSING_OPERATION_DEFAULTS)) {
+        const choice = element(
+          documentRef, "option", "", PROCESSING_OPERATION_LABELS[algorithm],
+        );
+        choice.value = algorithm;
+        choice.setAttribute("value", algorithm);
+        operationsAddSelect.append(choice);
+      }
+      operationsAddSelect.value = Object.keys(PROCESSING_OPERATION_DEFAULTS)[0];
+      const operationsAddButton = element(
+        documentRef, "button", "image-adjust-operation-add", "Add",
+      );
+      operationsAddButton.type = "button";
+      operationsAddButton.setAttribute(
+        "aria-label", "Add the selected processing operation",
+      );
+      operationsHead.append(
+        operationsLabel, operationsAddSelect, operationsAddButton,
+      );
+      const operationList = element(
+        documentRef, "ol", "image-adjust-operation-list",
+      );
+      // These operations run in the queued engine transform, before the
+      // binary adjustment. The exact binary preview cannot reproduce them
+      // client-side, so say so instead of faking it.
+      const operationsHint = element(
+        documentRef, "p", "image-adjust-operations-hint",
+        "Applied on queue, before the binary adjust — not shown in the preview.",
+      );
+      operationsHint.hidden = true;
+      operationsBlock.append(operationsHead, operationList, operationsHint);
 
       const ocrRow = element(documentRef, "div", "image-adjust-ocr-control");
       const ocrId = `${instanceId}-rerun-ocr`;
@@ -745,6 +936,7 @@
         contrastRow,
         brightnessRow,
         brightnessHint,
+        operationsBlock,
         ocrRow,
         ...(reocrRow ? [reocrRow] : []),
         thresholdStatus,
@@ -781,8 +973,14 @@
         documentRef,
         panel,
         activeTool,
-        contrastOutput,
+        contrastInput,
         brightnessInput,
+        operationsAddSelect,
+        operationsAddButton,
+        operationList,
+        operationsHint,
+        renderedOperations: null,
+        renderedOperationsActive: null,
         ocrInput,
         reocrRow,
         reocrButton,
@@ -844,6 +1042,31 @@
         this.setBrightness(brightnessInput.value);
         brightnessInput.value = String(this.brightness);
       });
+      addListener(removers, contrastInput, "input", () => {
+        const raw = String(contrastInput.value == null
+          ? "" : contrastInput.value).trim();
+        const numeric = raw === "" ? Number.NaN : Number(raw);
+        if (!Number.isFinite(numeric)) {
+          contrastInput.setAttribute("aria-invalid", "true");
+          return;
+        }
+        contrastInput.removeAttribute("aria-invalid");
+        this.setAdjustment(createManualBinaryAdjustment(
+          this.brightness, clampContrast(numeric)));
+      });
+      addListener(removers, contrastInput, "change", () => {
+        contrastInput.removeAttribute("aria-invalid");
+        this.setAdjustment(createManualBinaryAdjustment(
+          this.brightness, clampContrast(contrastInput.value)));
+        contrastInput.value = String(this.contrast);
+      });
+      addListener(removers, operationsAddButton, "click", () => {
+        const operations = this.stateOperations(record);
+        if (operations.length >= MAX_OPERATIONS_PER_RECIPE) return;
+        this.dispatchOperations(record, operations.concat([
+          createProcessingOperation(operationsAddSelect.value),
+        ]));
+      });
       addListener(removers, ocrInput, "change", () => {
         this.setRerunOcr(ocrInput.checked === true);
       });
@@ -898,7 +1121,9 @@
         : "Image Adjust inactive";
       record.brightnessInput.disabled = !active;
       record.brightnessInput.value = String(this.brightness);
-      record.contrastOutput.textContent = String(this.contrast);
+      record.contrastInput.disabled = !active;
+      record.contrastInput.value = String(this.contrast);
+      this.renderOperations(record, state, active);
       record.ocrInput.checked = this.rerunOcr;
       if (record.reocrRow) {
         const available = this.reocrCapability &&
@@ -910,7 +1135,7 @@
       const operationCount = Array.isArray(state.operations)
         ? state.operations.length : 0;
       record.thresholdStatus.textContent = this.adjustmentEnabled
-        ? `Contrast ${this.contrast} · brightness ${this.brightness} ` +
+        ? `Binarize ${this.contrast}% · brightness ${this.brightness} ` +
           `· binary threshold ${threshold}`
         : `Manual binary adjustment off · ${operationCount} processing ` +
           `operation${operationCount === 1 ? "" : "s"}`;
@@ -928,6 +1153,184 @@
           `Brightness ${this.brightness}; binary threshold ${threshold}.`;
       }
       if (previewVisible) this.schedulePreview(record);
+    }
+
+    stateOperations(record = this.mountRecord) {
+      const state = record && !record.disposed
+        ? record.controller.getState() : null;
+      return state && Array.isArray(state.operations)
+        ? state.operations.slice() : [];
+    }
+
+    dispatchOperations(record, operations) {
+      if (!record || record.disposed) return;
+      record.controller.dispatch({
+        type: "SET_PROCESSING_OPERATIONS",
+        operations,
+      });
+      // Hosts refresh through onStateChange; the direct call keeps a bare
+      // controller (tests, detached mounts) rendering the same truth.
+      this.refreshMount(false);
+    }
+
+    moveOperation(record, index, delta) {
+      const operations = this.stateOperations(record);
+      const target = index + delta;
+      if (index < 0 || index >= operations.length ||
+          target < 0 || target >= operations.length) return;
+      const [moved] = operations.splice(index, 1);
+      operations.splice(target, 0, moved);
+      this.dispatchOperations(record, operations);
+    }
+
+    removeOperation(record, index) {
+      const operations = this.stateOperations(record);
+      if (index < 0 || index >= operations.length) return;
+      operations.splice(index, 1);
+      this.dispatchOperations(record, operations);
+    }
+
+    setOperationParameter(record, index, name, value) {
+      const operations = this.stateOperations(record);
+      const current = operations[index];
+      if (!current) return null;
+      let next = value;
+      if (name !== "mode") {
+        const raw = String(value == null ? "" : value).trim();
+        const numeric = raw === "" ? Number.NaN : Number(raw);
+        // A cleared or unparseable field keeps the current value instead of
+        // silently resetting the recipe to the algorithm default.
+        next = Number.isFinite(numeric) ? numeric : current[name];
+      }
+      operations[index] = createProcessingOperation(current.algorithm, {
+        ...current,
+        [name]: next,
+      });
+      this.dispatchOperations(record, operations);
+      return operations[index];
+    }
+
+    renderOperations(record, state, active) {
+      const operations = Array.isArray(state.operations)
+        ? state.operations : [];
+      record.operationsAddSelect.disabled = !active;
+      record.operationsAddButton.disabled = !active ||
+        operations.length >= MAX_OPERATIONS_PER_RECIPE;
+      const serialized = JSON.stringify(operations);
+      // Rebuilding rows drops focus, so an unchanged pipeline (the common
+      // refresh) only re-syncs the enabled flags on the existing rows.
+      if (serialized === record.renderedOperations &&
+          active === record.renderedOperationsActive) return;
+      record.renderedOperations = serialized;
+      record.renderedOperationsActive = active;
+      record.operationsHint.hidden = operations.length === 0;
+      record.operationList.replaceChildren();
+      operations.forEach((operation, index) => {
+        record.operationList.append(this.buildOperationRow(
+          record, operation, index, operations.length, active));
+      });
+    }
+
+    buildOperationRow(record, operation, index, total, active) {
+      const documentRef = record.documentRef;
+      const label = PROCESSING_OPERATION_LABELS[operation.algorithm] ||
+        operation.algorithm;
+      const row = element(documentRef, "li", "image-adjust-operation");
+      setData(row, "operationAlgorithm", operation.algorithm);
+      setData(row, "operationIndex", index);
+      const head = element(documentRef, "div", "image-adjust-operation-head");
+      const name = element(
+        documentRef, "span", "image-adjust-operation-name",
+        `${index + 1} · ${label}`,
+      );
+      const actions = element(
+        documentRef, "span", "image-adjust-operation-actions",
+      );
+      const control = (className, text, ariaLabel, disabled, onClick) => {
+        const button = element(documentRef, "button", className, text);
+        button.type = "button";
+        button.setAttribute("aria-label", ariaLabel);
+        button.disabled = disabled;
+        button.addEventListener("click", onClick);
+        return button;
+      };
+      actions.append(
+        control(
+          "image-adjust-operation-up", "↑", `Move ${label} earlier`,
+          !active || index === 0,
+          () => this.moveOperation(record, index, -1),
+        ),
+        control(
+          "image-adjust-operation-down", "↓", `Move ${label} later`,
+          !active || index === total - 1,
+          () => this.moveOperation(record, index, 1),
+        ),
+        control(
+          "image-adjust-operation-remove", "✕", `Remove ${label}`,
+          !active,
+          () => this.removeOperation(record, index),
+        ),
+      );
+      head.append(name, actions);
+      const parameters = element(
+        documentRef, "div", "image-adjust-operation-params",
+      );
+      const grayWorld = operation.algorithm === "white-balance-v1" &&
+        operation.mode === "gray_world";
+      for (const parameterName of Object.keys(
+        PROCESSING_OPERATION_PARAMETERS[operation.algorithm],
+      )) {
+        const wrap = element(documentRef, "label", "image-adjust-operation-param");
+        if (parameterName === "mode") {
+          wrap.append(element(documentRef, "span", "", "Mode"));
+          const mode = element(documentRef, "select");
+          for (const [value, text] of [
+            ["gray_world", "Gray world"], ["manual", "Manual"],
+          ]) {
+            const choice = element(documentRef, "option", "", text);
+            choice.value = value;
+            choice.setAttribute("value", value);
+            mode.append(choice);
+          }
+          mode.value = operation.mode;
+          mode.disabled = !active;
+          mode.setAttribute("aria-label", `${label} mode`);
+          mode.addEventListener("change", () => {
+            this.setOperationParameter(record, index, "mode", mode.value);
+          });
+          wrap.append(mode);
+          parameters.append(wrap);
+          continue;
+        }
+        const bounds =
+          PROCESSING_OPERATION_PARAMETERS[operation.algorithm][parameterName];
+        wrap.append(element(
+          documentRef, "span", "",
+          PROCESSING_PARAMETER_LABELS[parameterName] || parameterName,
+        ));
+        const input = element(documentRef, "input");
+        input.type = "number";
+        input.min = String(bounds[0]);
+        input.max = String(bounds[1]);
+        input.step = "1";
+        input.inputMode = "numeric";
+        input.value = String(operation[parameterName]);
+        input.disabled = !active || grayWorld &&
+          (parameterName === "temperature" || parameterName === "tint");
+        input.setAttribute(
+          "aria-label",
+          `${label} ${PROCESSING_PARAMETER_LABELS[parameterName] || parameterName}`,
+        );
+        input.addEventListener("change", () => {
+          const replacement = this.setOperationParameter(
+            record, index, parameterName, input.value);
+          if (replacement) input.value = String(replacement[parameterName]);
+        });
+        wrap.append(input);
+        parameters.append(wrap);
+      }
+      row.append(head, parameters);
+      return row;
     }
 
     schedulePreview(record = this.mountRecord) {
@@ -1265,19 +1668,26 @@
     BINARY_ALGORITHM,
     BRIGHTNESS_MAX,
     BRIGHTNESS_MIN,
+    CONTRAST_MAX,
+    CONTRAST_MIN,
     DEFAULT_CONTRAST,
     IMAGE_ADJUST_PROFILE_DEFAULT,
     IMAGE_ADJUST_PROFILE_KEY,
     ImageAdjustTool,
+    PROCESSING_OPERATION_DEFAULTS,
+    PROCESSING_OPERATION_LABELS,
     THRESHOLD_RULE,
     applyManualBinaryPreview,
     canApplyWheel,
     canEnterImageAdjust,
     canQueueImageAdjustShortcut,
     clampBrightness,
+    clampContrast,
+    clampOperationParameter,
     composeImageAdjustRendererOptions,
     createImageAdjustTool,
     createManualBinaryAdjustment,
+    createProcessingOperation,
     normalizeImageAdjustProfile,
     previewDimensions,
     renderBinaryCanvasPreview,
