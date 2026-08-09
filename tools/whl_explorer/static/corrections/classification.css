@@ -388,6 +388,11 @@
   pointer-events: none;
 }
 
+.corrections-artifact-overlay-layer[data-region-labels="off"]
+  .corrections-artifact-overlay-code {
+  display: none;
+}
+
 [data-classification-hot="true"],
 [data-hot="true"][data-artifact-key] {
   box-shadow: inset 3px 0 0 var(--accent, #65a9ff);

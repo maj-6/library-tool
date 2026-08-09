@@ -44,6 +44,14 @@
       return Math.max(minimum, Math.min(maximum, finite(value)));
     }
 
+    function normalizeArtifactOverlayProfile(value) {
+      const source = value && typeof value === "object" && !Array.isArray(value)
+        ? value : {};
+      return Object.freeze({
+        regionLabels: source.regionLabels !== false,
+      });
+    }
+
     function nodeInside(root, node) {
       if (!root || !node) return false;
       if (root === node) return true;
@@ -395,6 +403,7 @@
         };
         this.hotKey = "";
         this.focusedKey = "";
+        this.regionLabels = options.regionLabels !== false;
         this.layer = null;
         this.observer = null;
         this.rendering = false;
@@ -410,6 +419,7 @@
             "corrections-artifact-overlay-layer",
           );
           this.layer.setAttribute("aria-label", "Artifact region overlays");
+          this.updateRegionLabels();
           this.root.append(this.layer);
         }
         if (this.ResizeObserver && !this.observer) {
@@ -418,6 +428,20 @@
         }
         this.render();
         return this;
+      }
+
+      setRegionLabels(visible) {
+        this.regionLabels = visible !== false;
+        this.updateRegionLabels();
+        return this.regionLabels;
+      }
+
+      updateRegionLabels() {
+        if (!this.layer) return;
+        this.layer.setAttribute(
+          "data-region-labels",
+          this.regionLabels ? "on" : "off",
+        );
       }
 
       setRegions(values, options = {}) {
@@ -652,6 +676,7 @@
       exifOrientation,
       localClipPath,
       normalizeOverlayRegion,
+      normalizeArtifactOverlayProfile,
       orientNormalizedPoint,
       orientedDimensions,
       polygonBounds,

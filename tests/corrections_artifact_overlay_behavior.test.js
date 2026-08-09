@@ -10,6 +10,7 @@ const {
   artifactPresentationMetadata,
   createArtifactOverlay,
   createOverlayTransform,
+  normalizeArtifactOverlayProfile,
   normalizeOverlayRegion,
   orientNormalizedPoint,
   projectPolygon,
@@ -335,6 +336,44 @@ test("overlay renderer exposes named focusable polygons and recomputes on resize
 });
 
 
+test("region labels toggle at the layer without changing markers or handlers", () => {
+  const documentRef = focusAwareDocument();
+  const root = new FakeNode("div", documentRef);
+  root.clientWidth = 200;
+  root.clientHeight = 100;
+  const activated = [];
+  const overlay = createArtifactOverlay({
+    root,
+    documentRef,
+    regionLabels: false,
+    onActivate: (target) => activated.push(target.key),
+  });
+  overlay.setView({ sourceWidth: 400, sourceHeight: 200 });
+  overlay.setRegions([region()]);
+  overlay.mount();
+
+  const layer = root.querySelector(".corrections-artifact-overlay-layer");
+  const marker = root.querySelector(".corrections-artifact-overlay-shape");
+  const badge = root.querySelector(".corrections-artifact-overlay-code");
+  assert.equal(layer.dataset.regionLabels, "off");
+  assert.equal(badge.getAttribute("aria-hidden"), "true");
+  assert.match(marker.getAttribute("aria-label"), /ILL, Botanical plate/);
+
+  marker.emit("click");
+  assert.deepEqual(activated, ["annotation:region-1"]);
+  overlay.setRegionLabels(true);
+  assert.equal(layer.dataset.regionLabels, "on");
+  assert.equal(root.querySelector(".corrections-artifact-overlay-shape"), marker,
+    "the toggle does not rebuild the interactive marker");
+  assert.equal(root.querySelector(".corrections-artifact-overlay-code"), badge,
+    "the CSS-hidden badge remains mounted and aria-hidden");
+  assert.deepEqual(normalizeArtifactOverlayProfile({ regionLabels: false }), {
+    regionLabels: false,
+  });
+  assert.deepEqual(normalizeArtifactOverlayProfile(null), { regionLabels: true });
+});
+
+
 test("destroying the overlay releases a live hot target", () => {
   const documentRef = focusAwareDocument();
   const root = new FakeNode("div", documentRef);
@@ -382,4 +421,6 @@ test("perspective and Image Adjust tools retain pointer ownership over classific
     /\.perspective-editor\[data-active-tool="image-adjust"\][\s\S]*?\.corrections-artifact-overlay-shape/);
   assert.match(source,
     /data-active-tool="image-adjust"[\s\S]*?pointer-events:\s*none/);
+  assert.match(source,
+    /data-region-labels="off"[\s\S]*?\.corrections-artifact-overlay-code[\s\S]*?display:\s*none/);
 });

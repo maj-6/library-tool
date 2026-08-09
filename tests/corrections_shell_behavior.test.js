@@ -24,6 +24,9 @@ const {
   normalizeImageAdjustProfile,
 } = require("../tools/whl_explorer/static/corrections/image-adjust-tool");
 const {
+  normalizeArtifactOverlayProfile,
+} = require("../tools/whl_explorer/static/corrections/artifact-overlay");
+const {
   CorrectionCommandRegistry,
   DEFAULT_CLASSIFICATION_COMMANDS,
   normalizeKeyBinding,
@@ -407,6 +410,8 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
     normalizeEditors: (value) => registry.validateChoices(value),
     normalizeTools: (value) => ({
       imageAdjust: normalizeImageAdjustProfile(value && value.imageAdjust),
+      artifactOverlay: normalizeArtifactOverlayProfile(
+        value && value.artifactOverlay),
     }),
   });
   const saved = store.save("corrections/default", {
@@ -414,6 +419,7 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
     editors: { image: "image-plain", text: "image-overlay" },
     tools: {
       imageAdjust: { lastAppliedBrightness: 24 },
+      artifactOverlay: { regionLabels: false },
       privateLocator: "must-not-persist",
     },
     selection: { itemId: "must-not-persist" },
@@ -424,13 +430,21 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
   assert.deepEqual(saved.editors, { image: "image-plain" });
   assert.deepEqual(saved.tools, {
     imageAdjust: { lastAppliedBrightness: 24 },
+    artifactOverlay: { regionLabels: false },
   });
   assert.deepEqual(
     store.load("corrections/default").tools.imageAdjust,
     { lastAppliedBrightness: 24 },
   );
+  assert.deepEqual(
+    store.load("corrections/default").tools.artifactOverlay,
+    { regionLabels: false },
+  );
   store.save("corrections/default", {
-    tools: { imageAdjust: { lastAppliedBrightness: -12 } },
+    tools: {
+      imageAdjust: { lastAppliedBrightness: -12 },
+      artifactOverlay: { regionLabels: false },
+    },
   });
   assert.deepEqual(
     store.load("corrections/default").tools.imageAdjust,
@@ -470,8 +484,11 @@ test("UI profiles are isolated, validated, and persist presentation/tool choices
   );
   const imageAdjustKey = store.toolKey(
     "corrections/default", "imageAdjust");
+  const artifactOverlayKey = store.toolKey(
+    "corrections/default", "artifactOverlay");
   assert.equal(store.clear("corrections/default"), true);
   assert.equal(storage.getItem(imageAdjustKey), null);
+  assert.equal(storage.getItem(artifactOverlayKey), null);
   assert.equal(store.load("corrections/default").found, false);
 });
 
@@ -698,6 +715,59 @@ test("profile storage listeners are window-scoped and removed on shell destroy",
   windowRef.emit("storage", { key: "after-destroy" });
   assert.deepEqual(received, [event]);
   assert.equal(windowRef.listeners.get("storage").length, 0);
+});
+
+
+test("region label profile sync updates open overlays and the compact control", () => {
+  const storage = new MemoryStorage();
+  const store = new CorrectionsProfileStore({
+    storage,
+    normalizeTools: (value) => ({
+      artifactOverlay: normalizeArtifactOverlayProfile(
+        value && value.artifactOverlay),
+    }),
+  });
+  store.save("corrections/default", {
+    tools: { artifactOverlay: { regionLabels: false } },
+  });
+  const documentRef = fakeDocument();
+  const rootNode = new FakeNode("div", documentRef);
+  const toggle = new FakeNode("button", documentRef);
+  toggle.dataset.regionLabelsToggle = "";
+  rootNode.append(toggle);
+  const observed = [];
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    root: rootNode,
+    profileKey: "corrections/default",
+    profileStore: store,
+    imageAdjustTool: null,
+    artifactOverlayProfile: { regionLabels: true },
+    artifactOverlays: new Set([{
+      setRegionLabels(value) { observed.push(value); },
+    }]),
+  });
+
+  assert.equal(shell.handleProfileStorageEvent({
+    key: store.toolKey("corrections/default", "artifactOverlay"),
+    storageArea: storage,
+  }), true);
+  assert.deepEqual(shell.artifactOverlayProfile, { regionLabels: false });
+  assert.deepEqual(observed, [false]);
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  assert.equal(toggle.title, "Show region labels");
+
+  let persisted = null;
+  shell.listeners = [];
+  shell.persistProfile = (options) => { persisted = options; };
+  shell.bindRegionLabelsToggle();
+  toggle.emit("click");
+  assert.deepEqual(shell.artifactOverlayProfile, { regionLabels: true });
+  assert.deepEqual(observed, [false, true]);
+  assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  assert.deepEqual(persisted, {
+    toolUpdates: { artifactOverlay: { regionLabels: true } },
+  });
 });
 
 
@@ -1425,6 +1495,8 @@ test("editor overlay teardown clears a hovered classification target", () => {
       setHotTarget(target, detail) { hot.push({ target, detail }); },
       setSelectionTarget() {},
     },
+    artifactOverlayProfile: { regionLabels: false },
+    artifactOverlays: new Set(),
   });
   const resource = {
     summary: { itemId: "book-1" },
@@ -1446,7 +1518,10 @@ test("editor overlay teardown clears a hovered classification target", () => {
   const cleanup = shell.mountArtifactOverlay({ image }, resource);
   assert.equal(typeof cleanup, "function");
   const marker = stage.querySelector(".corrections-artifact-overlay-shape");
+  const layer = stage.querySelector(".corrections-artifact-overlay-layer");
   assert.ok(marker, "the overlay renders the region marker");
+  assert.equal(layer.dataset.regionLabels, "off",
+    "new editor overlays inherit the shared profile preference");
   marker.emit("pointerenter");
   assert.equal(hot.at(-1).target.key, "annotation:region-1");
   assert.equal(hot.at(-1).detail.source, "editor-overlay");
@@ -3096,6 +3171,8 @@ test("standalone shell markup exposes accessible panes, tree, editor, tray, and 
   assert.match(templateSource, /<aside[^>]+id="corrections-properties"/);
   assert.match(templateSource, /id="corrections-tray"[\s\S]*?role="tablist"/);
   assert.match(templateSource, /data-editor-selector/);
+  assert.match(templateSource,
+    /data-region-labels-toggle[^>]+aria-pressed="true"/);
   assert.match(templateSource,
     /data-editor-resource-label[^>]+aria-live="polite"[^>]+aria-atomic="true"/);
   assert.doesNotMatch(templateSource, /data-editor-host[^>]+aria-live=/,
