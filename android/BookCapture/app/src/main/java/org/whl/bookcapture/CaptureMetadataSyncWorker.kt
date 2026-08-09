@@ -446,7 +446,10 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                             decision.plan.artifact,
                             decision.plan.artifact.mime,
                             installed.length(),
-                        ) == null) {
+                        ) == null && PhotoAssetStore.acknowledgeDesktopCorrectionRow(
+                            entry.dir,
+                            decision.plan,
+                        )) {
                         DesktopCorrectionStage.AlreadyApplied
                     } else {
                         download(decision.plan)

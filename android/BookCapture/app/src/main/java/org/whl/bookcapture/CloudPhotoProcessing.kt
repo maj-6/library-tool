@@ -302,6 +302,7 @@ internal data class DesktopCorrectionInstallPlan(
     val baseDisplaySha256: String,
     val baseDisplayRevision: Int,
     val baseAppliedCorrectionId: String,
+    val baseAppliedCorrectionRevision: Long,
     val targetRevision: Int,
 )
 
@@ -409,8 +410,15 @@ internal fun validateDesktopCorrection(
         baseDisplaySha256 = asset.display.sha256,
         baseDisplayRevision = asset.display.revision,
         baseAppliedCorrectionId = asset.appliedDesktopCorrectionId,
+        baseAppliedCorrectionRevision = asset.appliedDesktopCorrectionRevision,
         targetRevision = asset.display.revision,
     )
+    if (asset.appliedDesktopCorrectionRevision > 0L &&
+        (row.revision < asset.appliedDesktopCorrectionRevision ||
+            row.revision == asset.appliedDesktopCorrectionRevision &&
+            asset.appliedDesktopCorrectionId != row.correctionId)) {
+        return DesktopCorrectionDecision.Rejected("stale correction revision")
+    }
     val display = asset.display
     if (asset.appliedDesktopCorrectionId == row.correctionId &&
         display.reference == desktopCorrectionDisplayFileName(installedPlan) &&

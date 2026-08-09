@@ -223,8 +223,9 @@ Install (mirrors `installCloudDisplayDerivative`):
   JPEG structure, dimensions, sha256.
 - Write `desktop_<assetId>_r<newRevision>_<sha256[:20]>.jpg` in the entry
   directory; bump `display.revision` by 1; set display recipe
-  `whl-desktop-correction-v1`; record the applied `correction_id` on the
-  asset (new optional contract field — absent for older entries).
+  `whl-desktop-correction-v1`; record the applied `correction_id` and last
+  acknowledged server row `revision` on the asset (optional contract fields;
+  the revision is absent on older entries).
 - Drop OCR geometry and write the re-OCR pending marker so
   `CloudDisplayReocrWorker` re-runs OCR against the corrected pixels.
 - Never overwrite `photo_N.jpg` or `original_<assetId>.jpg`.
@@ -234,8 +235,12 @@ full row/artifact contract and installed display metadata validate and the
 installed file's bytes, dimensions, and sha256 match the artifact envelope.
 Missing or damaged same-id pixels are downloaded and replaced at the existing
 display revision; a mismatched display contract is reinstalled at a new local
-revision. A newer row (different `correction_id`) also supersedes and bumps the
-display revision. The server row revision alone never forces an install.
+revision. A newer valid row with unchanged pixels only advances the persisted
+ordering evidence. Overlapping pull and explicit-sync workers compare that
+server revision under the entry lock so a newer row may replace an intervening
+older install, while an older download can never roll it back. A newer row with
+a different `correction_id` supersedes and bumps the display revision; the
+server row revision alone never forces a pixel reinstall.
 
 Curated title, author, and year do not ride inside `capture_corrections`.
 They continue through the existing `capture_book_metadata` projection. The

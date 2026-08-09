@@ -2032,16 +2032,32 @@
         typeof feature.reloadSelection === "function";
       const refreshOriginal = imageSelected && artifactId !== displayArtifactId &&
         selection.artifactId === artifactId &&
-        typeof feature.refresh === "function";
-      if (!reloadDisplay && !refreshOriginal && !refreshBooks) return null;
-      const repaintRequested = reloadDisplay || refreshOriginal;
-      const repaintSelectionKey = repaintRequested ? selectionKey : "";
+        typeof feature.refresh === "function" &&
+        (typeof feature.select === "function" ||
+          typeof feature.openDeepLink === "function");
       const refreshes = this.captureDisplayRefreshes instanceof Map
         ? this.captureDisplayRefreshes
         : (this.captureDisplayRefreshes = new Map());
+      const existing = refreshes.get(operationId);
+      if (existing && existing.originalArtifactId === artifactId &&
+          artifactId !== displayArtifactId && selectionMatches &&
+          selection.artifactId === artifactId && feature &&
+          feature.selectedKey === "" &&
+          existing.key === key && existing.selectionKey === selectionKey &&
+          existing.contextGeneration === feature.contextGeneration &&
+          existing.selectionGeneration === feature.selectionGeneration) {
+        // refresh({preserveSelection:false}) clears the feature selection and
+        // advances both epochs synchronously. The shell selection deliberately
+        // remains on the original until its replacement display is ready, so
+        // an event replay in that interval must share the exact in-flight
+        // convergence instead of replacing it with a Books-only refresh.
+        return existing.promise;
+      }
+      if (!reloadDisplay && !refreshOriginal && !refreshBooks) return null;
+      const repaintRequested = reloadDisplay || refreshOriginal;
+      const repaintSelectionKey = repaintRequested ? selectionKey : "";
       const contextGeneration = repaintRequested ? feature.contextGeneration : -1;
       const selectionGeneration = repaintRequested ? feature.selectionGeneration : -1;
-      const existing = refreshes.get(operationId);
       if (existing && existing.key === key &&
           existing.selectionKey === repaintSelectionKey &&
           existing.contextGeneration === contextGeneration &&
@@ -2053,6 +2069,7 @@
         selectionKey: repaintSelectionKey,
         contextGeneration,
         selectionGeneration,
+        originalArtifactId: refreshOriginal ? artifactId : "",
         promise: null,
       };
       const refresh = (async () => {
@@ -2064,16 +2081,58 @@
             try {
               const pending = reloadDisplay
                 ? feature.reloadSelection(key)
-                : feature.refresh({
-                    preserveSelection: true,
-                    reason: "capture-transform",
-                  });
+                : (async () => {
+                    // #297 moves a transformed original into the private cold
+                    // store in the same commit. Rebuild the tree without
+                    // reopening that now-absent key, then route the editor and
+                    // shell selection through the corrected sibling display.
+                    const treeRefresh = feature.refresh({
+                      preserveSelection: false,
+                      reason: "capture-transform",
+                    });
+                    const refreshContextGeneration = feature.contextGeneration;
+                    await treeRefresh;
+                    const currentSelection = this.state &&
+                      this.state.selection || {};
+                    if (this.destroyed ||
+                        feature.contextGeneration !== refreshContextGeneration ||
+                        currentSelection.artifactId !== artifactId ||
+                        (itemId && currentSelection.itemId !== itemId)) {
+                      return null;
+                    }
+                    const displayIsLoaded = feature.items &&
+                      typeof feature.items.has === "function" &&
+                      feature.items.has(key);
+                    let selectedDisplay = null;
+                    if (displayIsLoaded && typeof feature.select === "function") {
+                      const displaySelection = feature.select(key);
+                      if (feature.selectedKey === key) {
+                        // select() changes this epoch synchronously before it
+                        // awaits detail/resource routing. A streamed result in
+                        // that interval must still share this refresh.
+                        record.selectionKey = key;
+                        record.contextGeneration = feature.contextGeneration;
+                        record.selectionGeneration = feature.selectionGeneration;
+                      }
+                      selectedDisplay = await displaySelection;
+                    } else if (typeof feature.openDeepLink === "function") {
+                      selectedDisplay = await feature.openDeepLink(key);
+                    }
+                    if (feature.selectedKey === key) {
+                      // A streamed replay observes the post-selection epoch;
+                      // rebase the in-flight record now so it dedupes against
+                      // this successful original-to-display convergence.
+                      record.selectionKey = key;
+                    }
+                    return selectedDisplay;
+                  })();
               record.contextGeneration = feature.contextGeneration;
               record.selectionGeneration = feature.selectionGeneration;
               refreshed = await pending;
             } catch (error) {
               succeeded = false;
-              if (!this.destroyed && feature.selectedKey === repaintSelectionKey &&
+              if (!this.destroyed &&
+                  [repaintSelectionKey, key].includes(feature.selectedKey) &&
                   (!error || error.name !== "AbortError")) {
                 this.setStatus(
                   error && error.message ||

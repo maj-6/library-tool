@@ -1863,15 +1863,37 @@ def test_original_root_replaces_warmed_lazy_display_and_stales_with_original(
     current_original = rasters.get_raster_artifact(original.key)
     assert current_display is not None
     assert current_display.content_sha256 == corrected.content_sha256
-    assert current_original is not None
-    assert current_original.content_sha256 == original.content_sha256
-    assert "correction_display_head" not in current_original.extensions
+    # #297 moves the immutable original out of the hot capture directory in
+    # the same commit. The logical display head remains authorized by the
+    # exact cold-backup marker without routine reads touching those bytes.
+    assert current_original is None
+    capture_dir = server.CAPTURES_DIR / CAPTURE_ID
+    manifest_path = capture_dir / "photo_assets.json"
+    committed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    committed_import = committed_manifest["desktop_import"]["assets"][0]
+    marker = committed_import["original_backup"]
+    assert marker["sha256"] == original.content_sha256
+    assert committed_import["active_desktop_correction_id"] == (
+        command.operation_id
+    )
+    assert not (capture_dir / "orig_1.jpg").exists()
+    backup_path = (
+        server.BUILDS_PATH.parent
+        / "backups"
+        / "originals"
+        / "v1"
+        / "sha256"
+        / original.content_sha256[:2]
+        / original.content_sha256[2:]
+    )
+    assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == (
+        original.content_sha256
+    )
     # Phone/display-frame geometry cannot be attached to pixels transformed
     # from the differently revisioned original canvas. With no source-frame
     # annotations to remap, the corrected display drops those overlays.
     assert rasters.list_spatial_annotations(BOOK_ID) == ()
 
-    capture_dir = server.CAPTURES_DIR / CAPTURE_ID
     display_path = capture_dir / "photo_1.jpg"
     display_bytes = display_path.read_bytes()
     display_path.unlink()
@@ -1935,13 +1957,17 @@ def test_original_root_replaces_warmed_lazy_display_and_stales_with_original(
     replacement = replacement_stream.getvalue()
     replacement_sha = hashlib.sha256(replacement).hexdigest()
     (capture_dir / "orig_1.jpg").write_bytes(replacement)
-    manifest_path = capture_dir / "photo_assets.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["assets"][0]["original"].update(
         {"sha256": replacement_sha, "revision": 2}
     )
     manifest["desktop_import"]["assets"][0]["source_checksum"] = (
         replacement_sha
+    )
+    manifest["desktop_import"]["assets"][0]["raw_ref"] = "orig_1.jpg"
+    manifest["desktop_import"]["assets"][0].pop("original_backup")
+    manifest["desktop_import"]["assets"][0].pop(
+        "active_desktop_correction_id"
     )
     for geometry in manifest["assets"][0]["geometry"]:
         geometry["source_sha256"] = replacement_sha
