@@ -86,6 +86,11 @@
         ? options.operationIdFactory : defaultChOperationId;
       this.onChanged = typeof options.onChanged === "function"
         ? options.onChanged : () => {};
+      // Announces every installed /ch/state body (or null when none is
+      // current) so other panels can share this panel's fetch instead of
+      // issuing their own duplicate request per selection.
+      this.onState = typeof options.onState === "function"
+        ? options.onState : () => {};
       this.itemId = null;
       this.stateData = null;
       this.loading = false;
@@ -198,12 +203,17 @@
       return match.row && match.row.key ? match.row.key : match.key || "";
     }
 
+    announceState() {
+      this.onState(this.stateData);
+    }
+
     setItem(itemId) {
       const next = typeof itemId === "string" && itemId ? itemId : null;
       if (next === this.itemId) return Promise.resolve(null);
       this.itemId = next;
       this.stateData = null;
       this.busy = false;
+      this.announceState();
       this.setMessage("");
       if (!next) {
         this.generation += 1;
@@ -235,6 +245,7 @@
         if (this.destroyed || generation !== this.generation) return null;
         this.stateData = body;
         this.panelHidden = false;
+        this.announceState();
         return body;
       } catch (error) {
         if (this.destroyed || generation !== this.generation) return null;
@@ -246,6 +257,7 @@
           this.setMessage(error && error.message ||
             "The CH master-list state could not be loaded.", true);
         }
+        this.announceState();
         return null;
       } finally {
         if (generation === this.generation) {
@@ -332,6 +344,7 @@
             rejected: null,
           };
           this.panelHidden = false;
+          this.announceState();
           const conflicts = fieldList(body.conflicts);
           this.setMessage(body.replayed === true
             ? "This CH link was already recorded."

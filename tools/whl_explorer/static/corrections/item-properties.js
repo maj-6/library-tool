@@ -179,6 +179,98 @@
       Object.freeze({ key: "rights", label: "Rights" }),
     ]);
 
+    // --- CH provisional fill ------------------------------------------------
+    // Display-only preview of what approving the TOP CH master-list candidate
+    // would blank-fill, mirroring server.py _ch_merge_plan: CH filling an
+    // empty field is adoption; a non-empty field never shows a provisional
+    // value (disagreements belong to the CH panel as conflicts). Values are
+    // rendered through the input's placeholder attribute so they can never
+    // reach draft state or a save patch.
+    const CH_PROVISIONAL_FIELD_ORDER = Object.freeze([
+      "title", "author", "year", "edition", "volume", "publisher", "city",
+      "pages", "condition", "illustrations", "price", "categories", "notes",
+    ]);
+    // The CH rows speak the phone's field names; the item API spells these
+    // two differently (server.py _CH_FIELD_TO_ITEM_FIELD).
+    const CH_PROVISIONAL_FIELD_TO_ITEM_FIELD = Object.freeze({
+      author: "authors",
+      city: "publisher_city",
+    });
+    // WhlCatalogueItemCodec has no columns for these, so a build-backed item
+    // could never adopt them (server.py _CH_BUILD_UNSUPPORTED_FIELDS).
+    const CH_PROVISIONAL_BUILD_UNSUPPORTED = new Set([
+      "condition", "illustrations", "price",
+    ]);
+    // The ingest placeholder is not a title (server.py
+    // _CAPTURE_TITLE_PLACEHOLDER): the merge plan treats it as blank.
+    const CAPTURE_TITLE_PLACEHOLDER_RE =
+      /^\(untitled capture [0-9a-fA-F]{8}\)$/;
+
+    // What the TOP candidate of a /api/corrections/ch/state body would
+    // blank-fill into the current DRAFT, or null when nothing is provisional:
+    // a stamped match (state.match) means the reconciliation already
+    // happened, and a draft that cannot be parsed offers no safe view of
+    // which fields are empty.
+    function chProvisionalPlan(item, draft, state) {
+      if (!item || !draft || !isPlainObject(state) || state.ok !== true) {
+        return null;
+      }
+      if (state.item_id !== item.id || state.match) return null;
+      const candidates = Array.isArray(state.candidates)
+        ? state.candidates : [];
+      const top = candidates.length && isPlainObject(candidates[0])
+        ? candidates[0] : null;
+      if (!top || typeof top.key !== "string" || !top.key ||
+          !isPlainObject(top.fields)) return null;
+      let metadata;
+      try {
+        metadata = JSON.parse(draft.metadataText);
+      } catch (cause) {
+        return null;
+      }
+      if (!isPlainObject(metadata)) return null;
+      const extra = isPlainObject(metadata.extra) ? metadata.extra : {};
+      const buildLike = (item.storageKind ||
+        (item.kind === "book" ? "build" : "manual")) === "build";
+      const values = {};
+      let title = null;
+      for (const name of CH_PROVISIONAL_FIELD_ORDER) {
+        const chValue = typeof top.fields[name] === "string"
+          ? top.fields[name].trim() : "";
+        if (!chValue) continue;
+        if (name === "title") {
+          const current = String(draft.title == null ? "" : draft.title).trim();
+          if (!current || CAPTURE_TITLE_PLACEHOLDER_RE.test(current)) {
+            title = chValue;
+          }
+          continue;
+        }
+        if (buildLike && CH_PROVISIONAL_BUILD_UNSUPPORTED.has(name)) continue;
+        const field = CH_PROVISIONAL_FIELD_TO_ITEM_FIELD[name] || name;
+        const raw = Object.prototype.hasOwnProperty.call(metadata, field)
+          ? metadata[field] : null;
+        let occupied = raw == null ? false
+          : typeof raw === "string" ? raw.trim() !== "" : true;
+        if (!occupied) {
+          // Phone-captured CH-only fields land in extra at ingest under the
+          // phone's field name; a value held there blocks blank-fill exactly
+          // as it blocks adoption server-side. Nested JSON is not a scan
+          // value there either.
+          const held = extra[name];
+          if (held != null && typeof held !== "object") {
+            occupied = (held ? String(held) : "").trim() !== "";
+          }
+        }
+        if (!occupied) values[field] = chValue;
+      }
+      if (title === null && Object.keys(values).length === 0) return null;
+      return Object.freeze({
+        key: top.key,
+        title,
+        values: Object.freeze(values),
+      });
+    }
+
     function itemStorageKind(value) {
       const raw = value.storageKind !== undefined
         ? value.storageKind
@@ -634,9 +726,64 @@
         this.fieldErrors = null;
         this.advancedError = "";
         this.advancedText = "";
+        this.chState = null;
         this.generation = 0;
         this.abortController = null;
         this.destroyed = false;
+      }
+
+      // The shell feeds the CH panel's /ch/state responses here so the two
+      // panels share one request per selection. Bodies for another item (a
+      // late response after navigating away) are discarded.
+      setChState(state) {
+        this.chState = isPlainObject(state) && state.ok === true &&
+          typeof state.item_id === "string" && this.selectedId !== null &&
+          state.item_id === this.selectedId ? state : null;
+        this.updateProvisionalDisplay();
+      }
+
+      // Decorates the rendered inputs in place: an empty field the top CH
+      // candidate would blank-fill shows the candidate value as its
+      // placeholder — DISPLAY ONLY, a placeholder is never part of the value
+      // the draft or a save patch reads — tinted provisional-yellow, with the
+      // source named in the title attribute. Recomputed from the current
+      // draft so a user edit immediately replaces the provisional value.
+      updateProvisionalDisplay() {
+        if (!this.root || typeof this.root.querySelectorAll !== "function") {
+          return;
+        }
+        const plan = this.item && this.draft
+          ? chProvisionalPlan(this.item, this.draft, this.chState) : null;
+        const decorate = (input, value) => {
+          if (!input) return false;
+          if (value == null) {
+            if (typeof input.removeAttribute === "function" &&
+                input.getAttribute &&
+                input.getAttribute("data-item-provisional") != null) {
+              input.removeAttribute("data-item-provisional");
+              input.removeAttribute("placeholder");
+              input.removeAttribute("title");
+            }
+            return false;
+          }
+          setAttribute(input, "data-item-provisional", "ch");
+          setAttribute(input, "placeholder", value);
+          setAttribute(input, "title", `CH candidate: ${plan.key}`);
+          return true;
+        };
+        let shown = 0;
+        const title = this.root.querySelector("[data-item-title]");
+        if (decorate(title, plan ? plan.title : null)) shown += 1;
+        for (const input of this.root.querySelectorAll("[data-item-field]")) {
+          const key = input.getAttribute("data-item-field");
+          const value = plan &&
+            Object.prototype.hasOwnProperty.call(plan.values, key)
+            ? plan.values[key] : null;
+          if (decorate(input, value)) shown += 1;
+        }
+        const legend = this.root.querySelector(
+          "[data-item-provisional-legend]");
+        if (legend) legend.hidden = shown === 0;
       }
 
       mount() {
@@ -800,6 +947,7 @@
           this.root.dataset.state = this.busy
             ? "saving" : this.draft && this.draft.dirty ? "dirty" : "ready";
         }
+        this.updateProvisionalDisplay();
       }
 
       async setSelection(itemId) {
@@ -818,6 +966,7 @@
         this.fieldErrors = null;
         this.advancedError = "";
         this.advancedText = "";
+        this.chState = null;
         if (!next) {
           this.abortWork();
           this.render();
@@ -1153,6 +1302,7 @@
         title.maxLength = 4096;
         title.value = this.draft.title;
         title.disabled = this.busy;
+        setAttribute(title, "data-item-title", "");
         title.addEventListener("input", () => this.updateDraft({ title: title.value }));
 
         let parsedMetadata = null;
@@ -1204,6 +1354,16 @@
             grid.append(row);
           }
         }
+
+        // The provisional legend: one under-styled line naming what the
+        // yellow tint means; hidden until updateProvisionalDisplay marks a
+        // field. Approval stays in the CH panel — nothing here commits.
+        const provisionalLegend = element(this.documentRef, "p",
+          "item-provisional-legend",
+          "Highlighted values are provisional CH master-list suggestions " +
+          "— approve in the CH panel to apply them.");
+        setAttribute(provisionalLegend, "data-item-provisional-legend", "");
+        provisionalLegend.hidden = true;
 
         const residualKeys = Object.keys(split.residual).sort();
         const residualErrors = this.fieldErrors
@@ -1275,11 +1435,13 @@
           this.updateDraft({ title: title.value });
           void this.save();
         });
-        form.append(titleLabel, title, grid, advanced, note, actions);
+        form.append(titleLabel, title, grid, provisionalLegend, advanced,
+          note, actions);
         body.append(form);
         this.renderMessage(body);
         card.append(body);
         this.root.append(card);
+        this.updateProvisionalDisplay();
       }
 
       destroy() {
@@ -1299,6 +1461,7 @@
       CorrectionsItemApi,
       ItemMetadataEditor,
       MAX_METADATA_TEXT,
+      chProvisionalPlan,
       createCorrectionsItemApi,
       createItemMetadataEditor,
       decodeCorrectionsItem,
