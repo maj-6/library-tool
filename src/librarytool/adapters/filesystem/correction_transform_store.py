@@ -3,9 +3,9 @@
 The transform worker builds a complete, immutable commit draft in memory.  This
 adapter owns the last concurrency boundary: it reloads the source under the
 workspace and catalogue locks, compares every command and assertion revision
-pin, and publishes four new object files, their publication envelope, and the
-item-scoped immutable pointer and idempotency receipt in one
-:class:`RecoverableWriteSet` transaction.
+pin, and publishes four new object files, their publication envelope, the
+item-scoped immutable pointer, an optional capture-display head, and the
+idempotency receipt in one :class:`RecoverableWriteSet` transaction.
 
 Public identifiers never become path components.  Private storage uses
 SHA-256-addressed filenames below ``.engine`` and a receipt is staged last so a
@@ -111,6 +111,9 @@ _ITEM_INDEX_MARKER_VERSION = 1
 _OBJECT_ROOT = PurePosixPath(".engine/correction-transforms/objects")
 _PUBLICATION_ROOT = PurePosixPath(".engine/correction-transforms/publications")
 _ITEM_POINTER_ROOT = PurePosixPath(".engine/correction-transforms/by-item")
+_DISPLAY_HEAD_ROOT = PurePosixPath(
+    ".engine/correction-transforms/display-heads"
+)
 _ITEM_INDEX_MARKER = PurePosixPath(
     ".engine/correction-transforms/item-index-v1.json"
 )
@@ -118,11 +121,13 @@ _RECEIPT_ROOT = PurePosixPath(".engine/receipts/correction-transforms")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_ITEM_POINTER_BYTES = 64 * 1024
+_MAX_DISPLAY_HEAD_BYTES = 64 * 1024
 _MAX_PUBLICATION_BYTES = 128 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
 _MAX_ITEM_TRANSFORMS = 10_000
 _MAX_LEGACY_MIGRATION_DOCUMENTS = 100_000
 _TRANSFORM_DOCUMENT_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
+_CAPTURE_DISPLAY_ID_RE = re.compile(r"^capture:[0-9a-f]{40}:display$")
 _PROJECTED_RASTER_OUTPUTS = {
     "corrected-display": ("corrected-image", "Corrected display", "display"),
     "ocr-ready": ("processed-source", "OCR-ready image", "ocr"),
@@ -143,6 +148,19 @@ _ITEM_POINTER_FIELDS = frozenset(
         "schema",
         "version",
         "item_id",
+        "operation_id",
+        "command_sha256",
+        "publication_sha256",
+    }
+)
+_DISPLAY_HEAD_SCHEMA = "librarytool.correction-display-head"
+_DISPLAY_HEAD_VERSION = 1
+_DISPLAY_HEAD_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "item_id",
+        "artifact_id",
         "operation_id",
         "command_sha256",
         "publication_sha256",
@@ -293,6 +311,18 @@ class _TransformProjection:
         tuple[str, str, str],
         _TransformResourceCandidate,
     ]
+    display_heads: tuple["_CorrectionDisplayHead", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CorrectionDisplayHead:
+    logical_key: RasterArtifactKey
+    operation_id: str
+    root_source_revision: str
+    root_source_sha256: str
+    root_source: RasterSourceRef
+    artifact: RasterArtifactView
+    spatial_annotations: tuple[SpatialAnnotationView, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +339,14 @@ class _ValidatedTransformPublication:
     result: CorrectionTransformCommitResult
     document: Mapping[str, Any]
     publication_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectedTransformPublication:
+    pointer: _ItemPublicationPointer
+    command: CorrectionTransformCommand
+    result: CorrectionTransformCommitResult
+    document: Mapping[str, Any]
 
 
 def _repository_error(
@@ -560,7 +598,7 @@ class FilesystemCorrectionTransformStore:
                     live = self._load_source_locked(draft.command.key)
                     self._compare_source(draft, live)
                     result = _commit_result_for(draft)
-                    self._publish(draft, result)
+                    self._publish(draft, result, live=live)
                     return result
         except WriteSetError as exc:
             raise _repository_error(
@@ -648,10 +686,15 @@ class FilesystemCorrectionTransformStore:
     ) -> tuple[RasterArtifactView, ...]:
         """Project durable image outputs without exposing private storage."""
 
+        return self.project_item(item_id).raster_artifacts
+
+    def project_item(self, item_id: str) -> _TransformProjection:
+        """Project one item's outputs and validated logical display heads."""
+
         try:
             with self._write_set.workspace_lease():
                 with self._lock_context_for():
-                    return self._project_locked(item_id).raster_artifacts
+                    return self._project_locked(item_id)
         except WriteSetError as exc:
             raise _repository_error(
                 "the correction transform workspace is unavailable",
@@ -873,8 +916,22 @@ class FilesystemCorrectionTransformStore:
         ] = {}
         identities: set[str] = set()
         spatial_identities: set[str] = set()
+        publications: dict[str, _ProjectedTransformPublication] = {}
+        views_by_id: dict[str, RasterArtifactView] = {}
         for pointer in self._projection_item_pointers_locked(item_id):
             command, result, publication = self._validated_publication(pointer)
+            if command.operation_id in publications:
+                raise _repository_error(
+                    "a correction transform operation is duplicated",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_transform_item_pointer",
+                )
+            publications[command.operation_id] = _ProjectedTransformPublication(
+                pointer,
+                command,
+                result,
+                publication,
+            )
             source_scope = self._raster_source_from_publication(publication)
             for committed, raw_output in zip(
                 result.outputs,
@@ -977,6 +1034,7 @@ class FilesystemCorrectionTransformStore:
                     committed.kind,
                 )
                 values.append(view)
+                views_by_id[artifact_identity] = view
             for annotation in self._mapped_annotation_views(
                 command,
                 result,
@@ -992,6 +1050,12 @@ class FilesystemCorrectionTransformStore:
                     )
                 spatial_identities.add(identity)
                 spatial.append(annotation)
+        display_heads = self._display_heads_locked(
+            item_id,
+            publications=publications,
+            views_by_id=views_by_id,
+            spatial=spatial,
+        )
         return _TransformProjection(
             tuple(sorted(values, key=lambda value: value.key.artifact_id)),
             tuple(
@@ -1001,7 +1065,196 @@ class FilesystemCorrectionTransformStore:
                 )
             ),
             resources,
+            display_heads,
         )
+
+    def _display_heads_locked(
+        self,
+        item_id: str,
+        *,
+        publications: Mapping[str, _ProjectedTransformPublication],
+        views_by_id: Mapping[str, RasterArtifactView],
+        spatial: Sequence[SpatialAnnotationView],
+    ) -> tuple[_CorrectionDisplayHead, ...]:
+        relative = _DISPLAY_HEAD_ROOT / _digest_text(item_id)
+        paths = self._authority_document_paths(
+            relative,
+            artifact="correction_display_head",
+            maximum_entries=_MAX_ITEM_TRANSFORMS,
+        )
+        heads: list[_CorrectionDisplayHead] = []
+        logical_identities: set[str] = set()
+        for _name, path in sorted(paths.items()):
+            head = self._validated_display_head(
+                path,
+                item_id=item_id,
+                publications=publications,
+                views_by_id=views_by_id,
+                spatial=spatial,
+            )
+            identity = head.logical_key.artifact_id.casefold()
+            if identity in logical_identities:
+                raise _repository_error(
+                    "a correction display head identity is duplicated",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_display_head",
+                )
+            logical_identities.add(identity)
+            heads.append(head)
+        return tuple(
+            sorted(heads, key=lambda value: value.logical_key.artifact_id)
+        )
+
+    def _validated_display_head(
+        self,
+        path: Path,
+        *,
+        item_id: str,
+        publications: Mapping[str, _ProjectedTransformPublication],
+        views_by_id: Mapping[str, RasterArtifactView],
+        spatial: Sequence[SpatialAnnotationView],
+    ) -> _CorrectionDisplayHead:
+        payload, _digest, _byte_count = self._read_regular(
+            path,
+            maximum=_MAX_DISPLAY_HEAD_BYTES,
+            artifact="correction_display_head",
+            collect=True,
+        )
+        raw = self._decode_json(payload, artifact="correction_display_head")
+        try:
+            head = _strict_object(
+                raw,
+                fields=_DISPLAY_HEAD_FIELDS,
+                artifact="correction_display_head",
+            )
+            artifact_id = head["artifact_id"]
+            operation_id = head["operation_id"]
+            if (
+                head["schema"] != _DISPLAY_HEAD_SCHEMA
+                or type(head["version"]) is not int
+                or head["version"] != _DISPLAY_HEAD_VERSION
+                or head["item_id"] != item_id
+                or not isinstance(artifact_id, str)
+                or _CAPTURE_DISPLAY_ID_RE.fullmatch(artifact_id) is None
+                or not isinstance(operation_id, str)
+                or not operation_id
+                or not isinstance(head["command_sha256"], str)
+                or _SHA256_RE.fullmatch(head["command_sha256"]) is None
+                or not isinstance(head["publication_sha256"], str)
+                or _SHA256_RE.fullmatch(head["publication_sha256"]) is None
+                or path != self._display_head_path(item_id, artifact_id)
+            ):
+                raise ValueError("display head envelope is invalid")
+            canonical = _canonical_json(
+                head,
+                artifact="correction_display_head",
+            )
+            if payload != canonical:
+                raise ValueError("display head is not canonical")
+
+            publication = publications.get(operation_id)
+            if publication is None:
+                raise ValueError("display head publication is unavailable")
+            if (
+                publication.pointer.command_sha256
+                != head["command_sha256"]
+                or publication.pointer.publication_sha256
+                != head["publication_sha256"]
+            ):
+                raise ValueError("display head is not bound to its publication")
+            corrected = publication.result.output("corrected-display")
+            artifact = views_by_id.get(corrected.artifact_id.casefold())
+            if (
+                artifact is None
+                or artifact.revision != corrected.artifact_revision
+                or artifact.content_sha256 != corrected.content_sha256
+            ):
+                raise ValueError("display head corrected output is unavailable")
+            for candidate in publications.values():
+                if candidate.command.operation_id == operation_id:
+                    continue
+                command = candidate.command
+                if (
+                    command.source_revision == corrected.artifact_revision
+                    and command.source_sha256 == corrected.content_sha256
+                    and (
+                        command.artifact_id.casefold() == artifact_id.casefold()
+                        or command.artifact_id.casefold()
+                        == corrected.artifact_id.casefold()
+                    )
+                ):
+                    raise ValueError("display head has a committed descendant")
+            root = self._display_head_root_publication(
+                artifact_id,
+                publication,
+                publications,
+            )
+            root_source = root.document["source"]
+            annotations = tuple(
+                value
+                for value in spatial
+                if corrected.artifact_id in value.linked_artifact_ids
+            )
+            return _CorrectionDisplayHead(
+                logical_key=RasterArtifactKey(item_id, artifact_id),
+                operation_id=operation_id,
+                root_source_revision=root_source["source_revision"],
+                root_source_sha256=root_source["source_sha256"],
+                root_source=self._raster_source_from_publication(root.document),
+                artifact=artifact,
+                spatial_annotations=annotations,
+            )
+        except RepositoryError:
+            raise
+        except (EngineError, KeyError, TypeError, ValueError) as exc:
+            raise _repository_error(
+                "the correction display head is invalid",
+                code="invalid_correction_transform_storage",
+                artifact="correction_display_head",
+                cause=exc,
+            ) from exc
+
+    @staticmethod
+    def _display_head_root_publication(
+        logical_artifact_id: str,
+        leaf: _ProjectedTransformPublication,
+        publications: Mapping[str, _ProjectedTransformPublication],
+    ) -> _ProjectedTransformPublication:
+        current = leaf
+        visited: set[str] = set()
+        while True:
+            operation_id = current.command.operation_id
+            if operation_id in visited:
+                raise ValueError("display head ancestry contains a cycle")
+            visited.add(operation_id)
+            command = current.command
+            candidates: list[_ProjectedTransformPublication] = []
+            for candidate in publications.values():
+                if candidate.command.operation_id == operation_id:
+                    continue
+                corrected = candidate.result.output("corrected-display")
+                if (
+                    corrected.artifact_revision != command.source_revision
+                    or corrected.content_sha256 != command.source_sha256
+                ):
+                    continue
+                if command.artifact_id.casefold() == logical_artifact_id.casefold():
+                    candidates.append(candidate)
+                elif (
+                    corrected.artifact_id.casefold()
+                    == command.artifact_id.casefold()
+                ):
+                    candidates.append(candidate)
+            if len(candidates) > 1:
+                raise ValueError("display head ancestry is ambiguous")
+            if not candidates:
+                if (
+                    command.artifact_id.casefold()
+                    != logical_artifact_id.casefold()
+                ):
+                    raise ValueError("display head ancestry has no logical root")
+                return current
+            current = candidates[0]
 
     def _item_publication_pointers(
         self,
@@ -2162,6 +2415,8 @@ class FilesystemCorrectionTransformStore:
         self,
         draft: CorrectionTransformCommitDraft,
         result: CorrectionTransformCommitResult,
+        *,
+        live: CorrectionSourceSnapshot,
     ) -> None:
         operation_id = draft.command.operation_id
         self._ensure_item_index_migrated_locked()
@@ -2211,8 +2466,13 @@ class FilesystemCorrectionTransformStore:
             draft.command,
             publication_sha256=receipt["publication_sha256"],
         )
+        display_head_payload = self._display_head_payload(
+            draft,
+            live=live,
+            publication_sha256=receipt["publication_sha256"],
+        )
 
-        targets: list[tuple[Path, bytes, str]] = []
+        targets: list[tuple[Path, bytes, str, bool]] = []
         for kind in CORRECTION_OUTPUT_KINDS:
             output = draft.output(kind)
             if len(output.content) > _MAX_OUTPUT_BYTES:
@@ -2227,6 +2487,7 @@ class FilesystemCorrectionTransformStore:
                     self._object_path(committed.artifact_id),
                     output.content,
                     kind,
+                    True,
                 )
             )
         targets.extend(
@@ -2235,6 +2496,7 @@ class FilesystemCorrectionTransformStore:
                     self._publication_path(operation_id),
                     publication_payload,
                     "correction_transform_publication",
+                    True,
                 ),
                 (
                     self._item_pointer_path(
@@ -2243,16 +2505,35 @@ class FilesystemCorrectionTransformStore:
                     ),
                     pointer_payload,
                     "correction_transform_item_pointer",
-                ),
-                (
-                    self._receipt_path(operation_id),
-                    receipt_payload,
-                    "correction_transform_receipt",
+                    True,
                 ),
             )
         )
-        for path, _payload, artifact in targets:
-            if self._path_exists(path, artifact=artifact):
+        if display_head_payload is not None:
+            logical_artifact_id, head_payload = display_head_payload
+            targets.append(
+                (
+                    self._display_head_path(
+                        draft.command.item_id,
+                        logical_artifact_id,
+                    ),
+                    head_payload,
+                    "correction_display_head",
+                    False,
+                )
+            )
+        # The receipt stays last: durable replay must never become visible
+        # before the mutable logical-display head is recoverable with it.
+        targets.append(
+            (
+                self._receipt_path(operation_id),
+                receipt_payload,
+                "correction_transform_receipt",
+                True,
+            )
+        )
+        for path, _payload, artifact, immutable in targets:
+            if immutable and self._path_exists(path, artifact=artifact):
                 raise _repository_error(
                     "an immutable correction transform target already exists",
                     code="correction_transform_target_exists",
@@ -2270,7 +2551,7 @@ class FilesystemCorrectionTransformStore:
                     "command_sha256": draft.command.fingerprint,
                 },
             )
-            for path, payload, _artifact in targets:
+            for path, payload, _artifact, _immutable in targets:
                 transaction.stage_write(self._relative(path), payload)
             transaction.commit(
                 receipt={
@@ -2287,6 +2568,109 @@ class FilesystemCorrectionTransformStore:
                 cause=exc,
                 retryable=True,
             ) from exc
+
+    def _display_head_payload(
+        self,
+        draft: CorrectionTransformCommitDraft,
+        *,
+        live: CorrectionSourceSnapshot,
+        publication_sha256: str,
+    ) -> tuple[str, bytes] | None:
+        command = draft.command
+        if (
+            live.artifact.key != command.key
+            or live.artifact.revision != command.artifact_revision
+            or live.source_revision != command.source_revision
+            or live.source_sha256 != command.source_sha256
+        ):
+            raise ConflictError(
+                "correction source changed before display-head publication",
+                code="correction_source_stale",
+                details={"artifact_id": command.artifact_id},
+            )
+
+        logical_artifact_id = ""
+        existing: _CorrectionDisplayHead | None = None
+        if _CAPTURE_DISPLAY_ID_RE.fullmatch(command.artifact_id) is not None:
+            logical_artifact_id = command.artifact_id
+            path = self._display_head_path(command.item_id, logical_artifact_id)
+            if self._path_exists(path, artifact="correction_display_head"):
+                existing = next(
+                    (
+                        value
+                        for value in self._project_locked(command.item_id).display_heads
+                        if value.logical_key == command.key
+                    ),
+                    None,
+                )
+                if existing is None:
+                    raise _repository_error(
+                        "the current correction display head is unavailable",
+                        code="invalid_correction_transform_storage",
+                        artifact="correction_display_head",
+                    )
+        else:
+            matches = tuple(
+                value
+                for value in self._project_locked(command.item_id).display_heads
+                if value.artifact.key == command.key
+            )
+            if len(matches) > 1:
+                raise _repository_error(
+                    "the current correction display head is ambiguous",
+                    code="invalid_correction_transform_storage",
+                    artifact="correction_display_head",
+                )
+            if not matches:
+                return None
+            existing = matches[0]
+            logical_artifact_id = existing.logical_key.artifact_id
+
+        if (
+            existing is not None
+            and command.artifact_id.casefold() != logical_artifact_id.casefold()
+            and (
+                existing.artifact.resource is None
+                or command.source_revision != existing.artifact.resource.revision
+                or command.source_sha256 != existing.artifact.content_sha256
+            )
+        ):
+            raise ConflictError(
+                "correction display changed before commit",
+                code="correction_source_stale",
+                details={
+                    "artifact_id": command.artifact_id,
+                    "expected_source_revision": (
+                        existing.artifact.resource.revision
+                        if existing.artifact.resource is not None
+                        else ""
+                    ),
+                    "actual_source_revision": command.source_revision,
+                    "expected_source_sha256": existing.artifact.content_sha256,
+                    "actual_source_sha256": command.source_sha256,
+                },
+            )
+
+        # For a logical command whose pins differ from `existing`, the exact
+        # live snapshot above and `_compare_source` have already established a
+        # new capture generation. Publishing it starts a new ancestry root.
+        document = {
+            "schema": _DISPLAY_HEAD_SCHEMA,
+            "version": _DISPLAY_HEAD_VERSION,
+            "item_id": command.item_id,
+            "artifact_id": logical_artifact_id,
+            "operation_id": command.operation_id,
+            "command_sha256": command.fingerprint,
+            "publication_sha256": publication_sha256,
+        }
+        payload = _canonical_json(document, artifact="correction_display_head")
+        if len(payload) > _MAX_DISPLAY_HEAD_BYTES:
+            raise _repository_error(
+                "the correction display head is too large",
+                code="invalid_correction_transform_document",
+                artifact="correction_display_head",
+            )
+        return logical_artifact_id, payload
 
     def _item_pointer_payload(
         self,
@@ -3051,6 +3435,13 @@ class FilesystemCorrectionTransformStore:
             _ITEM_POINTER_ROOT
             / _digest_text(item_id)
             / f"{_digest_text(operation_id)}.json"
+        )
+
+    def _display_head_path(self, item_id: str, artifact_id: str) -> Path:
+        return self._target(
+            _DISPLAY_HEAD_ROOT
+            / _digest_text(item_id)
+            / f"{_digest_text(artifact_id)}.json"
         )
 
     def _receipt_path(self, operation_id: str) -> Path:

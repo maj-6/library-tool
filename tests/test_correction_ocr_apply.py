@@ -15,7 +15,10 @@ from librarytool.engine.correction_ocr import (
     CorrectionOcrProposalProviderView,
     CorrectionOcrProposalView,
 )
-from librarytool.engine.correction_transforms import CommittedCorrectionOutput
+from librarytool.engine.correction_transforms import (
+    CommittedCorrectionOutput,
+    CorrectionTransformCommand,
+)
 
 
 ITEM_ID = "b-" + "1" * 32
@@ -89,32 +92,119 @@ IDENTITY_QUAD = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
 
 
 def _publish(engine_root, operation_id, source_artifact_id, outputs,
-             quad=IDENTITY_QUAD) -> None:
+             quad=IDENTITY_QUAD, *, source_revision: str = "",
+             source_sha256: str = "", committed: bool = True) -> None:
     """Minimal committed publication, laid out the way the store writes it."""
 
+    assert bool(source_revision) is bool(source_sha256)
     transforms = engine_root / ".engine" / "correction-transforms"
     digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
-    command = {"item_id": ITEM_ID, "artifact_id": source_artifact_id}
-    if quad is not None:
-        command["quad"] = quad
+    if not source_revision:
+        parent_outputs = [
+            output
+            for path in (transforms / "publications").glob("*.json")
+            for publication in (json.loads(path.read_text("utf-8")),)
+            for output in publication.get("outputs", ())
+            if output.get("artifact_id") == source_artifact_id
+        ] if (transforms / "publications").is_dir() else []
+        if len(parent_outputs) == 1:
+            source_revision = parent_outputs[0]["artifact_revision"]
+            source_sha256 = parent_outputs[0]["content_sha256"]
+    source_revision = source_revision or (
+        "source:" + hashlib.sha256(
+            f"source-revision:{operation_id}".encode("utf-8")
+        ).hexdigest()
+    )
+    source_sha256 = source_sha256 or hashlib.sha256(
+        f"source-content:{operation_id}".encode("utf-8")
+    ).hexdigest()
+    command = CorrectionTransformCommand(
+        item_id=ITEM_ID,
+        artifact_id=source_artifact_id,
+        artifact_revision=(
+            "artifact:" + hashlib.sha256(
+                f"artifact-revision:{operation_id}".encode("utf-8")
+            ).hexdigest()
+        ),
+        source_revision=source_revision,
+        source_sha256=source_sha256,
+        quad=tuple(tuple(point) for point in (quad or IDENTITY_QUAD)),
+        operation_id=operation_id,
+        rerun_ocr=False,
+    ).as_dict()
+    if quad is None:
+        # A self-consistently checksummed but invalid historical command must
+        # be tolerated by the scan and rejected by the geometry path.
+        command.pop("quad")
+    command_sha256 = hashlib.sha256(
+        server._correction_transform_canonical_json(command)
+    ).hexdigest()
+    output_rows = []
+    for output in outputs:
+        assert len(output) in {2, 4}
+        kind, artifact_id = output[:2]
+        row = {
+            "kind": kind,
+            "artifact_id": artifact_id,
+            "artifact_revision": (
+                output[2] if len(output) == 4 else
+                "ctr:" + hashlib.sha256(
+                    f"revision:{operation_id}:{kind}".encode("utf-8")
+                ).hexdigest()
+            ),
+            "content_sha256": (
+                output[3] if len(output) == 4 else
+                hashlib.sha256(
+                    f"content:{operation_id}:{kind}".encode("utf-8")
+                ).hexdigest()
+            ),
+        }
+        output_rows.append(row)
     publication = {
         "schema": "librarytool.correction-transform-publication",
         "version": 2,
         "operation_id": operation_id,
+        "command_sha256": command_sha256,
         "command": command,
-        "outputs": [
-            {"kind": kind, "artifact_id": artifact_id}
-            for kind, artifact_id in outputs
-        ],
+        "outputs": output_rows,
     }
     (transforms / "publications").mkdir(parents=True, exist_ok=True)
-    (transforms / "publications" / f"{digest}.json").write_text(
-        json.dumps(publication), encoding="utf-8")
+    publication_payload = server._correction_transform_canonical_json(
+        publication)
+    publication_sha256 = hashlib.sha256(publication_payload).hexdigest()
+    (transforms / "publications" / f"{digest}.json").write_bytes(
+        publication_payload)
     pointer_dir = transforms / "by-item" / hashlib.sha256(
         ITEM_ID.encode("utf-8")).hexdigest()
     pointer_dir.mkdir(parents=True, exist_ok=True)
-    (pointer_dir / f"{digest}.json").write_text(
-        json.dumps({"operation_id": operation_id}), encoding="utf-8")
+    (pointer_dir / f"{digest}.json").write_bytes(
+        server._correction_transform_canonical_json({
+            "schema": "librarytool.correction-transform-item-pointer",
+            "version": 1,
+            "item_id": ITEM_ID,
+            "operation_id": operation_id,
+            "command_sha256": command_sha256,
+            "publication_sha256": publication_sha256,
+        })
+    )
+    if committed:
+        receipt_dir = (
+            engine_root / ".engine" / "receipts" / "correction-transforms"
+        )
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        (receipt_dir / f"{digest}.json").write_bytes(
+            server._correction_transform_canonical_json({
+                "schema": "librarytool.correction-transform-receipt",
+                "version": 1,
+                "operation_id": operation_id,
+                "command_sha256": command_sha256,
+                "publication_sha256": publication_sha256,
+                "result": {
+                    "operation_id": operation_id,
+                    "outputs": output_rows,
+                },
+            })
+        )
 
 
 @pytest.fixture()
@@ -481,12 +571,153 @@ def test_apply_composes_chained_transform_inverses(
     }
 
 
+def test_apply_composes_same_slot_transform_inverses_from_source_pin(
+    monkeypatch, apply_workspace,
+) -> None:
+    """A rerun addresses the stable display slot and pins its prior output."""
+
+    display_slot = (
+        server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+        + ":display"
+    )
+    display_one = "ctr-" + "1" * 40
+    display_one_revision = "ctr:" + "5" * 64
+    display_one_sha = "6" * 64
+    _publish(
+        apply_workspace.engine_root,
+        "op-same-slot-1",
+        display_slot,
+        (("corrected-display", display_one,
+          display_one_revision, display_one_sha),
+         ("ocr-ready", "ctr-" + "2" * 40)),
+        quad=[[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]],
+    )
+    ocr_two = "ctr-" + "3" * 40
+    _publish(
+        apply_workspace.engine_root,
+        "op-same-slot-2",
+        display_slot,
+        (("corrected-display", "ctr-" + "4" * 40),
+         ("ocr-ready", ocr_two)),
+        quad=[[0.0, 0.0], [1.0, 0.0], [1.0, 0.5], [0.0, 0.5]],
+        source_revision=display_one_revision,
+        source_sha256=display_one_sha,
+    )
+    proposal = _proposal(recognition={
+        "text": "Same slot chain",
+        "regions": [{
+            "role": "text",
+            "box": {"x": 0.2, "y": 0.4, "w": 0.4, "h": 0.2},
+            "order": 1,
+            "text": "Same slot chain",
+        }],
+        "dims": {"w": 400, "h": 600, "dpi": 200},
+    }, source_artifact_id=ocr_two)
+    _install(monkeypatch, (proposal,))
+
+    response = _apply(apply_workspace, proposal.proposal_ref)
+
+    assert response.status_code == 200
+    layout = lib.load_json(
+        apply_workspace.entries / BUILD_ID / "ocr" / "layout.json", {})
+    assert layout["regions"]["primary"]["1"]["items"][0]["box"] == {
+        "x": 0.1, "y": 0.2, "w": 0.2, "h": 0.1,
+    }
+
+
+def test_ocr_capture_chain_rejects_ambiguous_same_slot_source_pin(
+    apply_workspace,
+) -> None:
+    display_slot = (
+        server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+        + ":display"
+    )
+    shared_revision = "ctr:" + "7" * 64
+    shared_sha = "8" * 64
+    for suffix in ("a", "b"):
+        _publish(
+            apply_workspace.engine_root,
+            f"op-pin-{suffix}",
+            display_slot,
+            (("corrected-display", "ctr-" + suffix * 40,
+              shared_revision, shared_sha),),
+        )
+    ocr_ready = "ctr-" + "c" * 40
+    _publish(
+        apply_workspace.engine_root,
+        "op-pin-child",
+        display_slot,
+        (("corrected-display", "ctr-" + "d" * 40),
+         ("ocr-ready", ocr_ready)),
+        source_revision=shared_revision,
+        source_sha256=shared_sha,
+    )
+
+    located = server._ocr_apply_capture_asset(
+        ITEM_ID, CAPTURE_ID, ocr_ready, apply_workspace.engine_root)
+
+    assert located is None
+
+
+def test_ocr_capture_chain_skips_in_flight_publication_without_receipt(
+    apply_workspace,
+) -> None:
+    display_slot = (
+        server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+        + ":display"
+    )
+    ocr_ready = "ctr-" + "e" * 40
+    _publish(
+        apply_workspace.engine_root,
+        "op-in-flight",
+        display_slot,
+        (("corrected-display", "ctr-" + "f" * 40),
+         ("ocr-ready", ocr_ready)),
+        committed=False,
+    )
+
+    located = server._ocr_apply_capture_asset(
+        ITEM_ID, CAPTURE_ID, ocr_ready, apply_workspace.engine_root)
+
+    assert located is None
+
+
+def test_ocr_capture_chain_rejects_legacy_id_with_mismatched_pins(
+    apply_workspace,
+) -> None:
+    display_slot = (
+        server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
+        + ":display"
+    )
+    parent_display = "ctr-" + "0" * 40
+    _publish(
+        apply_workspace.engine_root,
+        "op-mismatch-parent",
+        display_slot,
+        (("corrected-display", parent_display),),
+    )
+    ocr_ready = "ctr-" + "1" * 39 + "2"
+    _publish(
+        apply_workspace.engine_root,
+        "op-mismatch-child",
+        parent_display,
+        (("corrected-display", "ctr-" + "2" * 40),
+         ("ocr-ready", ocr_ready)),
+        source_revision="ctr:" + "9" * 64,
+        source_sha256="a" * 64,
+    )
+
+    located = server._ocr_apply_capture_asset(
+        ITEM_ID, CAPTURE_ID, ocr_ready, apply_workspace.engine_root)
+
+    assert located is None
+
+
 def test_apply_rejects_chains_it_cannot_map_back(
     monkeypatch, apply_workspace,
 ) -> None:
-    """An original-rooted chain (the entry page is the DISPLAY rendition) and
-    a publication without a quad must both refuse instead of writing
-    displaced boxes."""
+    """An original-rooted chain cannot map onto the displayed entry page, and
+    a malformed quadless publication is not admitted as committed state."""
 
     namespace = server._capture_artifact_namespace(CAPTURE_ID, "asset-01")
     original_ready = "ctr-" + "9" * 40
@@ -520,7 +751,9 @@ def test_apply_rejects_chains_it_cannot_map_back(
     assert from_original.status_code == 422
     assert from_original.get_json()["code"] == "ocr_apply_geometry_unmappable"
     assert without_quad.status_code == 422
-    assert without_quad.get_json()["code"] == "ocr_apply_geometry_unmappable"
+    assert without_quad.get_json()["code"] == (
+        "ocr_apply_source_not_capture_derived"
+    )
     assert apply_workspace.stale_calls == []
 
 

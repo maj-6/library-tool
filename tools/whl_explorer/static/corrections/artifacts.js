@@ -311,6 +311,7 @@
         this.context = null;
         this.contextGeneration = 0;
         this.selectionGeneration = 0;
+        this.selectionReloadGeneration = 0;
         this.contextAbort = null;
         this.selectionAbort = null;
         this.listeners = [];
@@ -655,6 +656,30 @@
         return detail;
       }
 
+      async reloadSelection(key = this.selectedKey) {
+        if (!key || key !== this.selectedKey || this.destroyed) return null;
+        const contextGeneration = this.contextGeneration;
+        const selectionGeneration = this.selectionGeneration;
+        const reloadGeneration = ++this.selectionReloadGeneration;
+        // A repaint is context-owned, not selection-request-owned. select()
+        // aborts the latter while replacing the raster lease, so sharing that
+        // signal lets an older completed repaint cancel a newer one.
+        const detail = await this.loadDetail(key, {
+          force: true,
+          signal: this.contextAbort && this.contextAbort.signal,
+        });
+        if (!detail || contextGeneration !== this.contextGeneration ||
+            selectionGeneration !== this.selectionGeneration ||
+            reloadGeneration !== this.selectionReloadGeneration ||
+            key !== this.selectedKey || this.destroyed) return null;
+        this.mergeDetail(detail);
+        // select() reuses the just-refreshed revision from the detail cache,
+        // releases the old raster lease, and routes the new display bytes.
+        // Expanded groups, keyboard cursor, scroll, and stable artifact key
+        // remain untouched.
+        return this.select(key, { preserveTreeNavigation: true });
+      }
+
       mergeDetail(detail) {
         if (!detail) return null;
         const state = this.groupState(detail.group);
@@ -964,6 +989,16 @@
       async select(key, options = {}) {
         const summary = this.items.get(key);
         if (!summary || this.destroyed) return null;
+        const preserveTreeNavigation = options.preserveTreeNavigation === true &&
+          key === this.selectedKey;
+        const preservedActiveKey = preserveTreeNavigation ? this.activeKey : "";
+        const preservedScrollTop = preserveTreeNavigation
+          ? Number(this.treeRoot.scrollTop) || 0 : 0;
+        const restoreTreeNavigation = () => {
+          if (!preserveTreeNavigation || this.selectedKey !== key ||
+              this.activeKey !== preservedActiveKey) return;
+          this.treeRoot.scrollTop = preservedScrollTop;
+        };
         const navigationPreview = this.currentResource &&
           this.currentResource.navigationOnly === true &&
           this.currentResource.id === summary.id &&
@@ -971,15 +1006,16 @@
           summary.family === "image"
           ? this.currentResource : null;
         this.selectedKey = key;
-        this.activeKey = key;
+        if (!preserveTreeNavigation) this.activeKey = key;
         this.relatedKeys = new Set(this.linkIndex.get(key) || []);
-        this.ensureActiveVisible();
+        if (!preserveTreeNavigation) this.ensureActiveVisible();
         this.abortSelectionWork();
         const selectionGeneration = this.selectionGeneration;
         this.emitSelection(summary);
         if (this.properties) this.properties.setSelection(summary, { loading: true });
         this.publishResource(navigationPreview || this.loadingResource(summary));
         this.render();
+        restoreTreeNavigation();
         if (options.focus && typeof this.treeRoot.focus === "function") this.treeRoot.focus();
         try {
           const detail = await this.loadDetail(key, {
@@ -988,6 +1024,7 @@
           if (!detail || selectionGeneration !== this.selectionGeneration ||
               this.selectedKey !== key || this.destroyed) return null;
           this.mergeDetail(detail);
+          restoreTreeNavigation();
           if (this.properties) this.properties.setSelection(detail);
           this.emitSelection(detail);
           await this.routeResource(detail, selectionGeneration);

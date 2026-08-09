@@ -556,6 +556,185 @@ test("refresh evicts same-revision details before restoring inherited-category s
 });
 
 
+test("selected capture display reload preserves its group and tree cursor", async () => {
+  const artifactId = "capture:stable-display:display";
+  const key = `artifact:${artifactId}`;
+  let revision = 1;
+  let listReads = 0;
+  let detailReads = 0;
+  const resolved = [];
+  const revoked = [];
+  const display = () => raster(artifactId, "captured-image", {
+    revision: `capture-display-r${revision}`,
+    resource: {
+      resource_id: "capture-display-resource",
+      revision: `capture-display-resource-r${revision}`,
+      variant: "display",
+    },
+  });
+  const { feature, treeRoot } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() {
+        listReads += 1;
+        return { revision: `source-index-r${revision}`, items: [display()] };
+      },
+      async get() {
+        detailReads += 1;
+        return display();
+      },
+    },
+    resources: {
+      async resolveRaster({ resourceRef }) {
+        resolved.push(resourceRef.revision);
+        const currentRevision = revision;
+        return {
+          url: `/safe/display-r${currentRevision}.jpg`,
+          revoke: () => revoked.push(currentRevision),
+        };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select(key);
+  assert.equal(feature.currentResource.url, "/safe/display-r1.jpg");
+  feature.activeKey = "group:source-images";
+  treeRoot.scrollTop = 73;
+
+  revision = 2;
+  await feature.reloadSelection(key);
+
+  assert.equal(feature.selectedKey, key);
+  assert.equal(feature.activeKey, "group:source-images",
+    "terminal repaint does not steal the keyboard cursor");
+  assert.equal(treeRoot.scrollTop, 73,
+    "terminal repaint does not scroll the tree back to the selection");
+  assert.equal(feature.items.get(key).group, "source-images");
+  assert.equal(feature.expandedGroups.has("source-images"), true);
+  assert.equal(feature.currentResource.url, "/safe/display-r2.jpg");
+  assert.equal(feature.currentResource.summary.revision, "capture-display-r2");
+  assert.equal(listReads, 1, "the stable display reload skips collection paging");
+  assert.equal(detailReads, 2, "only the selected detail is force-refreshed");
+  assert.deepEqual(resolved, [
+    "capture-display-resource-r1",
+    "capture-display-resource-r2",
+  ]);
+  assert.deepEqual(revoked, [1], "the replaced raster lease is released");
+});
+
+
+test("newest capture display reload wins when older detail resolves first", async () => {
+  const artifactId = "capture:stable-race:display";
+  const key = `artifact:${artifactId}`;
+  const reloadRequests = [];
+  const resolved = [];
+  let detailReads = 0;
+  const display = (revision) => raster(artifactId, "captured-image", {
+    revision: `capture-display-r${revision}`,
+    resource: {
+      resource_id: "capture-display-resource",
+      revision: `capture-display-resource-r${revision}`,
+      variant: "display",
+    },
+  });
+  const { feature } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() {
+        return { revision: "source-index-r1", items: [display(1)] };
+      },
+      get({ signal }) {
+        detailReads += 1;
+        if (detailReads === 1) return Promise.resolve(display(1));
+        const request = deferred();
+        reloadRequests.push({ ...request, signal });
+        return request.promise;
+      },
+    },
+    resources: {
+      async resolveRaster({ resourceRef }) {
+        resolved.push(resourceRef.revision);
+        return { url: `/safe/${resourceRef.revision}.jpg` };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select(key);
+  const older = feature.reloadSelection(key);
+  const newer = feature.reloadSelection(key);
+  assert.equal(reloadRequests.length, 2);
+
+  reloadRequests[0].resolve(display(2));
+  assert.equal(await older, null, "a superseded detail is never merged or routed");
+  assert.equal(feature.currentResource.summary.revision, "capture-display-r1");
+  assert.equal(reloadRequests[1].signal.aborted, false,
+    "the older completion cannot abort the newer repaint");
+
+  reloadRequests[1].resolve(display(3));
+  await newer;
+  assert.equal(feature.items.get(key).revision, "capture-display-r3");
+  assert.equal(feature.currentResource.summary.revision, "capture-display-r3");
+  assert.equal(feature.currentResource.url,
+    "/safe/capture-display-resource-r3.jpg");
+  assert.deepEqual(resolved, [
+    "capture-display-resource-r1",
+    "capture-display-resource-r3",
+  ], "the stale r2 resource is never resolved");
+});
+
+
+test("capture display reload cannot cross an away-and-back selection epoch", async () => {
+  const artifactId = "capture:stable-selection:display";
+  const key = `artifact:${artifactId}`;
+  const siblingKey = "artifact:capture-sibling";
+  const pendingReload = deferred();
+  let displayReads = 0;
+  const display = (revision) => raster(artifactId, "captured-image", {
+    revision: `capture-display-r${revision}`,
+    resource: {
+      resource_id: "capture-display-resource",
+      revision: `capture-display-resource-r${revision}`,
+      variant: "display",
+    },
+  });
+  const { feature } = harness({
+    initialExpandedGroups: ["source-images"],
+    catalog: {
+      async list() {
+        return { items: [display(1), raster("capture-sibling")] };
+      },
+      get({ key: requestedKey }) {
+        if (requestedKey === siblingKey) {
+          return Promise.resolve(raster("capture-sibling"));
+        }
+        displayReads += 1;
+        return displayReads === 1
+          ? Promise.resolve(display(1)) : pendingReload.promise;
+      },
+    },
+    resources: {
+      async resolveRaster({ resourceRef }) {
+        return { url: `/safe/${resourceRef.revision}.jpg` };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select(key);
+  const staleReload = feature.reloadSelection(key);
+  await feature.select(siblingKey);
+  await feature.select(key);
+
+  pendingReload.resolve(display(2));
+  assert.equal(await staleReload, null);
+  assert.equal(feature.selectedKey, key);
+  assert.equal(feature.currentResource.summary.revision, "capture-display-r1",
+    "a response from the earlier selection epoch cannot repaint after return");
+});
+
+
 test("image selection resolves only display data until full resolution is explicit", async () => {
   const variants = [];
   const revoked = [];

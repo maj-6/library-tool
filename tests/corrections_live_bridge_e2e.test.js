@@ -291,17 +291,17 @@ test("production EngineClient completes the representative Corrections flow", {
     itemId,
     representationId: display.source.representation_id,
     canvasId: display.source.canvas_id,
-    group: "processed-images",
+    group: "source-images",
   });
   assert.ok(
     corrected.artifacts.some((value) =>
-      ["corrected-image", "perspective-corrected", "processed-image",
-        "processed-source"].includes(value.kind)),
-    "corrected rendition was not projected back through the production bridge: " +
+      value.key.artifact_id === display.key.artifact_id &&
+      value.kind === "captured-image"),
+    "corrected rendition did not replace the stable capture display: " +
       JSON.stringify(corrected),
   );
   const correctedDisplay = corrected.artifacts.find(
-    (value) => value.kind === "corrected-image");
+    (value) => value.key.artifact_id === display.key.artifact_id);
   assert.ok(correctedDisplay, "corrected display was not projected");
   assert.equal(
     correctedDisplay.source.representation_id,
@@ -310,9 +310,9 @@ test("production EngineClient completes the representative Corrections flow", {
   assert.equal(correctedDisplay.source.canvas_id, display.source.canvas_id);
   assert.equal(
     correctedDisplay.source.canvas_revision,
-    correctedDisplay.revision,
+    correctedDisplay.resource.revision,
   );
-  assert.equal(correctedDisplay.freshness, "untracked");
+  assert.equal(correctedDisplay.freshness, "current");
   const mappedAnnotations = await reopened.spatialAnnotations.list({
     itemId,
     representationId: correctedDisplay.source.representation_id,
@@ -347,8 +347,11 @@ test("production EngineClient completes the representative Corrections flow", {
     itemId,
   });
   assert.equal(
-    annotationForRegion(preservedAnnotations, "margin-1").effective_role,
-    "marginalia",
+    preservedAnnotations.annotations.some((value) => value.extensions &&
+      value.extensions.android_geometry &&
+      value.extensions.android_geometry.region_id === "margin-1"),
+    false,
+    "geometry outside the corrected canvas must not remain as a stale overlay",
   );
   assert.equal(
     annotationForRegion(preservedAnnotations, "illustration-1").effective_role,

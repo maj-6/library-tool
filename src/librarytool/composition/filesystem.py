@@ -10,11 +10,12 @@ same service graph without introducing a second locking or recovery domain.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from inspect import getattr_static
 from pathlib import Path
 from typing import Any, ContextManager
@@ -161,6 +162,7 @@ from ..engine.raster_artifacts import (
     RasterArtifactProjectorPort,
     RasterArtifactView,
     RasterResourceRef,
+    ResourceState,
 )
 from ..engine.spatial_annotations import (
     SpatialAnnotationKey,
@@ -766,9 +768,27 @@ class _CorrectionProjectionUnion:
             # The base lookup is first so missing-item semantics remain owned
             # by the catalogue/capture authority rather than the private
             # output store.
+            base = tuple(self._base.list_raster_artifacts(item_id))
+            projection = self._transforms.project_item(item_id)
+            heads = self._active_display_heads(
+                item_id,
+                projection,
+                base_values=base,
+            )
+            hidden = {
+                value.artifact.key.artifact_id.casefold()
+                for value in heads.values()
+            }
             values = (
-                *self._base.list_raster_artifacts(item_id),
-                *self._transforms.list_raster_artifacts(item_id),
+                *(
+                    self._display_alias(value, heads.get(value.key.artifact_id.casefold()))
+                    for value in base
+                ),
+                *(
+                    value
+                    for value in projection.raster_artifacts
+                    if value.key.artifact_id.casefold() not in hidden
+                ),
             )
         identities = [value.key.artifact_id.casefold() for value in values]
         if len(identities) != len(set(identities)):
@@ -812,17 +832,51 @@ class _CorrectionProjectionUnion:
             return ()
         with self._read_context():
             values = hints(item_id)
-        if (
-            isinstance(values, (str, bytes))
-            or not isinstance(values, Sequence)
-            or any(not isinstance(value, Mapping) for value in values)
-        ):
-            raise RepositoryError(
-                "the correction capture index returned invalid hints",
-                code="invalid_corrections_index_projection",
-                details={"item_id": item_id},
+            if (
+                isinstance(values, (str, bytes))
+                or not isinstance(values, Sequence)
+                or any(not isinstance(value, Mapping) for value in values)
+            ):
+                raise RepositoryError(
+                    "the correction capture index returned invalid hints",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item_id},
+                )
+            projection = self._transforms.project_item(item_id)
+            heads = self._active_display_heads(item_id, projection)
+            head_aliases: dict[str, RasterArtifactView] = {}
+            for identity, head in heads.items():
+                base = self._base.get_raster_artifact(head.logical_key)
+                if base is not None:
+                    head_aliases[identity] = self._display_alias(
+                        base,
+                        head,
+                    )
+            return tuple(
+                {
+                    **value,
+                    "revision": self._display_head_revision(
+                        "index",
+                        authority_revision,
+                        head_aliases[identity].revision,
+                    ),
+                    "resource_state": ResourceState.AVAILABLE.value,
+                    "freshness": head_aliases[identity].freshness.value,
+                }
+                if (
+                    isinstance(
+                        (artifact_id := value.get("artifact_id")),
+                        str,
+                    )
+                    and (identity := artifact_id.casefold()) in head_aliases
+                    and isinstance(
+                        (authority_revision := value.get("revision")),
+                        str,
+                    )
+                )
+                else value
+                for value in values
             )
-        return tuple(values)
 
     def get_raster_artifact(
         self,
@@ -832,7 +886,24 @@ class _CorrectionProjectionUnion:
             raise TypeError("key must be a RasterArtifactKey")
         with self._read_context():
             base = self._base.get_raster_artifact(key)
-            transformed = self._transforms.get_raster_artifact(key)
+            projection = self._transforms.project_item(key.item_id)
+            heads = self._active_display_heads(
+                key.item_id,
+                projection,
+                base_values=(() if base is None else (base,)),
+            )
+            transformed = next(
+                (
+                    value
+                    for value in projection.raster_artifacts
+                    if value.key == key
+                ),
+                None,
+            )
+        if base is not None:
+            head = heads.get(key.artifact_id.casefold())
+            if head is not None:
+                return self._display_alias(base, head)
         if base is not None and transformed is not None:
             raise RepositoryError(
                 "a correction transform output reuses a raster identity",
@@ -845,7 +916,7 @@ class _CorrectionProjectionUnion:
         self,
         key: RasterArtifactKey,
     ) -> RasterArtifactView | None:
-        """Return only base capture authority for the no-durable fast path."""
+        """Return a stable capture slot, including its current display head."""
 
         if not isinstance(key, RasterArtifactKey):
             raise TypeError("key must be a RasterArtifactKey")
@@ -853,7 +924,19 @@ class _CorrectionProjectionUnion:
         if not callable(getter):
             return None
         with self._read_context():
-            return getter(key)
+            base = getter(key)
+            if base is None:
+                return None
+            projection = self._transforms.project_item(key.item_id)
+            heads = self._active_display_heads(
+                key.item_id,
+                projection,
+                base_values=(base,),
+            )
+            return self._display_alias(
+                base,
+                heads.get(key.artifact_id.casefold()),
+            )
 
     def resolve_capture_preview(
         self,
@@ -862,6 +945,19 @@ class _CorrectionProjectionUnion:
     ) -> Any:
         key = RasterArtifactKey(item_id, artifact_id)
         with self._read_context():
+            base = self._base.get_raster_artifact(key)
+            projection = self._transforms.project_item(item_id)
+            heads = self._active_display_heads(
+                item_id,
+                projection,
+                base_values=(() if base is None else (base,)),
+            )
+            head = heads.get(artifact_id.casefold())
+            if base is not None and head is not None:
+                return self._transforms.resolve_raster_resource(
+                    item_id,
+                    head.artifact.resource,
+                )
             preview = getattr(self._base, "resolve_capture_preview", None)
             if callable(preview):
                 resolved = preview(item_id, artifact_id)
@@ -907,18 +1003,127 @@ class _CorrectionProjectionUnion:
         canvas_id: str = "",
     ) -> tuple[SpatialAnnotationView, ...]:
         with self._read_context():
-            values = (
-                *self._base.list_spatial_annotations(
+            base = tuple(
+                self._base.list_spatial_annotations(
                     item_id,
                     representation_id=representation_id,
                     canvas_id=canvas_id,
-                ),
-                *self._transforms.list_spatial_annotations(
-                    item_id,
-                    representation_id=representation_id,
-                    canvas_id=canvas_id,
-                ),
+                )
             )
+            projection = self._transforms.project_item(item_id)
+            heads = self._active_display_heads(item_id, projection)
+            logical_ids = set(heads)
+            physical_ids = {
+                head.artifact.key.artifact_id.casefold()
+                for head in heads.values()
+            }
+            base_by_annotation_id = {
+                value.key.annotation_id.casefold(): value
+                for value in base
+            }
+            values = [
+                value
+                for value in base
+                if not any(
+                    linked.casefold() in logical_ids
+                    for linked in value.linked_artifact_ids
+                )
+            ]
+            values.extend(
+                value
+                for value in projection.spatial_annotations
+                if (
+                    not any(
+                        linked.casefold() in physical_ids
+                        for linked in value.linked_artifact_ids
+                    )
+                    and (
+                        not representation_id
+                        or value.source.representation_id == representation_id
+                    )
+                    and (not canvas_id or value.source.canvas_id == canvas_id)
+                )
+            )
+            for identity, head in heads.items():
+                for annotation in head.spatial_annotations:
+                    if (
+                        representation_id
+                        and annotation.source.representation_id != representation_id
+                    ) or (canvas_id and annotation.source.canvas_id != canvas_id):
+                        continue
+                    linked = tuple(
+                        dict.fromkeys(
+                            head.logical_key.artifact_id
+                            if value.casefold()
+                            == head.artifact.key.artifact_id.casefold()
+                            else value
+                            for value in annotation.linked_artifact_ids
+                        )
+                    )
+                    transform_extension = annotation.extensions.get(
+                        "correction_transform",
+                        {},
+                    )
+                    source_annotation_id = (
+                        transform_extension.get("source_annotation_id")
+                        if isinstance(transform_extension, Mapping)
+                        else None
+                    )
+                    key = (
+                        SpatialAnnotationKey(item_id, source_annotation_id)
+                        if isinstance(source_annotation_id, str)
+                        and source_annotation_id
+                        else annotation.key
+                    )
+                    original = base_by_annotation_id.get(
+                        key.annotation_id.casefold()
+                    )
+                    extensions = (
+                        {
+                            **dict(original.extensions),
+                            **dict(annotation.extensions),
+                        }
+                        if original is not None
+                        else annotation.extensions
+                    )
+                    extensions = dict(extensions)
+                    android_geometry = extensions.get("android_geometry")
+                    if isinstance(android_geometry, Mapping):
+                        projected_geometry = dict(android_geometry)
+                        projected_geometry.pop("source_revision", None)
+                        projected_geometry.pop("display_revision", None)
+                        if projected_geometry:
+                            extensions["android_geometry"] = projected_geometry
+                        else:
+                            extensions.pop("android_geometry", None)
+                    values.append(
+                        replace(
+                            annotation,
+                            key=key,
+                            revision=self._display_head_revision(
+                                "correction-annotation",
+                                (
+                                    original.revision
+                                    if original is not None
+                                    else ""
+                                ),
+                                annotation.revision,
+                                key.annotation_id,
+                            ),
+                            order=(
+                                original.order
+                                if original is not None
+                                else annotation.order
+                            ),
+                            label=(
+                                original.label
+                                if original is not None
+                                else annotation.label
+                            ),
+                            linked_artifact_ids=linked,
+                            extensions=extensions,
+                        )
+                    )
         identities = [value.key.annotation_id.casefold() for value in values]
         if len(identities) != len(set(identities)):
             raise RepositoryError(
@@ -927,6 +1132,75 @@ class _CorrectionProjectionUnion:
                 details={"item_id": item_id},
             )
         return tuple(sorted(values, key=lambda value: value.key.annotation_id))
+
+    def _active_display_heads(
+        self,
+        item_id: str,
+        projection: Any,
+        *,
+        base_values: Sequence[RasterArtifactView] = (),
+    ) -> dict[str, Any]:
+        base_by_id = {
+            value.key.artifact_id.casefold(): value
+            for value in base_values
+        }
+        active: dict[str, Any] = {}
+        for head in projection.display_heads:
+            identity = head.logical_key.artifact_id.casefold()
+            base = base_by_id.get(identity)
+            if base is None:
+                base = self._base.get_raster_artifact(head.logical_key)
+            if (
+                base is None
+                or base.key.item_id != item_id
+                or base.resource_state is not ResourceState.AVAILABLE
+                or base.resource is None
+                or base.content_sha256 != head.root_source_sha256
+                or base.resource.revision != head.root_source_revision
+                or base.source != head.root_source
+            ):
+                continue
+            active[identity] = head
+        return active
+
+    @staticmethod
+    def _display_alias(base: RasterArtifactView, head: Any) -> RasterArtifactView:
+        if head is None:
+            return base
+        corrected = head.artifact
+        extensions = dict(base.extensions)
+        extensions.pop("recipe", None)
+        extensions.pop("rendition", None)
+        extensions.update(corrected.extensions)
+        extensions["correction_display_head"] = {
+            "operation_id": head.operation_id,
+            "output_artifact_id": corrected.key.artifact_id,
+            "root_source_revision": head.root_source_revision,
+            "root_source_sha256": head.root_source_sha256,
+        }
+        return replace(
+            base,
+            revision=_CorrectionProjectionUnion._display_head_revision(
+                "correction-display",
+                base.revision,
+                corrected.revision,
+            ),
+            kind="captured-image",
+            media_type=corrected.media_type,
+            content_sha256=corrected.content_sha256,
+            dimensions=corrected.dimensions,
+            source=corrected.source,
+            resource_state=ResourceState.AVAILABLE,
+            resource=corrected.resource,
+            freshness=base.freshness,
+            provenance=corrected.provenance,
+            extensions=extensions,
+        )
+
+    @staticmethod
+    def _display_head_revision(prefix: str, *parts: str) -> str:
+        digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+        return f"{prefix}:{digest}"
 
     def get_spatial_annotation(
         self,

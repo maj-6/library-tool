@@ -15,6 +15,7 @@ import server
 from librarytool.adapters.filesystem.corrections_artifact_repository import (
     _opaque_identity,
 )
+from librarytool.engine.correction_transforms import CorrectionTransformCommand
 from PIL import Image
 
 
@@ -108,29 +109,82 @@ def _photo_assets(capture_id: str, assets) -> dict:
 def _publish_transform(engine_root, item_id: str, operation_id: str,
                        source_artifact_id: str, display_artifact_id: str,
                        png: bytes, *, generated_at: str = "",
-                       pointer_mtime: float | None = None) -> str:
+                       pointer_mtime: float | None = None,
+                       source_revision: str = "", source_sha256: str = "",
+                       output_revision: str = "", committed: bool = True,
+                       display_head: bool = False,
+                       display_head_artifact_id: str = "",
+                       legacy_missing_pins: bool = False) -> str:
     """Fabricate one committed v2 publication the way the store lays it out."""
 
+    assert bool(source_revision) is bool(source_sha256)
+    assert committed or not display_head
     transforms = engine_root / ".engine" / "correction-transforms"
     operation_digest = hashlib.sha256(
         operation_id.encode("utf-8")).hexdigest()
-    correction_id = hashlib.sha256(
-        f"command:{operation_id}".encode("utf-8")).hexdigest()
     image = Image.open(io.BytesIO(png))
+    if not source_revision:
+        parent_outputs = [
+            output
+            for path in (transforms / "publications").glob("*.json")
+            for publication in (json.loads(path.read_text("utf-8")),)
+            for output in publication.get("outputs", ())
+            if output.get("artifact_id") == source_artifact_id
+        ] if (transforms / "publications").is_dir() else []
+        if len(parent_outputs) == 1:
+            source_revision = parent_outputs[0]["artifact_revision"]
+            source_sha256 = parent_outputs[0]["content_sha256"]
+    source_revision = source_revision or (
+        "source:" + hashlib.sha256(
+            f"source-revision:{operation_id}".encode("utf-8")
+        ).hexdigest()
+    )
+    source_sha256 = source_sha256 or hashlib.sha256(
+        f"source-content:{operation_id}".encode("utf-8")
+    ).hexdigest()
+    command_value = CorrectionTransformCommand(
+        item_id=item_id,
+        artifact_id=source_artifact_id,
+        artifact_revision=(
+            "artifact:" + hashlib.sha256(
+                f"artifact-revision:{operation_id}".encode("utf-8")
+            ).hexdigest()
+        ),
+        source_revision=source_revision,
+        source_sha256=source_sha256,
+        quad=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        operation_id=operation_id,
+        rerun_ocr=False,
+    )
+    command = command_value.as_dict()
+    if legacy_missing_pins:
+        command.pop("source_revision")
+        command.pop("source_sha256")
+    command_payload = server._correction_transform_canonical_json(command)
+    correction_id = hashlib.sha256(command_payload).hexdigest()
+    output_revision = output_revision or (
+        "ctr:" + hashlib.sha256(
+            f"revision:{operation_id}".encode("utf-8")
+        ).hexdigest()
+    )
+    output_sha256 = hashlib.sha256(png).hexdigest()
+    output_descriptor = {
+        "kind": "corrected-display",
+        "artifact_id": display_artifact_id,
+        "artifact_revision": output_revision,
+        "content_sha256": output_sha256,
+    }
     publication = {
         "schema": "librarytool.correction-transform-publication",
         "version": 2,
         "operation_id": operation_id,
         "command_sha256": correction_id,
-        "command": {
-            "item_id": item_id,
-            "artifact_id": source_artifact_id,
-        },
+        "command": command,
         "outputs": [{
             "kind": "corrected-display",
             "artifact_id": display_artifact_id,
-            "artifact_revision": "ctr:" + "0" * 64,
-            "content_sha256": hashlib.sha256(png).hexdigest(),
+            "artifact_revision": output_revision,
+            "content_sha256": output_sha256,
             "bytes": len(png),
             "media_type": "image/png",
             "dimensions": {
@@ -147,16 +201,63 @@ def _publish_transform(engine_root, item_id: str, operation_id: str,
     }
     publications = transforms / "publications"
     publications.mkdir(parents=True, exist_ok=True)
-    (publications / f"{operation_digest}.json").write_text(
-        json.dumps(publication), encoding="utf-8")
+    publication_payload = server._correction_transform_canonical_json(
+        publication)
+    publication_sha256 = hashlib.sha256(publication_payload).hexdigest()
+    (publications / f"{operation_digest}.json").write_bytes(
+        publication_payload)
     pointer_dir = transforms / "by-item" / hashlib.sha256(
         item_id.encode("utf-8")).hexdigest()
     pointer_dir.mkdir(parents=True, exist_ok=True)
     pointer_path = pointer_dir / f"{operation_digest}.json"
-    pointer_path.write_text(
-        json.dumps({"operation_id": operation_id}), encoding="utf-8")
+    pointer_path.write_bytes(server._correction_transform_canonical_json({
+        "schema": "librarytool.correction-transform-item-pointer",
+        "version": 1,
+        "item_id": item_id,
+        "operation_id": operation_id,
+        "command_sha256": correction_id,
+        "publication_sha256": publication_sha256,
+    }))
     if pointer_mtime is not None:
         os.utime(pointer_path, (pointer_mtime, pointer_mtime))
+    if committed:
+        receipt_dir = (
+            engine_root / ".engine" / "receipts" / "correction-transforms"
+        )
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        (receipt_dir / f"{operation_digest}.json").write_bytes(
+            server._correction_transform_canonical_json({
+                "schema": "librarytool.correction-transform-receipt",
+                "version": 1,
+                "operation_id": operation_id,
+                "command_sha256": correction_id,
+                "publication_sha256": publication_sha256,
+                "result": {
+                    "operation_id": operation_id,
+                    "outputs": [output_descriptor],
+                },
+            })
+        )
+    if display_head:
+        head_artifact_id = display_head_artifact_id or source_artifact_id
+        head_dir = (
+            transforms / "display-heads"
+            / hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+        )
+        head_dir.mkdir(parents=True, exist_ok=True)
+        head_path = head_dir / (
+            hashlib.sha256(head_artifact_id.encode("utf-8")).hexdigest()
+            + ".json"
+        )
+        head_path.write_bytes(server._correction_transform_canonical_json({
+            "schema": "librarytool.correction-display-head",
+            "version": 1,
+            "item_id": item_id,
+            "artifact_id": head_artifact_id,
+            "operation_id": operation_id,
+            "command_sha256": correction_id,
+            "publication_sha256": publication_sha256,
+        }))
     objects = transforms / "objects"
     objects.mkdir(parents=True, exist_ok=True)
     (objects / (hashlib.sha256(
@@ -248,6 +349,240 @@ def test_mapping_descendant_beats_ancestor_despite_newer_ancestor_mtime(
         hashlib.sha256(chained_png).hexdigest()
 
 
+def test_mapping_resolves_same_slot_descendant_by_exact_source_pin(tmp_path):
+    """A rerun keeps the capture display id, so its immutable source pin is
+    the ancestry edge and must outrank disturbed pointer mtimes."""
+
+    capture_id = "c7777777-7777-4777-8777-777777777777"
+    item_id = "b-" + "5" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "f" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    base_png = _png(8, 6)
+    base_revision = "ctr:" + "1" * 64
+    base_sha = hashlib.sha256(base_png).hexdigest()
+    base_id = _publish_transform(
+        tmp_path, item_id, "op-base", display_slot,
+        "ctr-" + "a" * 40, base_png,
+        output_revision=base_revision, pointer_mtime=2_000_000.0)
+    rerun_png = _png(8, 6, color=(30, 40, 50))
+    rerun_id = _publish_transform(
+        tmp_path, item_id, "op-rerun", display_slot,
+        "ctr-" + "b" * 40, rerun_png,
+        source_revision=base_revision, source_sha256=base_sha,
+        pointer_mtime=1_000_000.0)
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == rerun_id
+    assert winner["ancestors"] == frozenset({base_id})
+    assert winner["display_sha256"] == hashlib.sha256(rerun_png).hexdigest()
+
+
+def test_mapping_rejects_ambiguous_same_slot_source_pin(tmp_path):
+    capture_id = "c8888888-8888-4888-8888-888888888888"
+    item_id = "b-" + "6" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "1" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    shared_png = _png(7, 5)
+    shared_revision = "ctr:" + "2" * 64
+    shared_sha = hashlib.sha256(shared_png).hexdigest()
+    first_id = _publish_transform(
+        tmp_path, item_id, "op-first", display_slot,
+        "ctr-" + "c" * 40, shared_png,
+        output_revision=shared_revision, pointer_mtime=2_000_000.0)
+    second_id = _publish_transform(
+        tmp_path, item_id, "op-second", display_slot,
+        "ctr-" + "d" * 40, shared_png,
+        output_revision=shared_revision, pointer_mtime=3_000_000.0)
+    ambiguous_id = _publish_transform(
+        tmp_path, item_id, "op-ambiguous", display_slot,
+        "ctr-" + "e" * 40, _png(7, 5, color=(1, 2, 3)),
+        source_revision=shared_revision, source_sha256=shared_sha,
+        pointer_mtime=1_000_000.0)
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    candidates = targets["asset-01"]["candidates"]
+    assert set(candidates) == {first_id, second_id}
+    assert ambiguous_id not in candidates
+
+
+def test_mapping_rejects_same_slot_source_pin_cycles(tmp_path):
+    capture_id = "c9999999-9999-4999-8999-999999999999"
+    item_id = "b-" + "7" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "2" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    first_png = _png(9, 5)
+    second_png = _png(9, 5, color=(4, 5, 6))
+    first_revision = "ctr:" + "3" * 64
+    second_revision = "ctr:" + "4" * 64
+    _publish_transform(
+        tmp_path, item_id, "op-cycle-a", display_slot,
+        "ctr-" + "f" * 40, first_png,
+        source_revision=second_revision,
+        source_sha256=hashlib.sha256(second_png).hexdigest(),
+        output_revision=first_revision)
+    _publish_transform(
+        tmp_path, item_id, "op-cycle-b", display_slot,
+        "ctr-" + "0" * 40, second_png,
+        source_revision=first_revision,
+        source_sha256=hashlib.sha256(first_png).hexdigest(),
+        output_revision=second_revision)
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    assert targets == {}
+
+
+def test_mapping_validated_display_head_beats_restored_newer_sibling(tmp_path):
+    capture_id = "c1010101-1010-4010-8010-101010101010"
+    item_id = "b-" + "8" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "3" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    parent_output = "ctr-" + "0" * 40
+    _publish_transform(
+        tmp_path, item_id, "op-head-parent", display_slot,
+        parent_output, _png(10, 6, color=(5, 6, 7)),
+        pointer_mtime=500_000.0, source_sha256="e" * 64,
+        source_revision="capture-display-r1")
+    head_png = _png(10, 6, color=(10, 11, 12))
+    head_id = _publish_transform(
+        tmp_path, item_id, "op-head", parent_output,
+        "ctr-" + "1" * 40, head_png,
+        pointer_mtime=1_000_000.0, display_head=True,
+        display_head_artifact_id=display_slot)
+    sibling_id = _publish_transform(
+        tmp_path, item_id, "op-restored-sibling", display_slot,
+        "ctr-" + "2" * 40, _png(10, 6, color=(20, 21, 22)),
+        pointer_mtime=3_000_000.0)
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == head_id
+    assert winner["correction_id"] != sibling_id
+    assert winner["display_sha256"] == hashlib.sha256(head_png).hexdigest()
+
+
+def test_mapping_rejects_display_head_from_replaced_capture_authority(tmp_path):
+    capture_id = "c1111111-2222-4333-8444-555555555555"
+    item_id = "b-" + "c" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "7" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    parent_output = "ctr-" + "9" * 40
+    _publish_transform(
+        tmp_path, item_id, "op-stale-parent", display_slot,
+        parent_output, _png(10, 6), source_revision="capture-display-r1",
+        source_sha256="e" * 64)
+    _publish_transform(
+        tmp_path, item_id, "op-stale-head", parent_output,
+        "ctr-" + "a" * 40, _png(10, 6, color=(31, 32, 33)),
+        display_head=True, display_head_artifact_id=display_slot)
+    replacement_id = _publish_transform(
+        tmp_path, item_id, "op-current-unheaded", display_slot,
+        "ctr-" + "b" * 40, _png(10, 6, color=(41, 42, 43)),
+        source_revision="capture-display-r2", source_sha256="d" * 64,
+        pointer_mtime=3_000_000.0)
+    photo_assets["desktop_import"]["assets"][0][
+        "derivative_checksum"
+    ] = "d" * 64
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    assert targets == {}
+    assert replacement_id
+
+
+def test_mapping_skips_in_flight_publication_without_receipt(tmp_path):
+    capture_id = "c2020202-2020-4020-8020-202020202020"
+    item_id = "b-" + "9" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "4" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    committed_id = _publish_transform(
+        tmp_path, item_id, "op-committed", display_slot,
+        "ctr-" + "3" * 40, _png(11, 6),
+        pointer_mtime=1_000_000.0)
+    in_flight_id = _publish_transform(
+        tmp_path, item_id, "op-in-flight", display_slot,
+        "ctr-" + "4" * 40, _png(11, 6, color=(30, 31, 32)),
+        pointer_mtime=3_000_000.0, committed=False)
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == committed_id
+    assert in_flight_id not in winner["candidates"]
+
+
+def test_mapping_legacy_id_edge_rejects_present_mismatched_pins(tmp_path):
+    capture_id = "c3030303-3030-4030-8030-303030303030"
+    item_id = "b-" + "a" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "5" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    parent_output = "ctr-" + "5" * 40
+    parent_id = _publish_transform(
+        tmp_path, item_id, "op-parent", display_slot,
+        parent_output, _png(12, 6), pointer_mtime=1_000_000.0)
+    invalid_child_id = _publish_transform(
+        tmp_path, item_id, "op-invalid-child", parent_output,
+        "ctr-" + "6" * 40, _png(12, 6, color=(40, 41, 42)),
+        source_revision="ctr:" + "f" * 64,
+        source_sha256="e" * 64,
+        pointer_mtime=3_000_000.0)
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == parent_id
+    assert invalid_child_id not in winner["candidates"]
+
+
+def test_mapping_legacy_id_edge_allows_historical_missing_pins(tmp_path):
+    capture_id = "c4040404-4040-4040-8040-404040404040"
+    item_id = "b-" + "b" * 32
+    photo_assets = _photo_assets(
+        capture_id, [("asset-01", "6" * 64, "completed")])
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    parent_output = "ctr-" + "7" * 40
+    parent_id = _publish_transform(
+        tmp_path, item_id, "op-legacy-parent", display_slot,
+        parent_output, _png(13, 6))
+    child_id = _publish_transform(
+        tmp_path, item_id, "op-legacy-child", parent_output,
+        "ctr-" + "8" * 40, _png(13, 6, color=(50, 51, 52)),
+        legacy_missing_pins=True)
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path)
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == child_id
+    assert winner["ancestors"] == frozenset({parent_id})
+
+
 def test_mapping_honors_recorded_stamps_if_ever_present(tmp_path):
     """The engine writes no stamps today, but a recorded ``generated_at``
     must keep outranking pointer mtimes if it ever appears."""
@@ -319,7 +654,8 @@ def test_correction_jpeg_transcode_caps_edges_without_upscaling():
 
 def _seed_corrected_capture(monkeypatch, *, lifecycle: str = "completed",
                             pointer_mtime: float | None = None,
-                            transport: str = "cloud"):
+                            transport: str = "cloud",
+                            display_head: bool = False):
     monkeypatch.setattr(server.capture, "process_photo", lambda raw: raw)
     monkeypatch.setattr(server, "_entry_checks", lambda _entry: {})
     monkeypatch.setattr(server, "activity", lambda *_args, **_kwargs: None)
@@ -350,7 +686,13 @@ def _seed_corrected_capture(monkeypatch, *, lifecycle: str = "completed",
     correction_id = _publish_transform(
         server._ensure_engine_session().write_set.root,
         item_id, "op-seeded", f"{namespace}:display", "ctr-" + "f" * 40,
-        png, pointer_mtime=pointer_mtime)
+        png, pointer_mtime=pointer_mtime,
+        source_revision="capture-display-r1" if display_head else "",
+        source_sha256="e" * 64 if display_head else "",
+        display_head=display_head,
+        display_head_artifact_id=(
+            f"{namespace}:display" if display_head else ""
+        ))
     return {
         "capture_id": capture_id,
         "asset_id": asset_id,
@@ -469,6 +811,52 @@ def test_publish_uploads_objects_and_rows_per_contract(
     assert doc["artifacts"]["thumbnail"]["path"] == thumbnail_path
     assert doc["artifacts"]["thumbnail"]["content_type"] == "image/jpeg"
     assert doc["generated_at"]
+
+
+def test_publish_revalidates_local_authority_after_uploads(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch, display_head=True)
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+    upload = server.sbase.upload_object
+    changed = False
+
+    def upload_then_replace_authority(*args, **kwargs):
+        nonlocal changed
+        outcome = upload(*args, **kwargs)
+        if not changed:
+            changed = True
+            path = (
+                server.CAPTURES_DIR / seeded["capture_id"]
+                / "photo_assets.json"
+            )
+            photo_assets = json.loads(path.read_text("utf-8"))
+            photo_assets["desktop_import"]["assets"][0][
+                "derivative_checksum"
+            ] = "d" * 64
+            path.write_text(json.dumps(photo_assets), encoding="utf-8")
+        return outcome
+
+    monkeypatch.setattr(
+        server.sbase, "upload_object", upload_then_replace_authority)
+
+    result = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert changed is True
+    assert len(calls["uploads"]) == 2
+    assert calls["published"] == []
+    assert result["pushed"] == 0
+    assert result["errors"] == []
+    assert len(result["notices"]) == 1
+    assert "authority changed before publication" in result["notices"][0]
 
 
 def test_publish_diff_short_circuits_matching_rows(

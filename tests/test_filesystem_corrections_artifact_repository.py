@@ -486,7 +486,7 @@ def test_android_capture_projection_is_stable_safe_and_read_only(tmp_path):
         CAPTURE_ORIGINAL_ID,
     ]
     display_view, original_view = artifacts
-    assert display_view.kind == "processed-image"
+    assert display_view.kind == "captured-image"
     assert display_view.media_type == "image/jpeg"
     assert display_view.dimensions.as_dict() == {
         "width": 19,
@@ -653,6 +653,9 @@ def test_android_geometry_projects_only_on_its_revision_pinned_display(tmp_path)
         pinned_record,
     ]
     manifest_path.write_text(json.dumps(pinned), encoding="utf-8")
+    pinned_hint = repository.list_capture_index_hints(ITEM_ID)[0]
+    assert pinned_hint["import_state"] == "ready"
+    assert pinned_hint["diagnostic_scopes"] == ()
     pinned_annotations = repository.list_spatial_annotations(ITEM_ID)
     assert len(pinned_annotations) == 1
     assert [
@@ -905,6 +908,56 @@ def test_capture_hints_match_rendition_group_state_and_import_timestamp(tmp_path
     assert states == {"display": "available"}
     assert len(missing) == 1
     assert missing[0].key.artifact_id.endswith(":original")
+
+
+def test_capture_hints_pin_geometry_to_the_effective_imported_display(tmp_path):
+    root = tmp_path / "library"
+    original = _jpeg_bytes((10, 20, 30), (17, 23))
+    phone_display = _jpeg_bytes((40, 50, 60), (13, 31))
+    imported_display = _jpeg_bytes((70, 80, 90), (19, 29))
+    directory = _capture(root)
+    directory.mkdir(parents=True)
+    (directory / "orig_1.jpg").write_bytes(original)
+    (directory / "photo_1.jpg").write_bytes(imported_display)
+    geometry = _capture_geometry(original)
+    manifest = _photo_manifest(
+        original,
+        phone_display,
+        geometry=[geometry],
+    )
+    manifest["assets"][0]["display"].update({"width": 13, "height": 31})
+    manifest["desktop_import"]["assets"][0]["derivative_checksum"] = (
+        _digest(imported_display)
+    )
+    manifest_path = _write_photo_manifest(root, manifest)
+    repository = _repository(root)
+
+    phone_frame_hint = repository.list_capture_index_hints(ITEM_ID)[0]
+    assert phone_frame_hint["import_state"] == "partial"
+    assert phone_frame_hint["diagnostic_scopes"] == ("capture_geometry",)
+    assert repository.list_spatial_annotations(ITEM_ID) == ()
+
+    foreign_pin = copy.deepcopy(manifest)
+    foreign_geometry = copy.deepcopy(geometry)
+    foreign_geometry["display_sha256"] = "ab" * 32
+    foreign_pin["assets"][0]["geometry"] = [foreign_geometry]
+    manifest_path.write_text(json.dumps(foreign_pin), encoding="utf-8")
+
+    foreign_hint = repository.list_capture_index_hints(ITEM_ID)[0]
+    assert foreign_hint["import_state"] == "partial"
+    assert foreign_hint["diagnostic_scopes"] == ("capture_geometry",)
+    assert repository.list_spatial_annotations(ITEM_ID) == ()
+
+    matching_pin = copy.deepcopy(manifest)
+    matching_geometry = copy.deepcopy(geometry)
+    matching_geometry["display_sha256"] = _digest(imported_display)
+    matching_pin["assets"][0]["geometry"] = [matching_geometry]
+    manifest_path.write_text(json.dumps(matching_pin), encoding="utf-8")
+
+    matching_hint = repository.list_capture_index_hints(ITEM_ID)[0]
+    assert matching_hint["import_state"] == "ready"
+    assert matching_hint["diagnostic_scopes"] == ()
+    assert len(repository.list_spatial_annotations(ITEM_ID)) == 1
 
 
 def test_invalid_display_rendition_cannot_preview_imported_display_ref(tmp_path):

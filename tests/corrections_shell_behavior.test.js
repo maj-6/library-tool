@@ -701,6 +701,194 @@ test("profile storage listeners are window-scoped and removed on shell destroy",
 });
 
 
+test("terminal transform reloads only the selected stable capture display", async () => {
+  const artifactId = "capture:stable-display:display";
+  const key = `artifact:${artifactId}`;
+  const observed = [];
+  const reloads = [];
+  const statuses = [];
+  let listener = null;
+  let released = 0;
+  let finishReload;
+  const reloaded = new Promise((resolve) => { finishReload = resolve; });
+  const selected = {
+    key,
+    id: artifactId,
+    itemId: "book-1",
+    family: "image",
+    group: "source-images",
+  };
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    destroyed: false,
+    unsubscribeTransformResults: null,
+    state: {
+      selection: { itemId: "book-1", artifactId },
+    },
+    imageAdjustTool: {
+      observeTransformResult(result, command) {
+        observed.push([result, command]);
+        return {
+          operationId: result && (result.operation_id ||
+            result.image_commit && result.image_commit.operation_id) || "",
+          imageCommitted: Boolean(result && result.image_commit),
+        };
+      },
+    },
+    artifactsFeature: {
+      selectedKey: key,
+      items: new Map([[key, selected]]),
+      async reloadSelection(value) {
+        reloads.push(value);
+        finishReload();
+        return selected;
+      },
+    },
+    subscribeTransformResults(callback) {
+      listener = callback;
+      return () => { released += 1; };
+    },
+    setStatus(message, error) { statuses.push([message, error]); },
+  });
+  shell.connectTransformResults();
+
+  const command = {
+    item_id: "book-1",
+    artifact_id: artifactId,
+    operation_id: "display-transform-1",
+  };
+  listener({
+    terminal_state: "done",
+    image_commit: { operation_id: "display-transform-1", outputs: [] },
+  }, command);
+  await reloaded;
+
+  assert.deepEqual(reloads, [key]);
+  assert.equal(shell.artifactsFeature.selectedKey, key);
+  assert.equal(shell.artifactsFeature.items.get(key).group, "source-images");
+  assert.deepEqual(shell.state.selection, {
+    itemId: "book-1",
+    artifactId,
+  }, "the deep-link address remains on the capture display slot");
+
+  listener({
+    terminal_state: "cancelled",
+    image_commit: null,
+    cancelled_before_commit: true,
+  }, { ...command, operation_id: "display-transform-cancelled" });
+  listener({
+    terminal_state: "done",
+    image_commit: { operation_id: "sibling-transform", outputs: [] },
+  }, {
+    ...command,
+    artifact_id: "ctr-sibling-display",
+    operation_id: "sibling-transform",
+  });
+  listener({
+    terminal_state: "done",
+    image_commit: { operation_id: "other-capture-transform", outputs: [] },
+  }, {
+    ...command,
+    artifact_id: "capture:other-display:display",
+    operation_id: "other-capture-transform",
+  });
+  listener({
+    operation_id: "actual-transform",
+    terminal_state: "done",
+    image_commit: { operation_id: "actual-transform", outputs: [] },
+  }, {
+    ...command,
+    operation_id: "stale-command-transform",
+  });
+  await Promise.resolve();
+
+  assert.equal(observed.length, 5,
+    "#295 terminal observation still receives every result");
+  assert.deepEqual(reloads, [key],
+    "cancelled, sibling, non-selected, and command-mismatched results are ignored");
+  assert.deepEqual(statuses, []);
+  shell.unsubscribeTransformResults();
+  assert.equal(released, 1);
+});
+
+
+test("immediate terminal repaint is deduplicated against its streamed result", async () => {
+  const artifactId = "capture:stable-immediate:display";
+  const key = `artifact:${artifactId}`;
+  const reloads = [];
+  const statuses = [];
+  let listener = null;
+  let finishReload;
+  const reloadFinished = new Promise((resolve) => { finishReload = resolve; });
+  const selected = {
+    key,
+    id: artifactId,
+    itemId: "book-1",
+    family: "image",
+  };
+  const shell = Object.create(CorrectionsShell.prototype);
+  Object.assign(shell, {
+    destroyed: false,
+    unsubscribeTransformResults: null,
+    state: {
+      selection: { itemId: "book-1", artifactId },
+    },
+    imageAdjustTool: {
+      observeTransformResult(result) {
+        return {
+          operationId: result.operation_id,
+          imageCommitted: true,
+        };
+      },
+    },
+    artifactsFeature: {
+      selectedKey: key,
+      items: new Map([[key, selected]]),
+      async reloadSelection(value) {
+        reloads.push(value);
+        await reloadFinished;
+        return selected;
+      },
+    },
+    subscribeTransformResults(callback) {
+      listener = callback;
+      return () => {};
+    },
+    setStatus(message, error) { statuses.push([message, error]); },
+  });
+  shell.connectTransformResults();
+
+  const command = {
+    item_id: "book-1",
+    artifact_id: artifactId,
+    operation_id: "display-transform-immediate",
+    adjustment: { brightness_percent: 12 },
+  };
+  const result = {
+    operation_id: command.operation_id,
+    terminal_state: "done",
+    image_commit: { operation_id: command.operation_id, outputs: [] },
+  };
+  const observation = shell.imageAdjustTool.observeTransformResult(result, command);
+  const immediate = shell.handleQueuedTransformResult(
+    result, command, selected, observation);
+  listener(result, command);
+  await Promise.resolve();
+
+  assert.deepEqual(reloads, [key],
+    "the immediate and streamed copies share one in-flight repaint");
+  assert.deepEqual(statuses, [["Image processing queued", undefined]]);
+  finishReload();
+  assert.equal(await immediate, selected);
+
+  listener(result, command);
+  await Promise.resolve();
+  assert.deepEqual(reloads, [key],
+    "a later replay of the same operation stays deduplicated");
+  shell.unsubscribeTransformResults();
+});
+
+
 test("classification shortcuts stay scoped and context menus use exact event targets", () => {
   const shell = Object.create(CorrectionsShell.prototype);
   shell.root = { dataset: {} };

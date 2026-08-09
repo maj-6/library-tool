@@ -2939,7 +2939,15 @@ class FilesystemCorrectionsArtifactRepository(
         display_revision = _positive_integer(record.display.get("revision"))
         if original_revision is None or display_revision is None:
             return True
-        original_sha256 = _sha256(record.original.get("sha256"))
+        original_sha256 = _sha256(
+            record.imported.get("source_checksum")
+            or record.original.get("sha256")
+        )
+        display_sha256 = _sha256(
+            record.imported.get("derivative_checksum")
+            or record.display.get("sha256")
+        )
+        phone_display_sha256 = _sha256(record.display.get("sha256"))
         display_width = _non_negative_integer(record.display.get("width")) or 0
         display_height = (
             _non_negative_integer(record.display.get("height")) or 0
@@ -2949,33 +2957,73 @@ class FilesystemCorrectionsArtifactRepository(
             if record.imported
             else _orientation(record.display.get("orientation"))
         )
+        geometries = tuple(raw_geometry)
+        if any(not isinstance(geometry, Mapping) for geometry in geometries):
+            return True
+        matching_pins = tuple(
+            geometry
+            for geometry in geometries
+            if (
+                display_sha256
+                and _sha256(geometry.get("display_sha256"))
+                == display_sha256
+            )
+        )
+        phone_frame_records = tuple(
+            geometry
+            for geometry in geometries
+            if not _sha256(geometry.get("display_sha256"))
+        )
+        if record.imported:
+            if matching_pins:
+                candidates = matching_pins
+            elif (
+                display_sha256
+                and phone_display_sha256 == display_sha256
+            ):
+                candidates = phone_frame_records
+            else:
+                candidates = ()
+        else:
+            candidates = (*matching_pins, *phone_frame_records)
+        if not candidates:
+            return True
         seen_regions: set[tuple[str, str, str]] = set()
-        for geometry in raw_geometry:
-            if not isinstance(geometry, Mapping):
-                return True
+        for geometry in candidates:
             geometry_width = _non_negative_integer(geometry.get("width")) or 0
             geometry_height = (
                 _non_negative_integer(geometry.get("height")) or 0
             )
+            geometry_display_sha256 = _sha256(
+                geometry.get("display_sha256")
+            )
             if (
                 geometry.get("asset_id") != record.asset_id
                 or geometry.get("coordinate_space") != "display_normalized"
-                or _positive_integer(geometry.get("source_revision"))
-                != original_revision
-                or _positive_integer(geometry.get("display_revision"))
-                != display_revision
+                or (
+                    not geometry_display_sha256
+                    and _positive_integer(geometry.get("source_revision"))
+                    != original_revision
+                )
+                or (
+                    not geometry_display_sha256
+                    and _positive_integer(geometry.get("display_revision"))
+                    != display_revision
+                )
                 or (
                     original_sha256
                     and _sha256(geometry.get("source_sha256"))
                     != original_sha256
                 )
                 or (
-                    display_width
+                    (not geometry_display_sha256 or not record.imported)
+                    and display_width
                     and geometry_width
                     and geometry_width != display_width
                 )
                 or (
-                    display_height
+                    (not geometry_display_sha256 or not record.imported)
+                    and display_height
                     and geometry_height
                     and geometry_height != display_height
                 )
@@ -3651,18 +3699,10 @@ class FilesystemCorrectionsArtifactRepository(
             display_view = self._capture_view(
                 item_id,
                 artifact_id=display_id,
-                kind=(
-                    "processed-image"
-                    if (
-                        imported
-                        or recipe != "camera-original"
-                        or (
-                            display_observation.content_sha256
-                            != original_observation.content_sha256
-                        )
-                    )
-                    else "captured-image"
-                ),
+                # The display is the stable, user-facing capture slot. Its
+                # recipe/provenance may advance, but moving it between public
+                # buckets would invalidate navigation and editor deep links.
+                kind="captured-image",
                 observation=display_observation,
                 source=display_source,
                 label=f"Capture {order} display",
