@@ -3,6 +3,26 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.13 — 2026-08-08
+
+Android version code: `44`.
+
+### Additions
+
+- Desktop-corrected capture images now install back into the matching photo on
+  the phone. The app verifies the correction against the immutable camera
+  original, refreshes it on Home resume or explicit sync, and re-runs OCR
+  against the corrected pixels.
+- Capture rows show desktop-curated title, author, and year when available,
+  falling back field by field to the phone's own extracted bibliography.
+
+### Bugfixes
+
+- Missing, damaged, or partially installed corrected displays repair on a
+  later sync instead of leaving the capture pinned to stale pixels.
+- Overlapping background and explicit syncs use the persisted cloud revision
+  to prevent an older correction from replacing a newer one.
+
 ## 0.5.2-alpha.12 — 2026-08-06
 
 Android version code: `43`.
