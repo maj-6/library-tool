@@ -277,6 +277,13 @@
           };
         this.onStatus = typeof options.onStatus === "function"
           ? options.onStatus : () => {};
+        // The host reports which raster URLs are still bound to mounted
+        // <img> elements. A lease for a displayed URL must never be revoked
+        // out from under the DOM (that is the "Image unavailable" flash);
+        // it is swept once the display moves on.
+        this.displayedRasterUrls =
+          typeof options.displayedRasterUrls === "function"
+            ? options.displayedRasterUrls : null;
         this.selectionListeners = new Set();
         this.hotTargetListeners = new Set();
         if (typeof options.onSelection === "function") {
@@ -1187,6 +1194,9 @@
       publishResource(resource) {
         this.currentResource = resource || null;
         this.onResource(this.currentResource);
+        // The host has now decided what stays mounted; anything else is a
+        // dead lease from a superseded publish and can be revoked.
+        this.sweepRasterLeases();
         if (!resource || !this.editorRegistry ||
             typeof deps.artifactEditorHint !== "function") return;
         const hint = deps.artifactEditorHint(resource);
@@ -1198,11 +1208,50 @@
         }
       }
 
-      releaseResources() {
-        for (const release of this.resourceReleases.splice(0)) {
-          try { release(); } catch (error) { /* best-effort lease cleanup */ }
+      displayedUrls() {
+        const urls = new Set();
+        if (!this.displayedRasterUrls) return urls;
+        let values = [];
+        try {
+          values = this.displayedRasterUrls() || [];
+        } catch (error) {
+          values = [];
         }
+        for (const value of values) {
+          if (typeof value === "string" && value) urls.add(value);
+        }
+        return urls;
+      }
+
+      // Revokes every raster lease except those backing the currently
+      // published resource or a URL the host still displays. A refresh must
+      // never revoke the blob URL of an <img> that is still in the DOM.
+      sweepRasterLeases() {
+        const keep = this.displayedUrls();
+        const current = this.currentResource &&
+          typeof this.currentResource.url === "string"
+          ? this.currentResource.url : "";
+        if (current) keep.add(current);
+        const kept = [];
+        for (const lease of this.resourceReleases.splice(0)) {
+          if (lease.url && keep.has(lease.url)) {
+            kept.push(lease);
+            continue;
+          }
+          try { lease.release(); } catch (error) { /* best-effort lease cleanup */ }
+        }
+        this.resourceReleases.push(...kept);
+      }
+
+      releaseResources() {
+        this.sweepRasterLeases();
         this.currentResource = null;
+      }
+
+      releaseAllRasterLeases() {
+        for (const lease of this.resourceReleases.splice(0)) {
+          try { lease.release(); } catch (error) { /* best-effort lease cleanup */ }
+        }
       }
 
       leaseResolvedRaster(value) {
@@ -1218,7 +1267,7 @@
           }
         }
         if (!url) throw new TypeError("raster resolver returned no safe display resource");
-        if (release) this.resourceReleases.push(release);
+        if (release) this.resourceReleases.push({ url, release });
         return Object.freeze({ url, release });
       }
 
@@ -1559,6 +1608,7 @@
         this.contextGeneration += 1;
         this.abortContextWork();
         this.abortSelectionWork();
+        this.releaseAllRasterLeases();
         for (const remove of this.listeners.splice(0)) remove();
         if (this.properties && typeof this.properties.destroy === "function") {
           this.properties.destroy();

@@ -135,7 +135,11 @@ function harness(options = {}) {
     overscan: options.overscan == null ? 2 : options.overscan,
     pageLimit: options.pageLimit || 2,
     objectUrls: options.objectUrls,
-    onResource: (resource) => published.push(resource),
+    displayedRasterUrls: options.displayedRasterUrls,
+    onResource: (resource) => {
+      published.push(resource);
+      if (typeof options.onResource === "function") options.onResource(resource);
+    },
     onSelection: (selection) => selections.push(selection),
     onHotTarget: (target) => hotTargets.push(target),
     onStatus: (...status) => statuses.push(status),
@@ -1472,4 +1476,75 @@ test("all #234 modules install through the browser LibraryToolCorrections namesp
   assert.equal(typeof exported.createPropertiesInspector, "function");
   assert.equal(typeof exported.createArtifactsFeature, "function");
   assert.equal(typeof exported.createUnavailableArtifactPorts, "function");
+});
+
+
+test("a displayed raster lease is never revoked while the host still shows it", async () => {
+  const revoked = [];
+  const displayed = [];
+  let revision = 1;
+  let detailGate = null;
+  const display = () => raster("capture-1", "captured-image", {
+    revision: `capture-1-r${revision}`,
+    resource: {
+      resource_id: "capture-1-resource",
+      revision: `display-r${revision}`,
+      variant: "display",
+    },
+  });
+  const { feature, published } = harness({
+    initialExpandedGroups: ["source-images"],
+    displayedRasterUrls: () => displayed.slice(),
+    // Emulates the shell: the mounted <img> keeps its current URL until a
+    // replacement resource with real display bytes is published.
+    onResource: (resource) => {
+      if (resource && resource.url) {
+        displayed.length = 0;
+        displayed.push(resource.url);
+      }
+    },
+    catalog: {
+      async list() { return { items: [display()] }; },
+      get() {
+        if (detailGate) return detailGate.promise;
+        return Promise.resolve(display());
+      },
+    },
+    resources: {
+      async resolveRaster({ resourceRef }) {
+        return {
+          url: `/safe/${resourceRef.revision}.jpg`,
+          revoke: () => revoked.push(resourceRef.revision),
+        };
+      },
+    },
+  });
+
+  await feature.setContext({ item_id: "book-1" });
+  await feature.select("artifact:capture-1");
+  assert.deepEqual(displayed, ["/safe/display-r1.jpg"]);
+  assert.deepEqual(revoked, []);
+
+  revision = 2;
+  detailGate = deferred();
+  const refreshing = feature.refresh({ preserveSelection: true });
+  for (let attempt = 0; attempt < 40 &&
+      !(published.at(-1) && published.at(-1).loading); attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(published.at(-1).loading, true,
+    "the refresh reached its transient loading publish");
+  assert.deepEqual(revoked, [],
+    "the refresh window must not revoke the URL still bound to the mounted image");
+
+  detailGate.resolve(display());
+  detailGate = null;
+  await refreshing;
+  assert.equal(feature.currentResource.url, "/safe/display-r2.jpg");
+  assert.deepEqual(revoked, ["display-r1"],
+    "the old lease is released once its replacement is published");
+
+  feature.destroy();
+  assert.deepEqual(revoked, ["display-r1", "display-r2"],
+    "teardown releases every remaining lease");
 });

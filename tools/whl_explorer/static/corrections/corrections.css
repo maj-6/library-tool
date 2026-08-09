@@ -499,6 +499,38 @@ body.desktop .window-controls {
   overflow: auto;
   display: grid;
   place-items: stretch;
+  position: relative;
+}
+
+/* Compact strip shown when a newer revision arrived while the editor holds
+   uncommitted work; the current editor stays mounted until Reload. */
+.editor-refresh-affordance {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  z-index: 12;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px 2px 8px;
+  font-family: var(--ui);
+  font-size: 11px;
+  color: var(--ink-muted);
+  background: var(--panel-subtle);
+  border: 1px solid var(--line);
+}
+
+.editor-refresh-affordance .editor-refresh-reload {
+  font: inherit;
+  color: var(--ink);
+  padding: 1px 7px;
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  cursor: pointer;
+}
+
+.editor-refresh-affordance .editor-refresh-reload:hover {
+  border-color: var(--accent);
 }
 
 .editor-empty,

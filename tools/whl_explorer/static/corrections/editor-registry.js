@@ -209,9 +209,16 @@
     selectEditor(editorId) {
       const selected = this.compatibleEditors().find((editor) => editor.id === editorId);
       if (!selected) return false;
+      // A republished resource re-asserts the same hint on every publish.
+      // Selecting what is already selected must not fire the change callback:
+      // the shell re-renders (and remounts the editor) on that callback.
+      const unchanged = this.selectedEditorId === selected.id &&
+        this.choices[this.family] === selected.id;
       this.selectedEditorId = selected.id;
       this.choices[this.family] = selected.id;
-      this.onSelectionChange({ family: this.family, editorId: selected.id });
+      if (!unchanged) {
+        this.onSelectionChange({ family: this.family, editorId: selected.id });
+      }
       return true;
     }
 

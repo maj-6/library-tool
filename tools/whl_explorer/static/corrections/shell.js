@@ -395,6 +395,36 @@
     return String(revision).startsWith("index:");
   }
 
+  function resourceItemId(resource) {
+    if (!resource || typeof resource !== "object") return "";
+    const summary = resource.summary || {};
+    return String(resource.itemId || resource.item_id ||
+      summary.itemId || summary.item_id || "");
+  }
+
+  function resourceRevisionToken(resource) {
+    if (!resource || typeof resource !== "object") return "";
+    const summary = resource.summary || {};
+    return String(summary.revision || resource.revision || "");
+  }
+
+  function resourceBytesIdentity(resource) {
+    const ref = resource && resource.resourceRef;
+    if (!ref || typeof ref !== "object") return "";
+    return [
+      String(ref.id || ref.resource_id || ""),
+      String(ref.revision || ""),
+      String(ref.variant || ""),
+    ].join("|");
+  }
+
+  function sameEditResourceIdentity(first, second) {
+    return Boolean(first && second &&
+      String(first.id || "") === String(second.id || "") &&
+      String(first.id || "") !== "" &&
+      resourceItemId(first) === resourceItemId(second));
+  }
+
   function nextTrayTab(current, key) {
     const currentIndex = TRAY_TABS.indexOf(current);
     if (currentIndex < 0) return null;
@@ -450,6 +480,19 @@
       this.externalRefreshPromise = null;
       this.restoringProfile = false;
       this.artifactOverlays = new Set();
+      // Resource the mounted editor was actually rendered with, and the
+      // editor id that rendered it. The equivalence gate compares incoming
+      // publishes against these instead of remounting on every publish.
+      this.renderedResource = null;
+      this.renderedEditorId = null;
+      // A newer non-equivalent resource held back because the mounted editor
+      // carries uncommitted user state; applied via the reload affordance.
+      this.pendingResource = null;
+      // Latest image-editor state, mirrored through onStateChange, so the
+      // gate can tell whether a remount would destroy in-progress work.
+      this.editorCanvasState = null;
+      // In-place region/metadata updater for the mounted editor overlay.
+      this.activeOverlayUpdate = null;
       this.artifactOverlayProfile = typeof deps.normalizeArtifactOverlayProfile === "function"
         ? deps.normalizeArtifactOverlayProfile(null) : { regionLabels: true };
       this.destroyed = false;
@@ -576,6 +619,7 @@
           return refreshed;
         },
         onStateChange: (state) => {
+          this.editorCanvasState = state || null;
           if (!this.classificationController ||
               typeof this.classificationController.setCanvasOwner !== "function") {
             return;
@@ -1005,6 +1049,7 @@
           "source-images",
         ],
         onResource: (resource) => this.setResource(resource),
+        displayedRasterUrls: () => this.displayedEditorUrls(),
         onSelection: (item) => this.selectArtifactItem(item),
         onHotTarget: (item) => {
           this.root.dataset.hotArtifactKey = item && item.key || "";
@@ -1696,26 +1741,31 @@
           typeof deps.createArtifactOverlay !== "function") return null;
       const stage = controller.image.parentNode;
       if (!stage || typeof stage.append !== "function") return null;
-      const summary = resource && resource.summary || {};
-      const rawRegions = Array.isArray(resource && resource.regions)
-        ? resource.regions : [];
-      const regions = rawRegions.map((raw) => {
-        const value = isPlainObject(raw) ? raw : {};
-        const objectType = value.objectType || value.object_type ||
-          value.type || "spatial-annotation";
-        const id = value.annotationId || value.annotation_id || value.id || "";
-        const normalized = {
-          ...value,
-          objectType,
-          itemId: value.itemId || value.item_id || summary.itemId || "",
-          id,
-          revision: value.revision || value.annotationRevision ||
-            value.annotation_revision || "",
-        };
-        return { ...normalized, key: targetKey(normalized) };
-      });
-      const dimensions = resource && resource.dimensions ||
-        summary.dimensions || {};
+      // The equivalence gate republishes region and freshness metadata into
+      // the mounted editor without a remount, so everything the overlay
+      // derives from the resource is read through this mutable reference.
+      let activeResource = resource;
+      const normalizedRegions = () => {
+        const summary = activeResource && activeResource.summary || {};
+        const rawRegions = Array.isArray(activeResource && activeResource.regions)
+          ? activeResource.regions : [];
+        const regions = rawRegions.map((raw) => {
+          const value = isPlainObject(raw) ? raw : {};
+          const objectType = value.objectType || value.object_type ||
+            value.type || "spatial-annotation";
+          const id = value.annotationId || value.annotation_id || value.id || "";
+          const normalized = {
+            ...value,
+            objectType,
+            itemId: value.itemId || value.item_id || summary.itemId || "",
+            id,
+            revision: value.revision || value.annotationRevision ||
+              value.annotation_revision || "",
+          };
+          return { ...normalized, key: targetKey(normalized) };
+        });
+        return { summary, rawRegions, regions };
+      };
       const overlay = deps.createArtifactOverlay({
         root: stage,
         documentRef: this.documentRef,
@@ -1757,6 +1807,9 @@
       }).mount();
       if (this.artifactOverlays) this.artifactOverlays.add(overlay);
       const sync = () => {
+        const { summary, rawRegions, regions } = normalizedRegions();
+        const dimensions = activeResource && activeResource.dimensions ||
+          summary.dimensions || {};
         const sourceWidth = Number(
           dimensions.width || dimensions.pixel_width ||
           controller.image.naturalWidth || controller.image.width) || 1;
@@ -1770,7 +1823,7 @@
           const selector = region && (region.selector || region.polygon) || region;
           const coordinateSpace = String(
             selector && (selector.coordinate_space || selector.coordinateSpace) ||
-            resource && resource.coordinateSpace || "").toLowerCase();
+            activeResource && activeResource.coordinateSpace || "").toLowerCase();
           // display_normalized belongs here too: capture geometry is
           // normalized against the EXIF-upright display rendition — every
           // stage that produces it (cv2, which applies the orientation on
@@ -1787,13 +1840,19 @@
         overlay.setRegions(regions, {
           sourceWidth,
           sourceHeight,
-          coordinateSpace: resource && resource.coordinateSpace,
+          coordinateSpace: activeResource && activeResource.coordinateSpace,
         });
       };
+      const update = (nextResource) => {
+        if (nextResource) activeResource = nextResource;
+        sync();
+      };
+      this.activeOverlayUpdate = update;
       controller.image.addEventListener("load", sync);
       sync();
       return () => {
         controller.image.removeEventListener("load", sync);
+        if (this.activeOverlayUpdate === update) this.activeOverlayUpdate = null;
         if (this.artifactOverlays) this.artifactOverlays.delete(overlay);
         overlay.destroy();
         // The overlay releases its own soft target on destroy; this covers
@@ -2661,12 +2720,136 @@
         `Profile: ${this.profileKey}`);
     }
 
+    // True while the mounted image editor holds user state a remount would
+    // silently destroy: an in-flight gesture, a mask draft, or edits that
+    // have not been queued (or whose queue attempt is still retryable).
+    editorHoldsDirtyState() {
+      const state = this.editorCanvasState;
+      if (!state) return false;
+      if (state.gesture || state.maskDraft) return true;
+      const status = state.submission && state.submission.status;
+      if (status === "submitting" || status === "retryable") return true;
+      if (status === "queued" || status === "complete") return false;
+      return Boolean(
+        Array.isArray(state.undoStack) && state.undoStack.length ||
+        Array.isArray(state.operations) && state.operations.length ||
+        state.maskPolygon,
+      );
+    }
+
+    // Decides what a newly published resource means for the mounted editor:
+    // - "render": mount or replace the editor (identity/family change, or a
+    //   genuinely new revision with no uncommitted work at risk);
+    // - "update": the resource is equivalent for editing purposes (same
+    //   artifact, revision, and underlying bytes) — apply metadata in place;
+    // - "hold": a transient loading placeholder for the artifact already on
+    //   screen — keep showing the current image;
+    // - "defer": a non-equivalent replacement while the editor holds
+    //   uncommitted user state — keep the editor and surface a reload
+    //   affordance instead of destroying the work.
+    classifyResourceUpdate(next) {
+      const rendered = this.renderedResource;
+      if (!rendered || !this.renderedEditorId) return "render";
+      if (deps.resourceFamily(rendered) !== "image") return "render";
+      if (typeof rendered.url !== "string" || !rendered.url) return "render";
+      if (!next || typeof next !== "object") return "render";
+      if (!sameEditResourceIdentity(rendered, next)) return "render";
+      if (next.loading === true && !next.url) return "hold";
+      if (deps.resourceFamily(next) === "image" &&
+          typeof next.url === "string" && next.url &&
+          resourceRevisionToken(rendered) === resourceRevisionToken(next) &&
+          resourceBytesIdentity(rendered) === resourceBytesIdentity(next)) {
+        return "update";
+      }
+      return this.editorHoldsDirtyState() ? "defer" : "render";
+    }
+
     setResource(resource) {
+      const verdict = this.classifyResourceUpdate(resource);
+      if (verdict === "hold") return;
+      if (verdict === "defer") {
+        this.pendingResource = resource;
+        this.showEditorRefreshAffordance();
+        this.sweepArtifactRasterLeases();
+        return;
+      }
       this.state.setResource(resource);
       this.editorRegistry.setResource(resource);
+      if (verdict === "update" &&
+          this.editorRegistry.selectedEditorId === this.renderedEditorId) {
+        // renderedResource deliberately keeps describing what the DOM shows
+        // (including the blob URL the mounted <img> still points at); only
+        // the metadata travels into the live editor.
+        this.refreshEditorSelector();
+        this.syncMountedEditorMetadata(resource);
+        this.sweepArtifactRasterLeases();
+        if (!this.artifactsFeature) this.renderProperties();
+        return;
+      }
       this.refreshEditorSelector();
       this.renderEditor();
       if (!this.artifactsFeature) this.renderProperties();
+    }
+
+    syncMountedEditorMetadata(resource) {
+      if (typeof this.activeOverlayUpdate === "function") {
+        this.activeOverlayUpdate(resource);
+      }
+    }
+
+    displayedEditorUrls() {
+      const urls = [];
+      for (const value of [
+        this.renderedResource,
+        this.pendingResource,
+        this.state && this.state.resource,
+      ]) {
+        if (value && typeof value.url === "string" && value.url) {
+          urls.push(value.url);
+        }
+      }
+      return urls;
+    }
+
+    sweepArtifactRasterLeases() {
+      const feature = this.artifactsFeature;
+      if (feature && typeof feature.sweepRasterLeases === "function") {
+        feature.sweepRasterLeases();
+      }
+    }
+
+    showEditorRefreshAffordance() {
+      const host = this.root.querySelector("[data-editor-host]");
+      if (!host || !this.documentRef) return null;
+      let bar = host.querySelector("[data-editor-refresh-affordance]");
+      if (bar) return bar;
+      bar = this.documentRef.createElement("div");
+      bar.className = "editor-refresh-affordance";
+      bar.setAttribute("data-editor-refresh-affordance", "");
+      bar.setAttribute("role", "status");
+      const label = this.documentRef.createElement("span");
+      label.textContent = "Newer revision available";
+      const reload = this.documentRef.createElement("button");
+      reload.type = "button";
+      reload.className = "editor-refresh-reload";
+      reload.setAttribute("data-editor-refresh-reload", "");
+      reload.textContent = "Reload";
+      this.listen(reload, "click", () => this.applyPendingResource());
+      bar.append(label, reload);
+      host.append(bar);
+      return bar;
+    }
+
+    applyPendingResource() {
+      const pending = this.pendingResource;
+      if (!pending) return null;
+      this.pendingResource = null;
+      this.state.setResource(pending);
+      this.editorRegistry.setResource(pending);
+      this.refreshEditorSelector();
+      this.renderEditor();
+      if (!this.artifactsFeature) this.renderProperties();
+      return pending;
     }
 
     refreshEditorSelector() {
@@ -2696,9 +2879,12 @@
     renderEditor() {
       const host = this.root.querySelector("[data-editor-host]");
       if (!host) return;
-      this.editorRegistry.render(host);
+      this.pendingResource = null;
+      this.renderedEditorId = this.editorRegistry.render(host);
+      this.renderedResource = this.editorRegistry.resource;
       replaceText(this.root.querySelector("[data-editor-resource-label]"),
         deps.resourceLabel(this.state.resource));
+      this.sweepArtifactRasterLeases();
     }
 
     renderProperties() {
@@ -2813,6 +2999,11 @@
       }
       this.imageAdjustTool = null;
       if (this.artifactOverlays) this.artifactOverlays.clear();
+      this.activeOverlayUpdate = null;
+      this.renderedResource = null;
+      this.renderedEditorId = null;
+      this.pendingResource = null;
+      this.editorCanvasState = null;
       this.layout.destroy();
       for (const remove of this.listeners.splice(0)) remove();
     }
