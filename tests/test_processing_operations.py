@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -189,6 +191,32 @@ def test_pipeline_order_is_significant_and_never_reordered() -> None:
 def test_out_of_range_parameters_are_rejected(factory, message: str) -> None:
     with pytest.raises(ProcessingOperationError, match=message):
         factory()
+
+
+def test_the_shared_authoring_fixture_is_engine_canonical() -> None:
+    """Pin the fixture the corrections UI builds its wire documents against.
+
+    corrections_image_adjust_tool_behavior.test.js asserts the JavaScript
+    authoring helper reproduces every ``canonical`` entry byte-for-byte; this
+    side proves those entries are exactly what ``operation_from_dict`` accepts
+    and what constructing the operation from the ``authoring`` parameters
+    serializes to.  Together the two suites guarantee a UI-authored recipe is
+    never rejected by the content-addressed transform command.
+    """
+
+    fixture = json.loads(
+        (Path(__file__).with_name("fixtures") / "processing_operations_canonical.json")
+        .read_text(encoding="utf-8")
+    )
+    assert fixture["schema"] == "librarytool.processing-operations-canonical/1"
+    entries = fixture["operations"]
+    covered = {entry["authoring"]["algorithm"] for entry in entries}
+    assert covered == set(PROCESSING_ALGORITHMS)
+    for entry in entries:
+        operation = operation_from_dict(entry["canonical"])
+        assert operation.as_dict() == entry["canonical"]
+        authored = type(operation)(**entry["authoring"]["parameters"])
+        assert authored == operation
 
 
 def test_wire_documents_must_be_canonical() -> None:

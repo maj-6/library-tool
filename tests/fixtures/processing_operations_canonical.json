@@ -1,0 +1,269 @@
+{
+  "schema": "librarytool.processing-operations-canonical/1",
+  "description": "Canonical wire serializations of every processing operation, generated from librarytool.processing.operations. The corrections UI must author these exact documents (rule strings included) or the engine rejects the transform command.",
+  "operations": [
+    {
+      "authoring": {
+        "algorithm": "unsharp-mask-v1",
+        "parameters": {}
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "unsharp-mask-v1",
+        "rule": "pillow_unsharp_mask(radius=radius_tenths/10, percent=amount_percent, threshold=threshold)",
+        "radius_tenths": 10,
+        "amount_percent": 150,
+        "threshold": 3
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "kernel-sharpen-v1",
+        "parameters": {}
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "kernel-sharpen-v1",
+        "rule": "3x3 kernel [[0,-1,0],[-1,5,-1],[0,-1,0]] blended with identity at strength_percent/100",
+        "strength_percent": 50
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "gamma-v1",
+        "parameters": {}
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "gamma-v1",
+        "rule": "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+        "gamma_hundredths": 100
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "contrast-v1",
+        "parameters": {}
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "contrast-v1",
+        "rule": "factor = 1 + contrast_percent/100 when positive else 1 + contrast_percent/100 toward 127.5; round_half_up(127.5 + (value - 127.5) * factor), clamped_0_255",
+        "contrast_percent": 0
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "channel-gain-v1",
+        "parameters": {}
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "channel-gain-v1",
+        "rule": "round_half_up(value * channel_percent/100), clamped_0_255",
+        "red_percent": 100,
+        "green_percent": 100,
+        "blue_percent": 100
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "white-balance-v1",
+        "parameters": {}
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "white-balance-v1",
+        "rule": "per-channel gain = 1 + strength_percent/100 * (mean_of_all_channels/channel_mean - 1); round_half_up(value * gain), clamped_0_255",
+        "mode": "gray_world",
+        "strength_percent": 100,
+        "temperature": 0,
+        "tint": 0
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "unsharp-mask-v1",
+        "parameters": {
+          "radius_tenths": 15,
+          "amount_percent": 180,
+          "threshold": 3
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "unsharp-mask-v1",
+        "rule": "pillow_unsharp_mask(radius=radius_tenths/10, percent=amount_percent, threshold=threshold)",
+        "radius_tenths": 15,
+        "amount_percent": 180,
+        "threshold": 3
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "unsharp-mask-v1",
+        "parameters": {
+          "radius_tenths": 500,
+          "amount_percent": 0,
+          "threshold": 255
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "unsharp-mask-v1",
+        "rule": "pillow_unsharp_mask(radius=radius_tenths/10, percent=amount_percent, threshold=threshold)",
+        "radius_tenths": 500,
+        "amount_percent": 0,
+        "threshold": 255
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "kernel-sharpen-v1",
+        "parameters": {
+          "strength_percent": 40
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "kernel-sharpen-v1",
+        "rule": "3x3 kernel [[0,-1,0],[-1,5,-1],[0,-1,0]] blended with identity at strength_percent/100",
+        "strength_percent": 40
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "gamma-v1",
+        "parameters": {
+          "gamma_hundredths": 120
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "gamma-v1",
+        "rule": "round_half_up(255 * (value/255) ** (100/gamma_hundredths)), clamped_0_255",
+        "gamma_hundredths": 120
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "contrast-v1",
+        "parameters": {
+          "contrast_percent": -100
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "contrast-v1",
+        "rule": "factor = 1 + contrast_percent/100 when positive else 1 + contrast_percent/100 toward 127.5; round_half_up(127.5 + (value - 127.5) * factor), clamped_0_255",
+        "contrast_percent": -100
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "contrast-v1",
+        "parameters": {
+          "contrast_percent": 25
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "contrast-v1",
+        "rule": "factor = 1 + contrast_percent/100 when positive else 1 + contrast_percent/100 toward 127.5; round_half_up(127.5 + (value - 127.5) * factor), clamped_0_255",
+        "contrast_percent": 25
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "channel-gain-v1",
+        "parameters": {
+          "red_percent": 110,
+          "green_percent": 100,
+          "blue_percent": 95
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "channel-gain-v1",
+        "rule": "round_half_up(value * channel_percent/100), clamped_0_255",
+        "red_percent": 110,
+        "green_percent": 100,
+        "blue_percent": 95
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "white-balance-v1",
+        "parameters": {
+          "mode": "gray_world",
+          "strength_percent": 55
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "white-balance-v1",
+        "rule": "per-channel gain = 1 + strength_percent/100 * (mean_of_all_channels/channel_mean - 1); round_half_up(value * gain), clamped_0_255",
+        "mode": "gray_world",
+        "strength_percent": 55,
+        "temperature": 0,
+        "tint": 0
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "white-balance-v1",
+        "parameters": {
+          "mode": "manual",
+          "strength_percent": 80,
+          "temperature": 30,
+          "tint": -10
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "white-balance-v1",
+        "rule": "red gain = 1 + strength_percent/100 * temperature/200; blue gain = 1 - strength_percent/100 * temperature/200; green gain = 1 + strength_percent/100 * tint/200; round_half_up(value * gain), clamped_0_255",
+        "mode": "manual",
+        "strength_percent": 80,
+        "temperature": 30,
+        "tint": -10
+      }
+    },
+    {
+      "authoring": {
+        "algorithm": "white-balance-v1",
+        "parameters": {
+          "mode": "manual",
+          "strength_percent": 100,
+          "temperature": -100,
+          "tint": 100
+        }
+      },
+      "canonical": {
+        "schema": "org.whl.raster.processing-operation",
+        "version": 1,
+        "algorithm": "white-balance-v1",
+        "rule": "red gain = 1 + strength_percent/100 * temperature/200; blue gain = 1 - strength_percent/100 * temperature/200; green gain = 1 + strength_percent/100 * tint/200; round_half_up(value * gain), clamped_0_255",
+        "mode": "manual",
+        "strength_percent": 100,
+        "temperature": -100,
+        "tint": 100
+      }
+    }
+  ]
+}
