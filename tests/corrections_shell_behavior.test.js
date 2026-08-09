@@ -4323,3 +4323,189 @@ test("capture geometry is drawn without re-applying the display orientation", ()
     "display_normalized coordinates are already upright, like canvas-normalized",
   );
 });
+
+
+function editorGateHarness() {
+  const documentRef = fakeDocument();
+  const windowRef = {
+    localStorage: new MemoryStorage(),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  documentRef.defaultView = windowRef;
+  const rootElement = new FakeNode("div", documentRef);
+  const host = new FakeNode("div", documentRef);
+  host.setAttribute("data-editor-host", "");
+  rootElement.append(host);
+  const shell = new CorrectionsShell({
+    root: rootElement,
+    documentRef,
+    windowRef,
+    layoutController: {
+      getState: () => ({ ...DEFAULT_LAYOUT }),
+      replaceState() {},
+      destroy() {},
+    },
+    features: false,
+    booksFeature: false,
+    artifactsFeature: false,
+    itemProperties: false,
+    ocrProposalsFeature: false,
+    chPanelFeature: false,
+  });
+  return { documentRef, host, rootElement, shell };
+}
+
+
+function editableImageResource(revision, overrides = {}) {
+  return {
+    id: "capture-9",
+    itemId: "book-1",
+    label: "capture 9",
+    kind: "captured-image",
+    family: "image",
+    media_type: "image/jpeg",
+    url: `/capture-9-${revision}.jpg`,
+    resourceRef: {
+      id: "capture-9-display",
+      revision: `display-${revision}`,
+      variant: "display",
+    },
+    summary: { itemId: "book-1", revision: `artifact-${revision}` },
+    correction: {
+      item_id: "book-1",
+      artifact_id: "capture-9",
+      artifact_revision: `artifact-${revision}`,
+      source_revision: "source-r1",
+      source_sha256: "a".repeat(64),
+      proposal: null,
+    },
+    regions: [],
+    dimensions: { width: 400, height: 300 },
+    ...overrides,
+  };
+}
+
+
+function overlayRegionRow(id) {
+  return {
+    annotation_id: id,
+    object_type: "spatial-annotation",
+    revision: `${id}-r1`,
+    label: id,
+    selector: {
+      type: "polygon",
+      coordinate_space: "canvas-normalized",
+      points: [
+        { x: 0.1, y: 0.1 },
+        { x: 0.4, y: 0.1 },
+        { x: 0.4, y: 0.3 },
+      ],
+    },
+  };
+}
+
+
+test("an equivalent republish updates the mounted image editor in place", () => {
+  const { host, shell } = editorGateHarness();
+  shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  assert.ok(surface, "the perspective editor mounts for the image resource");
+  assert.equal(host.querySelectorAll("[data-overlay-key]").length, 0);
+
+  shell.setResource(editableImageResource("r1", {
+    url: "/capture-9-r1-second-lease.jpg",
+    regions: [overlayRegionRow("region-1")],
+  }));
+
+  assert.equal(host.querySelector(".perspective-editor"), surface,
+    "an equivalent republish must not remount the editor");
+  assert.equal(host.querySelector(".perspective-image").src,
+    "/capture-9-r1.jpg",
+    "the mounted image keeps the URL it is already displaying");
+  assert.equal(host.querySelectorAll("[data-overlay-key]").length, 1,
+    "arriving regions land on the mounted overlay without a remount");
+  host.querySelector("[data-image-tool='polygon']").emit("click");
+  assert.equal(surface.dataset.activeTool, "polygon",
+    "the original editor's listeners remain live");
+  shell.destroy();
+});
+
+
+test("a transient loading republish keeps the current image on screen", () => {
+  const { host, shell } = editorGateHarness();
+  shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  shell.setResource({
+    id: "capture-9",
+    label: "capture 9",
+    kind: "captured-image",
+    family: "image",
+    media_type: "image/jpeg",
+    loading: true,
+    missing: false,
+    summary: { itemId: "book-1", revision: "artifact-r1" },
+  });
+  assert.equal(host.querySelector(".perspective-editor"), surface,
+    "a refresh's loading placeholder must not blank the mounted editor");
+  assert.doesNotMatch(host.textContent, /Image unavailable/,
+    "no 'no safe renderable source' flash during the refresh window");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg",
+    "the shell keeps describing the resource that is actually mounted");
+  shell.destroy();
+});
+
+
+test("a newer revision defers behind a reload affordance while the editor is dirty", () => {
+  const { host, shell } = editorGateHarness();
+  shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  const canvas = host.querySelector("[data-classification-canvas]");
+  canvas.getBoundingClientRect = () => ({
+    left: 0, top: 0, width: 400, height: 300,
+  });
+  canvas.setPointerCapture = () => {};
+  host.querySelector("[data-image-tool='perspective']").emit("click");
+  canvas.emit("pointerdown", {
+    pointerId: 3, button: 0, clientX: 12, clientY: 10,
+  });
+  assert.ok(shell.editorCanvasState && shell.editorCanvasState.gesture,
+    "a corner drag is in progress");
+
+  shell.setResource(editableImageResource("r2"));
+
+  assert.equal(host.querySelector(".perspective-editor"), surface,
+    "a non-equivalent refresh must not destroy in-progress work");
+  assert.ok(shell.editorCanvasState.gesture, "the drag survives the publish");
+  const affordance = host.querySelector("[data-editor-refresh-affordance]");
+  assert.ok(affordance, "a compact newer-revision affordance is surfaced");
+  assert.equal(shell.pendingResource.url, "/capture-9-r2.jpg");
+  assert.equal(shell.state.resource.url, "/capture-9-r1.jpg",
+    "commands keep operating on the mounted revision until reload");
+
+  affordance.querySelector("[data-editor-refresh-reload]").emit("click");
+  const replacement = host.querySelector(".perspective-editor");
+  assert.ok(replacement, "reload mounts an editor");
+  assert.notEqual(replacement, surface, "reload swaps in the newer revision");
+  assert.equal(host.querySelector("[data-editor-refresh-affordance]"), null,
+    "the affordance clears once the newer revision is mounted");
+  assert.equal(shell.pendingResource, null);
+  assert.equal(shell.state.resource.url, "/capture-9-r2.jpg");
+  shell.destroy();
+});
+
+
+test("a newer revision remounts immediately when nothing is at risk", () => {
+  const { host, shell } = editorGateHarness();
+  shell.setResource(editableImageResource("r1"));
+  const surface = host.querySelector(".perspective-editor");
+  shell.setResource(editableImageResource("r2"));
+  const replacement = host.querySelector(".perspective-editor");
+  assert.ok(replacement);
+  assert.notEqual(replacement, surface,
+    "a clean editor follows the newer revision without deferring");
+  assert.equal(host.querySelector("[data-editor-refresh-affordance]"), null);
+  assert.equal(host.querySelector(".perspective-image").src,
+    "/capture-9-r2.jpg");
+  shell.destroy();
+});
