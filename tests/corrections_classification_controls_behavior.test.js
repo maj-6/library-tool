@@ -340,6 +340,69 @@ test("context menu entries and invocation use the target owned by the event", as
 });
 
 
+test("context menus include an event-owned capture Delete command", async () => {
+  const {
+    contextTarget,
+    controller,
+    controls,
+    scope,
+  } = harness();
+  const clicked = {
+    ...image(),
+    key: "artifact:capture-hint",
+    id: "capture-hint",
+    revision: "index:capture-hint-r1",
+    kind: "capture",
+  };
+  const deleted = [];
+  controller.registry.register({
+    id: "corrections.capture.move-to-trash",
+    label: "Delete capture image",
+    shortLabel: "Delete",
+    code: "DEL",
+    defaultBinding: "backspace",
+    targetKind: "capture-page",
+    available: (commandContext) =>
+      commandContext.focusedTarget === clicked,
+    execute: (commandContext) => {
+      deleted.push(commandContext.focusedTarget);
+      return { ok: true };
+    },
+  });
+  controls.isContextMenuEvent = (event) =>
+    event.target === contextTarget ? clicked : null;
+  controller.setSelectionTarget(image());
+  controller.mount();
+  controls.mount();
+
+  const event = scope.emit("contextmenu", {
+    target: contextTarget,
+    clientX: 16,
+    clientY: 20,
+  });
+  assert.equal(event.defaultPrevented, true);
+  const menu = scope.querySelector("[data-classification-context-menu]");
+  const remove = byDataset(
+    menu,
+    "[data-surface-command]",
+    "surfaceCommand",
+    "corrections.capture.move-to-trash",
+  );
+  assert.ok(remove);
+  assert.equal(
+    remove.querySelector(".classification-surface-label").textContent,
+    "Delete capture image",
+  );
+
+  remove.emit("click");
+  await settled();
+  assert.deepEqual(deleted, [clicked]);
+  assert.equal(menu.hidden, true);
+  controls.destroy();
+  controller.destroy();
+});
+
+
 test("inline shortcut editor captures remaps, updates labels, and reports conflicts", async () => {
   const {
     bindingChanges,

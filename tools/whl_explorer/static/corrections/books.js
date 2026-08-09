@@ -1147,13 +1147,7 @@
     });
   }
 
-  function captureCommandTarget(book, capture) {
-    // ``index:`` revisions are navigation hints derived without reading image
-    // bytes. They are never valid optimistic-concurrency preconditions. The
-    // artifact feature publishes an authoritative target after detail hydration.
-    if (String(capture && capture.revision || "").startsWith("index:")) {
-      return null;
-    }
+  function captureContextTarget(book, capture) {
     return freezeDeep({
       key: `artifact:${capture.artifact_id}`,
       objectType: "raster-artifact",
@@ -1171,6 +1165,16 @@
         canvasId: capture.canvas_id || "",
       },
     });
+  }
+
+  function captureCommandTarget(book, capture) {
+    // ``index:`` revisions are navigation hints derived without reading image
+    // bytes. They are never valid optimistic-concurrency preconditions. The
+    // artifact feature publishes an authoritative target after detail hydration.
+    if (String(capture && capture.revision || "").startsWith("index:")) {
+      return null;
+    }
+    return captureContextTarget(book, capture);
   }
 
   function captureIsNavigationHint(capture) {
@@ -1500,6 +1504,11 @@
     commandTargetForSelection(address) {
       const match = this.captureForSelection(address);
       return match ? captureCommandTarget(match.book, match.capture) : null;
+    }
+
+    contextTargetForSelection(address) {
+      const match = this.captureForSelection(address);
+      return match ? captureContextTarget(match.book, match.capture) : null;
     }
 
     captureForSelection(address) {
@@ -2173,6 +2182,7 @@
     captureAddress,
     captureBooks,
     captureCommandTarget,
+    captureContextTarget,
     captureState,
     compareBooks,
     compareCaptureBooks,

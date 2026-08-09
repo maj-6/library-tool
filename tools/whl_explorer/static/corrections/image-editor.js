@@ -24,6 +24,7 @@
     resolveEscape,
     serializeCorrectionTransformCommand,
     sourcePinsValid,
+    validateMaskPolygon,
     visibleModal,
   } = stateApi;
 
@@ -990,19 +991,40 @@
         }
       }
 
-      function queueAllowed() {
-        if (!state || state.gesture || state.maskDraft || !state.validation.valid ||
+      function queueBaseAllowed({ allowMaskDraft = false } = {}) {
+        if (!state || state.gesture || (state.maskDraft && !allowMaskDraft) ||
+            !state.validation.valid ||
             !sourcePinsValid(contract.pins) ||
             ["submitting", "queued", "complete"].includes(
               state.submission && state.submission.status,
             )) return false;
+        return true;
+      }
+
+      function queueAllowed() {
+        if (!queueBaseAllowed()) return false;
         // Select controls overlay interaction, not transform validity. Keep
         // the toolbar action available there; the Space shortcut remains
         // deliberately scoped to Perspective mode.
         if (state.tool === TOOLS.SELECT) return true;
+        // A committed mask is a complete transform input. Keep the shared
+        // primary action available without forcing a round trip through the
+        // Perspective tool just to submit it.
+        if (state.tool === TOOLS.POLYGON) return Array.isArray(state.maskPolygon);
         if (canQueueTransform(state, contract.pins)) return true;
         return typeof options.canQueue === "function" &&
           options.canQueue({ state, resource: activeResource, pins: contract.pins }) === true;
+      }
+
+      function maskApplyAllowed() {
+        if (state.tool !== TOOLS.POLYGON ||
+            !queueBaseAllowed({ allowMaskDraft: true })) return false;
+        if (state.maskDraft) return validateMaskPolygon(state.maskDraft).valid;
+        return Array.isArray(state.maskPolygon);
+      }
+
+      function primaryActionAllowed() {
+        return state.tool === TOOLS.POLYGON ? maskApplyAllowed() : queueAllowed();
       }
 
       function toolInstruction() {
@@ -1013,7 +1035,7 @@
           return "Image Adjust mode. Adjustment controls can be supplied by a registered tool extension.";
         }
         if (state.tool === TOOLS.POLYGON) {
-          return "Mask mode. Click to place vertices or drag to trace; click the first vertex or press Enter to close.";
+          return "Mask mode. Click to place vertices or drag to trace, then choose Apply mask. Click the first vertex or press Enter to close the outline first.";
         }
         return "Select mode. Choose Perspective to edit the four-corner boundary.";
       }
@@ -1033,10 +1055,14 @@
         proposalBadge.title = state.quadSource.message || "";
         undoButton.disabled = Boolean(state.gesture) || !state.undoStack.length;
         redoButton.disabled = Boolean(state.gesture) || !state.redoStack.length;
+        const maskAction = state.tool === TOOLS.POLYGON;
         queueButton.disabled = !invokeCommand || numericInvalid.size > 0 ||
-          !queueAllowed();
+          !primaryActionAllowed();
         queueButton.textContent = state.submission.status === "retryable"
-          ? "Retry queue" : "Queue transform";
+          ? maskAction ? "Retry apply mask" : "Retry queue"
+          : maskAction ? "Apply mask" : "Queue transform";
+        if (maskAction) removeAttribute(queueButton, "aria-keyshortcuts");
+        else queueButton.setAttribute("aria-keyshortcuts", "Space");
         if (viewOriginalButton) {
           const identity = originalIdentity();
           const api = originalApi();
@@ -1632,6 +1658,17 @@
         }
       }
 
+      async function requestPrimaryAction() {
+        if (state.tool !== TOOLS.POLYGON) return requestQueue("toolbar");
+        if (destroyed || !invokeCommand || numericInvalid.size ||
+            !maskApplyAllowed()) return null;
+        if (state.maskDraft) {
+          dispatch({ type: "MASK_COMMIT" });
+          if (state.maskDraft || !Array.isArray(state.maskPolygon)) return null;
+        }
+        return requestQueue("toolbar");
+      }
+
       function handleKeyDown(event) {
         // An in-progress ring owns Escape and Enter before anything else, so a
         // half-drawn mask is never left behind by the editor-wide handlers.
@@ -1701,7 +1738,7 @@
       }
       addListener(removers, undoButton, "click", () => dispatch({ type: "UNDO" }));
       addListener(removers, redoButton, "click", () => dispatch({ type: "REDO" }));
-      addListener(removers, queueButton, "click", () => { void requestQueue("toolbar"); });
+      addListener(removers, queueButton, "click", () => { void requestPrimaryAction(); });
       addListener(removers, viewOriginalButton, "click", () => {
         void requestViewOriginal();
       });

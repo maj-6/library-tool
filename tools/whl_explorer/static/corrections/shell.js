@@ -4,6 +4,7 @@
     ...require("./ui-profile"),
     ...require("./layout-controller"),
     ...require("./reviews"),
+    ...require("./artifact-model"),
     ...require("./artifacts"),
     ...require("./item-properties"),
     ...require("./engine-adapter"),
@@ -71,8 +72,8 @@
     BOOKS_NAVIGATION_COMMANDS.map((command) => command.id));
   const CAPTURE_TRASH_COMMAND = Object.freeze({
     id: "corrections.capture.move-to-trash",
-    label: "Move the current capture page to Trash",
-    shortLabel: "Move capture to Trash",
+    label: "Delete capture image",
+    shortLabel: "Delete",
     code: "DEL",
     defaultBinding: "backspace",
     targetKind: "capture-page",
@@ -639,6 +640,8 @@
         typeof options.captureAssetOperationIdFactory === "function"
           ? options.captureAssetOperationIdFactory : captureAssetOperationId;
       this.captureAssetDeletionPromise = null;
+      this.captureAssetDeletionTarget = null;
+      this.captureAssetDeletionEditorLock = null;
       this.captureAssetDeleteAttempts = new Map();
       // Region extraction is queued independently of the mounted image
       // editor's submission state. Keep its source capture alive until the
@@ -1078,32 +1081,192 @@
         ? commands.trashCaptureAsset : null;
     }
 
-    currentCaptureDeletionTarget() {
+    captureDeletionContextTarget(context) {
+      if (!context || typeof context !== "object") return null;
+      return context.focusedTarget || context.selectionTarget || null;
+    }
+
+    captureDeletionAddressFromTarget(target) {
+      if (!target || typeof target !== "object") return null;
+      const key = targetKey(target);
+      if (key && !key.startsWith("artifact:")) return null;
+      const itemId = String(target.itemId || target.item_id || "");
+      const artifactId = String(
+        target.artifactId || target.artifact_id || target.id ||
+        (key.startsWith("artifact:") ? key.slice("artifact:".length) : ""),
+      );
+      return itemId && artifactId ? { itemId, artifactId } : null;
+    }
+
+    captureDeletionIntent(context = null) {
       const books = this.booksPanel();
-      const selection = this.state && this.state.selection || {};
       if (!books || typeof books.captureForSelection !== "function") return null;
-      const match = books.captureForSelection(selection);
+      const contextualTarget = this.captureDeletionContextTarget(context);
+      const address = contextualTarget
+        ? this.captureDeletionAddressFromTarget(contextualTarget)
+        : this.state && this.state.selection || null;
+      if (!address) return null;
+      const match = books.captureForSelection(address);
       if (!match) return null;
       const key = `artifact:${match.capture.artifact_id}`;
       const loaded = this.artifactsFeature && this.artifactsFeature.items &&
         this.artifactsFeature.items.get(key);
       const selected = this.classificationController &&
         this.classificationController.selectionTarget;
+      const contextual = contextualTarget && targetKey(contextualTarget) === key &&
+        String(contextualTarget.itemId || contextualTarget.item_id || "") ===
+          match.book.id ? contextualTarget : null;
       const candidate = loaded && loaded.itemId === match.book.id
         ? loaded
-        : selected && targetKey(selected) === key &&
-            String(selected.itemId || selected.item_id || "") === match.book.id
-          ? selected : match.capture;
+        : contextual
+          ? contextual
+          : selected && targetKey(selected) === key &&
+              String(selected.itemId || selected.item_id || "") === match.book.id
+            ? selected : match.capture;
       const revision = String(candidate && (
         candidate.revision || candidate.artifactRevision ||
         candidate.artifact_revision) || "");
-      if (!revision || revision.startsWith("index:")) return null;
       return Object.freeze({
         itemId: match.book.id,
         artifactId: match.capture.artifact_id,
-        expectedArtifactRevision: revision,
+        expectedArtifactRevision:
+          revision && !revision.startsWith("index:") ? revision : "",
         label: String(match.capture.label ||
           `Capture ${match.capture.capture_order + 1}`),
+        address: Object.freeze({
+          itemId: match.book.id,
+          representationId: match.capture.representation_id || null,
+          canvasId: match.capture.canvas_id || null,
+          artifactId: match.capture.artifact_id,
+          annotationId: null,
+        }),
+      });
+    }
+
+    currentCaptureDeletionTarget(context = null) {
+      const intent = this.captureDeletionIntent(context);
+      return intent && intent.expectedArtifactRevision ? intent : null;
+    }
+
+    captureDeletionCatalog() {
+      const catalog = this.artifactPorts && this.artifactPorts.catalog;
+      return catalog && typeof catalog.get === "function" ? catalog : null;
+    }
+
+    captureDeletionCanResolve(intent) {
+      return Boolean(intent && (
+        intent.expectedArtifactRevision ||
+        this.captureDeletionCatalog() && this.state && this.state.context
+      ));
+    }
+
+    captureDeletionDirty(intent) {
+      return Boolean(
+        intent && this.captureDeletionSelectionMatches(intent) &&
+        this.editorHoldsDirtyState(),
+      );
+    }
+
+    captureDeletionSelectionMatches(target) {
+      const selection = this.state && this.state.selection || {};
+      return Boolean(
+        target && selection.itemId === target.itemId &&
+        sameCaptureSlot(selection.artifactId, target.artifactId),
+      );
+    }
+
+    captureDeletionMatchesAddress(target, address) {
+      return Boolean(
+        target && address && target.itemId === address.itemId &&
+        sameCaptureSlot(target.artifactId, address.artifactId),
+      );
+    }
+
+    captureDeletionMatchesResource(target, resource) {
+      if (!target || !resource || typeof resource !== "object") return false;
+      const candidates = [resource, resource.summary].filter(Boolean);
+      return candidates.some((candidate) => {
+        const address = this.captureDeletionAddressFromTarget(candidate);
+        return this.captureDeletionMatchesAddress(target, address);
+      });
+    }
+
+    beginCaptureDeletion(target) {
+      this.captureAssetDeletionTarget = target;
+      if (!this.captureDeletionSelectionMatches(target)) return;
+      const host = this.root &&
+        typeof this.root.querySelector === "function"
+        ? this.root.querySelector("[data-editor-host]") : null;
+      if (!host) return;
+      const previousAriaBusy = typeof host.getAttribute === "function"
+        ? host.getAttribute("aria-busy") : null;
+      this.captureAssetDeletionEditorLock = {
+        host,
+        inert: Boolean(host.inert),
+        previousAriaBusy,
+      };
+      host.inert = true;
+      if (typeof host.setAttribute === "function") {
+        host.setAttribute("aria-busy", "true");
+      }
+    }
+
+    endCaptureDeletion(target = null) {
+      if (!target || this.captureAssetDeletionTarget === target) {
+        this.captureAssetDeletionTarget = null;
+      }
+      const lock = this.captureAssetDeletionEditorLock;
+      this.captureAssetDeletionEditorLock = null;
+      if (!lock || !lock.host) return;
+      lock.host.inert = lock.inert;
+      if (lock.previousAriaBusy === null) {
+        if (typeof lock.host.removeAttribute === "function") {
+          lock.host.removeAttribute("aria-busy");
+        }
+      } else if (typeof lock.host.setAttribute === "function") {
+        lock.host.setAttribute("aria-busy", lock.previousAriaBusy);
+      }
+    }
+
+    async resolveCaptureDeletionTarget(intent) {
+      if (!intent) return null;
+      if (intent.expectedArtifactRevision) return intent;
+      const catalog = this.captureDeletionCatalog();
+      const requestContext = selectionContext(
+        this.state && this.state.context,
+        intent.address,
+      );
+      if (!catalog || !requestContext || typeof deps.decodeArtifactDetail !== "function") {
+        throw new Error("The capture image has no authoritative revision pin");
+      }
+      const contextGeneration = Number.isSafeInteger(this.contextGeneration)
+        ? this.contextGeneration : null;
+      const response = await catalog.get({
+        context: requestContext,
+        key: `artifact:${intent.artifactId}`,
+      });
+      if (this.destroyed || contextGeneration !== null &&
+          this.contextGeneration !== contextGeneration) {
+        throw new Error("The Corrections context changed; the capture was not deleted");
+      }
+      const raw = response && (
+        response.item || response.artifact || response.detail || response
+      );
+      const detail = deps.decodeArtifactDetail(raw);
+      const revision = String(detail && detail.revision || "");
+      const books = this.booksPanel();
+      const match = books && typeof books.captureForSelection === "function"
+        ? books.captureForSelection(intent.address) : null;
+      if (!match || detail.key !== `artifact:${intent.artifactId}` ||
+          detail.itemId !== intent.itemId || !revision ||
+          revision.startsWith("index:")) {
+        throw new Error(
+          "The capture image changed while its delete command was being prepared",
+        );
+      }
+      return Object.freeze({
+        ...intent,
+        expectedArtifactRevision: revision,
       });
     }
 
@@ -1198,14 +1361,15 @@
           registry.get(CAPTURE_TRASH_COMMAND.id)) return;
       registry.register({
         ...CAPTURE_TRASH_COMMAND,
-        available: () => {
-          const target = this.currentCaptureDeletionTarget();
+        available: (context) => {
+          const target = this.captureDeletionIntent(context);
           return Boolean(
             this.captureTrashPort() && !this.captureAssetDeletionPromise &&
-            !this.editorHoldsDirtyState() && target &&
+            this.captureDeletionCanResolve(target) &&
+            !this.captureDeletionDirty(target) &&
             !this.captureExtractionInFlight(target));
         },
-        execute: () => this.moveCurrentCaptureToTrash(),
+        execute: (context) => this.moveCurrentCaptureToTrash(context),
       });
     }
 
@@ -1228,9 +1392,11 @@
       fallback,
       removedKey = "",
       reason = "capture-deleted",
+      removedTarget = null,
     ) {
-      const selection = this.selectCaptureDeletionFallback(fallback);
-      if (!selection) return null;
+      const selection = !removedTarget ||
+          this.captureDeletionSelectionMatches(removedTarget)
+        ? this.selectCaptureDeletionFallback(fallback) : null;
       if (this.booksFeature && typeof this.booksFeature.refresh === "function") {
         await this.booksFeature.refresh(reason);
       }
@@ -1245,61 +1411,94 @@
       return selection;
     }
 
-    moveCurrentCaptureToTrash() {
+    moveCurrentCaptureToTrash(context = null) {
       if (this.captureAssetDeletionPromise) {
         return this.captureAssetDeletionPromise;
       }
       const port = this.captureTrashPort();
-      const target = this.currentCaptureDeletionTarget();
+      const intent = this.captureDeletionIntent(context);
       const books = this.booksPanel();
-      const fallback = target && books &&
-        typeof books.captureDeletionFallback === "function"
-        ? books.captureDeletionFallback(this.state.selection) : null;
-      if (!port || !target || !fallback || this.editorHoldsDirtyState() ||
-          this.captureExtractionInFlight(target)) {
+      if (!port || !intent || !books ||
+          typeof books.captureDeletionFallback !== "function" ||
+          !this.captureDeletionCanResolve(intent) ||
+          this.captureDeletionDirty(intent) ||
+          this.captureExtractionInFlight(intent)) {
         return Promise.reject(new Error(
           "The current capture page cannot be moved to Trash"));
       }
-      const attemptKey = [
-        target.itemId, target.artifactId, target.expectedArtifactRevision,
-      ].join("\u0000");
-      let operationId = this.captureAssetDeleteAttempts.get(attemptKey);
-      if (!operationId) {
-        operationId = this.captureAssetOperationIdFactory(target);
-        this.captureAssetDeleteAttempts.set(attemptKey, operationId);
-      }
       const run = (async () => {
-        const receipt = await port({ ...target, operationId });
-        this.captureAssetDeleteAttempts.delete(attemptKey);
-        try {
-          safeStorage(this.windowRef).setItem(
-            CAPTURE_LIFECYCLE_CHANGE_KEY,
-            JSON.stringify({
-              action: "delete",
-              itemId: target.itemId,
-              artifactId: target.artifactId,
-              changedAt: Date.now(),
-            }),
-          );
-        } catch (error) {
-          // Cross-window refresh is advisory; the durable receipt is complete.
+        const target = await this.resolveCaptureDeletionTarget(intent);
+        const fallback = target && books.captureDeletionFallback(target.address);
+        if (!target || !fallback || this.captureDeletionDirty(target) ||
+            this.captureExtractionInFlight(target)) {
+          throw new Error("The current capture page cannot be moved to Trash");
         }
         try {
-          await this.refreshDeletedCapture(
-            fallback,
-            `artifact:${target.artifactId}`,
-          );
-          this.setStatus(
-            `${target.label} moved to Trash. Restore it from Info > Trash.`,
-          );
-        } catch (error) {
-          this.setStatus(
-            error && error.message ||
-              "The capture was moved to Trash, but the view could not refresh",
-            true,
-          );
+          this.beginCaptureDeletion(target);
+          const attemptKey = [
+            target.itemId, target.artifactId, target.expectedArtifactRevision,
+          ].join("\u0000");
+          let operationId = this.captureAssetDeleteAttempts.get(attemptKey);
+          if (!operationId) {
+            operationId = this.captureAssetOperationIdFactory(target);
+            this.captureAssetDeleteAttempts.set(attemptKey, operationId);
+          }
+          const receipt = await port({
+            itemId: target.itemId,
+            artifactId: target.artifactId,
+            expectedArtifactRevision: target.expectedArtifactRevision,
+            label: target.label,
+            operationId,
+          });
+          this.captureAssetDeleteAttempts.delete(attemptKey);
+          if (this.destroyed) return receipt;
+          try {
+            safeStorage(this.windowRef).setItem(
+              CAPTURE_LIFECYCLE_CHANGE_KEY,
+              JSON.stringify({
+                action: "delete",
+                itemId: target.itemId,
+                artifactId: target.artifactId,
+                changedAt: Date.now(),
+              }),
+            );
+          } catch (error) {
+            // Cross-window refresh is advisory; the durable receipt is complete.
+          }
+          if (this.captureDeletionDirty(target)) {
+            this.setStatus(
+              `${target.label} moved to Trash, but an edit began while the ` +
+                "request was finishing. The editor was kept open; restore the " +
+                "capture from Info > Trash before applying the edit.",
+              true,
+            );
+            return receipt;
+          }
+          // The fallback selection runs synchronously before either inventory
+          // refresh yields. Release the interaction lock immediately before it
+          // so the newly selected capture is never left inert.
+          this.endCaptureDeletion(target);
+          try {
+            await this.refreshDeletedCapture(
+              fallback,
+              `artifact:${target.artifactId}`,
+              "capture-deleted",
+              target,
+            );
+            this.setStatus(
+              `${target.label} moved to Trash. Restore it from Info > Trash.`,
+            );
+          } catch (error) {
+            this.setStatus(
+              error && error.message ||
+                "The capture was moved to Trash, but the view could not refresh",
+              true,
+            );
+          }
+          return receipt;
+        } finally {
+          this.endCaptureDeletion(target);
         }
-        return receipt;
       })();
       this.captureAssetDeletionPromise = run;
       void run.finally(() => {
@@ -1446,9 +1645,13 @@
       if (owner.kind === "book-capture") {
         const books = this.booksFeature &&
           (this.booksFeature.books || this.booksFeature);
-        if (!books ||
-            typeof books.commandTargetForSelection !== "function") return null;
-        return this.classificationTargetMetadata(books.commandTargetForSelection({
+        if (!books) return null;
+        const resolver = typeof books.contextTargetForSelection === "function"
+          ? books.contextTargetForSelection.bind(books)
+          : typeof books.commandTargetForSelection === "function"
+            ? books.commandTargetForSelection.bind(books) : null;
+        if (!resolver) return null;
+        return this.classificationTargetMetadata(resolver({
           itemId: owner.itemId,
           artifactId: owner.artifactId,
         }));
@@ -3036,6 +3239,14 @@
     }
 
     selectAddress(value, metadata = {}) {
+      const deletionTarget = this.captureAssetDeletionTarget;
+      if (deletionTarget &&
+          this.captureDeletionMatchesAddress(deletionTarget, value)) {
+        this.setStatus(
+          `${deletionTarget.label || "This capture image"} is being moved to Trash.`,
+        );
+        return { ...this.state.selection };
+      }
       const previous = { ...this.state.selection };
       const selection = this.state.setSelection(value);
       if (this.booksFeature && typeof this.booksFeature.setSelection === "function") {
@@ -3575,6 +3786,14 @@
     }
 
     setResource(resource) {
+      const deletionTarget = this.captureAssetDeletionTarget;
+      if (deletionTarget &&
+          this.captureDeletionMatchesResource(deletionTarget, resource)) {
+        this.setStatus(
+          `${deletionTarget.label || "This capture image"} is being moved to Trash.`,
+        );
+        return;
+      }
       const verdict = this.classifyResourceUpdate(resource);
       if (verdict === "hold") return;
       if (["update", "rebase"].includes(verdict) &&
@@ -3800,6 +4019,7 @@
       if (this.captureAssetDeleteAttempts) {
         this.captureAssetDeleteAttempts.clear();
       }
+      this.endCaptureDeletion();
       if (this.captureLifecycleChanges) {
         this.captureLifecycleChanges.clear();
       }
