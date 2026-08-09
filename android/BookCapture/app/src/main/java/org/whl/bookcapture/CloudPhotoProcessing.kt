@@ -301,6 +301,7 @@ internal data class DesktopCorrectionInstallPlan(
     val artifact: CloudDisplayArtifact,
     val baseDisplaySha256: String,
     val baseDisplayRevision: Int,
+    val baseAppliedCorrectionId: String,
     val targetRevision: Int,
 )
 
@@ -407,6 +408,7 @@ internal fun validateDesktopCorrection(
         artifact = artifact,
         baseDisplaySha256 = asset.display.sha256,
         baseDisplayRevision = asset.display.revision,
+        baseAppliedCorrectionId = asset.appliedDesktopCorrectionId,
         targetRevision = asset.display.revision,
     )
     val display = asset.display

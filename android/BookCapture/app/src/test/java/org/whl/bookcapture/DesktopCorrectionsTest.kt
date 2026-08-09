@@ -161,6 +161,7 @@ class DesktopCorrectionsTest {
         val plan = (decision as DesktopCorrectionDecision.Ready).plan
         assertEquals(displayHash, plan.baseDisplaySha256)
         assertEquals(1, plan.baseDisplayRevision)
+        assertEquals("", plan.baseAppliedCorrectionId)
         assertEquals(2, plan.targetRevision)
         assertEquals(artifact(), plan.artifact)
         assertEquals(
@@ -407,6 +408,48 @@ class DesktopCorrectionsTest {
             assertEquals(2, repaired.display.revision)
             assertEquals(correctionA, repaired.appliedDesktopCorrectionId)
             assertEquals(bytes.toList(), installedFile.readBytes().toList())
+        }
+    }
+
+    @Test
+    fun downloadedCorrectionRestagesAfterConcurrentNonDesktopDisplayInstall() {
+        withEntryDir { dir ->
+            val bytes = jpeg(12, 18)
+            val artifact = artifact(sha256(bytes), bytes.size.toLong(), 12, 18)
+            val row = correctionRow(artifact = artifact)
+            val staged = (validateDesktopCorrection(
+                PhotoAssetStore.read(dir),
+                row,
+                ownerId,
+            ) as DesktopCorrectionDecision.Ready).plan
+
+            val concurrent = PhotoAssetStore.read(dir)
+            val concurrentAsset = concurrent.assets.single()
+            val concurrentReference = "cloud_display_r2.jpg"
+            File(dir, concurrentReference).writeText("concurrent-cloud-display")
+            File(dir, PHOTO_ASSETS_FILE).writeText(concurrent.copy(assets = listOf(
+                concurrentAsset.copy(display = concurrentAsset.display.copy(
+                    reference = concurrentReference,
+                    sha256 = "d".repeat(64),
+                    revision = 2,
+                )),
+            )).toJson().toString())
+
+            assertTrue(PhotoAssetStore.installDesktopCorrectionDisplay(
+                dir,
+                staged,
+                File(dir, ".downloaded-before-race.part").apply { writeBytes(bytes) },
+                PrivateObjectDownload("image/jpeg", bytes.size.toLong()),
+            ))
+
+            val installed = PhotoAssetStore.read(dir).assets.single()
+            assertEquals(3, installed.display.revision)
+            assertEquals(correctionA, installed.appliedDesktopCorrectionId)
+            assertEquals(
+                "desktop_asset-1_r3_${artifact.sha256.take(20)}.jpg",
+                installed.display.reference,
+            )
+            assertEquals("concurrent-cloud-display", File(dir, concurrentReference).readText())
         }
     }
 

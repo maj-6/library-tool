@@ -2013,37 +2013,44 @@
       const displayArtifactId = captureLogicalDisplayArtifactId(artifactId);
       if (!displayArtifactId) return null;
       const selection = this.state && this.state.selection || {};
-      if (![artifactId, displayArtifactId].includes(selection.artifactId) ||
-          (itemId && selection.itemId !== itemId)) return null;
       const feature = this.artifactsFeature;
       const key = `artifact:${displayArtifactId}`;
-      const selectionKey = `artifact:${selection.artifactId}`;
-      if (!feature || feature.selectedKey !== selectionKey) return null;
-      const selected = feature.items && feature.items.get(selectionKey);
-      if (selected && selected.family && selected.family !== "image") return null;
-      const reloadDisplay = isCaptureDisplayArtifactId(selection.artifactId) &&
-        typeof feature.reloadSelection === "function";
-      const refreshOriginal = artifactId !== displayArtifactId &&
-        selection.artifactId === artifactId &&
-        typeof feature.refresh === "function";
       const refreshBooks = this.booksFeature &&
         typeof this.booksFeature.refresh === "function";
+      const selectionMatches =
+        [artifactId, displayArtifactId].includes(selection.artifactId) &&
+        (!itemId || selection.itemId === itemId);
+      const selectionKey = selectionMatches
+        ? `artifact:${selection.artifactId}` : "";
+      const selected = selectionMatches && feature && feature.items &&
+        feature.items.get(selectionKey);
+      const imageSelected = selectionMatches && feature &&
+        feature.selectedKey === selectionKey &&
+        (!selected || !selected.family || selected.family === "image");
+      const reloadDisplay = imageSelected &&
+        isCaptureDisplayArtifactId(selection.artifactId) &&
+        typeof feature.reloadSelection === "function";
+      const refreshOriginal = imageSelected && artifactId !== displayArtifactId &&
+        selection.artifactId === artifactId &&
+        typeof feature.refresh === "function";
       if (!reloadDisplay && !refreshOriginal && !refreshBooks) return null;
+      const repaintRequested = reloadDisplay || refreshOriginal;
+      const repaintSelectionKey = repaintRequested ? selectionKey : "";
       const refreshes = this.captureDisplayRefreshes instanceof Map
         ? this.captureDisplayRefreshes
         : (this.captureDisplayRefreshes = new Map());
-      const contextGeneration = feature.contextGeneration;
-      const selectionGeneration = feature.selectionGeneration;
+      const contextGeneration = repaintRequested ? feature.contextGeneration : -1;
+      const selectionGeneration = repaintRequested ? feature.selectionGeneration : -1;
       const existing = refreshes.get(operationId);
       if (existing && existing.key === key &&
-          existing.selectionKey === selectionKey &&
+          existing.selectionKey === repaintSelectionKey &&
           existing.contextGeneration === contextGeneration &&
           existing.selectionGeneration === selectionGeneration) {
         return existing.promise;
       }
       const record = {
         key,
-        selectionKey,
+        selectionKey: repaintSelectionKey,
         contextGeneration,
         selectionGeneration,
         promise: null,
@@ -2066,7 +2073,7 @@
               refreshed = await pending;
             } catch (error) {
               succeeded = false;
-              if (!this.destroyed && feature.selectedKey === selectionKey &&
+              if (!this.destroyed && feature.selectedKey === repaintSelectionKey &&
                   (!error || error.name !== "AbortError")) {
                 this.setStatus(
                   error && error.message ||
@@ -2098,7 +2105,7 @@
         }
         await Promise.all(tasks);
         if (!succeeded) return null;
-        if (refreshed) return refreshed;
+        if (repaintRequested) return refreshed || null;
         if (refreshBooks) return true;
         return null;
       })();
@@ -2110,12 +2117,14 @@
           refreshes.delete(operationId);
           return;
         }
-        // A successful reload routes the replacement through select(), which
-        // advances the selection generation. Rebase the dedupe record onto
-        // that completed epoch; navigation away and back advances it again and
-        // deliberately makes a later durable result replay retryable.
-        record.contextGeneration = feature.contextGeneration;
-        record.selectionGeneration = feature.selectionGeneration;
+        if (repaintRequested) {
+          // A successful reload routes the replacement through select(), which
+          // advances the selection generation. Rebase the dedupe record onto
+          // that completed epoch; navigation away and back advances it again
+          // and deliberately makes a later durable result replay retryable.
+          record.contextGeneration = feature.contextGeneration;
+          record.selectionGeneration = feature.selectionGeneration;
+        }
       });
       while (refreshes.size > MAX_CAPTURE_DISPLAY_REFRESHES) {
         refreshes.delete(refreshes.keys().next().value);

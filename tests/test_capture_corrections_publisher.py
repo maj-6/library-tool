@@ -554,6 +554,111 @@ def test_mapping_validated_original_root_head_uses_current_original_authority(
     ) == {}
 
 
+def test_mapping_keeps_original_authority_through_logical_display_child(
+    tmp_path,
+):
+    capture_id = "c13131313-1313-4313-8313-131313131313"
+    item_id = "b-" + "e" * 32
+    original_sha = "8" * 64
+    photo_assets = _photo_assets(
+        capture_id,
+        [("asset-01", original_sha, "completed")],
+    )
+    namespace = server._capture_artifact_namespace(capture_id, "asset-01")
+    display_slot = f"{namespace}:display"
+    original_slot = f"{namespace}:original"
+    original_correction = _png(10, 6, color=(31, 32, 33))
+    original_output_revision = "ctr:" + "4" * 64
+    parent_id = _publish_transform(
+        tmp_path,
+        item_id,
+        "op-original-parent",
+        original_slot,
+        "ctr-" + "5" * 40,
+        original_correction,
+        source_revision="capture-original-r1",
+        source_sha256=original_sha,
+        output_revision=original_output_revision,
+        pointer_mtime=1_000_000.0,
+    )
+    child_correction = _png(10, 6, color=(41, 42, 43))
+    child_id = _publish_transform(
+        tmp_path,
+        item_id,
+        "op-logical-display-child",
+        display_slot,
+        "ctr-" + "6" * 40,
+        child_correction,
+        source_revision=original_output_revision,
+        source_sha256=hashlib.sha256(original_correction).hexdigest(),
+        pointer_mtime=2_000_000.0,
+        display_head=True,
+        display_head_artifact_id=display_slot,
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path
+    )
+
+    winner = targets["asset-01"]
+    assert winner["correction_id"] == child_id
+    assert winner["display_sha256"] == hashlib.sha256(
+        child_correction
+    ).hexdigest()
+    assert winner["ancestors"] == frozenset({parent_id})
+    assert winner["source_original_sha256"] == original_sha
+    assert winner["authoritative_display_head"] is True
+
+
+def test_mapping_rejects_rendition_alias_across_capture_namespaces(tmp_path):
+    capture_id = "c14141414-1414-4414-8414-141414141414"
+    item_id = "b-" + "f" * 32
+    photo_assets = _photo_assets(
+        capture_id,
+        [
+            ("asset-01", "9" * 64, "completed"),
+            ("asset-02", "a" * 64, "completed"),
+        ],
+    )
+    first_namespace = server._capture_artifact_namespace(
+        capture_id, "asset-01"
+    )
+    second_namespace = server._capture_artifact_namespace(
+        capture_id, "asset-02"
+    )
+    parent_png = _png(10, 6, color=(51, 52, 53))
+    parent_revision = "ctr:" + "7" * 64
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-first-original",
+        f"{first_namespace}:original",
+        "ctr-" + "8" * 40,
+        parent_png,
+        source_revision="capture-original-r1",
+        source_sha256="9" * 64,
+        output_revision=parent_revision,
+    )
+    _publish_transform(
+        tmp_path,
+        item_id,
+        "op-cross-namespace-child",
+        f"{second_namespace}:display",
+        "ctr-" + "9" * 40,
+        _png(10, 6, color=(61, 62, 63)),
+        source_revision=parent_revision,
+        source_sha256=hashlib.sha256(parent_png).hexdigest(),
+        display_head=True,
+        display_head_artifact_id=f"{second_namespace}:display",
+    )
+
+    targets = server._capture_correction_targets(
+        capture_id, photo_assets, item_id, tmp_path
+    )
+
+    assert "asset-02" not in targets
+
+
 def test_mapping_rejects_display_head_from_replaced_capture_authority(tmp_path):
     capture_id = "c1111111-2222-4333-8444-555555555555"
     item_id = "b-" + "c" * 32
@@ -1370,6 +1475,60 @@ def test_publish_includes_every_corrected_asset_in_one_capture_refresh(
         (seeded["asset_id"], seeded["correction_id"], seeded["source_sha"]),
         (second_asset_id, second_correction_id, second_source_sha),
     }
+
+
+def test_publish_damaged_asset_does_not_starve_capture_sibling(
+        monkeypatch, capture_workspace):
+    seeded = _seed_corrected_capture(monkeypatch)
+    second_asset_id = "asset-02"
+    second_source_sha = hashlib.sha256(b"second original").hexdigest()
+    photo_assets = _photo_assets(seeded["capture_id"], [
+        (seeded["asset_id"], seeded["source_sha"], "completed"),
+        (second_asset_id, second_source_sha, "completed"),
+    ])
+    (server.CAPTURES_DIR / seeded["capture_id"] / "photo_assets.json").write_text(
+        json.dumps(photo_assets),
+        encoding="utf-8",
+    )
+    second_namespace = server._capture_artifact_namespace(
+        seeded["capture_id"], second_asset_id)
+    second_correction_id = _publish_transform(
+        server._ensure_engine_session().write_set.root,
+        seeded["item_id"],
+        "op-second-asset-after-damage",
+        f"{second_namespace}:display",
+        "ctr-" + "b" * 40,
+        _png(48, 64, color=(90, 130, 210)),
+    )
+    targets = server._capture_correction_targets(
+        seeded["capture_id"],
+        photo_assets,
+        seeded["item_id"],
+        server._ensure_engine_session().write_set.root,
+    )
+    targets[seeded["asset_id"]]["display_object"].write_bytes(b"damaged")
+    calls = _stub_cloud(
+        monkeypatch,
+        seeded["capture_id"],
+        owner_rows=[{
+            "id": seeded["capture_id"],
+            "created_by": OWNER_ID,
+        }],
+        existing=[],
+    )
+
+    outcome = server._publish_capture_corrections(
+        {"url": "cloud", "key": "service"})
+
+    assert outcome["pushed"] == 1
+    assert len(outcome["errors"]) == 1
+    assert "asset asset-01: committed display object could not be read safely" in \
+        outcome["errors"][0]
+    assert len(calls["uploads"]) == 2
+    (rows,) = calls["published"]
+    assert [(row["asset_id"], row["correction_id"]) for row in rows] == [
+        (second_asset_id, second_correction_id),
+    ]
 
 
 def test_publish_holds_local_authority_through_cloud_row_cas(

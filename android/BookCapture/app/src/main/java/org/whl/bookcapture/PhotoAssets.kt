@@ -1211,6 +1211,15 @@ internal object PhotoAssetStore {
     ): Boolean = synchronized(monitorFor(dir)) {
         if (!dir.isDirectory || downloaded.parentFile != dir) return@synchronized false
         val current = readCurrent(dir) ?: return@synchronized false
+        val asset = current.assets.firstOrNull { it.assetId == proposed.row.assetId }
+            ?: return@synchronized false
+        if (asset.appliedDesktopCorrectionId != proposed.baseAppliedCorrectionId &&
+            asset.appliedDesktopCorrectionId != proposed.row.correctionId) {
+            // Another metadata pull installed a different desktop row while
+            // these bytes were downloading. Never let the older staged row
+            // overwrite it; the next pull will observe the cloud winner.
+            return@synchronized false
+        }
         val checked = when (val decision = validateDesktopCorrection(
             current,
             proposed.row,
@@ -1220,10 +1229,7 @@ internal object PhotoAssetStore {
             is DesktopCorrectionDecision.Ready -> decision.plan
             else -> return@synchronized false
         }
-        if (checked.artifact != proposed.artifact ||
-            checked.targetRevision != proposed.targetRevision ||
-            checked.baseDisplaySha256 != proposed.baseDisplaySha256 ||
-            checked.baseDisplayRevision != proposed.baseDisplayRevision) {
+        if (checked.artifact != proposed.artifact) {
             return@synchronized false
         }
         if (verifyCloudDisplayDownload(
@@ -1233,8 +1239,6 @@ internal object PhotoAssetStore {
                 receipt.bytes,
             ) != null) return@synchronized false
 
-        val asset = current.assets.firstOrNull { it.assetId == checked.row.assetId }
-            ?: return@synchronized false
         val destination = File(dir, desktopCorrectionDisplayFileName(checked))
         if (destination.name == asset.original.reference ||
             destination.name == asset.captureFile) return@synchronized false
