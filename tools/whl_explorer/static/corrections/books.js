@@ -1256,6 +1256,7 @@
             : null;
       this.thumbnailObserver = null;
       this.pendingThumbnails = new Map();
+      this.renderedWorkspaceId = null;
       this.renderedIndex = null;
       this.renderedStatus = "";
       this.renderedError = null;
@@ -1720,6 +1721,43 @@
       this.restoreButtonFocus(this.bookElement(list, itemId));
     }
 
+    captureViewPosition(list, enabled) {
+      if (!enabled || !list) return null;
+      const scrollport = list.parentNode || null;
+      const scrollTop = Number(scrollport && scrollport.scrollTop);
+      const captures = new Map();
+      if (typeof list.querySelectorAll === "function") {
+        for (const strip of Array.from(
+          list.querySelectorAll("[data-captures-book]"))) {
+          const bookId = String((strip.dataset || {}).capturesBook || "");
+          const scrollLeft = Number(strip.scrollLeft);
+          if (bookId && Number.isFinite(scrollLeft)) {
+            captures.set(bookId, scrollLeft);
+          }
+        }
+      }
+      return {
+        scrollport,
+        scrollTop: Number.isFinite(scrollTop) ? scrollTop : null,
+        captures,
+      };
+    }
+
+    restoreViewPosition(list, position) {
+      if (!position) return;
+      if (position.scrollport && position.scrollTop !== null) {
+        position.scrollport.scrollTop = position.scrollTop;
+      }
+      if (!list || typeof list.querySelectorAll !== "function") return;
+      for (const strip of Array.from(
+        list.querySelectorAll("[data-captures-book]"))) {
+        const bookId = String((strip.dataset || {}).capturesBook || "");
+        if (position.captures.has(bookId)) {
+          strip.scrollLeft = position.captures.get(bookId);
+        }
+      }
+    }
+
     syncRenderedSelection(list, snapshot) {
       if (!list || typeof list.querySelectorAll !== "function") return;
       const selection = snapshot.selection;
@@ -1767,10 +1805,20 @@
         (focusedCapture ? null : this.focusedBook(list));
       const count = this.root.querySelector("[data-books-count]");
       if (!list || !this.documentRef) return;
-      if (this.renderedIndex !== snapshot.index) {
+      const workspaceChanged =
+        this.renderedWorkspaceId !== snapshot.workspaceId;
+      const viewPosition = this.captureViewPosition(list,
+        !workspaceChanged && this.renderedFilter === this.filter &&
+        this.renderedView === this.view);
+      if (workspaceChanged) {
         this.renderLimit = this.renderBatch;
         this.captureRenderLimits.clear();
         this.captureRenderRevision += 1;
+      } else if (this.renderedIndex !== snapshot.index && snapshot.index) {
+        const bookIds = new Set(snapshot.index.books.map((book) => book.id));
+        for (const bookId of this.captureRenderLimits.keys()) {
+          if (!bookIds.has(bookId)) this.captureRenderLimits.delete(bookId);
+        }
       }
       const books = this.visibleBooks(snapshot);
       const renderPins = this.selectionRenderPins(snapshot, books);
@@ -1787,10 +1835,9 @@
               dataset.artifactId === snapshot.selection.artifactId);
         })
       );
-      const selectionOnly = !this.hotCapture &&
+      const rowsUnchanged = !this.hotCapture &&
+        this.renderedWorkspaceId === snapshot.workspaceId &&
         this.renderedIndex === snapshot.index &&
-        this.renderedStatus === snapshot.status &&
-        this.renderedError === snapshot.error &&
         this.renderedFilter === this.filter &&
         this.renderedView === this.view &&
         this.renderedBookPin === renderPins.book &&
@@ -1798,14 +1845,33 @@
         this.renderedLimit === this.renderLimit &&
         this.renderedCaptureRevision === this.captureRenderRevision &&
         !selectedNodeMissing;
+      const selectionOnly = rowsUnchanged &&
+        this.renderedStatus === snapshot.status &&
+        this.renderedError === snapshot.error;
       this.rememberSelectionIndex(snapshot, books);
       this.renderViewControls(snapshot);
+      if (rowsUnchanged && snapshot.index && snapshot.status === "loading" &&
+          this.renderedStatus !== "error") {
+        // A refresh starts with the already-rendered index. Keep those exact
+        // rows and scrollports mounted while the replacement is in flight;
+        // only their busy presentation changes. The settled index will do the
+        // one structural render that is actually necessary.
+        this.renderedStatus = snapshot.status;
+        this.renderedError = snapshot.error;
+        setAttribute(list, "aria-busy", "true");
+        list.classList && list.classList.add("is-refreshing");
+        this.syncRenderedSelection(list, snapshot);
+        this.pendingStepFocus = null;
+        this.restoreBookFocus(list, stepFocus);
+        return;
+      }
       if (selectionOnly) {
         this.syncRenderedSelection(list, snapshot);
         this.pendingStepFocus = null;
         this.restoreBookFocus(list, stepFocus);
         return;
       }
+      this.renderedWorkspaceId = snapshot.workspaceId;
       this.renderedIndex = snapshot.index;
       this.renderedStatus = snapshot.status;
       this.renderedError = snapshot.error;
@@ -1845,6 +1911,7 @@
         };
         const [title, message] = messages[snapshot.status] || messages.idle;
         this.renderMessage(list, title, message, snapshot.status === "error");
+        this.restoreViewPosition(list, viewPosition);
         return;
       }
 
@@ -1859,6 +1926,7 @@
       }
       if (!snapshot.index.books.length) {
         list.append(this.messageRow("No books", "This workspace contains no books."));
+        this.restoreViewPosition(list, viewPosition);
         return;
       }
       if (!books.length) {
@@ -1875,6 +1943,7 @@
           list.append(this.messageRow("Nothing needs attention",
             "No items are marked for attention."));
         }
+        this.restoreViewPosition(list, viewPosition);
         return;
       }
       let visible = books.slice(0, this.renderLimit);
@@ -1914,6 +1983,7 @@
       this.syncRenderedSelection(list, snapshot);
       this.restoreCaptureFocus(list, focusedCapture);
       this.restoreBookFocus(list, focusedBook);
+      this.restoreViewPosition(list, viewPosition);
     }
 
     renderMessage(list, title, message, error = false) {
@@ -1994,6 +2064,7 @@
         return row;
       }
       const captures = element(this.documentRef, "ul", "book-captures");
+      if (captures.dataset) captures.dataset.capturesBook = book.id;
       setAttribute(captures, "aria-label", `Captured images for ${title}`);
       const captureLimit = this.captureRenderLimits.get(book.id) ||
         this.captureRenderBatch;
