@@ -2454,12 +2454,38 @@ def _index_review_state(
     return review.state.value, _index_review_summary(review)
 
 
+def _prefetched_capture_hints(
+    rasters: Any,
+    item_ids: Sequence[str],
+) -> Mapping[str, tuple[Mapping[str, Any], ...]] | None:
+    """Fetch hints for every hint-using item under one workspace lease.
+
+    Returns None when the composition predates the batch read; callers fall
+    back to the per-item read with identical semantics, just more lock
+    traffic.
+    """
+
+    if not item_ids:
+        return {}
+    many = getattr(rasters, "list_capture_index_hints_many", None)
+    if not callable(many):
+        return None
+    values = many(tuple(item_ids))
+    if not isinstance(values, Mapping):
+        raise RepositoryError(
+            "the Corrections capture hint service returned invalid hints",
+            code="invalid_corrections_index_projection",
+        )
+    return values
+
+
 def _corrections_index_book(
     item: ItemView,
     *,
     rasters: Any,
     use_hints: bool,
     review_summary: Mapping[str, Any],
+    capture_hints: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
 ) -> dict[str, Any]:
     """Project one book row, including everything derived from its captures.
 
@@ -2470,16 +2496,20 @@ def _corrections_index_book(
 
     item_kind = item.kind.casefold()
     if use_hints:
-        list_hints = getattr(rasters, "list_capture_index_hints", None)
-        if not callable(list_hints):
-            raise RepositoryError(
-                "the Corrections capture hint service is unavailable",
-                code="invalid_corrections_index_projection",
-                details={"item_id": item.item_id},
-            )
+        if capture_hints is not None and item.item_id in capture_hints:
+            hint_rows = capture_hints[item.item_id]
+        else:
+            list_hints = getattr(rasters, "list_capture_index_hints", None)
+            if not callable(list_hints):
+                raise RepositoryError(
+                    "the Corrections capture hint service is unavailable",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": item.item_id},
+                )
+            hint_rows = list_hints(item.item_id)
         captures, diagnostic_scopes = _capture_hint_rows(
             item.item_id,
-            list_hints(item.item_id),
+            hint_rows,
         )
         inventory_issues_list: list[str] = []
         if "capture_geometry" in diagnostic_scopes:
@@ -2685,6 +2715,15 @@ def _corrections_index_projection(
             retryable=True,
         )
     items = _validated_items(item_service.list_items())
+    capture_hints = _prefetched_capture_hints(
+        rasters,
+        [
+            item.item_id
+            for item in items
+            if item.kind.casefold() in {"book", "capture"}
+            and _index_capture_policy(item, lazy_capture_index_for_item)
+        ],
+    )
     for item in items:
         item_kind = item.kind.casefold()
         if item_kind not in {"book", "capture"}:
@@ -2703,6 +2742,7 @@ def _corrections_index_projection(
             rasters=rasters,
             use_hints=use_hints,
             review_summary=review_summary,
+            capture_hints=capture_hints,
         )
         capture_count += len(book["captures"])
         if capture_count > CORRECTIONS_INDEX_TOTAL_CAPTURE_LIMIT:
@@ -2881,6 +2921,15 @@ def _corrections_index_details_projection(
     }
     books: list[dict[str, Any]] = []
     missing: list[str] = []
+    capture_hints = _prefetched_capture_hints(
+        rasters,
+        [
+            item.item_id
+            for item in catalogue.values()
+            if item.kind.casefold() in {"book", "capture"}
+            and _index_capture_policy(item, lazy_capture_index_for_item)
+        ],
+    )
     for item_id in item_ids:
         item = catalogue.get(item_id)
         if item is None or item.kind.casefold() not in {"book", "capture"}:
@@ -2897,6 +2946,7 @@ def _corrections_index_details_projection(
             rasters=rasters,
             use_hints=use_hints,
             review_summary=review_summary,
+            capture_hints=capture_hints,
         ))
     revision = _collection_revision(
         "crd-",

@@ -2514,8 +2514,10 @@ def test_capture_authority_is_revalidated_for_every_asset_in_a_burst(
     module.FilesystemCorrectionsArtifactRepository._capture_manifest_records = (
         hooked
     )
-    getattr(module, "_capture_index_hints_cache", {}).clear()
-    getattr(module, "_capture_manifests", {}).clear()
+    # The hint cache would satisfy this read without re-entering the build,
+    # and the attack in `hooked` fires mid-build; clear it so the redirect
+    # scenario actually executes.
+    repository._capture_hint_cache.clear()
     try:
         hints = repository.list_capture_index_hints(ITEM_ID)
     finally:
@@ -2523,3 +2525,67 @@ def test_capture_authority_is_revalidated_for_every_asset_in_a_burst(
             original
         )
     assert all(hint["resource_state"] != "available" for hint in hints)
+
+
+def test_capture_hint_cache_serves_repeat_reads_without_rebuilding(tmp_path):
+    from librarytool.adapters.filesystem import (
+        corrections_artifact_repository as module,
+    )
+
+    directory, _manifest = _capture_with_manifest(tmp_path)
+    repository = _repository(tmp_path)
+    builds = {"count": 0}
+    original = (
+        module.FilesystemCorrectionsArtifactRepository._capture_index_hints
+    )
+
+    def counting(self, *args, **kwargs):
+        builds["count"] += 1
+        return original(self, *args, **kwargs)
+
+    module.FilesystemCorrectionsArtifactRepository._capture_index_hints = (
+        counting
+    )
+    try:
+        first = repository.list_capture_index_hints(ITEM_ID)
+        second = repository.list_capture_index_hints(ITEM_ID)
+    finally:
+        module.FilesystemCorrectionsArtifactRepository._capture_index_hints = (
+            original
+        )
+    assert builds["count"] == 1, "the unchanged capture is served from cache"
+    assert second == first
+
+    # A rendition content change (new inode via replace) must invalidate even
+    # though the manifest is untouched.
+    display = directory / "photo_1.jpg"
+    replacement = directory / "photo_1.jpg.new"
+    replacement.write_bytes(_jpeg_bytes((70, 80, 90), (2, 2)))
+    os.replace(replacement, display)
+    module.FilesystemCorrectionsArtifactRepository._capture_index_hints = (
+        counting
+    )
+    try:
+        third = repository.list_capture_index_hints(ITEM_ID)
+    finally:
+        module.FilesystemCorrectionsArtifactRepository._capture_index_hints = (
+            original
+        )
+    assert builds["count"] == 2, "a touched rendition forces a rebuild"
+    assert isinstance(third, tuple)
+
+
+def test_capture_hints_many_matches_single_reads_and_shares_one_lease(
+    tmp_path,
+):
+    _capture_with_manifest(tmp_path)
+    repository = _repository(tmp_path)
+
+    single = repository.list_capture_index_hints(ITEM_ID)
+    repository._capture_hint_cache.clear()
+    many = repository.list_capture_index_hints_many([ITEM_ID])
+    assert set(many) == {ITEM_ID}
+    assert many[ITEM_ID] == single
+
+    with pytest.raises(NotFoundError):
+        repository.list_capture_index_hints_many([ITEM_ID, "book-absent"])

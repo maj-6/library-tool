@@ -824,6 +824,44 @@ class _CorrectionProjectionUnion:
             )
         return tuple(values)
 
+    def list_capture_index_hints_many(
+        self,
+        item_ids: Sequence[str],
+    ) -> Mapping[str, tuple[Mapping[str, Any], ...]]:
+        """Batch capture hints under one lease instead of one per item."""
+
+        many = getattr(self._base, "list_capture_index_hints_many", None)
+        if not callable(many):
+            # Composed against an adapter without the batch read: preserve
+            # per-item semantics by looping the single read, still under one
+            # outer lease (the inner lease is reentrant).
+            with self._read_context():
+                return {
+                    item_id: self.list_capture_index_hints(item_id)
+                    for item_id in item_ids
+                }
+        with self._read_context():
+            values = many(item_ids)
+        if not isinstance(values, Mapping):
+            raise RepositoryError(
+                "the correction capture index returned invalid hints",
+                code="invalid_corrections_index_projection",
+            )
+        for item_id, rows in values.items():
+            if (
+                isinstance(rows, (str, bytes))
+                or not isinstance(rows, Sequence)
+                or any(not isinstance(row, Mapping) for row in rows)
+            ):
+                raise RepositoryError(
+                    "the correction capture index returned invalid hints",
+                    code="invalid_corrections_index_projection",
+                    details={"item_id": str(item_id)},
+                )
+        return {
+            str(item_id): tuple(rows) for item_id, rows in values.items()
+        }
+
     def get_raster_artifact(
         self,
         key: RasterArtifactKey,
