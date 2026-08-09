@@ -1596,6 +1596,13 @@ test("classification shortcuts stay scoped and context menus use exact event tar
     id: "capture-1",
     revision: "capture-r1",
   };
+  const captureHintTarget = {
+    ...captureTarget,
+    key: "artifact:capture-hint",
+    id: "capture-hint",
+    artifactId: "capture-hint",
+    revision: "index:capture-hint-r1",
+  };
   const artifactTarget = {
     key: "artifact:figure-1",
     objectType: "raster-artifact",
@@ -1625,6 +1632,12 @@ test("classification shortcuts stay scoped and context menus use exact event tar
           address.artifactId === "capture-1"
         ? captureTarget : null;
     },
+    contextTargetForSelection(address) {
+      if (address.itemId !== "book-1") return null;
+      if (address.artifactId === "capture-1") return captureTarget;
+      return address.artifactId === "capture-hint"
+        ? captureHintTarget : null;
+    },
   } };
   shell.artifactsFeature = {
     items: new Map([[artifactTarget.key, artifactTarget]]),
@@ -1645,6 +1658,10 @@ test("classification shortcuts stay scoped and context menus use exact event tar
   const booksList = { dataset: { booksList: "" }, parentNode: shell.root };
   const captureButton = {
     dataset: { itemId: "book-1", artifactId: "capture-1" },
+    parentNode: booksList,
+  };
+  const captureHintButton = {
+    dataset: { itemId: "book-1", artifactId: "capture-hint" },
     parentNode: booksList,
   };
   const bookRow = {
@@ -1707,6 +1724,9 @@ test("classification shortcuts stay scoped and context menus use exact event tar
 
   assert.equal(shell.classificationContextMenuTarget(
     { target: captureButton }), captureTarget);
+  assert.equal(shell.classificationContextMenuTarget(
+    { target: captureHintButton }), captureHintTarget,
+  "navigation-only rows own a context target without becoming correction targets");
   assert.equal(shell.classificationContextMenuTarget(
     { target: artifactRow }), artifactTarget);
   assert.equal(shell.classificationContextMenuTarget(
@@ -4727,6 +4747,537 @@ test("Backspace moves only the selected capture to Trash and advances in-book",
   });
 
 
+test("capture-list Delete hydrates the clicked hint without disturbing another edit",
+  async () => {
+    const registry = new CorrectionCommandRegistry();
+    const captures = {
+      "book-1\u0000capture-a": {
+        book: { id: "book-1" },
+        capture: {
+          artifact_id: "capture-a",
+          revision: "index:capture-a",
+          capture_order: 0,
+          label: "Capture A",
+          representation_id: "rep-1",
+          canvas_id: "page-a",
+        },
+      },
+      "book-2\u0000capture-b": {
+        book: { id: "book-2" },
+        capture: {
+          artifact_id: "capture-b",
+          revision: "index:capture-b",
+          capture_order: 0,
+          label: "Capture B",
+          representation_id: "rep-2",
+          canvas_id: "page-b",
+        },
+      },
+    };
+    const fallback = {
+      address: {
+        itemId: "book-2",
+        representationId: null,
+        canvasId: null,
+        artifactId: null,
+        annotationId: null,
+      },
+      navigationPreview: null,
+    };
+    const calls = [];
+    const catalogCalls = [];
+    const mutations = [];
+    let catalogResult = {
+      object_type: "raster-artifact",
+      kind: "capture",
+      item_id: "book-2",
+      artifact_id: "capture-b",
+      revision: "capture-b-r7",
+      label: "Capture B",
+      resource_state: "missing",
+    };
+    const shell = Object.create(CorrectionsShell.prototype);
+    const activeResource = { id: "capture-a", url: "blob:capture-a" };
+    Object.assign(shell, {
+      state: {
+        context: context({
+          item_id: "book-1",
+          representation_id: "rep-1",
+          canvas_id: "page-a",
+          artifact_id: "capture-a",
+        }),
+        selection: {
+          itemId: "book-1",
+          representationId: "rep-1",
+          canvasId: "page-a",
+          artifactId: "capture-a",
+          annotationId: null,
+        },
+        resource: activeResource,
+      },
+      classificationController: {
+        registry,
+        selectionTarget: {
+          key: "artifact:capture-a",
+          itemId: "book-1",
+          artifactId: "capture-a",
+          revision: "capture-a-r4",
+        },
+      },
+      booksFeature: {
+        books: {
+          stepSelection() { return null; },
+          captureForSelection(address) {
+            return captures[`${address.itemId}\u0000${address.artifactId}`] || null;
+          },
+          captureDeletionFallback(address) {
+            calls.push(["fallback", { ...address }]);
+            return fallback;
+          },
+        },
+        async refresh(reason) { calls.push(["books-refresh", reason]); },
+      },
+      artifactsFeature: {
+        items: new Map([["artifact:capture-a", {
+          key: "artifact:capture-a",
+          itemId: "book-1",
+          revision: "capture-a-r4",
+        }]]),
+        async refresh(options) { calls.push(["artifacts-refresh", options]); },
+      },
+      artifactPorts: {
+        catalog: {
+          async get(payload) {
+            catalogCalls.push(payload);
+            return catalogResult;
+          },
+        },
+        commands: {
+          async trashCaptureAsset(payload) {
+            mutations.push(payload);
+            return { operation_id: payload.operationId };
+          },
+        },
+      },
+      captureAssetOperationIdFactory: () => "capture-trash-context-b",
+      captureAssetDeletionPromise: null,
+      captureAssetDeleteAttempts: new Map(),
+      captureExtractionOperations: new Map(),
+      editorCanvasState: { maskPolygon: [[0.1, 0.1], [0.9, 0.9]] },
+      contextGeneration: 4,
+      destroyed: false,
+      windowRef: { localStorage: { setItem() {} } },
+      setResource(value) {
+        calls.push(["resource", value]);
+        this.state.resource = value;
+      },
+      selectAddress(address, metadata) {
+        calls.push(["select", address, metadata]);
+        this.state.selection = { ...address };
+        return this.state.selection;
+      },
+      setStatus(message, error) { calls.push(["status", message, error]); },
+    });
+    shell.registerCaptureTrashCommand();
+    const clicked = {
+      key: "artifact:capture-b",
+      objectType: "raster-artifact",
+      family: "image",
+      kind: "capture",
+      itemId: "book-2",
+      id: "capture-b",
+      artifactId: "capture-b",
+      revision: "index:capture-b",
+      label: "Capture B",
+    };
+    const clickedContext = {
+      focusedTarget: clicked,
+      selectionTarget: clicked,
+      softTarget: null,
+    };
+
+    assert.equal(CAPTURE_TRASH_COMMAND.label, "Delete capture image");
+    shell.captureExtractionOperations.set("extract-b", {
+      itemId: "book-2",
+      artifactId: "capture-b",
+    });
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, clickedContext), false,
+      "the clicked extraction source remains protected");
+    shell.captureExtractionOperations.clear();
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, clickedContext), true,
+      "dirty state on another mounted capture does not hide Delete");
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, {
+      focusedTarget: {
+        key: "artifact:figure-1",
+        itemId: "book-1",
+        artifactId: "figure-1",
+      },
+      selectionTarget: null,
+    }), false, "a non-capture target cannot borrow the current capture");
+
+    await registry.invoke(CAPTURE_TRASH_COMMAND.id, clickedContext);
+
+    assert.deepEqual(catalogCalls[0], {
+      context: context({
+        item_id: "book-2",
+        representation_id: "rep-2",
+        canvas_id: "page-b",
+        artifact_id: "capture-b",
+      }),
+      key: "artifact:capture-b",
+    });
+    assert.deepEqual(mutations, [{
+      itemId: "book-2",
+      artifactId: "capture-b",
+      expectedArtifactRevision: "capture-b-r7",
+      label: "Capture B",
+      operationId: "capture-trash-context-b",
+    }]);
+    assert.equal(shell.state.selection.artifactId, "capture-a");
+    assert.equal(shell.state.resource, activeResource);
+    assert.equal(calls.some((entry) => entry[0] === "select"), false,
+      "deleting an unrelated row never navigates the editor");
+    assert.equal(calls.some((entry) => entry[0] === "resource"), false);
+    assert.deepEqual(
+      calls.find((entry) => entry[0] === "artifacts-refresh")[1],
+      {
+        preserveSelection: true,
+        forgetSelectionKey: "artifact:capture-b",
+        reason: "capture-deleted",
+      },
+    );
+
+    const selectedContext = {
+      focusedTarget: shell.classificationController.selectionTarget,
+      selectionTarget: shell.classificationController.selectionTarget,
+    };
+    assert.equal(registry.canInvoke(CAPTURE_TRASH_COMMAND.id, selectedContext), false,
+      "the mounted capture remains protected by its dirty edit");
+
+    catalogResult = {
+      ...catalogResult,
+      item_id: "book-wrong",
+      revision: "capture-b-r8",
+    };
+    await assert.rejects(
+      registry.invoke(CAPTURE_TRASH_COMMAND.id, clickedContext),
+      /changed while its delete command was being prepared/,
+    );
+    assert.equal(mutations.length, 1,
+      "a mismatched detail response fails before the lifecycle mutation");
+  });
+
+
+test("capture deletion cannot unmount an edit begun while its request settles",
+  async () => {
+    const target = {
+      key: "artifact:capture-a",
+      itemId: "book-1",
+      artifactId: "capture-a",
+      revision: "capture-a-r4",
+    };
+    const fallback = {
+      address: {
+        itemId: "book-1",
+        representationId: "rep-1",
+        canvasId: "page-b",
+        artifactId: "capture-b",
+        annotationId: null,
+      },
+      navigationPreview: null,
+    };
+    const editorHost = new FakeNode("div");
+    const calls = [];
+    let resolveMutation;
+    let mutationStarted;
+    const started = new Promise((resolve) => { mutationStarted = resolve; });
+    const mutation = new Promise((resolve) => { resolveMutation = resolve; });
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      root: {
+        querySelector(selector) {
+          return selector === "[data-editor-host]" ? editorHost : null;
+        },
+      },
+      state: {
+        context: context({
+          item_id: "book-1",
+          representation_id: "rep-1",
+          canvas_id: "page-a",
+          artifact_id: "capture-a",
+        }),
+        selection: {
+          itemId: "book-1",
+          representationId: "rep-1",
+          canvasId: "page-a",
+          artifactId: "capture-a",
+          annotationId: null,
+        },
+        resource: { id: "capture-a", url: "blob:capture-a" },
+      },
+      classificationController: { selectionTarget: target },
+      booksFeature: {
+        books: {
+          stepSelection() { return null; },
+          captureForSelection() {
+            return {
+              book: { id: "book-1" },
+              capture: {
+                artifact_id: "capture-a",
+                revision: "capture-a-r4",
+                capture_order: 0,
+                label: "Capture A",
+                representation_id: "rep-1",
+                canvas_id: "page-a",
+              },
+            };
+          },
+          captureDeletionFallback() { return fallback; },
+        },
+        async refresh(reason) { calls.push(["books-refresh", reason]); },
+      },
+      artifactsFeature: {
+        items: new Map([["artifact:capture-a", target]]),
+        async refresh(options) { calls.push(["artifacts-refresh", options]); },
+      },
+      artifactPorts: { commands: {
+        trashCaptureAsset(payload) {
+          calls.push(["mutation", payload]);
+          mutationStarted();
+          return mutation;
+        },
+      } },
+      captureAssetOperationIdFactory: () => "capture-trash-race",
+      captureAssetDeletionPromise: null,
+      captureAssetDeletionTarget: null,
+      captureAssetDeletionEditorLock: null,
+      captureAssetDeleteAttempts: new Map(),
+      captureExtractionOperations: new Map(),
+      editorCanvasState: null,
+      destroyed: false,
+      windowRef: { localStorage: { setItem() {} } },
+      setResource(value) {
+        calls.push(["resource", value]);
+        this.state.resource = value;
+      },
+      selectAddress(address) {
+        calls.push(["select", address]);
+        this.state.selection = { ...address };
+        return this.state.selection;
+      },
+      setStatus(message, error) { calls.push(["status", message, error]); },
+    });
+
+    const deletion = shell.moveCurrentCaptureToTrash();
+    await started;
+    assert.equal(editorHost.inert, true,
+      "the mounted target is non-interactive while its delete is pending");
+    assert.equal(editorHost.getAttribute("aria-busy"), "true");
+
+    // The interaction lock is the primary guard. This direct state mutation
+    // simulates an unexpected programmatic edit and verifies the post-receipt
+    // fail-safe still refuses to replace it.
+    shell.editorCanvasState = {
+      maskPolygon: [[0.1, 0.1], [0.8, 0.1], [0.5, 0.8]],
+      undoStack: [],
+      redoStack: [],
+      operations: [],
+      submission: { status: "idle" },
+    };
+    resolveMutation({ operation_id: "capture-trash-race" });
+    await deletion;
+
+    assert.equal(editorHost.inert, false);
+    assert.equal(editorHost.getAttribute("aria-busy"), null);
+    assert.equal(shell.state.selection.artifactId, "capture-a");
+    assert.equal(shell.state.resource.id, "capture-a");
+    assert.equal(calls.some(([kind]) => kind === "select" ||
+      kind === "resource" || kind === "books-refresh" ||
+      kind === "artifacts-refresh"), false,
+    "a late edit prevents every unmounting or inventory-refresh path");
+    const status = calls.find(([kind]) => kind === "status");
+    assert.equal(status[2], true);
+    assert.match(status[1], /editor was kept open/i);
+
+    shell.captureAssetDeletionTarget = {
+      itemId: "book-1",
+      artifactId: "capture-b",
+      label: "Capture B",
+    };
+    const retained = CorrectionsShell.prototype.selectAddress.call(
+      shell, fallback.address, { source: "books" });
+    assert.equal(retained.artifactId, "capture-a");
+    assert.equal(shell.state.selection.artifactId, "capture-a",
+      "navigation cannot expose the exact row being deleted mid-request");
+    const retainedResource = shell.state.resource;
+    CorrectionsShell.prototype.setResource.call(shell, {
+      id: "capture-b",
+      itemId: "book-1",
+      family: "image",
+      url: "blob:capture-b",
+    });
+    assert.equal(shell.state.resource, retainedResource,
+      "an artifact publish cannot mount the target through a second surface");
+    shell.captureAssetDeletionTarget = null;
+  });
+
+
+test("capture deletion protects original and display aliases as one editor",
+  async () => {
+    const shell = Object.create(CorrectionsShell.prototype);
+    const editorHost = new FakeNode("div");
+    const target = {
+      itemId: "book-1",
+      artifactId: "capture:asset-1:display",
+      label: "Capture 1",
+    };
+    const calls = [];
+    Object.assign(shell, {
+      root: { querySelector: () => editorHost },
+      state: { selection: {
+        itemId: "book-1",
+        artifactId: "capture:asset-1:original",
+      } },
+      editorCanvasState: {
+        maskPolygon: [[0.1, 0.1], [0.8, 0.1], [0.5, 0.8]],
+        undoStack: [],
+        redoStack: [],
+        operations: [],
+        submission: { status: "idle" },
+      },
+      captureAssetDeletionTarget: null,
+      captureAssetDeletionEditorLock: null,
+      selectCaptureDeletionFallback(value) {
+        calls.push(["fallback", value]);
+        return value.address;
+      },
+      booksFeature: {
+        async refresh(reason) { calls.push(["books-refresh", reason]); },
+      },
+      artifactsFeature: {
+        async refresh(options) { calls.push(["artifacts-refresh", options]); },
+      },
+    });
+
+    assert.equal(shell.captureLifecycleSelectionMatches(target), false,
+      "cross-window lifecycle matching remains exact");
+    assert.equal(shell.captureDeletionDirty(target), true,
+      "local deletion protects the logical capture across display aliases");
+    shell.editorCanvasState = null;
+    shell.beginCaptureDeletion(target);
+    assert.equal(editorHost.inert, true,
+      "the aliased mounted editor receives the same interaction lock");
+    shell.endCaptureDeletion(target);
+    assert.equal(editorHost.inert, false);
+
+    const fallback = { address: {
+      itemId: "book-1",
+      artifactId: "capture:asset-2:display",
+    } };
+    await shell.refreshDeletedCapture(
+      fallback,
+      "artifact:capture:asset-1:display",
+      "capture-deleted",
+      target,
+    );
+    assert.equal(calls[0][0], "fallback",
+      "a successful delete advances an original-alias selection");
+  });
+
+
+test("a Trash receipt after destroy performs no lifecycle UI convergence",
+  async () => {
+    const target = {
+      itemId: "book-1",
+      artifactId: "capture-a",
+      expectedArtifactRevision: "capture-a-r4",
+      label: "Capture A",
+      address: {
+        itemId: "book-1",
+        artifactId: "capture-a",
+      },
+    };
+    const fallback = { address: {
+      itemId: "book-1",
+      artifactId: "capture-b",
+    } };
+    const editorHost = new FakeNode("div");
+    const calls = [];
+    let resolveMutation;
+    let mutationStarted;
+    const started = new Promise((resolve) => { mutationStarted = resolve; });
+    const mutation = new Promise((resolve) => { resolveMutation = resolve; });
+    const shell = Object.create(CorrectionsShell.prototype);
+    Object.assign(shell, {
+      root: { querySelector: () => editorHost },
+      state: { selection: {
+        itemId: "book-1",
+        artifactId: "capture-a",
+      } },
+      captureDeletionIntent: () => target,
+      captureDeletionCanResolve: () => true,
+      resolveCaptureDeletionTarget: async () => target,
+      captureDeletionDirty: () => false,
+      captureExtractionInFlight: () => false,
+      captureAssetOperationIdFactory: () => "capture-trash-destroyed",
+      captureAssetDeletionPromise: null,
+      captureAssetDeletionTarget: null,
+      captureAssetDeletionEditorLock: null,
+      captureAssetDeleteAttempts: new Map(),
+      captureLifecycleChanges: new Map(),
+      captureExtractionOperations: new Map(),
+      captureDisplayRefreshes: new Map(),
+      selectionListeners: new Set(),
+      artifactOverlays: new Set(),
+      contextGeneration: 0,
+      featureContextGeneration: 0,
+      destroyed: false,
+      listeners: [],
+      layout: { destroy() { calls.push(["layout-destroy"]); } },
+      booksFeature: {
+        books: {
+          stepSelection() { return null; },
+          captureDeletionFallback() { return fallback; },
+        },
+        destroy() { calls.push(["books-destroy"]); },
+        async refresh() { calls.push(["books-refresh"]); },
+      },
+      artifactsFeature: {
+        destroy() { calls.push(["artifacts-destroy"]); },
+        async refresh() { calls.push(["artifacts-refresh"]); },
+      },
+      artifactPorts: { commands: {
+        trashCaptureAsset() {
+          mutationStarted();
+          return mutation;
+        },
+      } },
+      windowRef: { localStorage: {
+        setItem() { calls.push(["storage"]); },
+      } },
+      setResource() { calls.push(["resource"]); },
+      selectAddress() { calls.push(["select"]); },
+      setStatus() { calls.push(["status"]); },
+    });
+
+    const deletion = shell.moveCurrentCaptureToTrash();
+    await started;
+    assert.equal(editorHost.inert, true);
+    shell.destroy();
+    assert.equal(editorHost.inert, false,
+      "destroy restores the editor host before its DOM is released");
+    resolveMutation({ operation_id: "capture-trash-destroyed" });
+    await deletion;
+
+    for (const kind of [
+      "storage", "books-refresh", "artifacts-refresh", "resource", "select", "status",
+    ]) {
+      assert.equal(calls.some(([entry]) => entry === kind), false,
+        `${kind} must not run after destroy`);
+    }
+  });
+
+
 test("Backspace waits for extraction success or failure on its source capture",
   async () => {
     const registry = new CorrectionCommandRegistry();
@@ -4744,6 +5295,7 @@ test("Backspace waits for extraction success or failure on its source capture",
     } };
     shell.classificationController = { registry };
     shell.currentCaptureDeletionTarget = () => target;
+    shell.captureDeletionIntent = () => target;
     shell.editorCanvasState = null;
     shell.captureAssetDeletionPromise = null;
     shell.captureExtractionOperations = new Map();
@@ -4956,6 +5508,7 @@ test("an extraction guard does not block Backspace on another capture", async ()
   shell.state = { selection: { itemId: "book-1", artifactId: selected } };
   shell.classificationController = { registry };
   shell.currentCaptureDeletionTarget = () => targets[selected];
+  shell.captureDeletionIntent = () => targets[selected];
   shell.editorCanvasState = null;
   shell.captureAssetDeletionPromise = null;
   shell.captureAssetDeleteAttempts = new Map();

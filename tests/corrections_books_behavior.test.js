@@ -16,6 +16,7 @@ const {
   digitizationCandidateBooks,
   latestImportedAt,
   captureCommandTarget,
+  captureContextTarget,
   normalizeCorrectionsIndex,
   sortedBooks,
 } = require("../tools/whl_explorer/static/corrections/books");
@@ -671,6 +672,23 @@ test("navigation-only capture revisions cannot become correction targets", () =>
   const capture = { ...value.captures[0], revision: "index:abc123" };
 
   assert.equal(captureCommandTarget(value, capture), null);
+  assert.deepEqual(captureContextTarget(value, capture), {
+    key: `artifact:${capture.artifact_id}`,
+    objectType: "raster-artifact",
+    family: "image",
+    group: "source-images",
+    kind: "capture",
+    itemId: value.id,
+    id: capture.artifact_id,
+    artifactId: capture.artifact_id,
+    revision: "index:abc123",
+    label: capture.label,
+    effectiveCategory: capture.effective_category,
+    source: {
+      representationId: capture.representation_id,
+      canvasId: capture.canvas_id,
+    },
+  }, "the context menu can identify the row without promoting its hint pin");
 });
 
 

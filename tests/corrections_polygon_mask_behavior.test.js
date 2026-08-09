@@ -558,17 +558,99 @@ test("the toolbar offers a mask tool that switches the editor into polygon mode"
   const { container, controller, dispose } = maskHarness({ initialTool: TOOLS.SELECT });
   const maskButton = byClass(container, "perspective-tool-button")
     .find((button) => button.dataset.imageTool === TOOLS.POLYGON);
+  const primaryButton = byClass(container, "perspective-queue-button")[0];
   assert.ok(maskButton, "the toolbar renders a mask tool button");
   assert.equal(maskButton.textContent, "Mask");
   assert.equal(maskButton.getAttribute("aria-pressed"), "false");
+  assert.equal(primaryButton.textContent, "Queue transform");
+  assert.equal(primaryButton.getAttribute("aria-keyshortcuts"), "Space");
 
   maskButton.emit("click");
   assert.equal(controller.getState().tool, TOOLS.POLYGON);
   assert.equal(maskButton.getAttribute("aria-pressed"), "true");
+  assert.equal(primaryButton.textContent, "Apply mask");
+  assert.equal(primaryButton.getAttribute("aria-keyshortcuts"), null,
+    "the Perspective-only Space shortcut is not advertised in Mask mode");
   assert.match(
     byClass(container, "perspective-tool-instruction")[0].textContent,
-    /click to place vertices or drag to trace/i,
+    /then choose Apply mask/i,
   );
+  dispose();
+});
+
+
+test("Apply mask commits a valid open outline and queues it without leaving Mask",
+  async () => {
+    const invocations = [];
+    const { container, controller, dispose } = maskHarness({
+      invokeCommand: async (commandId, payload) => {
+        invocations.push({ commandId, payload });
+        return { job_id: "correction-transform-job-open-mask" };
+      },
+      createOperationId: () => "correction-op-open-mask",
+    });
+    const canvas = controller.canvas;
+    const apply = byClass(container, "perspective-queue-button")[0];
+
+    assert.equal(apply.textContent, "Apply mask");
+    assert.equal(apply.disabled, true, "an empty outline cannot be applied");
+    clickCanvas(canvas, 1, 40, 40);
+    clickCanvas(canvas, 2, 360, 80);
+    assert.equal(apply.disabled, true, "two vertices cannot form a mask");
+    clickCanvas(canvas, 3, 200, 360);
+    assert.deepEqual(controller.getState().maskDraft, TRIANGLE_MASK);
+    assert.equal(controller.getState().maskPolygon, null);
+    assert.equal(apply.disabled, false, "a valid open outline is actionable");
+
+    canvas.focus();
+    const space = controller.surface.emit("keydown", {
+      key: " ", code: "Space", target: canvas, repeat: false,
+    });
+    await nextTurn();
+    assert.equal(space.defaultPrevented, false,
+      "Space remains reserved for Perspective mode");
+    assert.equal(invocations.length, 0);
+    assert.deepEqual(controller.getState().maskDraft, TRIANGLE_MASK);
+
+    apply.emit("click");
+    assert.equal(controller.getState().maskDraft, null,
+      "the visible action closes the outline before queueing");
+    assert.deepEqual(controller.getState().maskPolygon, TRIANGLE_MASK);
+    await nextTurn();
+
+    assert.equal(controller.getState().tool, TOOLS.POLYGON);
+    assert.equal(invocations.length, 1);
+    assert.equal(invocations[0].commandId, "corrections.transform.queue");
+    assert.equal(invocations[0].payload.trigger, "toolbar");
+    assert.deepEqual(invocations[0].payload.command.mask_polygon, TRIANGLE_MASK);
+    assert.equal(controller.getState().submission.status, "queued");
+    dispose();
+  });
+
+
+test("Apply mask refuses an invalid open outline", async () => {
+  const invocations = [];
+  const { container, controller, dispose } = maskHarness({
+    invokeCommand: async (commandId, payload) => {
+      invocations.push({ commandId, payload });
+      return { job_id: "unexpected-mask-job" };
+    },
+  });
+  const canvas = controller.canvas;
+  const apply = byClass(container, "perspective-queue-button")[0];
+  for (const [pointerId, x, y] of [
+    [1, 40, 40], [2, 360, 360], [3, 40, 360], [4, 360, 40],
+  ]) clickCanvas(canvas, pointerId, x, y);
+
+  assert.equal(validateMaskPolygon(controller.getState().maskDraft).code,
+    "polygon-self-intersection");
+  assert.equal(apply.disabled, true);
+  apply.emit("click");
+  await nextTurn();
+  assert.equal(invocations.length, 0,
+    "the click path independently guards a programmatically-fired disabled button");
+  assert.equal(controller.getState().maskPolygon, null);
+  assert.equal(controller.getState().maskDraft.length, 4);
   dispose();
 });
 
@@ -728,14 +810,13 @@ test("a mask committed on the canvas is carried into the queued transform comman
   canvas.emit("pointermove", { pointerId: 7, clientX: 200, clientY: 360 });
   canvas.emit("pointerup", { pointerId: 7, clientX: 200, clientY: 360 });
   assert.deepEqual(controller.getState().maskPolygon, traced);
+  assert.equal(controller.getState().tool, TOOLS.POLYGON);
 
-  byClass(container, "perspective-tool-button")
-    .find((button) => button.dataset.imageTool === TOOLS.PERSPECTIVE)
-    .emit("click");
-  assert.deepEqual(controller.getState().maskPolygon, traced,
-    "changing tools does not drop an applied mask");
-
-  byClass(container, "perspective-queue-button")[0].emit("click");
+  const apply = byClass(container, "perspective-queue-button")[0];
+  assert.equal(apply.textContent, "Apply mask");
+  assert.equal(apply.disabled, false,
+    "a committed mask can be applied without switching to Perspective");
+  apply.emit("click");
   await nextTurn();
   assert.equal(invocations.length, 1);
   assert.equal(invocations[0].commandId, "corrections.transform.queue");
