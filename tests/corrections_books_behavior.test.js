@@ -1236,6 +1236,135 @@ test("Books rerenders preserve a still-present focused nonselected capture",
   });
 
 
+test("operation refreshes preserve expanded capture strips and their latest view position",
+  async () => {
+    const value = fixture();
+    const firstBook = value.books.find((book) => book.id === "book-herbarium");
+    const firstTemplate = clone(firstBook.captures[0]);
+    firstBook.captures = Array.from({ length: 30 }, (_value, index) => ({
+      ...clone(firstTemplate),
+      artifact_id: `capture-scroll-${index}`,
+      revision: `capture-scroll-r${index}`,
+      capture_order: index,
+      canvas_id: `canvas-scroll-${index}`,
+      label: `Capture ${index}`,
+    }));
+    const secondBook = value.books.find((book) => book.id === "book-pending");
+    const secondTemplate = clone(secondBook.captures[0]);
+    secondBook.captures = Array.from({ length: 8 }, (_value, index) => ({
+      ...clone(secondTemplate),
+      artifact_id: `capture-pending-scroll-${index}`,
+      revision: `capture-pending-scroll-r${index}`,
+      capture_order: index,
+      canvas_id: `canvas-pending-scroll-${index}`,
+      label: `Pending capture ${index}`,
+    }));
+
+    const nextIndex = deferred();
+    let loadCount = 0;
+    const store = new CorrectionsIndexStore({
+      api: {
+        loadIndex: async () => {
+          loadCount += 1;
+          return loadCount === 1 ? value : nextIndex.promise;
+        },
+      },
+    });
+    const harness = miniHarness();
+    const controller = new BooksPanelController({
+      root: harness.root,
+      documentRef: harness.documentRef,
+      store,
+      captureRenderBatch: 4,
+    }).mount();
+    await store.openWorkspace("workspace-1");
+
+    const captureStrip = (bookId) =>
+      descendants(harness.list, "ul").find((node) =>
+        node.dataset.capturesBook === bookId) || null;
+    const captureButton = (artifactId) =>
+      descendants(harness.list, "button").find((button) =>
+        button.dataset.artifactId === artifactId) || null;
+    const capturesMore = (bookId) =>
+      descendants(harness.list, "button").find((button) =>
+        button.dataset.capturesLoadMore === bookId) || null;
+
+    for (let page = 0; page < 5; page += 1) {
+      capturesMore("book-herbarium").emit("click");
+    }
+    store.setSelection({
+      itemId: "book-herbarium",
+      representationId: firstBook.captures[0].representation_id || null,
+      canvasId: "canvas-scroll-0",
+      artifactId: "capture-scroll-0",
+      annotationId: null,
+    }, { ownedByFeature: true });
+    captureButton("capture-scroll-23").focus();
+    const firstStrip = captureStrip("book-herbarium");
+    const secondStrip = captureStrip("book-pending");
+    harness.body.scrollTop = 270;
+    firstStrip.scrollLeft = 430;
+    secondStrip.scrollLeft = 31;
+
+    let replacements = 0;
+    const replaceChildren = harness.list.replaceChildren.bind(harness.list);
+    harness.list.replaceChildren = (...nodes) => {
+      replacements += 1;
+      // Real scrollports clamp while their only child is temporarily empty.
+      harness.body.scrollTop = 0;
+      replaceChildren(...nodes);
+    };
+    const refreshing = store.refresh({ reason: "classification" });
+    assert.equal(store.snapshot().status, "loading");
+    assert.equal(replacements, 0,
+      "the stale-index loading state leaves the live rows mounted");
+    assert.equal(captureStrip("book-herbarium"), firstStrip);
+    assert.equal(harness.documentRef.activeElement,
+      captureButton("capture-scroll-23"));
+
+    // A user can keep scrolling while the operation is pending. The settled
+    // inventory must retain this latest position rather than the one captured
+    // when the request began.
+    harness.body.scrollTop = 333;
+    firstStrip.scrollLeft = 555;
+    secondStrip.scrollLeft = 47;
+    const revised = clone(value);
+    revised.revision = "index-scroll-r2";
+    const moved = revised.books.find((book) => book.id === "book-pending");
+    moved.title = "A Botanical Pending Book";
+    moved.revision = "book-pending-scroll-r2";
+    nextIndex.resolve(revised);
+    await refreshing;
+
+    const revisedFirstStrip = captureStrip("book-herbarium");
+    const revisedSecondStrip = captureStrip("book-pending");
+    assert.notEqual(revisedFirstStrip, firstStrip,
+      "the settled index performs the single required structural render");
+    assert.equal(replacements, 1);
+    assert.equal(harness.body.scrollTop, 333);
+    assert.equal(revisedFirstStrip.scrollLeft, 555);
+    assert.equal(revisedSecondStrip.scrollLeft, 47,
+      "horizontal offsets follow book identity when rows reorder");
+    assert.equal(controller.captureRenderLimits.get("book-herbarium"), 24);
+    assert.equal(descendants(revisedFirstStrip, "button").filter((button) =>
+      button.dataset.artifactId).length, 24,
+    "a new index revision cannot collapse an explicitly expanded strip");
+    assert.equal(harness.documentRef.activeElement.dataset.artifactId,
+      "capture-scroll-23");
+    assert.equal(store.snapshot().selection.artifactId, "capture-scroll-0");
+
+    harness.body.scrollTop = 111;
+    revisedFirstStrip.scrollLeft = 222;
+    await store.openWorkspace("workspace-2", { selection: null });
+    assert.equal(harness.body.scrollTop, 0,
+      "a different workspace does not inherit the prior vertical position");
+    assert.equal(Number(captureStrip("book-herbarium").scrollLeft || 0), 0);
+    assert.equal(controller.captureRenderLimits.has("book-herbarium"), false,
+      "a different workspace resets pagination even when item IDs repeat");
+    controller.destroy();
+  });
+
+
 test("Books rerenders withdraw a hover contribution left without pointerleave",
   async () => {
     const store = new CorrectionsIndexStore({
