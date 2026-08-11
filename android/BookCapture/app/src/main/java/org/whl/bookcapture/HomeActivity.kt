@@ -1,6 +1,7 @@
 package org.whl.bookcapture
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -19,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.ArrayAdapter
+import android.widget.Filter
 import android.widget.Spinner
 import android.widget.Space
 import android.widget.TextView
@@ -26,6 +28,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.AppCompatAutoCompleteTextView
 import androidx.appcompat.view.ActionMode
 import androidx.core.text.HtmlCompat
 import androidx.core.view.MenuCompat
@@ -54,6 +57,32 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.math.roundToInt
 
 internal const val INSPECT_MEMBERSHIP_ISOLATION_MAX_ATTEMPTS = 32
+
+private class CollectionNameSuggestionAdapter(
+    context: Context,
+    private val collections: List<BookCollection>,
+) : ArrayAdapter<String>(context, android.R.layout.simple_dropdown_item_1line) {
+    private val suggestionFilter = object : Filter() {
+        override fun performFiltering(constraint: CharSequence?): FilterResults {
+            val names = matchingCollectionNames(collections, constraint?.toString().orEmpty())
+            return FilterResults().apply {
+                values = names
+                count = names.size
+            }
+        }
+
+        override fun publishResults(constraint: CharSequence?, results: FilterResults) {
+            @Suppress("UNCHECKED_CAST")
+            val names = results.values as? List<String> ?: emptyList()
+            setNotifyOnChange(false)
+            clear()
+            addAll(names)
+            if (names.isEmpty()) notifyDataSetInvalidated() else notifyDataSetChanged()
+        }
+    }
+
+    override fun getFilter(): Filter = suggestionFilter
+}
 
 internal data class InspectMembershipIsolationResult(
     val acceptedIds: Set<String>,
@@ -1150,7 +1179,7 @@ class HomeActivity : AppCompatActivity() {
         val collections = collectionRecords.filter { !it.deleted && it.mergedInto == null }
         val collectionPaths = collectionDisplayPaths(collectionRecords)
         val view = layoutInflater.inflate(R.layout.dialog_collection, null)
-        val nameField = view.findViewById<android.widget.EditText>(R.id.collectionName)
+        val nameField = view.findViewById<AppCompatAutoCompleteTextView>(R.id.collectionName)
         val tagIdField = view.findViewById<android.widget.EditText>(R.id.collectionTagId)
         val parentField = view.findViewById<Spinner>(R.id.collectionParent)
         val fromField = view.findViewById<android.widget.EditText>(R.id.collectionFrom)
@@ -1175,6 +1204,9 @@ class HomeActivity : AppCompatActivity() {
         }
         parentField.setSelection(parentIds.indexOf(existing?.parentId).coerceAtLeast(0))
         nameField.setText(existing?.name.orEmpty())
+        if (existing == null) {
+            nameField.setAdapter(CollectionNameSuggestionAdapter(this, collections))
+        }
         tagIdField.setText(existing?.tagId.orEmpty())
         var tagIdEdited = false
         tagIdField.doAfterTextChanged { tagIdEdited = true }

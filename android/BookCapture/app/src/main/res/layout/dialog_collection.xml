@@ -20,11 +20,12 @@
             android:labelFor="@id/collectionName"
             android:text="@string/collections_field_name" />
 
-        <EditText
+        <androidx.appcompat.widget.AppCompatAutoCompleteTextView
             android:id="@+id/collectionName"
             style="@style/WhlInput"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:completionThreshold="1"
             android:inputType="textCapWords"
             android:maxLines="1"
             android:importantForAutofill="no" />

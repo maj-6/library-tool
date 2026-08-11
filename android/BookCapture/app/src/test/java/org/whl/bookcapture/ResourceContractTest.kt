@@ -232,6 +232,22 @@ class ResourceContractTest {
         assertFalse(session.contains("fun start(): String"))
     }
 
+    @Test
+    fun newCollectionNameUsesATypeAheadDropdown() {
+        val dialog = xml("src/main/res/layout/dialog_collection.xml")
+        val name = elementById(dialog, "collectionName")
+
+        assertEquals(
+            "androidx.appcompat.widget.AppCompatAutoCompleteTextView",
+            name.tagName,
+        )
+        assertEquals("1", name.getAttributeNS(androidNs, "completionThreshold"))
+
+        val source = File("src/main/java/org/whl/bookcapture/HomeActivity.kt").readText()
+        assertTrue(source.contains("if (existing == null)"))
+        assertTrue(source.contains("CollectionNameSuggestionAdapter(this, collections)"))
+    }
+
     /**
      * Home's chrome is the app mark plus the three tabs. Settings moved into a
      * menu behind the mark, so Home must carry no gear of its own — the capture
