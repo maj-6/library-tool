@@ -228,6 +228,24 @@ class CollectionsTest {
     }
 
     @Test
+    fun newCollectionNameSuggestionsMatchAndRankLiveNames() {
+        val collections = listOf(
+            collection("field", "Field Notes"),
+            collection("fungi", "Fungi Field Notes"),
+            collection("office", "Office Reference"),
+            collection("retired", "Field Archive").copy(deleted = true),
+            collection("merged", "Field Cabinet").copy(mergedInto = "field"),
+        )
+
+        assertEquals(
+            listOf("Field Notes", "Fungi Field Notes"),
+            matchingCollectionNames(collections, " FIELD "),
+        )
+        assertEquals(emptyList<String>(), matchingCollectionNames(collections, "  "))
+        assertEquals(listOf("Field Notes"), matchingCollectionNames(collections, "field", limit = 1))
+    }
+
+    @Test
     fun anUnchangedMissingParentSurvivesAnUnrelatedEdit() {
         val child = collection("child", "Periodicals", parentId = "missing")
         val edited = updateCollection(listOf(child), "child", "Periodicals A", "", "missing")

@@ -459,6 +459,30 @@ internal fun collectionNameTaken(
         it.name.equals(normalizeCollectionField(name), ignoreCase = true)
 }
 
+/** Existing live names to surface while a new collection name is typed.
+ * Prefixes are most useful, but a box may be remembered by any word in its
+ * name, so the remaining substring matches follow them. */
+internal fun matchingCollectionNames(
+    collections: List<BookCollection>,
+    query: String,
+    limit: Int = 8,
+): List<String> {
+    if (limit <= 0) return emptyList()
+    val cleanQuery = normalizeCollectionField(query)
+    if (cleanQuery.isEmpty()) return emptyList()
+    return collections.asSequence()
+        .filter { it.isLive() && it.name.contains(cleanQuery, ignoreCase = true) }
+        .distinctBy { it.name.lowercase() }
+        .sortedWith(
+            compareBy<BookCollection> {
+                if (it.name.startsWith(cleanQuery, ignoreCase = true)) 0 else 1
+            }.thenBy { it.name.lowercase() },
+        )
+        .take(limit)
+        .map(BookCollection::name)
+        .toList()
+}
+
 private fun normalizeCollectionParentId(value: String?): String? =
     value?.trim()?.ifEmpty { null }
 
