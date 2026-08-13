@@ -172,6 +172,7 @@ def _mistral_post(
 def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
                       want_images: bool = False,
                       want_blocks: bool = False,
+                      confidence_scores_granularity: str | None = None,
                       *,
                       model: str | None = None) -> list[dict]:
     """OCR one image via Mistral; returns the raw page dicts.
@@ -195,6 +196,13 @@ def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
         payload["include_image_base64"] = True
     if want_blocks:
         payload["include_blocks"] = True
+    if confidence_scores_granularity is not None:
+        granularity = str(confidence_scores_granularity).strip().lower()
+        if granularity not in {"page", "word"}:
+            raise ValueError(
+                "confidence_scores_granularity must be 'page' or 'word'"
+            )
+        payload["confidence_scores_granularity"] = granularity
     data = _mistral_post(MISTRAL_OCR_URL, payload, api_key, timeout)
     return data.get("pages") or []
 

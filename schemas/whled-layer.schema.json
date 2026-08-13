@@ -1,0 +1,417 @@
+{
+  "$id": "https://worldherblibrary.org/schemas/whled-layer-0.1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Structural schema shared by whled/0.1 editorial layers. The layer kind selects the shape inside data; semantic cross-layer references are checked by the reference validator.",
+  "properties": {
+    "$schema": {
+      "const": "https://worldherblibrary.org/schemas/whled-layer-0.1.json"
+    },
+    "data": {
+      "type": "object"
+    },
+    "dependencies": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "layer_id": {
+            "$ref": "#/$defs/id"
+          },
+          "relation": {
+            "$ref": "#/$defs/id"
+          },
+          "revision": {
+            "$ref": "#/$defs/revision"
+          }
+        },
+        "required": [
+          "layer_id",
+          "revision",
+          "relation"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "ext": {
+      "$ref": "#/$defs/ext"
+    },
+    "history": {
+      "items": {
+        "$ref": "#/$defs/history"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
+    "kind": {
+      "$ref": "#/$defs/id"
+    },
+    "label": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "language": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "generated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "method": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parameters": {
+          "type": "object"
+        },
+        "sources": {
+          "items": {
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "actor",
+        "generated_at",
+        "method",
+        "parameters",
+        "sources",
+        "ext"
+      ],
+      "type": "object"
+    },
+    "reviews": {
+      "items": {
+        "$ref": "#/$defs/review"
+      },
+      "type": "array"
+    },
+    "revision": {
+      "$ref": "#/$defs/revision"
+    },
+    "status": {
+      "enum": [
+        "machine-draft",
+        "human-draft",
+        "under-review",
+        "approved",
+        "frozen",
+        "superseded"
+      ]
+    }
+  },
+  "required": [
+    "$schema",
+    "id",
+    "revision",
+    "kind",
+    "label",
+    "status",
+    "language",
+    "provenance",
+    "dependencies",
+    "history",
+    "reviews",
+    "data",
+    "ext"
+  ],
+  "type": "object",
+  "$defs": {
+    "actor": {
+      "additionalProperties": false,
+      "properties": {
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "label": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "human",
+            "software",
+            "model",
+            "import"
+          ]
+        },
+        "uri": {
+          "format": "uri",
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "boxSelector": {
+      "additionalProperties": false,
+      "properties": {
+        "canvas_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "coordinate_space": {
+          "const": "canvas-normalized"
+        },
+        "height": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "box"
+        },
+        "width": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "type": "number"
+        },
+        "x": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "y": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "type",
+        "coordinate_space",
+        "canvas_revision",
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "ext": {
+      "maxProperties": 256,
+      "type": "object"
+    },
+    "history": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/id"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "base_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "action",
+        "actor",
+        "at",
+        "message",
+        "base_revision",
+        "ext"
+      ],
+      "type": "object"
+    },
+    "id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "type": "string"
+    },
+    "layerItemRef": {
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {
+          "$ref": "#/$defs/id"
+        },
+        "layer_id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        }
+      },
+      "required": [
+        "layer_id",
+        "revision",
+        "item_id"
+      ],
+      "type": "object"
+    },
+    "polygonSelector": {
+      "additionalProperties": false,
+      "properties": {
+        "canvas_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "coordinate_space": {
+          "const": "canvas-normalized"
+        },
+        "points": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
+              "y": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "maxItems": 256,
+          "minItems": 3,
+          "type": "array"
+        },
+        "type": {
+          "const": "polygon"
+        }
+      },
+      "required": [
+        "type",
+        "coordinate_space",
+        "canvas_revision",
+        "points"
+      ],
+      "type": "object"
+    },
+    "regionRef": {
+      "additionalProperties": false,
+      "properties": {
+        "layer_id": {
+          "$ref": "#/$defs/id"
+        },
+        "region_id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        }
+      },
+      "required": [
+        "layer_id",
+        "revision",
+        "region_id"
+      ],
+      "type": "object"
+    },
+    "review": {
+      "additionalProperties": false,
+      "properties": {
+        "applies_to_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "decision": {
+          "enum": [
+            "approve",
+            "reject",
+            "request-changes",
+            "abstain"
+          ]
+        },
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/actor"
+        }
+      },
+      "required": [
+        "id",
+        "decision",
+        "reviewer",
+        "at",
+        "rationale",
+        "applies_to_revision",
+        "ext"
+      ],
+      "type": "object"
+    },
+    "revision": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$",
+      "type": "string"
+    },
+    "selector": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/boxSelector"
+        },
+        {
+          "$ref": "#/$defs/polygonSelector"
+        }
+      ]
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    }
+  }
+}

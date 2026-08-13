@@ -1,0 +1,754 @@
+{
+  "$id": "https://worldherblibrary.org/schemas/whled-manifest-0.1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Structural schema for the whled/0.1 living-edition manifest. The reference validator additionally enforces graph, checksum, archive-safety, and approval semantics.",
+  "properties": {
+    "$schema": {
+      "const": "https://worldherblibrary.org/schemas/whled-manifest-0.1.json"
+    },
+    "authority_snapshots": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "$ref": "#/$defs/timestamp"
+          },
+          "database_id": {
+            "$ref": "#/$defs/id"
+          },
+          "ext": {
+            "$ref": "#/$defs/ext"
+          },
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "member": {
+            "pattern": "^authority-snapshots/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.json$",
+            "type": "string"
+          },
+          "release": {
+            "$ref": "#/$defs/revision"
+          }
+        },
+        "required": [
+          "id",
+          "database_id",
+          "release",
+          "member",
+          "created_at",
+          "ext"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "canvases": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "dimensions": {
+            "$ref": "#/$defs/dimensions"
+          },
+          "ext": {
+            "$ref": "#/$defs/ext"
+          },
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "image_member": {
+            "pattern": "^canvases/[A-Za-z0-9][A-Za-z0-9._/-]{0,510}$",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "revision": {
+            "$ref": "#/$defs/revision"
+          },
+          "sequence": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source_label": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "source_page": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "sequence",
+          "label",
+          "source_page",
+          "image_member",
+          "dimensions",
+          "ext"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "capabilities": {
+      "items": {
+        "$ref": "#/$defs/id"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "catalog": {
+      "additionalProperties": false,
+      "properties": {
+        "alternative_titles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "call_number": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "contributors": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "role": {
+                "$ref": "#/$defs/id"
+              },
+              "uri": {
+                "format": "uri",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "role"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "dates": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "display": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "end": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "qualifier": {
+                "enum": [
+                  "exact",
+                  "circa",
+                  "before",
+                  "after",
+                  "range",
+                  "unknown"
+                ]
+              },
+              "start": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "display",
+              "qualifier",
+              "start",
+              "end"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": "string"
+        },
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "extent": {
+          "type": "string"
+        },
+        "identifiers": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "scheme": {
+                "$ref": "#/$defs/id"
+              },
+              "uri": {
+                "format": "uri",
+                "type": "string"
+              },
+              "value": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "scheme",
+              "value"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "languages": {
+          "items": {
+            "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "license": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "material_type": {
+          "$ref": "#/$defs/id"
+        },
+        "record_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "repository": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "rights": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_url": {
+          "format": "uri",
+          "type": "string"
+        },
+        "subjects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "record_id",
+        "title",
+        "material_type",
+        "repository",
+        "call_number",
+        "dates",
+        "languages",
+        "identifiers",
+        "source_url",
+        "rights",
+        "ext"
+      ],
+      "type": "object"
+    },
+    "created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "edition": {
+      "additionalProperties": false,
+      "properties": {
+        "citation": {
+          "type": "string"
+        },
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "label": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "previous_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "release": {
+          "type": "string"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "status": {
+          "enum": [
+            "working",
+            "review",
+            "published",
+            "frozen"
+          ]
+        },
+        "steward": {
+          "$ref": "#/$defs/actor"
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "status",
+        "label",
+        "steward",
+        "previous_revision",
+        "ext"
+      ],
+      "type": "object"
+    },
+    "ext": {
+      "$ref": "#/$defs/ext"
+    },
+    "external_authorities": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "database_id": {
+            "$ref": "#/$defs/id"
+          },
+          "ext": {
+            "$ref": "#/$defs/ext"
+          },
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "kind": {
+            "$ref": "#/$defs/id"
+          },
+          "resolver_template": {
+            "pattern": "^https://.*\\{id\\}.*$",
+            "type": "string"
+          },
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "database_id",
+          "snapshot_id",
+          "resolver_template",
+          "ext"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "format": {
+      "const": "whled/0.1"
+    },
+    "generator": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "layers": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "current": {
+            "type": "boolean"
+          },
+          "ext": {
+            "$ref": "#/$defs/ext"
+          },
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "kind": {
+            "$ref": "#/$defs/id"
+          },
+          "label": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "language": {
+            "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$",
+            "type": "string"
+          },
+          "member": {
+            "pattern": "^layers/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\\.json$",
+            "type": "string"
+          },
+          "revision": {
+            "$ref": "#/$defs/revision"
+          },
+          "supersedes": {
+            "$ref": "#/$defs/revision"
+          },
+          "variant": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "kind",
+          "label",
+          "member",
+          "current",
+          "variant",
+          "ext"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "package_id": {
+      "$ref": "#/$defs/id"
+    },
+    "region_types": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "color": {
+            "pattern": "^#[0-9A-Fa-f]{6}$",
+            "type": "string"
+          },
+          "custom": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": "string"
+          },
+          "ext": {
+            "$ref": "#/$defs/ext"
+          },
+          "facet": {
+            "$ref": "#/$defs/id"
+          },
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "label": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "parent_id": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "facet",
+          "parent_id",
+          "description",
+          "custom",
+          "ext"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "registries": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/registryEntries"
+        },
+        "layer_kinds": {
+          "$ref": "#/$defs/registryEntries"
+        },
+        "region_relation_predicates": {
+          "$ref": "#/$defs/registryEntries"
+        },
+        "resource_roles": {
+          "$ref": "#/$defs/registryEntries"
+        },
+        "selector_types": {
+          "$ref": "#/$defs/registryEntries"
+        }
+      },
+      "required": [
+        "layer_kinds",
+        "selector_types",
+        "resource_roles",
+        "region_relation_predicates",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "resources": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes": {
+            "maximum": 268435456,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext": {
+            "$ref": "#/$defs/ext"
+          },
+          "media_type": {
+            "$ref": "#/$defs/mediaType"
+          },
+          "member": {
+            "$ref": "#/$defs/member"
+          },
+          "role": {
+            "$ref": "#/$defs/id"
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "required": [
+          "member",
+          "media_type",
+          "role",
+          "sha256",
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "excluded_pages": {
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "extraction": {
+          "type": "object"
+        },
+        "filename": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "media_type": {
+          "$ref": "#/$defs/mediaType"
+        },
+        "page_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_url": {
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename",
+        "media_type",
+        "sha256",
+        "page_count",
+        "excluded_pages",
+        "extraction",
+        "ext"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "$schema",
+    "format",
+    "package_id",
+    "created_at",
+    "generator",
+    "edition",
+    "catalog",
+    "source",
+    "canvases",
+    "region_types",
+    "layers",
+    "resources",
+    "authority_snapshots",
+    "external_authorities",
+    "registries",
+    "capabilities",
+    "ext"
+  ],
+  "type": "object",
+  "$defs": {
+    "actor": {
+      "additionalProperties": false,
+      "properties": {
+        "ext": {
+          "$ref": "#/$defs/ext"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "label": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "human",
+            "software",
+            "model",
+            "import"
+          ]
+        },
+        "uri": {
+          "format": "uri",
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "dimensions": {
+      "additionalProperties": false,
+      "properties": {
+        "height": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "width": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "ext": {
+      "maxProperties": 256,
+      "type": "object"
+    },
+    "id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "type": "string"
+    },
+    "mediaType": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$",
+      "type": "string"
+    },
+    "member": {
+      "pattern": "^(?:canvases|layers|authority-snapshots|assets)/[A-Za-z0-9][A-Za-z0-9._/-]{0,510}$",
+      "type": "string"
+    },
+    "revision": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$",
+      "type": "string"
+    },
+    "registryEntries": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "ext": {
+            "$ref": "#/$defs/ext"
+          },
+          "id": {
+            "pattern": "^(?:x-[A-Za-z0-9][A-Za-z0-9._:-]{0,125}|[A-Za-z0-9][A-Za-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63})$",
+            "type": "string"
+          },
+          "label": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "renderer_hint": {
+            "$ref": "#/$defs/id"
+          },
+          "schema_uri": {
+            "anyOf": [
+              {
+                "format": "uri",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "description",
+          "schema_uri",
+          "renderer_hint",
+          "ext"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    }
+  }
+}
