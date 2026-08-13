@@ -1,0 +1,1861 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>World Herb Library — the proposal, interactively</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --green:#2c5240; --green-d:#22412f; --gold:#a5854a;
+  --paper:#f7f5ee; --card:#fffef9; --ink:#23271f; --mut:#6c7263;
+  --hair:rgba(44,82,64,.22); --tint:#eef0e4;
+  --sans:'IBM Plex Sans',system-ui,'Segoe UI',sans-serif;
+  --serif:'IBM Plex Serif',Georgia,serif;
+  --mono:'IBM Plex Mono',Consolas,monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important}}
+body{margin:0;background:var(--paper);color:var(--ink);font:15.5px/1.65 var(--sans)}
+
+/* ---------- header ---------- */
+.masthead{background:var(--green);color:#eef2e8}
+.mast-in{max-width:1180px;margin:0 auto;padding:20px 28px;display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.seal{width:44px;height:44px;color:#c9dbba;flex:none}
+.mast-title{font:600 23px var(--serif);color:#fdfcf5;display:block;line-height:1.2}
+.mast-sub{font-size:12.5px;color:#adc4a0}
+.mast-tools{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.viewtoggle{display:flex;border:1px solid rgba(238,242,232,.45);border-radius:4px;overflow:hidden}
+.viewtoggle button{background:transparent;border:0;color:#dfe8d6;font:600 12.5px var(--sans);padding:7px 14px;cursor:pointer}
+.viewtoggle button[aria-pressed="true"]{background:var(--gold);color:#fff}
+.tbtn{background:rgba(255,255,255,.10);border:0;color:#eef2e8;font:600 12.5px var(--sans);padding:7px 13px;border-radius:4px;cursor:pointer}
+.tbtn:hover{background:rgba(255,255,255,.18)}
+.filterwrap{display:flex;align-items:center;background:#fdfcf5;border-radius:4px;overflow:hidden}
+.filterwrap input{border:0;padding:8px 12px;font:13px var(--sans);width:210px;color:var(--ink);background:transparent}
+.filterwrap input:focus{outline:2px solid var(--gold);outline-offset:-2px}
+.filterwrap .fclear{background:transparent;border:0;color:var(--mut);cursor:pointer;padding:0 10px;font-size:15px}
+
+/* ---------- layout ---------- */
+.shell{max-width:1180px;margin:0 auto;padding:0 28px 90px;display:grid;grid-template-columns:224px 1fr;gap:44px;align-items:start}
+nav.toc{position:sticky;top:18px;padding-top:26px;max-height:calc(100vh - 36px);overflow-y:auto}
+nav.toc h2{font:600 11px var(--sans);letter-spacing:.1em;text-transform:uppercase;color:var(--mut);margin:0 0 10px}
+nav.toc a{display:block;font-size:13px;color:var(--ink);text-decoration:none;padding:5px 0 5px 11px;border-left:2px solid var(--hair)}
+nav.toc a:hover{color:var(--green)}
+nav.toc a.active{border-left-color:var(--gold);color:var(--green);font-weight:600}
+nav.toc .tocnote{margin-top:16px;font-size:11.5px;color:var(--mut);border-top:1px solid var(--hair);padding-top:12px}
+main{padding-top:26px;min-width:0}
+
+/* ---------- sections ---------- */
+section{margin-bottom:14px;border-bottom:1px solid var(--hair);padding-bottom:26px}
+section:last-of-type{border-bottom:0}
+.s-head{display:flex;align-items:baseline;gap:12px;cursor:pointer;user-select:none}
+.s-head h2{font:600 21px var(--serif);color:var(--green);margin:22px 0 6px;flex:1}
+.s-head .chev{color:var(--mut);font-size:12px;transition:transform .15s ease;margin-top:24px}
+section.collapsed .chev{transform:rotate(-90deg)}
+section.collapsed .s-body{display:none}
+.lede{color:var(--mut);font-size:14px;margin:0 0 12px;max-width:70ch}
+h3.sub{font:600 13px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--green);margin:22px 0 6px}
+ul.pts{list-style:none;margin:0;padding:0}
+ul.pts li{position:relative;padding:5px 0 5px 20px;max-width:80ch}
+ul.pts li::before{content:"";position:absolute;left:2px;top:14px;width:6px;height:6px;border-radius:50%;background:var(--gold)}
+ul.pts li b{font-weight:600}
+ul.pts li i{color:#3d4436}
+.full{display:none;background:var(--card);border-left:3px solid var(--green);padding:12px 16px;margin:10px 0 4px 20px;font:15px/1.7 var(--serif);color:#3a4034;max-width:72ch}
+body.view-full .full{display:block}
+.full p{margin:.4em 0}
+mark{background:#f6e9c4;color:inherit;padding:0 2px}
+
+/* ---------- table ---------- */
+.tablewrap{overflow-x:auto;margin:12px 0}
+table{border-collapse:collapse;font-size:13.5px;width:100%;background:var(--card)}
+th,td{border:1px solid var(--hair);padding:8px 12px;text-align:left;vertical-align:top}
+th{background:var(--tint);font:600 11.5px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--green)}
+td b{font-weight:600}
+
+/* ---------- tiers ---------- */
+.tiers{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:12px 0}
+.tier{background:var(--card);border:1px solid var(--hair);padding:14px 16px}
+.tier .tag{display:inline-block;font:600 10.5px var(--sans);letter-spacing:.07em;text-transform:uppercase;padding:3px 9px;border-radius:3px;color:#fff;margin-bottom:8px}
+.t-open{background:var(--green)} .t-search{background:var(--gold)} .t-dark{background:#5a5f56}
+.tier p{margin:0;font-size:13px;color:var(--mut);line-height:1.6}
+
+/* ---------- phases ---------- */
+.phases{display:flex;gap:0;margin:14px 0;flex-wrap:wrap}
+.phase{flex:1;min-width:150px;background:var(--card);border:1px solid var(--hair);border-right:0;padding:12px 14px;cursor:pointer;text-align:left}
+.phase:last-child{border-right:1px solid var(--hair)}
+.phase[aria-selected="true"]{background:var(--green);border-color:var(--green)}
+.phase[aria-selected="true"] b,.phase[aria-selected="true"] span{color:#fdfcf5}
+.phase b{display:block;font:600 13.5px var(--serif);margin-bottom:2px}
+.phase span{font-size:11.5px;color:var(--mut)}
+.phasebody{background:var(--tint);border:1px solid var(--hair);padding:14px 18px;font-size:14px}
+.phasebody ul{margin:6px 0 0;padding-left:18px} .phasebody li{margin:3px 0}
+.phasebody .visible{margin-top:10px;padding-top:9px;border-top:1px solid var(--hair);font-size:13px;color:#3d4436}
+
+/* ---------- idea board ---------- */
+.boardbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 14px}
+.chip{background:var(--tint);border:1px solid var(--hair);border-radius:14px;padding:4px 12px;font:600 12px var(--sans);color:var(--mut);cursor:pointer}
+.chip[aria-pressed="true"]{background:var(--green);border-color:var(--green);color:#fff}
+.tally{margin-left:auto;font:600 12.5px var(--mono);color:var(--mut)}
+.ideas{display:grid;grid-template-columns:repeat(auto-fill,minmax(268px,1fr));gap:14px}
+.idea{background:var(--card);border:1px solid var(--hair);padding:13px 15px;display:flex;flex-direction:column;gap:8px}
+.idea.hide{display:none}
+.idea h3{font:600 15px var(--serif);margin:0}
+.idea p{margin:0;font-size:13px;color:var(--mut);line-height:1.55;flex:1}
+.idea .meta{display:flex;gap:6px;flex-wrap:wrap}
+.idea .meta span{font:600 10px var(--sans);letter-spacing:.06em;text-transform:uppercase;background:var(--tint);color:var(--mut);padding:2px 8px;border-radius:3px}
+.vote{display:flex;gap:5px}
+.vote button{flex:1;border:1px solid var(--hair);background:transparent;color:var(--mut);font:600 11.5px var(--sans);padding:5px 0;border-radius:3px;cursor:pointer}
+.vote button:hover{border-color:var(--green);color:var(--green)}
+.idea[data-vote="yes"]{border-color:var(--green);box-shadow:inset 3px 0 0 var(--green)}
+.idea[data-vote="yes"] .vote button[value="yes"]{background:var(--green);border-color:var(--green);color:#fff}
+.idea[data-vote="maybe"]{box-shadow:inset 3px 0 0 var(--gold)}
+.idea[data-vote="maybe"] .vote button[value="maybe"]{background:var(--gold);border-color:var(--gold);color:#fff}
+.idea[data-vote="no"]{opacity:.55}
+.idea[data-vote="no"] .vote button[value="no"]{background:#5a5f56;border-color:#5a5f56;color:#fff}
+
+/* ---------- misc ---------- */
+.callout{background:var(--card);border:1px solid var(--hair);border-left:3px solid var(--gold);padding:12px 16px;margin:14px 0;font-size:14px;max-width:74ch}
+.pill{font:600 11px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--gold)}
+.statrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+.stat{background:var(--card);border:1px solid var(--hair);border-top:3px solid var(--gold);padding:12px 14px}
+.stat b{display:block;font:600 25px var(--serif);color:var(--green);line-height:1.1}
+.stat span{font-size:12px;color:var(--mut);display:block;margin-top:3px}
+footer.pagefoot{background:var(--green-d);color:#c9dbba;padding:18px 0 22px;font-size:12.5px}
+footer.pagefoot div{max-width:1180px;margin:0 auto;padding:0 28px}
+footer.pagefoot a{color:#d9c89b}
+.nores{display:none;color:var(--mut);font-style:italic;padding:14px 0}
+body.filtering .nores.show{display:block}
+
+/* ---------- diagrams ---------- */
+figure.diagram{margin:18px 0;max-width:700px;background:var(--card);border:1px solid var(--hair);padding:16px 18px 10px}
+figure.diagram svg{width:100%;height:auto;display:block}
+figure.diagram figcaption{font-size:12px;color:var(--mut);margin-top:9px;border-top:1px solid var(--hair);padding-top:8px}
+.dg-t{font:600 11.5px 'IBM Plex Sans',sans-serif;fill:#23271f}
+.dg-s{font:11px 'IBM Plex Sans',sans-serif;fill:#6c7263}
+.dg-l{font:600 9.5px 'IBM Plex Sans',sans-serif;fill:#6c7263;letter-spacing:.06em}
+.dg-w{font:600 11.5px 'IBM Plex Sans',sans-serif;fill:#fdfcf5}
+.dg-ws{font:11px 'IBM Plex Sans',sans-serif;fill:#c9dbba}
+
+/* ---------- annotations ---------- */
+:root{
+  --a-good:#2c5240; --a-good-b:rgba(44,82,64,.07);
+  --a-relevant:#5c7f4e; --a-relevant-b:rgba(92,127,78,.10);
+  --a-weak:#a5854a; --a-weak-b:rgba(165,133,74,.10);
+  --a-miss:#a35f2e; --a-miss-b:rgba(163,95,46,.10);
+  --a-nrel:#5a5f56; --a-nrel-b:rgba(90,95,86,.07);
+  --a-prune:#8c4a3f; --a-prune-b:rgba(140,74,63,.09);
+  --a-expand:#3b6470; --a-expand-b:rgba(59,100,112,.09);
+  --a-brain:#6a5a7a; --a-brain-b:rgba(106,90,122,.09);
+  --a-ai:#46527f; --a-ai-b:rgba(70,82,127,.09);
+}
+.anno{cursor:default}
+/* reserve below the fixed bar is set from its measured height in script */
+[data-anno]{box-shadow:inset 3px 0 0 var(--ac);background:var(--ab)}
+[data-anno="good"]{--ac:var(--a-good);--ab:var(--a-good-b)}
+[data-anno="relevant"]{--ac:var(--a-relevant);--ab:var(--a-relevant-b)}
+[data-anno="weak"]{--ac:var(--a-weak);--ab:var(--a-weak-b)}
+[data-anno="miss"]{--ac:var(--a-miss);--ab:var(--a-miss-b)}
+[data-anno="nrel"]{--ac:var(--a-nrel);--ab:var(--a-nrel-b)}
+[data-anno="prune"]{--ac:var(--a-prune);--ab:var(--a-prune-b);opacity:.72}
+[data-anno="expand"]{--ac:var(--a-expand);--ab:var(--a-expand-b)}
+[data-anno="brain"]{--ac:var(--a-brain);--ab:var(--a-brain-b)}
+[data-anno="ai"]{--ac:var(--a-ai);--ab:var(--a-ai-b)}
+ul.pts li[data-anno]::before{left:11px}
+tr[data-anno]{box-shadow:none;background:var(--ab)}
+tr[data-anno] td:first-child{box-shadow:inset 3px 0 0 var(--ac)}
+.anno.sel{outline:2px dashed var(--gold);outline-offset:3px}
+.anno-chip{display:inline-block;font:600 9.5px var(--sans);letter-spacing:.07em;text-transform:uppercase;
+  color:#fff;background:var(--ac);padding:1px 7px;border-radius:2px;margin-left:8px;vertical-align:1px;white-space:nowrap}
+.anno-note{font:italic 13px/1.55 var(--serif);color:#3a4034;border-left:2px solid var(--ac);
+  padding:2px 0 2px 9px;margin:5px 0 2px}
+.anno-note b{font-style:normal;font-weight:600;font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);display:block}
+
+.annobar{position:fixed;left:0;right:0;bottom:0;z-index:60;background:var(--card);border-top:2px solid var(--green);
+  padding:10px 18px 12px;display:none;box-shadow:0 -4px 18px rgba(35,39,31,.10)}
+body.anno-active .annobar{display:block}
+.annobar .ab-in{max-width:1180px;margin:0 auto}
+.annobar .ab-ex{font:13px var(--serif);color:var(--mut);margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.annobar .ab-ex b{color:var(--green);font:600 10.5px var(--sans);letter-spacing:.06em;text-transform:uppercase;margin-right:8px}
+.ab-row{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.ab-t{border:1px solid var(--hair);background:transparent;color:var(--ink);font:600 12px var(--sans);
+  padding:6px 11px;border-radius:3px;cursor:pointer;display:flex;gap:6px;align-items:center}
+.ab-t u{color:var(--mut);text-decoration:none;font:600 10.5px var(--mono);border:1px solid var(--hair);border-radius:2px;padding:0 4px}
+.ab-t:hover{border-color:var(--tc);color:var(--tc)}
+.ab-t.on{background:var(--tc);border-color:var(--tc);color:#fff}
+.ab-t.on u{color:#fff;border-color:rgba(255,255,255,.5)}
+.ab-t[data-t="good"]{--tc:var(--a-good)} .ab-t[data-t="relevant"]{--tc:var(--a-relevant)}
+.ab-t[data-t="weak"]{--tc:var(--a-weak)} .ab-t[data-t="miss"]{--tc:var(--a-miss)}
+.ab-t[data-t="nrel"]{--tc:var(--a-nrel)} .ab-t[data-t="prune"]{--tc:var(--a-prune)}
+.ab-t[data-t="expand"]{--tc:var(--a-expand)} .ab-t[data-t="brain"]{--tc:var(--a-brain)}
+.ab-t[data-t="ai"]{--tc:var(--a-ai)}
+.ab-sp{margin-left:auto;display:flex;gap:7px}
+.ab-min{border:1px solid var(--hair);background:transparent;color:var(--mut);font:600 12px var(--sans);padding:6px 11px;border-radius:3px;cursor:pointer}
+.ab-min:hover{color:var(--green);border-color:var(--green)}
+.ab-note{display:none;margin-top:9px;gap:8px}
+body.anno-noting .ab-note{display:flex}
+.ab-note textarea{flex:1;font:13.5px var(--sans);padding:8px 10px;border:1px solid var(--hair);border-radius:3px;
+  background:var(--paper);color:var(--ink);resize:vertical;min-height:52px}
+.ab-note textarea:focus{outline:2px solid var(--gold);outline-offset:-2px}
+
+.annodraw{position:fixed;top:0;right:0;bottom:0;width:400px;max-width:92vw;z-index:70;background:var(--paper);
+  border-left:1px solid var(--hair);box-shadow:-6px 0 24px rgba(35,39,31,.14);display:none;flex-direction:column}
+body.anno-draw .annodraw{display:flex}
+.annodraw header{background:var(--green);color:#eef2e8;padding:14px 18px;display:flex;align-items:center;gap:10px}
+.annodraw header b{font:600 15px var(--serif);flex:1}
+.annodraw .adbody{flex:1;overflow-y:auto;padding:14px 18px}
+.adcounts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.adcount{font:600 11px var(--sans);padding:3px 9px;border-radius:2px;color:#fff}
+.adsec{font:600 11px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--mut);
+  margin:16px 0 6px;border-bottom:1px solid var(--hair);padding-bottom:4px}
+.aditem{background:var(--card);border:1px solid var(--hair);box-shadow:inset 3px 0 0 var(--ac);padding:8px 11px;margin-bottom:7px;cursor:pointer}
+.aditem:hover{border-color:var(--green)}
+.aditem .t{font:600 9.5px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--ac)}
+.aditem .x{font:12.5px/1.5 var(--serif);color:#3a4034;margin-top:3px}
+.aditem .n{font:italic 12px/1.5 var(--serif);color:var(--mut);margin-top:4px;border-top:1px dotted var(--hair);padding-top:4px}
+.annodraw footer{border-top:1px solid var(--hair);padding:12px 18px;display:flex;flex-wrap:wrap;gap:7px;background:var(--card)}
+.adbtn{border:1px solid var(--hair);background:transparent;color:var(--ink);font:600 12px var(--sans);padding:7px 12px;border-radius:3px;cursor:pointer}
+.adbtn.pri{background:var(--green);border-color:var(--green);color:#fff}
+.adbtn:hover{border-color:var(--green)}
+.adempty{color:var(--mut);font-style:italic;font-size:13.5px}
+.annohelp{position:fixed;inset:0;z-index:80;background:rgba(35,39,31,.45);display:none;align-items:center;justify-content:center;padding:20px}
+body.anno-help .annohelp{display:flex}
+.annohelp .hh{background:var(--card);border:1px solid var(--hair);max-width:520px;padding:20px 24px}
+.annohelp h3{font:600 17px var(--serif);color:var(--green);margin:0 0 10px}
+.annohelp table{font-size:13px} .annohelp td{border:0;padding:3px 10px 3px 0}
+.annohelp kbd{font:600 11.5px var(--mono);background:var(--tint);border:1px solid var(--hair);border-radius:2px;padding:1px 6px}
+
+@media (max-width:900px){
+  .shell{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;display:none}
+  .tiers{grid-template-columns:1fr}
+}
+@media (max-width:720px){
+  /* keep diagram lettering legible: scroll the figure rather than shrink the type */
+  figure.diagram{overflow-x:auto;padding:14px 14px 8px}
+  figure.diagram svg{min-width:600px}
+  figure.diagram figcaption{min-width:600px}
+  .annodraw{width:100%}
+}
+@media print{
+  .masthead,nav.toc,.boardbar,.vote,footer.pagefoot,.mast-tools,.annobar,.annodraw,.annohelp{display:none!important}
+  .shell{grid-template-columns:1fr;padding:0}
+  body{background:#fff;font-size:11pt}
+  .full{display:block!important}
+  section.collapsed .s-body{display:block}
+  figure.diagram{break-inside:avoid}
+}
+</style>
+</head>
+<body class="view-brief">
+
+<header class="masthead">
+  <div class="mast-in">
+    <svg class="seal" viewBox="0 0 48 48" aria-hidden="true">
+      <circle cx="24" cy="24" r="21.5" fill="none" stroke="currentColor" stroke-width="2.4"/>
+      <g fill="currentColor">
+        <path d="M24 7c1.8 7-1 11 0 17-4-5-6-10-4.5-16z"/>
+        <path d="M24 7c1.8 7-1 11 0 17-4-5-6-10-4.5-16z" transform="rotate(72 24 24)"/>
+        <path d="M24 7c1.8 7-1 11 0 17-4-5-6-10-4.5-16z" transform="rotate(144 24 24)"/>
+        <path d="M24 7c1.8 7-1 11 0 17-4-5-6-10-4.5-16z" transform="rotate(216 24 24)"/>
+        <path d="M24 7c1.8 7-1 11 0 17-4-5-6-10-4.5-16z" transform="rotate(288 24 24)"/>
+        <circle cx="24" cy="24" r="3"/>
+      </g>
+      <path d="M24 27v12M24 33c-3-1-5-3-6-6M24 33c3-1 5-3 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <span class="mast-title">The World Herb Library, rebuilt</span>
+      <span class="mast-sub">Findings, proposals, and open questions &middot; working document, August 2026</span>
+    </div>
+    <div class="mast-tools">
+      <div class="filterwrap">
+        <input id="filter" type="search" placeholder="Filter every point&hellip;" aria-label="Filter points">
+        <button class="fclear" id="fclear" title="Clear filter" aria-label="Clear filter">&times;</button>
+      </div>
+      <div class="viewtoggle" role="group" aria-label="Detail level">
+        <button id="v-brief" aria-pressed="true">Brief</button>
+        <button id="v-full" aria-pressed="false">Full</button>
+      </div>
+      <button class="tbtn" id="annobtn">Notes <span id="annocount">0</span></button>
+      <button class="tbtn" id="toggleall">Collapse all</button>
+      <button class="tbtn" id="printbtn">Print</button>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="toc" aria-label="Contents">
+    <h2>Contents</h2>
+    <a href="#stand">1 &middot; Where we stand</a>
+    <a href="#case">2 &middot; The case for rebuilding</a>
+    <a href="#records">3 &middot; Records &amp; data model</a>
+    <a href="#reader">4 &middot; The reader</a>
+    <a href="#interact">5 &middot; Interactivity</a>
+    <a href="#translations">6 &middot; Translations</a>
+    <a href="#index">7 &middot; The plant index</a>
+    <a href="#entity">8 &middot; The entity layer</a>
+    <a href="#rights">9 &middot; In-copyright works</a>
+    <a href="#ask">10 &middot; Ask the Library</a>
+    <a href="#ai">11 &middot; AI policy</a>
+    <a href="#workbench">12 &middot; The workbench</a>
+    <a href="#intake">13 &middot; Adding new books</a>
+    <a href="#sequence">14 &middot; The roadmap</a>
+    <a href="#alive">15 &middot; Keeping it alive</a>
+    <a href="#board">16 &middot; Idea board</a>
+    <a href="#questions">17 &middot; Open questions</a>
+    <p class="tocnote"><b>Brief</b> shows the bullets. <b>Full</b> adds the reasoning behind each one.<br><br>
+      <b>Mark anything up:</b> click a point, then press <b>G</b> good, <b>R</b> relevant, <b>W</b> weak,
+      <b>M</b> missing the point, <b>N</b> not relevant, <b>I</b> reads like AI, <b>P</b> prune,
+      <b>E</b> expand, <b>B</b> keep brainstorming; <b>C</b> to comment. Press <b>?</b> for the full list.
+      Everything is saved in this browser — <b>Notes</b> collects it for sending back.</p>
+  </nav>
+
+  <main>
+
+    <!-- 1 -->
+    <section id="stand">
+      <div class="s-head" role="button" tabindex="0"><h2>1 &middot; Where we stand</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">A full audit of the catalogue, the files, the reading experience, and the public voice. Every number below was measured, not estimated.</p>
+
+        <div class="statrow">
+          <div class="stat"><b>93%</b><span>core fields present on published books — title, author, year, subject, language, length</span></div>
+          <div class="stat"><b>26%</b><span>present for publisher, place, edition and description &mdash; where the real gap is</span></div>
+          <div class="stat"><b>90&nbsp;MB</b><span>downloaded before a single page appears, on our largest volume</span></div>
+          <div class="stat"><b>487</b><span>published entries that duplicate a book already catalogued</span></div>
+        </div>
+
+        <h3 class="sub">The catalogue</h3>
+        <ul class="pts">
+          <li><b>The core of the published catalogue is in better shape than it looks.</b> Across the 4,356 books a visitor can actually reach, the six fields people search on — title, author, year, subject, language, length — are <b>93% filled</b>, and <b>77% of books have all six</b>. Any account of this collection should start there.</li>
+          <li><b>The gap is in the imprint.</b> Publisher is recorded for 69% of published books, a description for 49%, and then it falls away: <b>place of publication 3.5%, subtitle 7%, edition 2%</b>. Averaged across all eleven fields that is the &ldquo;about a third missing&rdquo; figure — but the third that is missing is almost entirely this, not the basics.</li>
+          <li><b>971 further entries are unpublished drafts</b>, invisible to visitors and much thinner: an author on 18% of them, a year on 31%, a subject on 17%, and 219 with no file attached at all. That is reasonable for a working backlog — but it is a fifth of the catalogue that <i>cannot</i> be published as it stands, and it should be counted separately rather than folded into judgements about the live site.</li>
+          <li><b>Accuracy is a separate question from completeness, and it is where the harm is.</b> Twelve published books read page by page against their records turned up errors of the kind readers notice: an <i>editor</i> recorded as author; a first-edition date printed on a much later reprint; a year copied from a librarian&rsquo;s pencilled shelf-mark; a twentieth-century <b>donor</b> recorded as the author of a sixteenth-century manuscript.</li>
+          <li><b>A filled field is not a checked field.</b> In that same twelve, the title matched the book exactly in <b>three cases</b> and the authors in <b>two</b>. The rest were not wrong so much as <i>partial</i> — volume numbers absorbed into the title, author statements truncated or stripped of their roles. This is the honest qualification of the 93% above: the basics are present, and they are frequently approximate.</li>
+          <li>Subjects were assigned in bulk — botany volumes filed under <i>Ayurveda</i> because a batch was tagged at once. Three of the twelve carried a subject that was simply wrong.</li>
+          <li><b>852 published titles — one in five — are volumes of sets or journals</b> the catalogue cannot relate to one another. They belong to about 400 families; the largest are journal runs of nine to twelve issues, each currently standing alone with its volume number jammed into the title text where nothing can sort it.</li>
+          <li><mark>4,563 published entries describe about 4,075 distinct works</mark> — <b>487 are a second or third scan of a book already catalogued</b>, undetected because no file fingerprint is recorded.</li>
+          <li>235 published entries carry a broken link; entries with non-Latin characters in their address fail to match their own records. Corrections are keyed to a <i>spreadsheet row number</i>, so inserting a row misfiles every correction after it, with no error to warn you.</li>
+          <li>No rights field exists at all — <b>nothing records who digitised a book, or under what terms we may show it</b>.</li>
+        </ul>
+
+        <h3 class="sub">Reading and finding</h3>
+        <ul class="pts">
+          <li><b>Opening a book downloads the entire file first</b> — between 4 and 90&nbsp;MB. On a 494-page volume, nothing had appeared after thirty seconds of waiting.</li>
+          <li>Text cannot be selected. Search inside a book works only where the file happens to carry a hidden text layer: <b>nine of twelve sampled books have one</b> (uncorrected), three have none, including the Chinese fascicle.</li>
+          <li><b>No page has an address.</b> Nothing in the collection can be cited, linked, bookmarked, or quoted precisely — the single most consequential gap on this list.</li>
+          <li>Browsing means ten cards a page across <b>495 pages</b>, with a flat subject list and <i>no filters by author, year, or language, and no sort</i>.</li>
+          <li>A book&rsquo;s page shows five flat fields; when a field is empty the label still prints, so the page advertises what we do not know.</li>
+          <li>The viewer does not work usefully on a phone, where a growing share of readers arrive.</li>
+        </ul>
+
+        <h3 class="sub">Voice, trust, and infrastructure</h3>
+        <ul class="pts">
+          <li>The site speaks in a <b>promotional register</b> while our plates and manuscripts — the most persuasive material we own — barely appear.</li>
+          <li>Some descriptions were written from titles alone. One presents a <b>fourteenth-century Italian manuscript as though it were a modern wellness paperback</b>: fluent, confident, and almost entirely untrue.</li>
+          <li>The footer&rsquo;s &ldquo;AI Search&rdquo; is <b>a separate system we do not control</b>, served over an unencrypted connection at a bare numeric address. It shows <i>no authors at all</i> and uses raw filenames as titles — though the missing information exists in our own data and matched fifteen out of fifteen on test.</li>
+          <li><b>Eighty-eight per cent of our files are compressed derivatives</b> with their origins stripped: renamed, re-saved, and no longer traceable to the institution that digitised them. Only a handful still carry a source number.</li>
+          <li>Our own storage will not release images to a web page (a missing configuration line), so <i>any</i> new reader is blocked until that is fixed — a half-hour job nobody has been assigned.</li>
+        </ul>
+
+        <div class="full">
+          <p>None of this reflects badly on anyone. It is what happens when a collection grows faster than the tools built to describe it. The collection itself is the rare thing: thousands of digitised volumes across five centuries and a dozen languages, gathered by people who know the material, and given away free. Everything proposed here is in service of that.</p>
+          <p>The reason the errors matter more than their number suggests: <b>credibility is the only currency a free library earns</b>. A scholar deciding whether to cite us, or a foundation deciding whether to fund us, forms a judgement in about ten seconds — and every visible error spends a little of it.</p>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 168" role="img" aria-label="Opening a book today versus after the rebuild: the whole file downloads before anything appears, compared with one page tile arriving in about a second.">
+            <text class="dg-l" x="0" y="12">TODAY</text>
+            <rect x="0" y="20" width="560" height="30" fill="#eef0e4" stroke="rgba(44,82,64,.22)"/>
+            <rect x="0" y="20" width="560" height="30" fill="#5a5f56" opacity=".18"/>
+            <text class="dg-t" x="12" y="39">whole file downloads &mdash; 4 to 90 MB</text>
+            <path d="M566 35 h34" stroke="#5a5f56" stroke-width="1.5" stroke-dasharray="3 3"/>
+            <circle cx="604" cy="35" r="10" fill="#5a5f56"/>
+            <text class="dg-w" x="604" y="39" text-anchor="middle">1</text>
+            <text class="dg-s" x="0" y="66">first page appears only at the end &mdash; on the largest volume, not within 30 seconds</text>
+
+            <text class="dg-l" x="0" y="106">AFTER</text>
+            <rect x="0" y="114" width="52" height="30" fill="#2c5240"/>
+            <text class="dg-w" x="26" y="133" text-anchor="middle">tile</text>
+            <path d="M58 129 h26" stroke="#2c5240" stroke-width="1.5"/>
+            <circle cx="96" cy="129" r="10" fill="#2c5240"/>
+            <text class="dg-w" x="96" y="133" text-anchor="middle">1</text>
+            <text class="dg-s" x="118" y="133">page one is on screen in about a second; more detail loads only where you zoom</text>
+            <text class="dg-s" x="0" y="160">Same scans, same storage. Only the delivery changes.</text>
+          </svg>
+          <figcaption>The delivery problem in one picture. The scan is unchanged; what changes is that the reader asks for <i>a page</i> rather than <i>a book</i>.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- 2 -->
+    <section id="case">
+      <div class="s-head" role="button" tabindex="0"><h2>2 &middot; The case for rebuilding</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">The honest question is not &ldquo;are these faults real&rdquo; — they are measured — but <b>&ldquo;why rebuild rather than repair&rdquo;</b>. Five reasons, in the order they convinced us.</p>
+        <ul class="pts">
+          <li><b>Every fault above traces to two foundations, not to a hundred bugs.</b> One is the record — a single flat row per book. The other is delivery — a whole file handed over at once. Fix the surface and both remain; fix the foundations and most of the list disappears as a side effect.</li>
+          <li><b>Repair work done now would have to be redone.</b> Correct a date today and it lands in a field that cannot express <i>[1518?]</i>. Relate a journal run today and there is nowhere to record the relation. Every hour spent improving records inside the current model is an hour that must be spent again after it changes.</li>
+          <li><b>The one thing only we can offer cannot be built on the present model at all.</b> A plant index requires page addresses, confirmed occurrences, and a name authority. The current site has none of the three, and no amount of patching produces them.</li>
+          <li><b>Doing nothing is not free.</b> Scans keep arriving into a structure that mis-files them; duplicate rows keep multiplying; rights stay unrecorded while the law changes annually in our favour; and a public AI search we do not control keeps answering in our name.</li>
+          <li><b>It is far cheaper than it sounds.</b> Page-at-a-time delivery is a solved problem used by every major library; the storage is already paid for; the word positions needed for in-book search are already produced by our text recognition and <i>currently discarded</i>. This is mostly assembly, not invention.</li>
+        </ul>
+        <div class="callout">
+          <b>The one-sentence case:</b> we hold a collection of the first rank inside a presentation of the last, and the gap between the two <i>is</i> the opportunity — nobody else can close it, because nobody else has the books.
+        </div>
+        <ul class="pts">
+          <li><b>Nothing is thrown away and nothing goes dark.</b> The present site keeps running while the new one fills up book by book; existing entries migrate as they are and improve afterwards as small reviewable tasks.</li>
+          <li><b>Each phase is useful alone.</b> If work stopped after phase one, the library would still be materially better than it is today. That is the test every phase must pass.</li>
+        </ul>
+        <div class="full">
+          <p>There is a version of this argument that overreaches, and we should avoid it: the claim that the current site is worthless. It is not. It has delivered thousands of books to readers for years, free, and that is not nothing. The argument is narrower and stronger — that the <i>next</i> increment of value is unreachable from here, and that the cost of reaching it grows every month we add material to a structure that cannot hold it.</p>
+          <p>The comparison worth making is not with other herbal sites; it is with what a reader has learned to expect from any serious library: open a book instantly, cite a page, search inside, trust the record. We are measured against that standard whether or not we choose to be.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3 -->
+    <section id="records">
+      <div class="s-head" role="button" tabindex="0"><h2>3 &middot; Records that fit the books</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">Today a book is a spreadsheet row: one title, one author, one year, one file. Adequate for a paperback; <b>wrong for nearly everything we hold</b>.</p>
+        <ul class="pts">
+          <li><b>Journals and sets become one record with volumes beneath them</b> — not a hundred unrelated entries whose titles have the volume number jammed in.</li>
+          <li><b>People are recorded with roles</b>: author, editor, translator, illustrator, engraver, printer, former owner. This alone removes a whole class of our current errors.</li>
+          <li><b>Dates can be honest.</b> <span class="pill">[1518?]</span> means we inferred it; a sortable range sits behind the display form, so honesty does not break search.</li>
+          <li><b>Copies are described as copies</b> — our Woodville&rsquo;s bound-in manuscript index, our Fuchs&rsquo;s contemporary hand-colouring. This is what makes <i>our</i> copy worth consulting rather than any copy.</li>
+          <li><b>Rights status, file fingerprints, outward reference numbers</b>, and a <i>brief record</i> flag so an honest stub is distinguishable from confident emptiness.</li>
+          <li>Every record is <b>versioned and citable</b>; every change — human or machine — arrives as a <b>proposal that a named person approves</b>.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 234" role="img" aria-label="Diagram contrasting the current flat row with the proposed work, edition, volume and copy hierarchy.">
+            <text class="dg-l" x="0" y="12">TODAY &mdash; ONE FLAT ROW PER SCAN</text>
+            <rect x="0" y="20" width="200" height="26" fill="#fffef9" stroke="rgba(44,82,64,.22)"/><text class="dg-s" x="10" y="37">Gerard, Herball vol. 1</text>
+            <rect x="210" y="20" width="200" height="26" fill="#fffef9" stroke="rgba(44,82,64,.22)"/><text class="dg-s" x="220" y="37">Gerard, Herball vol. 2</text>
+            <rect x="420" y="20" width="200" height="26" fill="#fffef9" stroke="rgba(44,82,64,.22)"/><text class="dg-s" x="430" y="37">Herball (1633) &mdash; 2nd copy</text>
+            <text class="dg-s" x="0" y="62">unrelated to each other; no way to say &ldquo;same work&rdquo;, &ldquo;later edition&rdquo;, or &ldquo;another copy&rdquo;</text>
+
+            <text class="dg-l" x="0" y="104">PROPOSED &mdash; FOUR LEVELS</text>
+            <rect x="0" y="112" width="150" height="30" fill="#2c5240"/><text class="dg-w" x="12" y="131">WORK</text>
+            <text class="dg-s" x="160" y="131">the <tspan font-style="italic">Herball</tspan> as an idea &mdash; titles, subjects, the plant index hangs here</text>
+            <path d="M22 142 v14 h18" fill="none" stroke="rgba(44,82,64,.5)"/>
+            <rect x="40" y="150" width="150" height="30" fill="#3f6b52"/><text class="dg-w" x="52" y="169">EDITION</text>
+            <text class="dg-s" x="200" y="169">1597 &middot; 1633 &middot; a translation &mdash; each with its own date and printer</text>
+            <path d="M62 180 v14 h18" fill="none" stroke="rgba(44,82,64,.5)"/>
+            <rect x="80" y="188" width="150" height="30" fill="#a5854a"/><text class="dg-w" x="92" y="207">VOLUME / COPY</text>
+            <text class="dg-s" x="240" y="207">our scan, its binding, its marginalia, its rights and fingerprint</text>
+          </svg>
+          <figcaption>Four levels replace one row. Almost every catalogue error we found is an artefact of squeezing these four into one.</figcaption>
+        </figure>
+
+        <div class="full">
+          <p>Three examples of why the flat row fails. <b>A journal run:</b> a hundred issues currently look like a hundred unrelated books. <b>A manuscript with no title page:</b> someone invents a title, and the catalogue presents the invention as though the book announced it. <b>An undated book:</b> the field demands a year, so a guess is entered and becomes indistinguishable from a fact.</p>
+          <p>Migration is incremental. Existing entries move across as they are; improvement becomes a queue of small reviewable tasks rather than an impossible re-cataloguing project.</p>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Concept</th><th>What it means</th><th>Why we need it</th></tr></thead>
+            <tbody>
+              <tr><td><b>Work / edition / copy</b></td><td>An idea, its printings, and our physical volume, as three linked things</td><td>100 issues currently look like 100 unrelated books</td></tr>
+              <tr><td><b>Roles for contributors</b></td><td>Author, editor, translator, illustrator, engraver, printer, former owner</td><td>Removes a whole class of our current errors</td></tr>
+              <tr><td><b>Qualified dates</b></td><td>Display form <i>[1518?]</i> plus a machine-sortable range</td><td>Honest uncertainty without breaking sorting</td></tr>
+              <tr><td><b>Material class</b></td><td>Manuscript / early print / modern / periodical / digital edition / audio</td><td>Each type needs different fields and page layout</td></tr>
+              <tr><td><b>Copy-specific notes</b></td><td>Binding, inscriptions, provenance, bound-in extras</td><td>Explains why <i>our</i> copy is worth consulting</td></tr>
+              <tr><td><b>Outward identifiers</b></td><td>Reference numbers used by other catalogues</td><td>Lets researchers move between us and the wider world</td></tr>
+              <tr><td><b>Source and rights</b></td><td>Who digitised it, under what terms, with the evidence attached</td><td>Currently recorded nowhere at all</td></tr>
+              <tr><td><b>File fingerprint</b></td><td>A checksum per scan</td><td>144 files are shared by 291 published entries, undetected; 487 published entries duplicate a book already catalogued</td></tr>
+              <tr><td><b>Completeness flag</b></td><td>&ldquo;Brief record&rdquo;, and a real draft state</td><td>An honest stub beats confident emptiness &mdash; and 971 entries are already waiting in draft</td></tr>
+              <tr><td><b>Page addresses</b></td><td>A permanent identifier for every page of every scan</td><td>Citation, search hits, annotation and the plant index all depend on it</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4 -->
+    <section id="reader">
+      <div class="s-head" role="button" tabindex="0"><h2>4 &middot; A reader that respects readers</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <ul class="pts">
+          <li><b>Page-at-a-time delivery</b>: any book opens in about a second, whatever its size.</li>
+          <li>Deep zoom on plates; <b>a permanent link to every page</b>; the full download still available for anyone who wants the whole file.</li>
+          <li><b>Search inside a book with hits highlighted on the page image</b> — we already produce the word positions during text recognition and currently discard them.</li>
+          <li>Works properly on a phone, which the current viewer effectively does not.</li>
+          <li><b>One fix comes first:</b> our storage must be allowed to serve images to a web page. Until that half-hour configuration change is made, <i>no</i> new reader can display a single scan.</li>
+        </ul>
+        <div class="full">
+          <p>The scan is kept as page images at several zoom levels; the reader fetches only what is on screen, and more detail only when you zoom. This is the standard approach at essentially every major digital library, so we are <b>adopting a solved solution rather than inventing one</b>.</p>
+          <p>The same change unlocks the features we lack: addressable pages make citation possible, and word positions make in-book search visual rather than a list of numbers.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5 -->
+    <section id="interact">
+      <div class="s-head" role="button" tabindex="0"><h2>5 &middot; Interactivity worth building</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">Roughly in order of value against effort. Not gimmicks — things scholars, students, and browsing visitors actually ask for.</p>
+
+        <h3 class="sub">Working with the text</h3>
+        <ul class="pts">
+          <li><b>Compare editions side by side</b> — the same plant in Gerard 1597, Culpeper 1653, Woodville 1834, the eclectic dispensatory 1898. <i>The changing description is the history of the subject.</i></li>
+          <li><b>Personal shelf</b> — saved books, bookmarked pages with private notes, exportable as a formatted citation list.</li>
+          <li><b>Highlight and annotate</b>, with a shareable link back to the exact spot — a pencil line and a slip of paper, made citable.</li>
+          <li><b>Tap a word for a gloss</b> — archaic terms, apothecary symbols, obsolete plant names, always marked as <i>our</i> editorial addition rather than the book&rsquo;s words.</li>
+          <li><b>A key to the apothecary symbols</b> (&#8478;, &#438;, &#8536;, <i>ana</i>, <i>q.s.</i>) linked from any page that contains them.</li>
+          <li><b>&ldquo;How to read this book&rdquo; primers</b> — a single page explaining what a dispensatory, a receipt book, or a printed herbal actually is, linked from every work of that kind.</li>
+        </ul>
+
+        <h3 class="sub">Looking at the books</h3>
+        <ul class="pts">
+          <li><b>Plate gallery</b> — every illustration in the collection, browsable and filterable, downloadable at full resolution.</li>
+          <li><b>Light-table overlay</b> — lay two plates over one another with a slider, and copying, recutting, and mirroring become visible at a glance.</li>
+          <li><b>Woodblock tracing</b> — the same figure recurring across six later books is a genuine story this collection can tell, and no one has told it for herbals.</li>
+          <li><b>Marginalia index</b> — annotations, pressed plants, ownership inscriptions, and pen trials, gathered and page-linked.</li>
+          <li><b>A page-furniture explainer</b> — a viewer mode that labels catchwords, signatures, foliation and rubrication <i>on the actual page</i>, teaching book history in place.</li>
+        </ul>
+
+        <h3 class="sub">Finding your way in</h3>
+        <ul class="pts">
+          <li><b>Curated reading paths</b> — a sequence of pages with commentary: a lesson plan, an exhibition, and a fundraising asset at once.</li>
+          <li><b>Small exhibitions</b> — eight to twelve items with proper wall-label prose, rotated quarterly, with guest curators later.</li>
+          <li><b>Open a random page</b> — one button, optionally filtered to illustrated pages. The cheapest good idea on this list.</li>
+          <li><b>A weekly featured opening</b> — one spread and 150 words, archived so the back-run becomes a browsable trail of its own.</li>
+          <li><b>A timeline shelf and an imprint map</b> — the collection as five centuries of spines, and as a geography of where these books were printed, both straight from catalogue data.</li>
+        </ul>
+
+        <h3 class="sub">Taking it away</h3>
+        <ul class="pts">
+          <li><b>Pocket editions</b> — a clean e-book of a finished translation, every paragraph still carrying its page link.</li>
+          <li><b>Read-aloud audio</b> for translated text, with a checked pronunciation list for botanical names.</li>
+          <li><b>A properly accessible reading mode</b> — text-first for screen readers, large print, full keyboard navigation.</li>
+          <li>Later: a crowd-transcription desk, and a <b>&ldquo;cite this page&rdquo; widget</b> other sites can embed.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 6 -->
+    <section id="translations">
+      <div class="s-head" role="button" tabindex="0"><h2>6 &middot; Translations and living editions</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">Many of our foreign-language holdings have <b>never been translated into English at all</b> — not badly, never. This is the most quotable thing the library could do, and the hardest to sustain, so the machinery matters as much as the ambition.</p>
+
+        <h3 class="sub">What the reader sees</h3>
+        <ul class="pts">
+          <li><b>A three-column reader</b>: page image | transcription | English — each aligned to the others sentence by sentence, so clicking a line lights up its place on the page.</li>
+          <li><b>Machine drafts; a named human approves passage by passage</b>, and each passage shows its status, so a reader always knows what they are looking at.</li>
+          <li><b>More than one translation may coexist</b> — a literal rendering and a readable one serve different people, and pretending there is a single right answer is itself a distortion.</li>
+          <li><b>Uncertainty is printed, not hidden</b>: <i>disputed reading</i>, <i>illegible</i>, <i>conjectural</i> are honest states with a settled look on the page.</li>
+          <li><b>Living editions</b> — versioned like scholarly editions, correctable in public without erasing history, citable by version, contributors credited by name.</li>
+          <li>Reader corrections enter the same review queue as staff edits — <i>critics become contributors</i>.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 226" role="img" aria-label="The life of a translated passage: machine draft, review, approval, inclusion in a frozen release; and what happens when the underlying transcription changes.">
+            <rect x="0" y="24" width="118" height="38" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="59" y="41" text-anchor="middle">machine draft</text><text class="dg-s" x="59" y="55" text-anchor="middle">never public</text>
+            <path d="M124 43 h30" stroke="#6c7263" stroke-width="1.4"/><path d="M148 39 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="158" y="24" width="118" height="38" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="217" y="41" text-anchor="middle">under review</text><text class="dg-s" x="217" y="55" text-anchor="middle">named translator</text>
+            <path d="M282 43 h30" stroke="#6c7263" stroke-width="1.4"/><path d="M306 39 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="316" y="24" width="118" height="38" fill="#3f6b52"/>
+            <text class="dg-w" x="375" y="41" text-anchor="middle">approved</text><text class="dg-ws" x="375" y="55" text-anchor="middle">visible, labelled</text>
+            <path d="M440 43 h30" stroke="#6c7263" stroke-width="1.4"/><path d="M464 39 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="474" y="24" width="118" height="38" fill="#2c5240"/>
+            <text class="dg-w" x="533" y="41" text-anchor="middle">frozen release</text><text class="dg-ws" x="533" y="55" text-anchor="middle">citable for ever</text>
+
+            <path d="M375 66 v22 h-158 v-22" fill="none" stroke="#a5854a" stroke-width="1.4" stroke-dasharray="4 3"/>
+            <path d="M213 72 l4 -8 4 8z" fill="#a5854a"/>
+            <text class="dg-s" x="300" y="102">a correction sends the passage back &mdash; history is never erased</text>
+
+            <rect x="0" y="130" width="160" height="34" fill="#fffef9" stroke="#a5854a"/>
+            <text class="dg-t" x="80" y="151" text-anchor="middle">transcription changes</text>
+            <path d="M166 147 h40" stroke="#a5854a" stroke-width="1.4"/><path d="M200 143 l8 4 -8 4z" fill="#a5854a"/>
+            <rect x="210" y="130" width="180" height="34" fill="#f6e9c4" stroke="#a5854a"/>
+            <text class="dg-t" x="300" y="151" text-anchor="middle">dependent passages go stale</text>
+            <path d="M396 147 h40" stroke="#a5854a" stroke-width="1.4"/><path d="M430 143 l8 4 -8 4z" fill="#a5854a"/>
+            <rect x="440" y="130" width="200" height="34" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="540" y="151" text-anchor="middle">re-affirm or revise, with the diff</text>
+            <text class="dg-s" x="0" y="188">Nothing drifts unnoticed: if the source moves, everything built on it is marked until a person looks again.</text>
+            <text class="dg-s" x="0" y="208">Frozen releases are untouched by all of this &mdash; that is what makes a citation safe.</text>
+          </svg>
+          <figcaption>The life of a passage. The same machinery serves translation, transcription, and editorial notes, so there is one review queue rather than three.</figcaption>
+        </figure>
+
+        <h3 class="sub">The machinery that makes it sustainable</h3>
+        <ul class="pts">
+          <li><b>A term ledger per tradition</b> — Galenic, alchemical, Ayurvedic, Chinese materia medica each carry an agreed list of renderings, and a draft that departs from one is flagged before a human ever sees it.</li>
+          <li><b>Translation memory</b> — every approved passage is remembered, so the boilerplate that recurs across thousands of volumes (printers&rsquo; privileges, dedications, dosage formulae) is translated once and offered everywhere after.</li>
+          <li><b>Herbals copy each other heavily</b> — where a passage recurs almost verbatim in a later book, the approved translation arrives as a pre-filled draft marked <i>adapted from</i>, and needs only light review.</li>
+          <li><b>Changing a term updates the editions.</b> Revise an agreed rendering and every passage that used the old one is queued for a one-click mechanical update, so the ledger and the texts never drift apart.</li>
+          <li><b>The style guide runs as a check, not a memo</b> — keep original weights and measures with a bracketed modern equivalent; never modernise a disease name — enforced automatically on every draft.</li>
+          <li><b>A precedent registry</b>: <i>how we render X, and why</i>, searchable, so a new translator learns in one lookup that <i>theriaca</i> stays untranslated by earlier ruling.</li>
+          <li><b>Two independent renderings for anything dangerous</b> — recipes, doses, preparations — diffed automatically, with disagreements escalated before approval.</li>
+          <li><b>Occasional back-translation audits</b>: a monthly random sample is machine-translated back into the source language, and the divergent ones return to review as suspected drift.</li>
+          <li><b>The route is recorded.</b> A translation made through a pivot (Latin &rarr; 1546 German &rarr; English) says so on the page, and joins a standing list for direct retranslation.</li>
+          <li><b>Discussion becomes a footnote</b> — when a thread about a hard passage resolves, its conclusion is promoted to a reader-visible translator&rsquo;s note instead of being buried.</li>
+        </ul>
+
+        <h3 class="sub">People, credit, and momentum</h3>
+        <ul class="pts">
+          <li><b>Trial passages, not CVs</b> — applicants translate three calibrated samples scored against reference renderings, and earn badges per language and tradition that decide what they may draft or approve.</li>
+          <li><b>Every edition names a steward</b>, with a short handover packet of open questions and conventions, so an edition survives the departure of the person who began it.</li>
+          <li><b>Sampler first</b> — publish a translated contents page and one representative chapter, and let reader interest rank the backlog before committing to a whole volume.</li>
+          <li><b>Translation sprints</b> — a packaged weekend format (one work, pre-cut passages, glossary loaded, progress board) that reliably leaves an edition measurably nearer its next freeze.</li>
+          <li><b>An errata feed per edition</b>, and a <i>since your last visit</i> view that highlights what changed, with an old/new toggle.</li>
+          <li><b>Citations name the version</b>, resolve to exactly the text that was cited, and say plainly when the living edition has since moved on.</li>
+          <li>Later: <b>a printed volume from any frozen release</b>, with contributors in the front matter and the release number in the colophon; and <b>aligned read-aloud audio</b> that is flagged stale by the same machinery when its passage is revised.</li>
+        </ul>
+
+        <div class="full">
+          <p>This is also the honest answer to the word <i>World</i> in our name. The shelves today are mostly English and mostly Victorian, while extraordinary material sits freely available at major institutions. One Arabic herbal carries plant names in <b>nine languages</b> across some two thousand entries — a translation key in itself, and print-only to this day.</p>
+          <p>First targets: Egyptian medical papyri, the great Arabic herbals, the Aztec codex, Irish and Ethiopian medical manuscripts, Chinese and Ayurvedic materia medica. A flagship translation from each tradition would make this the place where the world&rsquo;s herbal knowledge can be read side by side. <b>Nobody has built that.</b></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 7 -->
+    <section id="index">
+      <div class="s-head" role="button" tabindex="0"><h2>7 &middot; The plant index</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">Stop organising knowledge only by book; start organising it by <i>what the books are about</i>. If we do one distinctive thing, this is it.</p>
+        <ul class="pts">
+          <li><b>Plant pages</b> — every occurrence of a species across all books and centuries, gathered in one place with each occurrence linked to its page.</li>
+          <li><b>All the names folded together</b> — <i>gentiana</i> in the 1518 Latin tract, &ldquo;gencyane&rdquo; in a medieval English hand, <i>Gentiana lutea</i> on Woodville&rsquo;s plate, &#40845;&#33086; in the Chinese materia medica.</li>
+          <li><b>Preparation pages</b> — a recipe&rsquo;s drift across time, e.g. compound tincture of gentian from the 1740s to the 1930s, laid out so the changes are visible without prose.</li>
+          <li><b>Person pages</b> — an author&rsquo;s works and the works citing them, doubling as the authority list the catalogue itself uses.</li>
+          <li>Occurrences are <b>found in real text, never inferred</b>; a match counts only once a person confirms it.</li>
+          <li>Build once, reuse everywhere: the comparison view, &ldquo;Ask&rdquo;, and most future features stand on this layer.</li>
+        </ul>
+
+        <h3 class="sub">The distinction that keeps it honest</h3>
+        <p class="lede">A word on a page, the thing its author meant, and a modern species are <b>three different things</b>. Collapsing them is the commonest error in this field, and it is how a historical library turns into a source of false botanical claims.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 210" role="img" aria-label="Three-step chain: the written form on the page, the historical concept the author meant, and one or more modern identifications with confidence levels.">
+            <rect x="0" y="16" width="176" height="46" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-l" x="10" y="31">WHAT IS WRITTEN</text>
+            <text class="dg-t" x="10" y="49" font-style="italic">&ldquo;gencyane&rdquo;, fol. 42r</text>
+            <path d="M182 39 h34" stroke="#6c7263" stroke-width="1.4"/><path d="M210 35 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="222" y="16" width="196" height="46" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-l" x="232" y="31">WHAT THE AUTHOR MEANT</text>
+            <text class="dg-t" x="232" y="49">a bitter root, English, c.1400</text>
+            <path d="M424 39 h34" stroke="#6c7263" stroke-width="1.4"/><path d="M452 35 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="464" y="6" width="196" height="30" fill="#3f6b52"/>
+            <text class="dg-w" x="474" y="25">Gentiana lutea</text><text class="dg-ws" x="618" y="25">likely</text>
+            <rect x="464" y="42" width="196" height="30" fill="#fffef9" stroke="#a5854a"/>
+            <text class="dg-t" x="474" y="61" font-style="italic">Gentiana amarella</text><text class="dg-s" x="613" y="61">possible</text>
+            <rect x="464" y="78" width="196" height="30" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="474" y="97">unresolved</text><text class="dg-s" x="600" y="97">also valid</text>
+
+            <rect x="0" y="128" width="660" height="1" fill="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="0" y="152">Each arrow carries: who proposed it, on what evidence, when, and how sure.</text>
+            <text class="dg-s" x="0" y="172">The chain is an editorial judgement with reasons attached &mdash; not a lookup, and not a fact about medicine.</text>
+            <text class="dg-s" x="0" y="192">&ldquo;We do not know&rdquo; is a publishable answer, and often the most accurate one.</text>
+          </svg>
+          <figcaption>Why this matters practically: a reader can disagree with a modern identification without disturbing the transcription, and a botanist&rsquo;s correction improves one link rather than rewriting the book.</figcaption>
+        </figure>
+
+        <ul class="pts">
+          <li><b>No reference index of historical remedy names exists anywhere</b> — not for plants, not for preparations. Projects that need one improvise privately, then abandon it.</li>
+          <li>Publishing ours openly, with the uncertainty intact, is <b>the contribution most likely to be cited, funded, and adopted by others</b> — and the one nobody can build faster than us, because it needs the books.</li>
+          <li>Seeding is cheaper than it sounds: one printed nine-language glossary of some two thousand entries, plus a free automated pass that finds botanical names in text we already hold.</li>
+          <li>Later: publish the index as data others can match their own terms against, and as printed cross-references to the great botanical authorities.</li>
+        </ul>
+
+        <div class="full">
+          <p>Someone asking about gentian would see five hundred years of answers, each linked to the page it came from. That is the difference between <i>a search engine</i> and <i>a reference work</i> — and no institution has built the latter for herbal medicine.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 8 -->
+    <section id="entity">
+      <div class="s-head" role="button" tabindex="0"><h2>8 &middot; The entity layer in detail</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">The technical companion to the previous section, for whoever builds this. The plant index is the visible product; <b>the entity layer is the machinery underneath it</b>, and almost every difficult decision in the whole project lives here.</p>
+
+        <h3 class="sub">8.1 &nbsp;What has to be represented</h3>
+        <p class="lede">Four distinct things, routinely collapsed into one by systems that later cannot be corrected.</p>
+        <ul class="pts">
+          <li><b>Name form</b> — a lexical string with its language, script, and period: <i>gencyane</i>, <i>gentiana</i>, <i>Enzian</i>, &#40845;&#33086;. A name form is not attached to any one book; it is the vocabulary the corpus uses.</li>
+          <li><b>Mention</b> — one occurrence of a name form at one place in one witness: this page, these coordinates, this character range, in this revision of the transcription.</li>
+          <li><b>Historical concept</b> — the drug, simple, or preparation an author appears to mean, <b>scoped to a tradition, a period, and a region</b>. The <i>gentiana</i> of a first-century Greek text and the <i>gentian</i> of an 1898 eclectic dispensatory are two concepts, however the modern identification falls out.</li>
+          <li><b>Modern referent</b> — a present-day taxon, a chemical substance, a material, or the honest value <b>unresolved</b>. This is a target of interpretation, never a property of the text.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 254" role="img" aria-label="Four-node model: name form, mention, historical concept, modern referent, with every connecting arrow reified as an assertion carrying author, evidence, confidence and review state.">
+            <rect x="0" y="18" width="146" height="50" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-l" x="10" y="33">NAME FORM</text>
+            <text class="dg-t" x="10" y="49" font-style="italic">&ldquo;gencyane&rdquo;</text>
+            <text class="dg-s" x="10" y="62">English, c.1400</text>
+            <path d="M152 43 h32" stroke="#6c7263" stroke-width="1.4"/><path d="M178 39 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="190" y="18" width="146" height="50" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-l" x="200" y="33">MENTION</text>
+            <text class="dg-t" x="200" y="49">fol. 42r, line 8</text>
+            <text class="dg-s" x="200" y="62">region + character range</text>
+            <path d="M342 43 h32" stroke="#a5854a" stroke-width="1.6"/><path d="M368 39 l8 4 -8 4z" fill="#a5854a"/>
+            <rect x="380" y="18" width="146" height="50" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-l" x="390" y="33">HISTORICAL CONCEPT</text>
+            <text class="dg-t" x="390" y="49">a bitter root</text>
+            <text class="dg-s" x="390" y="62">English herbals, c.1400</text>
+            <path d="M532 43 h32" stroke="#a5854a" stroke-width="1.6"/><path d="M558 39 l8 4 -8 4z" fill="#a5854a"/>
+            <rect x="570" y="18" width="90" height="50" fill="#3f6b52"/>
+            <text class="dg-w" x="580" y="36">REFERENT</text>
+            <text class="dg-ws" x="580" y="52" font-style="italic">G. lutea</text>
+            <text class="dg-ws" x="580" y="64">or unresolved</text>
+
+            <path d="M358 70 v22 h-40" fill="none" stroke="#a5854a" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <path d="M548 70 v22 h40" fill="none" stroke="#a5854a" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <rect x="150" y="104" width="400" height="86" fill="#f6e9c4" stroke="#a5854a"/>
+            <text class="dg-l" x="162" y="121">THE GOLD ARROWS ARE NOT LINKS &mdash; THEY ARE ASSERTIONS</text>
+            <text class="dg-s" x="162" y="140">who proposed it: a named person, or a model and its exact version</text>
+            <text class="dg-s" x="162" y="156">evidence: the quoted span, the page region, the reasoning</text>
+            <text class="dg-s" x="162" y="172">confidence, review state, and what earlier assertion it supersedes</text>
+            <text class="dg-s" x="0" y="214">One mention may carry several competing assertions at once. Rank them; do not resolve them.</text>
+            <text class="dg-s" x="0" y="234">The black arrow is mechanical. The gold arrows are scholarship, and must be argued with rather than overwritten.</text>
+          </svg>
+          <figcaption>The shape that makes correction cheap: disagree with an identification and you replace one assertion, leaving the transcription, the mention, and the concept untouched.</figcaption>
+        </figure>
+
+        <ul class="pts">
+          <li>The same treatment extends beyond plants to <b>preparation</b> (decoction, tincture, electuary), <b>process</b> (drying, calcining, distilling), <b>ailment and body part</b>, <b>measure and unit</b>, <b>person</b>, <b>place</b>, <b>quoted work</b>, and <b>illustration</b> — an illustration is a mention whose anchor is a region with no text at all.</li>
+          <li><b>A recipe is a structure, not a bag of entities.</b> An ingredient mention carries a quantity, a plant part, a preparation, and an order of operations; storing only &ldquo;this page mentions gentian&rdquo; throws away most of what the page says.</li>
+        </ul>
+
+        <h3 class="sub">8.2 &nbsp;Everything is an assertion</h3>
+        <ul class="pts">
+          <li>Model every link as <b>a row in its own right</b> — subject, predicate, object, plus author, evidence, confidence, review state, created-at, and superseded-by. A foreign key from mention to concept cannot hold any of that, and retrofitting it later means rewriting the whole layer.</li>
+          <li><b>Nothing is deleted.</b> A rejected identification is marked superseded and stays readable; that record is what lets a later editor see the argument rather than repeat it.</li>
+          <li><b>Confidence is a small controlled vocabulary, not a float.</b> Certain, likely, possible, disputed, unresolved. Invented decimals imply a precision nobody can defend, and reviewers cannot apply them consistently.</li>
+          <li><b>Competing assertions coexist.</b> The interface picks a default by rank and review state; the data never collapses to one answer. &ldquo;Two specialists disagree&rdquo; is a state the schema must be able to express.</li>
+          <li>Machine output enters as an assertion by a named model version, in state <i>proposed</i>, and is never promoted by another machine.</li>
+        </ul>
+
+        <h3 class="sub">8.3 &nbsp;Anchoring: how a mention stays attached</h3>
+        <p class="lede">Transcriptions get corrected. An anchor that depends only on character positions breaks on the first fix, and a layer that loses its anchors loses everything.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 208" role="img" aria-label="Three anchors stored per mention: page region coordinates, character offsets into a specific transcription revision, and the quoted string with its surrounding context. Only the offsets break when the transcription is corrected.">
+            <text class="dg-l" x="0" y="14">STORED WITH EVERY MENTION</text>
+            <rect x="0" y="22" width="206" height="60" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="12" y="41">1 &nbsp;region on the page</text>
+            <text class="dg-s" x="12" y="57">x, y, width, height</text>
+            <text class="dg-s" x="12" y="72">survives re-transcription</text>
+            <rect x="222" y="22" width="206" height="60" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="234" y="41">2 &nbsp;character range</text>
+            <text class="dg-s" x="234" y="57">start, end, revision id</text>
+            <text class="dg-s" x="234" y="72">breaks when text changes</text>
+            <rect x="444" y="22" width="216" height="60" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="456" y="41">3 &nbsp;quoted string</text>
+            <text class="dg-s" x="456" y="57">with 30 characters either side</text>
+            <text class="dg-s" x="456" y="72">re-finds itself after a fix</text>
+
+            <rect x="0" y="106" width="660" height="1" fill="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="0" y="130">A correction lands &rarr; anchor 2 is stale &rarr; re-match on 3 inside the box given by 1.</text>
+            <text class="dg-s" x="0" y="150">Unambiguous re-match: the anchor repairs itself and records that it did.</text>
+            <text class="dg-s" x="0" y="168">Ambiguous or absent: the mention is flagged for a person, never guessed.</text>
+            <text class="dg-s" x="0" y="192">The region is the anchor of last resort because the image is the only layer that never changes.</text>
+          </svg>
+          <figcaption>Three anchors, one purpose. This is also what lets a citation from &ldquo;Ask&rdquo; land on the right words after the page has been re-read by a better model.</figcaption>
+        </figure>
+
+        <h3 class="sub">8.4 &nbsp;Storage: relational first</h3>
+        <ul class="pts">
+          <li><b>A graph database is not required and should not be the starting point.</b> The queries this layer actually serves are two and three hops deep — mention to concept to referent, or concept to mentions to works — which is ordinary relational work. Variable-length path traversal over millions of edges is the case that justifies a graph engine, and it is not a case WHL has yet.</li>
+          <li><b>One database, with constraints.</b> The workbench needs transactions, uniqueness, and referential integrity far more than it needs exotic traversal. Adding a second engine doubles the operational surface for a project run by very few people.</li>
+          <li>Full-text and fuzzy matching belong in the same database: a trigram index over name forms answers &ldquo;what is this string close to&rdquo; without a separate service.</li>
+          <li><b>The public pages are built, not queried.</b> Entity pages are generated artefacts written out at publish time, so read performance never depends on the database. It serves the workbench and the build, nothing else.</li>
+        </ul>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Table</th><th>Holds</th><th>Notes that matter later</th></tr></thead>
+            <tbody>
+              <tr><td><b>name_form</b></td><td>string, language, script, period, normalised key</td><td>Trigram and phonetic indexes live here; the normalised key must be reversible to the original spelling</td></tr>
+              <tr><td><b>mention</b></td><td>witness, page, region, character range, revision, quoted string + context</td><td>The three anchors of 8.3; one row per occurrence, never deduplicated</td></tr>
+              <tr><td><b>concept</b></td><td>label, kind, tradition, period, region, scope note</td><td>Scope is part of identity &mdash; two traditions cannot share a concept row</td></tr>
+              <tr><td><b>referent</b></td><td>external authority, its identifier, cached label, retrieved-at</td><td>Cache the label for display; never treat the cache as the authority</td></tr>
+              <tr><td><b>assertion</b></td><td>subject, predicate, object, author, model version, confidence, state, superseded_by</td><td>The heart of the layer. Every gold arrow in 8.1 is a row here</td></tr>
+              <tr><td><b>evidence</b></td><td>assertion, quoted span, page anchor, free-text reasoning, external citation</td><td>Separate table because one assertion often rests on several passages</td></tr>
+              <tr><td><b>review</b></td><td>assertion, reviewer, decision, rationale, timestamp</td><td>Append-only; a reviewer who edits becomes the author of a new assertion</td></tr>
+              <tr><td><b>alias_of</b></td><td>name_form, concept, strength</td><td>Populated only from confirmed mentions &mdash; this is what the reconciliation service reads</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 class="sub">8.5 &nbsp;Finding candidates: matching before models</h3>
+        <ul class="pts">
+          <li><b>Start with a dictionary, not a model.</b> Exact and normalised matching against a curated name list is cheap, fully auditable, and reproducible &mdash; three properties a scholarly layer needs and a language model does not offer. Seed the list from the printed multilingual glossary and from a free automated pass that recognises botanical names in existing text.</li>
+          <li><b>Then widen recall deliberately.</b> Fuzzy string distance for spelling variation, phonetic keys for names transmitted by ear, and a model pass last, for the cases the list cannot anticipate. Record <i>which method proposed each candidate</i>; it is the only way to know later where recall is coming from.</li>
+          <li><b>Historical spelling and recognition error are different problems and must not be merged.</b> <i>Gencyane</i> is a period spelling; <i>gcncyane</i> is a misread <b>c</b> for <b>e</b>. Blur them and every recognition fault becomes a permanent lexicographical claim. Where our own text is uncertain, the mention should record that the underlying reading is provisional.</li>
+          <li><b>Normalisation is per language and period, and it is lossy.</b> Long <i>&#383;</i> to <i>s</i>, <i>u</i>/<i>v</i> and <i>i</i>/<i>j</i> interchange, ligature expansion, Arabic and Hebrew vowel pointing, transliteration schemes: all defensible, all destructive. Keep the original string in the mention and the normalised key beside it.</li>
+          <li><b>Candidates are proposals with a picture attached.</b> Every one enters the review queue carrying the image crop, so a reviewer confirms against the page rather than against our transcription of it.</li>
+        </ul>
+
+        <h3 class="sub">8.6 &nbsp;Telling concepts apart</h3>
+        <ul class="pts">
+          <li>The same string denotes different things across traditions and centuries; a single lookup table produces confident anachronism. <b>Disambiguation needs the passage&rsquo;s own context</b>: the language, the date of the witness, the section of the book, the ailment being treated, and above all the <b>co-occurring ingredients</b>, which are the strongest available signal in recipe literature.</li>
+          <li><b>Do not let identity travel.</b> If <i>A</i> is likely <i>B</i>, and <i>B</i> is likely <i>C</i>, it does not follow that <i>A</i> is <i>C</i>. Chaining likelihoods is how a plausible guess becomes a citable falsehood two hops from its evidence; the schema should refuse to compute transitive identity at all.</li>
+          <li><b>Resist popularity.</b> Both dictionary matching and language models drift toward the best-known taxon. Measure this directly: if the distribution of identifications is far narrower than the botanical literature for the period, the layer is guessing.</li>
+          <li><b>A concept may deserve to exist with no modern referent at all</b> &mdash; a compound whose composition is disputed, or a name whose plant is genuinely unknown. Those pages are among the most useful the index can publish, because they are where the open questions are.</li>
+        </ul>
+
+        <h3 class="sub">8.7 &nbsp;External authorities: link, never absorb</h3>
+        <ul class="pts">
+          <li>Store <b>the authority&rsquo;s own identifier, the date retrieved, and a cached display label</b> &mdash; nothing more. Copying their data makes us responsible for keeping it current, which we cannot do.</li>
+          <li><b>Modern taxonomic synonymy does not transfer to historical identity.</b> That two names are synonyms today says nothing about what a sixteenth-century author meant. Keep the two relationships in separate columns and never join them by accident.</li>
+          <li><b>Taxonomy changes; assertions must be re-validated by a person, never re-pointed on our behalf.</b> Record which snapshot an assertion was made against, and let a scheduled check raise the ones whose target has moved for a person to look at.</li>
+          <li>Some useful sources &mdash; a medicinal plant names service in particular &mdash; are available only by arrangement. That conversation should start early, because it shapes what the layer can link to.</li>
+        </ul>
+
+        <h3 class="sub">8.8 &nbsp;Publishing it as infrastructure</h3>
+        <ul class="pts">
+          <li><b>A stable, opaque identifier per concept</b>, resolvable as a web address, which never encodes the name. Names change; identifiers must not.</li>
+          <li><b>A reconciliation service</b>: send a historical string with optional language and date, receive ranked candidate concepts with scores and evidence links. This is the single feature that turns the index from a set of pages into something other projects build on, and it is a modest amount of work once the tables exist.</li>
+          <li><b>Bulk exports under an open licence</b>, versioned and checksummed: one file of concepts, one of name forms, one of assertions with their evidence. Publishing the assertions rather than the conclusions is what makes the dataset citable.</li>
+          <li><b>Crosswalk files</b> mapping our concepts to each external authority, one per target, regenerated on release &mdash; interoperability without adopting anybody&rsquo;s ontology.</li>
+          <li>Every published page and export states its release version, so a citation made today still resolves to what it said today.</li>
+        </ul>
+
+        <h3 class="sub">8.9 &nbsp;Measuring it honestly</h3>
+        <ul class="pts">
+          <li><b>Measure the stages separately</b>: did we find the mention, was the right concept among the candidates, did the top-ranked assertion turn out correct, and was the review decision itself sound.</li>
+          <li><b>Candidate recall matters more than top-one accuracy.</b> A reviewer can pick the right answer from five; nobody can pick an answer that was never proposed.</li>
+          <li><b>Score the preservation of ambiguity.</b> A system that always names one taxon will beat an honest one on naive accuracy while being worthless to a scholar. Where the gold set says <i>unresolved</i>, confidently resolving it is a <b>failure</b> and must be counted as one.</li>
+          <li>Build the gold set from published scholarship per tradition, and never let the same model that does the extraction also write the answers it is graded against.</li>
+        </ul>
+
+        <h3 class="sub">8.10 &nbsp;What goes wrong, and the guard against it</h3>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Failure</th><th>How it shows up</th><th>Guard</th></tr></thead>
+            <tbody>
+              <tr><td><b>Anachronism</b></td><td>A modern species asserted for a text that could not have meant it</td><td>Concepts scoped by tradition and period; date checks on every proposed referent</td></tr>
+              <tr><td><b>Transitive drift</b></td><td>Two likely links chained into a confident third</td><td>Never compute identity across hops; assertions link one pair only</td></tr>
+              <tr><td><b>Recognition error as vocabulary</b></td><td>A misread word becomes a recorded historical spelling</td><td>Mentions inherit the reading&rsquo;s confidence; low-confidence text cannot mint a name form</td></tr>
+              <tr><td><b>Popularity bias</b></td><td>Everything resolves to the famous species</td><td>Compare the distribution against the period literature; sample and audit</td></tr>
+              <tr><td><b>One-way doors</b></td><td>A modern name written into the transcription layer</td><td>Layers stay separate; interpretation never edits the text</td></tr>
+              <tr><td><b>Anchor rot</b></td><td>Mentions detach after a transcription is corrected</td><td>Three anchors per mention; re-match, and flag rather than guess</td></tr>
+              <tr><td><b>Confident emptiness</b></td><td>&ldquo;Unresolved&rdquo; treated as a gap to be filled</td><td>Unresolved is a publishable value with its own page and its own review state</td></tr>
+              <tr><td><b>Review debt</b></td><td>Millions of machine proposals nobody will ever confirm</td><td>Extract broadly, but only queue what a person will plausibly reach; rank by value</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 class="sub">8.11 &nbsp;Scale, and what to build first</h3>
+        <ul class="pts">
+          <li><b>The numbers are small for a database and large for people.</b> At roughly 1.3 million pages and a handful of mentions per page, expect single-digit millions of mentions &mdash; unremarkable for one ordinary database server, and far beyond what anyone will review. <b>The binding constraint is reviewer attention, so every design choice should be judged by how much of it the feature consumes.</b></li>
+          <li><b>Build in this order.</b> Name forms and mentions with their anchors, on one substance, in one tradition; then the review queue with image crops; then concepts with scope; then external links; then the reconciliation service and exports. Each step is useful on its own, and the first two are what everything else is measured against.</li>
+          <li><b>The pilot is the schema test.</b> One substance traced across languages and centuries will exercise scoping, competing assertions, unresolved cases, and re-anchoring within a few hundred mentions &mdash; cheaply enough that getting the model wrong is survivable.</li>
+        </ul>
+
+        <div class="full">
+          <p>A note on why this section is longer and drier than the rest of the document. Most of what is proposed elsewhere can be revised later at moderate cost: a reader can be redesigned, a page rebuilt, a translation improved. <b>The entity layer is the one part where an early shortcut becomes permanent</b> &mdash; if links are stored as plain foreign keys with no author or evidence, then a year of accumulated identifications cannot be argued with, audited, or undone, and the only remedy is to discard them.</p>
+          <p>The corresponding reassurance is that none of this is exotic. It is a handful of ordinary tables, one careful rule about what an arrow means, and the discipline to keep interpretation out of the text layer.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 8 -->
+    <section id="rights">
+      <div class="s-head" role="button" tabindex="0"><h2>9 &middot; Books we cannot publish</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">The line the courts have drawn is between <i>information about a book</i> (permitted) and <i>a substitute for reading it</i> (not). Three visible tiers, each with a plain-English reason printed on the page.</p>
+        <div class="tiers">
+          <div class="tier"><span class="tag t-open">Open</span><p>Public domain: read online, download, reuse freely. The great majority of the collection.</p></div>
+          <div class="tier"><span class="tag t-search">Search only</span><p>In copyright: full record, plus search that reports <i>where</i> a term appears without showing the text. Upheld by the courts; makes us a finding aid and sends readers to buy or borrow.</p></div>
+          <div class="tier"><span class="tag t-dark">Catalogue only</span><p>Preserved and described, nothing displayed — used where rights are unresolved, with a clear contact route for rights-holders.</p></div>
+        </div>
+        <ul class="pts">
+          <li><b>A documented rights decision per volume</b>, storing the rule it was decided under, so a yearly job can list the works graduating into the open tier each January.</li>
+          <li>Strict caps so no series of queries could reconstruct a work; a published takedown process and a registered contact.</li>
+          <li>Transparency here is a trust-builder, not an embarrassment — courts have explicitly credited that kind of good-faith apparatus.</li>
+        </ul>
+
+        <h3 class="sub">Ways to widen the open tier, lawfully</h3>
+        <ul class="pts">
+          <li><b>Check renewals.</b> A great many mid-century books were never renewed and are <i>already</i> public domain; the registers are public and searchable, and we already hold the dataset needed to do this in bulk.</li>
+          <li><b>Government publications</b> — agricultural bulletins, extension pamphlets, official pharmacopoeias — are frequently free of copyright regardless of date.</li>
+          <li><b>The last-twenty-years provision</b> lets a library display a work in the final stretch of its term after a documented check that it is not commercially available. It is genuinely underused.</li>
+          <li><b>Ask.</b> A one-page letter to estates and defunct publishers of long-out-of-print herbals, with every answer recorded on the record. The cost is postage.</li>
+          <li><b>Facts are not copyrighted.</b> Even for a dark work we may publish where a plant is mentioned, what a recipe&rsquo;s ingredients are, and how the book is structured — the index can know about a book it may not show.</li>
+          <li><b>Terms differ by country.</b> Recording both source-country and local status turns a single &ldquo;no&rdquo; into an accurate map of where a work is already free.</li>
+          <li><b>A public-domain-day queue</b> — scans staged to go live each first of January, turning expiry into a small annual occasion.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 9 -->
+    <section id="ask">
+      <div class="s-head" role="button" tabindex="0"><h2>10 &middot; &ldquo;Ask the Library&rdquo;</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <div class="callout"><b>The principle:</b> the library answers with <b>pages, not opinions</b>.</div>
+        <ul class="pts">
+          <li>A short synthesis, then <b>the actual passages</b> — quoted, attributed to book, volume and page, each linked to the scan and highlighted where the words sit.</li>
+          <li>Cross-language matching through the plant index, <b>with the mechanism stated</b>, so <i>gentian</i> finds <i>gentiana</i> and &#40845;&#33086; and the reader knows why.</li>
+          <li><b>Explicit abstention:</b> <i>&ldquo;the library is silent on this&rdquo;</i> rather than improvisation. This is a feature, and it should be visibly common.</li>
+          <li><b>Two manners, one engine.</b> A researcher&rsquo;s mode citing everything and showing disagreement; a general mode that explains first and keeps the sources one tap away.</li>
+          <li>For in-copyright books: citation, location, at most a brief attributed quotation, and a link to obtain the book.</li>
+          <li><b>Never health advice</b> — our founding rule, <i>preserve and educate, never prescribe</i>, binds the software too: no dose conversions, no modern claims, and a flag on toxic plants.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 176" role="img" aria-label="How an answer is built: question, find passages, check the evidence, then either answer with citations or abstain.">
+            <rect x="0" y="20" width="112" height="36" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="56" y="43" text-anchor="middle">a question</text>
+            <path d="M118 38 h26" stroke="#6c7263" stroke-width="1.4"/><path d="M138 34 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="150" y="20" width="150" height="36" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="225" y="38" text-anchor="middle">find real passages</text>
+            <text class="dg-s" x="225" y="51" text-anchor="middle">names, spellings, index</text>
+            <path d="M306 38 h26" stroke="#6c7263" stroke-width="1.4"/><path d="M326 34 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="338" y="20" width="150" height="36" fill="#f6e9c4" stroke="#a5854a"/>
+            <text class="dg-t" x="413" y="43" text-anchor="middle">enough evidence?</text>
+            <path d="M494 30 h26" stroke="#2c5240" stroke-width="1.4"/><path d="M514 26 l8 4 -8 4z" fill="#2c5240"/>
+            <rect x="526" y="4" width="134" height="32" fill="#2c5240"/>
+            <text class="dg-w" x="593" y="24" text-anchor="middle">answer + citations</text>
+            <path d="M494 48 h26" stroke="#5a5f56" stroke-width="1.4"/><path d="M514 44 l8 4 -8 4z" fill="#5a5f56"/>
+            <rect x="526" y="42" width="134" height="32" fill="#5a5f56"/>
+            <text class="dg-w" x="593" y="62" text-anchor="middle">&ldquo;the library is silent&rdquo;</text>
+
+            <rect x="0" y="100" width="660" height="1" fill="rgba(44,82,64,.22)"/>
+            <text class="dg-t" x="0" y="124">Every sentence that survives is one a quoted page supports.</text>
+            <text class="dg-s" x="0" y="144">Nothing is written from memory; nothing is written from a book the tier rules do not allow us to quote.</text>
+            <text class="dg-s" x="0" y="164">The same citation machinery highlights the words on the scan &mdash; the reader checks us in one click.</text>
+          </svg>
+          <figcaption>Answers are assembled from retrieved evidence, never recalled. If the passages are not there, the honest output is the grey box.</figcaption>
+        </figure>
+
+        <div class="full">
+          <p>Done this way it is not a chatbot bolted onto a library. It is <b>a research assistant that can read five centuries of material in a dozen languages and always shows its work</b>.</p>
+          <p>One caution we should state publicly rather than discover: a citation proves the sentence matches <i>our transcription</i> of the page, and our transcription can be wrong. That is exactly why the citation opens the image — the scan, not the text, is the evidence of last resort.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 10 -->
+    <section id="ai">
+      <div class="s-head" role="button" tabindex="0"><h2>11 &middot; AI &mdash; the decision we need</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <ul class="pts">
+          <li><b>Appropriate:</b> text recognition, translation drafting, entity extraction into review queues, error flagging, retrieval — all behind human review. <i>This is what lets a handful of colleagues work at institutional scale.</i></li>
+          <li><b>Not appropriate:</b> generated content presented as description or scholarship. Some current descriptions were written from titles alone; one describes a fourteenth-century Italian manuscript as though it were a modern wellness paperback — fluent, and almost entirely untrue.</li>
+          <li><b>Rule 1 — AI may draft; only named people publish.</b></li>
+          <li><b>Rule 2 — nothing speaks for the library that cannot cite a page;</b> silence is stated, not filled.</li>
+          <li><b>Rule 3 — AI is a cost of care, not a revenue strategy.</b> The library stays free, unadvertised, and unsold.</li>
+        </ul>
+
+        <h3 class="sub">What we already know goes wrong</h3>
+        <ul class="pts">
+          <li><b>Blank pages produce confident nonsense.</b> Our current recognition invents text on every blank leaf — mathematics, boilerplate in the wrong language, internal debris. Cheap filters must run before any of it is indexed.</li>
+          <li><b>Fluent fabrication on damaged pages</b> is worse than failure, because it reads correctly. Degraded material must be quarantined for human eyes, not passed through.</li>
+          <li><b>Silent tidying is a form of error</b> — printed typos corrected, struck-out words flattened into contradictions. A faithful transcription must preserve what is actually there.</li>
+          <li><b>An empty page once produced a complete fabricated record</b> in a related system. Every extraction step needs the right to say <i>nothing here</i>, and to be believed when it does.</li>
+          <li><b>Non-Latin scripts are far weaker</b> — roughly half the characters wrong on Chinese title pages. Any translation programme must name a tested recognition path per script, or plan for human transcription from the start.</li>
+        </ul>
+
+        <div class="full">
+          <p>One medievalist finding that manuscript description learns not that one entry is wrong, but that <b>nothing here can be trusted unchecked</b>. Fluent falsehood is the fastest way to lose the credibility everything else depends on.</p>
+          <p>Handled properly, though, AI is not a corner cut. It is the reason a small team can meet an institution&rsquo;s standards while those standards remain entirely human.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 11 -->
+    <section id="workbench">
+      <div class="s-head" role="button" tabindex="0"><h2>12 &middot; The workbench behind the site</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">The public site is the easy half. What decides whether this survives contact with real work is the <b>editing surface</b>: how a change is proposed, reviewed, published, and undone. Much of this exists already in the desktop cataloguing tools and needs promoting, not inventing.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 208" role="img" aria-label="The editorial loop: sources propose changes, a reviewer approves, the site rebuilds, and readers can propose corrections that re-enter the same queue.">
+            <rect x="0" y="16" width="128" height="72" fill="#fffef9" stroke="rgba(44,82,64,.22)"/>
+            <text class="dg-l" x="10" y="32">PROPOSALS FROM</text>
+            <text class="dg-s" x="10" y="50">machine drafts</text>
+            <text class="dg-s" x="10" y="66">volunteers &amp; staff</text>
+            <text class="dg-s" x="10" y="82">reader corrections</text>
+            <path d="M134 52 h34" stroke="#6c7263" stroke-width="1.4"/><path d="M162 48 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="174" y="16" width="150" height="72" fill="#f6e9c4" stroke="#a5854a"/>
+            <text class="dg-t" x="249" y="42" text-anchor="middle">one review queue</text>
+            <text class="dg-s" x="249" y="60" text-anchor="middle">field-by-field diff,</text>
+            <text class="dg-s" x="249" y="76" text-anchor="middle">evidence attached</text>
+            <path d="M330 52 h34" stroke="#6c7263" stroke-width="1.4"/><path d="M358 48 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="370" y="16" width="140" height="72" fill="#3f6b52"/>
+            <text class="dg-w" x="440" y="42" text-anchor="middle">approved</text>
+            <text class="dg-ws" x="440" y="60" text-anchor="middle">by a named person,</text>
+            <text class="dg-ws" x="440" y="76" text-anchor="middle">never self-approved</text>
+            <path d="M516 52 h34" stroke="#6c7263" stroke-width="1.4"/><path d="M544 48 l8 4 -8 4z" fill="#6c7263"/>
+            <rect x="556" y="16" width="104" height="72" fill="#2c5240"/>
+            <text class="dg-w" x="608" y="46" text-anchor="middle">site rebuilds</text>
+            <text class="dg-ws" x="608" y="64" text-anchor="middle">checked first</text>
+
+            <path d="M608 92 v28 h-544 v-28" fill="none" stroke="#a5854a" stroke-width="1.4" stroke-dasharray="4 3"/>
+            <path d="M60 98 l4 -8 4 8z" fill="#a5854a"/>
+            <text class="dg-s" x="330" y="136" text-anchor="middle">every published page invites a correction, which re-enters the same queue</text>
+            <text class="dg-s" x="0" y="170">One queue for catalogue fields, transcriptions, translations, notes and exhibition prose.</text>
+            <text class="dg-s" x="0" y="190">Nothing reaches the public site except through it &mdash; the build itself refuses under-reviewed material.</text>
+          </svg>
+          <figcaption>One loop, not five. The discipline that makes the library trustworthy is the same discipline that makes it maintainable by very few people.</figcaption>
+        </figure>
+
+        <h3 class="sub">Editing safely</h3>
+        <ul class="pts">
+          <li><b>Named changesets</b> — a bulk edit previews every affected record, applies as one named bundle, and reverts in a single click. A bad sweep across 400 records is <i>one</i> undo, not four hundred.</li>
+          <li><b>Field-level provenance</b> — hover any value to see where it came from: which page of the scan, which dealer record, which named human, with a link to jump there.</li>
+          <li><b>Preview builds per proposal</b> — reviewers judge the rendered page at a private address, not a raw list of field changes.</li>
+          <li><b>Cross-layer flags</b> — approving a transcription change automatically marks the translations that depend on it for re-review, with the exact difference attached.</li>
+          <li><b>A build that refuses to ship bad work</b> — any page containing material below that section&rsquo;s required review level simply does not publish. Machine drafts cannot leak through a template mistake.</li>
+        </ul>
+
+        <h3 class="sub">Publishing and prose</h3>
+        <ul class="pts">
+          <li><b>A block kit for exhibitions</b> — plate-with-caption, timeline entry, quotation-with-citation, compare-two-editions — assembled by choosing catalogue entries rather than writing free-form markup, so every citation is real and checkable.</li>
+          <li><b>A house-style check on our own prose</b> — flags prescriptive medical phrasing (<i>treats</i>, <i>cures</i>, dosages) at save time, enforcing <i>preserve and educate, never prescribe</i> mechanically rather than by memory.</li>
+          <li><b>Scheduled publication</b> — an approved change can simply carry a go-live date; no separate scheduling system is needed.</li>
+          <li><b>A calendar seeded from the catalogue</b> — anniversaries, author dates, and seasonal plants suggest features months ahead, so the front page never depends on remembering.</li>
+          <li><b>A generated &ldquo;what improved&rdquo; feed</b>, built from approved changes with cosmetic edits filtered out — proof the library is alive rather than a static shelf.</li>
+        </ul>
+
+        <h3 class="sub">Keeping the site honest</h3>
+        <ul class="pts">
+          <li><b>A pre-publish crawl</b> that checks every internal link, image and citation anchor resolves, and fails loudly instead of shipping quiet dead ends.</li>
+          <li><b>A redirect ledger</b> — merging or renaming a work writes a permanent redirect automatically, so <i>no address we ever published returns nothing</i>. Given 235 already-broken links, this is not hypothetical.</li>
+          <li><b>A staleness dashboard</b> — records ranked by how long since a human verified them, weighted by how often readers actually land there.</li>
+          <li><b>A coverage grid</b> — works by stage (scanned, recognised, transcribed, reviewed, translated), making the long tail visible instead of theoretical.</li>
+          <li><b>Plain-English change digests</b> — the history rendered nightly as readable sentences (<i>&ldquo;imprint date corrected from title-page evidence, p. 3&rdquo;</i>), so a week of changes can be skimmed over coffee.</li>
+          <li><b>Template fixtures</b> — every page design rendered against our worst records (longest title, no author, mixed scripts, no plates) before a real one finds the breakage.</li>
+          <li><b>An orphan report</b> — files with no record, records with no files, pages nothing links to.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 12 -->
+    <section id="intake">
+      <div class="s-head" role="button" tabindex="0"><h2>13 &middot; Adding new books</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">Every defect in section one entered through an intake that asked too little. The remedy is a single guided path from arrival to live record, with <b>hard stops where policy matters</b> — and it reuses tools we already have, including the phone capture app and the box labels.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 132" role="img" aria-label="Intake pipeline: arrival, fingerprint check, rights and source checklist, recognition, draft record, review, live.">
+            <g>
+              <rect x="0" y="26" width="86" height="34" fill="#fffef9" stroke="rgba(44,82,64,.22)"/><text class="dg-t" x="43" y="47" text-anchor="middle">arrives</text>
+              <rect x="96" y="26" width="96" height="34" fill="#fffef9" stroke="rgba(44,82,64,.22)"/><text class="dg-t" x="144" y="47" text-anchor="middle">fingerprint</text>
+              <rect x="202" y="26" width="112" height="34" fill="#f6e9c4" stroke="#a5854a"/><text class="dg-t" x="258" y="47" text-anchor="middle">rights + source</text>
+              <rect x="324" y="26" width="96" height="34" fill="#fffef9" stroke="rgba(44,82,64,.22)"/><text class="dg-t" x="372" y="47" text-anchor="middle">recognition</text>
+              <rect x="430" y="26" width="96" height="34" fill="#fffef9" stroke="rgba(44,82,64,.22)"/><text class="dg-t" x="478" y="47" text-anchor="middle">draft record</text>
+              <rect x="536" y="26" width="124" height="34" fill="#2c5240"/><text class="dg-w" x="598" y="47" text-anchor="middle">review &rarr; live</text>
+            </g>
+            <path d="M88 43 h6M194 43 h6M316 43 h6M422 43 h6M528 43 h6" stroke="#6c7263" stroke-width="1.4"/>
+            <path d="M144 62 v14" stroke="#5a5f56" stroke-width="1.2" stroke-dasharray="3 3"/>
+            <text class="dg-s" x="100" y="90">already held &rarr;</text><text class="dg-s" x="100" y="106">attach as another copy</text>
+            <path d="M258 62 v14" stroke="#a5854a" stroke-width="1.2" stroke-dasharray="3 3"/>
+            <text class="dg-s" x="330" y="90">blank rights or unknown source</text><text class="dg-s" x="330" y="106">stops the book here &mdash; by design</text>
+          </svg>
+          <figcaption>The two gates that would have prevented most of what section one describes: a fingerprint check, and a rights-and-source question that cannot be skipped.</figcaption>
+        </figure>
+
+        <ul class="pts">
+          <li><b>A fingerprint check before anything else</b> — a file already held becomes <i>another copy of a known work</i>, not a new entry. This attacks the 487 duplicate published entries — and the 256 more sitting in draft — at the source.</li>
+          <li><b>An accession number minted on arrival</b>, before cataloguing, so nothing can sit in storage untracked.</li>
+          <li><b>An intake wizard with hard stops</b> — it will not advance while rights status or source is blank. Policy becomes the shape of the form.</li>
+          <li><b>Bulk pre-fill by external catalogue number</b>, always landing in the review queue and <i>never</i> publishing unattended — outside metadata is often poor and must be hand-picked.</li>
+          <li><b>A guided merge</b> when a twin is found: the new scan attaches under the existing work as a copy, with its own notes, rather than a rewrite.</li>
+          <li><b>A scan-quality check before recognition</b> — resolution, blur, skew, page count — so we never spend recognition effort on a scan that must be redone.</li>
+          <li><b>A standard five-shot condition record</b> (binding, spine, title page, worst damage, text block) taken with the phone app we already have, stored as evidence about the copy.</li>
+          <li><b>Box labels that report progress</b> — scanning a box shows each book&rsquo;s stage in place, extending the QR feature already shipped from <i>what is here</i> to <i>how far along is it</i>.</li>
+          <li><b>A public per-book progress page</b> (received &rarr; scanned &rarr; recognised &rarr; drafted &rarr; reviewed &rarr; live) — the internal worklist and the donor&rsquo;s view are the same page.</li>
+          <li><b>A provisional shelf record</b> — accession number, fingerprint, one photograph, clearly marked unverified — so the backlog is visible and referenceable without lowering the catalogue&rsquo;s standard. <i>The 971 entries already sitting in draft are the first candidates:</i> most need an author, a year and a subject before they can go live, and a queue that shows exactly which field is missing turns that from a vague backlog into a countable job.</li>
+          <li><b>A priority score</b> for the queue: rarity, rights openness, gaps in the plant index, reader requests — recomputed nightly, instead of first-in-first-out.</li>
+          <li><b>A re-recognition campaign manager</b> — batch re-runs write only into the machine layer and produce a difference report; <b>human-approved readings are never overwritten</b>.</li>
+          <li><b>A wants list, published</b> — the editions we seek, with condition notes, so donors and partner collections can match their shelves against ours.</li>
+          <li><b>A deed-of-gift flow</b> for donations, binding the gift record to the book&rsquo;s provenance and crediting the donor by name on the live record if they wish.</li>
+          <li><b>Partner scans accepted only with a manifest</b> — scanner, date, source shelf-mark, licence — preserved verbatim as copy-level provenance.</li>
+          <li><b>A weekly orphan sweep</b>: files with no record, records with no file. Intake mistakes surface in days, not at the next migration.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 13 -->
+    <section id="sequence">
+      <div class="s-head" role="button" tabindex="0"><h2>14 &middot; The roadmap</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">Each phase ships something usable on its own — <b>no big bang, no gamble</b>. If work stopped at the end of any phase, the library would still be better than it is today. Select a phase to see what lands.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 660 176" role="img" aria-label="Roadmap: four phases from immediate reader fixes through the catalogue platform and search to the distinctive plant index and translation work.">
+            <rect x="0" y="34" width="660" height="4" fill="#eef0e4"/>
+            <g>
+              <circle cx="70" cy="36" r="9" fill="#2c5240"/><text class="dg-w" x="70" y="40" text-anchor="middle">1</text>
+              <circle cx="240" cy="36" r="9" fill="#3f6b52"/><text class="dg-w" x="240" y="40" text-anchor="middle">2</text>
+              <circle cx="420" cy="36" r="9" fill="#a5854a"/><text class="dg-w" x="420" y="40" text-anchor="middle">3</text>
+              <circle cx="590" cy="36" r="9" fill="#5a5f56"/><text class="dg-w" x="590" y="40" text-anchor="middle">4</text>
+            </g>
+            <text class="dg-t" x="70" y="66" text-anchor="middle">the reader</text>
+            <text class="dg-t" x="240" y="66" text-anchor="middle">the catalogue</text>
+            <text class="dg-t" x="420" y="66" text-anchor="middle">search &amp; depth</text>
+            <text class="dg-t" x="590" y="66" text-anchor="middle">the distinctive work</text>
+            <text class="dg-s" x="70" y="84" text-anchor="middle">books open instantly;</text><text class="dg-s" x="70" y="99" text-anchor="middle">pages can be cited</text>
+            <text class="dg-s" x="240" y="84" text-anchor="middle">records that fit</text><text class="dg-s" x="240" y="99" text-anchor="middle">the books we hold</text>
+            <text class="dg-s" x="420" y="84" text-anchor="middle">find a word inside</text><text class="dg-s" x="420" y="99" text-anchor="middle">five centuries</text>
+            <text class="dg-s" x="590" y="84" text-anchor="middle">plant index,</text><text class="dg-s" x="590" y="99" text-anchor="middle">translations, Ask</text>
+            <rect x="0" y="122" width="660" height="1" fill="rgba(44,82,64,.22)"/>
+            <text class="dg-s" x="0" y="144">Each phase depends on the one before it: citation needs page addresses; the index needs citation; Ask needs the index.</text>
+            <text class="dg-s" x="0" y="164">Nothing here requires the whole plan to be finished, or funded, before the first improvement reaches a reader.</text>
+          </svg>
+          <figcaption>The order is not a preference; it is a dependency chain. Building the distinctive work first would mean building it twice.</figcaption>
+        </figure>
+
+        <div class="phases" role="tablist" aria-label="Phases">
+          <button class="phase" role="tab" aria-selected="true" data-phase="1"><b>Phase 1</b><span>The reader &middot; weeks</span></button>
+          <button class="phase" role="tab" aria-selected="false" data-phase="2"><b>Phase 2</b><span>The catalogue platform</span></button>
+          <button class="phase" role="tab" aria-selected="false" data-phase="3"><b>Phase 3</b><span>Search and depth</span></button>
+          <button class="phase" role="tab" aria-selected="false" data-phase="4"><b>Phase 4</b><span>The distinctive work</span></button>
+        </div>
+        <div class="phasebody" id="phasebody"></div>
+
+        <h3 class="sub">What we deliberately do <i>not</i> do first</h3>
+        <ul class="pts">
+          <li><b>A volunteer platform before there are volunteers.</b> The first ten contributors need a queue and a named reviewer, not a governance system.</li>
+          <li><b>A finished translation before a sampler.</b> One chapter, published, tells us more about demand than a year of committee.</li>
+          <li><b>Perfect records before any records.</b> Migration first, improvement as reviewable tasks after — otherwise nothing ships.</li>
+          <li><b>An assistant before an index.</b> Ask over a collection with no page addresses is a demonstration, not a service.</li>
+        </ul>
+
+        <div class="full">
+          <p>A note on cost, since it is usually the unasked question. The heavy machine work — recognising, extracting, summarising across the whole collection — is a <b>one-off in the low thousands</b>, not a subscription. Serving questions afterwards is <b>tens of dollars a month</b> at any traffic this library is likely to see. The real budget is human: reviewing, translating, and deciding. That is why every proposal above is judged first by how much reviewer time it consumes.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 14 -->
+    <section id="alive">
+      <div class="s-head" role="button" tabindex="0"><h2>15 &middot; Keeping it alive</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">A library that promises permanent citations is making a promise measured in decades. These are cheap now and impossible to retrofit.</p>
+        <ul class="pts">
+          <li><b>Deposit every frozen release with an independent archive</b> that issues permanent identifiers. If this project ended tomorrow, the citations would still resolve. Nothing else on this page buys as much credibility for as little.</li>
+          <li><b>Three copies, two kinds of storage, one off-site</b> — with fingerprints checked on a schedule rather than assumed.</li>
+          <li><b>A static fallback</b>: the whole public site can render to plain files, so it can outlive its servers, its software, and its budget.</li>
+          <li><b>Name the body that holds the rights</b> before asking any contributor to sign anything, and license our own work so a successor could carry it on without hunting for permission.</li>
+          <li><b>Publish the annual keep-alive cost</b>, with a fund that could cover a decade. A concrete number is more persuasive than any statement of intent.</li>
+          <li><b>Record contributors by a stable internal key</b>, with names attached separately, so credit can be shown, changed, or withdrawn without rewriting history.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 15 -->
+    <section id="board">
+      <div class="s-head" role="button" tabindex="0"><h2>16 &middot; Idea board</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <p class="lede">Further ideas to weigh. Mark each <b>Yes / Maybe / No</b> — choices are kept in this browser, and &ldquo;Copy shortlist&rdquo; puts the result on your clipboard for pasting into an email.</p>
+        <div class="boardbar">
+          <button class="chip" data-cat="all" aria-pressed="true">All</button>
+          <button class="chip" data-cat="Programme" aria-pressed="false">Programme</button>
+          <button class="chip" data-cat="Reader" aria-pressed="false">Reader</button>
+          <button class="chip" data-cat="Outreach" aria-pressed="false">Outreach</button>
+          <button class="chip" data-cat="Data" aria-pressed="false">Data</button>
+          <button class="chip" data-cat="Support" aria-pressed="false">Support</button>
+          <button class="tbtn" id="copyshort" style="background:var(--green);color:#fff">Copy shortlist</button>
+          <button class="tbtn" id="resetvotes" style="background:transparent;color:var(--mut);border:1px solid var(--hair)">Reset</button>
+          <span class="tally" id="tally"></span>
+        </div>
+        <div class="ideas" id="ideas"></div>
+      </div>
+    </section>
+
+    <!-- 16 -->
+    <section id="questions">
+      <div class="s-head" role="button" tabindex="0"><h2>17 &middot; Open questions</h2><span class="chev">&#9660;</span></div>
+      <div class="s-body">
+        <ul class="pts">
+          <li>Which tradition leads the translation programme — and <b>who is the first specialist we ask</b>?</li>
+          <li>Is search-only treatment of in-copyright books acceptable to the founders — <i>including their own works</i>?</li>
+          <li>How much of the volunteer programme opens publicly, and how much stays by invitation?</li>
+          <li>Do we adopt the three AI rules as stated project policy?</li>
+          <li><b>What becomes of the existing &ldquo;AI Search&rdquo;</b> — do we retire it, redirect it, or adopt it — and who has the access to do so?</li>
+          <li>Are we prepared to <b>re-acquire scans from their original digitisers</b> where our copies are compressed derivatives with no provenance?</li>
+          <li>Which phase-one date do we commit to, and who owns it?</li>
+        </ul>
+      </div>
+    </section>
+
+    <p class="nores" id="nores">No points match that filter.</p>
+  </main>
+</div>
+
+<!-- ===== annotation furniture ===== -->
+<div class="annobar" id="annobar" role="region" aria-label="Annotate selection">
+  <div class="ab-in">
+    <div class="ab-ex" id="abEx"><b>Selected</b><span></span></div>
+    <div class="ab-row" id="abRow">
+      <button class="ab-t" data-t="good"><u>G</u> Good idea</button>
+      <button class="ab-t" data-t="relevant"><u>R</u> Relevant</button>
+      <button class="ab-t" data-t="weak"><u>W</u> Weak idea</button>
+      <button class="ab-t" data-t="miss"><u>M</u> Missing the point</button>
+      <button class="ab-t" data-t="nrel"><u>N</u> Not relevant</button>
+      <button class="ab-t" data-t="ai"><u>I</u> Reads like AI</button>
+      <button class="ab-t" data-t="prune"><u>P</u> Prune</button>
+      <button class="ab-t" data-t="expand"><u>E</u> Needs expansion</button>
+      <button class="ab-t" data-t="brain"><u>B</u> Keep brainstorming</button>
+      <span class="ab-sp">
+        <button class="ab-min" id="abComment">Comment <span style="opacity:.6">C</span></button>
+        <button class="ab-min" id="abClear">Clear <span style="opacity:.6">X</span></button>
+        <button class="ab-min" id="abHelp">?</button>
+        <button class="ab-min" id="abClose">Done <span style="opacity:.6">Esc</span></button>
+      </span>
+    </div>
+    <div class="ab-note">
+      <textarea id="abText" placeholder="Comment on this point&hellip; (Ctrl+Enter to save)" aria-label="Comment"></textarea>
+      <button class="ab-min" id="abSave" style="align-self:flex-start">Save</button>
+    </div>
+  </div>
+</div>
+
+<aside class="annodraw" id="annodraw" aria-label="All annotations">
+  <header><b>Annotations</b><button class="ab-min" id="adClose" style="color:#eef2e8;border-color:rgba(238,242,232,.4)">Close</button></header>
+  <div class="adbody" id="adBody"></div>
+  <footer>
+    <button class="adbtn pri" id="adCopy">Copy for Claude</button>
+    <button class="adbtn" id="adJson">Download JSON</button>
+    <button class="adbtn" id="adImport">Import</button>
+    <button class="adbtn" id="adClear">Clear all</button>
+    <input type="file" id="adFile" accept="application/json" style="display:none">
+  </footer>
+</aside>
+
+<div class="annohelp" id="annohelp">
+  <div class="hh">
+    <h3>Annotating this document</h3>
+    <p style="font-size:13.5px;color:var(--mut);margin:0 0 12px">
+      Click any bullet, paragraph, table row, or idea card to select it, then press a key. Everything is saved in this browser;
+      <b>Copy for Claude</b> in the Notes panel produces the feedback list to paste back.</p>
+    <table>
+      <tr><td><kbd>G</kbd></td><td>Good idea</td><td><kbd>J</kbd> / <kbd>&darr;</kbd></td><td>Next point</td></tr>
+      <tr><td><kbd>R</kbd></td><td>Relevant</td><td><kbd>K</kbd> / <kbd>&uarr;</kbd></td><td>Previous point</td></tr>
+      <tr><td><kbd>W</kbd></td><td>Weak idea</td><td><kbd>C</kbd></td><td>Comment</td></tr>
+      <tr><td><kbd>M</kbd></td><td>Missing the point</td><td><kbd>X</kbd></td><td>Clear tag</td></tr>
+      <tr><td><kbd>N</kbd></td><td>Not relevant</td><td><kbd>A</kbd></td><td>Open Notes panel</td></tr>
+      <tr><td><kbd>I</kbd></td><td>Reads like AI</td><td><kbd>Esc</kbd></td><td>Deselect</td></tr>
+      <tr><td><kbd>P</kbd></td><td>Prune</td><td><kbd>?</kbd></td><td>This list</td></tr>
+      <tr><td><kbd>E</kbd></td><td>Needs expansion</td><td></td><td></td></tr>
+      <tr><td><kbd>B</kbd></td><td>Keep brainstorming</td><td></td><td></td></tr>
+    </table>
+    <div style="margin-top:14px"><button class="adbtn pri" id="hhClose">Got it</button></div>
+  </div>
+</div>
+
+<footer class="pagefoot">
+  <div>World Herb Library working document &middot; prepared August 2026 &middot; <span id="stamp"></span> &middot; mock-ups and the full audits are available separately.</div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ---------- view toggle ---------- */
+  var vb=document.getElementById('v-brief'), vf=document.getElementById('v-full');
+  function setView(full){
+    document.body.classList.toggle('view-full',full);
+    document.body.classList.toggle('view-brief',!full);
+    vb.setAttribute('aria-pressed',String(!full));
+    vf.setAttribute('aria-pressed',String(full));
+    try{localStorage.setItem('whl.view',full?'full':'brief');}catch(e){}
+  }
+  vb.addEventListener('click',function(){setView(false);});
+  vf.addEventListener('click',function(){setView(true);});
+  try{ if(localStorage.getItem('whl.view')==='full') setView(true); }catch(e){}
+
+  /* ---------- collapsible sections ---------- */
+  var sections=[].slice.call(document.querySelectorAll('section'));
+  sections.forEach(function(s){
+    var head=s.querySelector('.s-head');
+    function toggle(){ s.classList.toggle('collapsed'); }
+    head.addEventListener('click',toggle);
+    head.addEventListener('keydown',function(e){
+      if(e.key==='Enter'||e.key===' '){ e.preventDefault(); toggle(); }
+    });
+  });
+  var allBtn=document.getElementById('toggleall');
+  allBtn.addEventListener('click',function(){
+    var anyOpen=sections.some(function(s){return !s.classList.contains('collapsed');});
+    sections.forEach(function(s){ s.classList.toggle('collapsed',anyOpen); });
+    allBtn.textContent=anyOpen?'Expand all':'Collapse all';
+  });
+
+  document.getElementById('printbtn').addEventListener('click',function(){window.print();});
+
+  /* ---------- filter ---------- */
+  var filter=document.getElementById('filter'), nores=document.getElementById('nores');
+  function runFilter(){
+    var q=filter.value.trim().toLowerCase();
+    document.body.classList.toggle('filtering',q.length>0);
+    var hits=0;
+    sections.forEach(function(s){
+      if(s.id==='board'){
+        var vis=0;
+        [].forEach.call(s.querySelectorAll('.idea'),function(card){
+          var match=!q||card.textContent.toLowerCase().indexOf(q)>-1;
+          card.classList.toggle('searchhide',!match);
+          card.classList.toggle('hide',!match||card.dataset.catHidden==='1');
+          if(match) vis++;
+        });
+        s.style.display=(q&&vis===0)?'none':'';
+        hits+=vis;
+        return;
+      }
+      var items=[].slice.call(s.querySelectorAll('ul.pts li, .tier, table tbody tr, .stat'));
+      var shown=0;
+      items.forEach(function(li){
+        var match=!q||li.textContent.toLowerCase().indexOf(q)>-1;
+        li.style.display=match?'':'none';
+        if(match) shown++;
+      });
+      var headMatch=!q||s.querySelector('h2').textContent.toLowerCase().indexOf(q)>-1;
+      s.style.display=(q && shown===0 && !headMatch)?'none':'';
+      if(shown||headMatch) hits+=shown;
+      if(q) s.classList.remove('collapsed');
+    });
+    nores.classList.toggle('show',!!q&&hits===0);
+  }
+  filter.addEventListener('input',runFilter);
+  document.getElementById('fclear').addEventListener('click',function(){filter.value='';runFilter();filter.focus();});
+
+  /* ---------- scrollspy ---------- */
+  var links=[].slice.call(document.querySelectorAll('nav.toc a'));
+  var spy=new IntersectionObserver(function(entries){
+    entries.forEach(function(en){
+      if(en.isIntersecting){
+        links.forEach(function(a){ a.classList.toggle('active', a.getAttribute('href')==='#'+en.target.id); });
+      }
+    });
+  },{rootMargin:'-20% 0px -70% 0px'});
+  sections.forEach(function(s){ spy.observe(s); });
+
+  /* ---------- phases ---------- */
+  var PHASES={
+    1:{t:'The reader, and honest labels',
+       d:'The two things every visitor feels within a second of arriving. Weeks, not quarters.',
+       l:['Unblock our own image storage &mdash; a configuration fix that everything else waits on',
+          'Page-at-a-time delivery from storage we already pay for',
+          'A permanent address for every page, and in-book search from word positions we already produce',
+          'Open / Search-only / Catalogue-only labels on every record',
+          'Full download retained everywhere, and the phone experience fixed'],
+       v:'A visitor opens a 90&nbsp;MB volume instantly, links a colleague to page 212, and searches inside it.'},
+    2:{t:'The catalogue platform',
+       d:'The structure that makes everything after it possible &mdash; and the intake that stops the old faults recurring.',
+       l:['Work / edition / copy records, with roles, qualified dates and rights',
+          'Migration of existing entries, with improvement as a queue of small reviewable tasks',
+          'Fingerprint checks, duplicate merging, and the intake wizard with its hard stops',
+          'New catalogue, book, manuscript and journal pages',
+          'Citation export, clear reuse terms, and a redirect ledger so no old link dies'],
+       v:'A journal run reads as one thing; a date can say <i>[1518?]</i>; every record says who digitised it and what we may show.'},
+    3:{t:'Search and depth',
+       d:'Turning the collection into something a person can work in for an afternoon.',
+       l:['Full-text search across the collection with hits highlighted on the page',
+          'Article-level records for the journal runs',
+          'The editorial workbench: proposals, diffs, preview builds, staleness and coverage dashboards',
+          'Personal shelves, bookmarks, annotation, and the plate gallery'],
+       v:'A researcher finds a phrase across five centuries, saves the pages, and exports the citations.'},
+    4:{t:'The distinctive work',
+       d:'What only this library can offer &mdash; and what everything before it was for.',
+       l:['The plant index, the comparison reader, and the open name authority',
+          'The translation programme, living editions, and frozen citable releases',
+          '&ldquo;Ask the Library&rdquo; over the indexed collection, with citations and abstention',
+          'The volunteer desk, credited by name; open data exports and a simple interface for reuse'],
+       v:'Someone asks about gentian and receives five hundred years of answers, each opening the page it came from.'}
+  };
+  var pbody=document.getElementById('phasebody');
+  function showPhase(n){
+    var p=PHASES[n];
+    pbody.innerHTML='<b style="font:600 15px var(--serif)">'+p.t+'</b><div style="color:var(--mut);font-size:13px;margin-top:2px">'+p.d+'</div><ul>'+
+      p.l.map(function(x){return '<li>'+x+'</li>';}).join('')+'</ul>'+
+      '<div class="visible"><b>At the end of this phase:</b> '+p.v+'</div>';
+  }
+  [].forEach.call(document.querySelectorAll('.phase'),function(btn){
+    btn.addEventListener('click',function(){
+      [].forEach.call(document.querySelectorAll('.phase'),function(b){b.setAttribute('aria-selected','false');});
+      btn.setAttribute('aria-selected','true');
+      showPhase(btn.dataset.phase);
+    });
+  });
+  showPhase(1);
+
+  /* ---------- idea board ---------- */
+  var IDEAS=[
+    {id:'trans-monthly',t:'A monthly first English translation',c:'Programme',e:'Medium effort',i:'High impact',
+     d:'One short text a month, published as an event. The most quotable thing we could do, and it builds an audience rhythm.'},
+    {id:'adopt',t:'Adopt a book or a plate',c:'Support',e:'Low effort',i:'High impact',
+     d:'A named dedication in the record, permanently. Scarcity comes from the collection itself &mdash; each book can be adopted once.'},
+    {id:'portfolio',t:'Annual portfolio of prints, by ballot',c:'Support',e:'Low effort',i:'Medium impact',
+     d:'A few plates printed well for supporters, allotted by ballot so nobody is turned away and the edition stays genuinely small.'},
+    {id:'opendata',t:'Open data downloads and an API',c:'Data',e:'Medium effort',i:'High impact',
+     d:'Records, recognised text, and the plant index freely reusable. How scholars come to depend on us &mdash; and what grant programmes expect.'},
+    {id:'feed',t:'A "what changed" feed',c:'Outreach',e:'Low effort',i:'Medium impact',
+     d:'New books, new translations, corrected records, generated from approved changes. Makes the library visibly alive rather than a static shelf.'},
+    {id:'coursepacks',t:'Course packs for herbal schools',c:'Outreach',e:'Medium effort',i:'High impact',
+     d:'Curated page sequences with commentary &mdash; a natural partnership offer, and it puts our links in front of students.'},
+    {id:'citations',t:'Citation of the month',c:'Outreach',e:'Low effort',i:'Medium impact',
+     d:'Publish where our books are being cited. Proof the work lands, and gentle pressure to keep records accurate.'},
+    {id:'labels',t:'Bilingual plant labels for botanic gardens',c:'Outreach',e:'Low effort',i:'Medium impact',
+     d:'Our historical names beside modern ones on garden labels, each linking to a plant page. Cheap, charming, and it puts the library in the physical world.'},
+    {id:'partner-scan',t:'Partner scanning for small collections',c:'Programme',e:'High effort',i:'High impact',
+     d:'Offer our pipeline to small herbal libraries in exchange for hosting their scans. Grows the collection without buying books.'},
+    {id:'wikidata',t:'Link into Wikipedia and Wikidata',c:'Data',e:'Low effort',i:'High impact',
+     d:'Put our page links where researchers already look. One of the highest-traffic returns available to a library our size.'},
+    {id:'corrections',t:'"Corrections welcome" on every record',c:'Programme',e:'Low effort',i:'Medium impact',
+     d:'A visible route for readers to report an error, feeding the same review queue as staff edits. Turns critics into contributors.'},
+    {id:'ledger',t:'A public conservation ledger',c:'Support',e:'Low effort',i:'Medium impact',
+     d:'What each donation funded, itemised. The single most persuasive document a small library can publish.'},
+    {id:'transcribe',t:'Crowd transcription desk',c:'Programme',e:'High effort',i:'High impact',
+     d:'Volunteers correct old hands page by page under editorial review, credited by name. Proven model at other libraries.'},
+    {id:'citewidget',t:'An embeddable "cite this page" widget',c:'Data',e:'Medium effort',i:'Medium impact',
+     d:'Other sites can quote a page of ours with a working citation and link. Distribution without advertising.'},
+    {id:'stateofthelibrary',t:'A yearly "state of the library"',c:'Support',e:'Low effort',i:'High impact',
+     d:'Holdings, additions, translations, usage. The document funders ask for anyway &mdash; better written once, deliberately.'},
+    {id:'glossary',t:'A public glossary of the old vocabulary',c:'Data',e:'Medium effort',i:'Medium impact',
+     d:'Apothecary units, archaic plant names, obsolete ailments &mdash; useful in its own right, and it powers the tap-for-gloss reader feature.'},
+    {id:'randompage',t:'Open a random page',c:'Reader',e:'Low effort',i:'Medium impact',
+     d:'One button, optionally filtered to illustrated pages. The cheapest serendipity that exists, and people remember it.'},
+    {id:'weekly',t:'A weekly featured opening',c:'Outreach',e:'Low effort',i:'High impact',
+     d:'One spread and 150 words, drafted in-house and edited by a person. The archive becomes a browsable trail of its own.'},
+    {id:'platewall',t:'The plate wall',c:'Reader',e:'Medium effort',i:'High impact',
+     d:'Every illustration in the collection as one browsable index, filterable by century and technique. Our most persuasive material, currently invisible.'},
+    {id:'lighttable',t:'Light-table plate overlay',c:'Reader',e:'Medium effort',i:'Medium impact',
+     d:'Lay two plates over one another with a slider. Copying, recutting and mirroring become obvious at a glance.'},
+    {id:'woodblock',t:'Trace reused woodblocks across books',c:'Data',e:'High effort',i:'High impact',
+     d:'Blocks were sold between print shops; the same figure reappears for decades. An art-historical dataset nobody has assembled for herbals.'},
+    {id:'renewals',t:'Copyright renewal sweep',c:'Data',e:'Medium effort',i:'High impact',
+     d:'Many mid-century herbals were never renewed and are already free. The registers are public, and we already hold the dataset needed to check in bulk.'},
+    {id:'brickwall',t:'A public register of unsolved problems',c:'Outreach',e:'Low effort',i:'Medium impact',
+     d:'Unread words, unidentified plants, editions we cannot locate, with what has been tried. Specific puzzles recruit experts that general appeals never reach.'},
+    {id:'firstatt',t:'Earliest-occurrence service for dictionaries',c:'Data',e:'Medium effort',i:'Medium impact',
+     d:'Offer lexicographers the earliest dated appearance of a term in our corpus. Cheap from text we already have, and it buys enormous goodwill.'},
+    {id:'reconcile',t:'Let other projects match against our name index',c:'Data',e:'Medium effort',i:'High impact',
+     d:'A simple matching service turns the plant index from a page into infrastructure other people build on &mdash; the strongest form of citation there is.'},
+    {id:'zenodo',t:'Deposit every release with an outside archive',c:'Support',e:'Low effort',i:'High impact',
+     d:'Permanent identifiers and off-site copies at no cost. If the project stopped tomorrow, the citations would still resolve.'},
+    {id:'deadman',t:'A static fallback of the whole site',c:'Support',e:'Medium effort',i:'High impact',
+     d:'The library rendered as plain files that can be served anywhere, so it outlives its software, its servers, and its budget.'},
+    {id:'wantslist',t:'A published wants list',c:'Programme',e:'Low effort',i:'Medium impact',
+     d:'The editions we seek, with condition notes, so donors and partner collections can match their shelves against ours.'},
+    {id:'progress',t:'A public progress page per book',c:'Programme',e:'Low effort',i:'Medium impact',
+     d:'Received, scanned, recognised, drafted, reviewed, live &mdash; with dates. The internal worklist and the donor&rsquo;s view are one page.'},
+    {id:'sprint',t:'Translation sprints',c:'Programme',e:'Medium effort',i:'Medium impact',
+     d:'A packaged weekend format with one work, pre-cut passages and a progress board. Ends with an edition measurably nearer its next freeze.'},
+    {id:'marginalia',t:'A marginalia and readers&rsquo; marks index',c:'Data',e:'Medium effort',i:'Medium impact',
+     d:'Annotations, pressed plants, inscriptions and pen trials, gathered and page-linked. A finishable volunteer project and a real research asset.'},
+    {id:'guested',t:'Guest-edited editions',c:'Programme',e:'Medium effort',i:'High impact',
+     d:'A named specialist edits one work and receives title-page credit. Academic incentive paid in the currency academics actually value.'},
+    {id:'gardenqr',t:'Garden bed labels linking to plant pages',c:'Outreach',e:'Low effort',i:'Medium impact',
+     d:'A botanical garden gains historical depth on its signage; we gain visitors standing in front of the living plant.'},
+    {id:'pocket',t:'Pocket e-book editions',c:'Reader',e:'Medium effort',i:'Medium impact',
+     d:'A finished translation as a clean e-book, every paragraph still carrying its page link. Reading on a train, citation intact.'},
+    {id:'giveback',t:'Return our corrected text to the source libraries',c:'Outreach',e:'Low effort',i:'Medium impact',
+     d:'Give improved transcriptions back to the institutions whose scans we hold. Costs nothing, opens doors, and is simply the right way to behave.'}
+  ];
+  var KEY='whl.ideas.v1';
+  var votes={};
+  try{ votes=JSON.parse(localStorage.getItem(KEY)||'{}')||{}; }catch(e){ votes={}; }
+  var wrap=document.getElementById('ideas');
+
+  function render(){
+    wrap.innerHTML='';
+    IDEAS.forEach(function(idea){
+      var card=document.createElement('article');
+      card.className='idea';
+      card.dataset.cat=idea.c;
+      card.dataset.id=idea.id;
+      if(votes[idea.id]) card.dataset.vote=votes[idea.id];
+      card.innerHTML=
+        '<h3>'+idea.t+'</h3>'+
+        '<p>'+idea.d+'</p>'+
+        '<div class="meta"><span>'+idea.c+'</span><span>'+idea.e+'</span><span>'+idea.i+'</span></div>'+
+        '<div class="vote">'+
+          '<button value="yes">Yes</button>'+
+          '<button value="maybe">Maybe</button>'+
+          '<button value="no">No</button>'+
+        '</div>';
+      card.querySelector('.vote').addEventListener('click',function(ev){
+        var b=ev.target.closest('button'); if(!b) return;
+        var v=b.value;
+        if(votes[idea.id]===v){ delete votes[idea.id]; card.removeAttribute('data-vote'); }
+        else { votes[idea.id]=v; card.dataset.vote=v; }
+        try{ localStorage.setItem(KEY,JSON.stringify(votes)); }catch(e){}
+        updateTally();
+      });
+      wrap.appendChild(card);
+    });
+    updateTally();
+  }
+  function updateTally(){
+    var y=0,m=0,n=0;
+    Object.keys(votes).forEach(function(k){
+      if(votes[k]==='yes')y++; else if(votes[k]==='maybe')m++; else if(votes[k]==='no')n++;
+    });
+    document.getElementById('tally').textContent='yes '+y+'  ·  maybe '+m+'  ·  no '+n+'  ·  undecided '+(IDEAS.length-y-m-n);
+  }
+  render();
+
+  [].forEach.call(document.querySelectorAll('.chip'),function(chip){
+    chip.addEventListener('click',function(){
+      [].forEach.call(document.querySelectorAll('.chip'),function(c){c.setAttribute('aria-pressed','false');});
+      chip.setAttribute('aria-pressed','true');
+      var cat=chip.dataset.cat;
+      [].forEach.call(document.querySelectorAll('.idea'),function(card){
+        var hidden=!(cat==='all'||card.dataset.cat===cat);
+        card.dataset.catHidden=hidden?'1':'0';
+        card.classList.toggle('hide',hidden||card.classList.contains('searchhide'));
+      });
+    });
+  });
+
+  document.getElementById('copyshort').addEventListener('click',function(){
+    var lines=['World Herb Library — idea shortlist',''];
+    ['yes','maybe','no'].forEach(function(v){
+      var picked=IDEAS.filter(function(i){return votes[i.id]===v;});
+      if(!picked.length) return;
+      lines.push(v.toUpperCase()+':');
+      picked.forEach(function(i){ lines.push('  - '+i.t+' ('+i.c+', '+i.e+', '+i.i+')'); });
+      lines.push('');
+    });
+    var undec=IDEAS.filter(function(i){return !votes[i.id];});
+    if(undec.length){ lines.push('UNDECIDED:'); undec.forEach(function(i){lines.push('  - '+i.t);}); }
+    var text=lines.join('\n');
+    var btn=this;
+    function done(ok){ btn.textContent=ok?'Copied':'Copy failed'; setTimeout(function(){btn.textContent='Copy shortlist';},1600); }
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){done(true);},function(){done(false);});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select();
+      try{ document.execCommand('copy'); done(true); }catch(e){ done(false); }
+      document.body.removeChild(ta);
+    }
+  });
+
+  document.getElementById('resetvotes').addEventListener('click',function(){
+    votes={}; try{ localStorage.removeItem(KEY); }catch(e){}
+    render();
+  });
+
+  /* ---------- stamp ---------- */
+  document.getElementById('stamp').textContent='opened '+new Date().toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'});
+})();
+</script>
+
+<script>
+/* ===================== annotation layer ===================== */
+(function(){
+  "use strict";
+  var TAGS=[
+    {id:'good',    key:'g', label:'Good idea'},
+    {id:'relevant',key:'r', label:'Relevant'},
+    {id:'weak',    key:'w', label:'Weak idea'},
+    {id:'miss',    key:'m', label:'Missing the point'},
+    {id:'nrel',    key:'n', label:'Not relevant'},
+    {id:'ai',      key:'i', label:'Reads like AI'},
+    {id:'prune',   key:'p', label:'Prune'},
+    {id:'expand',  key:'e', label:'Needs expansion'},
+    {id:'brain',   key:'b', label:'Keep brainstorming'}
+  ];
+  var BYKEY={},LABEL={};
+  TAGS.forEach(function(t){ BYKEY[t.key]=t.id; LABEL[t.id]=t.label; });
+
+  var SEL='ul.pts > li, p.lede, .full p, .callout, .tier, .idea, table tbody tr, figure.diagram figcaption, .phasebody li';
+  var KEY='whl.annos.v2';
+  var store={};
+  try{ store=JSON.parse(localStorage.getItem(KEY)||'{}')||{}; }catch(e){ store={}; }
+  function save(){ try{ localStorage.setItem(KEY,JSON.stringify(store)); }catch(e){} }
+
+  function hash(s){ var h=5381,i; for(i=0;i<s.length;i++){ h=((h<<5)+h+s.charCodeAt(i))>>>0; } return h.toString(36); }
+  function cleanText(el){
+    var c=el.cloneNode(true);
+    [].forEach.call(c.querySelectorAll('.anno-ui'),function(n){ n.parentNode.removeChild(n); });
+    return (c.textContent||'').replace(/\s+/g,' ').trim();
+  }
+  function sectionOf(el){
+    var s=el.closest('section');
+    return { id: s?s.id:'x', title: s?s.querySelector('h2').textContent.replace(/\s+/g,' ').trim():'Other' };
+  }
+
+  /* ---- indexing ---- */
+  var busy=false;
+  function index(){
+    busy=true;
+    [].forEach.call(document.querySelectorAll(SEL),function(el){
+      if(el.closest('.annodraw')||el.closest('.annobar')||el.closest('.annohelp')) return;
+      var txt=cleanText(el);
+      if(txt.length<12) return;
+      var sec=sectionOf(el);
+      var id=sec.id+':'+hash(txt);
+      el.dataset.annoId=id;
+      el.classList.add('anno');
+      paint(el);
+    });
+    busy=false;
+    refreshCount();
+  }
+  function paint(el){
+    var id=el.dataset.annoId, rec=store[id];
+    [].forEach.call(el.querySelectorAll(':scope > .anno-ui'),function(n){ n.parentNode.removeChild(n); });
+    if(!rec||!rec.tag){ el.removeAttribute('data-anno'); return; }
+    el.setAttribute('data-anno',rec.tag);
+    var chip=document.createElement('span');
+    chip.className='anno-ui anno-chip'; chip.textContent=LABEL[rec.tag];
+    var host = el.tagName==='TR' ? el.lastElementChild : el;
+    host.appendChild(chip);
+    if(rec.note){
+      var n=document.createElement('div');
+      n.className='anno-ui anno-note';
+      n.innerHTML='<b>note</b>';
+      n.appendChild(document.createTextNode(rec.note));
+      host.appendChild(n);
+    }
+  }
+
+  /* ---- selection ---- */
+  var cur=null;
+  var bar=document.getElementById('annobar');
+  var exEl=document.getElementById('abEx').querySelector('span');
+  function syncPad(){
+    document.body.style.paddingBottom =
+      document.body.classList.contains('anno-active') ? (bar.offsetHeight+26)+'px' : '';
+  }
+  window.addEventListener('resize',syncPad);
+  function visibleItems(){
+    return [].filter.call(document.querySelectorAll('[data-anno-id]'),function(el){
+      return el.offsetParent!==null;
+    });
+  }
+  function select(el){
+    if(cur) cur.classList.remove('sel');
+    cur=el;
+    if(!el){ document.body.classList.remove('anno-active','anno-noting'); syncPad(); return; }
+    el.classList.add('sel');
+    document.body.classList.add('anno-active');
+    document.body.classList.remove('anno-noting');
+    syncPad();
+    var t=cleanText(el);
+    exEl.textContent = t.length>150 ? t.slice(0,150)+'…' : t;
+    var rec=store[el.dataset.annoId]||{};
+    [].forEach.call(document.querySelectorAll('.ab-t'),function(b){
+      b.classList.toggle('on', b.dataset.t===rec.tag);
+    });
+    document.getElementById('abText').value=rec.note||'';
+    var r=el.getBoundingClientRect();
+    var barH=bar.offsetHeight||120;
+    if(r.bottom>window.innerHeight-barH-10 || r.top<70){
+      window.scrollBy({top:r.top-140,behavior:'smooth'});
+    }
+  }
+  function setTag(tag){
+    if(!cur) return;
+    var id=cur.dataset.annoId;
+    var rec=store[id]||{};
+    if(rec.tag===tag){ delete rec.tag; } else { rec.tag=tag; }
+    rec.text=cleanText(cur);
+    var s=sectionOf(cur); rec.sec=s.id; rec.secTitle=s.title;
+    if(!rec.tag && !rec.note) delete store[id]; else store[id]=rec;
+    save(); paint(cur); select(cur); refreshCount(); if(drawOpen) drawRender();
+  }
+  function clearAnno(){
+    if(!cur) return;
+    delete store[cur.dataset.annoId];
+    save(); paint(cur); select(cur); refreshCount(); if(drawOpen) drawRender();
+  }
+  function saveNote(){
+    if(!cur) return;
+    var id=cur.dataset.annoId, v=document.getElementById('abText').value.trim();
+    var rec=store[id]||{};
+    if(v) rec.note=v; else delete rec.note;
+    rec.text=cleanText(cur);
+    var s=sectionOf(cur); rec.sec=s.id; rec.secTitle=s.title;
+    if(!rec.tag && !rec.note) delete store[id]; else store[id]=rec;
+    save(); paint(cur); document.body.classList.remove('anno-noting'); syncPad();
+    refreshCount(); if(drawOpen) drawRender();
+  }
+
+  document.addEventListener('click',function(e){
+    if(e.target.closest('.annobar')||e.target.closest('.annodraw')||e.target.closest('.annohelp')||e.target.closest('.mast-tools')) return;
+    if(e.target.closest('button,a,input,textarea,select,.s-head')) return;
+    var el=e.target.closest('[data-anno-id]');
+    if(el) select(el);
+  });
+
+  [].forEach.call(document.querySelectorAll('.ab-t'),function(b){
+    b.addEventListener('click',function(){ setTag(b.dataset.t); });
+  });
+  document.getElementById('abClear').addEventListener('click',clearAnno);
+  document.getElementById('abClose').addEventListener('click',function(){ select(null); });
+  document.getElementById('abSave').addEventListener('click',saveNote);
+  document.getElementById('abComment').addEventListener('click',function(){
+    document.body.classList.add('anno-noting'); syncPad();
+    document.getElementById('abText').focus();
+  });
+  document.getElementById('abText').addEventListener('keydown',function(e){
+    if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); saveNote(); }
+    if(e.key==='Escape'){ e.preventDefault(); document.body.classList.remove('anno-noting'); syncPad(); }
+  });
+
+  /* ---- hotkeys ---- */
+  document.addEventListener('keydown',function(e){
+    var t=e.target.tagName;
+    if(t==='INPUT'||t==='TEXTAREA'||e.ctrlKey||e.metaKey||e.altKey) return;
+    var k=e.key.toLowerCase();
+    if(k==='escape'){
+      if(document.body.classList.contains('anno-help')){ document.body.classList.remove('anno-help'); return; }
+      if(drawOpen){ drawer(false); return; }
+      select(null); return;
+    }
+    if(k==='?'){ document.body.classList.toggle('anno-help'); return; }
+    if(k==='a'){ e.preventDefault(); drawer(!drawOpen); return; }
+    if(k==='j'||k==='arrowdown'||k==='k'||k==='arrowup'){
+      var list=visibleItems(); if(!list.length) return;
+      var i=cur?list.indexOf(cur):-1;
+      var next=(k==='j'||k==='arrowdown') ? Math.min(i+1,list.length-1) : Math.max(i-1,0);
+      if(i===-1) next=0;
+      e.preventDefault(); select(list[next]); return;
+    }
+    if(!cur) return;
+    if(BYKEY[k]){ e.preventDefault(); setTag(BYKEY[k]); return; }
+    if(k==='c'){ e.preventDefault(); document.body.classList.add('anno-noting'); syncPad(); document.getElementById('abText').focus(); return; }
+    if(k==='x'||k==='0'){ e.preventDefault(); clearAnno(); return; }
+  });
+
+  /* ---- drawer ---- */
+  var drawOpen=false;
+  function drawer(open){
+    drawOpen=open;
+    document.body.classList.toggle('anno-draw',open);
+    if(open) drawRender();
+  }
+  document.getElementById('annobtn').addEventListener('click',function(){ drawer(!drawOpen); });
+  document.getElementById('adClose').addEventListener('click',function(){ drawer(false); });
+  document.getElementById('abHelp').addEventListener('click',function(){ document.body.classList.add('anno-help'); });
+  document.getElementById('hhClose').addEventListener('click',function(){ document.body.classList.remove('anno-help'); });
+  document.getElementById('annohelp').addEventListener('click',function(e){
+    if(e.target.id==='annohelp') document.body.classList.remove('anno-help');
+  });
+
+  function grouped(){
+    var order=[].map.call(document.querySelectorAll('section'),function(s){return s.id;});
+    var out={};
+    Object.keys(store).forEach(function(id){
+      var r=store[id]; var k=r.sec||'x';
+      (out[k]=out[k]||[]).push({id:id,rec:r});
+    });
+    return order.filter(function(k){return out[k];}).map(function(k){ return {sec:k,items:out[k]}; });
+  }
+  function drawRender(){
+    var body=document.getElementById('adBody');
+    var keys=Object.keys(store);
+    if(!keys.length){ body.innerHTML='<p class="adempty">No annotations yet. Click any point in the document and press a letter key — press <b>?</b> for the list.</p>'; return; }
+    var counts={};
+    keys.forEach(function(id){ var t=store[id].tag; if(t) counts[t]=(counts[t]||0)+1; });
+    var html='<div class="adcounts">'+TAGS.filter(function(t){return counts[t.id];}).map(function(t){
+      return '<span class="adcount" style="background:var(--a-'+t.id+')">'+t.label+' '+counts[t.id]+'</span>';
+    }).join('')+'</div>';
+    grouped().forEach(function(g){
+      var title=(g.items[0].rec.secTitle)||g.sec;
+      html+='<div class="adsec">'+title+'</div>';
+      g.items.forEach(function(it){
+        var r=it.rec, tag=r.tag||'', txt=(r.text||'').slice(0,150);
+        html+='<div class="aditem" data-jump="'+it.id+'" style="--ac:'+(tag?'var(--a-'+tag+')':'var(--hair)')+'">'+
+          (tag?'<div class="t">'+LABEL[tag]+'</div>':'<div class="t" style="color:var(--mut)">comment only</div>')+
+          '<div class="x">'+txt.replace(/</g,'&lt;')+(r.text&&r.text.length>150?'…':'')+'</div>'+
+          (r.note?'<div class="n">'+r.note.replace(/</g,'&lt;')+'</div>':'')+
+        '</div>';
+      });
+    });
+    body.innerHTML=html;
+    [].forEach.call(body.querySelectorAll('.aditem'),function(it){
+      it.addEventListener('click',function(){
+        var el=document.querySelector('[data-anno-id="'+it.dataset.jump+'"]');
+        if(el){ var s=el.closest('section'); if(s) s.classList.remove('collapsed'); el.scrollIntoView({block:'center',behavior:'smooth'}); select(el); }
+      });
+    });
+  }
+  function refreshCount(){
+    document.getElementById('annocount').textContent=Object.keys(store).length;
+  }
+
+  /* ---- export / import ---- */
+  function markdown(){
+    var d=new Date().toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'});
+    var n=Object.keys(store).length;
+    var out=['# World Herb Library proposal — annotations ('+n+')','','Exported '+d+' from the interactive proposal. Each entry gives the tag, the text it applies to, and any comment.',''];
+    grouped().forEach(function(g){
+      out.push('## '+((g.items[0].rec.secTitle)||g.sec));
+      g.items.forEach(function(it){
+        var r=it.rec;
+        out.push('- **['+(r.tag?LABEL[r.tag].toUpperCase():'COMMENT')+']** "'+(r.text||'').slice(0,260)+'"  `'+it.id+'`');
+        if(r.note) out.push('  - comment: '+r.note);
+      });
+      out.push('');
+    });
+    return out.join('\n');
+  }
+  function copyText(text,btn,okLabel){
+    var orig=btn.textContent;
+    function done(ok){ btn.textContent=ok?okLabel:'Copy failed'; setTimeout(function(){btn.textContent=orig;},1600); }
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){done(true);},function(){done(false);});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select();
+      try{ document.execCommand('copy'); done(true); }catch(e){ done(false); }
+      document.body.removeChild(ta);
+    }
+  }
+  document.getElementById('adCopy').addEventListener('click',function(){
+    if(!Object.keys(store).length){ return copyText('(no annotations yet)',this,'Nothing to copy'); }
+    copyText(markdown(),this,'Copied');
+  });
+  document.getElementById('adJson').addEventListener('click',function(){
+    var blob=new Blob([JSON.stringify({exported:new Date().toISOString(),annotations:store},null,2)],{type:'application/json'});
+    var a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download='whl-annotations.json';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(a.href); },1000);
+  });
+  document.getElementById('adImport').addEventListener('click',function(){ document.getElementById('adFile').click(); });
+  document.getElementById('adFile').addEventListener('change',function(e){
+    var f=e.target.files[0]; if(!f) return;
+    var fr=new FileReader();
+    fr.onload=function(){
+      try{
+        var d=JSON.parse(fr.result);
+        var incoming=d.annotations||d;
+        Object.keys(incoming).forEach(function(k){ store[k]=incoming[k]; });
+        save(); repaintAll(); drawRender(); refreshCount();
+      }catch(err){ alert('Could not read that file.'); }
+    };
+    fr.readAsText(f); e.target.value='';
+  });
+  document.getElementById('adClear').addEventListener('click',function(){
+    if(!confirm('Remove every annotation in this browser?')) return;
+    store={}; save(); repaintAll(); drawRender(); refreshCount();
+  });
+  function repaintAll(){
+    [].forEach.call(document.querySelectorAll('[data-anno-id]'),paint);
+  }
+
+  /* ---- keep index fresh as the page re-renders ---- */
+  var pending=null;
+  new MutationObserver(function(muts){
+    if(busy) return;
+    var relevant=muts.some(function(m){
+      return [].some.call(m.addedNodes,function(n){
+        return n.nodeType===1 && !n.classList.contains('anno-ui') && !n.closest('.annodraw');
+      });
+    });
+    if(!relevant) return;
+    clearTimeout(pending);
+    pending=setTimeout(index,80);
+  }).observe(document.querySelector('main'),{childList:true,subtree:true});
+
+  index();
+})();
+</script>
+</body>
+</html>
