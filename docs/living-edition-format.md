@@ -1,5 +1,11 @@
 # `.whled` living-edition package and entity contract (`whled/0.1`)
 
+> **Prototype predecessor.** New Living Editions use the `.lib4` extension,
+> `format: "lib/4"`, and the `living-edition/1.0` profile specified in
+> [`lib4-format.md`](lib4-format.md). This document remains normative for
+> opening, validating, and explicitly migrating existing `.whled` prototypes;
+> a `.whled` archive must never be silently relabeled as `.lib4`.
+
 Status: **prototype, implemented** (2026-08-12).
 
 This document is normative for the portable data contract. The interaction and

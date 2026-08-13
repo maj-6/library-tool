@@ -1,0 +1,102 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-retrieval-record-1.0.json",
+  "profile": "lib4-retrieval-record/1.0",
+  "operation": "upsert",
+  "record_id": "chunk-0001:52b835ce20c62247",
+  "chunk_id": "chunk-0001",
+  "chunk_revision": "sha256:52b835ce20c62247a6a21165f697977f02b8362b3292ffd29921f56bdfba19cd",
+  "package": {
+    "id": "pkg-minimal-example",
+    "revision": "release-1",
+    "format": "lib/4",
+    "profile": "living-edition"
+  },
+  "release_id": "release-1",
+  "state": "current",
+  "target": {
+    "uri": "lib4://package/pkg-minimal-example/layer/transcription-primary/revision/rev-1/item/passage-0001",
+    "selectors": [
+      {
+        "type": "region",
+        "region_id": "region-0001",
+        "region_layer_id": "regions-primary",
+        "region_layer_revision": "rev-1"
+      },
+      {
+        "type": "text",
+        "item_id": "passage-0001",
+        "start": 0,
+        "end": 5,
+        "exact": "Herbs",
+        "prefix": "",
+        "suffix": ""
+      }
+    ]
+  },
+  "source_layer": {
+    "id": "transcription-primary",
+    "revision": "rev-1",
+    "kind": "transcription",
+    "item_ids": ["passage-0001"],
+    "editorial_status": "approved"
+  },
+  "content_hash": "sha256:52b835ce20c62247a6a21165f697977f02b8362b3292ffd29921f56bdfba19cd",
+  "content": {
+    "modality": "text",
+    "language": "en",
+    "script": "Latn",
+    "direction": "ltr",
+    "trust": "untrusted-source-data",
+    "fields": [
+      {"kind": "transcription", "value": "Herbs", "language": "en", "source_item_id": "passage-0001"}
+    ],
+    "resource_refs": [{"resource_id": "resource-page-0001", "role": "visual-evidence"}],
+    "alignments": [],
+    "ext": {}
+  },
+  "citation": {
+    "label": "Minimal Living Edition, page 1, reviewed transcription.",
+    "canonical_uri": "lib4://package/pkg-minimal-example/release/release-1/layer/transcription-primary/revision/rev-1/item/passage-0001",
+    "package_revision": "release-1",
+    "release_id": "release-1",
+    "locator": "Page 1, region 1",
+    "source_hash": "sha256:3890b49767f6ffe279bacbecf040f9ff6d47507f782f716e3c7d3773865127e0",
+    "ext": {}
+  },
+  "lineage": {
+    "projection_profile_id": "retrieval-default",
+    "projection_profile_version": "1.0",
+    "inputs": [
+      {
+        "id": "transcription-primary",
+        "revision": "rev-1",
+        "content_hash": "sha256:8bb2ebe1b8f3566a1a773ff504f0f4419e8e7795dbb9b26e8b052392f049bfca"
+      }
+    ],
+    "generated_at": "2026-08-12T19:04:00Z",
+    "generator": {"name": "Example retrieval projector", "version": "1.0", "actor_id": "generator-example"},
+    "ext": {}
+  },
+  "entity_refs": [],
+  "categories": [],
+  "rights": {
+    "policy_ids": ["rights-cc0"],
+    "effective_allowed_uses": ["discover", "read", "quote", "index", "embed"],
+    "effective_restrictions": [],
+    "evaluated_at": "2026-08-12T19:04:00Z"
+  },
+  "access": {
+    "policy_ids": ["access-public"],
+    "inherited_from": ["representation-minimal"],
+    "discover": true,
+    "read": true,
+    "index": true,
+    "embed": true,
+    "reason": "The example asset and text are released for public use.",
+    "evaluated_at": "2026-08-12T19:04:00Z"
+  },
+  "embeddings": [],
+  "created_at": "2026-08-12T19:04:00Z",
+  "updated_at": "2026-08-12T19:04:00Z",
+  "ext": {}
+}

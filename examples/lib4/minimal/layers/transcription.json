@@ -1,0 +1,74 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-layer-1.0.json",
+  "id": "transcription-primary",
+  "revision": "rev-1",
+  "kind": "transcription",
+  "label": "Reviewed transcription",
+  "language": "en",
+  "lifecycle": {"state": "complete", "completeness": 1, "updated_at": "2026-08-12T19:02:00Z", "message": null, "retryable": false, "ext": {}},
+  "editorial_status": "approved",
+  "coverage": {
+    "scope": "all",
+    "target_uris": ["lib4://package/pkg-minimal-example/canvas/canvas-0001/region/region-0001"],
+    "completed_items": 1,
+    "total_items": 1,
+    "omissions": [],
+    "ext": {}
+  },
+  "provenance": {
+    "actor": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+    "generated_at": "2026-08-12T19:02:00Z",
+    "method": "manual-transcription",
+    "run_id": "run-minimal-example",
+    "parameters": {"unicode_indexing": "code-points", "normalization": "NFC"},
+    "sources": [
+      {
+        "target_uri": "lib4://package/pkg-minimal-example/canvas/canvas-0001/region/region-0001",
+        "resource_id": null,
+        "layer_id": "regions-primary",
+        "revision": "rev-1",
+        "digest": null,
+        "ext": {}
+      }
+    ],
+    "ext": {}
+  },
+  "dependencies": [{"layer_id": "regions-primary", "revision": "rev-1", "relation": "segmented-by"}],
+  "history": [
+    {
+      "id": "history-transcription-create",
+      "action": "create",
+      "actor": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+      "at": "2026-08-12T19:02:00Z",
+      "message": "Transcribed the example line.",
+      "base_revision": null,
+      "ext": {}
+    }
+  ],
+  "reviews": [
+    {
+      "id": "review-transcription-1",
+      "decision": "approve",
+      "reviewer": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+      "at": "2026-08-12T19:03:00Z",
+      "rationale": "Text matches the evidence image.",
+      "applies_to_revision": "rev-1",
+      "ext": {}
+    }
+  ],
+  "errors": [],
+  "data": {
+    "passages": [
+      {
+        "id": "passage-0001",
+        "region_ref": {"layer_id": "regions-primary", "revision": "rev-1", "region_id": "region-0001"},
+        "order": 1,
+        "text": "Herbs",
+        "confidence": 1.0,
+        "uncertainty_spans": [],
+        "ext": {}
+      }
+    ]
+  },
+  "ext": {}
+}

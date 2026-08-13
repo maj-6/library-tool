@@ -29,6 +29,7 @@ import { ManuscriptCanvas } from './components/ManuscriptCanvas'
 import { NotesEditor } from './components/NotesEditor'
 import { RegionInspector, RegionTree } from './components/RegionTools'
 import { ReprocessPanel } from './components/ReprocessPanel'
+import { ReaderPreview } from './components/ReaderPreview'
 import { WorkspaceNav } from './components/WorkspaceNav'
 import { designs, initialRegions, queueItems } from './data/mockData'
 import {
@@ -147,7 +148,9 @@ function App() {
     ? <LibraryBrowser key={designId} variant={designId} onOpenEdition={() => setWorkspaceState('edition')} />
     : workspace === 'entities'
       ? <EntityWorkspace key={designId} variant={designId} fromMention={fromMention} onBackToEdition={() => setWorkspaceState('edition')} />
-      : null
+      : workspace === 'reader'
+        ? <ReaderPreview key={designId} shellId={designId} />
+        : null
 
   return (
     <div className={`gallery-app gallery-app--${designId}`}>
@@ -172,7 +175,7 @@ function App() {
           <div>
             <span className="eyebrow">Interface study</span>
             <h1>Living Edition layouts</h1>
-            <p>Seven light desktop variants. Test navigation, geometry, text, notes, processing, and entities.</p>
+            <p>Seven light desktop variants. Test editing, evidence, entities, and the read-only public Reader.</p>
           </div>
           <Card className="review-instructions">
             <span>Review stage</span>
@@ -380,7 +383,7 @@ function SpatialLab(props: SharedEditionProps & NoteProps & { activeTypeId: stri
     <div className="mockup-window spatial-window">
       <WorkspaceNav value={props.workspace} onChange={props.setWorkspace} mode="rail" />
       <div className="spatial-main">
-        <header className="spatial-topbar"><div><span className="section-kicker">Spatial Lab</span><strong>{props.workspace === 'edition' ? `${activeManuscript.label} · ${activeManuscript.folio}` : props.workspace === 'library' ? 'Library' : 'Plant entities'}</strong></div><div><Tag minimal icon="layers">{props.visibleLayerIds.length} layers</Tag><Switch inline large checked={props.showRegions} label="Regions" onChange={(event) => props.setShowRegions(event.currentTarget.checked)} /><Button intent="primary" icon="floppy-disk">Save</Button></div></header>
+        <header className="spatial-topbar"><div><span className="section-kicker">Spatial Lab</span><strong>{props.workspace === 'edition' ? activeManuscript.label + ' · ' + activeManuscript.folio : props.workspace === 'library' ? 'Library' : props.workspace === 'reader' ? 'Reader preview' : 'Plant entities'}</strong></div><div><Tag minimal icon="layers">{props.visibleLayerIds.length} layers</Tag><Switch inline large checked={props.showRegions} label="Regions" onChange={(event) => props.setShowRegions(event.currentTarget.checked)} /><Button intent="primary" icon="floppy-disk">Save</Button></div></header>
         {props.commonWorkspace ?? (
           <div className="spatial-workarea">
             <aside className="spatial-left"><RegionTree types={props.types} activeTypeId={props.activeTypeId} regionCounts={props.regionCounts} onSelect={props.setActiveTypeId} onAddSubclass={props.addSubclass} /><Divider /><div className="spatial-object-list"><div className="section-heading"><div><span className="section-kicker">Page objects</span><h3>Regions</h3></div><Tag round>{props.canvasProps.regions.length}</Tag></div>{props.canvasProps.regions.map((region) => <button key={region.id} className={props.selectedRegion?.id === region.id ? 'is-active' : ''} onClick={() => props.canvasProps.onSelect(region.id)}><span style={{ borderColor: region.color }} /><strong>{region.label}</strong><small>{region.source}</small></button>)}</div></aside>

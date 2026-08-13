@@ -1,0 +1,82 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-generation-receipt-1.0.json",
+  "profile": "lib4-generation-receipt/1.0",
+  "run_id": "run-minimal-example",
+  "package_id": "pkg-minimal-example",
+  "package_revision": "release-1",
+  "status": "complete",
+  "started_at": "2026-08-12T19:00:00Z",
+  "completed_at": "2026-08-12T19:05:00Z",
+  "generator": {"name": "Example LIB4 generator", "version": "1.0", "actor_id": "generator-example", "ext": {}},
+  "source_inventory": [
+    {
+      "id": "source-minimal", "role": "primary-source",
+      "declared_media_type": "image/x-portable-graymap", "detected_media_type": "image/x-portable-graymap",
+      "byte_length": 232, "content_hash": "sha256:3890b49767f6ffe279bacbecf040f9ff6d47507f782f716e3c7d3773865127e0",
+      "location": {"type": "workspace", "value": "assets/page-0001.pgm", "credential_free": true},
+      "trust": "untrusted-source-data", "acquisition": "provided", "status": "complete", "warnings": [], "ext": {}
+    }
+  ],
+  "stages": [
+    {
+      "id": "stage-inventory", "type": "inventory", "status": "complete", "inputs": ["source-minimal"], "outputs": ["resource-page-0001"], "dependencies": [],
+      "started_at": "2026-08-12T19:00:00Z", "completed_at": "2026-08-12T19:00:30Z", "progress": {"completed": 1, "total": 1, "unit": "source"},
+      "warnings": [], "errors": [], "retry": {"eligible": false, "attempts": 1}, "ext": {}
+    },
+    {
+      "id": "stage-regions", "type": "regions", "status": "complete", "inputs": ["resource-page-0001"], "outputs": ["regions-primary:rev-1"], "dependencies": [],
+      "started_at": "2026-08-12T19:00:30Z", "completed_at": "2026-08-12T19:01:00Z", "progress": {"completed": 1, "total": 1, "unit": "canvas"},
+      "warnings": [], "errors": [], "retry": {"eligible": false, "attempts": 1}, "ext": {}
+    },
+    {
+      "id": "stage-transcription", "type": "transcription", "status": "complete", "inputs": ["regions-primary:rev-1"], "outputs": ["transcription-primary:rev-1"],
+      "dependencies": [{"id": "regions-primary", "revision": "rev-1"}],
+      "started_at": "2026-08-12T19:01:00Z", "completed_at": "2026-08-12T19:03:00Z", "progress": {"completed": 1, "total": 1, "unit": "region"},
+      "warnings": [], "errors": [], "retry": {"eligible": false, "attempts": 1}, "ext": {}
+    },
+    {
+      "id": "stage-catalog", "type": "catalog", "status": "complete", "inputs": ["source-minimal", "transcription-primary:rev-1"], "outputs": ["catalog-minimal"], "dependencies": [],
+      "started_at": "2026-08-12T19:03:00Z", "completed_at": "2026-08-12T19:04:00Z", "progress": {"completed": 7, "total": 7, "unit": "required-field"},
+      "warnings": [], "errors": [], "retry": {"eligible": false, "attempts": 1}, "ext": {}
+    },
+    {
+      "id": "stage-retrieval", "type": "retrieval-projection", "status": "complete", "inputs": ["transcription-primary:rev-1"], "outputs": ["chunk-0001"],
+      "dependencies": [{"id": "transcription-primary", "revision": "rev-1"}],
+      "started_at": "2026-08-12T19:04:00Z", "completed_at": "2026-08-12T19:04:30Z", "progress": {"completed": 1, "total": 1, "unit": "chunk"},
+      "warnings": [], "errors": [], "retry": {"eligible": false, "attempts": 1}, "ext": {}
+    },
+    {
+      "id": "stage-validate", "type": "validate", "status": "complete", "inputs": ["manifest-json"], "outputs": ["validation-result"], "dependencies": [],
+      "started_at": "2026-08-12T19:04:30Z", "completed_at": "2026-08-12T19:05:00Z", "progress": {"completed": 3, "total": 3, "unit": "validation"},
+      "warnings": [], "errors": [], "retry": {"eligible": false, "attempts": 1}, "ext": {}
+    }
+  ],
+  "invocations": [],
+  "decisions": [
+    {
+      "id": "decision-public-example", "timestamp": "2026-08-12T19:04:00Z", "actor_id": "reviewer-example",
+      "question": "May the example be publicly indexed?", "choice": "Yes.",
+      "basis": "The example bytes and text were authored for this specification and released under CC0.", "reversible": true, "ext": {}
+    }
+  ],
+  "omissions": [],
+  "validation": [
+    {"validator": "jsonschema", "version": "4.x", "timestamp": "2026-08-12T19:05:00Z", "scope": "Schemas", "status": "pass", "errors": [], "warnings": [], "ext": {}},
+    {"validator": "lib4", "version": "1.0", "timestamp": "2026-08-12T19:05:00Z", "scope": "Semantic and archive checks", "status": "pass", "errors": [], "warnings": [], "ext": {}}
+  ],
+  "outputs": [
+    {
+      "id": "manifest-json", "role": "authoring-manifest", "location": {"type": "workspace", "value": "manifest.json", "credential_free": true},
+      "media_type": "application/json", "status": "complete", "ext": {}
+    },
+    {
+      "id": "output-lib4", "role": "living-edition-package", "location": {"type": "workspace", "value": "minimal.lib4", "credential_free": true},
+      "media_type": "application/vnd.world-herb-library.lib4+zip", "status": "complete", "ext": {}
+    }
+  ],
+  "safety": {
+    "source_treated_as_untrusted": true, "embedded_instructions_ignored": true, "network_allowlist_enforced": true,
+    "credentials_excluded": true, "active_content_excluded": true, "archive_paths_validated": true, "notes": []
+  },
+  "ext": {}
+}

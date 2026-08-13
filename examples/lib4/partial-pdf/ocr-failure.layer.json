@@ -1,0 +1,80 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-layer-1.0.json",
+  "id": "ocr-primary",
+  "revision": "attempt-1",
+  "kind": "transcription",
+  "label": "Initial OCR",
+  "language": null,
+  "lifecycle": {
+    "state": "failed",
+    "completeness": 0,
+    "updated_at": "2026-08-12T18:05:00Z",
+    "message": "OCR service unavailable; no text was produced.",
+    "retryable": true,
+    "ext": {}
+  },
+  "editorial_status": "machine-draft",
+  "coverage": {
+    "scope": "unknown",
+    "target_uris": [],
+    "completed_items": 0,
+    "total_items": null,
+    "omissions": [],
+    "ext": {}
+  },
+  "provenance": {
+    "actor": {
+      "type": "service",
+      "id": "service-initial-ocr",
+      "label": "Initial OCR service",
+      "version": "unknown",
+      "ext": {}
+    },
+    "generated_at": "2026-08-12T18:05:00Z",
+    "method": "remote-ocr",
+    "run_id": "run-partial-pdf-20260812",
+    "parameters": {"requested_output": ["text", "regions", "confidence"]},
+    "sources": [
+      {
+        "target_uri": "lib4://package/pkg-partial-pdf-example/source/source-input-pdf",
+        "resource_id": "resource-source-pdf",
+        "layer_id": null,
+        "revision": null,
+        "digest": null,
+        "ext": {}
+      }
+    ],
+    "ext": {}
+  },
+  "dependencies": [],
+  "history": [
+    {
+      "id": "history-ocr-attempt-1",
+      "action": "attempt",
+      "actor": {
+        "type": "service",
+        "id": "service-initial-ocr",
+        "label": "Initial OCR service",
+        "version": "unknown",
+        "ext": {}
+      },
+      "at": "2026-08-12T18:05:00Z",
+      "message": "The service failed without a usable response.",
+      "base_revision": null,
+      "ext": {}
+    }
+  ],
+  "reviews": [],
+  "errors": [
+    {
+      "code": "ocr-service-unavailable",
+      "message": "No OCR response was returned.",
+      "target_uri": "lib4://package/pkg-partial-pdf-example/layer/ocr-primary/revision/attempt-1",
+      "retryable": true,
+      "at": "2026-08-12T18:05:00Z",
+      "ext": {}
+    }
+  ],
+  "data": {},
+  "ext": {}
+}

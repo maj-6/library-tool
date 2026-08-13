@@ -1,0 +1,419 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worldherblibrary.org/schemas/lib4-manifest-1.0.json",
+  "title": "LIB4 living-edition manifest",
+  "description": "Normative package inventory for the lib/4 living-edition profile. Semantic and archive-safety constraints are additionally enforced by tools/living_edition/lib4.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "format",
+    "profile",
+    "profile_version",
+    "package_id",
+    "package_revision",
+    "created_at",
+    "generator",
+    "catalog",
+    "source_material",
+    "structures",
+    "canvases",
+    "resources",
+    "layers",
+    "releases",
+    "registries",
+    "capabilities",
+    "ext"
+  ],
+  "properties": {
+    "$schema": {"const": "https://worldherblibrary.org/schemas/lib4-manifest-1.0.json"},
+    "format": {"const": "lib/4"},
+    "profile": {"const": "living-edition"},
+    "profile_version": {"const": "1.0"},
+    "package_id": {"$ref": "#/$defs/id"},
+    "package_revision": {"$ref": "#/$defs/revision"},
+    "created_at": {"$ref": "#/$defs/timestamp"},
+    "generator": {"$ref": "#/$defs/actor"},
+    "catalog": {"$ref": "https://worldherblibrary.org/schemas/lib4-catalog-1.0.json"},
+    "catalog_resource_id": {
+      "description": "Optional richer catalog representation. It never replaces the inline discovery record.",
+      "oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]
+    },
+    "source_material": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/sourceMaterial"}
+    },
+    "structures": {
+      "description": "Material-neutral hierarchy: gatherings/folios, volumes/issues/articles, chapters, figures, tracks, or extension nodes.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/structure"}
+    },
+    "canvases": {
+      "description": "Addressable visual or spatial surfaces. Non-visual works may have none.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/canvas"}
+    },
+    "resources": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/resource"}
+    },
+    "layers": {
+      "description": "Every historical layer revision, including planned and failed work.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/layerDescriptor"}
+    },
+    "releases": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/release"}
+    },
+    "registries": {"$ref": "#/$defs/registries"},
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/id"}
+    },
+    "retrieval": {
+      "description": "Optional RAG-oriented projections. Canonical evidence remains in pinned layers and resources.",
+      "$ref": "#/$defs/retrieval"
+    },
+    "ext": {"$ref": "#/$defs/ext"}
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"
+    },
+    "timestamp": {"type": "string", "format": "date-time"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "mediaType": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$"
+    },
+    "language": {
+      "type": "string",
+      "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$"
+    },
+    "ext": {"type": "object"},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "label", "ext"],
+      "properties": {
+        "type": {"enum": ["human", "software", "model", "service", "import"]},
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1},
+        "version": {"type": "string"},
+        "uri": {"type": "string", "format": "uri"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "identifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "value", "ext"],
+      "properties": {
+        "scheme": {"$ref": "#/$defs/id"},
+        "value": {"type": "string", "minLength": 1},
+        "uri": {"type": "string", "format": "uri"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "location": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "member", "priority", "ext"],
+          "properties": {
+            "type": {"const": "embedded"},
+            "member": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$"},
+            "priority": {"type": "integer", "minimum": 0},
+            "ext": {"$ref": "#/$defs/ext"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "uri", "priority", "ext"],
+          "properties": {
+            "type": {"enum": ["http", "s3", "iiif"]},
+            "uri": {"type": "string", "format": "uri"},
+            "service": {"type": "string", "format": "uri"},
+            "priority": {"type": "integer", "minimum": 0},
+            "ext": {"$ref": "#/$defs/ext"}
+          }
+        }
+      ]
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "cache", "offline", "ext"],
+      "properties": {
+        "state": {"enum": ["available", "anticipated", "restricted", "unavailable", "unknown"]},
+        "checked_at": {"$ref": "#/$defs/timestamp"},
+        "cache": {"enum": ["allow", "require", "forbid"]},
+        "offline": {"enum": ["embedded", "use-alternate", "metadata-only", "unavailable"]},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "media_type", "byte_length", "integrity", "locations", "availability", "retrieval_policy", "rights_policy_id", "access_policy_id", "provenance", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "role": {"$ref": "#/$defs/id"},
+        "media_type": {"$ref": "#/$defs/mediaType"},
+        "byte_length": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "integrity": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state", "algorithm", "digest", "reason"],
+              "properties": {
+                "state": {"const": "verified"},
+                "algorithm": {"const": "sha256"},
+                "digest": {"$ref": "#/$defs/sha256"},
+                "reason": {"type": "null"}
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state", "algorithm", "digest", "reason"],
+              "properties": {
+                "state": {"enum": ["unverified", "unavailable"]},
+                "algorithm": {"type": "null"},
+                "digest": {"type": "null"},
+                "reason": {"type": "string", "minLength": 1}
+              }
+            }
+          ]
+        },
+        "locations": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/location"}},
+        "availability": {"$ref": "#/$defs/availability"},
+        "retrieval_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "authentication", "max_bytes", "ext"],
+          "properties": {
+            "mode": {"enum": ["manual", "on-demand", "prefetch-allowed", "embedded-only", "forbidden"]},
+            "authentication": {"enum": ["none", "application-managed", "user-mediated", "unavailable"]},
+            "max_bytes": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+            "ext": {"$ref": "#/$defs/ext"}
+          }
+        },
+        "rights_policy_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "access_policy_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["actor", "at", "method", "sources", "ext"],
+          "properties": {
+            "actor": {"$ref": "#/$defs/actor"},
+            "at": {"$ref": "#/$defs/timestamp"},
+            "method": {"type": "string", "minLength": 1},
+            "sources": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "ext": {"$ref": "#/$defs/ext"}
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "sourceMaterial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "material_type", "label", "media_type", "identifiers", "resource_ids", "rights_policy_id", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "material_type": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1},
+        "media_type": {"oneOf": [{"$ref": "#/$defs/mediaType"}, {"type": "null"}]},
+        "identifiers": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
+        "resource_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "rights_policy_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "structure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "type", "label", "parent_id", "order", "target_uris", "metadata", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "type": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1},
+        "parent_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "order": {"type": "integer", "minimum": 0},
+        "target_uris": {"type": "array", "items": {"type": "string", "format": "uri"}},
+        "metadata": {"type": "object"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "sequence", "label", "structure_ids", "image_resource_id", "dimensions", "duration_ms", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "label": {"type": "string", "minLength": 1},
+        "structure_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "image_resource_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "dimensions": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["width", "height"],
+              "properties": {"width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}}
+            },
+            {"type": "null"}
+          ]
+        },
+        "duration_ms": {"oneOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "completeness", "updated_at", "message", "retryable", "ext"],
+      "properties": {
+        "state": {"enum": ["planned", "running", "partial", "failed", "complete"]},
+        "completeness": {"type": "number", "minimum": 0, "maximum": 1},
+        "updated_at": {"$ref": "#/$defs/timestamp"},
+        "message": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+        "retryable": {"type": "boolean"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "layerDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "kind", "label", "variant", "language", "current", "lifecycle", "editorial_status", "content_resource_id", "supersedes", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "kind": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1},
+        "variant": {"$ref": "#/$defs/id"},
+        "language": {"oneOf": [{"$ref": "#/$defs/language"}, {"type": "null"}]},
+        "current": {"type": "boolean"},
+        "lifecycle": {"$ref": "#/$defs/lifecycle"},
+        "editorial_status": {"enum": ["machine-draft", "human-draft", "under-review", "approved", "frozen", "superseded"]},
+        "content_resource_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "supersedes": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["layer_id", "revision"],
+              "properties": {"layer_id": {"$ref": "#/$defs/id"}, "revision": {"$ref": "#/$defs/revision"}}
+            },
+            {"type": "null"}
+          ]
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "layerPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer_id", "revision"],
+      "properties": {"layer_id": {"$ref": "#/$defs/id"}, "revision": {"$ref": "#/$defs/revision"}}
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "state", "created_at", "created_by", "previous_release_id", "layer_pins", "resource_ids", "catalog_revision", "citation", "policy", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "state": {"enum": ["draft", "candidate", "published", "withdrawn"]},
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "created_by": {"$ref": "#/$defs/actor"},
+        "previous_release_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "layer_pins": {"type": "array", "items": {"$ref": "#/$defs/layerPin"}},
+        "resource_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "catalog_revision": {"$ref": "#/$defs/revision"},
+        "citation": {"type": "string", "minLength": 1},
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["approved_layers_only", "include_machine_drafts", "ext"],
+          "properties": {
+            "approved_layers_only": {"type": "boolean"},
+            "include_machine_drafts": {"type": "boolean"},
+            "ext": {"$ref": "#/$defs/ext"}
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "registryEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "description", "schema_uri", "renderer_hint", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1},
+        "description": {"type": "string"},
+        "schema_uri": {"oneOf": [{"type": "string", "format": "uri"}, {"type": "null"}]},
+        "renderer_hint": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "registries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer_kinds", "resource_roles", "structure_types", "material_types", "selector_types", "relation_predicates", "capabilities"],
+      "properties": {
+        "layer_kinds": {"type": "array", "items": {"$ref": "#/$defs/registryEntry"}},
+        "resource_roles": {"type": "array", "items": {"$ref": "#/$defs/registryEntry"}},
+        "structure_types": {"type": "array", "items": {"$ref": "#/$defs/registryEntry"}},
+        "material_types": {"type": "array", "items": {"$ref": "#/$defs/registryEntry"}},
+        "selector_types": {"type": "array", "items": {"$ref": "#/$defs/registryEntry"}},
+        "relation_predicates": {"type": "array", "items": {"$ref": "#/$defs/registryEntry"}},
+        "capabilities": {"type": "array", "items": {"$ref": "#/$defs/registryEntry"}}
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_id", "chunk_sets", "citation_uri_template", "ext"],
+      "properties": {
+        "document_id": {"$ref": "#/$defs/id"},
+        "chunk_sets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "layer_id", "revision", "record_schema", "records_resource_id", "content_sha256", "embedding_resource_id", "index_hint", "ext"],
+            "properties": {
+              "id": {"$ref": "#/$defs/id"},
+              "layer_id": {"$ref": "#/$defs/id"},
+              "revision": {"$ref": "#/$defs/revision"},
+              "record_schema": {"type": "string", "format": "uri"},
+              "records_resource_id": {"$ref": "#/$defs/id"},
+              "content_sha256": {"$ref": "#/$defs/sha256"},
+              "embedding_resource_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+              "index_hint": {"type": "object"},
+              "ext": {"$ref": "#/$defs/ext"}
+            }
+          }
+        },
+        "citation_uri_template": {"type": "string", "minLength": 1},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    }
+  }
+}

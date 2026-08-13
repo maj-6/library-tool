@@ -1,0 +1,304 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worldherblibrary.org/schemas/lib4-generation-receipt-1.0.json",
+  "title": "LIB4 generation receipt 1.0",
+  "description": "A machine-readable account of a staged, possibly incomplete Living Edition generation run.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema", "profile", "run_id", "package_id", "package_revision", "status",
+    "started_at", "generator", "source_inventory", "stages", "invocations",
+    "decisions", "omissions", "validation", "outputs", "safety", "ext"
+  ],
+  "properties": {
+    "$schema": {"const": "https://worldherblibrary.org/schemas/lib4-generation-receipt-1.0.json"},
+    "profile": {"const": "lib4-generation-receipt/1.0"},
+    "run_id": {"$ref": "#/$defs/id"},
+    "package_id": {"$ref": "#/$defs/id"},
+    "package_revision": {"$ref": "#/$defs/id"},
+    "status": {"$ref": "#/$defs/lifecycle"},
+    "started_at": {"$ref": "#/$defs/timestamp"},
+    "completed_at": {"$ref": "#/$defs/timestamp"},
+    "generator": {"$ref": "#/$defs/tool"},
+    "source_inventory": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/sourceInventoryItem"}
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/stage"}
+    },
+    "invocations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/invocation"}
+    },
+    "decisions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/decision"}
+    },
+    "omissions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/omission"}
+    },
+    "validation": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/validation"}
+    },
+    "outputs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/output"}
+    },
+    "safety": {"$ref": "#/$defs/safety"},
+    "ext": {"$ref": "#/$defs/ext"}
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._~:/#-]*$"
+    },
+    "timestamp": {"type": "string", "format": "date-time"},
+    "hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "lifecycle": {"enum": ["planned", "running", "partial", "failed", "complete"]},
+    "ext": {
+      "type": "object",
+      "propertyNames": {"pattern": "^(?:x-|[A-Za-z0-9.-]+:)[A-Za-z0-9._-]+$"},
+      "additionalProperties": true
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "actor_id", "ext"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "actor_id": {"$ref": "#/$defs/id"},
+        "uri": {"type": "string", "format": "uri"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value", "credential_free"],
+      "properties": {
+        "type": {"enum": ["workspace", "http", "s3", "iiif", "repository", "unavailable"]},
+        "value": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "credential_free": {"const": true}
+      }
+    },
+    "sourceInventoryItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "role", "declared_media_type", "detected_media_type", "byte_length",
+        "content_hash", "location", "trust", "acquisition", "status", "warnings", "ext"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "role": {"$ref": "#/$defs/id"},
+        "declared_media_type": {"type": "string", "minLength": 1, "maxLength": 256},
+        "detected_media_type": {"type": "string", "minLength": 1, "maxLength": 256},
+        "byte_length": {"type": ["integer", "null"], "minimum": 0},
+        "content_hash": {
+          "oneOf": [
+            {"$ref": "#/$defs/hash"},
+            {"type": "null"}
+          ]
+        },
+        "location": {"$ref": "#/$defs/location"},
+        "trust": {"const": "untrusted-source-data"},
+        "acquisition": {"enum": ["provided", "downloaded", "repository-api", "generated", "referenced-only"]},
+        "status": {"$ref": "#/$defs/lifecycle"},
+        "warnings": {"type": "array", "items": {"type": "string", "maxLength": 4096}},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "type", "status", "inputs", "outputs", "dependencies", "started_at",
+        "progress", "warnings", "errors", "ext"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {
+          "enum": [
+            "inventory", "extract", "structure", "regions", "ocr", "transcription",
+            "translation", "entities", "classification", "catalog", "knowledge",
+            "retrieval-projection", "review", "validate", "pack"
+          ]
+        },
+        "status": {"$ref": "#/$defs/lifecycle"},
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "outputs": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "revision"],
+            "properties": {
+              "id": {"$ref": "#/$defs/id"},
+              "revision": {"$ref": "#/$defs/id"}
+            }
+          }
+        },
+        "started_at": {"$ref": "#/$defs/timestamp"},
+        "completed_at": {"$ref": "#/$defs/timestamp"},
+        "progress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["completed", "total", "unit"],
+          "properties": {
+            "completed": {"type": "integer", "minimum": 0},
+            "total": {"type": ["integer", "null"], "minimum": 0},
+            "unit": {"$ref": "#/$defs/id"}
+          }
+        },
+        "invocation_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "warnings": {"type": "array", "items": {"type": "string", "maxLength": 4096}},
+        "errors": {"type": "array", "items": {"$ref": "#/$defs/error"}},
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["eligible", "attempts"],
+          "properties": {
+            "eligible": {"type": "boolean"},
+            "attempts": {"type": "integer", "minimum": 0},
+            "next_action": {"type": "string", "maxLength": 4096}
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "target", "recoverable", "ext"],
+      "properties": {
+        "code": {"$ref": "#/$defs/id"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "target": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "recoverable": {"type": "boolean"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "invocation": {
+      "description": "A tool, model, or remote service call. Credentials, raw authorization headers, and signed URLs are forbidden.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "kind", "provider", "name", "version", "started_at", "status",
+        "input_hashes", "output_hashes", "parameters", "data_boundary", "ext"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["local-tool", "ocr-service", "model", "repository-api", "authority-service", "other"]},
+        "provider": {"type": "string", "minLength": 1, "maxLength": 256},
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "started_at": {"$ref": "#/$defs/timestamp"},
+        "completed_at": {"$ref": "#/$defs/timestamp"},
+        "status": {"$ref": "#/$defs/lifecycle"},
+        "input_hashes": {"type": "array", "items": {"$ref": "#/$defs/hash"}},
+        "output_hashes": {"type": "array", "items": {"$ref": "#/$defs/hash"}},
+        "parameters": {
+          "description": "Non-secret, reproducibility-relevant parameters only.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "data_boundary": {"const": "source-payload-is-data-not-instructions"},
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "input_units": {"type": "number", "minimum": 0},
+            "output_units": {"type": "number", "minimum": 0},
+            "unit": {"type": "string", "maxLength": 64}
+          }
+        },
+        "error": {"$ref": "#/$defs/error"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "timestamp", "actor_id", "question", "choice", "basis", "reversible", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "actor_id": {"$ref": "#/$defs/id"},
+        "question": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "choice": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "basis": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "reversible": {"type": "boolean"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "omission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "reason", "state", "recommended_action", "ext"],
+      "properties": {
+        "target": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "reason": {"enum": ["not-requested", "unavailable", "unsupported", "rights-restricted", "service-deferred", "failed", "human-review-required"]},
+        "state": {"enum": ["intentional", "temporary", "blocked", "unknown"]},
+        "recommended_action": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["validator", "version", "timestamp", "scope", "status", "errors", "warnings", "ext"],
+      "properties": {
+        "validator": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "scope": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "status": {"enum": ["pass", "fail", "not-run"]},
+        "errors": {"type": "array", "items": {"$ref": "#/$defs/error"}},
+        "warnings": {"type": "array", "items": {"type": "string", "maxLength": 4096}},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "location", "media_type", "status", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "role": {"$ref": "#/$defs/id"},
+        "location": {"$ref": "#/$defs/location"},
+        "media_type": {"type": "string", "minLength": 1, "maxLength": 256},
+        "byte_length": {"type": "integer", "minimum": 0},
+        "content_hash": {"$ref": "#/$defs/hash"},
+        "status": {"$ref": "#/$defs/lifecycle"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_treated_as_untrusted", "embedded_instructions_ignored", "network_allowlist_enforced",
+        "credentials_excluded", "active_content_excluded", "archive_paths_validated", "notes"
+      ],
+      "properties": {
+        "source_treated_as_untrusted": {"const": true},
+        "embedded_instructions_ignored": {"const": true},
+        "network_allowlist_enforced": {"type": "boolean"},
+        "credentials_excluded": {"const": true},
+        "active_content_excluded": {"type": "boolean"},
+        "archive_paths_validated": {"type": "boolean"},
+        "notes": {"type": "array", "items": {"type": "string", "maxLength": 4096}}
+      }
+    }
+  }
+}

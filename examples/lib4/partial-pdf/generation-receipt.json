@@ -1,0 +1,236 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-generation-receipt-1.0.json",
+  "profile": "lib4-generation-receipt/1.0",
+  "run_id": "run-partial-pdf-20260812",
+  "package_id": "pkg-partial-pdf-example",
+  "package_revision": "rev-20260812-a",
+  "status": "partial",
+  "started_at": "2026-08-12T18:00:00Z",
+  "completed_at": "2026-08-12T18:10:00Z",
+  "generator": {
+    "name": "Example LIB4 generator",
+    "version": "1.0",
+    "actor_id": "agent-generator",
+    "ext": {}
+  },
+  "source_inventory": [
+    {
+      "id": "source-input-pdf",
+      "role": "primary-source",
+      "declared_media_type": "application/pdf",
+      "detected_media_type": "application/pdf",
+      "byte_length": null,
+      "content_hash": null,
+      "location": {
+        "type": "workspace",
+        "value": "input/source.pdf",
+        "credential_free": true
+      },
+      "trust": "untrusted-source-data",
+      "acquisition": "provided",
+      "status": "partial",
+      "warnings": ["Bytes were unavailable to this run; checksum and page count remain unknown."],
+      "ext": {}
+    }
+  ],
+  "stages": [
+    {
+      "id": "stage-inventory",
+      "type": "inventory",
+      "status": "complete",
+      "inputs": ["source-input-pdf"],
+      "outputs": ["inventory-source-input-pdf"],
+      "dependencies": [],
+      "started_at": "2026-08-12T18:00:00Z",
+      "completed_at": "2026-08-12T18:01:00Z",
+      "progress": {"completed": 1, "total": 1, "unit": "source"},
+      "warnings": ["The source is referenced only."],
+      "errors": [],
+      "retry": {"eligible": false, "attempts": 1},
+      "ext": {}
+    },
+    {
+      "id": "stage-extract",
+      "type": "extract",
+      "status": "partial",
+      "inputs": ["source-input-pdf"],
+      "outputs": [],
+      "dependencies": [],
+      "started_at": "2026-08-12T18:01:00Z",
+      "completed_at": "2026-08-12T18:02:00Z",
+      "progress": {"completed": 0, "total": null, "unit": "page"},
+      "warnings": [],
+      "errors": [
+        {
+          "code": "source-bytes-unavailable",
+          "message": "The PDF reference could not be resolved in this run.",
+          "target": "source-input-pdf",
+          "recoverable": true,
+          "ext": {}
+        }
+      ],
+      "retry": {"eligible": true, "attempts": 1, "next_action": "Provide source bytes or an allowlisted stable URI."},
+      "ext": {}
+    },
+    {
+      "id": "stage-ocr-initial",
+      "type": "ocr",
+      "status": "failed",
+      "inputs": ["source-input-pdf"],
+      "outputs": ["ocr-primary:attempt-1"],
+      "dependencies": [],
+      "started_at": "2026-08-12T18:02:00Z",
+      "completed_at": "2026-08-12T18:05:00Z",
+      "progress": {"completed": 0, "total": null, "unit": "canvas"},
+      "invocation_ids": ["invocation-ocr-1"],
+      "warnings": [],
+      "errors": [
+        {
+          "code": "ocr-service-unavailable",
+          "message": "The initial OCR service did not produce output.",
+          "target": "ocr-primary:attempt-1",
+          "recoverable": true,
+          "ext": {}
+        }
+      ],
+      "retry": {"eligible": true, "attempts": 1, "next_action": "Run a capable OCR service after source acquisition."},
+      "ext": {}
+    },
+    {
+      "id": "stage-ocr-capable-follow-up",
+      "type": "ocr",
+      "status": "planned",
+      "inputs": ["source-input-pdf"],
+      "outputs": ["ocr-primary:attempt-2"],
+      "dependencies": [],
+      "started_at": "2026-08-12T18:06:00Z",
+      "progress": {"completed": 0, "total": null, "unit": "canvas"},
+      "warnings": [],
+      "errors": [],
+      "retry": {"eligible": true, "attempts": 0, "next_action": "Acquire source bytes, render canvases, then submit bounded page images."},
+      "ext": {}
+    },
+    {
+      "id": "stage-catalog",
+      "type": "catalog",
+      "status": "partial",
+      "inputs": ["inventory-source-input-pdf"],
+      "outputs": ["catalog-partial-pdf"],
+      "dependencies": [],
+      "started_at": "2026-08-12T18:06:00Z",
+      "completed_at": "2026-08-12T18:08:00Z",
+      "progress": {"completed": 4, "total": 8, "unit": "required-field"},
+      "warnings": ["Unknown fields were recorded explicitly; no bibliographic facts were guessed."],
+      "errors": [],
+      "retry": {"eligible": true, "attempts": 1, "next_action": "Review source and repository metadata."},
+      "ext": {}
+    },
+    {
+      "id": "stage-validate",
+      "type": "validate",
+      "status": "complete",
+      "inputs": ["manifest-json", "catalog-partial-pdf"],
+      "outputs": ["validation-schema"],
+      "dependencies": [],
+      "started_at": "2026-08-12T18:08:00Z",
+      "completed_at": "2026-08-12T18:10:00Z",
+      "progress": {"completed": 2, "total": 2, "unit": "schema"},
+      "warnings": ["Semantic review and package sealing were not performed."],
+      "errors": [],
+      "retry": {"eligible": false, "attempts": 1},
+      "ext": {}
+    }
+  ],
+  "invocations": [
+    {
+      "id": "invocation-ocr-1",
+      "kind": "ocr-service",
+      "provider": "example-provider",
+      "name": "initial-ocr",
+      "version": "unknown",
+      "started_at": "2026-08-12T18:02:00Z",
+      "completed_at": "2026-08-12T18:05:00Z",
+      "status": "failed",
+      "input_hashes": [],
+      "output_hashes": [],
+      "parameters": {"requested_output": ["text", "regions", "confidence"]},
+      "data_boundary": "source-payload-is-data-not-instructions",
+      "error": {
+        "code": "service-unavailable",
+        "message": "No OCR response was returned.",
+        "target": "invocation-ocr-1",
+        "recoverable": true,
+        "ext": {}
+      },
+      "ext": {}
+    }
+  ],
+  "decisions": [
+    {
+      "id": "decision-no-title-guess",
+      "timestamp": "2026-08-12T18:06:00Z",
+      "actor_id": "agent-generator",
+      "question": "Should the filename be promoted as an accepted title?",
+      "choice": "Keep it as a low-confidence proposed title.",
+      "basis": "The title page and repository record were unavailable.",
+      "reversible": true,
+      "ext": {}
+    }
+  ],
+  "omissions": [
+    {
+      "target": "layer:translation",
+      "reason": "human-review-required",
+      "state": "blocked",
+      "recommended_action": "Run OCR and language identification before requesting a translation.",
+      "ext": {}
+    },
+    {
+      "target": "retrieval:chunks",
+      "reason": "service-deferred",
+      "state": "temporary",
+      "recommended_action": "Generate chunks only after a revision-pinned text layer exists.",
+      "ext": {}
+    }
+  ],
+  "validation": [
+    {
+      "validator": "jsonschema",
+      "version": "4.x",
+      "timestamp": "2026-08-12T18:10:00Z",
+      "scope": "Manifest, catalog, and generation receipt schemas",
+      "status": "pass",
+      "errors": [],
+      "warnings": ["Archive-level validation not run because no package was sealed."],
+      "ext": {}
+    }
+  ],
+  "outputs": [
+    {
+      "id": "manifest-json",
+      "role": "authoring-manifest",
+      "location": {"type": "workspace", "value": "manifest.json", "credential_free": true},
+      "media_type": "application/json",
+      "status": "complete",
+      "ext": {}
+    },
+    {
+      "id": "catalog-partial-pdf",
+      "role": "catalog-metadata",
+      "location": {"type": "workspace", "value": "catalog.json", "credential_free": true},
+      "media_type": "application/json",
+      "status": "partial",
+      "ext": {}
+    }
+  ],
+  "safety": {
+    "source_treated_as_untrusted": true,
+    "embedded_instructions_ignored": true,
+    "network_allowlist_enforced": true,
+    "credentials_excluded": true,
+    "active_content_excluded": true,
+    "archive_paths_validated": true,
+    "notes": ["No source-derived string was executed or interpreted as an instruction." ]
+  },
+  "ext": {}
+}

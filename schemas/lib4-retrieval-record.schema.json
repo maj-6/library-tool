@@ -1,0 +1,442 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worldherblibrary.org/schemas/lib4-retrieval-record-1.0.json",
+  "title": "LIB4 retrieval projection record 1.0",
+  "description": "A versioned upsert or tombstone record for hybrid, vector, multilingual, and multimodal retrieval. It is a derived projection, not authoritative edition content.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema", "profile", "operation", "record_id", "chunk_id", "chunk_revision",
+    "package", "release_id", "state", "target", "source_layer", "content_hash",
+    "content", "citation", "lineage", "entity_refs", "categories", "rights",
+    "access", "embeddings", "created_at", "updated_at", "ext"
+  ],
+  "properties": {
+    "$schema": {"const": "https://worldherblibrary.org/schemas/lib4-retrieval-record-1.0.json"},
+    "profile": {"const": "lib4-retrieval-record/1.0"},
+    "operation": {"enum": ["upsert", "delete"]},
+    "record_id": {
+      "description": "Deterministic identifier for this exact chunk revision.",
+      "$ref": "#/$defs/id"
+    },
+    "chunk_id": {
+      "description": "Deterministic stable logical slot used for update and deletion.",
+      "$ref": "#/$defs/id"
+    },
+    "chunk_revision": {"$ref": "#/$defs/hash"},
+    "package": {"$ref": "#/$defs/packageRef"},
+    "release_id": {"$ref": "#/$defs/id"},
+    "state": {"enum": ["current", "stale", "restricted", "tombstoned"]},
+    "target": {"$ref": "#/$defs/target"},
+    "source_layer": {"$ref": "#/$defs/layerRef"},
+    "content_hash": {"$ref": "#/$defs/hash"},
+    "content": {"$ref": "#/$defs/content"},
+    "citation": {"$ref": "#/$defs/citation"},
+    "lineage": {"$ref": "#/$defs/lineage"},
+    "entity_refs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/entityRef"}
+    },
+    "categories": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/category"}
+    },
+    "rights": {"$ref": "#/$defs/rights"},
+    "access": {"$ref": "#/$defs/access"},
+    "embeddings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/embedding"}
+    },
+    "created_at": {"$ref": "#/$defs/timestamp"},
+    "updated_at": {"$ref": "#/$defs/timestamp"},
+    "stale_because": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/dependencyRef"}
+    },
+    "tombstone": {"$ref": "#/$defs/tombstone"},
+    "ext": {"$ref": "#/$defs/ext"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"operation": {"const": "delete"}}, "required": ["operation"]},
+      "then": {
+        "properties": {"state": {"const": "tombstoned"}},
+        "required": ["tombstone"]
+      }
+    },
+    {
+      "if": {"properties": {"state": {"const": "stale"}}, "required": ["state"]},
+      "then": {"required": ["stale_because"]}
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._~:/#-]*$"
+    },
+    "timestamp": {"type": "string", "format": "date-time"},
+    "hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "language": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"
+    },
+    "ext": {
+      "type": "object",
+      "propertyNames": {"pattern": "^(?:x-|[A-Za-z0-9.-]+:)[A-Za-z0-9._-]+$"},
+      "additionalProperties": true
+    },
+    "packageRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "format", "profile"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/id"},
+        "format": {"const": "lib/4"},
+        "profile": {"const": "living-edition"}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "selectors"],
+      "properties": {
+        "uri": {"type": "string", "format": "uri"},
+        "selectors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/selector"}
+        }
+      }
+    },
+    "selector": {
+      "oneOf": [
+        {"$ref": "#/$defs/canvasSelector"},
+        {"$ref": "#/$defs/regionSelector"},
+        {"$ref": "#/$defs/textSelector"},
+        {"$ref": "#/$defs/timeSelector"},
+        {"$ref": "#/$defs/resourceSelector"}
+      ]
+    },
+    "canvasSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "canvas_id", "canvas_revision", "geometry"],
+      "properties": {
+        "type": {"const": "canvas"},
+        "canvas_id": {"$ref": "#/$defs/id"},
+        "canvas_revision": {"$ref": "#/$defs/id"},
+        "geometry": {"$ref": "#/$defs/geometry"}
+      }
+    },
+    "regionSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "region_id", "region_layer_id", "region_layer_revision"],
+      "properties": {
+        "type": {"const": "region"},
+        "region_id": {"$ref": "#/$defs/id"},
+        "region_layer_id": {"$ref": "#/$defs/id"},
+        "region_layer_revision": {"$ref": "#/$defs/id"}
+      }
+    },
+    "textSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "item_id", "start", "end", "exact", "prefix", "suffix"],
+      "properties": {
+        "type": {"const": "text"},
+        "item_id": {"$ref": "#/$defs/id"},
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0},
+        "exact": {"type": "string", "maxLength": 65536},
+        "prefix": {"type": "string", "maxLength": 256},
+        "suffix": {"type": "string", "maxLength": 256}
+      }
+    },
+    "timeSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "resource_id", "start_seconds", "end_seconds"],
+      "properties": {
+        "type": {"const": "time"},
+        "resource_id": {"$ref": "#/$defs/id"},
+        "start_seconds": {"type": "number", "minimum": 0},
+        "end_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "resourceSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "resource_id"],
+      "properties": {
+        "type": {"const": "resource"},
+        "resource_id": {"$ref": "#/$defs/id"},
+        "fragment": {"type": "string", "maxLength": 2048}
+      }
+    },
+    "geometry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "coordinate_space", "x", "y", "width", "height"],
+          "properties": {
+            "type": {"const": "box"},
+            "coordinate_space": {"const": "canvas-normalized"},
+            "x": {"type": "number", "minimum": 0, "maximum": 1},
+            "y": {"type": "number", "minimum": 0, "maximum": 1},
+            "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+            "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "coordinate_space", "points"],
+          "properties": {
+            "type": {"const": "polygon"},
+            "coordinate_space": {"const": "canvas-normalized"},
+            "points": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 256,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["x", "y"],
+                "properties": {
+                  "x": {"type": "number", "minimum": 0, "maximum": 1},
+                  "y": {"type": "number", "minimum": 0, "maximum": 1}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "layerRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "kind", "item_ids", "editorial_status"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/id"},
+        "kind": {"$ref": "#/$defs/id"},
+        "item_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "editorial_status": {"enum": ["machine-draft", "human-draft", "under-review", "approved", "frozen", "superseded"]}
+      }
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modality", "language", "trust", "fields", "resource_refs", "alignments", "ext"],
+      "properties": {
+        "modality": {"enum": ["text", "image", "audio", "video", "table", "diagram", "multimodal"]},
+        "language": {"$ref": "#/$defs/language"},
+        "script": {"type": "string", "pattern": "^[A-Z][a-z]{3}$"},
+        "direction": {"enum": ["ltr", "rtl", "ttb", "btt", "mixed"]},
+        "trust": {"const": "untrusted-source-data"},
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "value"],
+            "properties": {
+              "kind": {"enum": ["transcription", "translation", "caption", "description", "heading", "table-text", "alt-text", "summary", "keywords"]},
+              "value": {"type": "string", "maxLength": 262144},
+              "language": {"$ref": "#/$defs/language"},
+              "source_item_id": {"$ref": "#/$defs/id"}
+            }
+          }
+        },
+        "resource_refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["resource_id", "role"],
+            "properties": {
+              "resource_id": {"$ref": "#/$defs/id"},
+              "role": {"$ref": "#/$defs/id"}
+            }
+          }
+        },
+        "alignments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["relation", "target_uri"],
+            "properties": {
+              "relation": {"enum": ["translation-of", "transcription-of", "caption-of", "description-of", "corresponds-to", "continues-at"]},
+              "target_uri": {"type": "string", "format": "uri"}
+            }
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "canonical_uri", "package_revision", "release_id", "locator", "source_hash", "ext"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "canonical_uri": {"type": "string", "format": "uri"},
+        "package_revision": {"$ref": "#/$defs/id"},
+        "release_id": {"$ref": "#/$defs/id"},
+        "locator": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "source_hash": {"$ref": "#/$defs/hash"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projection_profile_id", "projection_profile_version", "inputs", "generated_at", "generator", "ext"],
+      "properties": {
+        "projection_profile_id": {"$ref": "#/$defs/id"},
+        "projection_profile_version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "inputs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/dependencyRef"}},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "generator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "actor_id"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 256},
+            "version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "actor_id": {"$ref": "#/$defs/id"}
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "dependencyRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "content_hash"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/id"},
+        "content_hash": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "entityRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "label", "relation", "assertion_id", "status"],
+      "properties": {
+        "uri": {"type": "string", "format": "uri"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "relation": {"$ref": "#/$defs/id"},
+        "assertion_id": {"$ref": "#/$defs/id"},
+        "status": {"enum": ["proposed", "accepted", "disputed", "rejected", "superseded"]}
+      }
+    },
+    "category": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["term_id", "label", "vocabulary", "assertion_id", "status", "confidence"],
+      "properties": {
+        "term_id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "vocabulary": {"type": "string", "format": "uri"},
+        "assertion_id": {"$ref": "#/$defs/id"},
+        "status": {"enum": ["proposed", "accepted", "disputed", "rejected", "superseded"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "rights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_ids", "effective_allowed_uses", "effective_restrictions", "evaluated_at"],
+      "properties": {
+        "policy_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "effective_allowed_uses": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "effective_restrictions": {"type": "array", "items": {"type": "string", "maxLength": 4096}},
+        "evaluated_at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_ids", "inherited_from", "discover", "read", "index", "embed", "reason", "evaluated_at"],
+      "properties": {
+        "policy_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "inherited_from": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "discover": {"type": "boolean"},
+        "read": {"type": "boolean"},
+        "index": {"type": "boolean"},
+        "embed": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "evaluated_at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "embedding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "modality", "model", "dimensions", "input_hash", "storage", "created_at", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "modality": {"enum": ["text", "image", "audio", "video", "multimodal"]},
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "name", "version"],
+          "properties": {
+            "provider": {"type": "string", "minLength": 1, "maxLength": 256},
+            "name": {"type": "string", "minLength": 1, "maxLength": 256},
+            "version": {"type": "string", "minLength": 1, "maxLength": 256}
+          }
+        },
+        "dimensions": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "input_hash": {"$ref": "#/$defs/hash"},
+        "storage": {"enum": ["inline", "external"]},
+        "vector": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "number"}
+        },
+        "external_ref": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend_id", "collection", "record_key"],
+          "properties": {
+            "backend_id": {"$ref": "#/$defs/id"},
+            "collection": {"type": "string", "minLength": 1, "maxLength": 512},
+            "record_key": {"type": "string", "minLength": 1, "maxLength": 2048}
+          }
+        },
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "ext": {"$ref": "#/$defs/ext"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"storage": {"const": "inline"}}, "required": ["storage"]},
+          "then": {"required": ["vector"]}
+        },
+        {
+          "if": {"properties": {"storage": {"const": "external"}}, "required": ["storage"]},
+          "then": {"required": ["external_ref"]}
+        }
+      ]
+    },
+    "tombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deleted_at", "reason", "superseded_record_ids"],
+      "properties": {
+        "deleted_at": {"$ref": "#/$defs/timestamp"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "superseded_record_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}
+      }
+    }
+  }
+}

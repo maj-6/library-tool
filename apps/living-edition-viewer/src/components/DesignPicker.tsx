@@ -15,7 +15,7 @@ export function DesignPicker({ designs, selected, shortlist, onSelect, onShortli
       <div className="design-picker__heading">
         <div>
           <div className="eyebrow" id="design-picker-title">Layout variants</div>
-          <p>Open Library, Edition, and Entities. Test editing and record a preference.</p>
+          <p>Open Library, Edition, Entities, and Reader. Test. Record a preference.</p>
         </div>
         <Tag minimal icon="layout">{designs.length} layouts</Tag>
       </div>

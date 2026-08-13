@@ -285,7 +285,13 @@ clearly labelled lossy rendering.
     book workspace store          external plant authority store
           |
           v
-    sealed .whled import/export + standard adapters
+    sealed .lib4 import/export + standard adapters
+
+The Local Library Engine also owns retrieval-projection and knowledge-engine
+adapters. External vector databases, lexical indexes and answer services never
+connect directly to the renderer or mutate the canonical book workspace; they
+receive rights-filtered, revision-pinned derived artifacts and return evidence
+references through typed contracts.
 
 The renderer MUST NOT read archives, SQLite/Postgres files, image paths, or
 credentials directly. It asks the main process to select a file, then passes
@@ -343,7 +349,7 @@ focuses a matching window; **Open New Window** is explicit.
 
 ### 6.3 Common shell anatomy
 
-    ┌ Library / Edition / Entities ─ context path ─ search ─ jobs ──────┐
+    ┌ Library / Edition / Entities / Reader ─ context ─ search ─ jobs ──┐
     │ workspace toolbar · view/layer/run selectors · Open in…           │
     ├──────────────┬────────────────────────────────────┬───────────────┤
     │ navigator /  │                                    │ contextual    │
@@ -357,7 +363,8 @@ focuses a matching window; **Open New Window** is explicit.
 
 The anatomy is not a mandatory three-pane template. Library is often
 table/dossier oriented; Edition is canvas/text oriented; Entities is
-record/evidence oriented. The primary work surface can be maximized and later
+record/evidence oriented; Reader is a publication-preview frame plus compact
+simulation controls. The primary work surface can be maximized and later
 restored in one command.
 
 #### 6.3.1 Desktop docking and sizing contract
@@ -492,7 +499,34 @@ entity mentions, unresolved review count, and last activity. Users can resize,
 reorder, show, and hide data columns. Selection, expansion, sorting, filter,
 and scroll position survive opening a record and returning.
 
-### 7.2 Dossier
+### 7.2 Library surface variants under test
+
+The Stage 1.2 mockup compares three views over the same query, selection,
+catalog hierarchy, coverage and command model. They are registered layout
+definitions, not separate Library implementations:
+
+- **Catalog Table** is a dense master-detail catalogue. A column-configurable
+  record grid is primary; the selected item's concise dossier and actions stay
+  visible. It tests rapid comparison and familiar desktop database behavior.
+- **Collection Tree** makes Work -> Edition -> Item -> Representation and
+  curated collections primary. A compact result pane and dossier follow tree
+  selection. It tests hierarchy, mixed material and returning to a known copy.
+- **Workflow Ledger** makes processing/review state primary. Rows group books
+  by actionable coverage gaps, integrity failures and review queues without
+  hiding catalogue identity. It tests triage and bulk scope clarity.
+
+Changing view preserves query, filters, sort where meaningful, selected stable
+record ID and dossier section. A view may recommend columns or grouping but
+cannot maintain a private copy of records, redefine coverage or invent a
+workflow status. Unknown catalog fields use the generic property renderer;
+unknown material types retain their identity and declared capabilities.
+
+The design gate measures time to find a known item, distinguish work/edition/
+copy, identify the next real problem, open the matching Edition location and
+return without losing context. The winning default MAY coexist with the other
+registered views when each serves a distinct job.
+
+### 7.3 Dossier
 
 The dossier has concise sections:
 
@@ -516,7 +550,7 @@ Each value offers provenance and a **Reveal evidence** link. Detailed edits
 open the owning workspace or catalog command surface; the dossier is not a
 second implementation of region or entity editing.
 
-### 7.3 Library actions
+### 7.4 Library actions
 
 Primary actions are Open in Edition, Reveal entities, Add book note, Validate
 archive, Export sealed archive, and Open source metadata. Optional installed
@@ -527,7 +561,7 @@ Bulk actions MUST state whether scope means selected rows, all loaded rows, or
 the complete filtered query. Long, networked, external, or destructive
 actions show a scope sheet and become persistent jobs.
 
-### 7.4 Coverage and attention
+### 7.5 Coverage and attention
 
 Coverage is never one misleading percent. It is a small matrix over canvases:
 
@@ -545,7 +579,7 @@ missing/corrupt source, ambiguous anchors, stale dependent layers, unresolved
 entity assertions, and review requests without requiring acknowledgement of
 routine successes.
 
-### 7.5 Empty, restricted, and degraded states
+### 7.6 Empty, restricted, and degraded states
 
 - An empty library offers Open archive, Import source, and Open recent.
 - A catalogue-only rights tier shows metadata and permitted factual indexes,
@@ -963,7 +997,36 @@ tradition, time range, region, concept kind, referent authority, confidence,
 review state, unresolved/disputed, mention count, and source book. Search
 results keep kinds distinct and show a one-line relationship reason.
 
-### 9.3 Name-form editor
+### 9.3 Entity surface variants under test
+
+The Stage 1.2 mockup compares three projections over the same authority nodes,
+mentions, assertions, evidence, review history and store revision:
+
+- **Concept Record** is a conservative record editor. Identity and scope are
+  primary, with name forms, referents, mentions, evidence and append-only
+  review in tabs/property panes. It tests careful single-concept maintenance.
+- **Name Concordance** is a dense attestation browser grouped by written form,
+  language/script, period and source. It exposes the exact relationship path
+  from form through mention/assertion to concept; it never displays a flat,
+  unexplained synonym list.
+- **Assertion Ledger** makes competing relationship claims and their evidence
+  primary. It aligns subject, predicate, object, author/method, confidence,
+  review state and supersession for comparison and human decision.
+
+Mode changes preserve authority store/release, stable selected node or
+assertion, filters, source-book context and return-to-folio link. Each surface
+invokes the same typed proposal, review and append-only history commands. A
+surface cannot approve by editing a display value, collapse competing claims,
+or write directly through cached labels in a book archive.
+
+The design gate uses the same task in all variants: locate an attested form,
+inspect its manuscript crop, distinguish historical concept from modern
+referent, compare two assertions, record evidence, review one proposal and
+return to the exact folio mention. The final application may retain multiple
+registered entity views if the concordance and ledger remain genuinely useful
+specialist tools.
+
+### 9.4 Name-form editor
 
 A name form records:
 
@@ -992,7 +1055,7 @@ Potential duplicate detection is accent/script/period aware. Merge is a
 previewed changeset that preserves both IDs through a redirect/supersession
 ledger and lists every affected assertion and mention.
 
-### 9.4 Mention editor and three-part anchoring
+### 9.5 Mention editor and three-part anchoring
 
 A mention stores three complementary anchors:
 
@@ -1015,7 +1078,7 @@ An entity record can point into a rights-restricted witness, but the public
 projection must obey that witness’s access policy. Internally permitted
 evidence and publicly safe citation/locator projections remain distinct.
 
-### 9.5 Historical-concept editor
+### 9.6 Historical-concept editor
 
 A historical concept includes label, kind, tradition, period range, geographic
 scope, scope note, and citations. These fields participate in identity. The
@@ -1037,7 +1100,7 @@ Creating a concept requires enough scope to distinguish it from candidates or
 an explicit **scope unresolved** state. The editor warns about overlapping
 concepts and offers Compare; it does not force a merge.
 
-### 9.6 Modern-referent editor
+### 9.7 Modern-referent editor
 
 A referent is typed as taxon, chemical substance, material, preparation, or
 another declared kind. For an external authority the canonical fields are its
@@ -1059,7 +1122,7 @@ Authority refresh:
 not a pressure to choose the most popular taxon. A concept may remain without
 a modern referent indefinitely.
 
-### 9.7 Assertion editor
+### 9.8 Assertion editor
 
 Every interpretive edge is a record with:
 
@@ -1082,7 +1145,7 @@ likely C, the UI cannot offer “therefore A is C” as a mechanical action.
 Modern taxonomic synonymy and historical-concept identity use different
 predicates and never join implicitly.
 
-### 9.8 Evidence and review
+### 9.9 Evidence and review
 
 Evidence can be:
 
@@ -1103,7 +1166,7 @@ new assertion rather than invisibly editing the old author’s work. Dangerous
 recipes/doses MAY require two independent reviews before a publication policy
 allows them, but the editor still exposes their distinct decisions.
 
-### 9.9 Entity review queues and quality views
+### 9.10 Entity review queues and quality views
 
 Queues include:
 
@@ -1124,7 +1187,7 @@ candidate recall, top-ranked result, assertion correctness, and reviewer
 agreement. An “always chooses a species” system fails the unresolved gold
 cases even if its naive accuracy looks high.
 
-### 9.10 Cross-book exploration
+### 9.11 Cross-book exploration
 
 An entity page can arrange occurrences by time, tradition, geography, work,
 edition, or preparation. Selecting an occurrence opens its exact Edition
@@ -1137,7 +1200,7 @@ projects can later reconcile a string with optional language/date to ranked
 concept candidates and evidence links. Reconciliation results are proposals,
 not canonical links.
 
-### 9.11 Cross-store write safety
+### 9.12 Cross-store write safety
 
 Linking a book mention to the external authority can affect two repositories.
 The renderer MUST invoke one engine command; it must never coordinate two
@@ -1152,6 +1215,313 @@ to produce one of:
 No partial link may appear as complete. An archive opened read-only can create
 a local workspace overlay and authority proposal, but the UI labels the book
 projection uncommitted until a writable destination is chosen.
+
+## 9A. Reader Preview workspace
+
+### 9A.1 Product boundary
+
+Reader Preview is a first-class registered workspace inside the editor and a
+separate product workstream. It previews what a public reader would receive;
+it is not the Edition workspace with toolbars hidden. The preview consumes a
+versioned **publication projection** produced by the engine from an explicit
+book revision, release policy, entity-authority release, rights policy and
+site-reader capability profile.
+
+Four states remain visibly distinct:
+
+1. **Living head** is the mutable editorial state and can include unapproved,
+   stale, private or rights-restricted work.
+2. **Preview projection** is a disposable build result for a named policy and
+   viewport. It is never citable merely because it renders.
+3. **Release candidate** is sealed, checksummed and awaiting publication.
+4. **Public release** is the exact immutable version currently served by the
+   site, or explicitly none.
+
+The preview header always names projection state, source revision, release or
+candidate ID, entity release, build time, rights tier and differences from the
+current public release. The default projection includes approved, publishable
+material only. An authorized editor MAY preview proposed or stale layers, but
+the frame receives a persistent **Editorial preview** watermark and a complete
+exclusion/warning list. Preview does not approve, release or publish anything.
+
+### 9A.2 Isolation and fidelity
+
+The engine builds the projection; the renderer does not query mutable stores
+to fill missing public fields. The preview loads a content-addressed snapshot
+through the same reader component contract, style tokens, routing semantics
+and asset adapters intended for the site. Differences between embedded and
+deployed contexts are declared capabilities, never a forked Reader UI.
+
+The preview runs in an isolated webContents/frame with no Node integration,
+preload API, editor credentials, filesystem access, clipboard writes, provider
+keys or arbitrary external navigation. It receives immutable projection data
+and a narrow host bridge for context return, viewport simulation, copyable
+citation and diagnostics. Links are intercepted: internal reader routes remain
+inside preview; entity/page links can also offer **Locate in editor**; external
+links show their destination and follow policy. Publication content cannot
+invoke editor commands.
+
+Preview fidelity is measured rather than assumed. The frame reports reader
+build hash, projection hash, font set, viewport, device scale, locale, writing
+direction, reduced-motion/forced-colors state and missing capabilities. A
+visible **Fidelity** indicator is `Exact`, `Approximate`, or `Blocked`, with a
+terse diagnostic. Exact means the same reader bundle and data projection as
+the target deployment, not merely similar CSS.
+
+### 9A.3 Reader composition model
+
+The product may need several reader experiences, but MUST NOT grow one bespoke
+application per audience/material combination. A reader type is a resolved
+composition of four orthogonal inputs:
+
+1. **Audience profile** describes the reader's current task and information
+   density. It changes defaults and navigation emphasis, not scholarly truth.
+2. **Material profile** declares structural and media capabilities supplied by
+   the publication, such as folios, articles, plates or timed media.
+3. **Presentation mode** selects a compatible spatial arrangement, such as
+   continuous reading, facsimile, parallel evidence or comparison.
+4. **Publication policy** determines which reviewed layers, notes, entities,
+   assets and rights tiers may enter the projection. It is authoritative and
+   cannot be relaxed by an audience or presentation choice.
+
+These inputs are typed open registries. Definitions have opaque IDs, labels,
+capability requirements, compatibility rules, fallbacks, commands and renderer
+contributions. Domain data remains in the shared canvas, structure, layer,
+segment, annotation, entity, release and citation models. Reader definitions
+MUST NOT add special-case fields to a book record or branch on filenames,
+MIME types, a known herbal, or a fixed asset list.
+
+The shared reader kernel owns identity, release routing, permanent citations,
+rights, search, entity links, notes, accessibility, selection, history and
+diagnostics. Material adapters contribute only genuine material behavior.
+Presentation modes arrange registered primitives. Audience profiles select
+defaults, labels and progressive disclosure. This boundary permits a new
+material adapter or audience profile without copying the reader shell.
+
+### 9A.4 Audience profiles
+
+The initial `reader.audience-profile` registry explores these task profiles:
+
+- **Research** prioritizes source evidence, apparatus, uncertainty,
+  provenance, layer/revision identity, contributor credit and precise citation.
+  It defaults to Parallel or Facsimile where those modes are compatible.
+- **General** prioritizes an approved readable text, orientation, restrained
+  notes, figures, glossary/entity explanations and an obvious path to evidence.
+  It defaults to Reading without hiding the existence of the source.
+- **Teaching** adds guided sequences, selected comparisons, glossary terms,
+  discussion prompts, learning context and stable classroom citations. Only
+  explicitly published teaching layers are shown; draft instructor notes do
+  not leak into a public projection.
+- **Reference** prioritizes rapid lookup, contents/index navigation, occurrence
+  lists, entity cross-links, bibliographic context and copyable citations. It
+  defaults to Explore or a dense Reading layout according to material.
+
+Additional profiles such as language learning or community annotation MAY be
+registered later. A profile can recommend vocabulary and navigation density,
+but it cannot synthesize a simplified text, suppress a dispute, modernize a
+name or substitute a translation at render time. Such content must exist as a
+separate versioned, reviewed and publishable layer with visible attribution.
+
+Accessibility is a baseline across every profile, not a lesser or segregated
+audience. **Assisted access** is a portable preference preset over compatible
+profiles: text and spacing scale, simplified chrome, keyboard/voice navigation,
+descriptions, synchronized audio, reduced motion and contrast preferences.
+The resolver reports when the publication lacks an accessible equivalent; it
+does not silently remove the object or claim equivalence. Personal settings
+are not written into the scholarly package or citation.
+
+Audience profile is a reversible view preference. A publication MAY recommend
+a default, and an editor MAY preview any allowed profile. A public reader can
+change profile without changing release, stable location or citation target.
+
+### 9A.5 Material profiles and adapters
+
+A material profile is inferred from declared catalog/structure capabilities
+and confirmed or overridden by an editor. It is not inferred from file
+extension alone. Initial profiles are:
+
+| Material profile | Structural capabilities | Reader-specific behavior |
+| --- | --- | --- |
+| Manuscript/codex | leaves, recto/verso, gatherings, regions, hands, marginalia | folio/spread navigation, source-first zoom, uncertain readings, hand and marginalia explanations |
+| Early printed book | pages, signatures, columns, running furniture, catchwords, illustrations | page/spread navigation, optional furniture, signature/column context, engraving/caption links |
+| Modern monograph/text | parts, chapters, sections, notes, bibliography | continuous reading, contents, endnote return, semantic section progress |
+| Illustrated/plate work | plates, figures, captions, facing text, image sequence | image-led browsing, paired plates/captions, figure index, high-resolution inspection |
+| Serial/periodical | title, volume, issue, article, supplement, advertisement | issue/article hierarchy, next article, issue context, article-level citation and search |
+| Reference or multi-volume work | volumes, entries, indexes, cross-references | entry lookup, volume context, cross-reference trail, dense result navigation |
+| Time-based or born-digital work | media tracks, time selectors, transcripts, interactive surrogates | synchronized media/transcript and time citation only when safe registered renderers exist |
+
+Profiles are composable capability sets rather than a closed enum. A work may
+be both serial and illustrated, or a codex may include a laid-in fragment with
+a different local structure. Adapters can apply at work, structure node,
+canvas or asset scope. The most specific compatible adapter supplies behavior
+while the common kernel preserves navigation and citation semantics.
+
+An unknown material profile falls back to a generic ordered-object reader:
+stable structure tree, safe asset link or generic renderer, published text,
+metadata, citations and an explicit capability warning. Unsupported content is
+listed with reason. Archive-provided scripts/components never execute; reader
+adapters are trusted application registrations referenced by namespaced IDs.
+
+### 9A.6 Presentation modes
+
+All modes render the same stable structures, canvases, segments, citations,
+approvals and entity assertions. A typed presentation registry supplies
+compatible layouts; it does not introduce a second text or entity model.
+
+**Reading** presents continuous approved reading text with restrained page or
+structure breaks, figures and notes on demand. Source evidence remains one
+command away. It tests long-form legibility, navigation, footnote return,
+entity explanations and search without exposing editorial controls.
+
+**Facsimile** makes source assets dominant, with synchronized published text,
+regions and entity details in a drawer. It tests zoom, tiled loading, spread or
+folio navigation, full-screen use and access to text when an image is difficult
+to read. A non-image source uses its registered safe asset renderer.
+
+**Parallel** presents source, selected transcription and selected translation
+in synchronized panes. It exposes layer/revision labels, uncertainty,
+apparatus, entity mentions, contributor/review state and version-pinned
+citation. Narrow viewports use named tabs without losing selection or context.
+
+**Compare** shows two explicitly selected published layers, witnesses or
+releases with text diff and, where meaningful, aligned geometry. It never
+creates an unrecorded consensus. Missing alignment remains visibly missing.
+
+**Explore** emphasizes structure, index, search, entity occurrence and media
+relationships. It is useful for reference works, plate collections and
+catalog-led discovery while keeping the cited source one command away.
+
+**Media** synchronizes a safe registered time-based renderer with transcript,
+descriptions and time selectors. It is offered only when required capabilities
+and accessible alternatives are present; otherwise the resolver explains why
+it is unavailable.
+
+Modes are presentation presets. A URL may preserve a mode, but a citation
+identifies release and scholarly object independently. Unknown publishable
+layer kinds use a generic inspector or are listed as omitted with reason. They
+are not silently flattened.
+
+### 9A.7 Compatibility resolver and representative readers
+
+The resolver receives publication/material capabilities, available approved
+layers, rights policy, audience preference, requested mode, viewport, locale
+and access preferences. It returns:
+
+- one recommended composition and the reason for it;
+- compatible alternatives, unmet optional capabilities and blocked choices;
+- the exact layer/revision pins and asset renditions used;
+- deterministic fallbacks for missing geometry, images, alignment or media;
+- publication problems that require editor action rather than reader repair.
+
+The resolver MUST NOT fetch a different revision, use a private layer, promote
+a proposed assertion, generate text or silently change a cited layer to make a
+layout work. If a requested mode is incompatible, it retains the requested
+stable object, selects the declared fallback and displays a terse explanation.
+
+Stage 1 explores representative compositions rather than every Cartesian
+permutation:
+
+| Working reader | Audience | Material capabilities | Default mode | Design question |
+| --- | --- | --- | --- | --- |
+| Manuscript Research Desk | Research | manuscript/codex | Parallel | Can evidence, uncertainty and folio location remain legible together? |
+| General Reading Edition | General | manuscript or early print | Reading | Can a reader follow the text while source evidence stays close and trustworthy? |
+| Classroom Guided Edition | Teaching | any structured textual work | Reading | Can guided context help without becoming an unpublished alternate edition? |
+| Plate Atlas | General or Reference | illustrated/plate work | Explore | Can image sequence, caption, facing text and entity index remain coherent? |
+| Serial Article Reader | General or Reference | serial/periodical | Reading | Can article flow retain issue, volume and advertisement/supplement context? |
+| Source Comparison Desk | Research | multiple witnesses/layers | Compare | Can differences be inspected without implying a consensus? |
+| Synchronized Media Reader | audience-selected | time-based media | Media | Are transcript, description and time citations robust and accessible? |
+
+Assisted-access preferences are tested across these compositions, not as a
+separate row. The test matrix uses pairwise audience/material/mode coverage,
+plus full coverage of each required capability, fallback and rights state.
+This controls scope without assuming one successful herbal page generalizes
+to every audience or material type.
+
+### 9A.8 Preview controls and responsive states
+
+Editor-owned controls sit outside the reader frame in one compact desktop
+toolbar:
+
+- projection: approved-only, authorized editorial preview, release candidate,
+  or public release;
+- audience profile, detected material capabilities and their resolver reason;
+- reader mode: Reading, Facsimile, Parallel, Compare, Explore, Media, plus
+  registered future modes; incompatible modes remain inspectable with reason;
+- viewport: responsive, desktop, tablet, mobile, print and custom dimensions;
+- locale, text scale, color/contrast simulation and reduced motion;
+- compare with public, refresh projection, copy preview URL/citation, open
+  deployed site when available, and locate current object in Edition/Entities;
+- Problems opens missing assets, stale dependencies, rights exclusions,
+  broken anchors, overflows, missing glyphs and accessibility findings.
+
+Desktop/tablet/mobile presets resize the content viewport, not the Electron
+window. The toolbar shows exact CSS dimensions and device scale. Rotation,
+safe-area insets, touch hit targets, virtual keyboard occlusion, browser zoom,
+200% text zoom and print pagination are separate checks. Presets are registry
+data and may be extended without branching Reader components.
+
+Preview maintains an editor context envelope outside public URLs: source book,
+canvas/segment/entity, selected projection, mode and viewport. Switching
+Reader to Edition returns to the same stable object. Following an approved
+plant link to Entities retains a return path to the reader segment. Reader
+navigation history and editor navigation history remain distinct but can
+exchange explicit context links.
+
+### 9A.9 Public reader requirements
+
+The production Reader requires its own accessibility, performance, security,
+rights and browser-compatibility acceptance program:
+
+- semantic headings, landmarks, synchronized selection alternatives, usable
+  tables/tabs/drawers, skip links, visible focus and complete keyboard paths;
+- WCAG 2.2 AA in the supported light and forced-colors presentations, with
+  reflow at 400% and correct screen-reader announcements for page/segment
+  navigation, notes and image regions;
+- mixed-script font coverage, bidi isolation, language changes, vertical text
+  where declared and no reliance on Segoe UI for manuscript glyph coverage;
+- progressive image tiles, bounded text/layer payloads, stable layout,
+  cancellable search and useful low-bandwidth/offline error states;
+- permanent citation resolution, release-aware search results, canonical and
+  alternate URLs, structured metadata, social previews and print styles;
+- rights enforcement in projection and delivery, accessible rights notices,
+  no restricted image leakage through thumbnails, crops, caches or metadata;
+- content security policy, sanitized scholarly markup, safe external links,
+  no executable archive content and no dependence on editor authentication;
+- analytics disabled by default in embedded preview and privacy-reviewed on
+  the public site; scholarly text and searches are not silently exported.
+
+Reader Preview acceptance uses screenshot and semantic parity tests against
+the independently deployed site reader for the representative composition matrix,
+every registered capability, mode, viewport, rights state and degraded state.
+A production reader is not complete when a single herbal page looks correct;
+it must survive long books, absent images, mixed scripts, competing
+translations, unresolved entities, serial hierarchies, plates, rights tiers,
+deep links, stale public citations and old frozen releases.
+
+### 9A.10 Reader iteration gates
+
+Reader work proceeds independently but coordinates with the editor gates:
+
+1. **R0 projection contract:** approved/stale/private/rights filtering,
+   release IDs, entity snapshots, citations and exclusions are deterministic.
+2. **R1 composition exploration:** representative audience/material/mode
+   compositions complete the same reading, evidence, entity, citation and
+   return-context tasks at desktop, tablet, mobile and print widths. Pairwise
+   coverage, every capability fallback and assisted-access presets are tested.
+   R1 requires a manuscript fixture and at least one structurally different
+   positive non-manuscript fixture; a simulated fallback alone does not pass.
+3. **R2 component parity:** the embedded preview and stand-alone site use the
+   same reader bundle/contracts; fidelity diagnostics and hostile-content tests
+   pass.
+4. **R3 publication pilot:** a sealed herbal release is deployed to staging;
+   accessibility, performance, rights, preservation URLs and browser support
+   pass with representative readers and scholars.
+5. **R4 production:** publishing remains a separate authorized command with
+   audit receipt, rollback/previous release, monitoring and archive deposit.
+
+Choosing a visual Reader mode does not pass these gates. Until R3, Reader is
+labelled prototype/preview and the editor MUST NOT imply that **Open site** is
+the authoritative public edition.
 
 ## 10. End-to-end workflows
 
@@ -1600,6 +1970,8 @@ include:
 - library.notes and corrections.reviews;
 - living-edition.archive.import/export;
 - plant-authority.read/edit/review/reconcile;
+- knowledge.retrieval.read/index/delete, knowledge.answer.propose and
+  knowledge.evidence.inspect;
 - library.jobs and library.history.
 
 Missing optional capabilities remove irrelevant commands or show one
@@ -1648,6 +2020,101 @@ stub. Rights and access are a dedicated editor with evidence and policy
 version; they are not a generic tag. Changes that affect a frozen release
 create a new live revision and never alter the release.
 
+## 12A. Knowledge engine and retrieval projections
+
+Knowledge-engine integration is a primary product boundary, not a later
+full-text-search add-on. The canonical edition remains canvases, structures,
+layers, annotations, entities, assertions and releases. Vector chunks,
+embeddings, summaries, answer caches and graph projections are derived,
+replaceable artifacts pinned to that evidence; they never become the source
+of record merely because retrieval ranks them highly.
+
+### 12A.1 Retrieval projection contract
+
+The engine can build a named retrieval projection for an exact `.lib4`
+release or living revision. Each chunk has:
+
+- opaque stable chunk ID, projection/release ID and deterministic content hash;
+- source layer ID and revision, target/structure path, segment IDs and exact
+  image/text/time selectors sufficient to open the cited evidence;
+- text or a content-addressed text resource, language/script, direction and
+  chunking recipe/version;
+- catalog context, headings/breadcrumbs, material profile and page/folio/
+  article labels that are display metadata rather than identity;
+- entity/assertion IDs and review states, without promoting proposed identity;
+- inherited rights/access policy, embargo and tenant/library scope;
+- provenance, review/freshness state and dependency hashes;
+- optional multimodal links to image regions, captions, tables, figures,
+  audio/video cues and accessible descriptions;
+- zero or more embedding descriptors containing provider/model/version,
+  dimensions, distance metric, input hash and either an embedded vector
+  resource or an opaque external vector-record reference.
+
+The package need not carry embeddings. A vector database can be rebuilt from
+approved chunks, and an external index stores package/release/chunk IDs rather
+than becoming the only copy of scholarly text. API credentials, collection
+secrets and expiring signed URLs never enter `.lib4`.
+
+Chunking is material- and layer-aware. It respects semantic sections and
+article boundaries where present, preserves sentence/region anchors for
+manuscripts, keeps table/figure/caption relationships, and records overlap.
+OCR, diplomatic transcription, normalization and translation remain distinct
+retrieval fields or indexes. A query can select them explicitly; the backend
+does not concatenate them into an unattributed consensus string.
+
+### 12A.2 Updates, deletion and access
+
+A changed source layer marks dependent chunks and embeddings stale. Rebuilds
+emit upserts and tombstones keyed by projection plus chunk ID so old vectors do
+not survive invisibly. Frozen releases retain their own immutable retrieval
+projection. Living-head indexes are visibly non-citable and use a separate
+namespace from release indexes.
+
+Access is enforced before retrieval and again before answer assembly. The most
+restrictive applicable book, asset, layer, note and chunk policy wins. Search
+snippets, embeddings, thumbnails, logs and cached answers cannot reveal text
+or images excluded from delivery. Rights changes trigger deletion receipts
+for every configured external index and a report of any backend that could not
+be reached.
+
+### 12A.3 RAG runtime and trust boundary
+
+Retrieved book text, OCR, catalog notes and archive metadata are untrusted
+content, never system/tool instructions. The knowledge engine isolates source
+content from prompts, strips executable markup, refuses archive-supplied code,
+uses allowlisted tools and treats instructions found inside a book as quoted
+evidence. Answers MUST cite release-pinned targets/selectors and expose the
+supporting source crop/text. Unsupported claims are labelled inference or
+omitted; retrieval score is not evidence of truth.
+
+An answer may be saved only as a proposed commentary/summary/knowledge layer
+with query, retrieved chunk IDs, model/version, parameters, answer hash,
+citations and responsible agent. It cannot approve itself, overwrite a human
+layer, resolve an entity assertion or alter catalog metadata. Later source
+changes make the proposal stale through the same dependency graph.
+
+### 12A.4 Application surface
+
+When `knowledge.retrieval` is installed, the shell gains registered Search,
+Ask, Index and Evidence contributions; these MAY become a dedicated Knowledge
+workspace after a separate design gate. The first surface provides:
+
+- exact scope: library/query, book, release/living head, layer kinds,
+  languages, rights tier and entity filters;
+- answer mode versus raw ranked chunks, with hybrid lexical/vector controls;
+- citations that open the exact Edition region/segment and name the retrieved
+  layer/revision;
+- an evidence inspector for chunk text, source selector, catalog path,
+  entities, score components, provenance, rights and staleness;
+- index health, model/recipe, last build, coverage, stale/tombstone counts and
+  durable reindex jobs;
+- **Save proposal**, never an unlabeled one-click publication command.
+
+Unknown retrieval artifact kinds use the generic artifact inspector. Backend
+adapters declare supported filters, vector dimensions, deletion semantics and
+health through capability discovery; the renderer never branches on Pinecone,
+pgvector, Elasticsearch or another vendor name.
+
 ## 13. Electron, archive, rights, and security boundaries
 
 ### 13.1 Electron hardening
@@ -1681,7 +2148,11 @@ inside the application. No archive can register a new executable protocol.
 
 ### 13.2 Archive opening and sealing
 
-The .whled adapter MUST stage and validate before publication into a workspace:
+The canonical Living Edition interchange is the ZIP-based `.lib4` package
+with manifest format marker `lib/4`. The earlier `.whled` proof-of-concept is
+accepted only through a labelled compatibility importer and is never emitted
+as the production format. The `.lib4` adapter MUST stage and validate before
+publication into a workspace:
 
 - reject absolute paths, drive/UNC paths, parent traversal, NULs, duplicate
   normalized names, case-fold collisions, symlinks, hard links, devices and
@@ -1997,7 +2468,7 @@ Cmd on macOS.
 
 | Shortcut | Command |
 | --- | --- |
-| Ctrl+1 / Ctrl+2 / Ctrl+3 | Library / Edition / Entities |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4 | Library / Edition / Entities / Reader |
 | Ctrl+O | Open archive/source |
 | Ctrl+S | Save active named draft |
 | Ctrl+Z / Ctrl+Y | Undo / Redo active aggregate command |
@@ -2174,7 +2645,11 @@ trees.
 - golden headless workflows for import, region edit, type creation, reading
   order, text correction, stale propagation, reprocessing proposal, entity
   link, cross-store recovery and export;
-- .whled deterministic round trip and unknown-extension preservation;
+- .lib4 deterministic round trip, external-asset reference handling and
+  unknown-extension preservation; compatibility import tests cover `.whled`;
+- retrieval projection golden tests cover stable chunks, source selectors,
+  rights inheritance, stale/upsert/tombstone deltas and external embedding
+  receipts without requiring a live vector vendor;
 - hostile archive corpus: traversal, collision, bombs, malformed JSON/XML,
   checksum drift, truncated images/PDFs, huge dimensions and external entities;
 - forward-version/read-only behavior and exact validation/loss receipts;
@@ -2195,6 +2670,8 @@ chosen equivalent for complete workflows:
 - two-window text and geometry conflicts;
 - offline/provider failure/entity-store disconnect;
 - archive export interrupted for storage/full/permission then retried;
+- indexed answer -> exact release/layer/region evidence, source correction ->
+  stale chunks -> reindex/tombstone receipt, and denied-rights non-retrieval;
 - restore a crash draft without affecting canonical revision.
 
 Network/provider tests use recorded contract fixtures; CI never spends API
@@ -2242,8 +2719,8 @@ apps/living-edition-viewer/dist/index.html. It is a single-page gallery with
 in-page workspace switching. Fixture actions do not write canonical book or
 authority data.
 
-Every variant MUST visibly provide **Library**, **Edition**, and **Entities**
-navigation and show how exact context crosses among them. All seven use the
+Every variant MUST visibly provide **Library**, **Edition**, **Entities**, and
+**Reader** navigation and show how exact context crosses among them. All seven use the
 same content, states, Blueprint components, window size and task script so
 reviewers compare layout decisions rather than sample-data advantages.
 Every variant uses Segoe UI, light-only desktop chrome, the same platform menu,
@@ -2343,9 +2820,10 @@ Test hypotheses:
   better than a web-dashboard treatment.
 
 Library uses a collection tree, result grid and docked properties/dossier.
-Entities uses a record tree, relationship grid and evidence properties. The
-three workspaces are different arrangements of the same registered panes,
-commands and status providers.
+Entities uses a record tree, relationship grid and evidence properties. Reader
+uses an isolated preview frame and host-owned composition controls. The four
+workspaces are different arrangements of the same registered panes, commands
+and status providers where those contributions are applicable.
 
 ### 20.7 Variant F — Parallel Register
 
@@ -2407,14 +2885,17 @@ Each reviewer performs, in every variant:
 7. Open the assertion in Entities, inspect evidence, and return to the exact
    mention/crop.
 8. Return to Library with filter, selection and dossier position intact.
+9. Open Reader, test a compatible and an incompatible audience/material/mode
+   composition, inspect the fallback reason, copy a release-pinned citation,
+   then return to the exact Edition segment.
 
 Record completion, time, errors/recovery, wrong-layer edits, context loss,
 viewport/pane changes, confidence, state comprehension, keyboard path, and
 think-aloud comments. After all variants, reviewers choose:
 
 - preferred overall foundation;
-- best Library, Edition geometry, reading, comparison, review, and Entities
-  elements;
+- best Library, Edition geometry, reading, comparison, review, Entities, and
+  Reader composition elements;
 - elements to combine or reject;
 - one change required before another test.
 
@@ -2424,14 +2905,15 @@ The review team records evidence in this order:
 
 | Criterion | Weight |
 | --- | ---: |
-| Scholarly/data integrity and state comprehension | 20 |
-| Region/text editing effectiveness | 15 |
-| Layer/engine comparison effectiveness | 12 |
-| Desktop command, docking and resize efficiency | 13 |
-| Information density, typography and copy clarity | 10 |
+| Scholarly/data integrity and state comprehension | 18 |
+| Region/text editing effectiveness | 14 |
+| Layer/engine comparison effectiveness | 11 |
+| Desktop command, docking and resize efficiency | 11 |
+| Information density, typography and copy clarity | 9 |
 | Cross-navigation and context recovery | 8 |
-| Library/catalogue work | 7 |
-| Entity assertion/evidence work | 7 |
+| Library/catalogue work | 6 |
+| Entity assertion/evidence work | 6 |
+| Reader composition and publication-preview fidelity | 9 |
 | Keyboard, screen-reader structure and scaling | 8 |
 
 Scores summarize observations; they do not overrule a safety or accessibility
@@ -2467,7 +2949,7 @@ Work:
   botanist/historian, preservation and rights stakeholders;
 - inventory the actual herbal pages, scripts, hands, marginalia, region
   failures, own OCR and Mistral OCR 4 outputs;
-- finalize the .whled and external authority proof-of-concept schemas;
+- finalize the .lib4 and external authority proof-of-concept schemas;
 - define gold tasks, terminology, user roles and accessibility needs;
 - record engine capability/command gaps without implementing UI rules.
 
@@ -2483,6 +2965,13 @@ Work:
 - maintain A Scriptorium, B Spatial Lab, C Review Queue, D Layer Matrix,
   E Drafting Desk, F Parallel Register and G Catalog Console in the shared
   gallery;
+- compare Catalog Table, Collection Tree and Workflow Ledger over the same
+  Library model, and Concept Record, Name Concordance and Assertion Ledger over
+  the same authority model;
+- exercise representative audience/material/presentation Reader compositions,
+  assisted-access presets, incompatibility explanations and responsive frames;
+- include at least one positive non-manuscript Reader fixture in addition to
+  the herbal so material adapters are tested rather than merely described;
 - run internal heuristic, keyboard, light-theme contrast, minimum-window,
   pane-resize/restore and 200% zoom review;
 - audit every surface for Segoe UI, compact desktop density, terse declarative
@@ -2504,6 +2993,8 @@ Work:
 - build medium-fidelity interactive prototypes for the finalists/hybrid;
 - implement fixture-only geometry gestures, text diff, reading-order list,
   note/reprocess scope, entity assertion comparison and cross-navigation;
+- refine the selected Library and Entity projections and the Reader resolver/
+  preview frame as separate registered contributions to the shared shell;
 - implement registered pane show/hide, docking roles, keyboard splitter resize,
   collapse/restore, minimum-window behavior, layout reset and exact status-bar
   feedback;
@@ -2534,6 +3025,10 @@ Work:
   paths;
 - prove registration collision, unknown resource/property kind, unavailable
   adapter and removed-pane layout migration paths without data loss;
+- prove Reader projection filtering, composition resolution, deterministic
+  fallback and release-pinned citation independent of the renderer;
+- prove retrieval chunk generation, exact selectors, rights filtering,
+  stale/upsert/tombstone deltas and a vendor-neutral embedding receipt;
 - generate the EngineClient and forbid direct renderer filesystem/network
   mutations.
 
@@ -2549,6 +3044,12 @@ Work:
 - implement Library search/dossier, one canvas, rect/polygon/type/order,
   two-engine comparison, diplomatic edit, scoped note/reprocessing request,
   entity linking/assertion comparison, jobs and archive save/export;
+- include an isolated Reader Preview for one sealed publication projection,
+  with at least two audience profiles, two material adapters, three modes and
+  an incompatible-mode diagnostic; publishing itself remains out of scope;
+- include a read-only Knowledge evidence slice over local fixture chunks:
+  scoped search, exact source navigation and index-health diagnostics; live
+  third-party vector infrastructure remains out of scope;
 - implement the native menu, registered one-row toolbar, docked panes/property
   inspector, status bar and saved/reset layouts at both reference window sizes;
 - use real herbal canvases while keeping legacy tools available;
@@ -2607,8 +3108,8 @@ plan, not an unrecorded UI adjustment.
 
 ### Structure and navigation
 
-- Library, Edition and Entities are always discoverable and preserve their
-  local state.
+- Library, Edition, Entities and Reader are always discoverable and preserve
+  their local state.
 - Any book/entity URI opens its nearest surviving target and explains
   degradation.
 - Entity → mention → page and page mention → entity round trips restore exact
@@ -2660,6 +3161,23 @@ plan, not an unrecorded UI adjustment.
   without silent loss.
 - Hostile/corrupt archives cannot escape staging or execute content.
 - No renderer receives provider secrets or unrestricted local paths.
+
+### Knowledge and retrieval integrity
+
+- Retrieval chunks pin exact release/layer revisions and open their source
+  selectors; display page numbers and vector row IDs are never identity.
+- OCR, transcription, normalization, translation and commentary remain
+  attributable fields or indexes, not an unrecorded consensus blob.
+- Source changes deterministically produce stale/upsert/tombstone deltas; old
+  vectors cannot remain silently active in a living-head namespace.
+- Rights and access are enforced before retrieval, snippet generation and
+  answer assembly, with deletion receipts for external indexes.
+- Every answer claim exposes cited evidence or is labelled inference; book
+  content is untrusted data and cannot supply executable prompt instructions.
+- Saved answers enter only as proposed, provenance-rich knowledge layers and
+  cannot self-approve or mutate catalog/entity assertions.
+- At least one vendor-neutral rebuild succeeds with no embedded vectors, and
+  one external embedding receipt round-trips without credentials.
 
 ### Desktop shell and extension
 
@@ -2715,6 +3233,10 @@ plan, not an unrecorded UI adjustment.
 | Huge packages exhaust disk/memory | Streaming staged validation, configurable ceilings, tiles/paging, byte-bounded caches |
 | Cross-store partial write | Engine-owned recoverable unit of work and repair receipt |
 | Rights-restricted text leaks through search/export | Engine policy projections, query caps and pinned export readiness |
+| Stale vectors outlive corrected text | Release namespaces, dependency hashes, deterministic upsert/tombstone receipts and index audits |
+| Book text performs prompt injection | Treat every retrieved field as untrusted quoted data; isolate prompts/tools and allowlist actions |
+| Generated catalog guesses become facts | Reified proposed assertions, evidence/confidence, incomplete state and human/engine review gates |
+| Retrieval vendor becomes the preservation copy | Canonical chunks/selectors remain rebuildable in `.lib4`; external IDs are replaceable receipts |
 | Private notes/credentials escape | audience defaults, explicit bundle policy, write-only secret store, redacted diagnostics |
 | Prototype visual choice ossifies bad schema | G0/G3 contract gates precede production; semantic changes require ADR |
 
@@ -2735,6 +3257,8 @@ plan, not an unrecorded UI adjustment.
 - which external botanical authorities can be licensed/linked and how often
   snapshots are checked;
 - institution-specific rights/export profiles;
+- retrieval chunking profiles, embedding models and vector/lexical backends
+  after representative manuscript, serial, article, table and image tests;
 - which IIIF, ALTO, PAGE, TEI, Web Annotation, MODS/METS/PREMIS, BagIt or OCFL
   adapters enter the first stable bundle.
 

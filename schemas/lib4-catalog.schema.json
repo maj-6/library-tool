@@ -1,0 +1,556 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worldherblibrary.org/schemas/lib4-catalog-1.0.json",
+  "title": "LIB4 catalog metadata profile 1.0",
+  "description": "An attributable, revisioned catalog graph plus a compact discovery projection. This object is embedded as manifest.catalog in a lib/4 Living Edition.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "record",
+    "primary_entity_id",
+    "entities",
+    "relationships",
+    "agents",
+    "contributions",
+    "statements",
+    "entry_projection",
+    "rights_policies",
+    "access_policies",
+    "provenance_events",
+    "registries",
+    "ext"
+  ],
+  "properties": {
+    "$schema": {"type": "string", "format": "uri"},
+    "profile": {"const": "lib4-catalog/1.0"},
+    "record": {"$ref": "#/$defs/record"},
+    "primary_entity_id": {"$ref": "#/$defs/id"},
+    "entities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/catalogEntity"}
+    },
+    "relationships": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/relationship"}
+    },
+    "agents": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/agent"}
+    },
+    "contributions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/contribution"}
+    },
+    "statements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/statement"}
+    },
+    "entry_projection": {"$ref": "#/$defs/entryProjection"},
+    "rights_policies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/rightsPolicy"}
+    },
+    "access_policies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/accessPolicy"}
+    },
+    "provenance_events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/provenanceEvent"}
+    },
+    "registries": {"$ref": "#/$defs/registries"},
+    "ext": {"$ref": "#/$defs/ext"}
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._~:/#-]*$"
+    },
+    "timestamp": {"type": "string", "format": "date-time"},
+    "language": {
+      "description": "A BCP 47 language tag, or und when language is not determined.",
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"
+    },
+    "ext": {
+      "type": "object",
+      "propertyNames": {"pattern": "^(?:x-|[A-Za-z0-9.-]+:)[A-Za-z0-9._-]+$"},
+      "additionalProperties": true
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "status", "created_at", "modified_at", "language", "completion", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/id"},
+        "status": {
+          "enum": ["machine-draft", "human-draft", "under-review", "approved", "published", "superseded", "tombstoned"]
+        },
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "modified_at": {"$ref": "#/$defs/timestamp"},
+        "language": {"$ref": "#/$defs/language"},
+        "completion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "missing_fields", "warnings", "errors"],
+          "properties": {
+            "state": {"enum": ["planned", "running", "partial", "failed", "complete"]},
+            "missing_fields": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+            "warnings": {"type": "array", "items": {"type": "string", "maxLength": 4096}},
+            "errors": {"type": "array", "items": {"$ref": "#/$defs/error"}}
+          }
+        },
+        "supersedes_revision": {"$ref": "#/$defs/id"},
+        "tombstone": {"$ref": "#/$defs/tombstone"},
+        "ext": {"$ref": "#/$defs/ext"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "tombstoned"}}, "required": ["status"]},
+          "then": {"required": ["tombstone"]}
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "recoverable", "ext"],
+      "properties": {
+        "code": {"$ref": "#/$defs/id"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "target": {"type": "string", "format": "uri-reference"},
+        "recoverable": {"type": "boolean"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "tombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deleted_at", "reason", "actor_id"],
+      "properties": {
+        "deleted_at": {"$ref": "#/$defs/timestamp"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "actor_id": {"$ref": "#/$defs/id"},
+        "replacement_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "catalogEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "status", "label", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["work", "expression", "manifestation", "item", "representation", "component"]},
+        "status": {"enum": ["proposed", "accepted", "disputed", "superseded", "tombstoned"]},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "component_type": {"$ref": "#/$defs/id"},
+        "parent_entity_id": {"$ref": "#/$defs/id"},
+        "tombstone": {"$ref": "#/$defs/tombstone"},
+        "ext": {"$ref": "#/$defs/ext"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "tombstoned"}}, "required": ["status"]},
+          "then": {"required": ["tombstone"]}
+        }
+      ]
+    },
+    "relationship": {
+      "description": "A navigational edge backed by a reified statement. The statement is authoritative.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "subject_entity_id", "predicate", "object_entity_id", "statement_id", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "subject_entity_id": {"$ref": "#/$defs/id"},
+        "predicate": {"$ref": "#/$defs/id"},
+        "object_entity_id": {"$ref": "#/$defs/id"},
+        "statement_id": {"$ref": "#/$defs/id"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "name", "identifiers", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"enum": ["person", "family", "organization", "community", "software", "model", "unknown"]},
+        "name": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "identifiers": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/identifierValue"}
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "contribution": {
+      "description": "An agent role in relation to a catalog entity, backed by a statement.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "agent_id", "target_entity_id", "role_id", "statement_id", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "agent_id": {"$ref": "#/$defs/id"},
+        "target_entity_id": {"$ref": "#/$defs/id"},
+        "role_id": {"$ref": "#/$defs/id"},
+        "statement_id": {"$ref": "#/$defs/id"},
+        "display_order": {"type": "integer", "minimum": 0},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "statement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "subject_id", "property_id", "value", "qualifiers", "certainty",
+        "status", "sources", "provenance", "created_at", "ext"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "subject_id": {"$ref": "#/$defs/id"},
+        "property_id": {"$ref": "#/$defs/id"},
+        "value": {"$ref": "#/$defs/typedValue"},
+        "qualifiers": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/qualifier"}
+        },
+        "certainty": {"enum": ["certain", "probable", "possible", "disputed", "unknown"]},
+        "status": {"enum": ["proposed", "accepted", "rejected", "superseded", "tombstoned"]},
+        "sources": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/sourceCitation"}
+        },
+        "provenance": {"$ref": "#/$defs/assertionProvenance"},
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "supersedes": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/id"}
+        },
+        "tombstone": {"$ref": "#/$defs/tombstone"},
+        "ext": {"$ref": "#/$defs/ext"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "tombstoned"}}, "required": ["status"]},
+          "then": {"required": ["tombstone"]}
+        }
+      ]
+    },
+    "qualifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["property_id", "value"],
+      "properties": {
+        "property_id": {"$ref": "#/$defs/id"},
+        "value": {"$ref": "#/$defs/typedValue"}
+      }
+    },
+    "typedValue": {
+      "oneOf": [
+        {"$ref": "#/$defs/textValue"},
+        {"$ref": "#/$defs/uriValue"},
+        {"$ref": "#/$defs/identifierValue"},
+        {"$ref": "#/$defs/entityRefValue"},
+        {"$ref": "#/$defs/agentRefValue"},
+        {"$ref": "#/$defs/dateValue"},
+        {"$ref": "#/$defs/controlledTermValue"},
+        {"$ref": "#/$defs/numberValue"},
+        {"$ref": "#/$defs/booleanValue"},
+        {"$ref": "#/$defs/unknownValue"}
+      ]
+    },
+    "textValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "text"},
+        "value": {"type": "string", "maxLength": 65536},
+        "language": {"$ref": "#/$defs/language"},
+        "script": {"type": "string", "pattern": "^[A-Z][a-z]{3}$"},
+        "direction": {"enum": ["ltr", "rtl", "ttb", "btt", "mixed"]}
+      }
+    },
+    "uriValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "uri"],
+      "properties": {
+        "type": {"const": "uri"},
+        "uri": {"type": "string", "format": "uri"},
+        "label": {"type": "string", "maxLength": 1024}
+      }
+    },
+    "identifierValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "scheme", "value"],
+      "properties": {
+        "type": {"const": "identifier"},
+        "scheme": {"$ref": "#/$defs/id"},
+        "value": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "resolver_uri": {"type": "string", "format": "uri"}
+      }
+    },
+    "entityRefValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "entity_id"],
+      "properties": {
+        "type": {"const": "entity-ref"},
+        "entity_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "agentRefValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "agent_id"],
+      "properties": {
+        "type": {"const": "agent-ref"},
+        "agent_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "dateValue": {
+      "description": "A display-preserving date or interval. EDTF is recommended; bounds make uncertain and non-Gregorian dates searchable without discarding the original form.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "display", "precision", "certainty"],
+      "properties": {
+        "type": {"const": "date"},
+        "display": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "edtf": {"type": "string", "minLength": 1, "maxLength": 128},
+        "not_before": {"type": "string", "minLength": 1, "maxLength": 64},
+        "not_after": {"type": "string", "minLength": 1, "maxLength": 64},
+        "precision": {"enum": ["instant", "day", "month", "year", "decade", "century", "interval", "unknown"]},
+        "certainty": {"enum": ["exact", "approximate", "uncertain", "open", "unknown"]},
+        "calendar": {"$ref": "#/$defs/id"},
+        "original": {"type": "string", "maxLength": 2048}
+      }
+    },
+    "controlledTermValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "term_id", "label"],
+      "properties": {
+        "type": {"const": "controlled-term"},
+        "term_id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "vocabulary_uri": {"type": "string", "format": "uri"}
+      }
+    },
+    "numberValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "number"},
+        "value": {"type": "number"},
+        "unit": {"$ref": "#/$defs/id"}
+      }
+    },
+    "booleanValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "boolean"},
+        "value": {"type": "boolean"}
+      }
+    },
+    "unknownValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": {
+        "type": {"const": "unknown"},
+        "reason": {"enum": ["not-provided", "not-applicable", "not-yet-researched", "ambiguous", "withheld", "unavailable"]},
+        "note": {"type": "string", "maxLength": 4096}
+      }
+    },
+    "sourceCitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "locator", "ext"],
+      "properties": {
+        "source_id": {"$ref": "#/$defs/id"},
+        "target": {"type": "string", "format": "uri-reference"},
+        "locator": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "quote": {"type": "string", "maxLength": 4096},
+        "retrieved_at": {"$ref": "#/$defs/timestamp"},
+        "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "assertionProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_id", "method", "generated_at", "confidence", "ext"],
+      "properties": {
+        "actor_id": {"$ref": "#/$defs/id"},
+        "method": {"$ref": "#/$defs/id"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "name", "version"],
+          "properties": {
+            "provider": {"type": "string", "minLength": 1, "maxLength": 256},
+            "name": {"type": "string", "minLength": 1, "maxLength": 256},
+            "version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "invocation_id": {"$ref": "#/$defs/id"}
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "entryProjection": {
+      "description": "A terse online-catalog projection assembled only from named statements. It is not a second source of truth.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "primary_entity_id", "fields", "required_field_status", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "primary_entity_id": {"$ref": "#/$defs/id"},
+        "fields": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/projectedField"}
+        },
+        "required_field_status": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["field_id", "state", "statement_ids"],
+            "properties": {
+              "field_id": {"$ref": "#/$defs/id"},
+              "state": {"enum": ["present", "unknown", "missing", "withheld", "not-applicable"]},
+              "statement_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}
+            }
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "projectedField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field_id", "statement_ids", "display"],
+      "properties": {
+        "field_id": {"$ref": "#/$defs/id"},
+        "statement_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/id"}
+        },
+        "display": {"type": "string", "maxLength": 8192},
+        "language": {"$ref": "#/$defs/language"}
+      }
+    },
+    "rightsPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "basis", "applies_to", "rights_statement", "allowed_uses", "restrictions", "source", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "basis": {"enum": ["copyright", "license", "contract", "repository-policy", "privacy", "ethical-restriction", "unknown"]},
+        "applies_to": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "rights_statement": {
+          "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 8192},
+            {"type": "string", "format": "uri"}
+          ]
+        },
+        "license_uri": {"type": "string", "format": "uri"},
+        "allowed_uses": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "restrictions": {"type": "array", "items": {"type": "string", "maxLength": 4096}},
+        "attribution": {"type": "string", "maxLength": 4096},
+        "valid_from": {"$ref": "#/$defs/timestamp"},
+        "valid_until": {"$ref": "#/$defs/timestamp"},
+        "source": {"$ref": "#/$defs/sourceCitation"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "accessPolicy": {
+      "description": "Portable ACL declaration. A consumer computes effective access; deny overrides allow and inherited restrictions are retained.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "effect", "actions", "principals", "applies_to", "inherit", "reason", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "effect": {"enum": ["allow", "deny"]},
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"enum": ["discover", "read", "download", "quote", "index", "embed", "train", "annotate"]}
+        },
+        "principals": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1, "maxLength": 512}
+        },
+        "applies_to": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "inherit": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "conditions": {"type": "object", "additionalProperties": true},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "provenanceEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "actor_id", "timestamp", "inputs", "outputs", "method", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"enum": ["create", "import", "extract", "classify", "transform", "review", "approve", "publish", "supersede", "delete"]},
+        "actor_id": {"$ref": "#/$defs/id"},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "outputs": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "method": {"$ref": "#/$defs/id"},
+        "note": {"type": "string", "maxLength": 4096},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "registryTerm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "description", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "description": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "uri": {"type": "string", "format": "uri"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "registries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["properties", "relationships", "roles", "entity_types", "identifier_schemes", "methods", "ext"],
+      "properties": {
+        "properties": {"type": "array", "items": {"$ref": "#/$defs/registryTerm"}},
+        "relationships": {"type": "array", "items": {"$ref": "#/$defs/registryTerm"}},
+        "roles": {"type": "array", "items": {"$ref": "#/$defs/registryTerm"}},
+        "entity_types": {"type": "array", "items": {"$ref": "#/$defs/registryTerm"}},
+        "identifier_schemes": {"type": "array", "items": {"$ref": "#/$defs/registryTerm"}},
+        "methods": {"type": "array", "items": {"$ref": "#/$defs/registryTerm"}},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    }
+  }
+}

@@ -1,0 +1,89 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-layer-1.0.json",
+  "id": "regions-primary",
+  "revision": "rev-1",
+  "kind": "region",
+  "label": "Reviewed regions",
+  "language": "en",
+  "lifecycle": {"state": "complete", "completeness": 1, "updated_at": "2026-08-12T19:00:00Z", "message": null, "retryable": false, "ext": {}},
+  "editorial_status": "approved",
+  "coverage": {
+    "scope": "all",
+    "target_uris": ["lib4://package/pkg-minimal-example/canvas/canvas-0001"],
+    "completed_items": 1,
+    "total_items": 1,
+    "omissions": [],
+    "ext": {}
+  },
+  "provenance": {
+    "actor": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+    "generated_at": "2026-08-12T19:00:00Z",
+    "method": "manual-region-review",
+    "run_id": "run-minimal-example",
+    "parameters": {},
+    "sources": [
+      {
+        "target_uri": "lib4://package/pkg-minimal-example/canvas/canvas-0001",
+        "resource_id": "resource-page-0001",
+        "layer_id": null,
+        "revision": "pixels-1",
+        "digest": null,
+        "ext": {}
+      }
+    ],
+    "ext": {}
+  },
+  "dependencies": [],
+  "history": [
+    {
+      "id": "history-regions-create",
+      "action": "create",
+      "actor": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+      "at": "2026-08-12T19:00:00Z",
+      "message": "Created and reviewed one text region.",
+      "base_revision": null,
+      "ext": {}
+    }
+  ],
+  "reviews": [
+    {
+      "id": "review-regions-1",
+      "decision": "approve",
+      "reviewer": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+      "at": "2026-08-12T19:01:00Z",
+      "rationale": "The polygon encloses the only text line.",
+      "applies_to_revision": "rev-1",
+      "ext": {}
+    }
+  ],
+  "errors": [],
+  "data": {
+    "regions": [
+      {
+        "id": "region-0001",
+        "target": {
+          "uri": "lib4://package/pkg-minimal-example/canvas/canvas-0001/region/region-0001",
+          "canvas": {
+            "canvas_id": "canvas-0001",
+            "canvas_revision": "pixels-1",
+            "selector": {
+              "type": "box",
+              "coordinate_space": "canvas-normalized",
+              "canvas_revision": "pixels-1",
+              "x": 0.125,
+              "y": 0.375,
+              "width": 0.75,
+              "height": 0.125
+            }
+          },
+          "text": null,
+          "ext": {}
+        },
+        "type_ids": ["layout:body-text"],
+        "order": 1
+      }
+    ],
+    "reading_flows": [{"id": "flow-main", "label": "Main", "direction": "ltr", "ordered_region_ids": ["region-0001"]}]
+  },
+  "ext": {}
+}

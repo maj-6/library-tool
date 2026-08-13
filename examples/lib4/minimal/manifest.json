@@ -1,0 +1,247 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-manifest-1.0.json",
+  "format": "lib/4",
+  "profile": "living-edition",
+  "profile_version": "1.0",
+  "package_id": "pkg-minimal-example",
+  "package_revision": "release-1",
+  "created_at": "2026-08-12T19:05:00Z",
+  "generator": {"type": "software", "id": "generator-example", "label": "Example LIB4 generator", "version": "1.0", "ext": {}},
+  "catalog": {
+    "$schema": "https://worldherblibrary.org/schemas/lib4-catalog-1.0.json",
+    "profile": "lib4-catalog/1.0",
+    "record": {
+      "id": "catalog-minimal",
+      "revision": "release-1",
+      "status": "published",
+      "created_at": "2026-08-12T19:00:00Z",
+      "modified_at": "2026-08-12T19:05:00Z",
+      "language": "en",
+      "completion": {"state": "complete", "missing_fields": [], "warnings": [], "errors": []},
+      "ext": {}
+    },
+    "primary_entity_id": "representation-minimal",
+    "entities": [
+      {"id": "work-minimal", "kind": "work", "status": "accepted", "label": "Minimal Living Edition", "ext": {}},
+      {"id": "expression-minimal", "kind": "expression", "status": "accepted", "label": "English expression", "ext": {}},
+      {"id": "representation-minimal", "kind": "representation", "status": "accepted", "label": "Minimal digital representation", "ext": {}}
+    ],
+    "relationships": [
+      {"id": "rel-expression-work", "subject_entity_id": "expression-minimal", "predicate": "expression-of", "object_entity_id": "work-minimal", "statement_id": "statement-expression-work", "ext": {}},
+      {"id": "rel-representation-expression", "subject_entity_id": "representation-minimal", "predicate": "representation-of", "object_entity_id": "expression-minimal", "statement_id": "statement-representation-expression", "ext": {}}
+    ],
+    "agents": [
+      {"id": "generator-example", "type": "software", "name": "Example LIB4 generator", "identifiers": [], "ext": {}},
+      {"id": "reviewer-example", "type": "person", "name": "Example reviewer", "identifiers": [], "ext": {}}
+    ],
+    "contributions": [
+      {"id": "contribution-editor", "agent_id": "reviewer-example", "target_entity_id": "expression-minimal", "role_id": "editor", "statement_id": "statement-editor", "display_order": 0, "ext": {}}
+    ],
+    "statements": [
+      {
+        "id": "statement-title", "subject_id": "work-minimal", "property_id": "preferred-title",
+        "value": {"type": "text", "value": "Minimal Living Edition", "language": "en", "direction": "ltr"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted",
+        "sources": [{"source_id": "resource-page-0001", "locator": "Example supplied by project", "ext": {}}],
+        "provenance": {"actor_id": "reviewer-example", "method": "human-review", "generated_at": "2026-08-12T19:00:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-resource-type", "subject_id": "representation-minimal", "property_id": "resource-type",
+        "value": {"type": "controlled-term", "term_id": "living-edition", "label": "Living Edition"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "generator-example", "method": "package-profile", "generated_at": "2026-08-12T19:00:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-language", "subject_id": "expression-minimal", "property_id": "language",
+        "value": {"type": "controlled-term", "term_id": "en", "label": "English"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted",
+        "sources": [{"source_id": "resource-transcription", "locator": "Reviewed passage", "ext": {}}],
+        "provenance": {"actor_id": "reviewer-example", "method": "human-review", "generated_at": "2026-08-12T19:03:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:03:00Z", "ext": {}
+      },
+      {
+        "id": "statement-date", "subject_id": "representation-minimal", "property_id": "date",
+        "value": {"type": "date", "display": "2026", "edtf": "2026", "not_before": "2026", "not_after": "2026", "precision": "year", "certainty": "exact", "calendar": "gregorian"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "generator-example", "method": "generation-time", "generated_at": "2026-08-12T19:05:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:05:00Z", "ext": {}
+      },
+      {
+        "id": "statement-rights", "subject_id": "representation-minimal", "property_id": "rights",
+        "value": {"type": "uri", "uri": "https://creativecommons.org/publicdomain/zero/1.0/", "label": "CC0 1.0"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted",
+        "sources": [{"source_id": "project-declaration", "locator": "Example asset rights declaration", "ext": {}}],
+        "provenance": {"actor_id": "reviewer-example", "method": "human-rights-review", "generated_at": "2026-08-12T19:04:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:04:00Z", "ext": {}
+      },
+      {
+        "id": "statement-access", "subject_id": "representation-minimal", "property_id": "access",
+        "value": {"type": "controlled-term", "term_id": "public", "label": "Public"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "reviewer-example", "method": "human-access-review", "generated_at": "2026-08-12T19:04:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:04:00Z", "ext": {}
+      },
+      {
+        "id": "statement-source", "subject_id": "representation-minimal", "property_id": "source",
+        "value": {"type": "identifier", "scheme": "lib4-resource", "value": "resource-page-0001"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "generator-example", "method": "source-inventory", "generated_at": "2026-08-12T19:00:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-expression-work", "subject_id": "expression-minimal", "property_id": "expression-of",
+        "value": {"type": "entity-ref", "entity_id": "work-minimal"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "reviewer-example", "method": "human-cataloging", "generated_at": "2026-08-12T19:00:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-representation-expression", "subject_id": "representation-minimal", "property_id": "representation-of",
+        "value": {"type": "entity-ref", "entity_id": "expression-minimal"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "reviewer-example", "method": "human-cataloging", "generated_at": "2026-08-12T19:00:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-editor", "subject_id": "expression-minimal", "property_id": "editor",
+        "value": {"type": "agent-ref", "agent_id": "reviewer-example"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "reviewer-example", "method": "human-cataloging", "generated_at": "2026-08-12T19:00:00Z", "confidence": 1, "ext": {}},
+        "created_at": "2026-08-12T19:00:00Z", "ext": {}
+      }
+    ],
+    "entry_projection": {
+      "id": "projection-default", "label": "Catalog entry", "primary_entity_id": "representation-minimal",
+      "fields": [
+        {"field_id": "preferred-title", "statement_ids": ["statement-title"], "display": "Minimal Living Edition", "language": "en"},
+        {"field_id": "resource-type", "statement_ids": ["statement-resource-type"], "display": "Living Edition"},
+        {"field_id": "language", "statement_ids": ["statement-language"], "display": "English"},
+        {"field_id": "date", "statement_ids": ["statement-date"], "display": "2026"},
+        {"field_id": "rights", "statement_ids": ["statement-rights"], "display": "CC0 1.0"},
+        {"field_id": "access", "statement_ids": ["statement-access"], "display": "Public"},
+        {"field_id": "source", "statement_ids": ["statement-source"], "display": "Embedded example page"}
+      ],
+      "required_field_status": [
+        {"field_id": "preferred-title", "state": "present", "statement_ids": ["statement-title"]},
+        {"field_id": "resource-type", "state": "present", "statement_ids": ["statement-resource-type"]},
+        {"field_id": "language", "state": "present", "statement_ids": ["statement-language"]},
+        {"field_id": "date", "state": "present", "statement_ids": ["statement-date"]},
+        {"field_id": "rights", "state": "present", "statement_ids": ["statement-rights"]},
+        {"field_id": "access", "state": "present", "statement_ids": ["statement-access"]},
+        {"field_id": "source", "state": "present", "statement_ids": ["statement-source"]}
+      ],
+      "ext": {}
+    },
+    "rights_policies": [
+      {
+        "id": "rights-cc0", "label": "CC0 1.0", "basis": "license", "applies_to": ["representation-minimal", "resource-page-0001", "resource-regions", "resource-transcription", "resource-retrieval-layer", "resource-retrieval"],
+        "rights_statement": "https://creativecommons.org/publicdomain/zero/1.0/", "license_uri": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "allowed_uses": ["discover", "read", "download", "quote", "index", "embed", "train", "annotate"], "restrictions": [],
+        "source": {"source_id": "project-declaration", "locator": "Example files authored for this specification", "ext": {}}, "ext": {}
+      }
+    ],
+    "access_policies": [
+      {
+        "id": "access-public", "effect": "allow", "actions": ["discover", "read", "download", "quote", "index", "embed", "train", "annotate"],
+        "principals": ["public"], "applies_to": ["representation-minimal", "resource-page-0001", "resource-regions", "resource-transcription", "resource-retrieval-layer", "resource-retrieval"],
+        "inherit": true, "reason": "Example content is intentionally public.", "ext": {}
+      }
+    ],
+    "provenance_events": [
+      {"id": "event-publish", "type": "publish", "actor_id": "reviewer-example", "timestamp": "2026-08-12T19:05:00Z", "inputs": ["resource-page-0001", "resource-regions", "resource-transcription"], "outputs": ["catalog-minimal", "release-1"], "method": "human-reviewed-example", "ext": {}}
+    ],
+    "registries": {"properties": [], "relationships": [], "roles": [], "entity_types": [], "identifier_schemes": [], "methods": [], "ext": {}},
+    "ext": {}
+  },
+  "source_material": [
+    {"id": "source-minimal", "material_type": "modern-book", "label": "Minimal example leaf", "media_type": "image/x-portable-graymap", "identifiers": [], "resource_ids": ["resource-page-0001"], "rights_policy_id": "rights-cc0", "ext": {}}
+  ],
+  "structures": [
+    {"id": "page-0001", "revision": "rev-1", "type": "page", "label": "Page 1", "parent_id": null, "order": 0, "target_uris": ["lib4://package/pkg-minimal-example/canvas/canvas-0001"], "metadata": {}, "ext": {}}
+  ],
+  "canvases": [
+    {"id": "canvas-0001", "revision": "pixels-1", "sequence": 1, "label": "Page 1", "structure_ids": ["page-0001"], "image_resource_id": "resource-page-0001", "dimensions": {"width": 8, "height": 8}, "duration_ms": null, "ext": {}}
+  ],
+  "resources": [
+    {
+      "id": "resource-page-0001", "role": "canvas-image", "media_type": "image/x-portable-graymap", "byte_length": 232,
+      "integrity": {"state": "verified", "algorithm": "sha256", "digest": "3890b49767f6ffe279bacbecf040f9ff6d47507f782f716e3c7d3773865127e0", "reason": null},
+      "locations": [{"type": "embedded", "member": "assets/page-0001.pgm", "priority": 0, "ext": {}}],
+      "availability": {"state": "available", "checked_at": "2026-08-12T19:05:00Z", "cache": "allow", "offline": "embedded", "ext": {}},
+      "retrieval_policy": {"mode": "embedded-only", "authentication": "none", "max_bytes": 232, "ext": {}},
+      "rights_policy_id": "rights-cc0", "access_policy_id": "access-public",
+      "provenance": {"actor": {"type": "software", "id": "generator-example", "label": "Example LIB4 generator", "version": "1.0", "ext": {}}, "at": "2026-08-12T19:00:00Z", "method": "example-generation", "sources": [], "ext": {}}, "ext": {}
+    },
+    {
+      "id": "resource-regions", "role": "layer", "media_type": "application/json", "byte_length": 2683,
+      "integrity": {"state": "verified", "algorithm": "sha256", "digest": "28a2eb1818a298d98d46d9ec21170ef59d96852f8ddc12d2db93e3669caf3b91", "reason": null},
+      "locations": [{"type": "embedded", "member": "layers/regions.json", "priority": 0, "ext": {}}],
+      "availability": {"state": "available", "checked_at": "2026-08-12T19:05:00Z", "cache": "allow", "offline": "embedded", "ext": {}},
+      "retrieval_policy": {"mode": "embedded-only", "authentication": "none", "max_bytes": 2683, "ext": {}},
+      "rights_policy_id": "rights-cc0", "access_policy_id": "access-public",
+      "provenance": {"actor": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}}, "at": "2026-08-12T19:01:00Z", "method": "human-review", "sources": ["resource-page-0001"], "ext": {}}, "ext": {}
+    },
+    {
+      "id": "resource-transcription", "role": "layer", "media_type": "application/json", "byte_length": 2349,
+      "integrity": {"state": "verified", "algorithm": "sha256", "digest": "8bb2ebe1b8f3566a1a773ff504f0f4419e8e7795dbb9b26e8b052392f049bfca", "reason": null},
+      "locations": [{"type": "embedded", "member": "layers/transcription.json", "priority": 0, "ext": {}}],
+      "availability": {"state": "available", "checked_at": "2026-08-12T19:05:00Z", "cache": "allow", "offline": "embedded", "ext": {}},
+      "retrieval_policy": {"mode": "embedded-only", "authentication": "none", "max_bytes": 2349, "ext": {}},
+      "rights_policy_id": "rights-cc0", "access_policy_id": "access-public",
+      "provenance": {"actor": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}}, "at": "2026-08-12T19:03:00Z", "method": "human-review", "sources": ["resource-regions"], "ext": {}}, "ext": {}
+    },
+    {
+      "id": "resource-retrieval-layer", "role": "layer", "media_type": "application/json", "byte_length": 2469,
+      "integrity": {"state": "verified", "algorithm": "sha256", "digest": "b1399145e8f52612a716dffb74c375f5a15f3c298f75824ce1dc453bea06b52d", "reason": null},
+      "locations": [{"type": "embedded", "member": "layers/retrieval.json", "priority": 0, "ext": {}}],
+      "availability": {"state": "available", "checked_at": "2026-08-12T19:05:00Z", "cache": "allow", "offline": "embedded", "ext": {}},
+      "retrieval_policy": {"mode": "embedded-only", "authentication": "none", "max_bytes": 2469, "ext": {}},
+      "rights_policy_id": "rights-cc0", "access_policy_id": "access-public",
+      "provenance": {"actor": {"type": "software", "id": "generator-example", "label": "Example LIB4 generator", "version": "1.0", "ext": {}}, "at": "2026-08-12T19:04:00Z", "method": "retrieval-projection", "sources": ["resource-transcription"], "ext": {}}, "ext": {}
+    },
+    {
+      "id": "resource-retrieval", "role": "retrieval-records", "media_type": "application/json", "byte_length": 3277,
+      "integrity": {"state": "verified", "algorithm": "sha256", "digest": "a21be7da5dea1a92fea25880ba3c4cc25a1626f1d30f881714a363782c517210", "reason": null},
+      "locations": [{"type": "embedded", "member": "retrieval/chunk-0001.json", "priority": 0, "ext": {}}],
+      "availability": {"state": "available", "checked_at": "2026-08-12T19:05:00Z", "cache": "allow", "offline": "embedded", "ext": {}},
+      "retrieval_policy": {"mode": "embedded-only", "authentication": "none", "max_bytes": 3277, "ext": {}},
+      "rights_policy_id": "rights-cc0", "access_policy_id": "access-public",
+      "provenance": {"actor": {"type": "software", "id": "generator-example", "label": "Example LIB4 generator", "version": "1.0", "ext": {}}, "at": "2026-08-12T19:04:00Z", "method": "retrieval-projection", "sources": ["resource-transcription"], "ext": {}}, "ext": {}
+    }
+  ],
+  "layers": [
+    {"id": "regions-primary", "revision": "rev-1", "kind": "region", "label": "Reviewed regions", "variant": "primary", "language": "en", "current": true, "lifecycle": {"state": "complete", "completeness": 1, "updated_at": "2026-08-12T19:00:00Z", "message": null, "retryable": false, "ext": {}}, "editorial_status": "approved", "content_resource_id": "resource-regions", "supersedes": null, "ext": {}},
+    {"id": "transcription-primary", "revision": "rev-1", "kind": "transcription", "label": "Reviewed transcription", "variant": "diplomatic", "language": "en", "current": true, "lifecycle": {"state": "complete", "completeness": 1, "updated_at": "2026-08-12T19:02:00Z", "message": null, "retryable": false, "ext": {}}, "editorial_status": "approved", "content_resource_id": "resource-transcription", "supersedes": null, "ext": {}},
+    {"id": "retrieval-reviewed-en", "revision": "rev-1", "kind": "retrieval", "label": "Reviewed English retrieval projection", "variant": "default", "language": "en", "current": true, "lifecycle": {"state": "complete", "completeness": 1, "updated_at": "2026-08-12T19:04:00Z", "message": null, "retryable": false, "ext": {}}, "editorial_status": "approved", "content_resource_id": "resource-retrieval-layer", "supersedes": null, "ext": {}}
+  ],
+  "releases": [
+    {
+      "id": "release-1", "revision": "release-1", "state": "published", "created_at": "2026-08-12T19:05:00Z",
+      "created_by": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+      "previous_release_id": null,
+      "layer_pins": [{"layer_id": "regions-primary", "revision": "rev-1"}, {"layer_id": "transcription-primary", "revision": "rev-1"}, {"layer_id": "retrieval-reviewed-en", "revision": "rev-1"}],
+      "resource_ids": ["resource-page-0001", "resource-regions", "resource-transcription", "resource-retrieval-layer", "resource-retrieval"],
+      "catalog_revision": "release-1", "citation": "Minimal Living Edition, release 1 (2026).",
+      "policy": {"approved_layers_only": true, "include_machine_drafts": false, "ext": {}}, "ext": {}
+    }
+  ],
+  "registries": {"layer_kinds": [], "resource_roles": [], "structure_types": [], "material_types": [], "selector_types": [], "relation_predicates": [], "capabilities": []},
+  "capabilities": ["polygon-regions", "parallel-layers", "retrieval-projection", "release-pins"],
+  "retrieval": {
+    "document_id": "document-minimal",
+    "chunk_sets": [
+      {
+        "id": "chunks-reviewed-en", "layer_id": "retrieval-reviewed-en", "revision": "rev-1",
+        "record_schema": "https://worldherblibrary.org/schemas/lib4-retrieval-record-1.0.json",
+        "records_resource_id": "resource-retrieval",
+        "content_sha256": "a21be7da5dea1a92fea25880ba3c4cc25a1626f1d30f881714a363782c517210",
+        "embedding_resource_id": null, "index_hint": {"language": "en", "modality": "text"}, "ext": {}
+      }
+    ],
+    "citation_uri_template": "lib4://package/pkg-minimal-example/release/release-1/chunk/{chunk_id}",
+    "ext": {}
+  },
+  "ext": {}
+}

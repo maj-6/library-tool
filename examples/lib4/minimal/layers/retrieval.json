@@ -1,0 +1,66 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-layer-1.0.json",
+  "id": "retrieval-reviewed-en",
+  "revision": "rev-1",
+  "kind": "retrieval",
+  "label": "Reviewed English retrieval projection",
+  "language": "en",
+  "lifecycle": {"state": "complete", "completeness": 1, "updated_at": "2026-08-12T19:04:00Z", "message": null, "retryable": false, "ext": {}},
+  "editorial_status": "approved",
+  "coverage": {
+    "scope": "all",
+    "target_uris": ["lib4://package/pkg-minimal-example/layer/transcription-primary/revision/rev-1/item/passage-0001"],
+    "completed_items": 1,
+    "total_items": 1,
+    "omissions": [],
+    "ext": {}
+  },
+  "provenance": {
+    "actor": {"type": "software", "id": "generator-example", "label": "Example LIB4 generator", "version": "1.0", "ext": {}},
+    "generated_at": "2026-08-12T19:04:00Z",
+    "method": "retrieval-projection",
+    "run_id": "run-minimal-example",
+    "parameters": {"projection_profile": "retrieval-default/1.0"},
+    "sources": [
+      {
+        "target_uri": "lib4://package/pkg-minimal-example/layer/transcription-primary/revision/rev-1",
+        "resource_id": "resource-transcription",
+        "layer_id": "transcription-primary",
+        "revision": "rev-1",
+        "digest": "8bb2ebe1b8f3566a1a773ff504f0f4419e8e7795dbb9b26e8b052392f049bfca",
+        "ext": {}
+      }
+    ],
+    "ext": {}
+  },
+  "dependencies": [{"layer_id": "transcription-primary", "revision": "rev-1", "relation": "derived-from"}],
+  "history": [
+    {
+      "id": "history-retrieval-create",
+      "action": "create",
+      "actor": {"type": "software", "id": "generator-example", "label": "Example LIB4 generator", "version": "1.0", "ext": {}},
+      "at": "2026-08-12T19:04:00Z",
+      "message": "Projected one citation-pinned retrieval record.",
+      "base_revision": null,
+      "ext": {}
+    }
+  ],
+  "reviews": [
+    {
+      "id": "review-retrieval-1",
+      "decision": "approve",
+      "reviewer": {"type": "human", "id": "reviewer-example", "label": "Example reviewer", "ext": {}},
+      "at": "2026-08-12T19:04:30Z",
+      "rationale": "The chunk cites the released transcription and preserves access policy.",
+      "applies_to_revision": "rev-1",
+      "ext": {}
+    }
+  ],
+  "errors": [],
+  "data": {
+    "record_schema": "https://worldherblibrary.org/schemas/lib4-retrieval-record-1.0.json",
+    "records_resource_id": "resource-retrieval",
+    "record_ids": ["chunk-0001:52b835ce20c62247"]
+  },
+  "ext": {}
+}

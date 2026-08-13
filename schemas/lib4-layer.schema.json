@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worldherblibrary.org/schemas/lib4-layer-1.0.json",
+  "title": "LIB4 revisioned layer",
+  "description": "Common immutable envelope for human, imported, service, and model-produced living-edition layers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "id",
+    "revision",
+    "kind",
+    "label",
+    "language",
+    "lifecycle",
+    "editorial_status",
+    "coverage",
+    "provenance",
+    "dependencies",
+    "history",
+    "reviews",
+    "errors",
+    "data",
+    "ext"
+  ],
+  "properties": {
+    "$schema": {"const": "https://worldherblibrary.org/schemas/lib4-layer-1.0.json"},
+    "id": {"$ref": "#/$defs/id"},
+    "revision": {"$ref": "#/$defs/revision"},
+    "kind": {"$ref": "#/$defs/id"},
+    "label": {"type": "string", "minLength": 1},
+    "language": {"oneOf": [{"$ref": "#/$defs/language"}, {"type": "null"}]},
+    "lifecycle": {"$ref": "#/$defs/lifecycle"},
+    "editorial_status": {"enum": ["machine-draft", "human-draft", "under-review", "approved", "frozen", "superseded"]},
+    "coverage": {"$ref": "#/$defs/coverage"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "dependencies": {"type": "array", "items": {"$ref": "#/$defs/dependency"}},
+    "history": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/history"}},
+    "reviews": {"type": "array", "items": {"$ref": "#/$defs/review"}},
+    "errors": {"type": "array", "items": {"$ref": "#/$defs/processingError"}},
+    "data": {"type": "object"},
+    "ext": {"$ref": "#/$defs/ext"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "revision": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "language": {"type": "string", "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ext": {"type": "object"},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "label", "ext"],
+      "properties": {
+        "type": {"enum": ["human", "software", "model", "service", "import"]},
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"type": "string", "minLength": 1},
+        "version": {"type": "string"},
+        "uri": {"type": "string", "format": "uri"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "completeness", "updated_at", "message", "retryable", "ext"],
+      "properties": {
+        "state": {"enum": ["planned", "running", "partial", "failed", "complete"]},
+        "completeness": {"type": "number", "minimum": 0, "maximum": 1},
+        "updated_at": {"$ref": "#/$defs/timestamp"},
+        "message": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+        "retryable": {"type": "boolean"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "target_uris", "completed_items", "total_items", "omissions", "ext"],
+      "properties": {
+        "scope": {"enum": ["all", "selection", "unknown"]},
+        "target_uris": {"type": "array", "items": {"type": "string", "format": "uri"}},
+        "completed_items": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "total_items": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "omissions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target_uri", "reason", "ext"],
+            "properties": {
+              "target_uri": {"type": "string", "format": "uri"},
+              "reason": {"type": "string", "minLength": 1},
+              "ext": {"$ref": "#/$defs/ext"}
+            }
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_uri", "resource_id", "layer_id", "revision", "digest", "ext"],
+      "properties": {
+        "target_uri": {"oneOf": [{"type": "string", "format": "uri"}, {"type": "null"}]},
+        "resource_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "layer_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "revision": {"oneOf": [{"$ref": "#/$defs/revision"}, {"type": "null"}]},
+        "digest": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor", "generated_at", "method", "run_id", "parameters", "sources", "ext"],
+      "properties": {
+        "actor": {"$ref": "#/$defs/actor"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "method": {"type": "string", "minLength": 1},
+        "run_id": {"$ref": "#/$defs/id"},
+        "parameters": {"type": "object"},
+        "sources": {"type": "array", "items": {"$ref": "#/$defs/source"}},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer_id", "revision", "relation"],
+      "properties": {
+        "layer_id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "relation": {"$ref": "#/$defs/id"}
+      }
+    },
+    "history": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "action", "actor", "at", "message", "base_revision", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "action": {"$ref": "#/$defs/id"},
+        "actor": {"$ref": "#/$defs/actor"},
+        "at": {"$ref": "#/$defs/timestamp"},
+        "message": {"type": "string"},
+        "base_revision": {"oneOf": [{"$ref": "#/$defs/revision"}, {"type": "null"}]},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "decision", "reviewer", "at", "rationale", "applies_to_revision", "ext"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "decision": {"enum": ["approve", "reject", "request-changes", "abstain"]},
+        "reviewer": {"$ref": "#/$defs/actor"},
+        "at": {"$ref": "#/$defs/timestamp"},
+        "rationale": {"type": "string"},
+        "applies_to_revision": {"$ref": "#/$defs/revision"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "processingError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "target_uri", "retryable", "at", "ext"],
+      "properties": {
+        "code": {"$ref": "#/$defs/id"},
+        "message": {"type": "string", "minLength": 1},
+        "target_uri": {"oneOf": [{"type": "string", "format": "uri"}, {"type": "null"}]},
+        "retryable": {"type": "boolean"},
+        "at": {"$ref": "#/$defs/timestamp"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "canvasTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canvas_id", "canvas_revision", "selector"],
+      "properties": {
+        "canvas_id": {"$ref": "#/$defs/id"},
+        "canvas_revision": {"$ref": "#/$defs/revision"},
+        "selector": {"oneOf": [{"$ref": "#/$defs/box"}, {"$ref": "#/$defs/polygon"}, {"$ref": "#/$defs/timeRange"}, {"$ref": "#/$defs/customSelector"}, {"type": "null"}]}
+      }
+    },
+    "box": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "coordinate_space", "canvas_revision", "x", "y", "width", "height"],
+      "properties": {
+        "type": {"const": "box"},
+        "coordinate_space": {"const": "canvas-normalized"},
+        "canvas_revision": {"$ref": "#/$defs/revision"},
+        "x": {"type": "number", "minimum": 0, "maximum": 1},
+        "y": {"type": "number", "minimum": 0, "maximum": 1},
+        "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}
+      }
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {"x": {"type": "number", "minimum": 0, "maximum": 1}, "y": {"type": "number", "minimum": 0, "maximum": 1}}
+    },
+    "polygon": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "coordinate_space", "canvas_revision", "points"],
+      "properties": {
+        "type": {"const": "polygon"},
+        "coordinate_space": {"const": "canvas-normalized"},
+        "canvas_revision": {"$ref": "#/$defs/revision"},
+        "points": {"type": "array", "minItems": 3, "maxItems": 256, "items": {"$ref": "#/$defs/point"}}
+      }
+    },
+    "timeRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "coordinate_space", "canvas_revision", "start_ms", "end_ms"],
+      "properties": {
+        "type": {"const": "time-range"},
+        "coordinate_space": {"const": "media-time"},
+        "canvas_revision": {"$ref": "#/$defs/revision"},
+        "start_ms": {"type": "integer", "minimum": 0},
+        "end_ms": {"type": "integer", "minimum": 1}
+      }
+    },
+    "customSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "coordinate_space", "canvas_revision", "data", "fallback"],
+      "properties": {
+        "type": {"$ref": "#/$defs/id"},
+        "coordinate_space": {"type": "string", "minLength": 1},
+        "canvas_revision": {"$ref": "#/$defs/revision"},
+        "data": {"type": "object"},
+        "fallback": {"oneOf": [{"$ref": "#/$defs/box"}, {"$ref": "#/$defs/polygon"}, {"$ref": "#/$defs/timeRange"}]}
+      }
+    },
+    "textQuoteSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "layer_id", "revision", "item_id", "start", "end", "exact", "prefix", "suffix", "status"],
+      "properties": {
+        "type": {"const": "text-quote"},
+        "layer_id": {"$ref": "#/$defs/id"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "item_id": {"$ref": "#/$defs/id"},
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0},
+        "exact": {"type": "string"},
+        "prefix": {"type": "string"},
+        "suffix": {"type": "string"},
+        "status": {"enum": ["current", "stale", "ambiguous"]}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "canvas", "text", "ext"],
+      "properties": {
+        "uri": {"type": "string", "format": "uri"},
+        "canvas": {"oneOf": [{"$ref": "#/$defs/canvasTarget"}, {"type": "null"}]},
+        "text": {"oneOf": [{"$ref": "#/$defs/textQuoteSelector"}, {"type": "null"}]},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    }
+  }
+}

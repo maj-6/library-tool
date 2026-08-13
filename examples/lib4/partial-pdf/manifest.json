@@ -1,0 +1,206 @@
+{
+  "$schema": "https://worldherblibrary.org/schemas/lib4-manifest-1.0.json",
+  "format": "lib/4",
+  "profile": "living-edition",
+  "profile_version": "1.0",
+  "package_id": "pkg-partial-pdf-example",
+  "package_revision": "rev-20260812-a",
+  "created_at": "2026-08-12T18:00:00Z",
+  "generator": {
+    "type": "model",
+    "id": "agent-generator",
+    "label": "Example LIB4 generator",
+    "version": "1.0",
+    "ext": {}
+  },
+  "catalog": {
+    "$schema": "https://worldherblibrary.org/schemas/lib4-catalog-1.0.json",
+    "profile": "lib4-catalog/1.0",
+    "record": {
+      "id": "catalog-partial-pdf",
+      "revision": "rev-20260812-a",
+      "status": "machine-draft",
+      "created_at": "2026-08-12T18:00:00Z",
+      "modified_at": "2026-08-12T18:00:00Z",
+      "language": "en",
+      "completion": {
+        "state": "partial",
+        "missing_fields": ["date", "creator", "language"],
+        "warnings": ["Metadata and rights require human review."],
+        "errors": []
+      },
+      "ext": {}
+    },
+    "primary_entity_id": "representation-input-pdf",
+    "entities": [
+      {"id": "representation-input-pdf", "kind": "representation", "status": "accepted", "label": "Provided PDF", "ext": {}}
+    ],
+    "relationships": [],
+    "agents": [
+      {"id": "agent-generator", "type": "model", "name": "Example LIB4 generator", "identifiers": [], "ext": {}}
+    ],
+    "contributions": [],
+    "statements": [
+      {
+        "id": "statement-title",
+        "subject_id": "representation-input-pdf",
+        "property_id": "preferred-title",
+        "value": {"type": "text", "value": "Unreviewed source document", "language": "en"},
+        "qualifiers": [], "certainty": "possible", "status": "proposed",
+        "sources": [{"source_id": "source-input-pdf", "locator": "Input filename", "ext": {}}],
+        "provenance": {"actor_id": "agent-generator", "method": "machine-extraction", "generated_at": "2026-08-12T18:00:00Z", "confidence": 0.35, "ext": {}},
+        "created_at": "2026-08-12T18:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-resource-type",
+        "subject_id": "representation-input-pdf",
+        "property_id": "resource-type",
+        "value": {"type": "controlled-term", "term_id": "digital-document", "label": "Digital document"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted",
+        "sources": [{"source_id": "source-input-pdf", "locator": "Detected application/pdf", "ext": {}}],
+        "provenance": {"actor_id": "agent-generator", "method": "media-type-detection", "generated_at": "2026-08-12T18:00:00Z", "confidence": 1.0, "ext": {}},
+        "created_at": "2026-08-12T18:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-language",
+        "subject_id": "representation-input-pdf",
+        "property_id": "language",
+        "value": {"type": "unknown", "reason": "not-yet-researched"},
+        "qualifiers": [], "certainty": "unknown", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "agent-generator", "method": "explicit-unknown", "generated_at": "2026-08-12T18:00:00Z", "confidence": 1.0, "ext": {}},
+        "created_at": "2026-08-12T18:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-date",
+        "subject_id": "representation-input-pdf",
+        "property_id": "date",
+        "value": {"type": "unknown", "reason": "not-yet-researched"},
+        "qualifiers": [], "certainty": "unknown", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "agent-generator", "method": "explicit-unknown", "generated_at": "2026-08-12T18:00:00Z", "confidence": 1.0, "ext": {}},
+        "created_at": "2026-08-12T18:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-rights",
+        "subject_id": "representation-input-pdf",
+        "property_id": "rights",
+        "value": {"type": "unknown", "reason": "not-provided"},
+        "qualifiers": [], "certainty": "unknown", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "agent-generator", "method": "explicit-unknown", "generated_at": "2026-08-12T18:00:00Z", "confidence": 1.0, "ext": {}},
+        "created_at": "2026-08-12T18:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-access",
+        "subject_id": "representation-input-pdf",
+        "property_id": "access",
+        "value": {"type": "controlled-term", "term_id": "project-only", "label": "Project members only"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "agent-generator", "method": "safe-default-policy", "generated_at": "2026-08-12T18:00:00Z", "confidence": 1.0, "ext": {}},
+        "created_at": "2026-08-12T18:00:00Z", "ext": {}
+      },
+      {
+        "id": "statement-source",
+        "subject_id": "representation-input-pdf",
+        "property_id": "source",
+        "value": {"type": "identifier", "scheme": "lib4-source-id", "value": "source-input-pdf"},
+        "qualifiers": [], "certainty": "certain", "status": "accepted", "sources": [],
+        "provenance": {"actor_id": "agent-generator", "method": "source-inventory", "generated_at": "2026-08-12T18:00:00Z", "confidence": 1.0, "ext": {}},
+        "created_at": "2026-08-12T18:00:00Z", "ext": {}
+      }
+    ],
+    "entry_projection": {
+      "id": "projection-default", "label": "Partial discovery entry", "primary_entity_id": "representation-input-pdf",
+      "fields": [
+        {"field_id": "preferred-title", "statement_ids": ["statement-title"], "display": "Unreviewed source document", "language": "en"},
+        {"field_id": "resource-type", "statement_ids": ["statement-resource-type"], "display": "Digital document"},
+        {"field_id": "rights", "statement_ids": ["statement-rights"], "display": "Rights not provided"},
+        {"field_id": "access", "statement_ids": ["statement-access"], "display": "Project members only"},
+        {"field_id": "source", "statement_ids": ["statement-source"], "display": "Provided PDF"}
+      ],
+      "required_field_status": [
+        {"field_id": "preferred-title", "state": "present", "statement_ids": ["statement-title"]},
+        {"field_id": "resource-type", "state": "present", "statement_ids": ["statement-resource-type"]},
+        {"field_id": "language", "state": "unknown", "statement_ids": ["statement-language"]},
+        {"field_id": "date", "state": "unknown", "statement_ids": ["statement-date"]},
+        {"field_id": "rights", "state": "unknown", "statement_ids": ["statement-rights"]},
+        {"field_id": "access", "state": "present", "statement_ids": ["statement-access"]},
+        {"field_id": "source", "state": "present", "statement_ids": ["statement-source"]}
+      ],
+      "ext": {}
+    },
+    "rights_policies": [
+      {
+        "id": "rights-unreviewed", "label": "Rights unreviewed", "basis": "unknown",
+        "applies_to": ["representation-input-pdf", "source-input-pdf"],
+        "rights_statement": "Rights information was not provided. No downstream use is granted by this record.",
+        "allowed_uses": [], "restrictions": ["Human review required before external indexing."],
+        "source": {"source_id": "source-input-pdf", "locator": "No rights metadata supplied", "ext": {}},
+        "ext": {}
+      }
+    ],
+    "access_policies": [
+      {
+        "id": "access-project-only", "effect": "allow",
+        "actions": ["discover", "read", "index", "embed", "annotate"],
+        "principals": ["group:project-members"], "applies_to": ["representation-input-pdf", "source-input-pdf"],
+        "inherit": true, "reason": "Conservative default pending review.", "ext": {}
+      }
+    ],
+    "provenance_events": [
+      {
+        "id": "event-catalog-created", "type": "create", "actor_id": "agent-generator",
+        "timestamp": "2026-08-12T18:00:00Z", "inputs": ["source-input-pdf"],
+        "outputs": ["catalog-partial-pdf"], "method": "machine-extraction", "ext": {}
+      }
+    ],
+    "registries": {"properties": [], "relationships": [], "roles": [], "entity_types": [], "identifier_schemes": [], "methods": [], "ext": {}},
+    "ext": {}
+  },
+  "source_material": [
+    {
+      "id": "source-input-pdf", "material_type": "digital-document", "label": "Provided PDF",
+      "media_type": "application/pdf", "identifiers": [], "resource_ids": ["resource-source-pdf"],
+      "rights_policy_id": "rights-unreviewed", "ext": {}
+    }
+  ],
+  "structures": [],
+  "canvases": [],
+  "resources": [
+    {
+      "id": "resource-source-pdf", "role": "source", "media_type": "application/pdf",
+      "byte_length": null,
+      "integrity": {"state": "unavailable", "algorithm": null, "digest": null, "reason": "Source bytes were unavailable to this run."},
+      "locations": [{"type": "http", "uri": "https://example.invalid/input.pdf", "priority": 0, "ext": {}}],
+      "availability": {"state": "anticipated", "cache": "forbid", "offline": "metadata-only", "ext": {}},
+      "retrieval_policy": {"mode": "manual", "authentication": "unavailable", "max_bytes": null, "ext": {}},
+      "rights_policy_id": "rights-unreviewed",
+      "access_policy_id": "access-project-only",
+      "provenance": {
+        "actor": {"type": "import", "id": "agent-source-provider", "label": "Source provider", "ext": {}},
+        "at": "2026-08-12T18:00:00Z", "method": "provided-reference", "sources": [], "ext": {}
+      },
+      "ext": {}
+    }
+  ],
+  "layers": [
+    {
+      "id": "ocr-primary", "revision": "attempt-1", "kind": "transcription", "label": "Initial OCR",
+      "variant": "diplomatic", "language": null, "current": false,
+      "lifecycle": {"state": "failed", "completeness": 0, "updated_at": "2026-08-12T18:05:00Z", "message": "OCR service unavailable.", "retryable": true, "ext": {}},
+      "editorial_status": "machine-draft", "content_resource_id": null, "supersedes": null, "ext": {}
+    },
+    {
+      "id": "ocr-primary", "revision": "attempt-2", "kind": "transcription", "label": "Capable OCR follow-up",
+      "variant": "diplomatic", "language": null, "current": true,
+      "lifecycle": {"state": "planned", "completeness": 0, "updated_at": "2026-08-12T18:06:00Z", "message": "Awaiting OCR service.", "retryable": true, "ext": {}},
+      "editorial_status": "machine-draft", "content_resource_id": null,
+      "supersedes": {"layer_id": "ocr-primary", "revision": "attempt-1"}, "ext": {}
+    }
+  ],
+  "releases": [],
+  "registries": {
+    "layer_kinds": [], "resource_roles": [], "structure_types": [], "material_types": [],
+    "selector_types": [], "relation_predicates": [], "capabilities": []
+  },
+  "capabilities": [],
+  "ext": {}
+}
