@@ -1,0 +1,3 @@
+# LIB4 fixtures include byte-addressed text; checkout conversion would invalidate digests.
+/examples/lib4/**/*.json text eol=lf
+/examples/lib4/minimal/assets/page-0001.pgm text eol=lf

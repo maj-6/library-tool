@@ -10,6 +10,71 @@ interface Props {
   dense?: boolean
 }
 
+type EntityAssertion = (typeof entityAssertions)[number]
+
+interface LineSegment {
+  text: string
+  entity?: EntityAssertion
+}
+
+const entityByForm = new Map(
+  entityAssertions.map((entity) => [entity.form.toLocaleLowerCase(), entity]),
+)
+
+const entityFormPattern = entityAssertions
+  .map((entity) => entity.form)
+  .sort((left, right) => right.length - left.length)
+  .map((form) => form.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|')
+
+const isWordCharacter = (value: string | undefined) => Boolean(value && /[\p{L}\p{N}]/u.test(value))
+
+function segmentEntityMentions(line: string): LineSegment[] {
+  if (!entityFormPattern) return [{ text: line }]
+
+  const segments: LineSegment[] = []
+  const pattern = new RegExp(entityFormPattern, 'giu')
+  let cursor = 0
+
+  for (const match of line.matchAll(pattern)) {
+    const start = match.index
+    const text = match[0]
+    const end = start + text.length
+    if (isWordCharacter(line[start - 1]) || isWordCharacter(line[end])) continue
+
+    if (start > cursor) segments.push({ text: line.slice(cursor, start) })
+    segments.push({ text, entity: entityByForm.get(text.toLocaleLowerCase()) })
+    cursor = end
+  }
+
+  if (cursor < line.length) segments.push({ text: line.slice(cursor) })
+  return segments.length > 0 ? segments : [{ text: line }]
+}
+
+function InlineEntityLine({ line, onOpenEntity }: { line: string; onOpenEntity: () => void }) {
+  return (
+    <span className="edition-line__text" contentEditable suppressContentEditableWarning>
+      {segmentEntityMentions(line).map((segment, index) => segment.entity ? (
+        <button
+          type="button"
+          className="entity-mention"
+          contentEditable={false}
+          data-state={segment.entity.state}
+          title={`${segment.entity.concept} (${segment.entity.confidence})`}
+          aria-label={`Open plant entity for ${segment.text}: ${segment.entity.concept}`}
+          onClick={(event) => {
+            event.stopPropagation()
+            onOpenEntity()
+          }}
+          key={`${segment.text}-${index}`}
+        >
+          {segment.text}<Icon icon="diagram-tree" size={10} />
+        </button>
+      ) : <span key={`text-${index}`}>{segment.text}</span>)}
+    </span>
+  )
+}
+
 export function LayerText({ selectedRegionId, onOpenEntity, dense = false }: Props) {
   const [source, setSource] = useState<TextSourceId>('mistral')
   const [translationMode, setTranslationMode] = useState<'literal' | 'reading'>('literal')
@@ -32,10 +97,7 @@ export function LayerText({ selectedRegionId, onOpenEntity, dense = false }: Pro
           {lines.map((line, index) => (
             <div className={`${selectedRegionId && index === 1 ? 'edition-line is-aligned' : 'edition-line'} ${source === 'local' ? 'is-low-confidence' : ''}`} key={line}>
               <span className="line-number">{index + 1}</span>
-              <span contentEditable suppressContentEditableWarning>{line}</span>
-              {index === 2 && source !== 'local' && (
-                <button className="entity-mention" onClick={onOpenEntity}>feuel <Icon icon="diagram-tree" size={10} /></button>
-              )}
+              <InlineEntityLine line={line} onOpenEntity={onOpenEntity} />
             </div>
           ))}
         </div>
@@ -63,16 +125,6 @@ export function LayerText({ selectedRegionId, onOpenEntity, dense = false }: Pro
           </Callout>
         )}
       </section>
-      {!dense && (
-        <section className="entity-strip">
-          <div className="entity-strip__label">Entity proposals</div>
-          {entityAssertions.map((entity) => (
-            <button key={entity.form} onClick={onOpenEntity}>
-              <span>{entity.form}</span><small>{entity.concept}</small><Tag minimal intent={entity.state === 'reviewed' ? 'success' : 'warning'}>{entity.confidence}</Tag>
-            </button>
-          ))}
-        </section>
-      )}
     </div>
   )
 }

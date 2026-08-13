@@ -163,7 +163,7 @@ polyline.region-draft { fill: none; }
 .manuscript-canvas.is-crop .region-label { display: none; }
 
 /* Shared aligned text */
-.layer-text { min-width: 0; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr) auto; background: #faf9f5; }
+.layer-text { min-width: 0; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr); background: #faf9f5; }
 .text-column { min-width: 0; padding: 14px; overflow: auto; border-left: 1px solid #dfe2df; }
 .text-column__head h3 { font-family: "Segoe UI", sans-serif; font-size: 13px; }
 .text-column > .bp6-button-group { margin-bottom: 13px; }
@@ -174,13 +174,25 @@ polyline.region-draft { fill: none; }
 .edition-line.is-low-confidence { color: #8d4a42; text-decoration: underline dotted rgba(141,74,66,.45); text-underline-offset: 3px; }
 .line-number { padding-top: 3px; color: #a0aaa4; font: 9px ui-monospace, monospace; text-align: right; }
 .edition-line [contenteditable]:focus { padding: 3px; outline: 1px solid #5b9bd1; border-radius: 2px; background: #fff; }
-.entity-mention { display: inline-flex; gap: 3px; align-items: center; margin: 4px 0 0 29px; padding: 2px 5px; width: max-content; border: 1px solid #78a88b; border-radius: 3px; color: #22633e; background: #ebf5ee; font: 700 10px ui-sans-serif, sans-serif; }
+.edition-line__text { min-width: 0; }
+.entity-mention {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+  margin: 0 2px;
+  padding: 0 4px;
+  border: 1px solid #78a88b;
+  border-radius: 3px;
+  color: #22633e;
+  background: #ebf5ee;
+  font: 700 .86em/1.45 "Segoe UI", sans-serif;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+.entity-mention:hover { border-color: #4d8967; background: #dfeee4; }
+.entity-mention[data-state="reviewed"] { border-color: #6d9a7c; background: #e6f1e9; }
+.entity-mention:focus-visible { outline: 2px solid #2f75a7; outline-offset: 1px; }
 .knowledge-note.bp6-callout { margin-top: 14px; background: #f0f4ea; font-size: 10px; line-height: 1.45; }
-.entity-strip { grid-column: 1 / -1; display: flex; gap: 6px; align-items: stretch; padding: 8px 12px; overflow-x: auto; border-top: 1px solid #daddda; background: #f3f5f0; }
-.entity-strip__label { display: grid; place-items: center; padding-right: 7px; color: #6d7b74; border-right: 1px solid #d8ded9; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; white-space: nowrap; }
-.entity-strip button { min-width: 155px; display: grid; grid-template-columns: 1fr auto; gap: 1px 6px; padding: 6px 8px; color: #29443a; background: #fff; border: 1px solid #d5ded7; border-radius: 4px; text-align: left; }
-.entity-strip button span { font: 700 11px "Segoe UI", sans-serif; }
-.entity-strip button small { grid-column: 1 / -1; color: #6f7d76; font-size: 8px; }
 .layer-text.is-dense { grid-template-rows: 1fr; font-size: 11px; }
 .layer-text.is-dense .text-column { padding: 9px; }
 .layer-text.is-dense .text-column__head { margin-bottom: 5px; }
@@ -563,17 +575,19 @@ polyline.region-draft { fill: none; }
 .dw-titlebar > span { color: #596169; font-size: 10px; }
 .dw-appmark { padding: 2px 4px; color: #fff; background: #2d5f85; font-size: 9px; font-weight: 700; }
 .dw-menubar {
-  height: 27px;
+  height: 23px;
   flex: none;
   display: flex;
   gap: 0;
   align-items: center;
-  padding: 0 3px;
+  padding: 0 2px;
   border-bottom: 1px solid var(--dw-border);
   background: #f7f7f7;
 }
-.dw-menubar > span, .dw-commandbar > span { flex: 1; }
-.dw-menubar .bp6-button { min-height: 23px; padding-inline: 8px; font-size: 10px; }
+.dw-menubar__spacer, .dw-commandbar__spacer { flex: 1; }
+.dw-menubar .bp6-button { min-height: 20px; padding-inline: 5px; font-size: 10px; }
+.dw-popup-menu.bp6-menu { min-width: 150px; padding: 2px; }
+.dw-popup-menu .bp6-menu-item { min-height: 24px; padding: 3px 7px; font-size: 10px; }
 .dw-commandbar {
   min-height: 36px;
   flex: none;

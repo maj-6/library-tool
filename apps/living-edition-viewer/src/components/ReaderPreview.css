@@ -210,20 +210,39 @@
 .reader-citation-links { display: flex; gap: 4px; }
 .reader-citation-links a { color: #476e5e; font-size: 10px; }
 
-.reader-entities { display: flex; flex-wrap: wrap; gap: 4px; }
-.reader-entity-chip {
-  display: flex;
-  gap: 4px;
-  align-items: center;
-  padding: 3px 6px;
-  color: #315746;
-  border: 1px solid #baccc3;
-  border-radius: 12px;
-  background: #f1f7f3;
-  font-size: 10px;
+.reader-entity-link {
+  color: #245f48;
+  font-weight: 600;
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
-.reader-entity-chip small { color: #728079; font-style: italic; }
-.reader-global-citations { max-width: 900px; margin: 0 auto; padding: 0 28px 34px; }
+.reader-entity-link:hover,
+.reader-entity-link:focus-visible {
+  color: #123e2e;
+  background: #e2eee8;
+  text-decoration-style: solid;
+  outline: 2px solid transparent;
+}
+
+.reader-global-apparatus { max-width: 900px; margin: 0 auto; padding: 0 28px 34px; }
+.reader-entity-apparatus { scroll-margin-top: 12px; margin-top: 28px; padding-top: 14px; border-top: 2px solid #557064; }
+.reader-entity-apparatus > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.reader-entity-apparatus > header strong,
+.reader-entity-apparatus > header small { display: block; }
+.reader-entity-apparatus > header strong { color: #2c493d; font-size: 12px; }
+.reader-entity-apparatus > header small { margin-top: 2px; color: #6f7772; font-size: 10px; }
+.reader-entity-apparatus__grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.reader-entity-record { min-width: 0; padding: 10px; border: 1px solid #d2d9d5; background: #f7f8f4; scroll-margin-top: 12px; }
+.reader-entity-record:target,
+.reader-entity-record:focus { border-color: #477561; background: #eaf2ed; box-shadow: inset 3px 0 #477561; outline: none; }
+.reader-entity-record__state { color: #66766e; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.reader-entity-record h2 { margin: 4px 0; color: #294a3c; font: 600 16px/1.2 Georgia, serif; }
+.reader-entity-record p { margin: 0 0 8px; font: 11px/1.5 Georgia, serif; }
+.reader-entity-record > small { display: block; color: #66726c; font-size: 10px; line-height: 1.4; }
+.reader-entity-record > small strong { color: #40534a; }
+.reader-entity-apparatus__notice { display: block; margin-top: 8px; color: #727a75; font-size: 10px; }
 .reader-citations.bp6-card { margin-top: 28px; padding: 15px; border: 1px solid #d5d7d2; border-radius: 1px; background: #f6f5f0; box-shadow: none; }
 .reader-citations > span { display: block; color: #52635c; font-size: 10px; font-weight: 700; text-transform: uppercase; }
 .reader-citations p { margin: 9px 0; font-size: 10px; line-height: 1.5; }
@@ -275,7 +294,6 @@
 .reader-parallel__select small { display: block; }
 .reader-parallel__row small { color: #768079; font-size: 10px; }
 .reader-parallel__row p { margin: 0; padding-right: 14px; font: 11px/1.5 Georgia, serif; }
-.reader-parallel__row .reader-entities { margin-top: 6px; }
 .reader-parallel__apparatus { max-width: 620px; margin: 0 auto; }
 
 .reader-compare { max-width: 900px; margin: 0 auto; padding: 28px; }
@@ -297,8 +315,9 @@
 .reader-explore__entry { min-height: 128px; display: flex; flex-direction: column; color: #303a36; border: 1px solid #d0d4d0; background: #fff; }
 .reader-explore__entry:hover,
 .reader-explore__entry.is-active { border-color: #5a7f6f; background: #f0f5f2; }
-.reader-explore__select { flex: 1; display: grid; grid-template-columns: 75px 1fr; gap: 10px; padding: 9px; color: inherit; border: 0; background: transparent; text-align: left; }
-.reader-explore__entry > .reader-citation-links { padding: 0 9px 8px 94px; }
+.reader-explore__content { flex: 1; display: grid; grid-template-columns: 75px 1fr; gap: 10px; padding: 9px; }
+.reader-explore__footer { min-height: 30px; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 3px 8px 5px 94px; }
+.reader-explore__select { color: #345f4d; }
 .reader-explore__figure { position: relative; display: grid; place-items: center; min-height: 105px; color: #5f4b36; background: #d7c49d; }
 .reader-explore__figure i { position: absolute; top: 5px; left: 6px; font-size: 10px; }
 .reader-explore__figure.is-entity { color: #3f6e5a; background: #dcebe4; }
@@ -349,6 +368,8 @@
 .public-reader--mobile .reader-explore { padding: 20px; }
 .public-reader--mobile .reader-explore__grid { grid-template-columns: 1fr; }
 .public-reader--mobile .reader-citations { margin-inline: 0; }
+.public-reader--mobile .reader-global-apparatus { padding-inline: 20px; }
+.public-reader--mobile .reader-entity-apparatus__grid { grid-template-columns: 1fr; }
 
 .scriptorium-window > .reader-preview,
 .queue-window > .reader-preview,

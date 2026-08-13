@@ -580,7 +580,8 @@ function ReaderFrame(props: ReaderFrameProps) {
       />
       <main className="public-reader__main">
         {props.runtime.render(props.presentationId, props)}
-        <div className="reader-global-citations">
+        <div className="reader-global-apparatus">
+          <EntityApparatus publication={props.publication} />
           <CitationPanel publication={props.publication} />
         </div>
       </main>
@@ -616,6 +617,7 @@ function PublicReaderHeader({
       <div className="public-reader__brand"><i>WHL</i><span>World Herb Library</span></div>
       <nav aria-label="Reader sections">
         <a href="#reader-text">Text</a>
+        <a href="#reader-entities">Entities</a>
         <a href="#reader-citation">Citation</a>
         <a href="#reader-about">About</a>
       </nav>
@@ -680,7 +682,6 @@ function ManuscriptReadingPresentation(props: ManuscriptPresentationProps) {
   return (
     <ReadingLayout
       publication={props.publication}
-      audience={props.audience}
       sections={props.payload.sections}
       showNotes={props.showNotes}
       deck="A continuous modern-English path through the selected passage, with evidence and notes available without interrupting the reading."
@@ -710,12 +711,17 @@ function ManuscriptFacsimilePresentation(props: ManuscriptPresentationProps) {
         </div>
         <small>{selected.label}</small>
         <h2>Source</h2>
-        <p className="reader-source-text">{selected.sourceText}</p>
+        <p className="reader-source-text">
+          <EntityLinkedText publication={props.publication} entityIds={selected.entityIds} text={selected.sourceText} />
+        </p>
         <h2>Edited reading</h2>
-        <p>{selected.transcription}</p>
+        <p>
+          <EntityLinkedText publication={props.publication} entityIds={selected.entityIds} text={selected.transcription} />
+        </p>
         <h2>Modern English</h2>
-        <p>{selected.translation}</p>
-        <EntityLinks publication={props.publication} entityIds={selected.entityIds} />
+        <p>
+          <EntityLinkedText publication={props.publication} entityIds={selected.entityIds} text={selected.translation} />
+        </p>
         <div className="reader-region-nav">
           {props.payload.sourceRegions.map((region) => (
             <button
@@ -757,10 +763,13 @@ function ManuscriptParallelPresentation(props: ManuscriptPresentationProps) {
             >
               <strong>{region.id}</strong><small>{region.label}</small>
             </button>
-            <p>{region.transcription}</p>
+            <p>
+              <EntityLinkedText publication={props.publication} entityIds={region.entityIds} text={region.transcription} />
+            </p>
             <span>
-              <p>{region.translation}</p>
-              <EntityLinks publication={props.publication} entityIds={region.entityIds} />
+              <p>
+                <EntityLinkedText publication={props.publication} entityIds={region.entityIds} text={region.translation} />
+              </p>
             </span>
           </div>
         ))}
@@ -796,9 +805,14 @@ function ManuscriptComparePresentation(props: ManuscriptPresentationProps) {
       {props.payload.sourceRegions.map((region) => (
         <section key={region.id}>
           <div><strong>{region.id}</strong><small>{region.label}</small></div>
-          <p><span>{sourcePin?.label ?? 'Source layer'}</span>{region.sourceText}</p>
-          <p><span>{readingPin?.label ?? 'Reading layer'}</span>{region.transcription}</p>
-          <EntityLinks publication={props.publication} entityIds={region.entityIds} />
+          <p>
+            <span>{sourcePin?.label ?? 'Source layer'}</span>
+            <EntityLinkedText publication={props.publication} entityIds={region.entityIds} text={region.sourceText} />
+          </p>
+          <p>
+            <span>{readingPin?.label ?? 'Reading layer'}</span>
+            <EntityLinkedText publication={props.publication} entityIds={region.entityIds} text={region.transcription} />
+          </p>
         </section>
       ))}
     </div>
@@ -821,7 +835,6 @@ function ReferenceReadingPresentation(props: ReferencePresentationProps) {
   return (
     <ReadingLayout
       publication={props.publication}
-      audience={props.audience}
       sections={props.payload.sections}
       showNotes={props.showNotes}
       deck="A continuous path through a synthetic multi-entry reference projection. Entry navigation remains available in Explore."
@@ -843,23 +856,31 @@ function ReferenceExplorePresentation(props: ReferencePresentationProps) {
             key={entry.id}
             className={props.selectionId === entry.id ? 'reader-explore__entry is-active' : 'reader-explore__entry'}
           >
-            <button
-              className="reader-explore__select"
-              onClick={() => props.onSelect(entry.id)}
-              aria-pressed={props.selectionId === entry.id}
-            >
+            <div className="reader-explore__content">
               <span className="reader-explore__figure is-entity">
                 <i>{String(index + 1).padStart(2, '0')}</i>
                 <Icon icon="diagram-tree" size={24} />
               </span>
               <span>
                 <small>{entry.kicker}</small>
-                <strong>{entry.label}</strong>
-                <p>{entry.summary}</p>
-                <EntityLinks publication={props.publication} entityIds={entry.entityIds} />
+                <strong>
+                  <EntityLinkedText publication={props.publication} entityIds={entry.entityIds} text={entry.label} />
+                </strong>
+                <p>
+                  <EntityLinkedText publication={props.publication} entityIds={entry.entityIds} text={entry.summary} />
+                </p>
               </span>
-            </button>
-            <CitationLinks publication={props.publication} citationIds={entry.citationIds} />
+            </div>
+            <div className="reader-explore__footer">
+              <Button
+                small
+                minimal
+                icon={props.selectionId === entry.id ? 'tick' : 'locate'}
+                text={props.selectionId === entry.id ? 'Selected entry' : 'Select entry'}
+                onClick={() => props.onSelect(entry.id)}
+              />
+              <CitationLinks publication={props.publication} citationIds={entry.citationIds} />
+            </div>
           </div>
         ))}
       </div>
@@ -869,13 +890,11 @@ function ReferenceExplorePresentation(props: ReferencePresentationProps) {
 
 function ReadingLayout({
   publication,
-  audience,
   sections,
   showNotes,
   deck,
 }: {
   publication: ReaderPublication
-  audience: ReaderAudienceDefinition
   sections: readonly ReaderSection[]
   showNotes: boolean
   deck: string
@@ -898,7 +917,6 @@ function ReadingLayout({
             key={section.id}
             publication={publication}
             section={section}
-            audience={audience}
             showNotes={showNotes}
           />
         ))}
@@ -910,28 +928,32 @@ function ReadingLayout({
 function ReaderSectionBlock({
   publication,
   section,
-  audience,
   showNotes,
 }: {
   publication: ReaderPublication
   section: ReaderSection
-  audience: ReaderAudienceDefinition
   showNotes: boolean
 }) {
   return (
     <section className="reader-section" id={section.id}>
-      <h2>{section.heading}</h2>
-      {section.body.map((paragraph, index) => <p key={index}>{paragraph}</p>)}
+      <h2>
+        <EntityLinkedText publication={publication} entityIds={section.entityIds} text={section.heading} />
+      </h2>
+      {section.body.map((paragraph, index) => (
+        <p key={index}>
+          <EntityLinkedText publication={publication} entityIds={section.entityIds} text={paragraph} />
+        </p>
+      ))}
       {showNotes && section.note && (
         <aside className="reader-note">
           <Icon icon="annotation" />
-          <span><strong>Reader note</strong>{section.note}</span>
+          <span>
+            <strong>Reader note</strong>
+            <EntityLinkedText publication={publication} entityIds={section.entityIds} text={section.note} />
+          </span>
         </aside>
       )}
       <div className="reader-inline-apparatus">
-        {audience.apparatus !== 'minimal' && (
-          <EntityLinks publication={publication} entityIds={section.entityIds} />
-        )}
         <CitationLinks publication={publication} citationIds={section.citationIds} />
       </div>
     </section>
@@ -971,28 +993,136 @@ function SourceLeaf({
   )
 }
 
-function EntityLinks({
+interface EntityMention {
+  start: number
+  end: number
+  entity: ReaderEntity
+}
+
+function entityAnchorId(entityId: string) {
+  return 'reader-entity-' + entityId.replace(/[^a-zA-Z0-9_-]/g, '-')
+}
+
+function isNameCharacter(value: string) {
+  return value !== '' && /[\p{L}\p{N}_]/u.test(value)
+}
+
+function findEntityMentions(
+  text: string,
+  entities: readonly ReaderEntity[],
+): EntityMention[] {
+  const foldedText = text.toLocaleLowerCase()
+  const candidates = entities.flatMap((entity) => {
+    const seen = new Set<string>()
+    return [entity.label, ...entity.writtenForms].flatMap((form) => {
+      const foldedForm = form.trim().toLocaleLowerCase()
+      if (!foldedForm || seen.has(foldedForm)) return []
+      seen.add(foldedForm)
+      return [{ entity, foldedForm }]
+    })
+  })
+  const mentions: EntityMention[] = []
+  let cursor = 0
+
+  while (cursor < text.length) {
+    let next: EntityMention | null = null
+    for (const candidate of candidates) {
+      let start = foldedText.indexOf(candidate.foldedForm, cursor)
+      while (start >= 0) {
+        const end = start + candidate.foldedForm.length
+        const hasLeftBoundary = start === 0 || !isNameCharacter(text[start - 1] ?? '')
+        const hasRightBoundary = end === text.length || !isNameCharacter(text[end] ?? '')
+        if (hasLeftBoundary && hasRightBoundary) {
+          if (
+            !next
+            || start < next.start
+            || (start === next.start && end - start > next.end - next.start)
+          ) {
+            next = { start, end, entity: candidate.entity }
+          }
+          break
+        }
+        start = foldedText.indexOf(candidate.foldedForm, start + 1)
+      }
+    }
+    if (!next) break
+    mentions.push(next)
+    cursor = next.end
+  }
+
+  return mentions
+}
+
+function EntityLinkedText({
   publication,
   entityIds,
+  text,
 }: {
   publication: ReaderPublication
   entityIds: readonly string[]
+  text: string
 }) {
-  if (entityIds.length === 0) return null
-  const entityById = new Map(publication.entities.map((entity) => [entity.id, entity]))
+  const entityIdSet = new Set(entityIds)
+  const entities = publication.entities.filter((entity) => entityIdSet.has(entity.id))
+  const mentions = findEntityMentions(text, entities)
+  if (mentions.length === 0) return <>{text}</>
+
+  const parts: ReactNode[] = []
+  let cursor = 0
+  mentions.forEach((mention, index) => {
+    if (mention.start > cursor) parts.push(text.slice(cursor, mention.start))
+    const literal = text.slice(mention.start, mention.end)
+    parts.push(
+      <a
+        key={mention.entity.id + ':' + mention.start + ':' + index}
+        className="reader-entity-link"
+        href={'#' + entityAnchorId(mention.entity.id)}
+        data-entity-id={mention.entity.id}
+        data-entity-release={publication.projection.entityReleaseId ?? 'unreleased'}
+        title={mention.entity.label + ' · ' + mention.entity.authorityState + ' · internal projection link'}
+        aria-label={literal + ': ' + mention.entity.label + ' entity'}
+      >
+        {literal}
+      </a>,
+    )
+    cursor = mention.end
+  })
+  if (cursor < text.length) parts.push(text.slice(cursor))
+  return <>{parts}</>
+}
+
+function EntityApparatus({ publication }: { publication: ReaderPublication }) {
+  if (publication.entities.length === 0) return null
   return (
-    <div className="reader-entities" aria-label="Plant entities">
-      {entityIds.map((id) => {
-        const entity = entityById.get(id) as ReaderEntity | undefined
-        return entity ? (
-          <span className="reader-entity-chip" key={id} title={entity.description}>
-            <Icon icon="tree" size={11} />
-            <span>{entity.label}</span>
-            <small>{entity.writtenForms[0]}</small>
-          </span>
-        ) : null
-      })}
-    </div>
+    <section className="reader-entity-apparatus" id="reader-entities" aria-labelledby="reader-entities-title">
+      <header>
+        <span>
+          <strong id="reader-entities-title">Plant entities</strong>
+          <small>Internal targets from the projection-pinned entity layer</small>
+        </span>
+        <Tag minimal icon="diagram-tree">
+          {publication.projection.entityReleaseId ?? 'No entity release'}
+        </Tag>
+      </header>
+      <div className="reader-entity-apparatus__grid">
+        {publication.entities.map((entity) => (
+          <article
+            key={entity.id}
+            id={entityAnchorId(entity.id)}
+            className="reader-entity-record"
+            tabIndex={-1}
+          >
+            <span className="reader-entity-record__state">{entity.authorityState}</span>
+            <h2>{entity.label}</h2>
+            <p>{entity.description}</p>
+            <small><strong>Written forms</strong> {entity.writtenForms.join(' · ')}</small>
+          </article>
+        ))}
+      </div>
+      <small className="reader-entity-apparatus__notice">
+        Same-document projection links only · no external authority URL asserted
+      </small>
+    </section>
   )
 }
 

@@ -313,6 +313,12 @@ Every window contains:
 - a status bar naming the active tool, selection count/scope, coordinate or
   text position, modifiers, save state, and concise feedback.
 
+Top-level menu items form one content-sized desktop menu run. They use native-
+like compact hit areas with 6 px horizontal label padding and at most 2 px
+between adjacent items; they never use `space-around`, `space-between`, flex
+growth, or equal-width web-navigation cells. Toolbar groups may consume the
+remaining width, but the File/Edit/View menu does not.
+
 This is desktop application chrome, not a web-page header. The platform menu
 is the complete, discoverable command inventory. File owns open/import/export/
 close; Edit owns undo/redo, clipboard and selection; View owns zoom, panes,
@@ -851,6 +857,14 @@ Text is edited in addressable units linked to region IDs. The text pane:
 - provides previous/next unreviewed or uncertain unit;
 - allows status change only as a separate reviewed command.
 
+Entity mention decoration remains inside the text flow. The literal source
+characters at the mention's revision-pinned offsets carry the entity styling
+and activation target; the text pane does not repeat plant labels in a chip or
+tag row beneath the transcription. Optional confidence or review glyphs follow
+the marked token inline and remain separately labelled for assistive
+technology. Activating a mention selects that exact span and opens its mention
+inspector without changing the transcription.
+
 Normalizations and translations cite source layer and content hash per unit.
 A transcription change marks dependent units stale and shows the exact source
 diff. The user can reaffirm, revise, or regenerate them. A frozen release
@@ -924,6 +938,11 @@ linking panel shows:
 - candidate historical concepts with tradition/period/region scope;
 - competing modern-referent assertions and their evidence/review;
 - match method, such as exact, normalized, fuzzy, phonetic, or model proposal.
+
+In the text pane the mention is rendered on its literal span, not as a detached
+tag associated with the whole section. Overlapping or competing assertions
+share one inline mention affordance whose inspector exposes the alternatives;
+the renderer does not duplicate the source words or imply a consensus.
 
 Low-confidence transcription cannot mint a confirmed written name
 automatically. The user may correct the text, record a proposed name form, mark
@@ -1260,6 +1279,16 @@ citation and diagnostics. Links are intercepted: internal reader routes remain
 inside preview; entity/page links can also offer **Locate in editor**; external
 links show their destination and follow policy. Publication content cannot
 invoke editor commands.
+
+Every published plant identification is a semantic hyperlink on the exact
+displayed name occurrence. Its destination is an entity route pinned to the
+publication projection's authority release, or an approved external authority
+URI declared by that projection. Link text remains the edition's displayed
+wording; it is never silently replaced by a preferred modern taxon. Proposed,
+disputed, stale, private, or excluded identifications do not acquire a public
+link. Entity links use ordinary keyboard, focus, visited-state, copy-address,
+and context-menu behavior, with an accessible entity-type label when the
+visible wording alone is ambiguous.
 
 Preview fidelity is measured rather than assumed. The frame reports reader
 build hash, projection hash, font set, viewport, device scale, locale, writing

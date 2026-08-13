@@ -75,12 +75,12 @@ export function DesktopWorkbench(props: Props) {
           <Popover
             key={menu.label}
             placement="bottom-start"
-            content={<Menu>{menu.items.map((item) => <MenuItem key={item} text={item} />)}</Menu>}
+            content={<Menu className="dw-popup-menu">{menu.items.map((item) => <MenuItem key={item} text={item} />)}</Menu>}
           >
             <Button minimal small>{menu.label}</Button>
           </Popover>
         ))}
-        <span />
+        <span className="dw-menubar__spacer" />
         <Button minimal small icon="help">Help</Button>
       </div>
       <div className="dw-commandbar">
@@ -110,7 +110,7 @@ export function DesktopWorkbench(props: Props) {
         >
           <Button small icon="layers">Layers</Button>
         </Popover>
-        <span />
+        <span className="dw-commandbar__spacer" />
         <WorkspaceNav value={props.workspace} onChange={props.setWorkspace} mode="compact" />
       </div>
 

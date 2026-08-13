@@ -164,14 +164,14 @@ export const herbalReaderPublication = {
     {
       id: 'concept-fig-medieval-western',
       label: 'Fig',
-      writtenForms: ['figes', 'fig', 'ficus'],
+      writtenForms: ['figes', 'fig', 'figs', 'ficus'],
       description: 'The fruit named in the March dietary regimen.',
       authorityState: 'Candidate written-name match',
     },
     {
       id: 'concept-grape-raisin-medieval-western',
       label: 'Raisin / grape',
-      writtenForms: ['rasyumes', 'raisins', 'uva'],
+      writtenForms: ['rasyumes', 'raisin', 'raisins', 'grape', 'uva'],
       description: 'A dried-grape food named beside figs in the regimen.',
       authorityState: 'Candidate written-name match',
     },
@@ -289,8 +289,8 @@ export const referenceReaderPublication = {
   ],
   entities: [
     { id: 'concept-betony-medieval-western', label: 'Betony', writtenForms: ['betayne', 'betony', 'betonica'], description: 'Provisional historical-concept fixture.', authorityState: 'Proposed authority assertion' },
-    { id: 'concept-fig-medieval-western', label: 'Fig', writtenForms: ['figes', 'fig', 'ficus'], description: 'Provisional written-name fixture.', authorityState: 'Candidate written-name match' },
-    { id: 'concept-grape-raisin-medieval-western', label: 'Raisin / grape', writtenForms: ['rasyumes', 'raisins', 'uva'], description: 'Provisional written-name fixture.', authorityState: 'Candidate written-name match' },
+    { id: 'concept-fig-medieval-western', label: 'Fig', writtenForms: ['figes', 'fig', 'figs', 'ficus'], description: 'Provisional written-name fixture.', authorityState: 'Candidate written-name match' },
+    { id: 'concept-grape-raisin-medieval-western', label: 'Raisin / grape', writtenForms: ['rasyumes', 'raisin', 'raisins', 'grape', 'uva'], description: 'Provisional written-name fixture.', authorityState: 'Candidate written-name match' },
   ],
 } as const satisfies ReferenceReaderPublication
 
