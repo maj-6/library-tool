@@ -56,10 +56,10 @@ export function RegionTree({ types, activeTypeId, regionCounts, onSelect, onAddS
   return (
     <section className="panel-section region-tree">
       <div className="section-heading">
-        <div><span className="section-kicker">Ontology</span><h3>Region types</h3></div>
+        <div><span className="section-kicker">Types</span><h3>Region types</h3></div>
         <Button minimal small icon="settings" aria-label="Region type settings" />
       </div>
-      <p className="section-help">Choose a type before drawing. Add subclasses for hands, scripts, or local conventions.</p>
+      <p className="section-help">Select type. Add subclass.</p>
       <div className="type-tree">{roots.map((type) => row(type))}</div>
     </section>
   )
@@ -77,7 +77,7 @@ export function RegionInspector({ region, types, onChange, onDelete, onOpenEntit
   if (!region) {
     return (
       <Callout className="empty-inspector" icon="select" title="Select a region">
-        Choose a box or polygon on the page to edit its geometry, semantic type, reading order, and notes.
+        Select a box or polygon.
       </Callout>
     )
   }
@@ -116,13 +116,13 @@ export function RegionInspector({ region, types, onChange, onDelete, onOpenEntit
       <Divider />
       <div className="anchor-summary">
         <Icon icon="locate" size={14} />
-        <div><strong>Triple anchor</strong><span>page region · revision range · quoted context</span></div>
+        <div><strong>Triple anchor</strong><span>region · text range · quote</span></div>
         <Tag intent="success" minimal>healthy</Tag>
       </div>
       {region.typeId === 'plant-name' && (
-        <Button fill icon="diagram-tree" intent="success" onClick={onOpenEntity}>Open linked plant entity</Button>
+        <Button fill icon="diagram-tree" intent="success" onClick={onOpenEntity}>Open entity</Button>
       )}
-      <Button minimal fill icon="trash" intent="danger" onClick={() => onDelete(region.id)}>Delete region</Button>
+      <Button minimal fill icon="trash" intent="danger" onClick={() => onDelete(region.id)}>Delete</Button>
     </section>
   )
 }

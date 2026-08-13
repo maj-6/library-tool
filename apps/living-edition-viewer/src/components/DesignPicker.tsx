@@ -14,10 +14,10 @@ export function DesignPicker({ designs, selected, shortlist, onSelect, onShortli
     <section className="design-picker" aria-labelledby="design-picker-title">
       <div className="design-picker__heading">
         <div>
-          <div className="eyebrow" id="design-picker-title">Choose a working direction</div>
-          <p>Explore each concept in Library, Edition, and Entity workspaces. Nothing here commits the final build.</p>
+          <div className="eyebrow" id="design-picker-title">Layout variants</div>
+          <p>Open Library, Edition, and Entities. Test editing and record a preference.</p>
         </div>
-        <Tag minimal icon="lightbulb">4 distinct workflows</Tag>
+        <Tag minimal icon="layout">{designs.length} layouts</Tag>
       </div>
       <div className="design-picker__grid">
         {designs.map((design) => {
@@ -46,7 +46,7 @@ export function DesignPicker({ designs, selected, shortlist, onSelect, onShortli
               <strong>{design.subtitle}</strong>
               <p>{design.description}</p>
               <div className="design-card__fit"><Icon icon="tick-circle" size={12} /> {design.bestFor}</div>
-              {isSelected && <Tag intent="primary" round>Viewing now</Tag>}
+              {isSelected && <Tag intent="primary">Active</Tag>}
             </Card>
           )
         })}

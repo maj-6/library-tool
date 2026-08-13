@@ -1,12 +1,14 @@
 import type { IconName } from '@blueprintjs/icons'
 
-export type DesignId = 'scriptorium' | 'spatial' | 'queue' | 'matrix'
+// Registry identifiers remain open strings so packages can add designs, layers,
+// sources, and workspaces without changing a central union.
+export type DesignId = string
 export type DrawMode = 'select' | 'rectangle' | 'polygon'
-export type LayerId = 'image' | 'regions' | 'transcription' | 'translation' | 'entities' | 'knowledge'
-export type MatrixFocusId = 'text' | 'geometry' | 'entities' | 'knowledge'
+export type LayerId = string
+export type MatrixFocusId = string
 export type NoteScope = 'book' | 'page' | 'region'
-export type TextSourceId = 'mistral' | 'local' | 'edited'
-export type Workspace = 'library' | 'edition' | 'entities'
+export type TextSourceId = string
+export type Workspace = string
 
 export interface WorkspaceDefinition {
   id: Workspace
@@ -84,4 +86,13 @@ export interface DesignDirection {
   description: string
   bestFor: string
   tradeoff: string
+}
+
+export interface WorkbenchLayoutDefinition {
+  designId: DesignId
+  layoutClass: string
+  windowTitle: string
+  documentCode: string
+  statusText: string
+  features: readonly string[]
 }

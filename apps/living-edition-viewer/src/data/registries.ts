@@ -4,6 +4,7 @@ import type {
   MatrixFocusDefinition,
   RegionType,
   TextSourceDefinition,
+  WorkbenchLayoutDefinition,
   WorkspaceDefinition,
 } from '../types'
 
@@ -63,3 +64,30 @@ export const regionTypeDefinitions = [
 export const regionTypeById = Object.fromEntries(
   regionTypeDefinitions.map((type) => [type.id, type]),
 ) as Record<string, RegionType>
+
+export const workbenchLayoutDefinitions = [
+  {
+    designId: 'drafting',
+    layoutClass: 'drafting',
+    windowTitle: 'Drafting Desk',
+    documentCode: 'WHL-M-014 / fol. 4r',
+    statusText: 'Ready',
+    features: ['navigator', 'properties', 'text', 'problems'],
+  },
+  {
+    designId: 'register',
+    layoutClass: 'register',
+    windowTitle: 'Parallel Register',
+    documentCode: 'WHL-M-014 / aligned view',
+    statusText: '4 differences',
+    features: ['navigator', 'properties', 'text', 'problems'],
+  },
+  {
+    designId: 'console',
+    layoutClass: 'console',
+    windowTitle: 'Catalog Console',
+    documentCode: 'Takamiya MS 46 1',
+    statusText: 'Authority DB connected',
+    features: ['navigator', 'properties', 'text', 'problems', 'catalog-index'],
+  },
+] as const satisfies readonly WorkbenchLayoutDefinition[]

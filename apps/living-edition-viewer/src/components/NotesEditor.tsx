@@ -19,7 +19,7 @@ export function NotesEditor({ scope, value, selectedRegionLabel, onChangeScope, 
   return (
     <section className="panel-section notes-editor">
       <div className="section-heading">
-        <div><span className="section-kicker">Editorial memory</span><h3>Notes & guidance</h3></div>
+        <div><span className="section-kicker">Annotations</span><h3>Notes</h3></div>
         <Tag minimal icon="saved">Saved locally</Tag>
       </div>
       <ButtonGroup fill>
@@ -29,17 +29,17 @@ export function NotesEditor({ scope, value, selectedRegionLabel, onChangeScope, 
       </ButtonGroup>
       <div className="note-context">
         <Icon icon="link" size={12} />
-        {scope === 'book' ? 'The Herbal · all pages' : scope === 'page' ? 'fol. 4r · this page' : selectedRegionLabel ?? 'Select a region to attach precisely'}
+        {scope === 'book' ? 'The Herbal · all pages' : scope === 'page' ? 'fol. 4r · current page' : selectedRegionLabel ?? 'No region selected'}
       </div>
       <TextArea
         fill
         rows={4}
-        placeholder={scope === 'region' && !selectedRegionLabel ? 'Select a region first…' : 'Record evidence, instructions, or an unresolved question…'}
+        placeholder={scope === 'region' && !selectedRegionLabel ? 'Select region' : 'Enter note'}
         value={value}
         disabled={scope === 'region' && !selectedRegionLabel}
         onChange={(event) => onChange(event.target.value)}
       />
-      <div className="note-footer"><span><kbd>@</kbd> mention a contributor</span><span><kbd>/</kbd> add evidence link</span></div>
+      <div className="note-footer"><span><kbd>@</kbd> Mention</span><span><kbd>/</kbd> Evidence link</span></div>
     </section>
   )
 }

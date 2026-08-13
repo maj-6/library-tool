@@ -16,16 +16,27 @@ Open <http://localhost:5191/>. Production assets can be checked with
 
 ## Review task
 
-Compare all four light-only variants—Scriptorium, Spatial Lab, Review Queue,
-and Layer Matrix—across Library, Living Edition, and Plant Entities. Try the
-box and polygon tools, custom hand/region types, scoped notes, reprocessing
-guidance, layer comparison, and plant-entity navigation. Shortlists and notes
-are stored only in browser `localStorage`.
+Compare seven light-only desktop variants across Library, Edition, and
+Entities:
+
+- A: Scriptorium — aligned scholarly edition
+- B: Spatial Lab — geometry editor
+- C: Review Queue — task review
+- D: Layer Matrix — dense evidence comparison
+- E: Drafting Desk — CAD canvas with docked navigator and properties
+- F: Parallel Register — synchronized scan, text, translation, and problems
+- G: Catalog Console — master-detail library and authority work
+
+All variants use Segoe UI, compact desktop chrome, terse labels, and Blueprint
+UI controls. Test box and polygon tools, custom region subclasses, scoped
+notes, guided reprocessing, layer comparison, and entity navigation. Selection
+and notes remain in browser `localStorage`.
 
 The fixture uses an abstract manuscript placeholder. Source rasters remain in
 the local edition workspace and are not copied into this design package.
 
-Shared concepts such as workspaces, layers, overlays, OCR sources, region
-types, and manuscript display metadata come from typed registries under
-`src/data/registries.ts`; the prototype avoids treating its current sample
-assets and layer kinds as a closed production model.
+Shared workspaces, layouts, layers, overlays, OCR sources, region types, and
+asset descriptors come from typed registries under `src/data/registries.ts`.
+E–G use one feature-driven desktop renderer. Current identifiers are open
+strings, so extensions do not require closed-enum changes or duplicated domain
+models.

@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react'
 import { Button, ButtonGroup, Card, Checkbox, Icon, InputGroup, Tag } from '@blueprintjs/core'
 import { activeManuscript } from '../data/registries'
+import type { DesignId } from '../types'
 
 interface Props {
-  variant: 'scriptorium' | 'spatial' | 'queue' | 'matrix'
+  variant: DesignId
   onOpenEdition: () => void
 }
 
@@ -28,7 +29,9 @@ const books = [
 
 export function LibraryBrowser({ variant, onOpenEdition }: Props) {
   const [query, setQuery] = useState('')
-  const [view, setView] = useState<'grid' | 'list'>(variant === 'matrix' ? 'list' : 'grid')
+  const [view, setView] = useState<'grid' | 'list'>(
+    ['matrix', 'drafting', 'register', 'console'].includes(variant) ? 'list' : 'grid',
+  )
   const [onlyEditions, setOnlyEditions] = useState(false)
   const filtered = useMemo(() => books.filter((book) => {
     const haystack = `${book.title} ${book.author} ${book.date} ${book.language} ${book.subject}`.toLowerCase()
@@ -38,27 +41,27 @@ export function LibraryBrowser({ variant, onOpenEdition }: Props) {
   return (
     <div className={`library-browser library-browser--${variant}`}>
       <aside className="library-filters">
-        <div className="library-filters__title"><Icon icon="filter-list" /> Refine</div>
+        <div className="library-filters__title"><Icon icon="filter-list" /> Filters</div>
         <div className="filter-group"><strong>Material</strong><Checkbox defaultChecked label="Manuscript (312)" /><Checkbox label="Early print (1,184)" /><Checkbox label="Modern (2,860)" /></div>
         <div className="filter-group"><strong>Language</strong><Checkbox defaultChecked label="English (1,932)" /><Checkbox label="Latin (488)" /><Checkbox label="Chinese (221)" /></div>
         <div className="filter-group"><strong>Layers</strong><Checkbox checked={onlyEditions} onChange={(event) => setOnlyEditions(event.currentTarget.checked)} label="Living-edition work" /><Checkbox label="Plant entities" /><Checkbox label="Translation" /></div>
-        <Button minimal icon="cross" onClick={() => { setQuery(''); setOnlyEditions(false) }}>Clear filters</Button>
+        <Button minimal icon="cross" onClick={() => { setQuery(''); setOnlyEditions(false) }}>Clear</Button>
       </aside>
       <main className="catalog-content">
         <header className="catalog-header">
           <div>
-            <span className="section-kicker">World Herb Library</span>
-            <h2>Browse the collection</h2>
-            <p>Works, editions, and physical witnesses are distinct—but discoverable together.</p>
+            <span className="section-kicker">Library</span>
+            <h2>Collection</h2>
+            <p>Works · editions · witnesses</p>
           </div>
-          <Tag large intent="success" minimal>4,356 open books</Tag>
+          <Tag intent="success" minimal>4,356 records</Tag>
         </header>
         <div className="catalog-toolbar">
-          <InputGroup large leftIcon="search" placeholder="Search title, person, plant, or passage…" value={query} onChange={(event) => setQuery(event.target.value)} rightElement={query ? <Button minimal icon="cross" onClick={() => setQuery('')} /> : undefined} />
+          <InputGroup leftIcon="search" placeholder="Search" value={query} onChange={(event) => setQuery(event.target.value)} rightElement={query ? <Button minimal icon="cross" onClick={() => setQuery('')} /> : undefined} />
           <Button icon="sort-alphabetical" text="Title" />
           <ButtonGroup><Button icon="grid-view" active={view === 'grid'} onClick={() => setView('grid')} aria-label="Grid view" /><Button icon="list" active={view === 'list'} onClick={() => setView('list')} aria-label="List view" /></ButtonGroup>
         </div>
-        <div className="catalog-result-line"><strong>{filtered.length}</strong> design-sample records <span>·</span> sorted by relevance</div>
+        <div className="catalog-result-line"><strong>{filtered.length}</strong> records <span>·</span> Relevance</div>
         <div className={`book-results is-${view}`}>
           {filtered.map((book) => (
             <Card className="book-card" key={book.id} interactive onClick={book.id === 'herbal-ms' ? onOpenEdition : undefined}>
@@ -75,11 +78,11 @@ export function LibraryBrowser({ variant, onOpenEdition }: Props) {
                   <span className="mini-progress"><i style={{ width: `${book.progress}%` }} /></span>
                   <span>{book.status}</span><small>{book.pages.toLocaleString()} pp.</small>
                 </div>
-                {book.id === 'herbal-ms' && <Button intent="primary" icon="book" onClick={(event) => { event.stopPropagation(); onOpenEdition() }}>Open living edition</Button>}
+                {book.id === 'herbal-ms' && <Button intent="primary" icon="book" onClick={(event) => { event.stopPropagation(); onOpenEdition() }}>Open edition</Button>}
               </div>
             </Card>
           ))}
-          {filtered.length === 0 && <div className="empty-results"><Icon icon="search" size={28} /><h3>No sample records match</h3><p>Try “herbal”, “Latin”, or clear the layer filter.</p></div>}
+          {filtered.length === 0 && <div className="empty-results"><Icon icon="search" size={28} /><h3>No records</h3><p>Change search or clear filters.</p></div>}
         </div>
       </main>
     </div>

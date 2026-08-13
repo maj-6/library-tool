@@ -20,6 +20,7 @@ import {
   Tag,
 } from '@blueprintjs/core'
 import { DesignPicker } from './components/DesignPicker'
+import { DesktopWorkbench } from './components/DesktopWorkbench'
 import { EntityWorkspace } from './components/EntityWorkspace'
 import { FeedbackPanel } from './components/FeedbackPanel'
 import { LayerText } from './components/LayerText'
@@ -36,6 +37,7 @@ import {
   matrixFocusDefinitions,
   overlayLayerDefinitions,
   regionTypeDefinitions,
+  workbenchLayoutDefinitions,
 } from './data/registries'
 import type { DesignId, DrawMode, LayerId, MatrixFocusId, NoteScope, Region, RegionType, Workspace } from './types'
 
@@ -55,7 +57,10 @@ function App() {
   const [workspace, setWorkspaceState] = useState<Workspace>('edition')
   const [fromMention, setFromMention] = useState(false)
   const [shortlist, setShortlist] = useState<DesignId[]>(() => readStored('whl.mockup.shortlist', []))
-  const [feedback, setFeedback] = useState<FeedbackMap>(() => readStored('whl.mockup.feedback', { scriptorium: '', spatial: '', queue: '', matrix: '' }))
+  const [feedback, setFeedback] = useState<FeedbackMap>(() => readStored(
+    'whl.mockup.feedback',
+    Object.fromEntries(designs.map((item) => [item.id, ''])) as FeedbackMap,
+  ))
   const [regions, setRegions] = useState<Region[]>(initialRegions)
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>('m4-03')
   const [drawMode, setDrawMode] = useState<DrawMode>('select')
@@ -73,6 +78,7 @@ function App() {
   const [matrixFocus, setMatrixFocus] = useState<MatrixFocusId>('text')
 
   const design = designs.find((candidate) => candidate.id === designId) ?? designs[0]
+  const workbenchLayout = workbenchLayoutDefinitions.find((candidate) => candidate.designId === designId)
   const selectedRegion = regions.find((region) => region.id === selectedRegionId) ?? null
   const regionCounts = useMemo(() => regions.reduce<Record<string, number>>((counts, region) => {
     counts[region.typeId] = (counts[region.typeId] ?? 0) + 1
@@ -138,9 +144,9 @@ function App() {
   }
 
   const commonWorkspace = workspace === 'library'
-    ? <LibraryBrowser variant={designId} onOpenEdition={() => setWorkspaceState('edition')} />
+    ? <LibraryBrowser key={designId} variant={designId} onOpenEdition={() => setWorkspaceState('edition')} />
     : workspace === 'entities'
-      ? <EntityWorkspace variant={designId} fromMention={fromMention} onBackToEdition={() => setWorkspaceState('edition')} />
+      ? <EntityWorkspace key={designId} variant={designId} fromMention={fromMention} onBackToEdition={() => setWorkspaceState('edition')} />
       : null
 
   return (
@@ -150,10 +156,10 @@ function App() {
           <span className="review-mark"><Icon icon="tree" size={18} /></span>
           <NavbarHeading>World Herb Library</NavbarHeading>
           <NavbarDivider />
-          <span className="review-title">Living Edition workbench</span>
+          <span className="review-title">Living Edition</span>
         </NavbarGroup>
         <NavbarGroup align={Alignment.RIGHT}>
-          <Tag intent="warning" icon="changes" round>Design exploration · Stage 1 of 3</Tag>
+          <Tag intent="warning" icon="changes">Design review 1/3</Tag>
           <span className="review-progress"><i /><i /><i /></span>
           <Popover content={<Menu><MenuItem icon="export" text="Export review notes" /><MenuItem icon="reset" text="Clear local feedback" onClick={() => { window.localStorage.removeItem('whl.mockup.feedback'); window.location.reload() }} /></Menu>} placement="bottom-end">
             <Button minimal icon="more" aria-label="Review menu" />
@@ -164,14 +170,14 @@ function App() {
       <main className="gallery-main">
         <header className="gallery-intro">
           <div>
-            <span className="eyebrow">A design review surface · not the final application</span>
-            <h1>How should a living book feel to work in?</h1>
-            <p>Four working mockups use the same real manuscript folio, OCR blocks, and editorial tasks. Open every workspace, draw regions, follow a plant mention, then record what belongs in the next round.</p>
+            <span className="eyebrow">Interface study</span>
+            <h1>Living Edition layouts</h1>
+            <p>Seven light desktop variants. Test navigation, geometry, text, notes, processing, and entities.</p>
           </div>
           <Card className="review-instructions">
-            <span>Review loop</span>
+            <span>Review stage</span>
             <ol><li className="is-current">Explore</li><li>Refine</li><li>Settle</li></ol>
-            <small>Your shortlist and notes stay in this browser.</small>
+            <small>Preferences are stored locally.</small>
           </Card>
         </header>
 
@@ -180,8 +186,8 @@ function App() {
         <section className={`concept-stage concept-stage--${designId}`} aria-label={`${design.title} interactive mockup`}>
           <div className="concept-caption">
             <div><span className="concept-caption__marker">{design.marker}</span><span><strong>{design.title}</strong><small>{design.subtitle}</small></span></div>
-            <div className="concept-caption__tips"><Icon icon="hand" /> Try it: switch workspaces · draw a box or polygon · edit a line · open “feuel”</div>
-            <Tag minimal icon="desktop">1440px prototype viewport</Tag>
+            <div className="concept-caption__tips"><Icon icon="hand" /> Switch workspace. Draw region. Edit text. Open entity.</div>
+            <Tag minimal icon="desktop">Desktop preview</Tag>
           </div>
 
           {designId === 'scriptorium' && (
@@ -259,6 +265,30 @@ function App() {
               onOpenEntity={openEntityFromMention}
               focus={matrixFocus}
               setFocus={setMatrixFocus}
+            />
+          )}
+          {workbenchLayout && (
+            <DesktopWorkbench
+              layout={workbenchLayout}
+              workspace={workspace}
+              setWorkspace={setWorkspace}
+              commonWorkspace={commonWorkspace}
+              canvasProps={canvasProps}
+              selectedRegion={selectedRegion}
+              types={types}
+              activeTypeId={activeTypeId}
+              setActiveTypeId={setActiveTypeId}
+              regionCounts={regionCounts}
+              addSubclass={addSubclass}
+              onUpdateRegion={updateRegion}
+              onDeleteRegion={deleteRegion}
+              onOpenEntity={openEntityFromMention}
+              noteScope={noteScope}
+              setNoteScope={setNoteScope}
+              notes={notes}
+              setNotes={setNotes}
+              visibleLayerIds={visibleLayerIds}
+              setLayerVisibility={setLayerVisibility}
             />
           )}
         </section>
@@ -350,13 +380,13 @@ function SpatialLab(props: SharedEditionProps & NoteProps & { activeTypeId: stri
     <div className="mockup-window spatial-window">
       <WorkspaceNav value={props.workspace} onChange={props.setWorkspace} mode="rail" />
       <div className="spatial-main">
-        <header className="spatial-topbar"><div><span className="section-kicker">Spatial Lab</span><strong>{props.workspace === 'edition' ? `${activeManuscript.label} · ${activeManuscript.folio}` : props.workspace === 'library' ? 'Library browser' : 'Plant entity database'}</strong></div><div><Tag minimal icon="layers">{props.visibleLayerIds.length} visible layers</Tag><Switch inline large checked={props.showRegions} label="Regions" onChange={(event) => props.setShowRegions(event.currentTarget.checked)} /><Button intent="primary" icon="floppy-disk">Save</Button></div></header>
+        <header className="spatial-topbar"><div><span className="section-kicker">Spatial Lab</span><strong>{props.workspace === 'edition' ? `${activeManuscript.label} · ${activeManuscript.folio}` : props.workspace === 'library' ? 'Library' : 'Plant entities'}</strong></div><div><Tag minimal icon="layers">{props.visibleLayerIds.length} layers</Tag><Switch inline large checked={props.showRegions} label="Regions" onChange={(event) => props.setShowRegions(event.currentTarget.checked)} /><Button intent="primary" icon="floppy-disk">Save</Button></div></header>
         {props.commonWorkspace ?? (
           <div className="spatial-workarea">
             <aside className="spatial-left"><RegionTree types={props.types} activeTypeId={props.activeTypeId} regionCounts={props.regionCounts} onSelect={props.setActiveTypeId} onAddSubclass={props.addSubclass} /><Divider /><div className="spatial-object-list"><div className="section-heading"><div><span className="section-kicker">Page objects</span><h3>Regions</h3></div><Tag round>{props.canvasProps.regions.length}</Tag></div>{props.canvasProps.regions.map((region) => <button key={region.id} className={props.selectedRegion?.id === region.id ? 'is-active' : ''} onClick={() => props.canvasProps.onSelect(region.id)}><span style={{ borderColor: region.color }} /><strong>{region.label}</strong><small>{region.source}</small></button>)}</div></aside>
-            <main className="spatial-canvas"><ManuscriptCanvas {...props.canvasProps} /><div className="spatial-status"><span>x 512 · y 884</span><span>zoom 43%</span><span>{props.canvasProps.drawMode === 'select' ? 'Select tool' : `Drawing ${props.canvasProps.drawMode}`}</span><Tag minimal>{props.types.find((type) => type.id === props.activeTypeId)?.name}</Tag></div></main>
+            <main className="spatial-canvas"><ManuscriptCanvas {...props.canvasProps} /><div className="spatial-status"><span>X 512 · Y 884</span><span>Zoom 43%</span><span>{props.canvasProps.drawMode === 'select' ? 'Select' : props.canvasProps.drawMode}</span><Tag minimal>{props.types.find((type) => type.id === props.activeTypeId)?.name}</Tag></div></main>
             <aside className="spatial-right"><RegionInspector region={props.selectedRegion} types={props.types} onChange={props.onUpdateRegion} onDelete={props.onDeleteRegion} onOpenEntity={props.onOpenEntity} /><Divider /><NotesEditor scope={props.noteScope} value={props.notes[props.noteScope]} selectedRegionLabel={props.selectedRegion?.label} onChangeScope={props.setNoteScope} onChange={(value) => props.setNotes((current) => ({ ...current, [props.noteScope]: value }))} /></aside>
-            <div className="spatial-bottom-drawer"><div className="drawer-handle"><span><Icon icon="comparison" /> Aligned text tray</span><Tag minimal>Mistral 4 ↔ Edited ↔ English</Tag><Button minimal small icon="chevron-down" /></div><LayerText dense selectedRegionId={props.selectedRegion?.id ?? null} onOpenEntity={props.onOpenEntity} /></div>
+            <div className="spatial-bottom-drawer"><div className="drawer-handle"><span><Icon icon="comparison" /> Aligned text</span><Tag minimal>Mistral 4 ↔ Edited ↔ English</Tag><Button minimal small icon="chevron-down" /></div><LayerText dense selectedRegionId={props.selectedRegion?.id ?? null} onOpenEntity={props.onOpenEntity} /></div>
           </div>
         )}
       </div>
@@ -372,20 +402,20 @@ function ReviewQueue(props: SharedEditionProps & { queueSelection: string; setQu
       {props.commonWorkspace ?? (
         <div className="queue-layout">
           <aside className="queue-list">
-            <div className="queue-list__head"><span className="section-kicker">My queue</span><h2>Uncertainties worth a person</h2><p>Ranked by downstream impact, not model confidence alone.</p></div>
+            <div className="queue-list__head"><span className="section-kicker">Queue</span><h2>Open items</h2><p>Impact order</p></div>
             <div className="queue-filters"><Button small active>All 14</Button><Button small>Layout 5</Button><Button small>Text 6</Button><Button small>Entities 3</Button></div>
             {queueItems.map((item, index) => <button key={item.id} className={props.queueSelection === item.id ? 'queue-item is-active' : 'queue-item'} onClick={() => { props.setQueueSelection(item.id); setDecision('pending') }}><span className={`queue-item__priority is-${item.severity}`}>{index + 1}</span><span><em>{item.kind}</em><strong>{item.title}</strong><small>{item.meta}</small></span><Icon icon="chevron-right" size={12} /></button>)}
             <div className="queue-progress"><span><strong>8</strong> reviewed today</span><span className="mini-progress"><i style={{ width: '57%' }} /></span></div>
           </aside>
           <main className="queue-focus">
-            <header><div><Tag intent="danger" minimal>High impact</Tag><h2>Rubric merged with opening line</h2><p>The detected block crosses a change in color and function. Correcting it will improve text order and every dependent anchor.</p></div><Button minimal icon="cross" aria-label="Close task" /></header>
+            <header><div><Tag intent="danger" minimal>High impact</Tag><h2>Rubric merged with opening line</h2><p>Color and function change. Split before anchor update.</p></div><Button minimal icon="cross" aria-label="Close task" /></header>
             <div className="queue-evidence"><div className="queue-image"><span className="evidence-label">Page evidence</span><ManuscriptCanvas {...props.canvasProps} crop /></div><div className="queue-comparison"><span className="evidence-label">Engine comparison</span><div className="comparison-card"><div><strong>Mistral OCR 4</strong><Tag intent="warning" minimal>merged</Tag></div><p>Bere tuis pponas ye gode leibe et reilles of metes; byut te to use ye tyme…</p></div><div className="comparison-card is-proposed"><div><strong>Proposed split</strong><Tag intent="success" minimal>manual</Tag></div><label>Rubric</label><p contentEditable suppressContentEditableWarning>Here begins guidance on wholesome diet and the ordering of meals.</p><label>Body text · Hand A</label><p contentEditable suppressContentEditableWarning>…and on choosing the proper seasons for bloodletting throughout the year.</p></div><button className="entity-jump" onClick={props.onOpenEntity}><Icon icon="diagram-tree" /> “feuel” has a dependent plant assertion <Icon icon="arrow-right" /></button></div></div>
           </main>
           <aside className="queue-decision">
-            <span className="section-kicker">Resolve this task</span><h2>Confirm the split</h2><p>Drag or edit the selected boxes, then record what the next pass should know.</p>
+            <span className="section-kicker">Decision</span><h2>Confirm split</h2><p>Edit geometry. Record processing guidance.</p>
             <RegionInspector region={props.selectedRegion} types={props.types} onChange={props.onUpdateRegion} onDelete={props.onDeleteRegion} onOpenEntity={props.onOpenEntity} />
             <ReprocessPanel />
-            <div className="queue-actions"><Button large fill icon="undo" onClick={() => setDecision('skipped')}>Needs specialist</Button><Button large fill intent="success" icon="tick" onClick={() => setDecision('accepted')}>Accept & next</Button></div>
+            <div className="queue-actions"><Button large fill icon="undo" onClick={() => setDecision('skipped')}>Escalate</Button><Button large fill intent="success" icon="tick" onClick={() => setDecision('accepted')}>Accept and next</Button></div>
             {decision !== 'pending' && <Tag large fill intent={decision === 'accepted' ? 'success' : 'warning'} icon={decision === 'accepted' ? 'tick-circle' : 'time'}>{decision === 'accepted' ? 'Decision saved · moving to task 2' : 'Held for paleography review'}</Tag>}
           </aside>
         </div>
@@ -401,7 +431,7 @@ function LayerMatrix(props: SharedEditionProps & { focus: MatrixFocusId; setFocu
       <header className="matrix-header"><div className="matrix-wordmark"><span>WHL</span><strong>Evidence Desk</strong></div><WorkspaceNav value={props.workspace} onChange={props.setWorkspace} mode="compact" /><div><InputSearch /><Button intent="primary" icon="git-merge">Prepare release</Button></div></header>
       {props.commonWorkspace ?? (
         <EditionChrome label={activeManuscript.witnessLabel}>
-          <div className="matrix-toolbar"><ButtonGroup>{matrixFocusDefinitions.map((item) => <Button key={item.id} active={props.focus === item.id} onClick={() => props.setFocus(item.id)} icon={item.icon}>{item.label}</Button>)}</ButtonGroup><span /><Checkbox checked={showDiffs} onChange={(event) => setShowDiffs(event.currentTarget.checked)} label="Only disagreements" /><Button icon="filter-list">Filters</Button><Button icon="export">Export</Button></div>
+          <div className="matrix-toolbar"><ButtonGroup>{matrixFocusDefinitions.map((item) => <Button key={item.id} active={props.focus === item.id} onClick={() => props.setFocus(item.id)} icon={item.icon}>{item.label}</Button>)}</ButtonGroup><span /><Checkbox checked={showDiffs} onChange={(event) => setShowDiffs(event.currentTarget.checked)} label="Differences only" /><Button icon="filter-list">Filters</Button><Button icon="export">Export</Button></div>
           <div className="matrix-body">
             <aside className="matrix-page"><div className="matrix-page__head"><span className="section-kicker">Image witness</span><strong>{activeManuscript.folio}</strong><Tag minimal>{activeManuscript.width} × {activeManuscript.height}</Tag></div><ManuscriptCanvas {...props.canvasProps} compact /><div className="matrix-page__legend"><span><i className="mistral" />Mistral 4</span><span><i className="manual" />Manual</span><span><i className="entity" />Entity anchor</span></div></aside>
             <main className="matrix-grid">
@@ -420,7 +450,7 @@ function LayerMatrix(props: SharedEditionProps & { focus: MatrixFocusId; setFocu
                 <MatrixRow source="Editorial note" badge="draft" intent="primary" text={<>Month-by-month regimens combine diet, humoral balance, and bloodletting.</>} meta="S. Editor · rev. 1" />
               </MatrixGroup>
             </main>
-            <aside className="matrix-inspector"><div className="matrix-inspector__head"><span className="section-kicker">Selection inspector</span><Tag minimal intent="success">anchor healthy</Tag></div><RegionInspector region={props.selectedRegion} types={props.types} onChange={props.onUpdateRegion} onDelete={props.onDeleteRegion} onOpenEntity={props.onOpenEntity} /><Divider /><div className="lineage"><h3>Lineage</h3><div><i />Image witness <small>immutable</small></div><div><i />Mistral block <small>machine · proposed</small></div><div><i />Editorial revision 3 <small>reviewed</small></div><div><i />Translation draft <small>stale if source moves</small></div></div></aside>
+            <aside className="matrix-inspector"><div className="matrix-inspector__head"><span className="section-kicker">Properties</span><Tag minimal intent="success">Anchor valid</Tag></div><RegionInspector region={props.selectedRegion} types={props.types} onChange={props.onUpdateRegion} onDelete={props.onDeleteRegion} onOpenEntity={props.onOpenEntity} /><Divider /><div className="lineage"><h3>Lineage</h3><div><i />Image witness <small>immutable</small></div><div><i />Mistral block <small>machine · proposed</small></div><div><i />Editorial revision 3 <small>reviewed</small></div><div><i />Translation draft <small>stale if source moves</small></div></div></aside>
           </div>
         </EditionChrome>
       )}

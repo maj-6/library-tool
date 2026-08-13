@@ -42,7 +42,7 @@ export function LayerText({ selectedRegionId, onOpenEntity, dense = false }: Pro
       </section>
       <section className="text-column translation-column">
         <div className="text-column__head">
-          <div><span className="section-kicker">Modern English</span><h3>{translationMode === 'literal' ? 'Literal rendering' : 'Reading edition'}</h3></div>
+          <div><span className="section-kicker">Modern English</span><h3>{translationMode === 'literal' ? 'Literal' : 'Reading'}</h3></div>
           <Tag minimal intent="primary">draft</Tag>
         </div>
         <ButtonGroup minimal>
@@ -58,7 +58,7 @@ export function LayerText({ selectedRegionId, onOpenEntity, dense = false }: Pro
           ))}
         </div>
         {!dense && (
-          <Callout className="knowledge-note" icon="learning" title="Knowledge layer · calendar medicine">
+          <Callout className="knowledge-note" icon="learning" title="Calendar medicine">
             Month-by-month regimens combine diet, humoral balance, and bloodletting. This note is editorial and remains separate from the translation.
           </Callout>
         )}

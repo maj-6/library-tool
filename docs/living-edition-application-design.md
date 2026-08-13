@@ -98,11 +98,28 @@ capabilities (for example, `spatial`, `textual`, `comparable`, or
 plant data. A newly registered kind can reuse generic browse, compare,
 provenance, validation, and inspector surfaces without editing every feature.
 
+The same rule applies to presentation. A workspace is composed from registered
+views, pane contributions, property editors, tool groups, status providers and
+commands. Layout presets store contribution IDs, docking positions and sizes;
+they do not name React components or assume that an asset is an image. A
+property row is supplied by a versioned descriptor with label, value type,
+editor capability, validation and provenance behavior. Feature code MUST NOT
+grow switches such as `if asset.type === "image"` or fixed fields such as
+`plantName`; it asks whether a resource is spatial, textual, name-bearing,
+renderable, comparable or otherwise capable, then selects a compatible
+registered adapter.
+
 Unknown declared kinds remain visible through a safe generic inspector and
 round-trip without loss. They never become executable merely because an
 archive names them. Specialized renderers are optional presentation adapters,
 not alternate domain models. Mock fixtures may be concrete, but production
 contracts and view composition MUST remain data-driven and extensible.
+
+Registrations are declarative data until trusted application code explicitly
+binds an implementation. Archive content can request a kind but cannot inject
+a component, command, icon, stylesheet or executable editor. Registry
+collisions, unsupported capability versions and missing adapters produce a
+terse diagnostic and a generic read-only view; they do not hide the resource.
 
 ## 3. Goals, non-goals, and measures
 
@@ -290,6 +307,31 @@ Every window contains:
 - a status bar naming the active tool, selection count/scope, coordinate or
   text position, modifiers, save state, and concise feedback.
 
+This is desktop application chrome, not a web-page header. The platform menu
+is the complete, discoverable command inventory. File owns open/import/export/
+close; Edit owns undo/redo, clipboard and selection; View owns zoom, panes,
+overlays and density; Navigate owns back/forward and document targets;
+Workspace changes workspace or preset; Tools owns registered tools and jobs;
+Window owns window arrangement; Help owns reference, diagnostics and version.
+Commands appear through the command registry and capability checks, not
+workspace-specific menu conditionals. Unavailable consequential commands stay
+visible with one reason when that explanation helps discovery.
+
+The toolbar is one flat row by default. It contains the active preset's small
+set of frequent commands, uses separators for command groups, never wraps, and
+moves lower-priority contributions into an overflow menu. Toggle tools retain
+pressed state. An icon-only command requires an unambiguous conventional icon,
+tooltip, accessible name and shortcut; unfamiliar or consequential commands
+use a terse text label. The context header is one compact row and truncates
+the middle of long paths while retaining the current object and state.
+
+The status bar is persistent, 22–24 CSS pixels high in pointer mode, and
+divided into registered left, center and right fields. It is the primary home
+for coordinates, text offsets, selection counts, tool hints, save/conflict
+state, job summary and provider/offline state. Fields do not jump position as
+values change. A click opens the relevant pane or diagnostic. Transient toasts
+never replace a durable status or problem record.
+
 Workspace navigation does not reset book, canvas, or entity context. When a
 target can be represented in another workspace, switching carries the nearest
 meaningful context. Otherwise the destination shows its last local context and
@@ -317,6 +359,54 @@ The anatomy is not a mandatory three-pane template. Library is often
 table/dossier oriented; Edition is canvas/text oriented; Entities is
 record/evidence oriented. The primary work surface can be maximized and later
 restored in one command.
+
+#### 6.3.1 Desktop docking and sizing contract
+
+The default shell follows a conservative drafting-workstation arrangement:
+left navigator, central work surface, right properties inspector and optional
+bottom results/problems tray. These are docking roles, not hard-coded feature
+panes. A registered pane descriptor declares compatible roles, minimum and
+preferred size, singleton/multiple behavior, applicable capabilities and
+whether it can share a tab stack. Unsupported panes remain absent; unknown
+read-only contributions use the generic resource/property pane.
+
+Desktop interaction rules are:
+
+- splitters are always visible, keyboard focusable and at least 8 CSS pixels
+  in effective drag width; arrow keys resize by 8 pixels and Shift+arrow by
+  32 pixels;
+- a double-click on a splitter restores the preset size; **View > Reset
+  Layout** restores the complete preset after confirmation only when drafts
+  would be displaced;
+- a pane collapses toward its dock edge and restores to its prior size; it
+  does not become a floating card or cover the central work surface at normal
+  desktop widths;
+- **View > Panes** lists every applicable registered pane with a stable
+  shortcut and checked state; pane headers contain a terse noun title, optional
+  scope, dock menu and close control;
+- tab stacking is reserved for peer panes that users reasonably alternate,
+  such as Notes and Jobs. Properties for the current selection remain visible
+  while geometry or text is edited;
+- arrangements persist per workspace/preset and display class. Persisted state
+  refers to registry contribution IDs and dock roles, tolerates missing/new
+  contributions, and can migrate without rewriting domain data;
+- the normal minimum target is 1024 × 700 CSS pixels. Below a pane's declared
+  minimum, secondary panes collapse in registered priority order; the primary
+  work surface never shrinks below 480 × 360. At 200% zoom the same priority
+  rules apply without horizontal page scrolling;
+- inspectors use aligned property grids and compact section headers, not a
+  stack of decorative cards. The selection type, object ID/revision and edit
+  target remain fixed at the top while properties scroll;
+- resizing is live for ordinary panes. Expensive canvas or matrix work may
+  render a lightweight preview during drag, then settle within 100 ms after
+  release. Resize never changes selection, zoom anchor or dirty state.
+
+The central surface MAY tile registered document views. Tiles have a plain
+title strip, view-kind label, exact layer/run, close action and keyboard focus
+indicator. New asset or layer kinds can occupy a tile if a compatible renderer
+is registered; otherwise the tile shows the safe generic inspector and
+provenance. Layout code never enumerates raster, OCR, translation or plant
+assets to decide where they belong.
 
 ### 6.4 Portable context and deep links
 
@@ -1804,19 +1894,95 @@ and stale hatch. Region-type colors are presentation metadata and must retain
 label/code/pattern equivalents.
 
 Spacing uses a 4 px base with common steps 4, 8, 12, 16, 24 and 32. Standard
-desktop control heights are 28 compact, 32 regular and 40 prominent; touch
-layouts use at least 44 CSS-pixel hit targets. Default body text is 14 px,
-dense metadata 12–13 px, and long-form transcription 16 px minimum with user
-scaling. Interface and manuscript/transcription fonts are separate settings.
+desktop control heights are 26 dense, 28 standard and 32 emphasized; touch
+layouts use at least 44 CSS-pixel hit targets. Default interface text is
+13 px, dense tables/status fields are 12 px, and long-form transcription is
+16 px minimum with user scaling. Interface and manuscript/transcription fonts
+are separate settings.
 
-### 15.3 Density, themes, and motion
+### 15.3 Typography and interface copy
+
+The interface default is **Segoe UI**. The CSS stack is `"Segoe UI",
+system-ui, sans-serif`; the application does not substitute an expressive
+brand face. Platform fallback is permitted only when Segoe UI is unavailable
+and cannot legally be distributed. Manuscript text, diplomatic transcription
+and scripts that Segoe UI does not cover use a separately declared scholarly
+font stack without changing surrounding interface controls.
+
+Typography is conservative and utilitarian:
+
+- window, menu, toolbar, tree, table, property-grid and status text use Segoe
+  UI at regular weight; semibold is reserved for current context, pane titles
+  and selected table emphasis;
+- interface type uses normal tracking and sentence case. There are no display
+  sizes, all-caps section labels, oversized dashboard numerals, gradients or
+  ornamental letter spacing;
+- pane titles are 13 px semibold; field labels, controls and ordinary rows are
+  13 px; compact metadata/status text is 12 px; primary document text starts
+  at 16 px with a 1.45–1.65 line height;
+- filenames, IDs, checksums, coordinates and literal machine tokens MAY use a
+  bundled monospaced font. Monospace does not spread to prose or controls;
+- tabular numbers align when comparison benefits. Text columns align left,
+  numeric measures right, and state/icon columns consistently;
+- hierarchy comes from alignment, indentation, dividers and modest weight
+  changes before font-size changes. Panels do not imitate web cards.
+
+Strings are terse and declarative. Menu items and buttons use an explicit verb
+plus object where needed; pane titles, tabs, fields and table headers use noun
+phrases. Prefer one to three words on controls and two to six words in status
+fields. Put scope in the surrounding panel or selection summary instead of
+repeating it in every command. Use domain terms consistently and expose exact
+layer/run names wherever ambiguity would risk an edit.
+
+Copy rules are:
+
+- state what happened, what remains selected or preserved, and the next valid
+  action. Do not use conversational filler, encouragement, marketing language,
+  exclamation marks, rhetorical questions or blame;
+- use sentence case. Reserve title case for platform menu conventions and
+  proper names;
+- use an ellipsis on a command label only when the command opens a dialog that
+  requires further input, for example **Export…**; never use it as decoration
+  or to mean that a job is running;
+- name destructive or irreversible scope in the confirmation and final action,
+  for example **Delete 3 regions**, not **Confirm**;
+- distinguish **Close**, **Cancel job**, **Discard draft**, **Reject proposal**
+  and **Delete**. These are not interchangeable;
+- avoid “OK” when a specific verb exists. Use **Save**, **Apply**, **Retry**,
+  **Open details** or **Cancel**;
+- place technical traces behind **Details** while keeping the primary message
+  complete and copyable. Provider and model identifiers remain visible where
+  provenance requires them.
+
+| Situation | Use | Avoid |
+| --- | --- | --- |
+| Empty selection | `Select a region` | `Nothing here yet!` |
+| Saved state | `Saved` | `All your changes have been saved successfully!` |
+| Selection status | `3 regions selected` | `You have selected 3 items` |
+| Failed OCR | `OCR run failed. No output was saved.` | `Oops, something went wrong` |
+| Stale result | `Translation is stale` | `Translation may need some love` |
+| Offline authority | `Authority store unavailable` | `We can't connect right now` |
+| Destructive action | `Delete 3 regions` | `Yes, continue` |
+| Job activity | `OCR running · 42%` | `Working on your pages…` |
+
+Copy is part of each command/view contribution: the registry supplies a terse
+label, optional menu label, past-tense result, unavailable reason and
+accessible description. The shell MUST NOT derive user-facing strings by
+title-casing kind IDs or asset filenames. Unknown kinds display their declared
+safe label plus namespaced kind ID.
+
+### 15.4 Density, themes, and motion
 
 The production baseline is calm, compact, light, and archival-professional.
 All first-release workspaces and design variants use a light color scheme;
 canvas focus comes from neutral tonal steps, borders, and overlay patterns,
-not a dark surround. Compact mode changes row/control density, never focus
-ring size, accessible name or minimum pointer target in touch mode.
-High-contrast/forced-colors mode has a dedicated test.
+not a dark surround. There is no dark theme, dark canvas surround or reversed
+navigation chrome in the first release. Light-only does not mean low contrast:
+panels, selection, focus, disabled state and boundaries must remain distinct
+under ordinary light, high-contrast and forced-color settings. Compact mode
+changes row/control density, never focus ring size, accessible name or minimum
+pointer target in touch mode. High-contrast/forced-colors mode has a dedicated
+test.
 
 Motion is limited to orientation and feedback, normally under 150 ms. Reduced
 motion removes panel animation, smooth zoom and pulsing status. Canvas changes
@@ -2077,9 +2243,13 @@ in-page workspace switching. Fixture actions do not write canonical book or
 authority data.
 
 Every variant MUST visibly provide **Library**, **Edition**, and **Entities**
-navigation and show how exact context crosses among them. All four use the
+navigation and show how exact context crosses among them. All seven use the
 same content, states, Blueprint components, window size and task script so
 reviewers compare layout decisions rather than sample-data advantages.
+Every variant uses Segoe UI, light-only desktop chrome, the same platform menu,
+toolbar/status grammar and registered pane/command contributions. A variant
+tests arrangement and emphasis; it is not permission for bespoke domain
+fields, asset checks, copy tone or interaction semantics.
 
 ### 20.2 Variant A — Scriptorium
 
@@ -2154,7 +2324,75 @@ Test hypotheses:
 Library and Entities views must use the same matrix discipline where useful
 without forcing unrelated record forms into a spreadsheet.
 
-### 20.6 Common moderated task script
+### 20.6 Variant E — Drafting Desk
+
+**E Drafting Desk** is the most explicit CAD-style option: a large central
+canvas, left object/reading-order tree, right property grid, bottom problems
+tray, one-row tool strip and persistent coordinate/status fields. Pane borders,
+splitters and selection scope are always legible; decoration is minimal.
+
+Test hypotheses:
+
+- experienced editors can draw, select, classify and reorder regions with the
+  fewest pointer miles and no mode ambiguity;
+- object tree, canvas selection and property rows provide a predictable
+  bidirectional editing model for hands, marginalia and custom region types;
+- reading, translation and entity evidence may feel subordinate unless tiled
+  document views and bottom trays are disciplined;
+- conservative desktop conventions reduce relearning and expose exact state
+  better than a web-dashboard treatment.
+
+Library uses a collection tree, result grid and docked properties/dossier.
+Entities uses a record tree, relationship grid and evidence properties. The
+three workspaces are different arrangements of the same registered panes,
+commands and status providers.
+
+### 20.7 Variant F — Parallel Register
+
+**F Parallel Register** is a synchronized document-and-grid workbench: a source
+tile and two to four compact text/evidence columns above a docked problems
+register. Column headers name exact layer, run, revision and editability. Row
+selection synchronizes the image region, text units, translation, commentary
+and entity mentions.
+
+Test hypotheses:
+
+- line-by-line engine comparison, transcription correction and translation
+  review remain dense without Layer Matrix's full spreadsheet breadth;
+- fixed headers and explicit editable-column state prevent wrong-layer edits;
+- the bottom register makes omissions, stale dependents and review decisions
+  efficient to process;
+- polygon construction and large-canvas inspection may require a quick switch
+  to a geometry preset.
+
+Library maps the register to search results plus catalogue coverage; Entities
+maps it to names, concepts, assertions and evidence. Columns are contributions
+selected by compatible capabilities, never fixed OCR/translation properties.
+
+### 20.8 Variant G — Catalog Console
+
+**G Catalog Console** is a library/entity-first master-detail desktop shell:
+collection or authority tree on the left, virtualized record grid in the
+center, docked property/evidence inspector on the right, and tabbed document
+views for opened books, canvases, mentions and assertions. It resembles a
+cataloguing workstation more than a public reader.
+
+Test hypotheses:
+
+- high-volume library browsing, cataloguing and entity authority work gain a
+  stable selection/property rhythm;
+- open document tabs preserve exact book, page, region and entity return
+  context across research tasks;
+- generic property descriptors make unfamiliar resource kinds useful without
+  feature-specific forms;
+- sustained page geometry or parallel reading may need a maximized document
+  tile or another saved preset.
+
+Edition remains fully capable inside a document tab with the same geometry,
+text and review contributions. The console must not demote Edition to a preview
+or create a second command grammar.
+
+### 20.9 Common moderated task script
 
 Each reviewer performs, in every variant:
 
@@ -2180,25 +2418,35 @@ think-aloud comments. After all variants, reviewers choose:
 - elements to combine or reject;
 - one change required before another test.
 
-### 20.7 Decision rubric
+### 20.10 Decision rubric
 
 The review team records evidence in this order:
 
 | Criterion | Weight |
 | --- | ---: |
-| Scholarly/data integrity and state comprehension | 25 |
-| Region/text editing effectiveness | 20 |
-| Layer/engine comparison effectiveness | 15 |
-| Cross-navigation and context recovery | 10 |
-| Library/catalogue work | 10 |
-| Entity assertion/evidence work | 10 |
-| Keyboard, screen-reader structure and scaling | 10 |
+| Scholarly/data integrity and state comprehension | 20 |
+| Region/text editing effectiveness | 15 |
+| Layer/engine comparison effectiveness | 12 |
+| Desktop command, docking and resize efficiency | 13 |
+| Information density, typography and copy clarity | 10 |
+| Cross-navigation and context recovery | 8 |
+| Library/catalogue work | 7 |
+| Entity assertion/evidence work | 7 |
+| Keyboard, screen-reader structure and scaling | 8 |
 
 Scores summarize observations; they do not overrule a safety or accessibility
 failure. The outcome MAY be a documented hybrid, such as Scriptorium for
 Reading, Spatial Lab for Geometry, Review Queue as a review preset, and Layer
-Matrix for Compare. A hybrid must still use one command grammar and not become
-four unrelated applications.
+Matrix or Parallel Register for Compare, within the Drafting Desk or Catalog
+Console shell. A hybrid must still use one command grammar and not become
+several unrelated applications.
+
+A variant is ineligible regardless of score if it introduces dark chrome,
+replaces Segoe UI without a script/platform need, hides the menu or status bar,
+uses decorative web-card spacing, relies on conversational copy, loses state
+on pane resize, or requires hard-coded knowledge of an asset/property kind.
+Moderators test 1280 × 800 and 1024 × 700 windows, 200% zoom, keyboard pane
+resize, collapse/restore and **View > Reset Layout** before scoring aesthetics.
 
 The gallery SHOULD allow a reviewer to record favorite, per-criterion scores,
 free-text notes, and desired combinations locally, then copy/download a small
@@ -2228,19 +2476,26 @@ semantics, layer distinctions, three-anchor mentions, reified assertions,
 archive/entity boundary, IDs/revisions and rights owners have no unresolved
 contradiction. Output is ADRs and fixture data, not production UI.
 
-### Stage D1 — four-variant gallery
+### Stage D1 — seven-variant gallery
 
 Work:
 
-- maintain A Scriptorium, B Spatial Lab, C Review Queue and D Layer Matrix in
-  the shared gallery;
-- run internal heuristic, keyboard, contrast and 200% zoom review;
+- maintain A Scriptorium, B Spatial Lab, C Review Queue, D Layer Matrix,
+  E Drafting Desk, F Parallel Register and G Catalog Console in the shared
+  gallery;
+- run internal heuristic, keyboard, light-theme contrast, minimum-window,
+  pane-resize/restore and 200% zoom review;
+- audit every surface for Segoe UI, compact desktop density, terse declarative
+  copy, one-row toolbars, stable status fields and capability-driven pane/
+  property contributions;
 - collect stakeholder annotations using the common tasks and rubric.
 
 **Gate G1: narrow deliberately.** Choose at most two overall foundations or a
 precisely enumerated hybrid. Record rejected elements and why. Do not choose
 based only on visual taste. Required result: a signed design decision and a
-ranked list of workflow problems to refine.
+ranked list of workflow problems to refine. No finalist may violate the
+mandatory desktop, light-only, typography, copy or registry conditions in
+Section 20.10.
 
 ### Stage D2 — interaction refinement
 
@@ -2249,6 +2504,11 @@ Work:
 - build medium-fidelity interactive prototypes for the finalists/hybrid;
 - implement fixture-only geometry gestures, text diff, reading-order list,
   note/reprocess scope, entity assertion comparison and cross-navigation;
+- implement registered pane show/hide, docking roles, keyboard splitter resize,
+  collapse/restore, minimum-window behavior, layout reset and exact status-bar
+  feedback;
+- run a copy review using representative success, empty, unavailable, stale,
+  conflict, destructive and failed-job states;
 - conduct moderated sessions with at least two representatives of each
   primary expert role and at least one keyboard/screen-reader user;
 - iterate at least twice on observed failures.
@@ -2257,7 +2517,9 @@ Work:
 state comprehension, context return, keyboard paths and no-wrong-layer-edit
 criteria meet Section 3 targets, and every rejected observation has a
 disposition. Freeze shell anatomy, primary presets and interaction grammar;
-visual polish remains adjustable.
+visual polish remains adjustable. The frozen grammar includes menu ownership,
+toolbar contribution/overflow, docking roles, status fields, density,
+typography and copy conventions.
 
 ### Stage D3 — headless contract and archive proof
 
@@ -2270,6 +2532,8 @@ Work:
   recovery and sealed export on fixtures;
 - prove two-client conflicts, job restart, missing capability and offline
   paths;
+- prove registration collision, unknown resource/property kind, unavailable
+  adapter and removed-pane layout migration paths without data loss;
 - generate the EngineClient and forbid direct renderer filesystem/network
   mutations.
 
@@ -2285,6 +2549,8 @@ Work:
 - implement Library search/dossier, one canvas, rect/polygon/type/order,
   two-engine comparison, diplomatic edit, scoped note/reprocessing request,
   entity linking/assertion comparison, jobs and archive save/export;
+- implement the native menu, registered one-row toolbar, docked panes/property
+  inspector, status bar and saved/reset layouts at both reference window sizes;
 - use real herbal canvases while keeping legacy tools available;
 - instrument local performance and run security/a11y suites.
 
@@ -2395,6 +2661,28 @@ plan, not an unrecorded UI adjustment.
 - Hostile/corrupt archives cannot escape staging or execute content.
 - No renderer receives provider secrets or unrestricted local paths.
 
+### Desktop shell and extension
+
+- Every command is discoverable in the platform menu or command palette;
+  frequent contextual commands occupy one non-wrapping toolbar row.
+- The fixed status bar reports tool, scope/selection, position, save/conflict
+  and provider/job state without moving fields or relying on toasts.
+- Navigator, document, inspector and bottom-tray panes resize, collapse,
+  restore, reset and survive restart by registered contribution ID. Keyboard
+  and pointer behavior match.
+- The 1024 × 700 minimum layout remains workable; secondary panes collapse by
+  declared priority and never reduce the primary surface below its minimum.
+- Segoe UI is the interface default, all standard variants are light-only, and
+  compact hierarchy uses alignment/dividers rather than web-card decoration.
+- User-facing strings pass the terse declarative copy review, including empty,
+  unavailable, stale, conflict, destructive and failed-job states.
+- A fixture plugin can add an unfamiliar resource kind, property descriptor,
+  pane, command and renderer through registries without changing shell or
+  workspace feature code.
+- Removing that fixture leaves its data round-trippable, its layout migratable
+  and its resource inspectable through the safe generic view. Untrusted archive
+  declarations cannot bind executable contributions.
+
 ### Usability, accessibility, and quality
 
 - Primary journeys meet the Section 3 task and comprehension targets.
@@ -2406,6 +2694,8 @@ plan, not an unrecorded UI adjustment.
   memory.
 - Errors and state never depend on color, hover, disappearing status or a
   technical log.
+- Visual regression fixtures use Segoe UI metrics (or the declared platform
+  fallback), light theme, standard density and both reference window sizes.
 
 ## 23. Risks, mitigations, and open decisions
 

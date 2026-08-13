@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react'
 import { Button, ButtonGroup, Callout, Card, Dialog, Divider, FormGroup, HTMLSelect, Icon, InputGroup, ProgressBar, Tag, TextArea } from '@blueprintjs/core'
+import type { DesignId } from '../types'
 
 interface Props {
-  variant: 'scriptorium' | 'spatial' | 'queue' | 'matrix'
+  variant: DesignId
   fromMention: boolean
   onBackToEdition: () => void
 }
@@ -29,9 +30,9 @@ export function EntityWorkspace({ variant, fromMention, onBackToEdition }: Props
     <div className={`entity-workspace entity-workspace--${variant}`}>
       <aside className="entity-results">
         <div className="entity-results__head">
-          <span className="section-kicker">External proof-of-concept database</span>
+          <span className="section-kicker">External authority POC</span>
           <h2>Plant entities</h2>
-          <InputGroup leftIcon="search" placeholder="Names, concepts, identifiers…" value={query} onChange={(event) => setQuery(event.target.value)} />
+          <InputGroup leftIcon="search" placeholder="Search names or IDs" value={query} onChange={(event) => setQuery(event.target.value)} />
         </div>
         <div className="entity-result-tabs"><button className="is-active">Concepts</button><button>Name forms</button><button>Needs review <Tag round intent="warning">14</Tag></button></div>
         <div className="entity-result-list">
@@ -47,7 +48,7 @@ export function EntityWorkspace({ variant, fromMention, onBackToEdition }: Props
       <main className="entity-detail">
         {fromMention && (
           <Callout className="mention-context" icon="locate" intent="primary">
-            Opened from <strong>“feuel”</strong> · <button onClick={onBackToEdition}>Herbal, fol. 4r, region m4-03</button>
+            Source: <strong>“feuel”</strong> · <button onClick={onBackToEdition}>Herbal · 4r · m4-03</button>
           </Callout>
         )}
         <header className="entity-titlebar">
@@ -65,10 +66,10 @@ export function EntityWorkspace({ variant, fromMention, onBackToEdition }: Props
                   <div key={`${form}-${index}`}><strong>{form}</strong><span>{index === 3 ? 'Chinese · 18th c.' : index === 2 ? 'Latin · early print' : 'Middle English · c.1450'}</span><button>{index === 0 ? '1 manuscript mention' : `${8 + index * 7} confirmed`}</button></div>
                 ))}
               </div>
-              <p className="entity-rule"><Icon icon="info-sign" size={12} /> A written form is vocabulary, not a taxonomic conclusion. OCR errors cannot mint name forms.</p>
+              <p className="entity-rule"><Icon icon="info-sign" size={12} /> Historical vocabulary only. OCR errors are excluded.</p>
             </Card>
             <Card className="entity-card">
-              <div className="entity-card__head"><div><span className="section-kicker">Scope is identity</span><h3>Concept definition</h3></div><Tag intent="warning" minimal>working</Tag></div>
+              <div className="entity-card__head"><div><span className="section-kicker">Concept scope</span><h3>Definition</h3></div><Tag intent="warning" minimal>working</Tag></div>
               <div className="definition-grid">
                 <FormGroup label="Tradition"><HTMLSelect fill options={['Late medieval English regimen', 'Galenic materia medica', 'Early modern botany']} /></FormGroup>
                 <FormGroup label="Period"><InputGroup value="c. 1400–1500" readOnly /></FormGroup>
@@ -100,20 +101,20 @@ export function EntityWorkspace({ variant, fromMention, onBackToEdition }: Props
                 <HTMLSelect fill value={candidate} onChange={(event) => setCandidate(event.target.value)} options={['Foeniculum vulgare Mill.', 'Unresolved preparation', 'No preferred assertion']} />
               </FormGroup>
               <Callout intent={decision === 'accept' ? 'success' : 'warning'} icon={decision === 'accept' ? 'tick-circle' : 'warning-sign'}>
-                {decision === 'accept' ? 'Accepted as a new reviewed assertion. The alternative remains visible.' : 'No assertion is promoted until a named human reviews the evidence.'}
+                {decision === 'accept' ? 'Reviewed assertion added. Alternate retained.' : 'Human review required.'}
               </Callout>
             </Card>
           </aside>
         </div>
       </main>
-      <Dialog isOpen={addAliasOpen} onClose={() => setAddAliasOpen(false)} title="Add a written name form" icon="text-highlight">
+      <Dialog isOpen={addAliasOpen} onClose={() => setAddAliasOpen(false)} title="Add name form" icon="text-highlight">
         <div className="bp6-dialog-body">
-          <Callout icon="info-sign">Record the string as written. Link it to this concept through a reviewable assertion.</Callout>
+          <Callout icon="info-sign">Record the written string. Link by reviewed assertion.</Callout>
           <FormGroup label="Written form" labelInfo="(required)"><InputGroup autoFocus value={newAlias} onChange={(event) => setNewAlias(event.target.value)} placeholder="e.g. fenicule" /></FormGroup>
           <div className="definition-grid"><FormGroup label="Language"><HTMLSelect fill options={['Middle English', 'Latin', 'English', 'German', 'Chinese']} /></FormGroup><FormGroup label="Period"><InputGroup placeholder="e.g. c. 1450" /></FormGroup></div>
           <FormGroup label="Evidence"><TextArea fill rows={3} placeholder="Page mention or external citation…" /></FormGroup>
         </div>
-        <div className="bp6-dialog-footer"><div className="bp6-dialog-footer-actions"><Button onClick={() => setAddAliasOpen(false)}>Cancel</Button><Button intent="primary" disabled={!newAlias.trim()} onClick={() => { setAliases((current) => [...current, newAlias.trim()]); setNewAlias(''); setAddAliasOpen(false) }}>Add proposed form</Button></div></div>
+        <div className="bp6-dialog-footer"><div className="bp6-dialog-footer-actions"><Button onClick={() => setAddAliasOpen(false)}>Cancel</Button><Button intent="primary" disabled={!newAlias.trim()} onClick={() => { setAliases((current) => [...current, newAlias.trim()]); setNewAlias(''); setAddAliasOpen(false) }}>Add proposal</Button></div></div>
       </Dialog>
     </div>
   )
