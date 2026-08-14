@@ -2,10 +2,10 @@
   "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
   "protocol_version": "1.0",
   "ledger_id": "living-edition-studio",
-  "ledger_revision": 3,
-  "status": "bootstrap-draft",
+  "ledger_revision": 4,
+  "status": "active",
   "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
-  "coordination_ref": null,
+  "coordination_ref": "refs/heads/studio-s00-coordination",
   "bootstrap": {
     "status": "ready-for-review",
     "digest_domain": "git-blob-payload-sha256/1",
@@ -216,6 +216,18 @@
       ],
       "verification_status": "verified",
       "verified_at": "2026-08-14T18:33:57Z"
+    },
+    {
+      "baseline_id": "studio-adoption-v1.1.0",
+      "kind": "studio-adoption",
+      "tag": "studio-adoption-v1.1.0",
+      "tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "remote_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "peeled_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+      "tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+      "subtrees": [],
+      "verification_status": "verified",
+      "verified_at": "2026-08-14T18:54:32Z"
     }
   ],
   "receipts": [
@@ -277,7 +289,168 @@
         "tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
         "peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad"
       }
+    },
+    {
+      "receipt_id": "S00-A00-ACCEPTANCE-001",
+      "kind": "a00-adoption-accepted",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T18:54:32Z",
+      "payload": {
+        "work_order_id": "A00-WO-001",
+        "session_id": "A00-001",
+        "work_package": "A00",
+        "accepted_at": "2026-08-14T18:46:44Z",
+        "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
+        "accepted_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+        "accepted_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+        "ordered_commits": [
+          "4ed00a49b5fbb7d5b0bac45d82e3f7c3068fb77c",
+          "68be9fbaabfad31b2ad3347e8890d5df2090220c",
+          "2bffb1f5297169b2e1dd6d17a434e23a7e428f36"
+        ],
+        "ledger_path": "coordination/studio-ledger.json",
+        "ledger_digest_domain": "git-blob-payload-sha256/1",
+        "ledger_sha256": "465b5ff501af27033b0e10bea28ba941bfbaf1fe63f21d2fe4454582b5b38de3",
+        "adoption_tag": {
+          "ref": "refs/tags/studio-adoption-v1.1.0",
+          "tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+          "peeled_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+          "tagged_at": "2026-08-14T18:48:15Z",
+          "publisher_identity": "github:maj-6",
+          "verified_at": "2026-08-14T18:54:32Z"
+        },
+        "coordination_ref": {
+          "ref": "refs/heads/studio-s00-coordination",
+          "initial_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "remote_initial_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "created_at": "2026-08-14T18:53:18Z"
+        },
+        "acceptance_commands_declared": 8,
+        "acceptance_commands_passed": 8,
+        "validation_environment": {
+          "os": "Microsoft Windows NT 10.0.26200.0",
+          "git": "2.50.0.windows.1",
+          "python": "3.11.2",
+          "jsonschema": "4.26.0"
+        },
+        "pre_adoption_waiver_decisions": {
+          "s00_disposition": "accepted-with-unchanged-a00-head",
+          "external_decision": {
+            "status": "approved",
+            "approver": "github:maj-6",
+            "decided_at": "2026-08-14T18:31:59Z",
+            "evidence_locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+            "evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
+          },
+          "waivers": [
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-SCREENSHOTS-001",
+              "category": "screenshots",
+              "revisit_gate": "G3-renderer-composition"
+            },
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-TASK-RECORDINGS-001",
+              "category": "task_recordings",
+              "revisit_gate": "G4-production-vertical"
+            },
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-BEHAVIOR-VECTORS-001",
+              "category": "behavior_vectors",
+              "revisit_gate": "studio-fixtures-v1.0.0"
+            },
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-RUNTIME-ARCHIVES-001",
+              "category": "sealed_prototype_runtime_archives",
+              "revisit_gate": "studio-fixtures-v1.0.0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "receipt_id": "S00-COORDINATION-REF-PROTECTION-001",
+      "kind": "coordination-ref-protection",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T18:54:32Z",
+      "payload": {
+        "provider": "github",
+        "api_version": "2026-03-10",
+        "repository": {
+          "id": 1294866705,
+          "owner": "maj-6",
+          "name": "library-tool",
+          "remote_url": "https://github.com/maj-6/library-tool.git"
+        },
+        "ref": "refs/heads/studio-s00-coordination",
+        "ruleset_ids": [20865800, 20865801],
+        "authorized_s00_principals": [
+          {
+            "actor_type": "User",
+            "actor_id": 37586976,
+            "login": "maj-6",
+            "bypass_mode": "always"
+          }
+        ],
+        "deletion_allowed": false,
+        "force_updates_allowed": false,
+        "ordinary_updates_restricted_to_authorized_s00_principals": true,
+        "repository_administrators_enforced": true,
+        "update_allows_fetch_and_merge": false,
+        "effective_rule_types": [
+          "creation",
+          "deletion",
+          "non_fast_forward",
+          "update"
+        ],
+        "observed_at": "2026-08-14T18:54:32Z",
+        "projection_schema": "github-coordination-protection-projection/1",
+        "digest_domain": "rfc8785-jcs-sha256/1",
+        "projection_sha256": "90d7a0d821d98d7d2fd348f0c847b25fd3d6987a902c7f2342c2d563eec0f542",
+        "projection": {
+          "schema": "github-coordination-protection-projection/1",
+          "owner": "maj-6",
+          "name": "library-tool",
+          "ref": "refs/heads/studio-s00-coordination",
+          "rulesets": [
+            {
+              "id": 20865800,
+              "name": "studio-s00-coordination-integrity",
+              "target": "branch",
+              "enforcement": "active",
+              "conditions": {
+                "ref_name": {
+                  "include": ["refs/heads/studio-s00-coordination"],
+                  "exclude": []
+                }
+              },
+              "rules": [{ "type": "deletion" }, { "type": "non_fast_forward" }],
+              "bypass_actors": []
+            },
+            {
+              "id": 20865801,
+              "name": "studio-s00-coordination-writer",
+              "target": "branch",
+              "enforcement": "active",
+              "conditions": {
+                "ref_name": {
+                  "include": ["refs/heads/studio-s00-coordination"],
+                  "exclude": []
+                }
+              },
+              "rules": [{ "type": "creation" }, { "type": "update" }],
+              "bypass_actors": [
+                {
+                  "actor_type": "User",
+                  "actor_id": 37586976,
+                  "bypass_mode": "always"
+                }
+              ]
+            }
+          ]
+        }
+      }
     }
   ],
-  "updated_at": "2026-08-14T18:33:57Z"
+  "updated_at": "2026-08-14T18:54:32Z"
 }
