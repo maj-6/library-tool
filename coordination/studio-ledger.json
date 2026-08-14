@@ -2,7 +2,7 @@
   "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
   "protocol_version": "1.0",
   "ledger_id": "living-edition-studio",
-  "ledger_revision": 5,
+  "ledger_revision": 6,
   "status": "active",
   "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
   "coordination_ref": "refs/heads/studio-s00-coordination",
@@ -216,13 +216,13 @@
           "path": "docs/living-edition-production-build-spec.md"
         }
       ],
-      "lease_state": "issued",
+      "lease_state": "active",
       "reserved_ids": [
         "living-edition-concurrent-session-handoff/1.0.1",
         "living-edition-production-build-spec/1.1.1"
       ],
-      "status": "ready",
-      "head_commit": null,
+      "status": "active",
+      "head_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
       "state_history": [
         {
           "from": null,
@@ -230,6 +230,13 @@
           "actor": "codex-session:S00-001",
           "at": "2026-08-14T21:36:52Z",
           "receipt_id": "S00-A01-ASSIGNMENT-001"
+        },
+        {
+          "from": "ready",
+          "to": "active",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:41:41Z",
+          "receipt_id": "S00-A01-START-001"
         }
       ],
       "lease_history": [
@@ -239,6 +246,13 @@
           "actor": "codex-session:S00-001",
           "at": "2026-08-14T21:36:52Z",
           "receipt_id": "S00-A01-ASSIGNMENT-001"
+        },
+        {
+          "from": "issued",
+          "to": "active",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:41:41Z",
+          "receipt_id": "S00-A01-START-001"
         }
       ],
       "validation": [
@@ -248,10 +262,26 @@
           "ledger_sha256": "75766a273a31e591d9f9b361a960a38533e694652912c9f2b7104916874b7a79",
           "digest_domain": "git-blob-payload-sha256/1",
           "protection_receipt_id": "S00-COORDINATION-REF-PROTECTION-001"
+        },
+        {
+          "kind": "assignment-ledger-pin",
+          "coordination_commit": "3f3eddcd3df708bfee40a5c47a5cadd70d735c8a",
+          "ledger_sha256": "db9a4cff6bfb36ca8014fa1852c613c436d02ccded27c064a0fcb66bc3dcd735",
+          "digest_domain": "git-blob-payload-sha256/1",
+          "lease_id": "lease-A01-001-01"
+        },
+        {
+          "kind": "clean-start-verification",
+          "branch": "studio-a01-001-context-packets",
+          "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+          "head_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "status_porcelain_entries": 0,
+          "outside_lease_entries": 0,
+          "verified_at": "2026-08-14T21:41:41Z"
         }
       ],
       "blocker": null,
-      "updated_at": "2026-08-14T21:36:52Z"
+      "updated_at": "2026-08-14T21:41:41Z"
     }
   ],
   "id_reservations": [
@@ -652,7 +682,29 @@
         "protection_receipt_id": "S00-COORDINATION-REF-PROTECTION-001",
         "return_destination": "codex-session:S00-002 read-only acceptance"
       }
+    },
+    {
+      "receipt_id": "S00-A01-START-001",
+      "kind": "context-amendment-start-verified",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T21:41:41Z",
+      "payload": {
+        "session_id": "A01-001",
+        "lease_id": "lease-A01-001-01",
+        "assignment_coordination_commit": "3f3eddcd3df708bfee40a5c47a5cadd70d735c8a",
+        "assignment_ledger_sha256": "db9a4cff6bfb36ca8014fa1852c613c436d02ccded27c064a0fcb66bc3dcd735",
+        "digest_domain": "git-blob-payload-sha256/1",
+        "branch": "studio-a01-001-context-packets",
+        "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+        "base_tag": "studio-adoption-v1.1.0",
+        "base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+        "base_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+        "base_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+        "clean_start": true,
+        "lease_state": "active",
+        "status": "active"
+      }
     }
   ],
-  "updated_at": "2026-08-14T21:36:52Z"
+  "updated_at": "2026-08-14T21:41:41Z"
 }
