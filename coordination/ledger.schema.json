@@ -97,6 +97,172 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "bootstrap": {
+            "properties": {
+              "status": {
+                "const": "ready-for-review"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["bootstrap"]
+      },
+      "then": {
+        "properties": {
+          "bootstrap": {
+            "properties": {
+              "work_order": {
+                "properties": {
+                  "s00_contact": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "publisher_authorizations": {
+                    "allOf": [
+                      {
+                        "contains": {
+                          "type": "object",
+                          "properties": {
+                            "authorization_status": {
+                              "const": "authorized"
+                            },
+                            "action": {
+                              "const": "publish-existing-prototype-tag"
+                            },
+                            "source_ref": {
+                              "const": "refs/tags/living-edition-viewer-v0.1.1"
+                            },
+                            "target_ref": {
+                              "const": "refs/tags/living-edition-viewer-v0.1.1"
+                            }
+                          },
+                          "required": [
+                            "authorization_status",
+                            "action",
+                            "source_ref",
+                            "target_ref"
+                          ]
+                        },
+                        "minContains": 1,
+                        "maxContains": 1
+                      },
+                      {
+                        "contains": {
+                          "type": "object",
+                          "properties": {
+                            "authorization_status": {
+                              "const": "authorized"
+                            },
+                            "action": {
+                              "const": "publish-adoption-tag"
+                            },
+                            "source_ref": {
+                              "const": "refs/tags/studio-adoption-v1.1.0"
+                            },
+                            "target_ref": {
+                              "const": "refs/tags/studio-adoption-v1.1.0"
+                            }
+                          },
+                          "required": [
+                            "authorization_status",
+                            "action",
+                            "source_ref",
+                            "target_ref"
+                          ]
+                        },
+                        "minContains": 1,
+                        "maxContains": 1
+                      },
+                      {
+                        "contains": {
+                          "type": "object",
+                          "properties": {
+                            "authorization_status": {
+                              "const": "authorized"
+                            },
+                            "action": {
+                              "const": "publish-coordination-ref"
+                            },
+                            "source_ref": {
+                              "const": "refs/heads/studio-s00-coordination"
+                            },
+                            "target_ref": {
+                              "const": "refs/heads/studio-s00-coordination"
+                            }
+                          },
+                          "required": [
+                            "authorization_status",
+                            "action",
+                            "source_ref",
+                            "target_ref"
+                          ]
+                        },
+                        "minContains": 1,
+                        "maxContains": 1
+                      },
+                      {
+                        "contains": {
+                          "type": "object",
+                          "properties": {
+                            "authorization_status": {
+                              "const": "authorized"
+                            },
+                            "action": {
+                              "const": "configure-coordination-ref-protection"
+                            },
+                            "source_ref": {
+                              "const": "refs/heads/studio-s00-coordination"
+                            },
+                            "target_ref": {
+                              "const": "refs/heads/studio-s00-coordination"
+                            }
+                          },
+                          "required": [
+                            "authorization_status",
+                            "action",
+                            "source_ref",
+                            "target_ref"
+                          ]
+                        },
+                        "minContains": 1,
+                        "maxContains": 1
+                      }
+                    ]
+                  }
+                },
+                "required": ["s00_contact", "publisher_authorizations"]
+              }
+            }
+          },
+          "baselines": {
+            "contains": {
+              "type": "object",
+              "properties": {
+                "baseline_id": {
+                  "const": "living-edition-viewer-v0.1.1"
+                },
+                "verification_status": {
+                  "const": "verified"
+                },
+                "remote_tag_object": {
+                  "$ref": "#/$defs/hex40"
+                }
+              },
+              "required": [
+                "baseline_id",
+                "verification_status",
+                "remote_tag_object"
+              ]
+            },
+            "minContains": 1
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -239,7 +405,8 @@
             "publish-existing-prototype-tag",
             "publish-adoption-tag",
             "publish-review-branch",
-            "publish-coordination-ref"
+            "publish-coordination-ref",
+            "configure-coordination-ref-protection"
           ]
         },
         "remote_url": {
@@ -413,9 +580,24 @@
                     },
                     "action": {
                       "const": "publish-existing-prototype-tag"
+                    },
+                    "remote_url": {
+                      "const": "https://github.com/maj-6/library-tool.git"
+                    },
+                    "source_ref": {
+                      "const": "refs/tags/living-edition-viewer-v0.1.1"
+                    },
+                    "target_ref": {
+                      "const": "refs/tags/living-edition-viewer-v0.1.1"
                     }
                   },
-                  "required": ["authorization_status", "action"]
+                  "required": [
+                    "authorization_status",
+                    "action",
+                    "remote_url",
+                    "source_ref",
+                    "target_ref"
+                  ]
                 }
               }
             }
@@ -607,6 +789,7 @@
       "additionalProperties": false,
       "required": [
         "status",
+        "digest_domain",
         "work_order",
         "candidate_documents",
         "intended_adoption_tag",
@@ -622,6 +805,9 @@
         "status": {
           "enum": ["preparation-blocked", "authorized", "ready-for-review"]
         },
+        "digest_domain": {
+          "const": "git-blob-payload-sha256/1"
+        },
         "work_order": {
           "$ref": "#/$defs/workOrder"
         },
@@ -629,9 +815,40 @@
           "type": "array",
           "minItems": 2,
           "maxItems": 2,
-          "items": {
-            "$ref": "#/$defs/documentPin"
-          }
+          "uniqueItems": true,
+          "prefixItems": [
+            {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/documentPin"
+                },
+                {
+                  "properties": {
+                    "path": {
+                      "const": "docs/living-edition-production-build-spec.md"
+                    }
+                  },
+                  "required": ["path"]
+                }
+              ]
+            },
+            {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/documentPin"
+                },
+                {
+                  "properties": {
+                    "path": {
+                      "const": "docs/living-edition-concurrent-session-handoff.md"
+                    }
+                  },
+                  "required": ["path"]
+                }
+              ]
+            }
+          ],
+          "items": false
         },
         "intended_adoption_tag": {
           "const": "studio-adoption-v1.1.0"

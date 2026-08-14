@@ -15,10 +15,11 @@ sibling dependency, or handing off uncommitted state.
 
 Before `studio-adoption-v1.1.0` exists, only A00 may use this candidate protocol,
 and only under an explicit repository-maintainer work order. That work order
-MUST pin the SHA-256 of this candidate and the production specification, the
-exact local prototype tag tuple, authoritative remote, A00 owner, branch,
-external worktree, and typed lease entries. It also names any separately
-authorized tag publisher.
+MUST pin the externally selected candidate commit, the SHA-256 of this candidate
+and the production specification at that commit, the exact local prototype tag
+tuple, authoritative remote, A00 owner, branch, external worktree, and typed
+lease entries. It also names any separately authorized publisher or remote
+administrator.
 A00 records that approval and both document digests in its bootstrap ledger
 record. This narrow authority permits reconciliation and adoption preparation;
 it does not activate B00 or any product package. All other provisions become
@@ -26,12 +27,22 @@ effective only from the adopted document bytes in `studio-adoption-v1.1.0`.
 Changing either candidate after approval invalidates the work order and requires
 new digests and renewed maintainer approval.
 
+Unless a field explicitly declares another domain, every SHA-256 for a committed
+repository path in this protocol, including candidate-document pins and the
+external bootstrap-ledger digest, uses `git-blob-payload-sha256/1`: SHA-256 over
+the raw Git blob payload at the externally pinned commit before checkout filters,
+encoding conversion, or end-of-line conversion. Validators MUST read those bytes
+through Git object plumbing such as `git cat-file blob <commit>:<path>` and MUST
+NOT hash a working-tree path or filtered checkout bytes. A validator may use
+`HEAD` only after proving that `HEAD` equals the externally pinned commit.
+
 The work order and assignment receipt, which are external to the bootstrap
-ledger bytes, pin the ledger path and SHA-256. The ledger MUST NOT contain its own
-digest, its future commit ID, or the future adoption tag object. A00 records only
-facts already knowable when its commit is created. S00 records the accepted A00
-commit, adoption tag object, and final bootstrap-ledger digest in its first
-post-adoption coordination receipt without moving the adoption tag.
+ledger bytes, pin the ledger path, commit, digest domain, and SHA-256. The ledger
+MUST NOT contain its own digest, its future commit ID, or the future adoption tag
+object. A00 records only facts already knowable when its commit is created. S00
+records the accepted A00 commit, adoption tag object, and final bootstrap-ledger
+digest in its first post-adoption coordination receipt without moving the
+adoption tag.
 
 ## 1. Non-negotiable session model
 
@@ -80,6 +91,44 @@ tags that commit as `studio-adoption-v1.1.0`, S00 creates its own external
 `refs/heads/studio-s00-coordination` ref, and becomes the only writer of
 `coordination/**`. S00 ledger commits are merged into immutable baselines by the
 assembly procedure in section 12; implementer branches never edit them.
+
+For this protocol, “protected” means a remote-enforced policy scoped to the exact
+`refs/heads/studio-s00-coordination` ref that rejects force updates and deletion,
+permits ordinary non-force direct updates only by the explicitly authorized S00
+publisher principal or principals, and applies to repository administrators as
+well as ordinary writers. A local convention or an unprotected published branch
+does not qualify. Before B00 starts, S00 reads the effective provider policy back
+through the provider API and records a `coordination-ref-protection` receipt with
+provider, repository, exact ref/pattern, rule or ruleset ID, authorized
+principals, force-update/deletion settings, observation time, and SHA-256 of the
+`github-coordination-protection-projection/1` bytes described below. Creating or
+changing this policy is a separate remote administration action and requires
+explicit authority.
+
+For the authoritative user-owned GitHub repository, classic branch protection
+alone is insufficient because it cannot restrict pushes to a principal
+allowlist. The required policy is two active repository rulesets with the exact
+ref condition `refs/heads/studio-s00-coordination`: an integrity ruleset with no
+bypass actors and `deletion` plus `non_fast_forward` rules, and a writer-gate
+ruleset with `creation` plus `update` rules whose only bypass actor or actors are
+the authorized S00 GitHub user or installation principals. Layering is
+mandatory: S00 may bypass the writer gate for ordinary direct updates but cannot
+bypass the integrity rules. A different provider mechanism is acceptable only
+if its readback proves equivalent constraints.
+
+`github-coordination-protection-projection/1` is a JSON object containing only
+`schema`, repository `owner` and `name`, exact `ref`, and a `rulesets` array. Each
+ruleset entry contains provider integer `id`, `name`, `target`, `enforcement`,
+the exact included/excluded ref arrays, relevant rule `type` and parameters, and
+each bypass actor's `actor_type`, integer `actor_id`, and `bypass_mode`. Rulesets
+sort by integer ID, rules by type, ref arrays lexicographically, and bypass actors
+by `(actor_type, actor_id, bypass_mode)`. Volatile timestamps, URLs, node IDs,
+transport metadata, and unrelated provider fields are excluded. The receipt's
+`digest_domain` is `rfc8785-jcs-sha256/1`: SHA-256 over the UTF-8 bytes of the
+projection serialized with RFC 8785 JSON Canonicalization Scheme. For this
+GitHub policy the sole writer-gate bypass mode is `always`; the integrity
+ruleset has no bypass actors. The receipt carries both projection schema and
+digest domain, so API key order or transport changes cannot change its identity.
 
 ### Package implementer
 
@@ -250,6 +299,11 @@ Required outcomes:
   assignment's ledger commit, its current ledger digest is recorded, and the
   lease remains active and nonoverlapping; A00 instead verifies its approved
   bootstrap ledger digest;
+- for B00 and later, the brief's `coordination-ref-protection` receipt matches a
+  fresh provider-policy readback for the exact coordination ref, including the
+  authorized S00 principals and force-update/deletion prohibitions; the verifier
+  rebuilds `github-coordination-protection-projection/1` and compares its
+  `rfc8785-jcs-sha256/1` digest;
 - every phase-required contract and fixture file/digest matches the assignment
   packet, and every nonapplicable pin has the declared phase reason;
 - each typed lease entry exists or the brief explicitly authorizes creation at
@@ -417,6 +471,9 @@ Every session receives a brief containing:
 - protected coordination ref, minimum assignment-ledger commit/digest, and the
   lease ID represented there, or A00's explicit bootstrap-ledger
   `not-applicable` substitution;
+- for B00 and later, the `coordination-ref-protection` receipt ID, canonical
+  provider-policy projection schema, digest domain/digest, rule/ruleset IDs, and
+  authorized S00 principals;
 - authoritative remote URL; exact base tag; matching local/remote annotated tag
   object; peeled commit; tree; and baseline-verification status, subject only to
   A00's temporary missing-remote exception;

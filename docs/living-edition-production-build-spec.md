@@ -36,6 +36,11 @@ or uncommitted working-tree material MUST NOT be treated as evidence that a
 prerequisite exists. Each handoff records the repository snapshot it actually
 verified.
 
+Candidate-document and bootstrap-ledger digests use
+`git-blob-payload-sha256/1` from the concurrent-session protocol: SHA-256 over
+the committed raw Git blob payload at the externally pinned commit, never over
+checkout-filtered or working-tree bytes.
+
 S00 creates `studio-adoption-v1.1.0` from a clean external worktree after this
 revision, the concurrent-session protocol, and the corrected prototype reference
 manifest plus bootstrap coordination schema/record are committed and reviewed.
@@ -191,13 +196,17 @@ gate unless it was genuinely a prototype runtime dependency; an authoring
 `manifest.json` MUST NOT be represented as a sealed archive.
 
 During A00 preparation, an absent category is represented honestly as a pending
-waiver request with null approver, acceptance receipt, and decision commit; that
-state blocks A00 review and adoption. Before adoption, the S00 role may review
-A00, but the protected S00 coordination ref and post-adoption receipt do not yet
-exist. The repository maintainer's explicit pre-adoption waiver decision may
-substitute for the S00 receipt fields when its external approval locator and
-SHA-256 are pinned by the work order. S00 then accepts or rejects the unchanged
-A00 HEAD and records its decision in the first post-adoption coordination
+waiver request; that state blocks A00 review and adoption. Before adoption, the
+S00 role may review A00, but the protected S00 coordination ref and post-adoption
+receipt do not yet exist. The repository maintainer's explicit pre-adoption
+waiver decision uses a `pre_adoption_decision` object containing status,
+approver, decision time, immutable external evidence locator, and SHA-256 over
+that evidence's declared bytes. `approved` requires every field and must be
+pinned by the work order; `pending` or `rejected` remains blocking. Under this
+narrow substitution, `s00_acceptance_receipt` and `decision_commit` remain null
+in the immutable adoption manifest rather than naming fabricated or future
+objects. S00 accepts or rejects the unchanged A00 HEAD and records each waiver ID
+and the external decision evidence in the first post-adoption coordination
 receipt. A waiver MUST NOT name its own containing commit, a future commit, or a
 future tag object. Post-adoption waivers require the ordinary S00 receipt and an
 already-existing decision commit.
@@ -206,6 +215,13 @@ At the repository snapshot used for this revision, the prototype code tuple is
 locally verifiable, but remote publication and a committed, corrected reference
 manifest remain prerequisites. Their presence in one local worktree does not
 authorize B00.
+
+Before A00 enters review, the manifest sets `code_freeze_status` to
+`verified-local-and-remote`, sets `adoption_gate_status` to `ready-for-review`,
+clears `adoption_blockers`, and records the exact matching remote tag object and
+peeled commit. A semantic acceptance check compares those fields with both the
+bootstrap ledger and live remote refs; merely changing the status strings is not
+evidence.
 
 The current provisional manifest MUST NOT be committed unchanged. It must move
 the listed TypeScript files from `behavior_vectors` to `behavior_sources`, add
@@ -2906,6 +2922,12 @@ checked out and its digest and 33/33/34 counts verify from a clean worktree.
   phase-aware owners, including S00, `tools/studio/**`, exact I30 transfers, and
   `apps/public-reader/**`;
 - coordination schema, bootstrap record, and S00 worktree/lease procedure exist;
+- the exact S00 coordination ref has an authorized protection policy definition;
+  before B00 starts, the published ref's provider-policy readback proves the
+  restricted writer set, administrator enforcement, and force-update/deletion
+  prohibitions and is pinned by a `coordination-ref-protection` receipt using
+  `github-coordination-protection-projection/1` and
+  `rfc8785-jcs-sha256/1`;
 - the root Node scope remains CommonJS, legacy package/Python boundaries are
   excluded, and all shared dependencies are locked;
 - additive Studio CI exists without replacing legacy CI;
@@ -3346,7 +3368,11 @@ The following order is authoritative:
 1. Select one authoritative repository commit/worktree and inventory every
    proposed migration input by tracked path, commit, digest, and provenance.
    Review, deduplicate, or reject provisional files; never bulk-commit the
-   working tree.
+   working tree. This A00 revision selects no provisional primary-worktree input
+   beyond the frozen prototype evidence listed in its reference manifest; all
+   other unpinned material is rejected from adoption without being deleted.
+   C00 or T01 may reconsider it only through a later explicit work order that
+   identifies exact bytes and provenance inside that package's lease.
 2. Verify and publish the immutable prototype tag tuple in section 3. Commit the
    corrected reference manifest afterward without moving the tag. Record real
    evidence artifacts or explicit approved waivers; source files are not vectors
@@ -3497,8 +3523,9 @@ removes obsolete mockup alternatives, and defines the contracts, ownership, and
 integration process required for parallel construction.
 
 The mistakenly routed no-work branch from the earlier handoff is not a repository
-snapshot or migration input and requires no recovery or merge. Existing
-provisional Theatrum, Dodoens, Yale, prompt-generator, and reading-protocol
-material is a migration candidate only if A00 selects its exact bytes, records
-their provenance and digest, and C00 or T01 later locks them. Mere working-tree
-presence does not make that material normative.
+snapshot or migration input and requires no recovery or merge. A00 selected none
+of the provisional Theatrum, Dodoens, Yale, prompt-generator, or reading-protocol
+working-tree material for adoption. Those bytes are neither deleted nor
+normative. C00 or T01 may reconsider an item only under a later explicit work
+order that pins its exact provenance and digest before the owning package locks
+it; mere working-tree presence never qualifies.

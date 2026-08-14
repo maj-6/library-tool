@@ -2,12 +2,13 @@
   "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
   "protocol_version": "1.0",
   "ledger_id": "living-edition-studio",
-  "ledger_revision": 1,
+  "ledger_revision": 2,
   "status": "bootstrap-draft",
   "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
   "coordination_ref": null,
   "bootstrap": {
     "status": "preparation-blocked",
+    "digest_domain": "git-blob-payload-sha256/1",
     "work_order": {
       "work_order_id": "A00-WO-001",
       "status": "pending-maintainer-approval",
@@ -29,6 +30,36 @@
           "target_ref": "refs/tags/living-edition-viewer-v0.1.1",
           "approved_at": null,
           "approval_evidence": null
+        },
+        {
+          "authorization_status": "pending",
+          "publisher_identity": null,
+          "action": "publish-adoption-tag",
+          "remote_url": "https://github.com/maj-6/library-tool.git",
+          "source_ref": "refs/tags/studio-adoption-v1.1.0",
+          "target_ref": "refs/tags/studio-adoption-v1.1.0",
+          "approved_at": null,
+          "approval_evidence": null
+        },
+        {
+          "authorization_status": "pending",
+          "publisher_identity": null,
+          "action": "publish-coordination-ref",
+          "remote_url": "https://github.com/maj-6/library-tool.git",
+          "source_ref": "refs/heads/studio-s00-coordination",
+          "target_ref": "refs/heads/studio-s00-coordination",
+          "approved_at": null,
+          "approval_evidence": null
+        },
+        {
+          "authorization_status": "pending",
+          "publisher_identity": null,
+          "action": "configure-coordination-ref-protection",
+          "remote_url": "https://github.com/maj-6/library-tool.git",
+          "source_ref": "refs/heads/studio-s00-coordination",
+          "target_ref": "refs/heads/studio-s00-coordination",
+          "approved_at": null,
+          "approval_evidence": null
         }
       ],
       "return_destination": "interactive user handoff",
@@ -37,11 +68,11 @@
     "candidate_documents": [
       {
         "path": "docs/living-edition-production-build-spec.md",
-        "sha256": "2841d2760889694a579df4568d16a64a2d8d97be71dd0ada542288d3fcd7a73c"
+        "sha256": "7ad2f77e27ab9e94df86435f2aecb4c13f5c04a545950816538dca843350306d"
       },
       {
         "path": "docs/living-edition-concurrent-session-handoff.md",
-        "sha256": "f86ca7b2ec2633d334b533430280fbd97bfc184700a6b1ecdf20ea76968703b4"
+        "sha256": "244c36025ee073f6f59dbcbca7aacfcca10d6ba3ec13e655944ad00fc12cfd4a"
       }
     ],
     "intended_adoption_tag": "studio-adoption-v1.1.0",
@@ -114,10 +145,11 @@
       "python -m json.tool coordination/ledger.schema.json",
       "python -m json.tool coordination/studio-ledger.json",
       "python -c \"import json,jsonschema,pathlib; root=pathlib.Path('.'); schema=json.loads((root/'coordination/ledger.schema.json').read_text(encoding='utf-8')); ledger=json.loads((root/'coordination/studio-ledger.json').read_text(encoding='utf-8')); jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker()).validate(ledger)\"",
-      "python -c \"import hashlib,json,pathlib; root=pathlib.Path('.'); ledger=json.loads((root/'coordination/studio-ledger.json').read_text(encoding='utf-8')); mismatches=[pin['path'] for pin in ledger['bootstrap']['candidate_documents'] if hashlib.sha256((root/pin['path']).read_bytes()).hexdigest()!=pin['sha256']]; assert not mismatches, mismatches\"",
+      "python -c \"import hashlib,json,subprocess; c=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(); blob=lambda p: subprocess.check_output(['git','cat-file','blob',f'{c}:{p}']); ledger=json.loads(blob('coordination/studio-ledger.json')); mismatches=[pin['path'] for pin in ledger['bootstrap']['candidate_documents'] if hashlib.sha256(blob(pin['path'])).hexdigest()!=pin['sha256']]; assert not mismatches,mismatches; print(hashlib.sha256(blob('coordination/studio-ledger.json')).hexdigest())\"",
+      "python -c \"import json,re,subprocess; blob=lambda p: subprocess.check_output(['git','cat-file','blob',f'HEAD:{p}']); ledger=json.loads(blob('coordination/studio-ledger.json')); manifest=json.loads(blob('docs/reference/living-edition-viewer-0.1.1.json')); bootstrap=ledger['bootstrap']; work_order=bootstrap['work_order']; assert bootstrap['status']=='ready-for-review' and not bootstrap['blockers'] and work_order['s00_contact']; required={'publish-existing-prototype-tag':('refs/tags/living-edition-viewer-v0.1.1','refs/tags/living-edition-viewer-v0.1.1'),'publish-adoption-tag':('refs/tags/studio-adoption-v1.1.0','refs/tags/studio-adoption-v1.1.0'),'publish-coordination-ref':('refs/heads/studio-s00-coordination','refs/heads/studio-s00-coordination'),'configure-coordination-ref-protection':('refs/heads/studio-s00-coordination','refs/heads/studio-s00-coordination')}; auth=work_order['publisher_authorizations']; assert all(any(a['action']==action and a['authorization_status']=='authorized' and (a['source_ref'],a['target_ref'])==refs and a['publisher_identity'] and a['approval_evidence'] for a in auth) for action,refs in required.items()); waivers=[v['waiver_request'] for v in manifest['evidence'].values() if isinstance(v,dict) and 'waiver_request' in v]; expected={'A00-WAIVER-PROTOTYPE-SCREENSHOTS-001':'screenshots','A00-WAIVER-PROTOTYPE-TASK-RECORDINGS-001':'task_recordings','A00-WAIVER-PROTOTYPE-BEHAVIOR-VECTORS-001':'behavior_vectors','A00-WAIVER-PROTOTYPE-RUNTIME-ARCHIVES-001':'sealed_prototype_runtime_archives'}; assert {w['waiver_id']:w['category'] for w in waivers}==expected; assert manifest['adoption_gate_status']=='ready-for-review' and manifest['adoption_blockers']==[]; assert all(w['status']=='approved-pre-adoption' and w['pre_adoption_decision']['status']=='approved' and w['pre_adoption_decision']['approver']==work_order['maintainer_approver'] and w['pre_adoption_decision']['decided_at']==work_order['approved_at'] and w['pre_adoption_decision']['evidence_locator']==work_order['approval_evidence']['locator'] and w['pre_adoption_decision']['evidence_sha256']==work_order['approval_evidence']['sha256'] and re.fullmatch('[0-9a-f]{64}',w['pre_adoption_decision']['evidence_sha256'] or '') and w['s00_acceptance_receipt'] is None and w['decision_commit'] is None for w in waivers)\"",
       "git diff --check -- coordination/ledger.schema.json coordination/studio-ledger.json docs/living-edition-concurrent-session-handoff.md docs/living-edition-production-build-spec.md docs/reference/living-edition-viewer-0.1.1.json",
       "git rev-parse \"refs/tags/living-edition-viewer-v0.1.1\" \"refs/tags/living-edition-viewer-v0.1.1^{commit}\" \"refs/tags/living-edition-viewer-v0.1.1^{tree}\" \"refs/tags/living-edition-viewer-v0.1.1^{commit}:apps/living-edition-viewer\"",
-      "git ls-remote --tags origin \"refs/tags/living-edition-viewer-v0.1.1\" \"refs/tags/living-edition-viewer-v0.1.1^{}\""
+      "python -c \"import json,subprocess; g=lambda *a: subprocess.check_output(['git',*a],text=True).strip(); ledger=json.loads(g('cat-file','blob','HEAD:coordination/studio-ledger.json')); manifest=json.loads(g('cat-file','blob','HEAD:docs/reference/living-edition-viewer-0.1.1.json')); prototype=ledger['bootstrap']['prototype']; baseline=next(x for x in ledger['baselines'] if x['baseline_id']==prototype['tag']); repository=manifest['repository']; remote=repository['remote_verification']; ref='refs/tags/'+prototype['tag']; rows={remote_ref:oid for oid,remote_ref in (line.split('\\t',1) for line in g('ls-remote','--tags',ledger['authoritative_remote_url'],ref,ref+'^{}').splitlines())}; assert baseline['verification_status']=='verified' and remote['status']=='verified' and manifest['code_freeze_status']=='verified-local-and-remote'; assert repository['authoritative_remote_url']==ledger['authoritative_remote_url'] and repository['tag']==prototype['tag']; assert baseline['tag_object']==baseline['remote_tag_object']==prototype['tag_object']==repository['tag_object']==remote['remote_tag_object']==g('rev-parse',ref+'^{tag}')==rows[ref]; assert baseline['peeled_commit']==prototype['peeled_commit']==repository['peeled_commit']==remote['remote_peeled_commit']==g('rev-parse',ref+'^{commit}')==rows[ref+'^{}']; assert baseline['tree']==prototype['repository_tree']==repository['repository_tree']==g('rev-parse',ref+'^{tree}'); assert prototype['prototype_tree']==repository['prototype_tree']==g('rev-parse',ref+'^{commit}:apps/living-edition-viewer')\""
     ],
     "self_reference_policy": {
       "ledger_sha256": "external-assignment-and-receipt-only",
@@ -130,7 +162,10 @@
       "prototype-tag-publisher-authorization-missing",
       "remote-prototype-tag-missing",
       "prototype-evidence-waivers-pending",
-      "s00-contact-missing"
+      "s00-contact-missing",
+      "adoption-tag-publisher-authorization-missing",
+      "coordination-ref-publisher-authorization-missing",
+      "coordination-ref-protection-authorization-missing"
     ],
     "created_at": "2026-08-14T15:33:48Z"
   },
@@ -183,5 +218,5 @@
       }
     }
   ],
-  "updated_at": "2026-08-14T15:33:48Z"
+  "updated_at": "2026-08-14T18:26:33Z"
 }

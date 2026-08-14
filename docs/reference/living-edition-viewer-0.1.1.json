@@ -98,12 +98,18 @@
         "waiver_id": "A00-WAIVER-PROTOTYPE-SCREENSHOTS-001",
         "category": "screenshots",
         "rationale": "No screenshot artifact was committed for the frozen prototype. Source files must not be represented as screenshots.",
-        "approver": null,
+        "pre_adoption_decision": {
+          "status": "pending",
+          "approver": null,
+          "decided_at": null,
+          "evidence_locator": null,
+          "evidence_sha256": null
+        },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "G3-renderer-composition",
-        "status": "pending-s00-acceptance"
+        "status": "pending-maintainer-decision"
       }
     },
     "task_recordings": {
@@ -113,12 +119,18 @@
         "waiver_id": "A00-WAIVER-PROTOTYPE-TASK-RECORDINGS-001",
         "category": "task_recordings",
         "rationale": "No task recording was committed for the frozen prototype. Written review instructions are not recordings.",
-        "approver": null,
+        "pre_adoption_decision": {
+          "status": "pending",
+          "approver": null,
+          "decided_at": null,
+          "evidence_locator": null,
+          "evidence_sha256": null
+        },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "G4-production-vertical",
-        "status": "pending-s00-acceptance"
+        "status": "pending-maintainer-decision"
       }
     },
     "behavior_vectors": {
@@ -128,12 +140,18 @@
         "waiver_id": "A00-WAIVER-PROTOTYPE-BEHAVIOR-VECTORS-001",
         "category": "behavior_vectors",
         "rationale": "The tagged prototype contains behavior source code but no deterministic input and expected-output vector artifact.",
-        "approver": null,
+        "pre_adoption_decision": {
+          "status": "pending",
+          "approver": null,
+          "decided_at": null,
+          "evidence_locator": null,
+          "evidence_sha256": null
+        },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "studio-fixtures-v1.0.0",
-        "status": "pending-s00-acceptance"
+        "status": "pending-maintainer-decision"
       }
     },
     "sealed_prototype_runtime_archives": {
@@ -143,14 +161,26 @@
         "waiver_id": "A00-WAIVER-PROTOTYPE-RUNTIME-ARCHIVES-001",
         "category": "sealed_prototype_runtime_archives",
         "rationale": "The prototype uses unpublished typed synthetic fixtures and abstract rasters; no sealed LIB4 is a runtime dependency. T01 owns production fixture archives.",
-        "approver": null,
+        "pre_adoption_decision": {
+          "status": "pending",
+          "approver": null,
+          "decided_at": null,
+          "evidence_locator": null,
+          "evidence_sha256": null
+        },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "studio-fixtures-v1.0.0",
-        "status": "pending-s00-acceptance"
+        "status": "pending-maintainer-decision"
       }
     }
+  },
+  "migration_input_disposition": {
+    "status": "none-selected",
+    "selected_items": [],
+    "scope": "Provisional primary-worktree material outside the frozen prototype tag.",
+    "reason": "No additional bytes were approved and pinned for A00 adoption. Later C00 or T01 consideration requires a separate work order with exact provenance and digest; working-tree presence is not evidence."
   },
   "excluded_misclassifications": [
     {
