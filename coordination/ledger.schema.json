@@ -474,6 +474,9 @@
       "required": [
         "work_order_id",
         "status",
+        "candidate_commit",
+        "candidate_ledger_sha256",
+        "candidate_digest_domain",
         "request_evidence",
         "maintainer_approver",
         "approved_at",
@@ -493,6 +496,15 @@
             "approved-preparation-only",
             "approved-with-publisher"
           ]
+        },
+        "candidate_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "candidate_ledger_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "candidate_digest_domain": {
+          "const": "git-blob-payload-sha256/1"
         },
         "request_evidence": {
           "$ref": "#/$defs/approvalEvidence"

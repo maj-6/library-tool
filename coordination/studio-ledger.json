@@ -2,68 +2,91 @@
   "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
   "protocol_version": "1.0",
   "ledger_id": "living-edition-studio",
-  "ledger_revision": 2,
+  "ledger_revision": 3,
   "status": "bootstrap-draft",
   "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
   "coordination_ref": null,
   "bootstrap": {
-    "status": "preparation-blocked",
+    "status": "ready-for-review",
     "digest_domain": "git-blob-payload-sha256/1",
     "work_order": {
       "work_order_id": "A00-WO-001",
-      "status": "pending-maintainer-approval",
+      "status": "approved-with-publisher",
+      "candidate_commit": "68be9fbaabfad31b2ad3347e8890d5df2090220c",
+      "candidate_ledger_sha256": "0ccf32c5b4918e30a8fa5de42b7fb7cdcafe5395168dce7e536d92ee9347a351",
+      "candidate_digest_domain": "git-blob-payload-sha256/1",
       "request_evidence": {
         "kind": "interactive-user-request",
         "locator": "conversation:2026-08-14:start-where-you-can",
         "sha256": "70346aeb0f09dabe6f3860981f942e03554545ca3d9bd933d3fd798165bcc5ce"
       },
-      "maintainer_approver": null,
-      "approved_at": null,
-      "approval_evidence": null,
+      "maintainer_approver": "github:maj-6",
+      "approved_at": "2026-08-14T18:31:59Z",
+      "approval_evidence": {
+        "kind": "interactive-user-approval-of-pinned-fast-path",
+        "locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+        "sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
+      },
       "publisher_authorizations": [
         {
-          "authorization_status": "pending",
-          "publisher_identity": null,
+          "authorization_status": "authorized",
+          "publisher_identity": "github:maj-6",
           "action": "publish-existing-prototype-tag",
           "remote_url": "https://github.com/maj-6/library-tool.git",
           "source_ref": "refs/tags/living-edition-viewer-v0.1.1",
           "target_ref": "refs/tags/living-edition-viewer-v0.1.1",
-          "approved_at": null,
-          "approval_evidence": null
+          "approved_at": "2026-08-14T18:31:59Z",
+          "approval_evidence": {
+            "kind": "interactive-user-approval-of-pinned-fast-path",
+            "locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+            "sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
+          }
         },
         {
-          "authorization_status": "pending",
-          "publisher_identity": null,
+          "authorization_status": "authorized",
+          "publisher_identity": "github:maj-6",
           "action": "publish-adoption-tag",
           "remote_url": "https://github.com/maj-6/library-tool.git",
           "source_ref": "refs/tags/studio-adoption-v1.1.0",
           "target_ref": "refs/tags/studio-adoption-v1.1.0",
-          "approved_at": null,
-          "approval_evidence": null
+          "approved_at": "2026-08-14T18:31:59Z",
+          "approval_evidence": {
+            "kind": "interactive-user-approval-of-pinned-fast-path",
+            "locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+            "sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
+          }
         },
         {
-          "authorization_status": "pending",
-          "publisher_identity": null,
+          "authorization_status": "authorized",
+          "publisher_identity": "github:maj-6",
           "action": "publish-coordination-ref",
           "remote_url": "https://github.com/maj-6/library-tool.git",
           "source_ref": "refs/heads/studio-s00-coordination",
           "target_ref": "refs/heads/studio-s00-coordination",
-          "approved_at": null,
-          "approval_evidence": null
+          "approved_at": "2026-08-14T18:31:59Z",
+          "approval_evidence": {
+            "kind": "interactive-user-approval-of-pinned-fast-path",
+            "locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+            "sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
+          }
         },
         {
-          "authorization_status": "pending",
-          "publisher_identity": null,
+          "authorization_status": "authorized",
+          "publisher_identity": "github:maj-6",
           "action": "configure-coordination-ref-protection",
           "remote_url": "https://github.com/maj-6/library-tool.git",
           "source_ref": "refs/heads/studio-s00-coordination",
           "target_ref": "refs/heads/studio-s00-coordination",
-          "approved_at": null,
-          "approval_evidence": null
+          "approved_at": "2026-08-14T18:31:59Z",
+          "approval_evidence": {
+            "kind": "interactive-user-approval-of-pinned-fast-path",
+            "locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+            "sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
+          }
         }
       ],
-      "return_destination": "interactive user handoff",
-      "s00_contact": null
+      "return_destination": "codex-session:S00-001 read-only acceptance",
+      "s00_contact": "codex-session:S00-001"
     },
     "candidate_documents": [
       {
@@ -90,7 +113,7 @@
       "session_id": "A00-001",
       "work_package": "A00",
       "preparation_owner": "codex:/root",
-      "accountable_owner": null,
+      "accountable_owner": "codex:/root",
       "branch": "studio-a00-001-adoption",
       "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a00-001-adoption",
       "lease_id": "lease-A00-001-01",
@@ -156,17 +179,7 @@
       "containing_commit": "post-adoption-receipt-only",
       "adoption_tag_object": "post-adoption-receipt-only"
     },
-    "blockers": [
-      "work-order-maintainer-approval-missing",
-      "accountable-owner-missing",
-      "prototype-tag-publisher-authorization-missing",
-      "remote-prototype-tag-missing",
-      "prototype-evidence-waivers-pending",
-      "s00-contact-missing",
-      "adoption-tag-publisher-authorization-missing",
-      "coordination-ref-publisher-authorization-missing",
-      "coordination-ref-protection-authorization-missing"
-    ],
+    "blockers": [],
     "created_at": "2026-08-14T15:33:48Z"
   },
   "sessions": [],
@@ -192,7 +205,7 @@
       "kind": "prototype-reference",
       "tag": "living-edition-viewer-v0.1.1",
       "tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
-      "remote_tag_object": null,
+      "remote_tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
       "peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad",
       "tree": "fe7840c3f173132c59aa7825fdd44eba99c3b295",
       "subtrees": [
@@ -201,8 +214,8 @@
           "tree": "616250cb7fcbe4cb17b0a2254876f73c1a0411ac"
         }
       ],
-      "verification_status": "remote-baseline-missing",
-      "verified_at": "2026-08-14T15:29:08Z"
+      "verification_status": "verified",
+      "verified_at": "2026-08-14T18:33:57Z"
     }
   ],
   "receipts": [
@@ -216,7 +229,55 @@
         "authority_claimed": false,
         "external_state_changes_authorized": false
       }
+    },
+    {
+      "receipt_id": "A00-WORK-ORDER-APPROVED-001",
+      "kind": "pre-adoption-work-order-approved",
+      "actor": "github:maj-6",
+      "created_at": "2026-08-14T18:31:59Z",
+      "payload": {
+        "work_order_id": "A00-WO-001",
+        "candidate_commit": "68be9fbaabfad31b2ad3347e8890d5df2090220c",
+        "candidate_ledger_sha256": "0ccf32c5b4918e30a8fa5de42b7fb7cdcafe5395168dce7e536d92ee9347a351",
+        "digest_domain": "git-blob-payload-sha256/1",
+        "approval_evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52",
+        "accountable_owner": "codex:/root",
+        "s00_contact": "codex-session:S00-001",
+        "authorized_actions": [
+          "publish-existing-prototype-tag",
+          "publish-adoption-tag",
+          "publish-coordination-ref",
+          "configure-coordination-ref-protection"
+        ]
+      }
+    },
+    {
+      "receipt_id": "A00-WAIVERS-APPROVED-001",
+      "kind": "pre-adoption-waivers-approved",
+      "actor": "github:maj-6",
+      "created_at": "2026-08-14T18:31:59Z",
+      "payload": {
+        "approval_evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52",
+        "waiver_ids": [
+          "A00-WAIVER-PROTOTYPE-SCREENSHOTS-001",
+          "A00-WAIVER-PROTOTYPE-TASK-RECORDINGS-001",
+          "A00-WAIVER-PROTOTYPE-BEHAVIOR-VECTORS-001",
+          "A00-WAIVER-PROTOTYPE-RUNTIME-ARCHIVES-001"
+        ]
+      }
+    },
+    {
+      "receipt_id": "A00-REMOTE-BASELINE-VERIFIED-001",
+      "kind": "remote-prototype-baseline-verified",
+      "actor": "github:maj-6",
+      "created_at": "2026-08-14T18:33:57Z",
+      "payload": {
+        "remote_url": "https://github.com/maj-6/library-tool.git",
+        "tag": "living-edition-viewer-v0.1.1",
+        "tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
+        "peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad"
+      }
     }
   ],
-  "updated_at": "2026-08-14T18:26:33Z"
+  "updated_at": "2026-08-14T18:33:57Z"
 }

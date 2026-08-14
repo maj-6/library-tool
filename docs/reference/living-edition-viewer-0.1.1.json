@@ -2,12 +2,9 @@
   "format": "whl.prototype-reference-manifest/1",
   "reference_id": "living-edition-viewer-0.1.1",
   "status": "candidate-pending-adoption",
-  "code_freeze_status": "verified-local",
-  "adoption_gate_status": "blocked",
-  "adoption_blockers": [
-    "remote-prototype-tag-missing",
-    "prototype-evidence-waivers-pending"
-  ],
+  "code_freeze_status": "verified-local-and-remote",
+  "adoption_gate_status": "ready-for-review",
+  "adoption_blockers": [],
   "digest_domain": {
     "id": "git-blob-payload-sha256/1",
     "algorithm": "SHA-256",
@@ -21,10 +18,10 @@
     "repository_tree": "fe7840c3f173132c59aa7825fdd44eba99c3b295",
     "prototype_tree": "616250cb7fcbe4cb17b0a2254876f73c1a0411ac",
     "remote_verification": {
-      "status": "remote-baseline-missing",
-      "checked_at": "2026-08-14T15:29:08Z",
-      "remote_tag_object": null,
-      "remote_peeled_commit": null
+      "status": "verified",
+      "checked_at": "2026-08-14T18:33:57Z",
+      "remote_tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
+      "remote_peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad"
     }
   },
   "application": {
@@ -99,17 +96,17 @@
         "category": "screenshots",
         "rationale": "No screenshot artifact was committed for the frozen prototype. Source files must not be represented as screenshots.",
         "pre_adoption_decision": {
-          "status": "pending",
-          "approver": null,
-          "decided_at": null,
-          "evidence_locator": null,
-          "evidence_sha256": null
+          "status": "approved",
+          "approver": "github:maj-6",
+          "decided_at": "2026-08-14T18:31:59Z",
+          "evidence_locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+          "evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
         },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "G3-renderer-composition",
-        "status": "pending-maintainer-decision"
+        "status": "approved-pre-adoption"
       }
     },
     "task_recordings": {
@@ -120,17 +117,17 @@
         "category": "task_recordings",
         "rationale": "No task recording was committed for the frozen prototype. Written review instructions are not recordings.",
         "pre_adoption_decision": {
-          "status": "pending",
-          "approver": null,
-          "decided_at": null,
-          "evidence_locator": null,
-          "evidence_sha256": null
+          "status": "approved",
+          "approver": "github:maj-6",
+          "decided_at": "2026-08-14T18:31:59Z",
+          "evidence_locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+          "evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
         },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "G4-production-vertical",
-        "status": "pending-maintainer-decision"
+        "status": "approved-pre-adoption"
       }
     },
     "behavior_vectors": {
@@ -141,17 +138,17 @@
         "category": "behavior_vectors",
         "rationale": "The tagged prototype contains behavior source code but no deterministic input and expected-output vector artifact.",
         "pre_adoption_decision": {
-          "status": "pending",
-          "approver": null,
-          "decided_at": null,
-          "evidence_locator": null,
-          "evidence_sha256": null
+          "status": "approved",
+          "approver": "github:maj-6",
+          "decided_at": "2026-08-14T18:31:59Z",
+          "evidence_locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+          "evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
         },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "studio-fixtures-v1.0.0",
-        "status": "pending-maintainer-decision"
+        "status": "approved-pre-adoption"
       }
     },
     "sealed_prototype_runtime_archives": {
@@ -162,17 +159,17 @@
         "category": "sealed_prototype_runtime_archives",
         "rationale": "The prototype uses unpublished typed synthetic fixtures and abstract rasters; no sealed LIB4 is a runtime dependency. T01 owns production fixture archives.",
         "pre_adoption_decision": {
-          "status": "pending",
-          "approver": null,
-          "decided_at": null,
-          "evidence_locator": null,
-          "evidence_sha256": null
+          "status": "approved",
+          "approver": "github:maj-6",
+          "decided_at": "2026-08-14T18:31:59Z",
+          "evidence_locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+          "evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
         },
         "s00_acceptance_receipt": null,
         "decision_commit": null,
         "expiry": null,
         "revisit_gate": "studio-fixtures-v1.0.0",
-        "status": "pending-maintainer-decision"
+        "status": "approved-pre-adoption"
       }
     }
   },
