@@ -1,11 +1,12 @@
 # Living Edition Studio: production build specification
 
-Status: normative candidate; effective only when adopted by
-`studio-adoption-v1.1.0`
+Status: normative amendment candidate; revision `1.1.1` is effective only when
+adopted by `studio-adoption-v1.1.1`. The bytes adopted by
+`studio-adoption-v1.1.0` remain an immutable historical baseline.
 
 Contract target: `studio-contracts/1.0`
 
-Document revision: `1.1` (repository-audit reconciliation, 2026-08-14)
+Document revision: `1.1.1` (context-packet amendment, 2026-08-14)
 
 Prototype reference: annotated tag `living-edition-viewer-v0.1.1`, peeled commit
 `89a5b8f3564469e5375f5c2997680a013ace97ad`, path
@@ -41,15 +42,20 @@ Candidate-document and bootstrap-ledger digests use
 the committed raw Git blob payload at the externally pinned commit, never over
 checkout-filtered or working-tree bytes.
 
-S00 creates `studio-adoption-v1.1.0` from a clean external worktree after this
-revision, the concurrent-session protocol, and the corrected prototype reference
-manifest plus bootstrap coordination schema/record are committed and reviewed.
-The adoption commit MUST exclude
-provisional B00 scaffolding and unrelated working-tree material. Until that tag
-is published, this document is a draft and does not authorize B00.
-A00 alone may prepare that adoption under the handoff protocol's explicit
-pre-adoption approval procedure, which pins the candidate document digests and
-grants no authority to a later work package.
+S00 assembles and publishes `studio-adoption-v1.1.1` from a clean external
+worktree after the A01 revisions to this specification and the
+concurrent-session protocol are committed and independently reviewed, and after
+S00 has committed the matching context schema, phase profiles, pre-GB validator,
+and pre-assembly record. The new baseline MUST descend from
+`studio-adoption-v1.1.0`; that historical tag MUST NOT be moved or recreated.
+The amendment baseline MUST exclude provisional B00 scaffolding and unrelated
+working-tree material. Until
+`studio-adoption-v1.1.1` is published, revision `1.1.1` is a candidate and does
+not authorize B00.
+
+A01 alone may prepare this two-document amendment from
+`studio-adoption-v1.1.0` under an S00-issued assignment governed by adopted
+protocol `1.0`. It grants no authority to a product package.
 
 ## 1. Product decision
 
@@ -520,6 +526,18 @@ JSON Schema `format: uri` check is not a semantic identity validator. Every
 identity, canonicalization, offset, workflow, and selection contract below MUST
 have a C00-owned semantic validator and TypeScript/Python vectors. A source
 implementation is migration evidence, not a normative algorithm.
+
+The lock also freezes a top-level `context_routes` object for every T01 and
+downstream work package that requires the contract pin. Each package key maps to
+a nonempty, minimal, ordered array of exact `context_id`, `source_path`,
+`media_type`, selector, and purpose records as defined by handoff protocol
+section 8. Each routed source path MUST be a member of this same lock. G0 rejects
+a missing package route, duplicate context ID, nonmember path, unsupported
+selector, irrelevant entry, or route that omits a contract surface required by
+the package's assigned operations, ports, schemas, or generated client. G0 also
+materializes every contract route with the pinned profile core and rejects a T01
+packet above its default or any downstream contract portion that already exceeds
+that package's default.
 
 The bundle incorporates and pins reviewed contracts for:
 
@@ -1518,9 +1536,9 @@ portable-domain registration, or contract-version/schema/digest mismatch fails
 G0 producer/consumer tests and I30 composition before startup.
 
 Every independently assigned session receives the phase-applicable inputs below.
-The handoff protocol's phase matrix is authoritative: A00/B00/C00 do not claim a
-contract or fixture input that does not yet exist; T01 pins the contract and
-records its fixture input as not applicable; downstream packages pin both.
+The handoff protocol's phase matrix is authoritative: A00/A01/B00/C00 do not
+claim a contract or fixture input that does not yet exist; T01 pins the contract
+and records its fixture input as not applicable; downstream packages pin both.
 
 - the frozen contract tag and digest, or the declared `not-applicable` phase
   reason;
@@ -2932,6 +2950,14 @@ checked out and its digest and 33/33/34 counts verify from a clean worktree.
   excluded, and all shared dependencies are locked;
 - additive Studio CI exists without replacing legacy CI;
 - real format and lint scripts execute rather than placeholder commands;
+- S00's pinned `coordination/validate_context_packet.py` pre-GB validator
+  validates B00's `studio-context-packet/1` before selected semantic bytes are
+  presented; B00's resulting `tools/studio/**` validator MUST replay that
+  evidence before GB acceptance and, for C00 and later, validates source
+  Git-blob pins, unique selector resolution, selected-value digests and byte
+  lengths, packet-manifest JCS digest, frozen initial-expansion routes, closed
+  activation/handoff/review receipt payloads, and the authorized UTF-8 byte
+  budget before presentation;
 - B00 records the exact S00 Git build/runtime and provides the clean
   `merge-tree`/accepted-blob provenance verifier that S00 uses even for B00's own
   baseline assembly;
@@ -2941,7 +2967,7 @@ checked out and its digest and 33/33/34 counts verify from a clean worktree.
   and writes outside declared production boundaries;
 - a clean checkout reproduces the scaffold, dependency lock, and all checks.
 
-B00 starts from `studio-adoption-v1.1.0` and returns its accepted GB report to
+B00 starts from `studio-adoption-v1.1.1` and returns its accepted GB report to
 S00, which assembles and publishes `studio-bootstrap-v1.0.0`. C00 starts from
 that exact tag. A failed GB check
 blocks C00 authorization; it does not license
@@ -3008,8 +3034,14 @@ dual-read compatibility tests for the supported window, and an ADR.
 
 ### GF — fixture and fake freeze
 
-- fixture lock records every shared fixture path or retrieval locator, byte
+- `fixtures/fixtures.lock.json` records every shared fixture path or retrieval locator, byte
   count, SHA-256, license/access class, and expected contract version;
+- that lock freezes the protocol-section-8 `context_routes` object for every
+  E10/D20/U20, E11–E21, U21–U27, and I30 work package that requires the fixture
+  pin; every nonempty ordered route is minimal, uses only fixture paths in the
+  same lock, and covers the package's required fake, vector, archive, and
+  conformance evidence; GF materializes each complete contract-plus-fixture
+  revision-1 packet and rejects any package above its profile default;
 - the sealed 114-canvas herbal fixture verifies from a clean worktree and its
   4r/4v/5r counts are exactly 33/33/34;
 - deterministic fake client/engine, clock, IDs, every port and registry binding,
@@ -3135,9 +3167,12 @@ Implementation work is staged. B00 creates and freezes the workspace scaffold;
 C00 creates the contract tag; T01 creates the fixture tag. Only downstream
 implementation packages start from a committed baseline containing both frozen
 tags. S00 is the gate steward and lease coordinator; it does not implement
-product behavior. The `Owned paths` column is exclusive for production paths. A
-work session may read everything but write only its active lease within those
-paths.
+product behavior. The `Owned paths` column is exclusive for production paths.
+Every B00 and later session receives the closed, digest-pinned required context
+defined by the concurrent-session protocol and may obtain more only through
+progressive disclosure. Repository readability does not make unlisted material
+required or authoritative. A session writes only its active lease. A01 uses the
+complete two-document pins and checks in its protocol-1.0 work order instead.
 
 Existing `schemas/**`, `tools/**`, `tests/**`, `examples/**`, `data/**`, legacy
 applications, and legacy workflows are read-only migration inputs unless a
@@ -3165,6 +3200,7 @@ static owner map that cannot represent those transitions fails GB.
 | ID  | Scope                                | Owned paths                                                                                                                                                                                                                                                                                                                                                                                                                                       | Required output                                                                                                                                                                                                                  |
 | --- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A00 | One-time adoption/reconciliation     | `docs/living-edition-production-build-spec.md`, `docs/living-edition-concurrent-session-handoff.md`, `docs/reference/living-edition-viewer-0.1.1.json`, initial `coordination/ledger.schema.json` and `coordination/studio-ledger.json` only                                                                                                                                                                                                      | reviewed revision, corrected prototype manifest/waivers, exact remote tag verification, bootstrap coordination record; S00 publishes `studio-adoption-v1.1.0` after acceptance, then owns `coordination/**` exclusively          |
+| A01 | One-time context-packet amendment    | `docs/living-edition-production-build-spec.md`, `docs/living-edition-concurrent-session-handoff.md` only                                                                                                                                                                                                                                                                                                                                          | production specification revision `1.1.1`, handoff protocol `1.0.1`, and reviewed context-packet rules; S00 assembles and publishes `studio-adoption-v1.1.1` after acceptance                                                    |
 | S00 | Gate stewardship and coordination    | `coordination/**`                                                                                                                                                                                                                                                                                                                                                                                                                                 | lease ledger, ID reservations, accepted commit receipts, immutable baseline records, merge order                                                                                                                                 |
 | B00 | One-time bootstrap                   | root `package.json`, `package-lock.json`, `.npmrc`, `.nvmrc`, `tsconfig.base.json`, `tsconfig.studio.json`, `vitest.config.ts`, `prettier.config.mjs`, `studio-workspace.json`, `tools/studio/**`, root `.gitignore` under a temporary whole-file lease, `.github/workflows/studio-ci.yml`, empty production package scaffolds                                                                                                                    | explicit production-only workspace graph, pinned shared dependencies, ownership/lint/format rules and verifier, additive Studio CI; preserve root `pyproject.toml` and legacy CI; return accepted GB report for S00 assembly/tag |
 | C00 | Contracts/code generation            | `contracts/**`, `generated/**`                                                                                                                                                                                                                                                                                                                                                                                                                    | OpenAPI, schemas, deterministic TS/Python clients, compatibility checker, contract lock                                                                                                                                          |
@@ -3196,6 +3232,7 @@ static owner map that cannot represent those transitions fails GB.
 
 ```text
 A00 adoption reconciliation -> S00 `studio-adoption-v1.1.0`
+-> A01 context-packet amendment -> S00 `studio-adoption-v1.1.1`
 -> B00 Bootstrap and GB tag
 -> C00 Contracts/codegen and G0 contract tag
 -> T01 Fixture/fake and GF tag
@@ -3254,17 +3291,20 @@ composition-input tag.
 Immediately before each post-adoption baseline assembly, S00 pushes one
 coordination-only pre-assembly commit naming base, accepted heads, order, and
 receipts. The clean assembly merges that commit first and the declared inputs
-after it. Each `--no-ff` merge tree MUST equal the GB-pinned `git merge-tree`
+after it. Each `--no-ff` merge tree MUST equal the pinned `git merge-tree`
 result for its two parents, and each introduced product blob/deletion MUST trace
-to an accepted input diff. This verified non-authoring assembly is the sole
-exception to lease-bound product-path diffs; S00 may not create or resolve a
-product blob. After publishing the immutable tag, S00 writes the tag
+to an accepted input diff. A01 uses the pre-GB Git executable/digest and exact
+commands pinned by S00's pre-assembly record under the maintainer-authorized
+work order; B00's GB verifier replays that evidence. B00 and later assemblies
+use the GB-pinned implementation and verifier. This verified non-authoring assembly is the sole exception to
+lease-bound product-path diffs; S00 may not create or resolve a product blob.
+After publishing the immutable tag, S00 writes the tag
 object/commit/tree and source-to-merge mapping to a later coordination receipt;
 the tag never moves to include its self-referential receipt.
-The adoption tag alone points directly at the accepted A00 commit containing the
-bootstrap coordination record; the protected S00 coordination ref is established
-from it. B00, C00, T01, foundation, and integration tags all use the assembly
-procedure.
+The original `studio-adoption-v1.1.0` tag alone points directly at the accepted
+A00 commit containing the bootstrap coordination record; the protected S00
+coordination ref is established from it. `studio-adoption-v1.1.1`, B00, C00,
+T01, foundation, and integration tags all use the assembly procedure.
 
 U23 publishes region selection through the shell context contract. U24 reacts
 and contributes the crop/text popover and sidecar. They never import one another.
@@ -3325,7 +3365,7 @@ CI enforces:
 - contract changes require RFC/ADR and a new contract release;
 
 - every post-GF module manifest declares its contract and fixture digests; the
-  A00, B00, C00, and T01 phase packets use the protocol's explicit
+  A00, A01, B00, C00, and T01 phase packets use the protocol's explicit
   `not-applicable` pins.
 
 ## 19. Cross-module acceptance scenarios
@@ -3368,8 +3408,9 @@ The following order is authoritative:
 1. Select one authoritative repository commit/worktree and inventory every
    proposed migration input by tracked path, commit, digest, and provenance.
    Review, deduplicate, or reject provisional files; never bulk-commit the
-   working tree. This A00 revision selects no provisional primary-worktree input
-   beyond the frozen prototype evidence listed in its reference manifest; all
+   working tree. The revision adopted by `studio-adoption-v1.1.0` selects no
+   provisional primary-worktree input beyond the frozen prototype evidence
+   listed in its reference manifest; all
    other unpinned material is rejected from adoption without being deleted.
    C00 or T01 may reconsider it only through a later explicit work order that
    identifies exact bytes and provenance inside that package's lease.
@@ -3378,6 +3419,11 @@ The following order is authoritative:
    evidence artifacts or explicit approved waivers; source files are not vectors
    and an authoring manifest is not a sealed `.lib4`. These two steps are A00;
    after acceptance S00 publishes `studio-adoption-v1.1.0`.
+
+   Before step 3, A01 amends only the two normative documents from
+   `studio-adoption-v1.1.0`. S00 independently reviews and assembles its unchanged
+   accepted HEAD, then publishes `studio-adoption-v1.1.1`. B00 MUST start from
+   that tag.
 
 3. B00 creates the explicit production-only workspace, isolated boundaries,
    additive Studio CI, ownership rules, and empty production scaffolds. It
@@ -3484,16 +3530,30 @@ The application is done when:
 
 The separate
 [concurrent-session and handoff protocol](living-edition-concurrent-session-handoff.md)
-is authoritative. S00 MUST issue each assignment from its section 8 template and
-MUST require its section 11 return receipt.
+is authoritative. For B00 and later, S00 MUST issue both an assignment and a
+digest-pinned `studio-context-packet/1` from its section 8 template and MUST
+require its section 11 return receipt. A01 instead uses its complete-document,
+protocol-1.0 maintainer work order and does not establish a precedent for later
+sessions.
 
-At minimum, every brief pins the session/work-package ID, external worktree and
-branch, authoritative remote, immutable base tag object/commit/tree, each
+At minimum, every B00-and-later brief pins the session/work-package ID, external
+worktree and branch, authoritative remote, immutable base tag
+object/commit/tree, each
 phase-required contract and fixture tag object/lock digest or the exact
 `not-applicable` phase reason, exclusive
 lease, reserved public IDs, permitted imports/ports, required outputs, exact
-acceptance commands, and escalation destination. No implementation session may
-start from an informal prompt that omits those fields.
+acceptance commands, escalation destination, context packet ID and revision,
+audience, phase profile, default/hard/authorized UTF-8 byte budget, manifest
+digest, and the closed ordered `required_context`. From B00 onward, no
+implementation or review session may inherit a conversation or start from an
+informal prompt that omits those fields. Referenced links, files, directories,
+and prior packets do not recursively add context.
+
+Additional authoritative context requires the protocol's immutable
+progressive-disclosure revision. Every B00-and-later handoff pins the final
+context-packet digest and all activated revisions. Every independent reviewer
+receives a distinct reviewer packet rather than the implementer's conversation
+or an implicit union of its context.
 
 At minimum, every handoff is a clean committed branch with a lease-bound diff,
 test/build receipts, public-surface inventory, unchanged-frozen-input
@@ -3516,6 +3576,10 @@ another worktree's state, or a branch name without its commit are not a handoff.
 - [Exploratory application design record](living-edition-application-design.md)
 
 - [Concurrent-session and handoff protocol](living-edition-concurrent-session-handoff.md)
+
+These related documents are not universal required reading. S00 selects and
+pins only the exact anchors needed by the work package; a link here does not
+implicitly authorize or require the linked bytes.
 
 The exploratory design record remains valuable rationale and detailed UX
 research. This production specification resolves its implementation gates,
