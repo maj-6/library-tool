@@ -2,7 +2,7 @@
   "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
   "protocol_version": "1.0",
   "ledger_id": "living-edition-studio",
-  "ledger_revision": 4,
+  "ledger_revision": 5,
   "status": "active",
   "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
   "coordination_ref": "refs/heads/studio-s00-coordination",
@@ -182,7 +182,78 @@
     "blockers": [],
     "created_at": "2026-08-14T15:33:48Z"
   },
-  "sessions": [],
+  "sessions": [
+    {
+      "session_id": "A01-001",
+      "work_package": "A01",
+      "accountable_owner": "codex:/root",
+      "lease_id": "lease-A01-001-01",
+      "branch": "studio-a01-001-context-packets",
+      "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+      "coordination_ref": "refs/heads/studio-s00-coordination",
+      "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
+      "base_tag": "studio-adoption-v1.1.0",
+      "base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "remote_base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "baseline_verification_status": "verified",
+      "base_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+      "base_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+      "contract_pin": {
+        "status": "not-applicable",
+        "reason": "A01 amends pre-contract adoption documents only"
+      },
+      "fixture_pin": {
+        "status": "not-applicable",
+        "reason": "A01 precedes the fixture phase"
+      },
+      "lease_entries": [
+        {
+          "kind": "exact-file",
+          "path": "docs/living-edition-concurrent-session-handoff.md"
+        },
+        {
+          "kind": "exact-file",
+          "path": "docs/living-edition-production-build-spec.md"
+        }
+      ],
+      "lease_state": "issued",
+      "reserved_ids": [
+        "living-edition-concurrent-session-handoff/1.0.1",
+        "living-edition-production-build-spec/1.1.1"
+      ],
+      "status": "ready",
+      "head_commit": null,
+      "state_history": [
+        {
+          "from": null,
+          "to": "ready",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:36:52Z",
+          "receipt_id": "S00-A01-ASSIGNMENT-001"
+        }
+      ],
+      "lease_history": [
+        {
+          "from": null,
+          "to": "issued",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:36:52Z",
+          "receipt_id": "S00-A01-ASSIGNMENT-001"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "coordination-input",
+          "coordination_commit": "c6e3c13003f4b42aa05a8eb506f1803fec7e3646",
+          "ledger_sha256": "75766a273a31e591d9f9b361a960a38533e694652912c9f2b7104916874b7a79",
+          "digest_domain": "git-blob-payload-sha256/1",
+          "protection_receipt_id": "S00-COORDINATION-REF-PROTECTION-001"
+        }
+      ],
+      "blocker": null,
+      "updated_at": "2026-08-14T21:36:52Z"
+    }
+  ],
   "id_reservations": [
     {
       "id": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
@@ -197,6 +268,34 @@
       "owner": "A00",
       "status": "reserved",
       "reserved_at": "2026-08-14T15:33:48Z"
+    },
+    {
+      "id": "living-edition-concurrent-session-handoff/1.0.1",
+      "kind": "normative-document-version",
+      "owner": "A01",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
+    },
+    {
+      "id": "living-edition-production-build-spec/1.1.1",
+      "kind": "normative-document-version",
+      "owner": "A01",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
+    },
+    {
+      "id": "https://worldherblibrary.org/schemas/studio-context-packet-1.0.json",
+      "kind": "json-schema",
+      "owner": "S00",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
+    },
+    {
+      "id": "studio-context-profiles/1",
+      "kind": "manifest-format",
+      "owner": "S00",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
     }
   ],
   "baselines": [
@@ -450,7 +549,110 @@
           ]
         }
       }
+    },
+    {
+      "receipt_id": "S00-CONTEXT-DEFECT-HOLD-001",
+      "kind": "normative-context-defect-and-b00-hold",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T21:36:52Z",
+      "payload": {
+        "affected_baseline": {
+          "tag": "studio-adoption-v1.1.0",
+          "tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+          "peeled_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008"
+        },
+        "defect": "The authoritative assignment template requires every package session to ingest both normative documents completely, including unrelated package material.",
+        "evidence": [
+          {
+            "path": "docs/living-edition-concurrent-session-handoff.md",
+            "git_blob_oid": "616cdfd9b22f6f4ce4c6c10c74078d59231f9a4e",
+            "blob_payload_sha256": "244c36025ee073f6f59dbcbca7aacfcca10d6ba3ec13e655944ad00fc12cfd4a",
+            "selector": "8. Assignment packet / Read completely"
+          },
+          {
+            "path": "docs/living-edition-production-build-spec.md",
+            "git_blob_oid": "826adb49ba2f84cb4694a1efb11f949d8b0fe143",
+            "blob_payload_sha256": "7ad2f77e27ab9e94df86435f2aecb4c13f5c04a545950816538dca843350306d",
+            "selector": "22. Exact handoff brief / authoritative template"
+          }
+        ],
+        "disposition": "Publish a reviewed immutable context-packet amendment before assigning B00.",
+        "b00_hold": true,
+        "active_b00_sessions": 0,
+        "target_superseding_tag": "studio-adoption-v1.1.1"
+      }
+    },
+    {
+      "receipt_id": "S00-A01-WORK-ORDER-001",
+      "kind": "context-amendment-work-order-approved",
+      "actor": "github:maj-6",
+      "created_at": "2026-08-14T21:36:52Z",
+      "payload": {
+        "work_order_id": "A01-WO-001",
+        "approval_evidence": {
+          "kind": "interactive-user-approval",
+          "locator": "conversation:2026-08-14:a01-context-amendment-approval",
+          "utf8_byte_length": 8,
+          "sha256": "87b42e40c2a290e01d87b721bf381c3c5e259d1eb0a4660e41fdbf8bc73f7ddd"
+        },
+        "accountable_owner": "codex:/root",
+        "independent_reviewer": "codex-session:S00-002",
+        "base_tag": "studio-adoption-v1.1.0",
+        "base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+        "base_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+        "base_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+        "leased_paths": [
+          "docs/living-edition-concurrent-session-handoff.md",
+          "docs/living-edition-production-build-spec.md"
+        ],
+        "required_change": "Replace universal full-document ingestion with closed, integrity-pinned, progressively disclosed context packets.",
+        "target_versions": {
+          "production_specification": "1.1.1",
+          "handoff_protocol": "1.0.1",
+          "context_packet": "studio-context-packet/1"
+        },
+        "publisher_authorization": {
+          "status": "authorized",
+          "publisher_identity": "github:maj-6",
+          "remote_url": "https://github.com/maj-6/library-tool.git",
+          "source_ref": "refs/tags/studio-adoption-v1.1.1",
+          "target_ref": "refs/tags/studio-adoption-v1.1.1",
+          "force_update_allowed": false,
+          "move_or_recreate_allowed": false
+        },
+        "assembly_authorization": "One conflict-free, provenance-verified pre-GB amendment assembly containing only accepted A01 document blobs and S00 coordination artifacts."
+      }
+    },
+    {
+      "receipt_id": "S00-A01-ASSIGNMENT-001",
+      "kind": "context-amendment-assigned",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T21:36:52Z",
+      "payload": {
+        "session_id": "A01-001",
+        "work_package": "A01",
+        "accountable_owner": "codex:/root",
+        "reviewer": "codex-session:S00-002",
+        "branch": "studio-a01-001-context-packets",
+        "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+        "lease_id": "lease-A01-001-01",
+        "lease_entries": [
+          {
+            "kind": "exact-file",
+            "path": "docs/living-edition-concurrent-session-handoff.md"
+          },
+          {
+            "kind": "exact-file",
+            "path": "docs/living-edition-production-build-spec.md"
+          }
+        ],
+        "coordination_commit": "c6e3c13003f4b42aa05a8eb506f1803fec7e3646",
+        "coordination_ledger_sha256": "75766a273a31e591d9f9b361a960a38533e694652912c9f2b7104916874b7a79",
+        "protection_receipt_id": "S00-COORDINATION-REF-PROTECTION-001",
+        "return_destination": "codex-session:S00-002 read-only acceptance"
+      }
     }
   ],
-  "updated_at": "2026-08-14T18:54:32Z"
+  "updated_at": "2026-08-14T21:36:52Z"
 }
