@@ -1,5 +1,8 @@
 # Living Edition design gallery
 
+> Frozen reference artifact, version 0.1.1. Production packages must not import
+> this application. See `docs/living-edition-production-build-spec.md`.
+
 This Blueprint UI gallery is the first design-review gate for the World Herb
 Library living-edition workbench. It is intentionally not the final Electron
 application.
