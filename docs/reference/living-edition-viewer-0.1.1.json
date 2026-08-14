@@ -1,0 +1,169 @@
+{
+  "format": "whl.prototype-reference-manifest/1",
+  "reference_id": "living-edition-viewer-0.1.1",
+  "status": "candidate-pending-adoption",
+  "code_freeze_status": "verified-local",
+  "adoption_gate_status": "blocked",
+  "adoption_blockers": [
+    "remote-prototype-tag-missing",
+    "prototype-evidence-waivers-pending"
+  ],
+  "digest_domain": {
+    "id": "git-blob-payload-sha256/1",
+    "algorithm": "SHA-256",
+    "bytes": "raw Git blob payload at the peeled commit, before worktree end-of-line conversion"
+  },
+  "repository": {
+    "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
+    "tag": "living-edition-viewer-v0.1.1",
+    "tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
+    "peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad",
+    "repository_tree": "fe7840c3f173132c59aa7825fdd44eba99c3b295",
+    "prototype_tree": "616250cb7fcbe4cb17b0a2254876f73c1a0411ac",
+    "remote_verification": {
+      "status": "remote-baseline-missing",
+      "checked_at": "2026-08-14T15:29:08Z",
+      "remote_tag_object": null,
+      "remote_peeled_commit": null
+    }
+  },
+  "application": {
+    "path": "apps/living-edition-viewer",
+    "package_name": "whl-living-edition-mockups",
+    "package_version": "0.1.1",
+    "role": "reference-only",
+    "production_imports_allowed": false
+  },
+  "evidence": {
+    "visual_token_sources": {
+      "status": "present",
+      "items": [
+        {
+          "path": "apps/living-edition-viewer/src/styles.css",
+          "sha256": "ca372bd26220df05438f5b4210dbe95434da901aa8c47bbfc9495271f8d29155",
+          "bytes": 56270
+        },
+        {
+          "path": "apps/living-edition-viewer/src/components/ReaderPreview.css",
+          "sha256": "4c4b0c64bb9a6c077ad66e71c6cfc703662d039c25b20f594c363514653b2af2",
+          "bytes": 20639
+        },
+        {
+          "path": "apps/living-edition-viewer/src/components/library/LibraryBrowser.css",
+          "sha256": "9352f77296e5eeed93e31dfb8da0e6b324734c104213fe6800f86fb519e192b1",
+          "bytes": 12110
+        },
+        {
+          "path": "apps/living-edition-viewer/src/components/entities/EntityWorkspace.css",
+          "sha256": "9b37908e660b6b662214b940057edc512fe2b922a7977bb517bf55f050fb02df",
+          "bytes": 18569
+        }
+      ]
+    },
+    "behavior_sources": {
+      "status": "present",
+      "items": [
+        {
+          "path": "apps/living-edition-viewer/src/components/DesktopWorkbench.tsx",
+          "sha256": "b36018f7a8bf3f5b3de978171bbe51870c9a2d743ad218bc1785f48e16de49d1",
+          "bytes": 10113
+        },
+        {
+          "path": "apps/living-edition-viewer/src/data/registries.ts",
+          "sha256": "b74528a21f08d0f430318f066891dc9ac9396a28fa057bb82b9e83806b7943a2",
+          "bytes": 11253
+        },
+        {
+          "path": "apps/living-edition-viewer/src/data/readerResolver.ts",
+          "sha256": "70902c177ece477ec1fc94eed13b04d1b5ebd2dc7a15af673d05d6f4b1dc9c9c",
+          "bytes": 4996
+        }
+      ]
+    },
+    "related_design_sources": {
+      "status": "present",
+      "items": [
+        {
+          "path": "docs/living-edition-application-design.md",
+          "sha256": "3b237a72c0e69dc651fd56691805afb9fcf8d2cf6fddb5f75135a623ae74c626",
+          "bytes": 167377,
+          "role": "exploratory design source; not a prototype review record"
+        }
+      ]
+    },
+    "screenshots": {
+      "status": "waiver-required",
+      "items": [],
+      "waiver_request": {
+        "waiver_id": "A00-WAIVER-PROTOTYPE-SCREENSHOTS-001",
+        "category": "screenshots",
+        "rationale": "No screenshot artifact was committed for the frozen prototype. Source files must not be represented as screenshots.",
+        "approver": null,
+        "s00_acceptance_receipt": null,
+        "decision_commit": null,
+        "expiry": null,
+        "revisit_gate": "G3-renderer-composition",
+        "status": "pending-s00-acceptance"
+      }
+    },
+    "task_recordings": {
+      "status": "waiver-required",
+      "items": [],
+      "waiver_request": {
+        "waiver_id": "A00-WAIVER-PROTOTYPE-TASK-RECORDINGS-001",
+        "category": "task_recordings",
+        "rationale": "No task recording was committed for the frozen prototype. Written review instructions are not recordings.",
+        "approver": null,
+        "s00_acceptance_receipt": null,
+        "decision_commit": null,
+        "expiry": null,
+        "revisit_gate": "G4-production-vertical",
+        "status": "pending-s00-acceptance"
+      }
+    },
+    "behavior_vectors": {
+      "status": "waiver-required",
+      "items": [],
+      "waiver_request": {
+        "waiver_id": "A00-WAIVER-PROTOTYPE-BEHAVIOR-VECTORS-001",
+        "category": "behavior_vectors",
+        "rationale": "The tagged prototype contains behavior source code but no deterministic input and expected-output vector artifact.",
+        "approver": null,
+        "s00_acceptance_receipt": null,
+        "decision_commit": null,
+        "expiry": null,
+        "revisit_gate": "studio-fixtures-v1.0.0",
+        "status": "pending-s00-acceptance"
+      }
+    },
+    "sealed_prototype_runtime_archives": {
+      "status": "waiver-required",
+      "items": [],
+      "waiver_request": {
+        "waiver_id": "A00-WAIVER-PROTOTYPE-RUNTIME-ARCHIVES-001",
+        "category": "sealed_prototype_runtime_archives",
+        "rationale": "The prototype uses unpublished typed synthetic fixtures and abstract rasters; no sealed LIB4 is a runtime dependency. T01 owns production fixture archives.",
+        "approver": null,
+        "s00_acceptance_receipt": null,
+        "decision_commit": null,
+        "expiry": null,
+        "revisit_gate": "studio-fixtures-v1.0.0",
+        "status": "pending-s00-acceptance"
+      }
+    }
+  },
+  "excluded_misclassifications": [
+    {
+      "path": "docs/ui-review-workbench.md",
+      "reason": "Reviews tools/whl_explorer rather than apps/living-edition-viewer."
+    },
+    {
+      "path": "docs/ui-review-dialogs.md",
+      "reason": "Reviews tools/whl_explorer rather than apps/living-edition-viewer."
+    },
+    {
+      "path": "examples/lib4/minimal/manifest.json",
+      "reason": "Unsealed authoring-tree manifest; not a portable archive or prototype runtime dependency."
+    }
+  ]
+}

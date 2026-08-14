@@ -1,0 +1,187 @@
+{
+  "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
+  "protocol_version": "1.0",
+  "ledger_id": "living-edition-studio",
+  "ledger_revision": 1,
+  "status": "bootstrap-draft",
+  "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
+  "coordination_ref": null,
+  "bootstrap": {
+    "status": "preparation-blocked",
+    "work_order": {
+      "work_order_id": "A00-WO-001",
+      "status": "pending-maintainer-approval",
+      "request_evidence": {
+        "kind": "interactive-user-request",
+        "locator": "conversation:2026-08-14:start-where-you-can",
+        "sha256": "70346aeb0f09dabe6f3860981f942e03554545ca3d9bd933d3fd798165bcc5ce"
+      },
+      "maintainer_approver": null,
+      "approved_at": null,
+      "approval_evidence": null,
+      "publisher_authorizations": [
+        {
+          "authorization_status": "pending",
+          "publisher_identity": null,
+          "action": "publish-existing-prototype-tag",
+          "remote_url": "https://github.com/maj-6/library-tool.git",
+          "source_ref": "refs/tags/living-edition-viewer-v0.1.1",
+          "target_ref": "refs/tags/living-edition-viewer-v0.1.1",
+          "approved_at": null,
+          "approval_evidence": null
+        }
+      ],
+      "return_destination": "interactive user handoff",
+      "s00_contact": null
+    },
+    "candidate_documents": [
+      {
+        "path": "docs/living-edition-production-build-spec.md",
+        "sha256": "2841d2760889694a579df4568d16a64a2d8d97be71dd0ada542288d3fcd7a73c"
+      },
+      {
+        "path": "docs/living-edition-concurrent-session-handoff.md",
+        "sha256": "f86ca7b2ec2633d334b533430280fbd97bfc184700a6b1ecdf20ea76968703b4"
+      }
+    ],
+    "intended_adoption_tag": "studio-adoption-v1.1.0",
+    "prototype": {
+      "tag": "living-edition-viewer-v0.1.1",
+      "tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
+      "peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad",
+      "repository_tree": "fe7840c3f173132c59aa7825fdd44eba99c3b295",
+      "prototype_path": "apps/living-edition-viewer",
+      "prototype_tree": "616250cb7fcbe4cb17b0a2254876f73c1a0411ac",
+      "package_name": "whl-living-edition-mockups",
+      "package_version": "0.1.1"
+    },
+    "proposed_assignment": {
+      "session_id": "A00-001",
+      "work_package": "A00",
+      "preparation_owner": "codex:/root",
+      "accountable_owner": null,
+      "branch": "studio-a00-001-adoption",
+      "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a00-001-adoption",
+      "lease_id": "lease-A00-001-01",
+      "lease_entries": [
+        {
+          "kind": "exact-file",
+          "path": "coordination/ledger.schema.json"
+        },
+        {
+          "kind": "exact-file",
+          "path": "coordination/studio-ledger.json"
+        },
+        {
+          "kind": "exact-file",
+          "path": "docs/living-edition-concurrent-session-handoff.md"
+        },
+        {
+          "kind": "exact-file",
+          "path": "docs/living-edition-production-build-spec.md"
+        },
+        {
+          "kind": "exact-file",
+          "path": "docs/reference/living-edition-viewer-0.1.1.json"
+        }
+      ],
+      "base_tag": "living-edition-viewer-v0.1.1",
+      "base_tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
+      "base_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad",
+      "base_tree": "fe7840c3f173132c59aa7825fdd44eba99c3b295",
+      "contract_pin": {
+        "status": "not-applicable",
+        "reason": "contract tag does not exist"
+      },
+      "fixture_pin": {
+        "status": "not-applicable",
+        "reason": "fixture tag does not exist"
+      },
+      "coordination_input": {
+        "status": "not-applicable",
+        "reason": "protected coordination ref does not exist before adoption",
+        "bootstrap_ledger_path": "coordination/studio-ledger.json"
+      }
+    },
+    "required_outputs": [
+      "coordination/ledger.schema.json",
+      "coordination/studio-ledger.json",
+      "docs/living-edition-concurrent-session-handoff.md",
+      "docs/living-edition-production-build-spec.md",
+      "docs/reference/living-edition-viewer-0.1.1.json"
+    ],
+    "acceptance_commands": [
+      "python -m json.tool coordination/ledger.schema.json",
+      "python -m json.tool coordination/studio-ledger.json",
+      "python -c \"import json,jsonschema,pathlib; root=pathlib.Path('.'); schema=json.loads((root/'coordination/ledger.schema.json').read_text(encoding='utf-8')); ledger=json.loads((root/'coordination/studio-ledger.json').read_text(encoding='utf-8')); jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker()).validate(ledger)\"",
+      "python -c \"import hashlib,json,pathlib; root=pathlib.Path('.'); ledger=json.loads((root/'coordination/studio-ledger.json').read_text(encoding='utf-8')); mismatches=[pin['path'] for pin in ledger['bootstrap']['candidate_documents'] if hashlib.sha256((root/pin['path']).read_bytes()).hexdigest()!=pin['sha256']]; assert not mismatches, mismatches\"",
+      "git diff --check -- coordination/ledger.schema.json coordination/studio-ledger.json docs/living-edition-concurrent-session-handoff.md docs/living-edition-production-build-spec.md docs/reference/living-edition-viewer-0.1.1.json",
+      "git rev-parse \"refs/tags/living-edition-viewer-v0.1.1\" \"refs/tags/living-edition-viewer-v0.1.1^{commit}\" \"refs/tags/living-edition-viewer-v0.1.1^{tree}\" \"refs/tags/living-edition-viewer-v0.1.1^{commit}:apps/living-edition-viewer\"",
+      "git ls-remote --tags origin \"refs/tags/living-edition-viewer-v0.1.1\" \"refs/tags/living-edition-viewer-v0.1.1^{}\""
+    ],
+    "self_reference_policy": {
+      "ledger_sha256": "external-assignment-and-receipt-only",
+      "containing_commit": "post-adoption-receipt-only",
+      "adoption_tag_object": "post-adoption-receipt-only"
+    },
+    "blockers": [
+      "work-order-maintainer-approval-missing",
+      "accountable-owner-missing",
+      "prototype-tag-publisher-authorization-missing",
+      "remote-prototype-tag-missing",
+      "prototype-evidence-waivers-pending",
+      "s00-contact-missing"
+    ],
+    "created_at": "2026-08-14T15:33:48Z"
+  },
+  "sessions": [],
+  "id_reservations": [
+    {
+      "id": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
+      "kind": "json-schema",
+      "owner": "A00",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T15:33:48Z"
+    },
+    {
+      "id": "whl.prototype-reference-manifest/1",
+      "kind": "manifest-format",
+      "owner": "A00",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T15:33:48Z"
+    }
+  ],
+  "baselines": [
+    {
+      "baseline_id": "living-edition-viewer-v0.1.1",
+      "kind": "prototype-reference",
+      "tag": "living-edition-viewer-v0.1.1",
+      "tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
+      "remote_tag_object": null,
+      "peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad",
+      "tree": "fe7840c3f173132c59aa7825fdd44eba99c3b295",
+      "subtrees": [
+        {
+          "path": "apps/living-edition-viewer",
+          "tree": "616250cb7fcbe4cb17b0a2254876f73c1a0411ac"
+        }
+      ],
+      "verification_status": "remote-baseline-missing",
+      "verified_at": "2026-08-14T15:29:08Z"
+    }
+  ],
+  "receipts": [
+    {
+      "receipt_id": "A00-PREPARATION-REQUEST-001",
+      "kind": "preparation-request-observed",
+      "actor": "codex:/root",
+      "created_at": "2026-08-14T15:33:48Z",
+      "payload": {
+        "request_evidence_sha256": "70346aeb0f09dabe6f3860981f942e03554545ca3d9bd933d3fd798165bcc5ce",
+        "authority_claimed": false,
+        "external_state_changes_authorized": false
+      }
+    }
+  ],
+  "updated_at": "2026-08-14T15:33:48Z"
+}

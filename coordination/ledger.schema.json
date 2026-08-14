@@ -1,0 +1,1165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
+  "title": "Living Edition Studio coordination ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "protocol_version",
+    "ledger_id",
+    "ledger_revision",
+    "status",
+    "authoritative_remote_url",
+    "coordination_ref",
+    "bootstrap",
+    "sessions",
+    "id_reservations",
+    "baselines",
+    "receipts",
+    "updated_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json"
+    },
+    "protocol_version": {
+      "const": "1.0"
+    },
+    "ledger_id": {
+      "const": "living-edition-studio"
+    },
+    "ledger_revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": ["bootstrap-draft", "active"]
+    },
+    "authoritative_remote_url": {
+      "const": "https://github.com/maj-6/library-tool.git"
+    },
+    "coordination_ref": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "const": "refs/heads/studio-s00-coordination"
+        }
+      ]
+    },
+    "bootstrap": {
+      "$ref": "#/$defs/bootstrap"
+    },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/session"
+      }
+    },
+    "id_reservations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/idReservation"
+      }
+    },
+    "baselines": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/baseline"
+      }
+    },
+    "receipts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/receipt"
+      }
+    },
+    "updated_at": {
+      "$ref": "#/$defs/timestamp"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "active"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "coordination_ref": {
+            "const": "refs/heads/studio-s00-coordination"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "hex40": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "allOf": [
+        {
+          "pattern": "^[A-Za-z0-9._@+\\-]+(?:/[A-Za-z0-9._@+\\-]+)*$"
+        },
+        {
+          "not": {
+            "pattern": "(^|/)\\.{1,2}(/|$)"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(^|/)[^/]*\\.(/|$)"
+          }
+        }
+      ]
+    },
+    "leaseEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": {
+          "enum": ["exact-file", "subtree"]
+        },
+        "path": {
+          "$ref": "#/$defs/repositoryPath"
+        }
+      }
+    },
+    "phasePin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {
+              "const": "not-applicable"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "tag", "tag_object", "lock_sha256"],
+          "properties": {
+            "status": {
+              "const": "required"
+            },
+            "tag": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag_object": {
+              "$ref": "#/$defs/hex40"
+            },
+            "lock_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      ]
+    },
+    "documentPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repositoryPath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "approvalEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "locator", "sha256"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "publisherAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorization_status",
+        "publisher_identity",
+        "action",
+        "remote_url",
+        "source_ref",
+        "target_ref",
+        "approved_at",
+        "approval_evidence"
+      ],
+      "properties": {
+        "authorization_status": {
+          "enum": ["pending", "authorized"]
+        },
+        "publisher_identity": {
+          "type": ["string", "null"]
+        },
+        "action": {
+          "enum": [
+            "publish-existing-prototype-tag",
+            "publish-adoption-tag",
+            "publish-review-branch",
+            "publish-coordination-ref"
+          ]
+        },
+        "remote_url": {
+          "const": "https://github.com/maj-6/library-tool.git"
+        },
+        "source_ref": {
+          "type": "string",
+          "pattern": "^refs/(heads|tags)/[A-Za-z0-9._@+\\-/]+$"
+        },
+        "target_ref": {
+          "type": "string",
+          "pattern": "^refs/(heads|tags)/[A-Za-z0-9._@+\\-/]+$"
+        },
+        "approved_at": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "approval_evidence": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/approvalEvidence"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "authorization_status": {
+                "const": "authorized"
+              }
+            },
+            "required": ["authorization_status"]
+          },
+          "then": {
+            "properties": {
+              "publisher_identity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "approved_at": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "approval_evidence": {
+                "$ref": "#/$defs/approvalEvidence"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "workOrder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "work_order_id",
+        "status",
+        "request_evidence",
+        "maintainer_approver",
+        "approved_at",
+        "approval_evidence",
+        "publisher_authorizations",
+        "return_destination",
+        "s00_contact"
+      ],
+      "properties": {
+        "work_order_id": {
+          "type": "string",
+          "pattern": "^A00-WO-[0-9]{3}$"
+        },
+        "status": {
+          "enum": [
+            "pending-maintainer-approval",
+            "approved-preparation-only",
+            "approved-with-publisher"
+          ]
+        },
+        "request_evidence": {
+          "$ref": "#/$defs/approvalEvidence"
+        },
+        "maintainer_approver": {
+          "type": ["string", "null"]
+        },
+        "approved_at": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "approval_evidence": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/approvalEvidence"
+            }
+          ]
+        },
+        "publisher_authorizations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/publisherAuthorization"
+          }
+        },
+        "return_destination": {
+          "type": "string",
+          "minLength": 1
+        },
+        "s00_contact": {
+          "type": ["string", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": ["approved-preparation-only", "approved-with-publisher"]
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "maintainer_approver": {
+                "type": "string",
+                "minLength": 1
+              },
+              "approved_at": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "approval_evidence": {
+                "$ref": "#/$defs/approvalEvidence"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "approved-with-publisher"
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "publisher_authorizations": {
+                "minItems": 1,
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "authorization_status": {
+                      "const": "authorized"
+                    },
+                    "action": {
+                      "const": "publish-existing-prototype-tag"
+                    }
+                  },
+                  "required": ["authorization_status", "action"]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "prototypeTuple": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "tag_object",
+        "peeled_commit",
+        "repository_tree",
+        "prototype_path",
+        "prototype_tree",
+        "package_name",
+        "package_version"
+      ],
+      "properties": {
+        "tag": {
+          "const": "living-edition-viewer-v0.1.1"
+        },
+        "tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "peeled_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "repository_tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "prototype_path": {
+          "const": "apps/living-edition-viewer"
+        },
+        "prototype_tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "package_name": {
+          "const": "whl-living-edition-mockups"
+        },
+        "package_version": {
+          "const": "0.1.1"
+        }
+      }
+    },
+    "proposedAssignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "work_package",
+        "preparation_owner",
+        "accountable_owner",
+        "branch",
+        "worktree",
+        "lease_id",
+        "lease_entries",
+        "base_tag",
+        "base_tag_object",
+        "base_commit",
+        "base_tree",
+        "contract_pin",
+        "fixture_pin",
+        "coordination_input"
+      ],
+      "properties": {
+        "session_id": {
+          "const": "A00-001"
+        },
+        "work_package": {
+          "const": "A00"
+        },
+        "preparation_owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accountable_owner": {
+          "type": ["string", "null"]
+        },
+        "branch": {
+          "const": "studio-a00-001-adoption"
+        },
+        "worktree": {
+          "type": "string",
+          "pattern": "^[A-Za-z]:/"
+        },
+        "lease_id": {
+          "const": "lease-A00-001-01"
+        },
+        "lease_entries": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "prefixItems": [
+            {
+              "const": {
+                "kind": "exact-file",
+                "path": "coordination/ledger.schema.json"
+              }
+            },
+            {
+              "const": {
+                "kind": "exact-file",
+                "path": "coordination/studio-ledger.json"
+              }
+            },
+            {
+              "const": {
+                "kind": "exact-file",
+                "path": "docs/living-edition-concurrent-session-handoff.md"
+              }
+            },
+            {
+              "const": {
+                "kind": "exact-file",
+                "path": "docs/living-edition-production-build-spec.md"
+              }
+            },
+            {
+              "const": {
+                "kind": "exact-file",
+                "path": "docs/reference/living-edition-viewer-0.1.1.json"
+              }
+            }
+          ],
+          "items": false
+        },
+        "base_tag": {
+          "const": "living-edition-viewer-v0.1.1"
+        },
+        "base_tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "base_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "base_tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "contract_pin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {
+              "const": "not-applicable"
+            },
+            "reason": {
+              "const": "contract tag does not exist"
+            }
+          }
+        },
+        "fixture_pin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {
+              "const": "not-applicable"
+            },
+            "reason": {
+              "const": "fixture tag does not exist"
+            }
+          }
+        },
+        "coordination_input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "bootstrap_ledger_path"],
+          "properties": {
+            "status": {
+              "const": "not-applicable"
+            },
+            "reason": {
+              "const": "protected coordination ref does not exist before adoption"
+            },
+            "bootstrap_ledger_path": {
+              "const": "coordination/studio-ledger.json"
+            }
+          }
+        }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "work_order",
+        "candidate_documents",
+        "intended_adoption_tag",
+        "prototype",
+        "proposed_assignment",
+        "required_outputs",
+        "acceptance_commands",
+        "self_reference_policy",
+        "blockers",
+        "created_at"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["preparation-blocked", "authorized", "ready-for-review"]
+        },
+        "work_order": {
+          "$ref": "#/$defs/workOrder"
+        },
+        "candidate_documents": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/documentPin"
+          }
+        },
+        "intended_adoption_tag": {
+          "const": "studio-adoption-v1.1.0"
+        },
+        "prototype": {
+          "$ref": "#/$defs/prototypeTuple"
+        },
+        "proposed_assignment": {
+          "$ref": "#/$defs/proposedAssignment"
+        },
+        "required_outputs": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "prefixItems": [
+            {
+              "const": "coordination/ledger.schema.json"
+            },
+            {
+              "const": "coordination/studio-ledger.json"
+            },
+            {
+              "const": "docs/living-edition-concurrent-session-handoff.md"
+            },
+            {
+              "const": "docs/living-edition-production-build-spec.md"
+            },
+            {
+              "const": "docs/reference/living-edition-viewer-0.1.1.json"
+            }
+          ],
+          "items": false
+        },
+        "acceptance_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "self_reference_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ledger_sha256",
+            "containing_commit",
+            "adoption_tag_object"
+          ],
+          "properties": {
+            "ledger_sha256": {
+              "const": "external-assignment-and-receipt-only"
+            },
+            "containing_commit": {
+              "const": "post-adoption-receipt-only"
+            },
+            "adoption_tag_object": {
+              "const": "post-adoption-receipt-only"
+            }
+          }
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": ["authorized", "ready-for-review"]
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "work_order": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "approved-preparation-only",
+                      "approved-with-publisher"
+                    ]
+                  }
+                },
+                "required": ["status"]
+              },
+              "proposed_assignment": {
+                "properties": {
+                  "accountable_owner": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["accountable_owner"]
+              },
+              "blockers": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ready-for-review"
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "work_order": {
+                "properties": {
+                  "status": {
+                    "const": "approved-with-publisher"
+                  }
+                },
+                "required": ["status"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "stateTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "actor", "at", "receipt_id"],
+      "properties": {
+        "from": {
+          "type": ["string", "null"]
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "receipt_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "work_package",
+        "accountable_owner",
+        "lease_id",
+        "branch",
+        "worktree",
+        "coordination_ref",
+        "authoritative_remote_url",
+        "base_tag",
+        "base_tag_object",
+        "remote_base_tag_object",
+        "baseline_verification_status",
+        "base_commit",
+        "base_tree",
+        "contract_pin",
+        "fixture_pin",
+        "lease_entries",
+        "lease_state",
+        "reserved_ids",
+        "status",
+        "head_commit",
+        "state_history",
+        "lease_history",
+        "validation",
+        "blocker",
+        "updated_at"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]*-[0-9]{3}$"
+        },
+        "work_package": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]*$"
+        },
+        "accountable_owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branch": {
+          "type": "string",
+          "pattern": "^studio-[a-z0-9._@+\\-]+$"
+        },
+        "worktree": {
+          "type": "string",
+          "minLength": 1
+        },
+        "coordination_ref": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "const": "refs/heads/studio-s00-coordination"
+            }
+          ]
+        },
+        "authoritative_remote_url": {
+          "const": "https://github.com/maj-6/library-tool.git"
+        },
+        "base_tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "base_tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "remote_base_tag_object": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/hex40"
+            }
+          ]
+        },
+        "baseline_verification_status": {
+          "enum": ["remote-baseline-missing", "verified", "baseline-mismatch"]
+        },
+        "base_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "base_tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "contract_pin": {
+          "$ref": "#/$defs/phasePin"
+        },
+        "fixture_pin": {
+          "$ref": "#/$defs/phasePin"
+        },
+        "lease_entries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/leaseEntry"
+          }
+        },
+        "lease_state": {
+          "enum": ["issued", "active", "released", "revoked"]
+        },
+        "reserved_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "status": {
+          "enum": [
+            "queued",
+            "ready",
+            "active",
+            "blocked",
+            "review",
+            "accepted",
+            "integrated",
+            "abandoned",
+            "superseded"
+          ]
+        },
+        "head_commit": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/hex40"
+            }
+          ]
+        },
+        "state_history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stateTransition"
+          }
+        },
+        "lease_history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stateTransition"
+          }
+        },
+        "validation": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "blocker": {
+          "type": ["object", "null"]
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "baseline_verification_status": {
+                "const": "remote-baseline-missing"
+              }
+            },
+            "required": ["baseline_verification_status"]
+          },
+          "then": {
+            "properties": {
+              "work_package": {
+                "const": "A00"
+              },
+              "remote_base_tag_object": {
+                "type": "null"
+              },
+              "status": {
+                "enum": ["queued", "ready", "active", "blocked"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": ["review", "accepted", "integrated"]
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "baseline_verification_status": {
+                "const": "verified"
+              },
+              "remote_base_tag_object": {
+                "$ref": "#/$defs/hex40"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "idReservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "owner", "status", "reserved_at"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": ["reserved", "released"]
+        },
+        "reserved_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_id",
+        "kind",
+        "tag",
+        "tag_object",
+        "remote_tag_object",
+        "peeled_commit",
+        "tree",
+        "subtrees",
+        "verification_status",
+        "verified_at"
+      ],
+      "properties": {
+        "baseline_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "remote_tag_object": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/hex40"
+            }
+          ]
+        },
+        "peeled_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "subtrees": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "tree"],
+            "properties": {
+              "path": {
+                "$ref": "#/$defs/repositoryPath"
+              },
+              "tree": {
+                "$ref": "#/$defs/hex40"
+              }
+            }
+          }
+        },
+        "verification_status": {
+          "enum": ["remote-baseline-missing", "verified", "baseline-mismatch"]
+        },
+        "verified_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verification_status": {
+                "const": "remote-baseline-missing"
+              }
+            },
+            "required": ["verification_status"]
+          },
+          "then": {
+            "properties": {
+              "remote_tag_object": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "verification_status": {
+                "const": "verified"
+              }
+            },
+            "required": ["verification_status"]
+          },
+          "then": {
+            "properties": {
+              "remote_tag_object": {
+                "$ref": "#/$defs/hex40"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt_id", "kind", "actor", "created_at", "payload"],
+      "properties": {
+        "receipt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "payload": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}
