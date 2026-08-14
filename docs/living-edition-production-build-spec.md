@@ -2957,7 +2957,9 @@ checked out and its digest and 33/33/34 counts verify from a clean worktree.
   Git-blob pins, unique selector resolution, selected-value digests and byte
   lengths, packet-manifest JCS digest, frozen initial-expansion routes, closed
   activation/handoff/review receipt payloads, and the authorized UTF-8 byte
-  budget before presentation;
+  budget before presentation; semantic emission additionally requires the exact
+  externally pinned activation-receipt ledger commit/digest and an active
+  session/lease, never only a caller-supplied packet digest;
 - B00 records the exact S00 Git build/runtime and provides the clean
   `merge-tree`/accepted-blob provenance verifier that S00 uses even for B00's own
   baseline assembly;
@@ -3463,7 +3465,6 @@ The following order is authoritative:
     imports or one-off adapters.
 
 12. Through the owning modules and frozen migration contracts:
-
     - convert reviewed prototype profile data to validated JSON registries;
 
     - import existing `.lib4` archives while preserving IDs, revisions,

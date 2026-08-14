@@ -480,6 +480,17 @@ binds the final implementer packet revision to the unchanged handoff HEAD.
 Receipt payloads are the ledger 1.0 extension seam. The packet itself cannot
 contain its own commit or digest.
 
+The activation receipt's containing coordination commit and raw ledger-blob
+digest are an external activation pin because neither can appear in the packet
+or receipt without self-reference. Before emission, the validator MUST read that
+exact committed ledger blob through Git, prove the packet's assignment-ledger
+commit is its ancestor, find exactly one named activation receipt, validate its
+closed payload and packet revision chain, and confirm that the same session and
+lease are `active`. A caller-supplied packet digest alone never authorizes
+semantic presentation. Candidate validation before the activation commit may
+compute the digest while the pinned assignment state is `ready` with an `issued`
+lease, but it MUST NOT emit context.
+
 The closed receipt payload schemas are the
 `contextPacketActivationReceipt`, `contextPacketHandoffReceipt`, and
 `contextPacketReviewReceipt` definitions in
@@ -794,6 +805,7 @@ Fresh-session rule: do not inherit or rely on prior conversations.
 Context packet: studio-context-packet/1 / <packet-id> / revision <n>
 Manifest digest: rfc8785-jcs-sha256/1 / <SHA-256>
 Profile and budget: <profile> / <default> / <hard> / <authorized UTF-8 bytes>
+Activation pin: <receipt ID / containing coordination commit / raw ledger SHA-256>
 
 Required context is only the closed ordered selector list in that validated
 packet. Validate each whole blob before resolving or presenting its selection.
