@@ -801,7 +801,7 @@ Context budgets use deterministic UTF-8 bytes; token estimates are advisory:
 | Profile | Default bytes | Hard maximum bytes |
 | ------- | ------------: | -----------------: |
 | B00     |        49,152 |             73,728 |
-| C00     |       131,072 |            163,840 |
+| C00     |       135,168 |            163,840 |
 | T01     |        98,304 |            131,072 |
 | E10     |       180,224 |            229,376 |
 | D20     |        98,304 |            131,072 |
