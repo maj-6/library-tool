@@ -1,0 +1,2442 @@
+{
+  "schema": "studio-context-profiles/1",
+  "version": 1,
+  "digest_domain": "rfc8785-jcs-sha256/1",
+  "template_sources": [
+    {
+      "source_id": "handoff-protocol",
+      "path": "docs/living-edition-concurrent-session-handoff.md",
+      "media_type": "text/markdown; charset=utf-8"
+    },
+    {
+      "source_id": "production-spec",
+      "path": "docs/living-edition-production-build-spec.md",
+      "media_type": "text/markdown; charset=utf-8"
+    }
+  ],
+  "universal_templates": [
+    {
+      "context_id": "protocol-session-model",
+      "capsule": "universal",
+      "source_id": "handoff-protocol",
+      "selector": {
+        "kind": "markdown-heading-section/1",
+        "heading_level": 2,
+        "heading_text": "1. Non-negotiable session model",
+        "occurrence": 1
+      },
+      "purpose": "Session isolation, immutable inputs, and authoritative-context boundary."
+    },
+    {
+      "context_id": "protocol-context-packets",
+      "capsule": "universal",
+      "source_id": "handoff-protocol",
+      "selector": {
+        "kind": "markdown-heading-section/1",
+        "heading_level": 2,
+        "heading_text": "8. Assignment and context packets",
+        "occurrence": 1
+      },
+      "purpose": "Closed packet, selector, digest, budget, and disclosure rules."
+    },
+    {
+      "context_id": "protocol-stop-rules",
+      "capsule": "universal",
+      "source_id": "handoff-protocol",
+      "selector": {
+        "kind": "markdown-heading-section/1",
+        "heading_level": 2,
+        "heading_text": "10. Stop and escalation rules",
+        "occurrence": 1
+      },
+      "purpose": "Conditions that prohibit local assumptions or out-of-scope work."
+    }
+  ],
+  "audience_templates": {
+    "implementer": [
+      {
+        "context_id": "protocol-implementer-role",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 3,
+          "heading_text": "Package implementer",
+          "occurrence": 1
+        },
+        "purpose": "Implementer authority and delivery boundary."
+      },
+      {
+        "context_id": "protocol-during-implementation",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 2,
+          "heading_text": "9. During implementation",
+          "occurrence": 1
+        },
+        "purpose": "Required updates and dependency discipline."
+      },
+      {
+        "context_id": "protocol-handoff-acceptance",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 2,
+          "heading_text": "11. Handoff acceptance",
+          "occurrence": 1
+        },
+        "purpose": "Exact return evidence and receipt fields."
+      }
+    ],
+    "integrator": [
+      {
+        "context_id": "protocol-integrator-role",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 3,
+          "heading_text": "I30 — integrator",
+          "occurrence": 1
+        },
+        "purpose": "Integrator authority and conflict-routing boundary."
+      },
+      {
+        "context_id": "protocol-during-integration",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 2,
+          "heading_text": "9. During implementation",
+          "occurrence": 1
+        },
+        "purpose": "Required updates and dependency discipline."
+      },
+      {
+        "context_id": "protocol-integration-handoff",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 2,
+          "heading_text": "11. Handoff acceptance",
+          "occurrence": 1
+        },
+        "purpose": "Exact return evidence and receipt fields."
+      },
+      {
+        "context_id": "protocol-integration-assembly",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 2,
+          "heading_text": "12. Review, merge, and supersession",
+          "occurrence": 1
+        },
+        "purpose": "Review and provenance-verified assembly rules."
+      }
+    ],
+    "reviewer": [
+      {
+        "context_id": "protocol-reviewer-role",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 3,
+          "heading_text": "Reviewer/validator",
+          "occurrence": 1
+        },
+        "purpose": "Reviewer independence and no-fix boundary."
+      },
+      {
+        "context_id": "protocol-review-assembly",
+        "capsule": "universal",
+        "source_id": "handoff-protocol",
+        "selector": {
+          "kind": "markdown-heading-section/1",
+          "heading_level": 2,
+          "heading_text": "12. Review, merge, and supersession",
+          "occurrence": 1
+        },
+        "purpose": "Acceptance, unchanged-HEAD, and assembly requirements."
+      }
+    ]
+  },
+  "expansion_catalog": [
+    {
+      "expansion_id": "contract-detail",
+      "trigger": "A required operation, schema, port, or canonicalization rule is not in the core packet."
+    },
+    {
+      "expansion_id": "fixture-evidence",
+      "trigger": "A required fixture, fake, conformance vector, or lock record is not in the core packet."
+    },
+    {
+      "expansion_id": "security-rights-recovery",
+      "trigger": "A security, rights, privacy, recovery, or failure-race decision requires more pinned context."
+    },
+    {
+      "expansion_id": "quality-scale-a11y",
+      "trigger": "A performance, scale, accessibility, or international-text acceptance rule requires more pinned context."
+    },
+    {
+      "expansion_id": "integration-scenarios",
+      "trigger": "A cross-module scenario or composition receipt requires more pinned context."
+    },
+    {
+      "expansion_id": "legacy-migration",
+      "trigger": "A separately authorized migration input requires exact provenance and selected source bytes."
+    }
+  ],
+  "profiles": [
+    {
+      "profile_id": "B00",
+      "work_packages": ["B00"],
+      "required_base": "studio-adoption-v1.1.1",
+      "contract_pin": {
+        "expectation": "not-applicable",
+        "not_applicable_reason": "contract tag does not exist"
+      },
+      "fixture_pin": {
+        "expectation": "not-applicable",
+        "not_applicable_reason": "fixture tag does not exist"
+      },
+      "default_utf8_bytes": 49152,
+      "hard_max_utf8_bytes": 73728,
+      "templates": [
+        {
+          "context_id": "spec-prototype-boundary",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "3. Prototype boundary and migration rule",
+            "occurrence": 1
+          },
+          "purpose": "Bootstrap separation from the frozen prototype and legacy projects."
+        },
+        {
+          "context_id": "spec-production-topology",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "4. Production stack and repository topology",
+            "occurrence": 1
+          },
+          "purpose": "Exact workspace boundaries, package topology, and first-release scope."
+        },
+        {
+          "context_id": "spec-gate-gb",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "GB — bootstrap freeze",
+            "occurrence": 1
+          },
+          "purpose": "Bootstrap acceptance gate."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "B00",
+          "templates": [
+            {
+              "context_id": "spec-package-row-b00",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "B00"
+              },
+              "purpose": "B00 exclusive lease and required output."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [],
+      "allowed_expansion_ids": [
+        "security-rights-recovery",
+        "quality-scale-a11y",
+        "legacy-migration"
+      ]
+    },
+    {
+      "profile_id": "C00",
+      "work_packages": ["C00"],
+      "required_base": "studio-bootstrap-v1.0.0",
+      "contract_pin": {
+        "expectation": "producer",
+        "not_applicable_reason": "C00 produces the contract tag"
+      },
+      "fixture_pin": {
+        "expectation": "not-applicable",
+        "not_applicable_reason": "fixture tag does not exist"
+      },
+      "default_utf8_bytes": 135168,
+      "hard_max_utf8_bytes": 163840,
+      "templates": [
+        {
+          "context_id": "spec-contract-freeze",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "5. Contract definition and freeze before feature development",
+            "occurrence": 1
+          },
+          "purpose": "Complete contract target, operations, ports, identity, and serialization rules."
+        },
+        {
+          "context_id": "spec-module-manifest",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "6. Module manifest and independent implementation rule",
+            "occurrence": 1
+          },
+          "purpose": "Generated manifest and module boundary contract."
+        },
+        {
+          "context_id": "spec-gate-g0",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G0 — contract freeze",
+            "occurrence": 1
+          },
+          "purpose": "Contract-freeze acceptance gate."
+        },
+        {
+          "context_id": "spec-related-contract-inputs",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "23. Related normative documents",
+            "occurrence": 1
+          },
+          "purpose": "Closed routing rules for separately pinned migration sources."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "C00",
+          "templates": [
+            {
+              "context_id": "spec-package-row-c00",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "C00"
+              },
+              "purpose": "C00 exclusive lease and required output."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "security-rights-recovery",
+        "legacy-migration"
+      ]
+    },
+    {
+      "profile_id": "T01",
+      "work_packages": ["T01"],
+      "required_base": "studio-contracts-v1.0.0",
+      "contract_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "fixture_pin": {
+        "expectation": "producer",
+        "not_applicable_reason": "T01 produces the fixture tag"
+      },
+      "default_utf8_bytes": 98304,
+      "hard_max_utf8_bytes": 131072,
+      "templates": [
+        {
+          "context_id": "spec-prototype-freeze",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "2. What is frozen from the prototype",
+            "occurrence": 1
+          },
+          "purpose": "Prototype behavior and evidence boundary for fixture reconstruction."
+        },
+        {
+          "context_id": "spec-contract-fixture-kit",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.9 Contract fixture kit",
+            "occurrence": 1
+          },
+          "purpose": "Required fixture, fake, and conformance coverage."
+        },
+        {
+          "context_id": "spec-performance-budgets",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "14. Performance and scale budgets",
+            "occurrence": 1
+          },
+          "purpose": "Deterministic scale fixtures and thresholds."
+        },
+        {
+          "context_id": "spec-accessibility-text",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "15. Accessibility and international text",
+            "occurrence": 1
+          },
+          "purpose": "Accessibility and Unicode fixture requirements."
+        },
+        {
+          "context_id": "spec-fixture-strategy",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "16. Fixture and test strategy",
+            "occurrence": 1
+          },
+          "purpose": "Layered test kit and sealed archive requirements."
+        },
+        {
+          "context_id": "spec-gate-gf",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "GF — fixture and fake freeze",
+            "occurrence": 1
+          },
+          "purpose": "Fixture-freeze acceptance gate."
+        },
+        {
+          "context_id": "spec-related-fixture-inputs",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "23. Related normative documents",
+            "occurrence": 1
+          },
+          "purpose": "Closed routing rules for separately pinned fixture inputs."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "T01",
+          "templates": [
+            {
+              "context_id": "spec-package-row-t01",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "T01"
+              },
+              "purpose": "T01 exclusive lease and required output."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [
+        {
+          "expansion_id": "contract-detail",
+          "phase_pin": "contract",
+          "route_pointer_template": "/context_routes/{work_package}"
+        }
+      ],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "fixture-evidence",
+        "quality-scale-a11y",
+        "legacy-migration"
+      ]
+    },
+    {
+      "profile_id": "E10",
+      "work_packages": ["E10"],
+      "required_base": "studio-fixtures-v1.0.0",
+      "contract_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "fixture_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "default_utf8_bytes": 180224,
+      "hard_max_utf8_bytes": 229376,
+      "templates": [
+        {
+          "context_id": "spec-query-through-operations",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.2 Query envelope",
+            "occurrence": 1
+          },
+          "purpose": "Host query envelope."
+        },
+        {
+          "context_id": "spec-command-envelope",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.3 Command envelope",
+            "occurrence": 1
+          },
+          "purpose": "Host command envelope and optimistic revision pins."
+        },
+        {
+          "context_id": "spec-error-envelope",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.4 Error envelope",
+            "occurrence": 1
+          },
+          "purpose": "Stable error and recovery contract."
+        },
+        {
+          "context_id": "spec-event-envelope",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.5 Event envelope",
+            "occurrence": 1
+          },
+          "purpose": "Revisioned event and replay envelope."
+        },
+        {
+          "context_id": "spec-domain-projections",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.6 Required domain projections",
+            "occurrence": 1
+          },
+          "purpose": "Required host query projections."
+        },
+        {
+          "context_id": "spec-operation-catalog-e10",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.7 Initial operation catalog",
+            "occurrence": 1
+          },
+          "purpose": "Operation ownership, workflows, and management commands."
+        },
+        {
+          "context_id": "spec-workbench-context-e10",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.8 Workbench context and selection seam",
+            "occurrence": 1
+          },
+          "purpose": "Selection snapshots, capabilities, and context resolution."
+        },
+        {
+          "context_id": "spec-port-catalog",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.11 Inter-module port catalog",
+            "occurrence": 1
+          },
+          "purpose": "Host-owned and module-provided port bindings."
+        },
+        {
+          "context_id": "spec-consistency-orchestration",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.12 Consistency and orchestration model",
+            "occurrence": 1
+          },
+          "purpose": "Unit-of-work and workflow recovery semantics."
+        },
+        {
+          "context_id": "spec-identity-mapping",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.13 Portable and workspace identity mapping",
+            "occurrence": 1
+          },
+          "purpose": "Portable URI and workspace identity boundary."
+        },
+        {
+          "context_id": "spec-serialization-cancellation",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.14 Serialization, code generation, cursors, and cancellation",
+            "occurrence": 1
+          },
+          "purpose": "Canonical bytes, cursors, deadlines, and cancellation behavior."
+        },
+        {
+          "context_id": "spec-engine-manifest",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "6. Module manifest and independent implementation rule",
+            "occurrence": 1
+          },
+          "purpose": "Engine SPI and manifest registry boundary."
+        },
+        {
+          "context_id": "spec-data-ownership",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "7. Canonical data ownership",
+            "occurrence": 1
+          },
+          "purpose": "Canonical store and projection ownership."
+        },
+        {
+          "context_id": "spec-host-security",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "8. Engine host and desktop security",
+            "occurrence": 1
+          },
+          "purpose": "Authenticated host and capability boundary."
+        },
+        {
+          "context_id": "spec-recovery-conflicts",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "12. Offline, recovery, and conflicts",
+            "occurrence": 1
+          },
+          "purpose": "Host recovery, backup, and conflict obligations."
+        },
+        {
+          "context_id": "spec-gate-g1-e10",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G1 — isolated module",
+            "occurrence": 1
+          },
+          "purpose": "Foundation module acceptance gate."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "E10",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e10",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E10"
+              },
+              "purpose": "E10 exclusive lease and required output."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [
+        {
+          "expansion_id": "contract-detail",
+          "phase_pin": "contract",
+          "route_pointer_template": "/context_routes/{work_package}"
+        },
+        {
+          "expansion_id": "fixture-evidence",
+          "phase_pin": "fixture",
+          "route_pointer_template": "/context_routes/{work_package}"
+        }
+      ],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "fixture-evidence",
+        "security-rights-recovery",
+        "quality-scale-a11y"
+      ]
+    },
+    {
+      "profile_id": "D20",
+      "work_packages": ["D20"],
+      "required_base": "studio-fixtures-v1.0.0",
+      "contract_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "fixture_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "default_utf8_bytes": 98304,
+      "hard_max_utf8_bytes": 131072,
+      "templates": [
+        {
+          "context_id": "spec-workbench-context-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.8 Workbench context and selection seam",
+            "occurrence": 1
+          },
+          "purpose": "Desktop-to-renderer context and selection boundary."
+        },
+        {
+          "context_id": "spec-port-catalog-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.11 Inter-module port catalog",
+            "occurrence": 1
+          },
+          "purpose": "Source handle and host port contracts."
+        },
+        {
+          "context_id": "spec-module-manifest-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "6. Module manifest and independent implementation rule",
+            "occurrence": 1
+          },
+          "purpose": "Desktop adapter boundary and manifest rules."
+        },
+        {
+          "context_id": "spec-host-security-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "8. Engine host and desktop security",
+            "occurrence": 1
+          },
+          "purpose": "Electron, sidecar, preload, and opaque-handle security."
+        },
+        {
+          "context_id": "spec-shell-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "10.1 Shell",
+            "occurrence": 1
+          },
+          "purpose": "Native menu and renderer shell integration."
+        },
+        {
+          "context_id": "spec-rights-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "13. Rights, access, and privacy",
+            "occurrence": 1
+          },
+          "purpose": "Host-enforced rights and privacy boundary."
+        },
+        {
+          "context_id": "spec-accessibility-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "15. Accessibility and international text",
+            "occurrence": 1
+          },
+          "purpose": "Desktop accessibility and international-text requirements."
+        },
+        {
+          "context_id": "spec-gate-g1-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G1 — isolated module",
+            "occurrence": 1
+          },
+          "purpose": "Desktop module acceptance gate."
+        },
+        {
+          "context_id": "spec-gate-g5-d20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G5 — security, scale, release",
+            "occurrence": 1
+          },
+          "purpose": "Packaged-host security and release obligations."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "D20",
+          "templates": [
+            {
+              "context_id": "spec-package-row-d20",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "D20"
+              },
+              "purpose": "D20 exclusive lease and required output."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [
+        {
+          "expansion_id": "contract-detail",
+          "phase_pin": "contract",
+          "route_pointer_template": "/context_routes/{work_package}"
+        },
+        {
+          "expansion_id": "fixture-evidence",
+          "phase_pin": "fixture",
+          "route_pointer_template": "/context_routes/{work_package}"
+        }
+      ],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "fixture-evidence",
+        "security-rights-recovery",
+        "quality-scale-a11y"
+      ]
+    },
+    {
+      "profile_id": "U20",
+      "work_packages": ["U20"],
+      "required_base": "studio-fixtures-v1.0.0",
+      "contract_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "fixture_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "default_utf8_bytes": 65536,
+      "hard_max_utf8_bytes": 98304,
+      "templates": [
+        {
+          "context_id": "spec-workbench-context-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.8 Workbench context and selection seam",
+            "occurrence": 1
+          },
+          "purpose": "Renderer command, selection, and contribution seam."
+        },
+        {
+          "context_id": "spec-renderer-contributions-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "6.1 Renderer contribution contract",
+            "occurrence": 1
+          },
+          "purpose": "Renderer manifest and contribution registration."
+        },
+        {
+          "context_id": "spec-shell-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "10.1 Shell",
+            "occurrence": 1
+          },
+          "purpose": "Workbench shell, routing, panels, and command surfaces."
+        },
+        {
+          "context_id": "spec-basic-advanced-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "10.2 Basic and Advanced",
+            "occurrence": 1
+          },
+          "purpose": "Progressive-disclosure UX rules."
+        },
+        {
+          "context_id": "spec-copy-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "10.10 Typography and copy",
+            "occurrence": 1
+          },
+          "purpose": "Shared typography, terminology, and status language."
+        },
+        {
+          "context_id": "spec-accessibility-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "15. Accessibility and international text",
+            "occurrence": 1
+          },
+          "purpose": "UI accessibility and international-text baseline."
+        },
+        {
+          "context_id": "spec-gate-g1-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G1 — isolated module",
+            "occurrence": 1
+          },
+          "purpose": "Renderer foundation module acceptance gate."
+        },
+        {
+          "context_id": "spec-gate-g3-u20",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G3 — renderer composition",
+            "occurrence": 1
+          },
+          "purpose": "Renderer composition quality gate."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "U20",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u20",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U20"
+              },
+              "purpose": "U20 exclusive lease and required output."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [
+        {
+          "expansion_id": "contract-detail",
+          "phase_pin": "contract",
+          "route_pointer_template": "/context_routes/{work_package}"
+        },
+        {
+          "expansion_id": "fixture-evidence",
+          "phase_pin": "fixture",
+          "route_pointer_template": "/context_routes/{work_package}"
+        }
+      ],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "fixture-evidence",
+        "quality-scale-a11y",
+        "integration-scenarios"
+      ]
+    },
+    {
+      "profile_id": "E11-E21",
+      "work_packages": [
+        "E11",
+        "E12",
+        "E13",
+        "E14",
+        "E15",
+        "E16",
+        "E17",
+        "E18",
+        "E19",
+        "E20",
+        "E21"
+      ],
+      "required_base": "studio-engine-foundation-v1.0.0",
+      "contract_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "fixture_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "default_utf8_bytes": 131072,
+      "hard_max_utf8_bytes": 163840,
+      "templates": [
+        {
+          "context_id": "spec-port-catalog-engines",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.11 Inter-module port catalog",
+            "occurrence": 1
+          },
+          "purpose": "Module port bindings and legal sibling seams."
+        },
+        {
+          "context_id": "spec-consistency-engines",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.12 Consistency and orchestration model",
+            "occurrence": 1
+          },
+          "purpose": "Atomicity, workflow, cancellation, and recovery behavior."
+        },
+        {
+          "context_id": "spec-module-manifest-engines",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "6. Module manifest and independent implementation rule",
+            "occurrence": 1
+          },
+          "purpose": "Independent engine module SPI and manifest requirements."
+        },
+        {
+          "context_id": "spec-data-ownership-engines",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "7. Canonical data ownership",
+            "occurrence": 1
+          },
+          "purpose": "Exactly-one canonical owner and projection boundaries."
+        },
+        {
+          "context_id": "spec-gate-g1-engines",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G1 — isolated module",
+            "occurrence": 1
+          },
+          "purpose": "Isolated engine module acceptance gate."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "E11",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e11",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E11"
+              },
+              "purpose": "E11 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e11",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.1 Workspace and archive",
+                "occurrence": 1
+              },
+              "purpose": "Archive and asset domain behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E12",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e12",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E12"
+              },
+              "purpose": "E12 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e12",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.1 Workspace and archive",
+                "occurrence": 1
+              },
+              "purpose": "Workspace structure and rights-owned aggregate behavior."
+            },
+            {
+              "context_id": "spec-rights-e12",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 2,
+                "heading_text": "13. Rights, access, and privacy",
+                "occurrence": 1
+              },
+              "purpose": "Rights facts, privacy, and enforcement."
+            }
+          ]
+        },
+        {
+          "work_package": "E13",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e13",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E13"
+              },
+              "purpose": "E13 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e13-catalog",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.2 Catalog and profiles",
+                "occurrence": 1
+              },
+              "purpose": "Catalog and profile domain behavior."
+            },
+            {
+              "context_id": "spec-domain-e13-ingestion",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.10 Ingestion and prompt generation",
+                "occurrence": 1
+              },
+              "purpose": "Ingestion and prompt-generation behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E14",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e14",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E14"
+              },
+              "purpose": "E14 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e14",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.3 Edition",
+                "occurrence": 1
+              },
+              "purpose": "Edition domain behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E15",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e15",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E15"
+              },
+              "purpose": "E15 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e15",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.4 Review",
+                "occurrence": 1
+              },
+              "purpose": "Review domain behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E16",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e16",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E16"
+              },
+              "purpose": "E16 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e16",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.6 Authority and entities",
+                "occurrence": 1
+              },
+              "purpose": "Authority and entity domain behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E17",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e17",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E17"
+              },
+              "purpose": "E17 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e17",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.5 Jobs, providers, and reprocessing",
+                "occurrence": 1
+              },
+              "purpose": "Jobs, provider, and reprocessing behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E18",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e18",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E18"
+              },
+              "purpose": "E18 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e18",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.7 Publication and Reader",
+                "occurrence": 1
+              },
+              "purpose": "Publication and Reader projection behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E19",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e19",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E19"
+              },
+              "purpose": "E19 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e19",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.8 Retrieval and knowledge",
+                "occurrence": 1
+              },
+              "purpose": "Retrieval and knowledge behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E20",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e20",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E20"
+              },
+              "purpose": "E20 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-e20",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.9 Repository and GitHub",
+                "occurrence": 1
+              },
+              "purpose": "Repository import-and-bind, Git, and GitHub behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "E21",
+          "templates": [
+            {
+              "context_id": "spec-package-row-e21",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "E21"
+              },
+              "purpose": "E21 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-workflows-e21",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "5.7 Initial operation catalog",
+                "occurrence": 1
+              },
+              "purpose": "Workflow operation, participant, and local-step catalog."
+            },
+            {
+              "context_id": "spec-composition-contract-e21",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "5.10 Composition contract",
+                "occurrence": 1
+              },
+              "purpose": "Composition-owned application service boundary."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [
+        {
+          "expansion_id": "contract-detail",
+          "phase_pin": "contract",
+          "route_pointer_template": "/context_routes/{work_package}"
+        },
+        {
+          "expansion_id": "fixture-evidence",
+          "phase_pin": "fixture",
+          "route_pointer_template": "/context_routes/{work_package}"
+        }
+      ],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "fixture-evidence",
+        "security-rights-recovery",
+        "integration-scenarios",
+        "legacy-migration"
+      ]
+    },
+    {
+      "profile_id": "U21-U27",
+      "work_packages": ["U21", "U22", "U23", "U24", "U25", "U26", "U27"],
+      "required_base": "studio-renderer-foundation-v1.0.0",
+      "contract_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "fixture_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "default_utf8_bytes": 65536,
+      "hard_max_utf8_bytes": 98304,
+      "templates": [
+        {
+          "context_id": "spec-workbench-context-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.8 Workbench context and selection seam",
+            "occurrence": 1
+          },
+          "purpose": "Feature command, context, and selection seam."
+        },
+        {
+          "context_id": "spec-renderer-contributions-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "6.1 Renderer contribution contract",
+            "occurrence": 1
+          },
+          "purpose": "Feature contribution and manifest contract."
+        },
+        {
+          "context_id": "spec-shell-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "10.1 Shell",
+            "occurrence": 1
+          },
+          "purpose": "Shared shell contribution surface."
+        },
+        {
+          "context_id": "spec-basic-advanced-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "10.2 Basic and Advanced",
+            "occurrence": 1
+          },
+          "purpose": "Basic and Advanced progressive disclosure."
+        },
+        {
+          "context_id": "spec-copy-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "10.10 Typography and copy",
+            "occurrence": 1
+          },
+          "purpose": "Shared terminology and copy."
+        },
+        {
+          "context_id": "spec-accessibility-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "15. Accessibility and international text",
+            "occurrence": 1
+          },
+          "purpose": "Feature accessibility and international-text requirements."
+        },
+        {
+          "context_id": "spec-gate-g1-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G1 — isolated module",
+            "occurrence": 1
+          },
+          "purpose": "Isolated feature acceptance gate."
+        },
+        {
+          "context_id": "spec-gate-g3-features",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G3 — renderer composition",
+            "occurrence": 1
+          },
+          "purpose": "Renderer composition quality gate."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "U21",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u21",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U21"
+              },
+              "purpose": "U21 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-ui-u21",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.3 Library",
+                "occurrence": 1
+              },
+              "purpose": "Library user-interface behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "U22",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u22",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U22"
+              },
+              "purpose": "U22 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-ui-u22",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.4 Edition Overview",
+                "occurrence": 1
+              },
+              "purpose": "Edition Overview user-interface behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "U23",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u23",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U23"
+              },
+              "purpose": "U23 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-ui-u23-layout",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.5 Edition Layout",
+                "occurrence": 1
+              },
+              "purpose": "Canvas and layout behavior."
+            },
+            {
+              "context_id": "spec-ui-u23-selection",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.7 Selection and batch behavior",
+                "occurrence": 1
+              },
+              "purpose": "Canvas selection and batch behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "U24",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u24",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U24"
+              },
+              "purpose": "U24 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-ui-u24-review",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.6 Layout-integrated text review",
+                "occurrence": 1
+              },
+              "purpose": "Text and review interaction behavior."
+            },
+            {
+              "context_id": "spec-ui-u24-selection",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.7 Selection and batch behavior",
+                "occurrence": 1
+              },
+              "purpose": "Review selection and batch behavior."
+            }
+          ]
+        },
+        {
+          "work_package": "U25",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u25",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U25"
+              },
+              "purpose": "U25 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-ui-u25",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.8 Entities",
+                "occurrence": 1
+              },
+              "purpose": "Entity user-interface behavior."
+            },
+            {
+              "context_id": "spec-domain-u25",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.6 Authority and entities",
+                "occurrence": 1
+              },
+              "purpose": "Entity domain projections consumed by the feature."
+            }
+          ]
+        },
+        {
+          "work_package": "U26",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u26",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U26"
+              },
+              "purpose": "U26 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-ui-u26",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "10.9 Reader",
+                "occurrence": 1
+              },
+              "purpose": "Reader user-interface behavior."
+            },
+            {
+              "context_id": "spec-domain-u26",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.7 Publication and Reader",
+                "occurrence": 1
+              },
+              "purpose": "Publication projection consumed by the Reader."
+            }
+          ]
+        },
+        {
+          "work_package": "U27",
+          "templates": [
+            {
+              "context_id": "spec-package-row-u27",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "U27"
+              },
+              "purpose": "U27 exclusive lease and required output."
+            },
+            {
+              "context_id": "spec-domain-u27-jobs",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.5 Jobs, providers, and reprocessing",
+                "occurrence": 1
+              },
+              "purpose": "Jobs and provider projections consumed by Operations UI."
+            },
+            {
+              "context_id": "spec-domain-u27-retrieval",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.8 Retrieval and knowledge",
+                "occurrence": 1
+              },
+              "purpose": "Retrieval health and proposal projections."
+            },
+            {
+              "context_id": "spec-domain-u27-repository",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.9 Repository and GitHub",
+                "occurrence": 1
+              },
+              "purpose": "Repository and GitHub operation projections."
+            },
+            {
+              "context_id": "spec-domain-u27-ingestion",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-heading-section/1",
+                "heading_level": 3,
+                "heading_text": "9.10 Ingestion and prompt generation",
+                "occurrence": 1
+              },
+              "purpose": "Ingestion and prompt-generation operations."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [
+        {
+          "expansion_id": "contract-detail",
+          "phase_pin": "contract",
+          "route_pointer_template": "/context_routes/{work_package}"
+        },
+        {
+          "expansion_id": "fixture-evidence",
+          "phase_pin": "fixture",
+          "route_pointer_template": "/context_routes/{work_package}"
+        }
+      ],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "fixture-evidence",
+        "quality-scale-a11y",
+        "integration-scenarios"
+      ]
+    },
+    {
+      "profile_id": "I30",
+      "work_packages": ["I30"],
+      "required_base": "studio-composition-input-v1.0.0",
+      "contract_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "fixture_pin": {
+        "expectation": "required",
+        "not_applicable_reason": null
+      },
+      "default_utf8_bytes": 114688,
+      "hard_max_utf8_bytes": 163840,
+      "templates": [
+        {
+          "context_id": "spec-composition-contract-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "5.10 Composition contract",
+            "occurrence": 1
+          },
+          "purpose": "Only legal all-module composition surface."
+        },
+        {
+          "context_id": "spec-module-manifest-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "6. Module manifest and independent implementation rule",
+            "occurrence": 1
+          },
+          "purpose": "Manifest and contribution registration at composition."
+        },
+        {
+          "context_id": "spec-host-security-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "8. Engine host and desktop security",
+            "occurrence": 1
+          },
+          "purpose": "Real sidecar, Electron, and capability boundary."
+        },
+        {
+          "context_id": "spec-ui-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "10. User interface specification",
+            "occurrence": 1
+          },
+          "purpose": "Full composed UI behavior."
+        },
+        {
+          "context_id": "spec-recovery-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "12. Offline, recovery, and conflicts",
+            "occurrence": 1
+          },
+          "purpose": "Composed recovery and conflict behavior."
+        },
+        {
+          "context_id": "spec-rights-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "13. Rights, access, and privacy",
+            "occurrence": 1
+          },
+          "purpose": "End-to-end rights and privacy acceptance."
+        },
+        {
+          "context_id": "spec-performance-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "14. Performance and scale budgets",
+            "occurrence": 1
+          },
+          "purpose": "Composed scale and performance thresholds."
+        },
+        {
+          "context_id": "spec-accessibility-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "15. Accessibility and international text",
+            "occurrence": 1
+          },
+          "purpose": "Composed accessibility and international-text acceptance."
+        },
+        {
+          "context_id": "spec-gate-g2-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G2 — headless engine",
+            "occurrence": 1
+          },
+          "purpose": "Prerequisite headless integration gate."
+        },
+        {
+          "context_id": "spec-gate-g3-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G3 — renderer composition",
+            "occurrence": 1
+          },
+          "purpose": "Renderer composition gate."
+        },
+        {
+          "context_id": "spec-gate-g4-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G4 — production vertical",
+            "occurrence": 1
+          },
+          "purpose": "Production vertical gate."
+        },
+        {
+          "context_id": "spec-gate-g5-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 3,
+            "heading_text": "G5 — security, scale, release",
+            "occurrence": 1
+          },
+          "purpose": "Final security, scale, and release gate."
+        },
+        {
+          "context_id": "spec-acceptance-scenarios-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "19. Cross-module acceptance scenarios",
+            "occurrence": 1
+          },
+          "purpose": "End-to-end acceptance scenarios."
+        },
+        {
+          "context_id": "spec-delivery-sequence-i30",
+          "capsule": "package",
+          "source_id": "production-spec",
+          "selector": {
+            "kind": "markdown-heading-section/1",
+            "heading_level": 2,
+            "heading_text": "20. Migration and delivery sequence",
+            "occurrence": 1
+          },
+          "purpose": "Composition order and release delivery sequence."
+        }
+      ],
+      "package_templates": [
+        {
+          "work_package": "I30",
+          "templates": [
+            {
+              "context_id": "spec-package-row-i30",
+              "capsule": "package",
+              "source_id": "production-spec",
+              "selector": {
+                "kind": "markdown-table-row/1",
+                "containing_heading": {
+                  "heading_level": 2,
+                  "heading_text": "18. Independent work packages",
+                  "occurrence": 1
+                },
+                "table_columns": [
+                  "ID",
+                  "Scope",
+                  "Owned paths",
+                  "Required output"
+                ],
+                "table_occurrence": 1,
+                "key_column": "ID",
+                "key_value": "I30"
+              },
+              "purpose": "I30 exclusive lease and required output."
+            }
+          ]
+        }
+      ],
+      "required_initial_expansion_routes": [
+        {
+          "expansion_id": "contract-detail",
+          "phase_pin": "contract",
+          "route_pointer_template": "/context_routes/{work_package}"
+        },
+        {
+          "expansion_id": "fixture-evidence",
+          "phase_pin": "fixture",
+          "route_pointer_template": "/context_routes/{work_package}"
+        }
+      ],
+      "allowed_expansion_ids": [
+        "contract-detail",
+        "fixture-evidence",
+        "security-rights-recovery",
+        "quality-scale-a11y",
+        "integration-scenarios",
+        "legacy-migration"
+      ]
+    }
+  ]
+}
