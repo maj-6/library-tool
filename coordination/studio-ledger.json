@@ -2,10 +2,10 @@
   "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
   "protocol_version": "1.0",
   "ledger_id": "living-edition-studio",
-  "ledger_revision": 3,
-  "status": "bootstrap-draft",
+  "ledger_revision": 8,
+  "status": "active",
   "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
-  "coordination_ref": null,
+  "coordination_ref": "refs/heads/studio-s00-coordination",
   "bootstrap": {
     "status": "ready-for-review",
     "digest_domain": "git-blob-payload-sha256/1",
@@ -182,7 +182,129 @@
     "blockers": [],
     "created_at": "2026-08-14T15:33:48Z"
   },
-  "sessions": [],
+  "sessions": [
+    {
+      "session_id": "A01-001",
+      "work_package": "A01",
+      "accountable_owner": "codex:/root",
+      "lease_id": "lease-A01-001-01",
+      "branch": "studio-a01-001-context-packets",
+      "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+      "coordination_ref": "refs/heads/studio-s00-coordination",
+      "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
+      "base_tag": "studio-adoption-v1.1.0",
+      "base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "remote_base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "baseline_verification_status": "verified",
+      "base_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+      "base_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+      "contract_pin": {
+        "status": "not-applicable",
+        "reason": "A01 amends pre-contract adoption documents only"
+      },
+      "fixture_pin": {
+        "status": "not-applicable",
+        "reason": "A01 precedes the fixture phase"
+      },
+      "lease_entries": [
+        {
+          "kind": "exact-file",
+          "path": "docs/living-edition-concurrent-session-handoff.md"
+        },
+        {
+          "kind": "exact-file",
+          "path": "docs/living-edition-production-build-spec.md"
+        }
+      ],
+      "lease_state": "released",
+      "reserved_ids": [
+        "living-edition-concurrent-session-handoff/1.0.1",
+        "living-edition-production-build-spec/1.1.1"
+      ],
+      "status": "accepted",
+      "head_commit": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+      "state_history": [
+        {
+          "from": null,
+          "to": "ready",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:36:52Z",
+          "receipt_id": "S00-A01-ASSIGNMENT-001"
+        },
+        {
+          "from": "ready",
+          "to": "active",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:41:41Z",
+          "receipt_id": "S00-A01-START-001"
+        },
+        {
+          "from": "active",
+          "to": "review",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-15T00:34:11Z",
+          "receipt_id": "S00-A01-HANDOFF-001"
+        },
+        {
+          "from": "review",
+          "to": "accepted",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-15T01:13:06Z",
+          "receipt_id": "S00-A01-ACCEPTANCE-001"
+        }
+      ],
+      "lease_history": [
+        {
+          "from": null,
+          "to": "issued",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:36:52Z",
+          "receipt_id": "S00-A01-ASSIGNMENT-001"
+        },
+        {
+          "from": "issued",
+          "to": "active",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-14T21:41:41Z",
+          "receipt_id": "S00-A01-START-001"
+        },
+        {
+          "from": "active",
+          "to": "released",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-15T01:13:06Z",
+          "receipt_id": "S00-A01-ACCEPTANCE-001"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "coordination-input",
+          "coordination_commit": "c6e3c13003f4b42aa05a8eb506f1803fec7e3646",
+          "ledger_sha256": "75766a273a31e591d9f9b361a960a38533e694652912c9f2b7104916874b7a79",
+          "digest_domain": "git-blob-payload-sha256/1",
+          "protection_receipt_id": "S00-COORDINATION-REF-PROTECTION-001"
+        },
+        {
+          "kind": "assignment-ledger-pin",
+          "coordination_commit": "3f3eddcd3df708bfee40a5c47a5cadd70d735c8a",
+          "ledger_sha256": "db9a4cff6bfb36ca8014fa1852c613c436d02ccded27c064a0fcb66bc3dcd735",
+          "digest_domain": "git-blob-payload-sha256/1",
+          "lease_id": "lease-A01-001-01"
+        },
+        {
+          "kind": "clean-start-verification",
+          "branch": "studio-a01-001-context-packets",
+          "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+          "head_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "status_porcelain_entries": 0,
+          "outside_lease_entries": 0,
+          "verified_at": "2026-08-14T21:41:41Z"
+        }
+      ],
+      "blocker": null,
+      "updated_at": "2026-08-15T01:13:06Z"
+    }
+  ],
   "id_reservations": [
     {
       "id": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
@@ -197,6 +319,34 @@
       "owner": "A00",
       "status": "reserved",
       "reserved_at": "2026-08-14T15:33:48Z"
+    },
+    {
+      "id": "living-edition-concurrent-session-handoff/1.0.1",
+      "kind": "normative-document-version",
+      "owner": "A01",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
+    },
+    {
+      "id": "living-edition-production-build-spec/1.1.1",
+      "kind": "normative-document-version",
+      "owner": "A01",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
+    },
+    {
+      "id": "https://worldherblibrary.org/schemas/studio-context-packet-1.0.json",
+      "kind": "json-schema",
+      "owner": "S00",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
+    },
+    {
+      "id": "studio-context-profiles/1",
+      "kind": "manifest-format",
+      "owner": "S00",
+      "status": "reserved",
+      "reserved_at": "2026-08-14T21:36:52Z"
     }
   ],
   "baselines": [
@@ -216,6 +366,18 @@
       ],
       "verification_status": "verified",
       "verified_at": "2026-08-14T18:33:57Z"
+    },
+    {
+      "baseline_id": "studio-adoption-v1.1.0",
+      "kind": "studio-adoption",
+      "tag": "studio-adoption-v1.1.0",
+      "tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "remote_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+      "peeled_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+      "tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+      "subtrees": [],
+      "verification_status": "verified",
+      "verified_at": "2026-08-14T18:54:32Z"
     }
   ],
   "receipts": [
@@ -277,7 +439,708 @@
         "tag_object": "fa3798650f2083e91770e0d94e9948243154673f",
         "peeled_commit": "89a5b8f3564469e5375f5c2997680a013ace97ad"
       }
+    },
+    {
+      "receipt_id": "S00-A00-ACCEPTANCE-001",
+      "kind": "a00-adoption-accepted",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T18:54:32Z",
+      "payload": {
+        "work_order_id": "A00-WO-001",
+        "session_id": "A00-001",
+        "work_package": "A00",
+        "accepted_at": "2026-08-14T18:46:44Z",
+        "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
+        "accepted_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+        "accepted_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+        "ordered_commits": [
+          "4ed00a49b5fbb7d5b0bac45d82e3f7c3068fb77c",
+          "68be9fbaabfad31b2ad3347e8890d5df2090220c",
+          "2bffb1f5297169b2e1dd6d17a434e23a7e428f36"
+        ],
+        "ledger_path": "coordination/studio-ledger.json",
+        "ledger_digest_domain": "git-blob-payload-sha256/1",
+        "ledger_sha256": "465b5ff501af27033b0e10bea28ba941bfbaf1fe63f21d2fe4454582b5b38de3",
+        "adoption_tag": {
+          "ref": "refs/tags/studio-adoption-v1.1.0",
+          "tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+          "peeled_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+          "tagged_at": "2026-08-14T18:48:15Z",
+          "publisher_identity": "github:maj-6",
+          "verified_at": "2026-08-14T18:54:32Z"
+        },
+        "coordination_ref": {
+          "ref": "refs/heads/studio-s00-coordination",
+          "initial_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "remote_initial_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "created_at": "2026-08-14T18:53:18Z"
+        },
+        "acceptance_commands_declared": 8,
+        "acceptance_commands_passed": 8,
+        "validation_environment": {
+          "os": "Microsoft Windows NT 10.0.26200.0",
+          "git": "2.50.0.windows.1",
+          "python": "3.11.2",
+          "jsonschema": "4.26.0"
+        },
+        "pre_adoption_waiver_decisions": {
+          "s00_disposition": "accepted-with-unchanged-a00-head",
+          "external_decision": {
+            "status": "approved",
+            "approver": "github:maj-6",
+            "decided_at": "2026-08-14T18:31:59Z",
+            "evidence_locator": "conversation:2026-08-14:a00-wo-001-fast-path-approval",
+            "evidence_sha256": "e776d259f9513f2752ba30311e94220ed162aec3e75d0d30545dba5406df4b52"
+          },
+          "waivers": [
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-SCREENSHOTS-001",
+              "category": "screenshots",
+              "revisit_gate": "G3-renderer-composition"
+            },
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-TASK-RECORDINGS-001",
+              "category": "task_recordings",
+              "revisit_gate": "G4-production-vertical"
+            },
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-BEHAVIOR-VECTORS-001",
+              "category": "behavior_vectors",
+              "revisit_gate": "studio-fixtures-v1.0.0"
+            },
+            {
+              "waiver_id": "A00-WAIVER-PROTOTYPE-RUNTIME-ARCHIVES-001",
+              "category": "sealed_prototype_runtime_archives",
+              "revisit_gate": "studio-fixtures-v1.0.0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "receipt_id": "S00-COORDINATION-REF-PROTECTION-001",
+      "kind": "coordination-ref-protection",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T18:54:32Z",
+      "payload": {
+        "provider": "github",
+        "api_version": "2026-03-10",
+        "repository": {
+          "id": 1294866705,
+          "owner": "maj-6",
+          "name": "library-tool",
+          "remote_url": "https://github.com/maj-6/library-tool.git"
+        },
+        "ref": "refs/heads/studio-s00-coordination",
+        "ruleset_ids": [20865800, 20865801],
+        "authorized_s00_principals": [
+          {
+            "actor_type": "User",
+            "actor_id": 37586976,
+            "login": "maj-6",
+            "bypass_mode": "always"
+          }
+        ],
+        "deletion_allowed": false,
+        "force_updates_allowed": false,
+        "ordinary_updates_restricted_to_authorized_s00_principals": true,
+        "repository_administrators_enforced": true,
+        "update_allows_fetch_and_merge": false,
+        "effective_rule_types": [
+          "creation",
+          "deletion",
+          "non_fast_forward",
+          "update"
+        ],
+        "observed_at": "2026-08-14T18:54:32Z",
+        "projection_schema": "github-coordination-protection-projection/1",
+        "digest_domain": "rfc8785-jcs-sha256/1",
+        "projection_sha256": "90d7a0d821d98d7d2fd348f0c847b25fd3d6987a902c7f2342c2d563eec0f542",
+        "projection": {
+          "schema": "github-coordination-protection-projection/1",
+          "owner": "maj-6",
+          "name": "library-tool",
+          "ref": "refs/heads/studio-s00-coordination",
+          "rulesets": [
+            {
+              "id": 20865800,
+              "name": "studio-s00-coordination-integrity",
+              "target": "branch",
+              "enforcement": "active",
+              "conditions": {
+                "ref_name": {
+                  "include": ["refs/heads/studio-s00-coordination"],
+                  "exclude": []
+                }
+              },
+              "rules": [{ "type": "deletion" }, { "type": "non_fast_forward" }],
+              "bypass_actors": []
+            },
+            {
+              "id": 20865801,
+              "name": "studio-s00-coordination-writer",
+              "target": "branch",
+              "enforcement": "active",
+              "conditions": {
+                "ref_name": {
+                  "include": ["refs/heads/studio-s00-coordination"],
+                  "exclude": []
+                }
+              },
+              "rules": [{ "type": "creation" }, { "type": "update" }],
+              "bypass_actors": [
+                {
+                  "actor_type": "User",
+                  "actor_id": 37586976,
+                  "bypass_mode": "always"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "receipt_id": "S00-CONTEXT-DEFECT-HOLD-001",
+      "kind": "normative-context-defect-and-b00-hold",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T21:36:52Z",
+      "payload": {
+        "affected_baseline": {
+          "tag": "studio-adoption-v1.1.0",
+          "tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+          "peeled_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008"
+        },
+        "defect": "The authoritative assignment template requires every package session to ingest both normative documents completely, including unrelated package material.",
+        "evidence": [
+          {
+            "path": "docs/living-edition-concurrent-session-handoff.md",
+            "git_blob_oid": "616cdfd9b22f6f4ce4c6c10c74078d59231f9a4e",
+            "blob_payload_sha256": "244c36025ee073f6f59dbcbca7aacfcca10d6ba3ec13e655944ad00fc12cfd4a",
+            "selector": "8. Assignment packet / Read completely"
+          },
+          {
+            "path": "docs/living-edition-production-build-spec.md",
+            "git_blob_oid": "826adb49ba2f84cb4694a1efb11f949d8b0fe143",
+            "blob_payload_sha256": "7ad2f77e27ab9e94df86435f2aecb4c13f5c04a545950816538dca843350306d",
+            "selector": "22. Exact handoff brief / authoritative template"
+          }
+        ],
+        "disposition": "Publish a reviewed immutable context-packet amendment before assigning B00.",
+        "b00_hold": true,
+        "active_b00_sessions": 0,
+        "target_superseding_tag": "studio-adoption-v1.1.1"
+      }
+    },
+    {
+      "receipt_id": "S00-A01-WORK-ORDER-001",
+      "kind": "context-amendment-work-order-approved",
+      "actor": "github:maj-6",
+      "created_at": "2026-08-14T21:36:52Z",
+      "payload": {
+        "work_order_id": "A01-WO-001",
+        "approval_evidence": {
+          "kind": "interactive-user-approval",
+          "locator": "conversation:2026-08-14:a01-context-amendment-approval",
+          "utf8_byte_length": 8,
+          "sha256": "87b42e40c2a290e01d87b721bf381c3c5e259d1eb0a4660e41fdbf8bc73f7ddd"
+        },
+        "accountable_owner": "codex:/root",
+        "independent_reviewer": "codex-session:S00-002",
+        "base_tag": "studio-adoption-v1.1.0",
+        "base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+        "base_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+        "base_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+        "leased_paths": [
+          "docs/living-edition-concurrent-session-handoff.md",
+          "docs/living-edition-production-build-spec.md"
+        ],
+        "required_change": "Replace universal full-document ingestion with closed, integrity-pinned, progressively disclosed context packets.",
+        "target_versions": {
+          "production_specification": "1.1.1",
+          "handoff_protocol": "1.0.1",
+          "context_packet": "studio-context-packet/1"
+        },
+        "publisher_authorization": {
+          "status": "authorized",
+          "publisher_identity": "github:maj-6",
+          "remote_url": "https://github.com/maj-6/library-tool.git",
+          "source_ref": "refs/tags/studio-adoption-v1.1.1",
+          "target_ref": "refs/tags/studio-adoption-v1.1.1",
+          "force_update_allowed": false,
+          "move_or_recreate_allowed": false
+        },
+        "assembly_authorization": "One conflict-free, provenance-verified pre-GB amendment assembly containing only accepted A01 document blobs and S00 coordination artifacts."
+      }
+    },
+    {
+      "receipt_id": "S00-A01-ASSIGNMENT-001",
+      "kind": "context-amendment-assigned",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T21:36:52Z",
+      "payload": {
+        "session_id": "A01-001",
+        "work_package": "A01",
+        "accountable_owner": "codex:/root",
+        "reviewer": "codex-session:S00-002",
+        "branch": "studio-a01-001-context-packets",
+        "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+        "lease_id": "lease-A01-001-01",
+        "lease_entries": [
+          {
+            "kind": "exact-file",
+            "path": "docs/living-edition-concurrent-session-handoff.md"
+          },
+          {
+            "kind": "exact-file",
+            "path": "docs/living-edition-production-build-spec.md"
+          }
+        ],
+        "coordination_commit": "c6e3c13003f4b42aa05a8eb506f1803fec7e3646",
+        "coordination_ledger_sha256": "75766a273a31e591d9f9b361a960a38533e694652912c9f2b7104916874b7a79",
+        "protection_receipt_id": "S00-COORDINATION-REF-PROTECTION-001",
+        "return_destination": "codex-session:S00-002 read-only acceptance"
+      }
+    },
+    {
+      "receipt_id": "S00-A01-START-001",
+      "kind": "context-amendment-start-verified",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-14T21:41:41Z",
+      "payload": {
+        "session_id": "A01-001",
+        "lease_id": "lease-A01-001-01",
+        "assignment_coordination_commit": "3f3eddcd3df708bfee40a5c47a5cadd70d735c8a",
+        "assignment_ledger_sha256": "db9a4cff6bfb36ca8014fa1852c613c436d02ccded27c064a0fcb66bc3dcd735",
+        "digest_domain": "git-blob-payload-sha256/1",
+        "branch": "studio-a01-001-context-packets",
+        "worktree": "C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets",
+        "base_tag": "studio-adoption-v1.1.0",
+        "base_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+        "base_commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+        "base_tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+        "clean_start": true,
+        "lease_state": "active",
+        "status": "active"
+      }
+    },
+    {
+      "receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+      "kind": "context-packet-artifact-candidate",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-15T00:34:11Z",
+      "payload": {
+        "artifact_set_id": "studio-context-packet-artifacts/1",
+        "status": "candidate-for-independent-review",
+        "target_tag": "studio-adoption-v1.1.1",
+        "digest_domain": "git-blob-payload-sha256/1",
+        "artifacts": [
+          {
+            "role": "context-packet-schema",
+            "path": "coordination/context-packet.schema.json",
+            "git_blob_oid": "7cca9c25a393e88321a0e90f7c7824936203c3c6",
+            "sha256": "418c711ae3237b3996333b74944cb7e2950075b5006d22dbcb552f1313968296",
+            "byte_length": 48033
+          },
+          {
+            "role": "context-profile-catalog",
+            "path": "coordination/context-profiles.json",
+            "git_blob_oid": "8c8db4fbb0036277f633f1834260a944bf853a1c",
+            "sha256": "f7b81ce3931e166b8bcd209c1b69374c77d5951bd67951db2c2710310b840b85",
+            "byte_length": 81847
+          },
+          {
+            "role": "pre-gb-context-packet-validator",
+            "path": "coordination/validate_context_packet.py",
+            "git_blob_oid": "41d5d1b0106f8c47794158890d644eed7537528a",
+            "sha256": "58c1e281c393cbefe3a0c900f2f56543cf7a6253846aafa9973d19faf8af45d5",
+            "byte_length": 100025
+          }
+        ],
+        "context_profiles_manifest": {
+          "schema": "studio-context-profiles/1",
+          "canonicalization": "rfc8785-jcs-sha256/1",
+          "manifest_jcs_sha256": "3755edde6d848c980055c1cf12e95c3cb329e4a071db94f9acd36551dac69b2e",
+          "manifest_jcs_bytes": 49974
+        },
+        "checks": [
+          {
+            "check_id": "profile-catalog-all-work-packages",
+            "command": "python coordination/validate_context_packet.py profiles --schema coordination/context-packet.schema.json --profiles coordination/context-profiles.json --source-root C:/Users/amill/Documents/whl-worktrees/studio-a01-001-context-packets --source-commit 98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+            "exit_code": 0,
+            "result": "passed",
+            "profiles_measured": 25,
+            "c00_core_selected_utf8_bytes": 131994,
+            "c00_default_utf8_bytes": 135168,
+            "c00_within_default": true
+          },
+          {
+            "check_id": "independent-prehandoff-final-audit",
+            "command": "independent artifact-and-document audit",
+            "exit_code": 0,
+            "result": "passed",
+            "evidence_locator": "agent-audit:A01-final-prehandoff:98f56659/58c1e281",
+            "verified_sha256": {
+              "docs/living-edition-concurrent-session-handoff.md": "580f451b99247574fe16222656407c7aa064830366d906757fbbd827df452d67",
+              "docs/living-edition-production-build-spec.md": "05707d8191fbf86c98e3092d9731ae9d26707ded4195f9179c3678bcb9ac519a",
+              "coordination/context-packet.schema.json": "418c711ae3237b3996333b74944cb7e2950075b5006d22dbcb552f1313968296",
+              "coordination/context-profiles.json": "f7b81ce3931e166b8bcd209c1b69374c77d5951bd67951db2c2710310b840b85",
+              "coordination/validate_context_packet.py": "58c1e281c393cbefe3a0c900f2f56543cf7a6253846aafa9973d19faf8af45d5"
+            }
+          },
+          {
+            "check_id": "context-lifecycle-adversarial-suite",
+            "command": "independent fail-closed overlap, stale-ledger, and receipt-chain adversarial audit",
+            "exit_code": 0,
+            "result": "passed",
+            "evidence_locator": "agent-audit:A01-final-prehandoff:98f56659/58c1e281",
+            "cases": [
+              "overlapping-lease-rejected",
+              "stale-coordination-ledger-rejected",
+              "invalid-receipt-chain-rejected"
+            ]
+          }
+        ],
+        "self_reference_policy": {
+          "containing_commit": "external-review-pin-after-commit",
+          "containing_ledger_sha256": "external-review-pin-after-commit",
+          "adoption_tag_object": "post-assembly-receipt-only"
+        }
+      }
+    },
+    {
+      "receipt_id": "S00-A01-HANDOFF-001",
+      "kind": "context-amendment-handoff-verified",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-15T00:34:11Z",
+      "payload": {
+        "work_order_id": "A01-WO-001",
+        "session_id": "A01-001",
+        "work_package": "A01",
+        "lease_id": "lease-A01-001-01",
+        "assignment_receipt_id": "S00-A01-ASSIGNMENT-001",
+        "start_receipt_id": "S00-A01-START-001",
+        "returning_actor": "codex:/root",
+        "reviewer": "codex-session:S00-002",
+        "base": {
+          "tag": "studio-adoption-v1.1.0",
+          "tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+          "remote_tag_object": "e2b4c505eea2c272b9c4f41a6b228b32f5273a3e",
+          "commit": "2bffb1f5297169b2e1dd6d17a434e23a7e428f36",
+          "tree": "39a094c7aef9117957bec3622a37ccfb8ab1b008",
+          "verification_status": "verified"
+        },
+        "handoff_head": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+        "handoff_tree": "c1c4b738885f8e651f127e8643251c97b62dd3e1",
+        "parents": ["3fd603d6c0e32ad3deb04db5fc8d464df82c4771"],
+        "ordered_commits": [
+          "e1a5451395192ad85259b2cbce68141889d527bb",
+          "c6940f6442a288bbdc8d23dfa3e4b6d07af69d7b",
+          "074e140b362f6a4781d4bb7c92e4be243c69efda",
+          "3fd603d6c0e32ad3deb04db5fc8d464df82c4771",
+          "98f566599a7d5e74a4077a8ef75e25977f2d1fdc"
+        ],
+        "merge_commits": [],
+        "lease_entries": [
+          {
+            "kind": "exact-file",
+            "path": "docs/living-edition-concurrent-session-handoff.md"
+          },
+          {
+            "kind": "exact-file",
+            "path": "docs/living-edition-production-build-spec.md"
+          }
+        ],
+        "changed_paths": [
+          "docs/living-edition-concurrent-session-handoff.md",
+          "docs/living-edition-production-build-spec.md"
+        ],
+        "document_blobs": [
+          {
+            "path": "docs/living-edition-concurrent-session-handoff.md",
+            "git_blob_oid": "78e407f5f119f1a18ec733680e94cf56f7e17684",
+            "digest_domain": "git-blob-payload-sha256/1",
+            "sha256": "580f451b99247574fe16222656407c7aa064830366d906757fbbd827df452d67",
+            "byte_length": 64762
+          },
+          {
+            "path": "docs/living-edition-production-build-spec.md",
+            "git_blob_oid": "7aef7e9aaf657dff87f24d4839084b6a5a42a926",
+            "digest_domain": "git-blob-payload-sha256/1",
+            "sha256": "05707d8191fbf86c98e3092d9731ae9d26707ded4195f9179c3678bcb9ac519a",
+            "byte_length": 225894
+          }
+        ],
+        "artifact_candidate_receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+        "ownership_proof": {
+          "working_tree_clean": true,
+          "base_is_ancestor": true,
+          "implementation_branch_merge_commits_absent": true,
+          "changed_paths_outside_lease": [],
+          "phase_frozen_inputs_and_protected_paths_outside_lease_unchanged": true
+        },
+        "checks": [
+          {
+            "check_id": "clean-worktree",
+            "command": "git status --porcelain",
+            "exit_code": 0,
+            "result": "passed",
+            "status_porcelain_entries": 0
+          },
+          {
+            "check_id": "base-ancestor",
+            "command": "git merge-base --is-ancestor 2bffb1f5297169b2e1dd6d17a434e23a7e428f36 98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+            "exit_code": 0,
+            "result": "passed"
+          },
+          {
+            "check_id": "ordered-commit-inventory",
+            "command": "git rev-list --reverse 2bffb1f5297169b2e1dd6d17a434e23a7e428f36..98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+            "exit_code": 0,
+            "result": "passed",
+            "commit_count": 5
+          },
+          {
+            "check_id": "implementation-merge-commit-inventory",
+            "command": "git rev-list --merges 2bffb1f5297169b2e1dd6d17a434e23a7e428f36..98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+            "exit_code": 0,
+            "result": "passed",
+            "merge_commit_count": 0
+          },
+          {
+            "check_id": "lease-bound-diff",
+            "command": "git diff --name-only 2bffb1f5297169b2e1dd6d17a434e23a7e428f36...98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+            "exit_code": 0,
+            "result": "passed",
+            "changed_path_count": 2
+          },
+          {
+            "check_id": "document-diff-check",
+            "command": "git diff --check 2bffb1f5297169b2e1dd6d17a434e23a7e428f36...98f566599a7d5e74a4077a8ef75e25977f2d1fdc -- docs/living-edition-concurrent-session-handoff.md docs/living-edition-production-build-spec.md",
+            "exit_code": 0,
+            "result": "passed"
+          },
+          {
+            "check_id": "document-blob-pins",
+            "command": "git ls-tree -r -l 98f566599a7d5e74a4077a8ef75e25977f2d1fdc -- docs/living-edition-concurrent-session-handoff.md docs/living-edition-production-build-spec.md",
+            "exit_code": 0,
+            "result": "passed",
+            "verified_blob_count": 2
+          }
+        ],
+        "validation_environment": {
+          "os": "Microsoft Windows NT 10.0.26200.0",
+          "architecture": "X64",
+          "git": "git version 2.50.0.windows.1",
+          "python": "Python 3.11.2",
+          "node": "v22.16.0",
+          "npm": "11.4.2"
+        },
+        "migration_data_impact": "none",
+        "known_limitations": [
+          "An uncommitted LIB4 candidate delta changes the mandatory archive schema inventory from five to nine while retaining profile 1.0. It is not an A01 or v1.1.1 input; C00 remains held until S00 supplies a separately reviewed committed provenance pin and C00 freezes compatibility/versioning."
+        ],
+        "composition_instructions": [
+          "Do not assemble until codex-session:S00-002 accepts this unchanged handoff head and the S00 artifact candidate."
+        ],
+        "required_follow_up_owner": "codex-session:S00-002",
+        "return_destination": "codex-session:S00-002 read-only acceptance"
+      }
+    },
+    {
+      "receipt_id": "S00-LIB4-CANDIDATE-DELTA-OBSERVED-001",
+      "kind": "uncommitted-lib4-candidate-input-observed",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-15T00:54:06Z",
+      "payload": {
+        "observation_scope": "primary working tree LIB4 compatibility inputs only",
+        "observed_primary_head": "89a5b8f3564469e5375f5c2997680a013ace97ad",
+        "provenance_status": "uncommitted-working-tree-observation-not-contract-input",
+        "selected_as_contract_input": false,
+        "included_in_a01": false,
+        "included_in_studio_adoption_v1_1_1": false,
+        "b00_hold": false,
+        "c00_hold": true,
+        "unchanged_compatibility_baseline": {
+          "path": "docs/lib4-format.md",
+          "git_blob_oid": "bb036f6f88fd4f7dbe438ef14fdc82c7dc12d882",
+          "sha256": "2e4a22777c62068b42379ae7933bbd29ff4d9143ab2b6522b3cafdc2cb35d5f8",
+          "matches_studio_adoption_v1_1_0": true
+        },
+        "observed_candidate_files": [
+          {
+            "path": "tools/living_edition/lib4.py",
+            "status": "tracked-modified-unstaged",
+            "baseline_git_blob_oid": "2fff941b1ff8c8da85d5f33b103d7597db50631f",
+            "observed_git_blob_oid_if_committed_unchanged": "ba6b522d66dd5b29b69ca8691491d24e9259261d",
+            "observed_sha256": "c80db7aabd9e2d05cc51d429c7297f7798a46ef336b2c4e29e2fecbbaca2d074"
+          },
+          {
+            "path": "tests/test_lib4_format.py",
+            "status": "tracked-modified-unstaged",
+            "baseline_git_blob_oid": "122849f434a41845c2f72d0a6fff884b78655162",
+            "observed_git_blob_oid_if_committed_unchanged": "352e0cf20d7eb424ef0a1ad1c39df150fa8f364e",
+            "observed_sha256": "05ee3adcd1fc3311c6f987cc9bb9225b7240f1c3a6c8c26a303902dc5be7b503"
+          },
+          {
+            "path": "schemas/lib4-text-region-alignment.schema.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "fc04a590fa5241dac3e340c2ee2e52af9b04b8ed",
+            "observed_sha256": "374e85ff16a80b693816b38489ad157f80042887f56ceafcd0ec2710dbe5cf5c"
+          },
+          {
+            "path": "schemas/lib4-text-markup.schema.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "37497c0e8d33b2dbcdc8e692f2b180b0b8ac9f58",
+            "observed_sha256": "958fe0cfb2f66b0ce80a06e5d3d1640a3dfa1bc9a2390ec5c2f79d5108aa4231"
+          },
+          {
+            "path": "schemas/lib4-transcription-profile-registry.schema.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "888f67353b94195ea87f75a81e288c7aa0fc1985",
+            "observed_sha256": "4a3c399f34579a91fa94286f856b8b61ef7d259a6fa0d5acbacb8ef685f58e69"
+          },
+          {
+            "path": "schemas/lib4-book-transcription-profile.schema.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "4905630fac782f87f0ff4b920c5299686d436be7",
+            "observed_sha256": "1c1c55cc6be808e8081c8d6afdf2555aa3f08f970957544f94c0870702558a34"
+          },
+          {
+            "path": "examples/lib4/alignment/text-region-alignment.layer.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "fd523640a7181442899c31eebfbc22d71e11cb24",
+            "observed_sha256": "990a757b198b75501a1296b2365679f5f5bf6ae06f989b4270f17495ca2febe5"
+          },
+          {
+            "path": "examples/lib4/text-markup/text-markup.layer.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "bcab2d1e43a2dbb9c878998d131d1db6337cfaca",
+            "observed_sha256": "432b47f364e287db7cbd01cb54aa6c68a08946c8c4608a70c8763a258891e0b2"
+          },
+          {
+            "path": "examples/lib4/transcription-profiles/registry.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "970bfb4edfc14a2dc0734beb14af529490887ccf",
+            "observed_sha256": "6d83c5b90ba05ae14837bf1fd51e2f79a6931d521b38e243b178d832a21dcc6f"
+          },
+          {
+            "path": "examples/lib4/transcription-profiles/yale-16960297.book-profile.json",
+            "status": "untracked",
+            "observed_git_blob_oid_if_committed_unchanged": "a033f8d6356a99542625ad5ccd33b13ac3299168",
+            "observed_sha256": "5cbac20149a0ad4acba94462cb499178763ed13ebe63c79094b7b612dd8d8ba6"
+          }
+        ],
+        "compatibility_finding": {
+          "mandatory_archive_schema_members": {
+            "adopted_validator": 5,
+            "observed_candidate_validator": 9
+          },
+          "declared_profile_version": "1.0",
+          "old_archives_pass_observed_candidate_validator": false,
+          "candidate_archives_pass_adopted_validator": false,
+          "archive_bytes_and_digest_change": true,
+          "classification": "lib4-archive/1 compatibility-and-versioning change"
+        },
+        "disposition": {
+          "required_before_c00": [
+            "Preserve any selected candidate bytes in a separately reviewed commit and work order with exact provenance and digests.",
+            "Have C00 explicitly freeze archive/profile versioning and deterministic five-schema-to-nine-schema migration under contracts/lib4/**."
+          ],
+          "t01_rule": "T01 builds fixtures only from the frozen C00 contract tag; current examples and tests remain candidate evidence."
+        }
+      }
+    },
+    {
+      "receipt_id": "S00-A01-FORMAL-REVIEW-001",
+      "kind": "context-amendment-formal-review",
+      "actor": "codex-session:S00-002",
+      "created_at": "2026-08-15T01:12:23Z",
+      "payload": {
+        "work_order_id": "A01-WO-001",
+        "session_id": "A01-001",
+        "work_package": "A01",
+        "reviewer": "codex-session:S00-002",
+        "decision": "ACCEPT",
+        "decided_at": "2026-08-15T01:12:23Z",
+        "review_evidence": {
+          "kind": "agent-review-payload-sha256/1",
+          "locator": "agent-result:codex-session:S00-002/A01/08a2620f4bb55d802d3a86c7e823963e131f2666",
+          "digest_domain": "sha256-utf8-bytes/1",
+          "sha256": "05d18becb906429a96a86e20a6da0c5fb281c18a9986952b08bccd8f3caa2fbd",
+          "byte_length": 754
+        },
+        "reviewed_coordination": {
+          "commit": "08a2620f4bb55d802d3a86c7e823963e131f2666",
+          "tree": "ae95d434e30ecc0745eec3687bf8b78819e23cb0",
+          "ledger_revision": 7,
+          "ledger_path": "coordination/studio-ledger.json",
+          "ledger_git_blob_oid": "94537db30d3a13b9c3b35ccc4caa80d42c517a1b",
+          "ledger_digest_domain": "git-blob-payload-sha256/1",
+          "ledger_sha256": "de309f3c3a61acc8681a88ccf8b7d4606607b50ce83894a7299e60e1a4cb0d7f"
+        },
+        "reviewed_handoff": {
+          "receipt_id": "S00-A01-HANDOFF-001",
+          "head": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+          "tree": "c1c4b738885f8e651f127e8643251c97b62dd3e1"
+        },
+        "reviewed_artifact_candidate_receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+        "reviewed_lib4_observation_receipt_id": "S00-LIB4-CANDIDATE-DELTA-OBSERVED-001",
+        "lib4_disposition": {
+          "selected": false,
+          "b00_hold": false,
+          "c00_hold": true
+        },
+        "blockers": []
+      }
+    },
+    {
+      "receipt_id": "S00-A01-ACCEPTANCE-001",
+      "kind": "context-amendment-accepted",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-15T01:13:06Z",
+      "payload": {
+        "work_order_id": "A01-WO-001",
+        "session_id": "A01-001",
+        "work_package": "A01",
+        "formal_review_receipt_id": "S00-A01-FORMAL-REVIEW-001",
+        "handoff_receipt_id": "S00-A01-HANDOFF-001",
+        "artifact_candidate_receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+        "accepted_at": "2026-08-15T01:13:06Z",
+        "accepted_head": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+        "accepted_tree": "c1c4b738885f8e651f127e8643251c97b62dd3e1",
+        "lease_id": "lease-A01-001-01",
+        "lease_disposition": "released",
+        "acceptance_disposition": "accepted-with-unchanged-a01-head-and-artifact-candidate"
+      }
+    },
+    {
+      "receipt_id": "S00-A01-PREASSEMBLY-001",
+      "kind": "context-amendment-preassembly-authorized",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-15T01:13:06Z",
+      "payload": {
+        "work_order_receipt_id": "S00-A01-WORK-ORDER-001",
+        "formal_review_receipt_id": "S00-A01-FORMAL-REVIEW-001",
+        "acceptance_receipt_id": "S00-A01-ACCEPTANCE-001",
+        "handoff_receipt_id": "S00-A01-HANDOFF-001",
+        "artifact_candidate_receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+        "target_tag": "studio-adoption-v1.1.1",
+        "accepted_head": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+        "accepted_tree": "c1c4b738885f8e651f127e8643251c97b62dd3e1",
+        "assembly_authorization": "One conflict-free, provenance-verified pre-GB amendment assembly containing only accepted A01 document blobs and S00 coordination artifacts.",
+        "lib4_observation_receipt_id": "S00-LIB4-CANDIDATE-DELTA-OBSERVED-001",
+        "lib4_candidate_selected": false,
+        "c00_hold": true,
+        "self_reference_policy": {
+          "containing_commit": "external-review-pin-after-commit",
+          "containing_ledger_sha256": "external-review-pin-after-commit",
+          "adoption_tag_object": "post-assembly-receipt-only"
+        }
+      }
     }
   ],
-  "updated_at": "2026-08-14T18:33:57Z"
+  "updated_at": "2026-08-15T01:13:06Z"
 }

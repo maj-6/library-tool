@@ -1,0 +1,1986 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worldherblibrary.org/schemas/studio-context-packet-1.0.json",
+  "title": "Living Edition Studio context packet",
+  "description": "Closed, digest-pinned semantic context for one Studio implementation, integration, or review session.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "packet_id",
+    "revision",
+    "issued_at",
+    "previous_revision",
+    "audience",
+    "assignment",
+    "profile",
+    "pins",
+    "budget",
+    "required_context",
+    "activated_expansion_ids",
+    "review_of"
+  ],
+  "properties": {
+    "schema": {
+      "const": "studio-context-packet/1"
+    },
+    "packet_id": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9-]*-CONTEXT-[0-9]{3}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "issued_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "previous_revision": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/reviewedPacketPin"
+        }
+      ]
+    },
+    "audience": {
+      "enum": ["implementer", "integrator", "reviewer"]
+    },
+    "assignment": {
+      "$ref": "#/$defs/assignment"
+    },
+    "profile": {
+      "$ref": "#/$defs/profilePin"
+    },
+    "pins": {
+      "$ref": "#/$defs/pins"
+    },
+    "budget": {
+      "$ref": "#/$defs/budget"
+    },
+    "required_context": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/contextEntry"
+      }
+    },
+    "activated_expansion_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/stableId"
+      }
+    },
+    "review_of": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/reviewOf"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "revision": {
+            "const": 1
+          }
+        },
+        "required": ["revision"]
+      },
+      "then": {
+        "properties": {
+          "previous_revision": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "previous_revision": {
+            "$ref": "#/$defs/reviewedPacketPin"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "audience": {
+            "const": "reviewer"
+          }
+        },
+        "required": ["audience"]
+      },
+      "then": {
+        "properties": {
+          "assignment": {
+            "properties": {
+              "access_mode": {
+                "const": "read-only-review"
+              }
+            }
+          },
+          "review_of": {
+            "$ref": "#/$defs/reviewOf"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "assignment": {
+            "properties": {
+              "access_mode": {
+                "const": "write-lease"
+              }
+            }
+          },
+          "review_of": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "hex40": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "stableId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "allOf": [
+        {
+          "pattern": "^[A-Za-z0-9._@+\\-]+(?:/[A-Za-z0-9._@+\\-]+)*$"
+        },
+        {
+          "not": {
+            "pattern": "(^|/)\\.{1,2}(/|$)"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(^|/)[^/]*\\.(/|$)"
+          }
+        }
+      ]
+    },
+    "gitRef": {
+      "type": "string",
+      "pattern": "^refs/(heads|tags)/[A-Za-z0-9._@+\\-/]+$"
+    },
+    "notApplicablePhasePin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {
+          "const": "not-applicable"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "requiredPhasePin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "tag",
+        "tag_object",
+        "remote_tag_object",
+        "commit",
+        "tree",
+        "verification_status",
+        "lock"
+      ],
+      "properties": {
+        "status": {
+          "const": "required"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "remote_tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "verification_status": {
+          "const": "verified"
+        },
+        "lock": {
+          "$ref": "#/$defs/gitBlobPin"
+        }
+      }
+    },
+    "contractPhasePin": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/notApplicablePhasePin"
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/requiredPhasePin"
+            },
+            {
+              "properties": {
+                "lock": {
+                  "properties": {
+                    "path": {
+                      "const": "contracts/contracts.lock.json"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "fixturePhasePin": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/notApplicablePhasePin"
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/requiredPhasePin"
+            },
+            {
+              "properties": {
+                "lock": {
+                  "properties": {
+                    "path": {
+                      "const": "fixtures/fixtures.lock.json"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "gitBlobPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "commit", "git_blob_oid", "digest_domain", "sha256"],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repositoryPath"
+        },
+        "commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "git_blob_oid": {
+          "$ref": "#/$defs/hex40"
+        },
+        "digest_domain": {
+          "const": "git-blob-payload-sha256/1"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "activationLedgerPin": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/gitBlobPin"
+        },
+        {
+          "properties": {
+            "path": {
+              "const": "coordination/studio-ledger.json"
+            }
+          }
+        }
+      ]
+    },
+    "assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "work_package",
+        "accountable_owner",
+        "branch",
+        "worktree",
+        "access_mode",
+        "lease_id",
+        "lease_entries",
+        "assignment_receipt_id",
+        "authoritative_remote_url",
+        "reserved_ids",
+        "permitted_imports",
+        "required_ports",
+        "required_outputs",
+        "acceptance_commands",
+        "known_upstream_limitations",
+        "non_goals",
+        "composition_instructions",
+        "return_destination",
+        "s00_contact",
+        "escalation_destination"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "work_package": {
+          "$ref": "#/$defs/stableId"
+        },
+        "accountable_owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branch": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "worktree": {
+          "type": "string",
+          "minLength": 1
+        },
+        "access_mode": {
+          "enum": ["write-lease", "read-only-review"]
+        },
+        "lease_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "lease_entries": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/leaseEntry"
+          }
+        },
+        "assignment_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "authoritative_remote_url": {
+          "const": "https://github.com/maj-6/library-tool.git"
+        },
+        "reserved_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "permitted_imports": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required_ports": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required_outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "acceptance_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "known_upstream_limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "non_goals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "composition_instructions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "return_destination": {
+          "type": "string",
+          "minLength": 1
+        },
+        "s00_contact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "escalation_destination": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "profilePin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "profile_id", "manifest", "manifest_jcs_sha256"],
+      "properties": {
+        "schema": {
+          "const": "studio-context-profiles/1"
+        },
+        "profile_id": {
+          "enum": [
+            "B00",
+            "C00",
+            "T01",
+            "E10",
+            "D20",
+            "U20",
+            "E11-E21",
+            "U21-U27",
+            "I30"
+          ]
+        },
+        "manifest": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/gitBlobPin"
+            },
+            {
+              "properties": {
+                "path": {
+                  "const": "coordination/context-profiles.json"
+                }
+              }
+            }
+          ]
+        },
+        "manifest_jcs_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "coordinationPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref",
+        "ledger_commit",
+        "ledger_path",
+        "ledger_git_blob_oid",
+        "digest_domain",
+        "sha256",
+        "protection_receipt_id"
+      ],
+      "properties": {
+        "ref": {
+          "const": "refs/heads/studio-s00-coordination"
+        },
+        "ledger_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "ledger_path": {
+          "const": "coordination/studio-ledger.json"
+        },
+        "ledger_git_blob_oid": {
+          "$ref": "#/$defs/hex40"
+        },
+        "digest_domain": {
+          "const": "git-blob-payload-sha256/1"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "protection_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        }
+      }
+    },
+    "basePin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "tag_object",
+        "remote_tag_object",
+        "commit",
+        "tree",
+        "verification_status"
+      ],
+      "properties": {
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "remote_tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "verification_status": {
+          "const": "verified"
+        }
+      }
+    },
+    "protocolPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "tag_object",
+        "remote_tag_object",
+        "commit",
+        "tree",
+        "verification_status",
+        "protocol_version",
+        "handoff",
+        "specification_revision",
+        "specification"
+      ],
+      "properties": {
+        "tag": {
+          "const": "studio-adoption-v1.1.1"
+        },
+        "tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "remote_tag_object": {
+          "$ref": "#/$defs/hex40"
+        },
+        "commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "tree": {
+          "$ref": "#/$defs/hex40"
+        },
+        "verification_status": {
+          "const": "verified"
+        },
+        "protocol_version": {
+          "const": "1.0.1"
+        },
+        "handoff": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/gitBlobPin"
+            },
+            {
+              "properties": {
+                "path": {
+                  "const": "docs/living-edition-concurrent-session-handoff.md"
+                }
+              }
+            }
+          ]
+        },
+        "specification_revision": {
+          "const": "1.1.1"
+        },
+        "specification": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/gitBlobPin"
+            },
+            {
+              "properties": {
+                "path": {
+                  "const": "docs/living-edition-production-build-spec.md"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "contextSchemaPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "artifact"],
+      "properties": {
+        "schema_id": {
+          "const": "https://worldherblibrary.org/schemas/studio-context-packet-1.0.json"
+        },
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/gitBlobPin"
+            },
+            {
+              "properties": {
+                "path": {
+                  "const": "coordination/context-packet.schema.json"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "pins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coordination",
+        "base",
+        "contract",
+        "fixture",
+        "protocol",
+        "context_schema"
+      ],
+      "properties": {
+        "coordination": {
+          "$ref": "#/$defs/coordinationPin"
+        },
+        "base": {
+          "$ref": "#/$defs/basePin"
+        },
+        "contract": {
+          "$ref": "#/$defs/contractPhasePin"
+        },
+        "fixture": {
+          "$ref": "#/$defs/fixturePhasePin"
+        },
+        "protocol": {
+          "$ref": "#/$defs/protocolPin"
+        },
+        "context_schema": {
+          "$ref": "#/$defs/contextSchemaPin"
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "default_utf8_bytes",
+        "hard_max_utf8_bytes",
+        "authorized_utf8_bytes",
+        "selected_utf8_bytes",
+        "manifest_jcs_bytes",
+        "manifest_hard_max_bytes",
+        "above_default_reason"
+      ],
+      "properties": {
+        "unit": {
+          "const": "utf8-bytes"
+        },
+        "default_utf8_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hard_max_utf8_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "authorized_utf8_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "selected_utf8_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "manifest_jcs_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536
+        },
+        "manifest_hard_max_bytes": {
+          "const": 65536
+        },
+        "above_default_reason": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      }
+    },
+    "headingAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["heading_level", "heading_text", "occurrence"],
+      "properties": {
+        "heading_level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "heading_text": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\r\\n]+$"
+        },
+        "occurrence": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "wholeGitBlobSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "const": "whole-git-blob/1"
+        }
+      }
+    },
+    "markdownHeadingSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "heading_level", "heading_text", "occurrence"],
+      "properties": {
+        "kind": {
+          "const": "markdown-heading-section/1"
+        },
+        "heading_level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "heading_text": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\r\\n]+$"
+        },
+        "occurrence": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "markdownTableRowSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "containing_heading",
+        "table_columns",
+        "table_occurrence",
+        "key_column",
+        "key_value"
+      ],
+      "properties": {
+        "kind": {
+          "const": "markdown-table-row/1"
+        },
+        "containing_heading": {
+          "$ref": "#/$defs/headingAnchor"
+        },
+        "table_columns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^|\\r\\n]+$"
+          }
+        },
+        "table_occurrence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "key_column": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^|\\r\\n]+$"
+        },
+        "key_value": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^|\\r\\n]+$"
+        }
+      }
+    },
+    "jsonScalar": {
+      "type": ["string", "number", "integer", "boolean", "null"]
+    },
+    "jsonPointerSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "pointer"],
+      "properties": {
+        "kind": {
+          "const": "rfc6901-json-pointer/1"
+        },
+        "pointer": {
+          "type": "string",
+          "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+        },
+        "expected_identity": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonScalar"
+          }
+        }
+      }
+    },
+    "selector": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/wholeGitBlobSelector"
+        },
+        {
+          "$ref": "#/$defs/markdownHeadingSelector"
+        },
+        {
+          "$ref": "#/$defs/markdownTableRowSelector"
+        },
+        {
+          "$ref": "#/$defs/jsonPointerSelector"
+        }
+      ]
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest_domain", "sha256", "selected_utf8_bytes"],
+      "properties": {
+        "digest_domain": {
+          "enum": ["selected-git-blob-bytes-sha256/1", "rfc8785-jcs-sha256/1"]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "selected_utf8_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "contextEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context_id",
+        "capsule",
+        "expansion_id",
+        "purpose",
+        "repository_url",
+        "media_type",
+        "source",
+        "selector",
+        "selection"
+      ],
+      "properties": {
+        "context_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "capsule": {
+          "enum": ["universal", "package", "expansion"]
+        },
+        "expansion_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/stableId"
+            }
+          ]
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository_url": {
+          "const": "https://github.com/maj-6/library-tool.git"
+        },
+        "media_type": {
+          "enum": [
+            "text/markdown; charset=utf-8",
+            "application/json; charset=utf-8",
+            "text/plain; charset=utf-8"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/gitBlobPin"
+        },
+        "selector": {
+          "$ref": "#/$defs/selector"
+        },
+        "selection": {
+          "$ref": "#/$defs/selection"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capsule": {
+                "const": "expansion"
+              }
+            },
+            "required": ["capsule"]
+          },
+          "then": {
+            "properties": {
+              "expansion_id": {
+                "$ref": "#/$defs/stableId"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "expansion_id": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "selector": {
+                "properties": {
+                  "kind": {
+                    "const": "rfc6901-json-pointer/1"
+                  }
+                },
+                "required": ["kind"]
+              }
+            },
+            "required": ["selector"]
+          },
+          "then": {
+            "properties": {
+              "media_type": {
+                "const": "application/json; charset=utf-8"
+              },
+              "selection": {
+                "properties": {
+                  "digest_domain": {
+                    "const": "rfc8785-jcs-sha256/1"
+                  }
+                },
+                "required": ["digest_domain"]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "selection": {
+                "properties": {
+                  "digest_domain": {
+                    "const": "selected-git-blob-bytes-sha256/1"
+                  }
+                },
+                "required": ["digest_domain"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "selector": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "markdown-heading-section/1",
+                      "markdown-table-row/1"
+                    ]
+                  }
+                },
+                "required": ["kind"]
+              }
+            },
+            "required": ["selector"]
+          },
+          "then": {
+            "properties": {
+              "media_type": {
+                "const": "text/markdown; charset=utf-8"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "reviewedPacketPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "packet_id",
+        "revision",
+        "path",
+        "commit",
+        "git_blob_oid",
+        "digest_domain",
+        "sha256"
+      ],
+      "properties": {
+        "packet_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "path": {
+          "$ref": "#/$defs/repositoryPath"
+        },
+        "commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "git_blob_oid": {
+          "$ref": "#/$defs/hex40"
+        },
+        "digest_domain": {
+          "const": "rfc8785-jcs-sha256/1"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "contextPacketActivationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "session_id",
+        "work_package",
+        "lease_id",
+        "assignment_receipt_id",
+        "packet",
+        "profile",
+        "budget",
+        "activated_expansion_ids",
+        "packet_revision_chain",
+        "handoff_head"
+      ],
+      "properties": {
+        "schema": {
+          "const": "studio-context-packet-activation/1"
+        },
+        "session_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "work_package": {
+          "$ref": "#/$defs/stableId"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "assignment_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "packet": {
+          "$ref": "#/$defs/reviewedPacketPin"
+        },
+        "profile": {
+          "$ref": "#/$defs/profilePin"
+        },
+        "budget": {
+          "$ref": "#/$defs/budget"
+        },
+        "activated_expansion_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          }
+        },
+        "packet_revision_chain": {
+          "description": "Ordered packet pins from revision 1 through the exact packet pin.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reviewedPacketPin"
+          }
+        },
+        "handoff_head": {
+          "type": "null"
+        }
+      }
+    },
+    "contextPacketReturnReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "session_id",
+        "work_package",
+        "lease_id",
+        "assignment_receipt_id",
+        "access_mode",
+        "packet",
+        "base_commit",
+        "handoff_head",
+        "lease_entries",
+        "changed_paths",
+        "acceptance_commands",
+        "checks",
+        "clean_worktree",
+        "ordered_commits",
+        "merge_commits"
+      ],
+      "properties": {
+        "schema": {
+          "const": "studio-context-packet-return/1"
+        },
+        "session_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "work_package": {
+          "$ref": "#/$defs/stableId"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "assignment_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "access_mode": {
+          "const": "write-lease"
+        },
+        "packet": {
+          "$ref": "#/$defs/reviewedPacketPin"
+        },
+        "base_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "handoff_head": {
+          "$ref": "#/$defs/hex40"
+        },
+        "lease_entries": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/leaseEntry"
+          }
+        },
+        "changed_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryPath"
+          }
+        },
+        "acceptance_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/contextPacketReviewCheck"
+          }
+        },
+        "clean_worktree": {
+          "const": true
+        },
+        "ordered_commits": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/hex40"
+          }
+        },
+        "merge_commits": {
+          "type": "array",
+          "maxItems": 0,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/hex40"
+          }
+        }
+      }
+    },
+    "contextPacketHandoffReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "session_id",
+        "work_package",
+        "lease_id",
+        "assignment_receipt_id",
+        "activation_receipt_id",
+        "activation_ledger",
+        "packet",
+        "profile",
+        "budget",
+        "activated_expansion_ids",
+        "packet_revision_chain",
+        "handoff_head",
+        "return_receipt_id"
+      ],
+      "properties": {
+        "schema": {
+          "const": "studio-context-packet-handoff/1"
+        },
+        "session_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "work_package": {
+          "$ref": "#/$defs/stableId"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "assignment_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "activation_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "activation_ledger": {
+          "$ref": "#/$defs/activationLedgerPin"
+        },
+        "packet": {
+          "$ref": "#/$defs/reviewedPacketPin"
+        },
+        "profile": {
+          "$ref": "#/$defs/profilePin"
+        },
+        "budget": {
+          "$ref": "#/$defs/budget"
+        },
+        "activated_expansion_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          }
+        },
+        "packet_revision_chain": {
+          "description": "Ordered packet pins from revision 1 through the exact final implementer packet pin.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reviewedPacketPin"
+          }
+        },
+        "handoff_head": {
+          "$ref": "#/$defs/hex40"
+        },
+        "return_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        }
+      }
+    },
+    "contextPacketReviewCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "command", "exit_code", "result"],
+      "properties": {
+        "check_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "result": {
+          "enum": ["passed", "failed"]
+        }
+      }
+    },
+    "contextPacketReviewReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "reviewer_session_id",
+        "implementation_session_id",
+        "work_package",
+        "lease_id",
+        "reviewer_packet",
+        "reviewer_revision_chain",
+        "implementation_packet",
+        "implementation_revision_chain",
+        "handoff_head",
+        "return_receipt_id",
+        "handoff_receipt_id",
+        "checks",
+        "outcome"
+      ],
+      "properties": {
+        "schema": {
+          "const": "studio-context-packet-review/1"
+        },
+        "reviewer_session_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "implementation_session_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "work_package": {
+          "$ref": "#/$defs/stableId"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "reviewer_packet": {
+          "$ref": "#/$defs/reviewedPacketPin"
+        },
+        "reviewer_revision_chain": {
+          "description": "Ordered reviewer packet pins from revision 1 through the exact reviewer packet pin.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reviewedPacketPin"
+          }
+        },
+        "implementation_packet": {
+          "$ref": "#/$defs/reviewedPacketPin"
+        },
+        "implementation_revision_chain": {
+          "description": "Ordered implementation packet pins from revision 1 through the exact final implementer packet pin.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reviewedPacketPin"
+          }
+        },
+        "handoff_head": {
+          "$ref": "#/$defs/hex40"
+        },
+        "return_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "handoff_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/contextPacketReviewCheck"
+          }
+        },
+        "outcome": {
+          "enum": ["accepted", "changes-requested", "rejected"]
+        }
+      }
+    },
+    "contextPacketReceiptPayload": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/contextPacketActivationReceipt"
+        },
+        {
+          "$ref": "#/$defs/contextPacketReturnReceipt"
+        },
+        {
+          "$ref": "#/$defs/contextPacketHandoffReceipt"
+        },
+        {
+          "$ref": "#/$defs/contextPacketReviewReceipt"
+        }
+      ]
+    },
+    "leaseEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": {
+          "enum": ["exact-file", "subtree"]
+        },
+        "path": {
+          "$ref": "#/$defs/repositoryPath"
+        }
+      }
+    },
+    "reviewOf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation_packet",
+        "implementation_session_id",
+        "work_package",
+        "implementation_lease_id",
+        "base_commit",
+        "handoff_head",
+        "lease",
+        "changed_paths",
+        "return_receipt_id",
+        "handoff_receipt_id",
+        "acceptance_commands"
+      ],
+      "properties": {
+        "implementation_packet": {
+          "$ref": "#/$defs/reviewedPacketPin"
+        },
+        "implementation_session_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "work_package": {
+          "$ref": "#/$defs/stableId"
+        },
+        "implementation_lease_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "base_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "handoff_head": {
+          "$ref": "#/$defs/hex40"
+        },
+        "lease": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/leaseEntry"
+          }
+        },
+        "changed_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryPath"
+          }
+        },
+        "return_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "handoff_receipt_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "acceptance_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "contextRouteEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context_id",
+        "source_path",
+        "media_type",
+        "selector",
+        "purpose"
+      ],
+      "properties": {
+        "context_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "source_path": {
+          "$ref": "#/$defs/repositoryPath"
+        },
+        "media_type": {
+          "enum": [
+            "text/markdown; charset=utf-8",
+            "application/json; charset=utf-8",
+            "text/plain; charset=utf-8"
+          ]
+        },
+        "selector": {
+          "$ref": "#/$defs/selector"
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "contextRoutes": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/stableId"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "$ref": "#/$defs/contextRouteEntry"
+        }
+      }
+    },
+    "profileTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context_id", "capsule", "source_id", "selector", "purpose"],
+      "properties": {
+        "context_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "capsule": {
+          "enum": ["universal", "package"]
+        },
+        "source_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "selector": {
+          "$ref": "#/$defs/selector"
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "profilePhaseExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectation", "not_applicable_reason"],
+      "properties": {
+        "expectation": {
+          "enum": ["required", "not-applicable", "producer"]
+        },
+        "not_applicable_reason": {
+          "enum": [
+            null,
+            "contract tag does not exist",
+            "fixture tag does not exist",
+            "C00 produces the contract tag",
+            "T01 produces the fixture tag"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "expectation": {
+                "const": "required"
+              }
+            },
+            "required": ["expectation"]
+          },
+          "then": {
+            "properties": {
+              "not_applicable_reason": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "not_applicable_reason": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "requiredInitialExpansionRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expansion_id", "phase_pin", "route_pointer_template"],
+      "properties": {
+        "expansion_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "phase_pin": {
+          "enum": ["contract", "fixture"]
+        },
+        "route_pointer_template": {
+          "const": "/context_routes/{work_package}"
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "work_packages",
+        "required_base",
+        "contract_pin",
+        "fixture_pin",
+        "default_utf8_bytes",
+        "hard_max_utf8_bytes",
+        "templates",
+        "package_templates",
+        "required_initial_expansion_routes",
+        "allowed_expansion_ids"
+      ],
+      "properties": {
+        "profile_id": {
+          "enum": [
+            "B00",
+            "C00",
+            "T01",
+            "E10",
+            "D20",
+            "U20",
+            "E11-E21",
+            "U21-U27",
+            "I30"
+          ]
+        },
+        "work_packages": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          }
+        },
+        "required_base": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contract_pin": {
+          "$ref": "#/$defs/profilePhaseExpectation"
+        },
+        "fixture_pin": {
+          "$ref": "#/$defs/profilePhaseExpectation"
+        },
+        "default_utf8_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hard_max_utf8_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "templates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/profileTemplate"
+          }
+        },
+        "package_templates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["work_package", "templates"],
+            "properties": {
+              "work_package": {
+                "$ref": "#/$defs/stableId"
+              },
+              "templates": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "#/$defs/profileTemplate"
+                }
+              }
+            }
+          }
+        },
+        "required_initial_expansion_routes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/requiredInitialExpansionRoute"
+          }
+        },
+        "allowed_expansion_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "profile_id": {
+                "const": "B00"
+              }
+            },
+            "required": ["profile_id"]
+          },
+          "then": {
+            "properties": {
+              "contract_pin": {
+                "const": {
+                  "expectation": "not-applicable",
+                  "not_applicable_reason": "contract tag does not exist"
+                }
+              },
+              "fixture_pin": {
+                "const": {
+                  "expectation": "not-applicable",
+                  "not_applicable_reason": "fixture tag does not exist"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profile_id": {
+                "const": "C00"
+              }
+            },
+            "required": ["profile_id"]
+          },
+          "then": {
+            "properties": {
+              "contract_pin": {
+                "const": {
+                  "expectation": "producer",
+                  "not_applicable_reason": "C00 produces the contract tag"
+                }
+              },
+              "fixture_pin": {
+                "const": {
+                  "expectation": "not-applicable",
+                  "not_applicable_reason": "fixture tag does not exist"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profile_id": {
+                "const": "T01"
+              }
+            },
+            "required": ["profile_id"]
+          },
+          "then": {
+            "properties": {
+              "contract_pin": {
+                "const": {
+                  "expectation": "required",
+                  "not_applicable_reason": null
+                }
+              },
+              "fixture_pin": {
+                "const": {
+                  "expectation": "producer",
+                  "not_applicable_reason": "T01 produces the fixture tag"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profile_id": {
+                "enum": ["E10", "D20", "U20", "E11-E21", "U21-U27", "I30"]
+              }
+            },
+            "required": ["profile_id"]
+          },
+          "then": {
+            "properties": {
+              "contract_pin": {
+                "const": {
+                  "expectation": "required",
+                  "not_applicable_reason": null
+                }
+              },
+              "fixture_pin": {
+                "const": {
+                  "expectation": "required",
+                  "not_applicable_reason": null
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "profileManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "version",
+        "digest_domain",
+        "template_sources",
+        "universal_templates",
+        "audience_templates",
+        "expansion_catalog",
+        "profiles"
+      ],
+      "properties": {
+        "schema": {
+          "const": "studio-context-profiles/1"
+        },
+        "version": {
+          "const": 1
+        },
+        "digest_domain": {
+          "const": "rfc8785-jcs-sha256/1"
+        },
+        "template_sources": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source_id", "path", "media_type"],
+            "properties": {
+              "source_id": {
+                "$ref": "#/$defs/stableId"
+              },
+              "path": {
+                "$ref": "#/$defs/repositoryPath"
+              },
+              "media_type": {
+                "enum": [
+                  "text/markdown; charset=utf-8",
+                  "application/json; charset=utf-8",
+                  "text/plain; charset=utf-8"
+                ]
+              }
+            }
+          }
+        },
+        "universal_templates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/profileTemplate"
+          }
+        },
+        "audience_templates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["implementer", "integrator", "reviewer"],
+          "properties": {
+            "implementer": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/profileTemplate"
+              }
+            },
+            "integrator": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/profileTemplate"
+              }
+            },
+            "reviewer": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/profileTemplate"
+              }
+            }
+          }
+        },
+        "expansion_catalog": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expansion_id", "trigger"],
+            "properties": {
+              "expansion_id": {
+                "$ref": "#/$defs/stableId"
+              },
+              "trigger": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "profiles": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "items": {
+            "$ref": "#/$defs/profile"
+          }
+        }
+      }
+    }
+  }
+}
