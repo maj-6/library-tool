@@ -2956,10 +2956,18 @@ checked out and its digest and 33/33/34 counts verify from a clean worktree.
   evidence before GB acceptance and, for C00 and later, validates source
   Git-blob pins, unique selector resolution, selected-value digests and byte
   lengths, packet-manifest JCS digest, frozen initial-expansion routes, closed
-  activation/handoff/review receipt payloads, and the authorized UTF-8 byte
-  budget before presentation; semantic emission additionally requires the exact
-  externally pinned activation-receipt ledger commit/digest and an active
-  session/lease, never only a caller-supplied packet digest;
+  activation/return/handoff/review receipt payloads, and the authorized UTF-8 byte
+  budget before presentation; semantic emission separately validates the exact
+  externally pinned historical activation ledger, samples and parses the live
+  protected-ref ledger, requires the matching session and access lease to remain
+  active with an exact access-mode validation entry, and resamples the ref before
+  emission, failing if its HEAD changed; `context-packet-handoff` receipts carry
+  a full `activation_ledger` Git-blob pin and never search the earlier assignment
+  ledger for the activation receipt; reviewer validation binds implementation
+  session, package, lease, base, handoff receipt, return receipt, changed paths,
+  commands, and unchanged HEAD to the resolved implementation packet, Git diff,
+  and ledger receipts; phase `not-applicable` reasons match the selected profile
+  byte-for-byte; a caller-supplied packet digest alone never authorizes emission;
 - B00 records the exact S00 Git build/runtime and provides the clean
   `merge-tree`/accepted-blob provenance verifier that S00 uses even for B00's own
   baseline assembly;
@@ -3173,15 +3181,17 @@ product behavior. The `Owned paths` column is exclusive for production paths.
 Every B00 and later session receives the closed, digest-pinned required context
 defined by the concurrent-session protocol and may obtain more only through
 progressive disclosure. Repository readability does not make unlisted material
-required or authoritative. A session writes only its active lease. A01 uses the
-complete two-document pins and checks in its protocol-1.0 work order instead.
+required or authoritative. An implementer or integrator uses `write-lease` and
+writes only its active lease; a reviewer uses a separate active
+`read-only-review` scope lease whose nonempty entries grant zero writes. A01 uses
+the complete two-document pins and checks in its protocol-1.0 work order instead.
 
 Existing `schemas/**`, `tools/**`, `tests/**`, `examples/**`, `data/**`, legacy
 applications, and legacy workflows are read-only migration inputs unless a
 separate non-Studio task explicitly owns them. C00, E17, or another package
 copies reviewed material into its owned production path; it does not edit the
 legacy source in place. One session equals one work package, branch, external
-worktree, and non-overlapping S00 lease. The shared primary checkout is
+worktree, and non-overlapping S00 access lease. The shared primary checkout is
 inspection-only while concurrent sessions are active.
 
 The production-only `tools/studio/**` carve-out is owned by B00 and later I30;
@@ -3542,19 +3552,30 @@ worktree and branch, authoritative remote, immutable base tag
 object/commit/tree, each
 phase-required contract and fixture tag object/lock digest or the exact
 `not-applicable` phase reason, exclusive
-lease, reserved public IDs, permitted imports/ports, required outputs, exact
-acceptance commands, escalation destination, context packet ID and revision,
-audience, phase profile, default/hard/authorized UTF-8 byte budget, manifest
-digest, and the closed ordered `required_context`. From B00 onward, no
+access lease, `access_mode` (`write-lease` or `read-only-review`), reserved public
+IDs, permitted imports/ports, required outputs, exact acceptance commands,
+escalation destination, context packet ID and revision, audience, phase profile,
+default/hard/authorized UTF-8 byte budget, manifest digest, and the closed
+ordered `required_context`. Each `not-applicable` reason MUST exactly equal the
+selected profile's frozen reason. From B00 onward, no
 implementation or review session may inherit a conversation or start from an
 informal prompt that omits those fields. Referenced links, files, directories,
 and prior packets do not recursively add context.
 
 Additional authoritative context requires the protocol's immutable
 progressive-disclosure revision. Every B00-and-later handoff pins the final
-context-packet digest and all activated revisions. Every independent reviewer
-receives a distinct reviewer packet rather than the implementer's conversation
-or an implicit union of its context.
+context-packet digest, all activated revisions, and the full latest cumulative
+pre-handoff `activation_ledger` Git-blob pin that contains both the named
+activation and return receipts.
+Its `return_receipt_id` resolves one closed `studio-context-packet-return/1`
+payload that is reconstructed from the exact base-to-head Git evidence and
+acceptance checks.
+Every independent reviewer receives a distinct `read-only-review` packet and a
+separate active non-write review-scope lease rather than the implementer's
+conversation or an implicit union of its context. Its `review_of` facts bind the
+implementation session, package, lease, base, handoff and return receipts,
+base-to-handoff changed paths, commands, and unchanged HEAD mechanically. A
+review lease grants zero repository writes.
 
 At minimum, every handoff is a clean committed branch with a lease-bound diff,
 test/build receipts, public-surface inventory, unchanged-frozen-input

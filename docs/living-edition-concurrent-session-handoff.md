@@ -78,7 +78,7 @@ One implementation session has exactly:
 - one external Git worktree;
 - one immutable base tag and commit;
 - for B00 and later, one immutable, digest-pinned context-packet revision;
-- one active, non-overlapping write lease;
+- one active, non-overlapping access lease whose mode is fixed by the assignment;
 - one set of reserved public IDs;
 - one accountable package owner.
 
@@ -92,8 +92,12 @@ The shared primary checkout's content is read-only while concurrent sessions are
 active. An implementation session MUST NOT work in it. S00 alone may use it for
 approved common-Git-directory administration—listing/adding/removing registered
 worktrees and read-only ref inspection—without editing or committing its files.
-A reviewer is read-only unless S00 separately assigns a branch, worktree, and
-lease.
+Every reviewer has a separate active session, branch, worktree, and nonempty
+review-scope lease. Its assignment sets `access_mode` to `read-only-review`; the
+lease entries constrain what the reviewer may observe and grant zero repository
+writes. An implementer or integrator assignment sets `access_mode` to
+`write-lease`. A reviewer who must make a correction requires a distinct
+write-lease assignment rather than mutation of the review session.
 
 Handoffs contain commits, not working-tree patches. A branch name is never a
 baseline: every brief and receipt records the peeled commit and required
@@ -174,10 +178,11 @@ clean committed branch plus evidence.
 ### Reviewer/validator
 
 A reviewer verifies the diff, ownership, public surface, and receipts from a
-separate closed reviewer packet. It inherits neither the implementer's
-conversation nor its caches and does not make opportunistic fixes in the
-implementer's branch. Findings return to the package owner unless S00 issues a
-separate corrective lease.
+separate closed reviewer packet and active `read-only-review` scope lease. Its
+nonempty lease entries are observation bounds, not write authority. It inherits
+neither the implementer's conversation nor its caches and does not make
+opportunistic fixes in the implementer's branch. Findings return to the package
+owner unless S00 issues a separate corrective `write-lease` session.
 
 ### I30 — integrator
 
@@ -223,6 +228,16 @@ The packet, ledger, start check, and return receipt MUST carry either the exact
 required pin or the literal `not-applicable` plus the reason from this table.
 They MUST NOT invent a placeholder tag or digest for a phase that produces that
 artifact.
+
+For `studio-context-profiles/1`, the exact B00 contract and fixture reasons are
+`contract tag does not exist` and `fixture tag does not exist`; C00's exact
+contract and fixture reasons are `C00 produces the contract tag` and
+`fixture tag does not exist`; and T01's exact fixture reason is
+`T01 produces the fixture tag`. The profile stores each phase expectation with
+`not_applicable_reason`; required pins store `null`. A `producer` expectation is
+represented in the packet and ledger by `status: not-applicable` plus that exact
+producer reason. The validator compares these strings byte-for-byte among the
+profile, packet, and ledger; paraphrases and punctuation changes fail.
 
 A00's live-coordination input is likewise `not-applicable`: its approved
 bootstrap ledger path and SHA-256 replace the protected-ref fields. B00 and every
@@ -469,6 +484,27 @@ Minimum session record:
 }
 ```
 
+For B00 and later, `session.validation` contains exactly one context access-mode
+entry with this closed semantic shape:
+
+```json
+{
+  "schema": "studio-context-access-mode/1",
+  "session_id": "U23-001",
+  "work_package": "U23",
+  "assignment_receipt_id": "<assignment-receipt-id>",
+  "lease_id": "lease-U23-001-01",
+  "access_mode": "write-lease"
+}
+```
+
+The five identity values MUST equal the containing session and resolved packet
+assignment. Exactly one matching entry is allowed. A reviewer uses
+`read-only-review` and still has `status: active`, `lease_state: active`, a
+nonnull `lease_id`, and nonempty observation-scope `lease_entries`; this ledger
+1.0 validation extension grants no write authority and does not change the
+ledger schema.
+
 The coordination-ledger schema remains version `1.0`; protocol `1.0.1` does not
 silently change that published schema ID or the historical bootstrap subtree.
 For B00 and later, S00 first appends a `context-packet-activation` receipt that
@@ -476,24 +512,42 @@ pins `studio-context-packet/1`, packet ID/revision/path/commit/blob OID, phase
 profile, `rfc8785-jcs-sha256/1` manifest digest, budget, and activated expansion
 IDs before selected context is presented. It omits a handoff HEAD that does not
 yet exist. The later `context-packet-handoff` receipt repeats those pins and
-binds the final implementer packet revision to the unchanged handoff HEAD.
+binds the final implementer packet revision to the unchanged handoff HEAD. It
+also carries `activation_ledger`, a complete `gitBlobPin` whose path is exactly
+`coordination/studio-ledger.json` and whose commit identifies the latest
+cumulative pre-handoff ledger blob. That blob MUST contain exactly one named
+outer `context-packet-activation` receipt and exactly one named outer
+`context-packet-return` receipt for the session.
 Receipt payloads are the ledger 1.0 extension seam. The packet itself cannot
 contain its own commit or digest.
 
 The activation receipt's containing coordination commit and raw ledger-blob
-digest are an external activation pin because neither can appear in the packet
-or receipt without self-reference. Before emission, the validator MUST read that
-exact committed ledger blob through Git, prove the packet's assignment-ledger
-commit is its ancestor, find exactly one named activation receipt, validate its
-closed payload and packet revision chain, and confirm that the same session and
-lease are `active`. A caller-supplied packet digest alone never authorizes
-semantic presentation. Candidate validation before the activation commit may
-compute the digest while the pinned assignment state is `ready` with an `issued`
-lease, but it MUST NOT emit context.
+digest are an external historical activation pin because neither can appear in
+the packet or activation receipt without self-reference. Emission validation
+MUST treat that historical pin and current authority as separate checks. It
+first samples the authoritative remote's protected coordination-ref HEAD, fetches
+that exact commit into the session-local ref, reads and validates its complete
+ledger 1.0 blob, and resolves exactly one session matching the packet's session,
+work package, assignment receipt, lease, and access-mode validation entry. Both
+the live session status and live access-lease state MUST be `active`. A
+`write-lease` authorizes only its nonoverlapping write entries; a
+`read-only-review` lease authorizes only bounded observation and zero writes.
+
+The validator separately reads the externally pinned historical activation
+ledger blob, proves its commit is an ancestor of the sampled live HEAD, finds
+exactly one named activation receipt there, and validates its closed payload and
+packet revision chain. After all packet, selector, digest, budget, and live-state
+checks but before emitting any selected bytes, it samples the protected ref
+again. If the second HEAD differs from the first, validation fails with
+`coordination-ref-changed`; it MUST NOT emit from the stale sample. A
+caller-supplied packet or activation digest alone never authorizes semantic
+presentation. Candidate validation before the activation commit may compute the
+digest while the pinned assignment state is `ready` with an `issued` lease, but
+it MUST NOT emit context.
 
 The closed receipt payload schemas are the
-`contextPacketActivationReceipt`, `contextPacketHandoffReceipt`, and
-`contextPacketReviewReceipt` definitions in
+`contextPacketActivationReceipt`, `contextPacketReturnReceipt`,
+`contextPacketHandoffReceipt`, and `contextPacketReviewReceipt` definitions in
 `coordination/context-packet.schema.json`; ledger extension payloads MUST
 validate against the corresponding definition with no additional properties.
 Their exact required fields are:
@@ -502,15 +556,35 @@ Their exact required fields are:
   `assignment_receipt_id`, `packet`, `profile`, `budget`,
   `activated_expansion_ids`, ordered `packet_revision_chain`, and
   `handoff_head`, which is `null`;
+- return: `schema`, `session_id`, `work_package`, `lease_id`,
+  `assignment_receipt_id`, `access_mode`, `packet`, `base_commit`,
+  `handoff_head`, `lease_entries`, `changed_paths`, `acceptance_commands`, closed
+  `checks`, `clean_worktree`, ordered `ordered_commits`, and empty
+  `merge_commits`; `access_mode` is exactly `write-lease` and
+  `clean_worktree` is exactly `true`;
 - handoff: `schema`, `session_id`, `work_package`, `lease_id`,
-  `assignment_receipt_id`, `activation_receipt_id`, `packet`, `profile`,
-  `budget`, `activated_expansion_ids`, ordered `packet_revision_chain`,
-  non-null `handoff_head`, and `return_receipt_id`;
+  `assignment_receipt_id`, `activation_receipt_id`, `activation_ledger`,
+  `packet`, `profile`, `budget`, `activated_expansion_ids`, ordered
+  `packet_revision_chain`, non-null `handoff_head`, and `return_receipt_id`;
 - review: `schema`, `reviewer_session_id`, `implementation_session_id`,
   `work_package`, `lease_id`, `reviewer_packet`, ordered
   `reviewer_revision_chain`, `implementation_packet`, ordered
   `implementation_revision_chain`, the unchanged `handoff_head`,
   `return_receipt_id`, `handoff_receipt_id`, closed `checks`, and `outcome`.
+
+The review receipt's `lease_id` is the reviewer's active non-write scope lease;
+the implementation lease is the separately bound
+`review_of.implementation_lease_id`.
+
+The enclosing ledger receipt kind is `context-packet-activation`,
+`context-packet-return`, `context-packet-handoff`, or `context-packet-review` and
+MUST match the payload schema marker. A handoff resolves exactly one
+`context-packet-return` receipt by `return_receipt_id` and exactly one activation
+receipt by `activation_receipt_id` from its pinned `activation_ledger`. A
+reviewer packet's later assignment-ledger pin independently resolves exactly one
+named `context-packet-handoff` receipt plus that same named
+`context-packet-return` receipt; reviewer `review_of` and the review receipt bind
+both closed payloads.
 
 Each `checks` item has exactly `check_id`, `command`, integer `exit_code`, and
 `result` (`passed` or `failed`). `passed` is valid only for exit code zero;
@@ -523,15 +597,23 @@ packet ID and canonical path, and ends at the separately named packet pin. An
 activation or handoff chain equals all revisions activated for that session; a
 review receipt repeats both its own reviewer chain and the final implementation
 chain. Packet/profile/budget/expansion facts MUST equal the validated packet,
-and review base, lease, changed paths, and commands MUST equal its `review_of`
-facts and the pinned handoff. A differing HEAD or omitted revision fails the
-receipt. These equality and chain rules are semantic validation in addition to
-the closed JSON shape.
+and review implementation session, work package, implementation lease, base,
+handoff receipt, return receipt, changed paths, and commands MUST equal its
+`review_of` facts, the resolved final implementation packet, the base-to-handoff
+Git diff, the closed `context-packet-return` payload, and the pinned ledger
+receipts. The handoff verifier resolves both its `return_receipt_id` and
+`activation_receipt_id` in the latest cumulative pre-handoff
+`activation_ledger`, never in the packet's earlier assignment-ledger pin. A
+differing HEAD, identity, path set, or omitted revision fails the receipt. These
+equality and chain rules are semantic validation in addition to the closed JSON
+shape.
 
 For a nonapplicable phase input, the corresponding pin object is exactly
-`{"status":"not-applicable","reason":"<phase reason>"}` and omits tag and
-digest fields. The ledger schema rejects empty strings, synthetic hashes, or a
-`required` pin with any missing field.
+`{"status":"not-applicable","reason":"<exact profile reason>"}` and omits tag
+and digest fields. The exact reason is frozen above and in the selected profile.
+The ledger schema rejects empty strings, synthetic hashes, or a `required` pin
+with any missing field; the context validator additionally rejects a reason that
+does not exactly match the selected profile.
 
 Only A00 may temporarily set `baseline_verification_status` to
 `remote-baseline-missing` and `remote_base_tag_object` to `null`. Before A00
@@ -581,6 +663,12 @@ back to that assignment, validates the manifest against
 set, not a starting point for recursive discovery. A referenced link,
 directory, prior packet, conversation, or unlisted file adds no implicit
 context.
+
+Every packet assignment has required `access_mode`. A reviewer packet requires
+`read-only-review`; implementer and integrator packets require `write-lease`.
+Both modes retain a nonnull lease ID and nonempty typed lease entries. For
+`read-only-review`, those entries are review-scope observation bounds only and
+MUST NOT be interpreted as repository write authority.
 
 The canonical packet path is
 `coordination/context-packets/<packet_id>.json`. Revisions reuse that path at
@@ -759,18 +847,26 @@ authoritative before that revision. The packet cannot pin its own containing
 commit or digest, so the later activation receipt pins its path, commit, blob
 OID, digest domain, and digest.
 
-Reviewers receive a distinct `audience: reviewer` packet that pins the final
-implementer packet, base and unchanged handoff HEAD, lease-bound path inventory,
-return receipt, exact checks, and its own closed `required_context`. It repeats
-needed selectors rather than importing the implementer's conversation or an
-implicit union of its context.
+Reviewers receive a distinct `audience: reviewer` packet with
+`assignment.access_mode: read-only-review`, a separate active reviewer session,
+and a separate active non-write review-scope lease. `review_of` pins the final
+implementation packet plus `implementation_session_id`, `work_package`,
+`implementation_lease_id`, base and unchanged handoff HEAD, the implementation
+lease-bound path inventory, exact changed paths, `return_receipt_id`,
+`handoff_receipt_id`, and acceptance commands. The validator resolves the final
+implementation packet and both named receipts, reconstructs
+`git diff --name-only <base_commit>...<handoff_head>`, and requires every one of
+those values to match mechanically. The reviewer's own assignment lease is
+distinct from `review_of.implementation_lease_id` and `review_of.lease`. The
+packet repeats needed selectors rather than importing the implementer's
+conversation or an implicit union of its context.
 
 Every assignment brief contains the phase-applicable fields below. For B00 and
 later, the context packet repeats the complete closed brief; A00 and A01 use the
 explicit earlier exceptions and omit packet-only fields.
 
-- session/work-package ID, owner, branch, worktree, lease ID, and canonical
-  `lease_entries` array using the section 6 representation;
+- session/work-package ID, owner, branch, worktree, required `access_mode`, lease
+  ID, and canonical `lease_entries` array using the section 6 representation;
 - protected coordination ref, minimum assignment-ledger commit/digest, and the
   lease ID represented there, or A00's explicit bootstrap-ledger
   `not-applicable` substitution;
@@ -806,6 +902,7 @@ Context packet: studio-context-packet/1 / <packet-id> / revision <n>
 Manifest digest: rfc8785-jcs-sha256/1 / <SHA-256>
 Profile and budget: <profile> / <default> / <hard> / <authorized UTF-8 bytes>
 Activation pin: <receipt ID / containing coordination commit / raw ledger SHA-256>
+Access mode: write-lease
 
 Required context is only the closed ordered selector list in that validated
 packet. Validate each whole blob before resolving or presenting its selection.
@@ -909,6 +1006,9 @@ Before requesting review, the implementer provides:
 - for B00 and later, protected coordination ref plus the observed current ledger
   commit/digest, with the lease still active and nonoverlapping; for A00, the
   approved bootstrap-ledger digest;
+- for B00 and later, the complete latest cumulative pre-handoff
+  `activation_ledger` Git-blob pin whose ledger contains the named
+  context-packet activation and return receipts;
 - final context packet/profile IDs, packet revision, manifest digest, selected
   byte total versus budget, and every activated disclosure revision;
 - each phase-required contract and fixture tag object/lock digest, or the exact
@@ -931,6 +1031,17 @@ Before requesting review, the implementer provides:
 - migration/data-impact statement;
 - known limitations, deferred work, and required I30 actions.
 
+S00 records the mechanically bindable subset as one outer ledger receipt of kind
+`context-packet-return` whose payload validates as
+`studio-context-packet-return/1`. `ordered_commits` is the exact ordered output
+of `git rev-list --reverse <base_commit>..<handoff_head>`; `merge_commits` is the
+exact output of `git rev-list --merges <base_commit>..<handoff_head>` and MUST be
+empty. `changed_paths` is the ordered repository-path sequence decoded from the
+NUL-safe output of
+`git diff --name-only -z <base_commit>...<handoff_head> --`. Its packet, session,
+work package, assignment, write lease, commands, checks, clean-worktree fact,
+base, and head MUST equal the validated packet and Git evidence.
+
 Copy-paste return receipt:
 
 ```text
@@ -938,6 +1049,8 @@ Session/work package/lease: <id> / <package> / <lease-id>
 Lease entries: <canonical JSON exact-file/subtree array>
 Authoritative remote: <URL>
 Observed coordination pin: <ref / ledger commit / ledger SHA-256 | A00 bootstrap ledger SHA-256>
+Access mode: write-lease
+Activation ledger: coordination/studio-ledger.json / <commit> / <blob OID> / git-blob-payload-sha256/1 / <SHA-256>
 Context packet/profile/revision: <packet-id> / <profile-id> / <n>
 Context manifest digest: rfc8785-jcs-sha256/1 / <SHA-256>
 Context use: <selected UTF-8 bytes> / <authorized bytes>; expansions: <ids or none>
@@ -991,7 +1104,9 @@ packet and receipt.
 
 1. S00 verifies the receipt and lease-bound diff.
 2. A reviewer reruns package checks in a clean worktree without trusting source
-   caches and only after its distinct reviewer packet validates.
+   caches and only after its distinct reviewer packet, active reviewer session,
+   active non-write review-scope lease, `read-only-review` validation entry, and
+   all `review_of` bindings validate. The review lease grants zero writes.
 3. The package owner fixes semantic findings on the same session branch.
 4. S00 marks the unchanged handoff HEAD accepted and records its ordered commit
    list and validation environment.
