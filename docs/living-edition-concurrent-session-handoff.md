@@ -78,7 +78,7 @@ One implementation session has exactly:
 - one external Git worktree;
 - one immutable base tag and commit;
 - for B00 and later, one immutable, digest-pinned context-packet revision;
-- one active, non-overlapping access lease whose mode is fixed by the assignment;
+- one active access lease whose mode and overlap rules are fixed by the assignment;
 - one set of reserved public IDs;
 - one accountable package owner.
 
@@ -335,7 +335,8 @@ The assignment pins the protected coordination ref, a minimum ledger commit, and
 the SHA-256 of `coordination/studio-ledger.json` at that commit. At start, the
 implementer records the current remote ledger commit/digest, validates it against
 `coordination/ledger.schema.json`, proves the assignment commit is its ancestor,
-and verifies that the assigned lease is active and nonoverlapping under section 6.
+and verifies that the assigned lease is active and satisfies section 6's
+mode-specific overlap rules.
 
 After GB, `tools/studio/**` supplies this exact check. For A01, S00 supplies the
 pinned protocol-1.0 ledger and start checks. For B00, S00 supplies the committed
@@ -358,7 +359,8 @@ Required outcomes:
 - the base commit is an ancestor of every later handoff HEAD;
 - for A01 and later, the protected coordination ref is at or after the
   assignment's ledger commit, its current ledger digest is recorded, and the
-  lease remains active and nonoverlapping; A00 instead verifies its approved
+  lease remains active and satisfies section 6's mode-specific overlap rules;
+  A00 instead verifies its approved
   bootstrap ledger digest;
 - for A01 and later, the brief's `coordination-ref-protection` receipt matches a
   fresh provider-policy readback for the exact coordination ref, including the
@@ -371,7 +373,8 @@ Required outcomes:
   source blobs, selectors, selected digests, and UTF-8 byte budget validate;
 - each typed lease entry exists or the brief explicitly authorizes creation at
   that exact path;
-- no other active lease overlaps after path normalization.
+- no other active `write-lease` overlaps after path normalization, and any
+  `read-only-review` overlap is the exact reviewed-session exception below.
 
 If any result differs, stop and report `baseline-mismatch`; do not rebase,
 silently select another branch, or copy files from another worktree.
@@ -387,7 +390,13 @@ another worktree does not grant ownership or prove GB.
 
 Rules:
 
-- at most one active lease covers a normalized path;
+- at most one active `write-lease` covers a normalized path;
+- one active `read-only-review` scope may overlap the write lease of exactly the
+  implementation session named by its `review_of` evidence. Its entries MUST be
+  equal to or contained by that implementation lease, every changed path MUST be
+  inside both scopes, and it grants no ownership or write authority. It MUST NOT
+  overlap an unrelated write lease or serve more than one implementation
+  session;
 - a work package may be subdivided only into explicitly disjoint typed lease
   entries with one named package lead;
 - package-local code, tests, fixtures, snapshots, styles, strings, manifests,
@@ -429,9 +438,11 @@ before creation. Canonical lease paths:
 
 Two entries overlap when their lowercase exact-file keys match, an exact file is
 inside either subtree, or one subtree is equal to or an ancestor of the other at
-a segment boundary. This deterministic test runs across all active leases and
-reserved-but-not-yet-created paths. Filesystem glob expansion and string-prefix
-tests are not ownership proofs.
+a segment boundary. The ownership-collision test runs across active write leases
+and reserved-but-not-yet-created paths. A read-only review scope is instead
+checked for containment by, and identity binding to, its one reviewed
+implementation lease; it never participates as an owner. Filesystem glob
+expansion and string-prefix tests are not ownership proofs.
 
 ## 7. Coordination ledger
 
@@ -1004,7 +1015,8 @@ Before requesting review, the implementer provides:
 - authoritative remote, matching local/remote base tag object, peeled base
   commit/tree, and head commit;
 - for B00 and later, protected coordination ref plus the observed current ledger
-  commit/digest, with the lease still active and nonoverlapping; for A00, the
+  commit/digest, with a write lease still active and nonoverlapping or a review
+  scope satisfying section 6's exact reviewed-session exception; for A00, the
   approved bootstrap-ledger digest;
 - for B00 and later, the complete latest cumulative pre-handoff
   `activation_ledger` Git-blob pin whose ledger contains the named

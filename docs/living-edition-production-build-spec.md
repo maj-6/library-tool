@@ -2971,7 +2971,8 @@ checked out and its digest and 33/33/34 counts verify from a clean worktree.
 - B00 records the exact S00 Git build/runtime and provides the clean
   `merge-tree`/accepted-blob provenance verifier that S00 uses even for B00's own
   baseline assembly;
-- the B00 verifier rejects ownership/lease overlap, missing workspace lock
+- the B00 verifier rejects ownership/write-lease overlap, an invalid
+  read-only-review scope overlap, missing workspace lock
   membership, undeclared `tsconfig.studio.json` references, a root ESM scope,
   changed root `pyproject.toml` or legacy CI, forbidden prototype/sibling imports,
   and writes outside declared production boundaries;
@@ -3191,7 +3192,10 @@ applications, and legacy workflows are read-only migration inputs unless a
 separate non-Studio task explicitly owns them. C00, E17, or another package
 copies reviewed material into its owned production path; it does not edit the
 legacy source in place. One session equals one work package, branch, external
-worktree, and non-overlapping S00 access lease. The shared primary checkout is
+worktree, and S00 access lease. Write leases are non-overlapping; a
+`read-only-review` scope may overlap only the exact implementation write lease
+it reviews, is contained by that lease, and grants no ownership or writes. The
+shared primary checkout is
 inspection-only while concurrent sessions are active.
 
 The production-only `tools/studio/**` carve-out is owned by B00 and later I30;
