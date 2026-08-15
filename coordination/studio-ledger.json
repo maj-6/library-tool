@@ -2,7 +2,7 @@
   "schema": "https://worldherblibrary.org/schemas/studio-coordination-ledger-1.0.json",
   "protocol_version": "1.0",
   "ledger_id": "living-edition-studio",
-  "ledger_revision": 7,
+  "ledger_revision": 8,
   "status": "active",
   "authoritative_remote_url": "https://github.com/maj-6/library-tool.git",
   "coordination_ref": "refs/heads/studio-s00-coordination",
@@ -216,12 +216,12 @@
           "path": "docs/living-edition-production-build-spec.md"
         }
       ],
-      "lease_state": "active",
+      "lease_state": "released",
       "reserved_ids": [
         "living-edition-concurrent-session-handoff/1.0.1",
         "living-edition-production-build-spec/1.1.1"
       ],
-      "status": "review",
+      "status": "accepted",
       "head_commit": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
       "state_history": [
         {
@@ -244,6 +244,13 @@
           "actor": "codex-session:S00-001",
           "at": "2026-08-15T00:34:11Z",
           "receipt_id": "S00-A01-HANDOFF-001"
+        },
+        {
+          "from": "review",
+          "to": "accepted",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-15T01:13:06Z",
+          "receipt_id": "S00-A01-ACCEPTANCE-001"
         }
       ],
       "lease_history": [
@@ -260,6 +267,13 @@
           "actor": "codex-session:S00-001",
           "at": "2026-08-14T21:41:41Z",
           "receipt_id": "S00-A01-START-001"
+        },
+        {
+          "from": "active",
+          "to": "released",
+          "actor": "codex-session:S00-001",
+          "at": "2026-08-15T01:13:06Z",
+          "receipt_id": "S00-A01-ACCEPTANCE-001"
         }
       ],
       "validation": [
@@ -288,7 +302,7 @@
         }
       ],
       "blocker": null,
-      "updated_at": "2026-08-15T00:34:11Z"
+      "updated_at": "2026-08-15T01:13:06Z"
     }
   ],
   "id_reservations": [
@@ -1038,7 +1052,95 @@
           "t01_rule": "T01 builds fixtures only from the frozen C00 contract tag; current examples and tests remain candidate evidence."
         }
       }
+    },
+    {
+      "receipt_id": "S00-A01-FORMAL-REVIEW-001",
+      "kind": "context-amendment-formal-review",
+      "actor": "codex-session:S00-002",
+      "created_at": "2026-08-15T01:12:23Z",
+      "payload": {
+        "work_order_id": "A01-WO-001",
+        "session_id": "A01-001",
+        "work_package": "A01",
+        "reviewer": "codex-session:S00-002",
+        "decision": "ACCEPT",
+        "decided_at": "2026-08-15T01:12:23Z",
+        "review_evidence": {
+          "kind": "agent-review-payload-sha256/1",
+          "locator": "agent-result:codex-session:S00-002/A01/08a2620f4bb55d802d3a86c7e823963e131f2666",
+          "digest_domain": "sha256-utf8-bytes/1",
+          "sha256": "05d18becb906429a96a86e20a6da0c5fb281c18a9986952b08bccd8f3caa2fbd",
+          "byte_length": 754
+        },
+        "reviewed_coordination": {
+          "commit": "08a2620f4bb55d802d3a86c7e823963e131f2666",
+          "tree": "ae95d434e30ecc0745eec3687bf8b78819e23cb0",
+          "ledger_revision": 7,
+          "ledger_path": "coordination/studio-ledger.json",
+          "ledger_git_blob_oid": "94537db30d3a13b9c3b35ccc4caa80d42c517a1b",
+          "ledger_digest_domain": "git-blob-payload-sha256/1",
+          "ledger_sha256": "de309f3c3a61acc8681a88ccf8b7d4606607b50ce83894a7299e60e1a4cb0d7f"
+        },
+        "reviewed_handoff": {
+          "receipt_id": "S00-A01-HANDOFF-001",
+          "head": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+          "tree": "c1c4b738885f8e651f127e8643251c97b62dd3e1"
+        },
+        "reviewed_artifact_candidate_receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+        "reviewed_lib4_observation_receipt_id": "S00-LIB4-CANDIDATE-DELTA-OBSERVED-001",
+        "lib4_disposition": {
+          "selected": false,
+          "b00_hold": false,
+          "c00_hold": true
+        },
+        "blockers": []
+      }
+    },
+    {
+      "receipt_id": "S00-A01-ACCEPTANCE-001",
+      "kind": "context-amendment-accepted",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-15T01:13:06Z",
+      "payload": {
+        "work_order_id": "A01-WO-001",
+        "session_id": "A01-001",
+        "work_package": "A01",
+        "formal_review_receipt_id": "S00-A01-FORMAL-REVIEW-001",
+        "handoff_receipt_id": "S00-A01-HANDOFF-001",
+        "artifact_candidate_receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+        "accepted_at": "2026-08-15T01:13:06Z",
+        "accepted_head": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+        "accepted_tree": "c1c4b738885f8e651f127e8643251c97b62dd3e1",
+        "lease_id": "lease-A01-001-01",
+        "lease_disposition": "released",
+        "acceptance_disposition": "accepted-with-unchanged-a01-head-and-artifact-candidate"
+      }
+    },
+    {
+      "receipt_id": "S00-A01-PREASSEMBLY-001",
+      "kind": "context-amendment-preassembly-authorized",
+      "actor": "codex-session:S00-001",
+      "created_at": "2026-08-15T01:13:06Z",
+      "payload": {
+        "work_order_receipt_id": "S00-A01-WORK-ORDER-001",
+        "formal_review_receipt_id": "S00-A01-FORMAL-REVIEW-001",
+        "acceptance_receipt_id": "S00-A01-ACCEPTANCE-001",
+        "handoff_receipt_id": "S00-A01-HANDOFF-001",
+        "artifact_candidate_receipt_id": "S00-A01-ARTIFACT-CANDIDATE-001",
+        "target_tag": "studio-adoption-v1.1.1",
+        "accepted_head": "98f566599a7d5e74a4077a8ef75e25977f2d1fdc",
+        "accepted_tree": "c1c4b738885f8e651f127e8643251c97b62dd3e1",
+        "assembly_authorization": "One conflict-free, provenance-verified pre-GB amendment assembly containing only accepted A01 document blobs and S00 coordination artifacts.",
+        "lib4_observation_receipt_id": "S00-LIB4-CANDIDATE-DELTA-OBSERVED-001",
+        "lib4_candidate_selected": false,
+        "c00_hold": true,
+        "self_reference_policy": {
+          "containing_commit": "external-review-pin-after-commit",
+          "containing_ledger_sha256": "external-review-pin-after-commit",
+          "adoption_tag_object": "post-assembly-receipt-only"
+        }
+      }
     }
   ],
-  "updated_at": "2026-08-15T00:54:06Z"
+  "updated_at": "2026-08-15T01:13:06Z"
 }
