@@ -407,6 +407,12 @@ object Prefs {
         str(ctx, "current_collection").ifEmpty { null }
     fun setCurrentCollectionId(ctx: Context, id: String?) = put(ctx, "current_collection" to id)
 
+    /** The independently active queue for books set aside for digitization. */
+    fun currentScanCollectionId(ctx: Context): String? =
+        str(ctx, "current_scan_collection").ifEmpty { null }
+    fun setCurrentScanCollectionId(ctx: Context, id: String?) =
+        put(ctx, "current_scan_collection" to id)
+
     /** A terminal command accepted while CameraX owns a file must survive an
      * Activity replacement. Commit synchronously because this is a tiny state
      * transition whose durability is more important than avoiding a disk

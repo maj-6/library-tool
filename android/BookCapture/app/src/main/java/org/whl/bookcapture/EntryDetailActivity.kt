@@ -144,7 +144,7 @@ class EntryDetailActivity : AppCompatActivity() {
         val details = BookDetailPresenter.from(entry.meta)
         bindScanPriorityIndicator(
             bookView = binding.detailBookSummary,
-            candidate = entry.desktopBook?.digitizationCandidateClassification,
+            candidate = entryScanCandidate(this, entry),
             priority = entry.desktopBook?.scanPriority,
         )
 
@@ -236,7 +236,7 @@ class EntryDetailActivity : AppCompatActivity() {
             getString(R.string.detail_ia_availability),
             desktopAvailabilityText(desktop.internetArchive),
         )
-        if (desktop.digitizationCandidate) {
+        if (entryScanCandidate(this, entry) == true) {
             val digitization = scanPriorityPresentation(
                 candidate = true,
                 priority = desktop.scanPriority,

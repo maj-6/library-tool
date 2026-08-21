@@ -1553,6 +1553,11 @@ def test_metadata_publish_filters_lan_only_capture_and_tombstones_cloud(
         "list_capture_book_metadata",
         lambda cfg, ids: scope_calls.append(("metadata", cfg, set(ids))) or [],
     )
+    monkeypatch.setattr(
+        supabase_sync,
+        "list_capture_scan_state",
+        lambda cfg, ids: scope_calls.append(("scan-state", cfg, set(ids))) or [],
+    )
     batches = []
     monkeypatch.setattr(
         supabase_sync, "push_capture_book_metadata",
@@ -1565,7 +1570,8 @@ def test_metadata_publish_filters_lan_only_capture_and_tombstones_cloud(
     assert scope_calls[0] == (
         "ids", CAPTURE_CFG, {CAPTURE_ID, SECOND_CAPTURE_ID},
     )
-    assert scope_calls[1] == ("metadata", OWNER_CFG, {CAPTURE_ID})
+    assert scope_calls[1] == ("scan-state", CAPTURE_CFG, {CAPTURE_ID})
+    assert scope_calls[2] == ("metadata", OWNER_CFG, {CAPTURE_ID})
     lib.save_json(builds_path, {})
     assert server._publish_capture_book_metadata(OWNER_CFG, CAPTURE_CFG) == 1
     tombstone = batches[-1][1][0]

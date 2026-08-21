@@ -46,6 +46,7 @@ class VoiceCommandVocabularyTest {
         assertEquals("spine", partial("spine"))
         assertEquals("cover", partial("cover"))
         assertEquals("title", partial("title"))
+        assertNull(partial("scan"))
     }
 
     @Test
@@ -72,6 +73,7 @@ class VoiceCommandVocabularyTest {
     fun existingCommandsStillResolve() {
         assertEquals("start", final("start"))
         assertEquals("photo", final("photo"))
+        assertEquals("scan", final("scan"))
         assertEquals("done", final("done"))
         assertEquals("cancel", final("cancel"))
         assertEquals("restart", final("restart"))

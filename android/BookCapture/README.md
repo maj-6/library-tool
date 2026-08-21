@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.16` (version code 47) is the Android
+Library Tool Capture `0.5.2-alpha.17` (version code 48) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -77,8 +77,11 @@ preview and the bottom controls contains one **last captured book** card:
 
 ## Collections and provenance
 
-A collection represents the catalog batch into which a book was scanned. It
-has two deliberately separate location concepts:
+A capture-type collection represents the catalog batch into which a book was
+photographed. A scan-type collection instead represents books physically set
+aside for full-book digitization. The current capture collection and current
+scan collection are selected independently, and every collection has two
+deliberately separate location concepts:
 
 - `parentId` is the durable collection-to-collection hierarchy edge. It builds
   paths such as `Office > Periodicals` and is synchronized as `parent_id`.
@@ -121,6 +124,12 @@ bibliographic summary when old delivered scan media is cleared, so the list
 remains useful without defeating the app's storage limit; cleared photos and
 their local detail view are not retained.
 
+The camera action beside Inspect can photograph either a cover or title page,
+read it with Mistral OCR 4.1, and add only the recognized text to a durable
+owner-scoped search queue. Choosing the matching existing record moves that
+book into the independently active scan-type collection. The temporary image
+is deleted after OCR and is never stored in the local or cloud queue.
+
 Long-pressing a book starts a multi-selection. Selected books can be moved to
 another collection or removed from their current collection; any local page
 photos are also deleted after removal, while an already imported Library Tool
@@ -129,6 +138,13 @@ capture-time collection provenance. Cloud-backed membership is owner-scoped;
 after migration `026_capture_collection_state.sql` is applied, offline changes
 resume under the original authenticated account when it is online. Local-only
 books remain editable offline.
+
+The scanner action in Inspect and the action chooser on a sealed local book
+mark it for physical digitization without reopening its editor. The move keeps
+the original capture collection as provenance while making the active scan
+collection its current membership. Moving the book back to a capture-type
+collection clears the active marker without erasing the synchronized audit
+record.
 
 ## Voice commands and notes
 
@@ -142,6 +158,7 @@ owns the microphone.
 | **start** | Begin a capture in the current collection. |
 | **photo** | Photograph the page shown in the preview. |
 | **check** | Photograph the page, extract its bibliography, and check the bundled CH and WHL lists. |
+| **scan** | Mark the open book for physical digitization in the active scan-type collection when it is sealed. |
 | **done** | Seal the capture and submit it for background processing/upload. |
 | **cancel** | Discard the open capture immediately; no confirmation dialog. |
 | **restart** | Discard the open capture and start a fresh one in the same/current collection. |

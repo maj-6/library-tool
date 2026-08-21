@@ -19,7 +19,10 @@ class StateAwareVoiceCommandPolicyTest {
             evaluate("done, then photo", VoiceRecognitionStability.STABLE_PARTIAL)?.command,
         )
 
-        for (command in listOf("check", "done", "cancel", "restart", "undo", "notes")) {
+        for (command in listOf(
+                "check", "scan", "done", "cancel", "restart", "undo", "notes",
+            )
+        ) {
             assertNull(evaluate(command, VoiceRecognitionStability.STABLE_PARTIAL))
         }
     }
@@ -30,6 +33,7 @@ class StateAwareVoiceCommandPolicyTest {
             "start" to PolicyVoiceCommand.START,
             "photo" to PolicyVoiceCommand.PHOTO,
             "check" to PolicyVoiceCommand.CHECK,
+            "scan" to PolicyVoiceCommand.SCAN,
             "done" to PolicyVoiceCommand.DONE,
             "cancel" to PolicyVoiceCommand.CANCEL,
             "restart" to PolicyVoiceCommand.RESTART,

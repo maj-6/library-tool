@@ -39,7 +39,10 @@ VIEWS = {
     "capture_collection_inventory": [
         "id", "created_by", "created_at", "original_collection_id",
         "collection_id", "collection_name", "title", "author", "year",
-        "photo_count", "removed", "membership_revision",
+        "photo_count", "removed", "membership_revision", "collection_type",
+        "scan_marked", "scan_source_collection_id",
+        "scan_destination_collection_id", "scan_revision", "scan_marked_at",
+        "scan_updated_at",
     ],
 }
 BUCKETS = {
@@ -71,6 +74,7 @@ ANON_CANNOT = [
     "collections", "android_ui_publishers", "capture_book_metadata",
     "capture_reviews", "capture_corrections", "capture_collection_state",
     "capture_collection_inventory", "capture_asset_lifecycle",
+    "capture_scan_state", "scan_search_queue",
 ]
 
 

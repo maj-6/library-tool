@@ -170,7 +170,12 @@ internal fun captureCollectionBooksPath(
         ",title,author,year" +
         ",$CAPTURE_COLLECTION_PHOTO_COUNT_FIELD" +
         ",$CAPTURE_COLLECTION_REMOVED_FIELD" +
-        ",$CAPTURE_COLLECTION_REVISION_FIELD"
+        ",$CAPTURE_COLLECTION_REVISION_FIELD" +
+        ",$CAPTURE_COLLECTION_TYPE_FIELD" +
+        ",$CAPTURE_SCAN_MARKED_FIELD" +
+        ",$CAPTURE_SCAN_SOURCE_COLLECTION_ID_FIELD" +
+        ",$CAPTURE_SCAN_DESTINATION_COLLECTION_ID_FIELD" +
+        ",$CAPTURE_SCAN_REVISION_FIELD"
     return "/rest/v1/capture_collection_inventory?created_by=eq.$owner" +
         "&or=($CAPTURE_ORIGINAL_COLLECTION_ID_FIELD.in.($filter)," +
         "$CAPTURE_COLLECTION_ID_FIELD.in.($filter))" +
@@ -266,6 +271,11 @@ internal fun cloudCollectionFromJson(row: JSONObject): BookCollection? {
         mergedInto = mergedInto,
         parentId = parentId,
         tagId = tagId,
+        collectionType = when (val rawType = row.opt("collection_type")) {
+            null, JSONObject.NULL -> CollectionType.CAPTURE
+            is String -> CollectionType.fromWire(rawType) ?: return null
+            else -> return null
+        },
     )
 }
 
@@ -318,6 +328,7 @@ internal fun collectionCloudBody(
     row: BookCollection,
     ownerId: String? = null,
     includeUpdatedAt: Boolean = true,
+    includeCollectionType: Boolean = false,
 ): JSONObject = JSONObject()
     .put("id", row.id)
     .put("name", row.name)
@@ -329,6 +340,9 @@ internal fun collectionCloudBody(
     .apply {
         ownerId?.takeIf { it.isNotEmpty() }?.let { put("created_by", it) }
         if (includeUpdatedAt && row.updatedAt.isNotEmpty()) put("updated_at", row.updatedAt)
+        // collection_type is immutable in Postgres. It is supplied exactly
+        // once on INSERT and deliberately omitted from every PATCH.
+        if (includeCollectionType) put("collection_type", row.collectionType.wireValue)
     }
 
 internal const val CAPTURE_ASSET_LIFECYCLE_PAGE_SIZE = 500
@@ -1049,7 +1063,8 @@ class SupabaseClient(
         val conn = open(
             "GET",
             "$baseUrl/rest/v1/collections" +
-                "?select=id,name,from_place,tag_id,updated_at,deleted,merged_into,parent_id" +
+                "?select=id,name,from_place,tag_id,updated_at,deleted,merged_into,parent_id," +
+                "collection_type" +
                 "&order=id.asc&limit=$COLLECTION_PAGE_SIZE$cursor",
             null,
         )
@@ -1074,7 +1089,12 @@ class SupabaseClient(
                 // There is no remote revision to order against yet. Let
                 // Postgres default now() establish a trustworthy baseline so
                 // a phone clock set years ahead cannot poison shared LWW.
-                collectionCloudBody(row, ownerId, includeUpdatedAt = false),
+                collectionCloudBody(
+                    row,
+                    ownerId,
+                    includeUpdatedAt = false,
+                    includeCollectionType = true,
+                ),
             )
         } else {
             val idFilter = URLEncoder.encode(row.id, Charsets.UTF_8.name())

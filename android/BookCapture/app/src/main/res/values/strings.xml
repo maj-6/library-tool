@@ -73,6 +73,11 @@
     <string name="home_mark_needs_attention">Mark needs attention</string>
     <string name="home_book_actions">Show book actions</string>
     <string name="entry_action_remark">Add or edit remark</string>
+    <string name="entry_action_mark_scan">Mark for physical scanning</string>
+    <string name="entry_scan_marked">Moved to the active scan collection.</string>
+    <string name="entry_scan_marked_pending_sync">Moved to the active scan collection on this device. Cloud sync is pending.</string>
+    <string name="entry_scan_mark_active_capture">Finish or discard this active capture before marking it for scanning.</string>
+    <string name="entry_scan_mark_failed">This book could not be marked for scanning.</string>
     <string name="entry_action_reprocess">Reprocess</string>
     <string name="entry_action_delete">Delete from device</string>
     <string name="entry_action_delete_confirm">Delete</string>
@@ -190,6 +195,10 @@
     <string name="collections_edit_title">Edit collection</string>
     <string name="collections_retag_retired_title">Retag retired collection</string>
     <string name="collections_field_name">Collection</string>
+    <string name="collections_field_type">Purpose</string>
+    <string name="collections_type_capture">Book capture</string>
+    <string name="collections_type_scan">Physical scan queue</string>
+    <string name="collections_type_help">Capture collections record where a book entered the library. Scan collections hold books set aside for full-book digitization. The purpose cannot be changed later.</string>
     <string name="collections_field_tag_id">Tag ID</string>
     <string name="collections_hint_tag_id">FUNGI_1</string>
     <string name="collections_tag_id_help">Printed on the box and encoded in its QR label. A new collection gets a short ID automatically.</string>
@@ -214,6 +223,11 @@
     <string name="collections_delete_message">Deletes “%1$s”. Books already scanned into it keep their recorded collection and origin — only the choice for future scans goes away.</string>
     <string name="collections_delete_failed">The collection could not be deleted. Free storage and try again.</string>
     <string name="collections_current">Scanning into %1$s</string>
+    <string name="collections_current_scan">Physical scan queue: %1$s</string>
+    <string name="collections_active_pair">Capture: %1$s  &#183;  Physical scan: %2$s</string>
+    <string name="collections_type_capture_short">capture</string>
+    <string name="collections_type_scan_short">scan queue</string>
+    <string name="collections_current_scan_state">Active physical scan collection</string>
     <string name="collections_current_state">Current collection</string>
     <string name="collections_retired_tag_conflict">%1$s (retired tag conflict)</string>
     <string name="collections_retired_conflict_state">Retired tag conflict</string>
@@ -256,6 +270,23 @@
     <string name="inspect_scan_box">Scan box QR</string>
     <string name="inspect_search_hint">Find a book by title</string>
     <string name="inspect_scan_cover">Scan a book cover</string>
+    <string name="scan_queue_add">Queue scan book</string>
+    <string name="scan_queue_photo_title">Add a book to the physical scan queue</string>
+    <string name="scan_queue_photo_cover">Photograph cover</string>
+    <string name="scan_queue_photo_title_page">Photograph title page</string>
+    <string name="scan_queue_needs_collection">Create or select a physical scan collection first.</string>
+    <string name="scan_queue_requires_sign_in">Sign in before adding a photo to the synced scan search queue.</string>
+    <string name="scan_queue_saved">OCR text saved to the search queue. Choose the matching book below.</string>
+    <string name="scan_queue_save_failed">The OCR search could not be saved. Free storage and try again.</string>
+    <string name="scan_queue_summary">%1$s &#183; %2$d waiting to be matched</string>
+    <string name="scan_queue_summary_empty">%1$s &#183; no books waiting to be matched</string>
+    <string name="scan_queue_open_oldest">Open the oldest book waiting for a match</string>
+    <string name="scan_queue_match_title">Mark this book for physical scanning?</string>
+    <string name="scan_queue_match_message">Match the photo text to “%1$s” and move it from %2$s to %3$s. Its source collection remains in the scan history.</string>
+    <string name="scan_queue_match_action">Match and mark</string>
+    <string name="scan_queue_match_saved">Matched and moved to the physical scan queue.</string>
+    <string name="scan_queue_match_pending">Matched on this device. Cloud sync will complete when the account is online.</string>
+    <string name="scan_queue_match_failed">The match could not be saved. Refresh and try again.</string>
     <string name="inspect_cover_no_text">No readable title was found on that cover. Try again in brighter, even light.</string>
     <string name="inspect_lookup_searching_cloud">Searching every collection&#8230;</string>
     <string name="inspect_lookup_no_matches">No matching book was found in a collection.</string>
@@ -300,6 +331,7 @@
         <item quantity="other">%d selected</item>
     </plurals>
     <string name="inspect_selection_move">Move</string>
+    <string name="inspect_selection_mark_scan">Physical scan</string>
     <string name="inspect_selection_delete">Delete</string>
     <string name="inspect_selection_move_title">Move to collection</string>
     <string name="inspect_selection_delete_title">Delete selected books?</string>
@@ -361,6 +393,13 @@
     <string name="cover_scanner_capture_failed">The cover photo could not be saved. Try again.</string>
     <string name="cover_scanner_read_failed">Mistral OCR 4.1 could not read the cover. Check your connection and API key, then try again.</string>
     <string name="cover_scanner_no_text">No readable cover text was found. Move closer and try again.</string>
+    <string name="title_page_scanner_title">Read title page</string>
+    <string name="title_page_scanner_help">Center the title and author inside the frame. The temporary photo is sent to Mistral OCR 4.1, then deleted.</string>
+    <string name="title_page_scanner_capture">Read title page</string>
+    <string name="title_page_scanner_capture_description">Photograph and read this book title page</string>
+    <string name="title_page_scanner_ready">Hold the title page steady, then tap Read title page.</string>
+    <string name="title_page_scanner_capturing">Photographing title page…</string>
+    <string name="title_page_scanner_reading">Reading title page text with Mistral OCR 4.1…</string>
 
     <string name="detail_from">From</string>
     <string name="detail_from_edit">Change</string>
@@ -426,6 +465,13 @@
     <!-- Capture controls; the words live in the content descriptions. -->
     <string name="cmd_start">Start new scan</string>
     <string name="cmd_photo">Take page photo</string>
+    <string name="cmd_scan">Mark for physical scanning</string>
+    <string name="cmd_scan_marked">Marked for physical scanning</string>
+    <string name="capture_scan_mark_needs_capture">Start a book capture before marking it for physical scanning.</string>
+    <string name="capture_scan_mark_needs_collection">Create or select a physical scan collection first.</string>
+    <string name="capture_scan_marked">This book will move to %1$s when you finish it.</string>
+    <string name="capture_scan_mark_failed">The physical scan mark could not be saved.</string>
+    <string name="capture_scan_mark_stage_failed">The book was saved, but its physical scan move is still pending.</string>
     <string name="cmd_done">Finish book scan</string>
     <string name="cmd_cancel">Discard book scan</string>
     <string name="catalog_check_processing">Check photo saved · extracting bibliography and searching CH + WHL…</string>

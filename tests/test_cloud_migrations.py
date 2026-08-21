@@ -1141,7 +1141,10 @@ def test_capture_collection_inventory_preserves_provenance_and_tombstones():
     assert cloud_setup.VIEWS["capture_collection_inventory"] == [
         "id", "created_by", "created_at", "original_collection_id",
         "collection_id", "collection_name", "title", "author", "year",
-        "photo_count", "removed", "membership_revision",
+        "photo_count", "removed", "membership_revision", "collection_type",
+        "scan_marked", "scan_source_collection_id",
+        "scan_destination_collection_id", "scan_revision", "scan_marked_at",
+        "scan_updated_at",
     ]
 
 

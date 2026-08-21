@@ -42,7 +42,7 @@ class CollectionsTest {
             collection("b", "Shelf 3", parentId = "a"),
         )
         val encoded = collectionsToJson(original)
-        assertEquals(4, JSONObject(encoded).getInt("version"))
+        assertEquals(5, JSONObject(encoded).getInt("version"))
         assertEquals(original, collectionsFromJson(encoded))
     }
 

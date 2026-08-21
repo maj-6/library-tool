@@ -940,7 +940,7 @@ def api_auth_logout():
 # Keeping the two paths separate is what makes a rename safe -- the row changes,
 # while books already scanned under the old name continue to say so.
 
-_COLLECTION_SELECT = ("id,name,from_place,created_by,updated_at,deleted,"
+_COLLECTION_SELECT = ("id,name,from_place,collection_type,created_by,updated_at,deleted,"
                       "merged_into")
 _COLLECTION_FIELD_MAX = 80
 COLLECTION_ALIASES_PATH = lib.OUTPUT_DIR / "collection_aliases.json"
@@ -955,6 +955,14 @@ def _collection_text(value, *, required: bool = False) -> str:
     if required and not text:
         raise ValueError("collection name is required")
     return text
+
+
+def _collection_type(value, *, default: str = "capture") -> str:
+    """Normalize the immutable purpose assigned when a collection is made."""
+    normalized = str(value if value is not None else default).strip().lower()
+    if normalized not in {"capture", "scan"}:
+        raise ValueError("collection_type must be capture or scan")
+    return normalized
 
 
 def _collection_payload() -> dict:
@@ -1124,6 +1132,7 @@ def _collection_json(row: dict) -> dict:
         "id": str(row.get("id") or ""),
         "name": str(row.get("name") or ""),
         "from": str(row.get("from_place") or ""),
+        "collection_type": _collection_type(row.get("collection_type")),
         "created_by": str(row.get("created_by") or ""),
         "updated_at": str(row.get("updated_at") or ""),
         "deleted": bool(row.get("deleted")),
@@ -1241,10 +1250,12 @@ def api_collections_add():
         payload = _collection_payload()
         name = _collection_text(payload.get("name"), required=True)
         from_place = _collection_text(payload.get("from"))
+        collection_type = _collection_type(payload.get("collection_type"))
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     cfg, ses = auth
     row = {"id": str(uuid.uuid4()), "name": name, "from_place": from_place,
+           "collection_type": collection_type,
            "created_by": ses.get("user_id"), "deleted": False}
     try:
         saved = sauth.rest(
@@ -1273,6 +1284,8 @@ def api_collections_update(collection_id: str):
         expected = str(payload.get("expected_updated_at") or "").strip()
         if not expected:
             raise ValueError("expected_updated_at is required")
+        if "collection_type" in payload:
+            raise ValueError("collection type cannot be changed after creation")
         changes = {}
         if "name" in payload:
             changes["name"] = _collection_text(payload.get("name"), required=True)
@@ -1516,6 +1529,128 @@ def api_collections_merge():
                     "deleted": _collection_json(duplicate),
                     "resolved_survivor_id": resolved_survivor,
                     "repointed": repointed, "continued": continued})
+
+
+# --- physical digitization queue ----------------------------------------------
+
+def _scan_cloud_auth() -> tuple[dict, dict] | None:
+    """Return one short-lived user-token config for owner-scoped scan APIs."""
+    auth = _collection_auth()
+    if not auth:
+        return None
+    cfg, ses = auth
+    token = str(ses.get("access_token") or "").strip()
+    if not token:
+        return None
+    return {**cfg, "access_token": token}, ses
+
+
+def _scan_api_uuid(value, label: str) -> str:
+    raw = str(value or "").strip()
+    try:
+        normalized = str(uuid.UUID(raw))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(f"invalid {label}") from None
+    if raw != normalized:
+        raise ValueError(f"invalid {label}")
+    return normalized
+
+
+def _scan_cloud_error(exc: sbase.SyncError):
+    status = exc.http_status
+    if status not in {400, 401, 403, 404, 409, 422, 429}:
+        status = 503 if status is None or status >= 500 else 502
+    return jsonify({"ok": False, "error": str(exc)}), status
+
+
+@app.route("/api/scan/state")
+def api_scan_state_list():
+    """List this contributor's bounded current physical-scan state."""
+    auth = _scan_cloud_auth()
+    if not auth:
+        return jsonify({"ok": True, "signed_in": False, "states": []})
+    cfg, _ses = auth
+    try:
+        rows = sbase.list_capture_scan_state(cfg)
+    except (ValueError, sbase.SyncError) as exc:
+        if isinstance(exc, sbase.SyncError):
+            return _scan_cloud_error(exc)
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    finally:
+        cfg.pop("access_token", None)
+    return jsonify({"ok": True, "signed_in": True, "states": rows})
+
+
+@app.route("/api/scan/search-queue")
+def api_scan_search_queue_list():
+    """List pending cover/title-page OCR rows for desktop matching."""
+    auth = _scan_cloud_auth()
+    if not auth:
+        return jsonify({"ok": True, "signed_in": False, "queue": []})
+    cfg, _ses = auth
+    statuses = request.args.getlist("status") or ["pending"]
+    try:
+        rows = sbase.list_scan_search_queue(cfg, statuses=statuses)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except sbase.SyncError as exc:
+        return _scan_cloud_error(exc)
+    finally:
+        cfg.pop("access_token", None)
+    return jsonify({"ok": True, "signed_in": True, "queue": rows})
+
+
+@app.route("/api/scan/search-queue", methods=["POST"])
+def api_scan_search_queue_add():
+    """Safely enqueue OCR using the signed-in contributor's database RPC."""
+    auth = _scan_cloud_auth()
+    if not auth:
+        return jsonify({"ok": False, "error": "sign in to add a scan search"}), 401
+    try:
+        payload = _collection_payload()
+        queue_id = _scan_api_uuid(payload.get("id"), "scan queue id")
+        scan_collection_id = _scan_api_uuid(
+            payload.get("scan_collection_id"), "scan collection id")
+        photo_role = str(payload.get("photo_role") or "").strip()
+        ocr_text = payload.get("ocr_text")
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    cfg, _ses = auth
+    try:
+        row = sbase.enqueue_scan_search(
+            cfg, queue_id, scan_collection_id, photo_role, ocr_text)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except sbase.SyncError as exc:
+        return _scan_cloud_error(exc)
+    finally:
+        cfg.pop("access_token", None)
+    return jsonify({"ok": True, "queue_item": row})
+
+
+@app.route("/api/scan/search-queue/<queue_id>/complete", methods=["POST"])
+def api_scan_search_queue_complete(queue_id: str):
+    """Match one OCR row; the RPC atomically moves/marks the capture."""
+    auth = _scan_cloud_auth()
+    if not auth:
+        return jsonify({"ok": False, "error": "sign in to match a scan search"}), 401
+    try:
+        payload = _collection_payload()
+        normalized_queue_id = _scan_api_uuid(queue_id, "scan queue id")
+        capture_id = _scan_api_uuid(payload.get("capture_id"), "capture id")
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    cfg, _ses = auth
+    try:
+        row = sbase.complete_scan_search(
+            cfg, normalized_queue_id, capture_id)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except sbase.SyncError as exc:
+        return _scan_cloud_error(exc)
+    finally:
+        cfg.pop("access_token", None)
+    return jsonify({"ok": True, "queue_item": row})
 
 
 # --- the activity mirror: local jsonl -> cloud events table ----------------------
@@ -27868,6 +28003,9 @@ def _merge_capture_projection_with_existing(row: dict,
     if not desired_source.get("evidence_updated_at"):
         desired_source["evidence_updated_at"] = str(
             previous_source.get("evidence_updated_at") or "")
+    if not desired_source.get("scan_state_updated_at"):
+        desired_source["scan_state_updated_at"] = str(
+            previous_source.get("scan_state_updated_at") or "")
     registration_stamp = _capture_latest_projection_stamp(
         desired_source.get("registration_updated_at"),
         previous_source.get("registration_updated_at"),
@@ -27879,11 +28017,13 @@ def _merge_capture_projection_with_existing(row: dict,
             desired_source.get("evidence_updated_at"),
             desired_source.get("registration_updated_at"),
             desired_source.get("tombstone_updated_at"),
+            desired_source.get("scan_state_updated_at"),
             previous_source.get("build_updated_at"),
             previous_source.get("manual_updated_at"),
             previous_source.get("evidence_updated_at"),
             previous_source.get("registration_updated_at"),
             previous_source.get("tombstone_updated_at"),
+            previous_source.get("scan_state_updated_at"),
         )
     desired_source["registration_updated_at"] = registration_stamp
     desired_source["tombstone_updated_at"] = str(
@@ -27896,6 +28036,7 @@ def _merge_capture_projection_with_existing(row: dict,
         desired_source.get("evidence_updated_at"),
         desired_source.get("registration_updated_at"),
         desired_source.get("tombstone_updated_at"),
+        desired_source.get("scan_state_updated_at"),
     )
     return {**row, "data": desired}
 
@@ -27906,6 +28047,7 @@ def _capture_book_metadata_rows(builds: dict | None = None,
                                 registration_cache: dict | None = None,
                                 tombstone_capture_ids=(),
                                 tombstone_updated_at: dict | None = None,
+                                scan_states: dict | None = None,
                                 validation_errors: list[dict] | None = None
                                 ) -> list[dict]:
     """Desktop-enriched snapshots keyed by the registered build's capture id."""
@@ -27921,6 +28063,7 @@ def _capture_book_metadata_rows(builds: dict | None = None,
     if registration_cache is None:
         with _reg_cache_lock:
             registration_cache = dict(_reg_cache_load())
+    scan_states = scan_states if isinstance(scan_states, dict) else {}
 
     sources = {}
     for value in manual_entries.values():
@@ -27991,6 +28134,9 @@ def _capture_book_metadata_rows(builds: dict | None = None,
             build, source, registration_cache)
         registration_stamp = _capture_latest_projection_stamp(
             build_stamp, manual_stamp)
+        scan_state = scan_states.get(capture_id)
+        scan_state_stamp = _capture_projection_stamp(
+            scan_state.get("updated_at") if isinstance(scan_state, dict) else "")
         copyright_data = {
             "status": copyright_status,
             "automated_status": automated_status,
@@ -28008,7 +28154,7 @@ def _capture_book_metadata_rows(builds: dict | None = None,
             "version": 1,
             "source_updated_at": _capture_latest_projection_stamp(
                 build_stamp, manual_stamp, evidence_stamp,
-                registration_stamp),
+                registration_stamp, scan_state_stamp),
             "projection_source": {
                 "build_updated_at": build_stamp,
                 "manual_updated_at": manual_stamp,
@@ -28032,13 +28178,20 @@ def _capture_book_metadata_rows(builds: dict | None = None,
                                if registered else ""),
             "remarks": _capture_remarks(build, source),
         }
+        if scan_state_stamp:
+            data["projection_source"]["scan_state_updated_at"] = scan_state_stamp
         # `digitization_candidate` is book metadata, not phone scan
         # provenance. Project only a real boolean from the selected active item
         # (`build` is the manual row for an unregistered capture). Keeping the
         # key absent for legacy rows lets the merge distinguish "unknown" from
         # an explicit False and prevents stale source metadata from resurrecting
         # a flag that was cleared on the promoted build.
-        digitization_candidate = build.get("digitization_candidate")
+        scan_state_active = (
+            isinstance(scan_state, dict) and scan_state.get("active") is True
+        )
+        digitization_candidate = (
+            True if scan_state_active else build.get("digitization_candidate")
+        )
         if isinstance(digitization_candidate, bool):
             data["digitization_candidate"] = digitization_candidate
             if digitization_candidate and "scan_priority" in build:
@@ -28119,6 +28272,11 @@ def _publish_capture_book_metadata(owner_cfg: dict, capture_cfg: dict) -> int:
     scope = published | set(targets)
     cloud_ids = set(sbase.list_capture_ids(capture_cfg, scope))
     current = local_current & cloud_ids
+    scan_states = {
+        str(row.get("capture_id")): row
+        for row in sbase.list_capture_scan_state(capture_cfg, cloud_ids)
+        if isinstance(row, dict)
+    }
     existing = sbase.list_capture_book_metadata(owner_cfg, cloud_ids)
     existing_by_id = {
         str(row.get("capture_id")): row
@@ -28136,6 +28294,7 @@ def _publish_capture_book_metadata(owner_cfg: dict, capture_cfg: dict) -> int:
         tombstone_capture_ids=stale,
         tombstone_updated_at={capture_id: tombstone_time
                               for capture_id in tombstone_ids},
+        scan_states=scan_states,
     )
     rows = [row for row in rows if row["capture_id"] in cloud_ids]
     rows = [

@@ -1,5 +1,6 @@
 package org.whl.bookcapture
 
+import android.content.Context
 import android.view.View
 import android.widget.TextView
 import androidx.core.content.ContextCompat
@@ -16,6 +17,27 @@ internal data class ScanPriorityPresentation(
     val badge: String,
     val accessibilityLabel: String,
 )
+
+/** Effective candidate state for views backed directly by an Entry. */
+internal fun entryScanCandidate(ctx: Context, entry: Entries.Entry): Boolean? {
+    if (entry.desktopBook?.digitizationCandidateClassification == true) return true
+    val pending = InspectBookMemberships.read(ctx)
+        .takeIf { it.valid }
+        ?.memberships
+        ?.get(entry.id)
+    if (pending != null) {
+        if (pending.removed) return entry.desktopBook?.digitizationCandidateClassification
+        return if (Collections.byId(ctx, pending.collectionId)?.collectionType ==
+            CollectionType.SCAN
+        ) {
+            true
+        } else {
+            entry.desktopBook?.digitizationCandidateClassification
+        }
+    }
+    if (CaptureScanMarkStore.read(entry.dir) != null) return true
+    return entry.desktopBook?.digitizationCandidateClassification
+}
 
 internal fun scanPriorityPresentation(
     candidate: Boolean?,

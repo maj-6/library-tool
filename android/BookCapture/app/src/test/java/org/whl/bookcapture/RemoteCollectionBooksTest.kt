@@ -318,6 +318,11 @@ class RemoteCollectionBooksTest {
                 ",$CAPTURE_COLLECTION_PHOTO_COUNT_FIELD" +
                 ",$CAPTURE_COLLECTION_REMOVED_FIELD" +
                 ",$CAPTURE_COLLECTION_REVISION_FIELD" +
+                ",$CAPTURE_COLLECTION_TYPE_FIELD" +
+                ",$CAPTURE_SCAN_MARKED_FIELD" +
+                ",$CAPTURE_SCAN_SOURCE_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_SCAN_DESTINATION_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_SCAN_REVISION_FIELD" +
                 "&order=id.asc&limit=$REMOTE_COLLECTION_BOOKS_PAGE_SIZE",
             first,
         )
@@ -335,6 +340,11 @@ class RemoteCollectionBooksTest {
                 ",$CAPTURE_COLLECTION_PHOTO_COUNT_FIELD" +
                 ",$CAPTURE_COLLECTION_REMOVED_FIELD" +
                 ",$CAPTURE_COLLECTION_REVISION_FIELD" +
+                ",$CAPTURE_COLLECTION_TYPE_FIELD" +
+                ",$CAPTURE_SCAN_MARKED_FIELD" +
+                ",$CAPTURE_SCAN_SOURCE_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_SCAN_DESTINATION_COLLECTION_ID_FIELD" +
+                ",$CAPTURE_SCAN_REVISION_FIELD" +
                 "&order=id.asc&limit=$REMOTE_COLLECTION_BOOKS_PAGE_SIZE&id=gt.$capA",
             next,
         )

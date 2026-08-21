@@ -220,6 +220,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnStart.setOnClickListener { command("start") }
         binding.btnPhoto.setOnClickListener { command("photo") }
+        binding.btnMarkScan.setOnClickListener { command("scan") }
         binding.btnDone.setOnClickListener { command("done") }
         binding.btnCancel.setOnClickListener { command("cancel") }
         binding.btnNote.setOnClickListener {
@@ -1685,6 +1686,7 @@ class MainActivity : AppCompatActivity() {
                 if (!session.active) cues.error("no entry open")
                 else takePhoto(checkCatalogs = true)
             }
+            "scan" -> markCurrentBookForScan()
             "done" -> {
                 if (!session.active) cues.error("nothing to save")
                 else {
@@ -1695,10 +1697,18 @@ class MainActivity : AppCompatActivity() {
                     val id = session.done()
                     when {
                         id != null -> {
+                            val hasScanMark = Entries.findIncludingArchive(this, id)
+                                ?.dir
+                                ?.let(CaptureScanMarkStore::read) != null
+                            val markStaged = !hasScanMark ||
+                                CaptureScanMarkStore.stageMembership(this, id)
                             cues.saved(photos)
                             ProcessWorker.enqueuePending(this, id)
                             UploadWorker.enqueue(this)
                             refreshLastCapturedBook()
+                            if (!markStaged) {
+                                setStatus(getString(R.string.capture_scan_mark_stage_failed))
+                            }
                         }
                         // null + still active = the manifest write failed
                         // (disk full); the pages are kept and "done" can retry
@@ -1725,6 +1735,40 @@ class MainActivity : AppCompatActivity() {
             "restart" -> restartCapture()
             "undo" -> undoLastCaptureOrNote()
             "edit" -> reopenLastScannedBook()
+        }
+        updateUi()
+    }
+
+    /**
+     * "Scan" means the later physical digitization workflow, not this camera
+     * shutter. The source is recorded while the entry is open, but membership
+     * changes only after Done, so Cancel cannot leave a ghost scan-list row.
+     */
+    private fun markCurrentBookForScan() {
+        val entryId = session.entryId
+        val provenance = session.provenance
+        val destination = Collections.currentScan(this)
+        when {
+            entryId == null || provenance == null || !session.active -> {
+                cues.error("no entry open")
+                setStatus(getString(R.string.capture_scan_mark_needs_capture))
+            }
+            destination == null -> {
+                cues.error("choose a scan collection first")
+                setStatus(getString(R.string.capture_scan_mark_needs_collection))
+            }
+            !CaptureScanMarkStore.write(
+                session.entryDir(entryId),
+                provenance.collectionId,
+                destination.id,
+            ) -> {
+                cues.error("could not mark for scan")
+                setStatus(getString(R.string.capture_scan_mark_failed))
+            }
+            else -> {
+                cues.markedForScan()
+                setStatus(getString(R.string.capture_scan_marked, destination.name))
+            }
         }
         updateUi()
     }
@@ -2878,6 +2922,14 @@ class MainActivity : AppCompatActivity() {
         syncCaptureTimer()
         binding.btnStart.isEnabled = !active && captureAvailable && !noteActive
         binding.btnPhoto.isEnabled = active && captureAvailable && !noteActive && !captureQueue.full
+        binding.btnMarkScan.isEnabled = active && captureAvailable && !noteActive
+        val scanMarked = session.entryId?.let { entryId ->
+            CaptureScanMarkStore.read(session.entryDir(entryId)) != null
+        } == true
+        binding.btnMarkScan.isActivated = scanMarked
+        binding.btnMarkScan.contentDescription = getString(
+            if (scanMarked) R.string.cmd_scan_marked else R.string.cmd_scan,
+        )
         binding.btnDone.isEnabled = active && captureAvailable && !noteActive
         binding.btnCancel.isEnabled = active && captureAvailable && !noteActive
         binding.btnNote.isEnabled = active &&
@@ -3038,7 +3090,7 @@ class MainActivity : AppCompatActivity() {
 
         val scanPriority = bindScanPriorityIndicator(
             bookView = binding.lastBookPreview,
-            candidate = entry.desktopBook?.digitizationCandidateClassification,
+            candidate = entryScanCandidate(this, entry),
             priority = entry.desktopBook?.scanPriority,
         )
 

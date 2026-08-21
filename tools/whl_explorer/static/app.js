@@ -328,6 +328,11 @@ const state = {
   collectionsLoading: false,
   collectionsWritable: false,
   collectionsError: "",
+  scanQueue: [],
+  scanStates: [],
+  scanQueueLoading: false,
+  scanQueueBusy: false,
+  scanQueueError: "",
   rowsById: new Map(),        // combined-table row lookup (per render)
   checkedFilter: "",
   chBooks: null,              // CH catalogue rows (lazy)
@@ -15117,6 +15122,10 @@ function collectionIdentityLabel(collection) {
   return `"${String(row.name || "(unnamed)")}" [${collectionIdShort(row.id)}]`;
 }
 
+function collectionType(collection) {
+  return collection && collection.collection_type === "scan" ? "scan" : "capture";
+}
+
 function collectionBookCount(usage, collectionId) {
   const item = usage && usage.linked && usage.linked.get(String(collectionId || ""));
   return item ? Number(item.count || 0) : 0;
@@ -15232,7 +15241,10 @@ async function loadCollections({ force = false } = {}) {
   } finally {
     if (mine === collectionsLoadSeq) {
       state.collectionsLoading = false;
-      if (!el("collections-overlay").hidden) renderCollections();
+      if (!el("collections-overlay").hidden) {
+        renderCollections();
+        renderScanQueue();
+      }
     }
   }
   return state.collections;
@@ -15299,7 +15311,7 @@ function renderCollections() {
   const liveIds = new Set(rows.map((c) => String(c.id || "")));
   const folded = new Map();
   for (const c of rows) {
-    const key = String(c.name || "").trim().toLocaleLowerCase();
+    const key = `${collectionType(c)}\u0000${String(c.name || "").trim().toLocaleLowerCase()}`;
     if (!folded.has(key)) folded.set(key, []);
     folded.get(key).push(c);
   }
@@ -15315,6 +15327,7 @@ function renderCollections() {
   el("collections-add").disabled = !canMutate;
   el("collections-new-name").disabled = !canMutate;
   el("collections-new-from").disabled = !canMutate;
+  el("collections-new-type").disabled = !canMutate;
   el("collections-revert").hidden = collectionEditDrafts.size === 0;
   el("collections-revert").disabled = state.collectionsLoading || collectionsMutationBusy;
   const msg = state.collectionsError || (state.collectionsLoading ? "Loading collections…" :
@@ -15331,11 +15344,13 @@ function renderCollections() {
     return;
   }
   let html = `<table class="grid collections-table"><thead><tr>` +
-    `<th>Collection</th><th>From</th><th>Books</th><th>Captured as</th><th>Actions</th>` +
+    `<th>Collection</th><th>Type</th><th>From</th><th>Books</th><th>Captured as</th><th>Actions</th>` +
     `</tr></thead><tbody>`;
   for (const c of rows) {
     const item = use.linked.get(String(c.id || "")) || { count: 0, snapshots: new Set() };
-    const dupes = folded.get(String(c.name || "").trim().toLocaleLowerCase()) || [];
+    const dupes = folded.get(
+      `${collectionType(c)}\u0000${String(c.name || "").trim().toLocaleLowerCase()}`,
+    ) || [];
     const duplicate = dupes.length > 1;
     const captured = [...item.snapshots].sort().join("; ");
     const mergeTargets = dupes.filter((target) => target.id !== c.id);
@@ -15347,6 +15362,8 @@ function renderCollections() {
         (duplicate ? `<span class="collection-warning" ` +
           `data-tip="Two collection identities have the same name; rename one or merge them">duplicate name</span>` : "") +
       `</td>` +
+      `<td><span class="collection-type ${collectionType(c)}">` +
+        `${collectionType(c)}</span></td>` +
       `<td><input class="cad-input" data-collection-field="from" maxlength="80" ` +
         `value="${esc(draft.from)}" aria-label="${esc(`Origin for collection ${identity}`)}"${controlDisabled} /></td>` +
       `<td class="collection-books">${item.count}</td>` +
@@ -15367,7 +15384,7 @@ function renderCollections() {
   for (const [id, item] of orphanLinked) {
     html += `<tr class="collection-snapshot-only"><td>${esc([...item.snapshots][0] || "(unnamed)")}` +
       `<span class="collection-warning">${state.collectionsSignedIn && !state.collectionsError
-        ? "deleted/missing row" : "current row unavailable"}</span></td><td>—</td>` +
+        ? "deleted/missing row" : "current row unavailable"}</span></td><td>—</td><td>—</td>` +
       `<td class="collection-books">${item.count}</td>` +
       `<td class="collection-snapshots">${esc([...item.snapshots].join("; "))}</td>` +
       `<td class="collection-id-note">${esc(id)}</td></tr>`;
@@ -15375,10 +15392,165 @@ function renderCollections() {
   for (const item of use.unlinked.values()) {
     html += `<tr class="collection-snapshot-only"><td>${esc(item.collection)}` +
       `<span class="collection-warning">unlinked snapshot</span></td>` +
-      `<td>${esc(item.from || "—")}</td><td class="collection-books">${item.count}</td>` +
+      `<td>—</td><td>${esc(item.from || "—")}</td>` +
+      `<td class="collection-books">${item.count}</td>` +
       `<td class="collection-snapshots">Imported before collection IDs</td><td>—</td></tr>`;
   }
   host.innerHTML = html + `</tbody></table>`;
+}
+
+let scanQueueLoadSeq = 0;
+
+function scanQueueCandidates(ocrText = "") {
+  const seen = new Set();
+  const query = String(ocrText || "").toLocaleLowerCase();
+  return combinedRows().flatMap((row) => {
+    const book = row.book || {};
+    const captureId = String(book.capture_id || "");
+    if (!captureId || seen.has(captureId)) return [];
+    seen.add(captureId);
+    const title = String(book.title || "Untitled capture").trim();
+    const author = String(book.author || book.authors || "").trim();
+    const year = String(book.year || "").trim();
+    const score = title.toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u)
+      .filter((token) => token.length >= 3 && query.includes(token)).length;
+    return [{ captureId, title, author, year, score }];
+  }).sort((a, b) => b.score - a.score || a.title.localeCompare(b.title) ||
+    a.captureId.localeCompare(b.captureId));
+}
+
+function scanQueueCollectionName(collectionId) {
+  const row = state.collections.find((item) =>
+    String(item.id || "") === String(collectionId || ""));
+  return row ? String(row.name || "Unnamed collection") :
+    `Collection ${String(collectionId || "").slice(0, 8)}`;
+}
+
+function scanQueueCaptureLabel(captureId, candidates = scanQueueCandidates()) {
+  const candidate = candidates.find((item) => item.captureId === captureId);
+  return candidate ? candidate.title : `Capture ${String(captureId || "").slice(0, 8)}`;
+}
+
+function renderScanQueue() {
+  const queueHost = el("scan-queue-list");
+  const stateHost = el("scan-state-list");
+  const pending = Array.isArray(state.scanQueue) ? state.scanQueue : [];
+  const marks = Array.isArray(state.scanStates) ? state.scanStates : [];
+  const capturedBooks = scanQueueCandidates();
+  el("scan-queue-refresh").disabled = state.scanQueueLoading || state.scanQueueBusy;
+  el("scan-queue-msg").textContent = state.scanQueueError ||
+    (state.scanQueueLoading ? "Loading scan queue…" :
+      state.scanQueueBusy ? "Matching book…" : "");
+  el("scan-queue-count").textContent = `${pending.length} pending · ` +
+    `${marks.filter((row) => row.active).length} marked`;
+
+  if (!pending.length) {
+    queueHost.innerHTML = `<p class="pane-note">${state.scanQueueLoading
+      ? "Loading pending cover and title-page searches…"
+      : "No pending cover or title-page searches."}</p>`;
+  } else {
+    let html = `<table class="grid scan-queue-table"><thead><tr>` +
+      `<th>OCR search</th><th>Destination</th><th>Existing captured book</th>` +
+      `</tr></thead><tbody>`;
+    for (const item of pending) {
+      const candidates = scanQueueCandidates(item.ocr_text);
+      const options = candidates.map((candidate) => {
+        const detail = [candidate.author, candidate.year].filter(Boolean).join(" · ");
+        const label = `${candidate.title}${detail ? ` — ${detail}` : ""} ` +
+          `[${candidate.captureId.slice(0, 8)}]`;
+        return `<option value="${esc(candidate.captureId)}">${esc(label)}</option>`;
+      }).join("");
+      const excerpt = String(item.ocr_text || "").replace(/\s+/g, " ").trim().slice(0, 600);
+      html += `<tr data-scan-queue-id="${esc(item.id)}">` +
+        `<td class="scan-queue-ocr"><strong>${esc(item.photo_role === "title_page"
+          ? "Title page" : "Cover")}</strong><br>${esc(excerpt)}</td>` +
+        `<td>${esc(scanQueueCollectionName(item.scan_collection_id))}</td>` +
+        `<td><span class="scan-queue-match"><select class="cad-input" ` +
+          `data-scan-match aria-label="Match OCR row to an existing captured book"` +
+          `${state.scanQueueBusy || !candidates.length ? " disabled" : ""}>` +
+          `${options || '<option value="">No captured books available</option>'}</select>` +
+          `<button class="cad-btn tiny" type="button" data-scan-queue-act="complete"` +
+          `${state.scanQueueBusy || !candidates.length ? " disabled" : ""}>Match</button>` +
+          `</span></td></tr>`;
+    }
+    queueHost.innerHTML = html + `</tbody></table>`;
+  }
+
+  if (!marks.length) {
+    stateHost.innerHTML = `<p class="pane-note">No synced physical scan marks.</p>`;
+  } else {
+    stateHost.innerHTML = `<table class="grid scan-queue-table"><thead><tr>` +
+      `<th>Physical scan state</th><th>Scan collection</th><th>Moved from</th>` +
+      `</tr></thead><tbody>` + marks.map((mark) =>
+        `<tr class="${mark.active ? "" : "scan-state-inactive"}">` +
+        `<td>${esc(scanQueueCaptureLabel(mark.capture_id, capturedBooks))} · ` +
+          `${mark.active ? "marked" : "inactive"}</td>` +
+        `<td>${esc(scanQueueCollectionName(mark.scan_collection_id))}</td>` +
+        `<td>${esc(mark.source_collection_id
+          ? scanQueueCollectionName(mark.source_collection_id) : "Not recorded")}</td></tr>`
+      ).join("") + `</tbody></table>`;
+  }
+}
+
+async function loadScanQueue() {
+  const mine = ++scanQueueLoadSeq;
+  state.scanQueueLoading = true;
+  state.scanQueueError = "";
+  renderScanQueue();
+  try {
+    const [queueResponse, stateResponse] = await Promise.all([
+      fetch("/api/scan/search-queue"), fetch("/api/scan/state"),
+    ]);
+    const [queueData, stateData] = await Promise.all([
+      queueResponse.json().catch(() => ({})),
+      stateResponse.json().catch(() => ({})),
+    ]);
+    if (!queueResponse.ok || !queueData.ok)
+      throw new Error(queueData.error || `queue HTTP ${queueResponse.status}`);
+    if (!stateResponse.ok || !stateData.ok)
+      throw new Error(stateData.error || `state HTTP ${stateResponse.status}`);
+    if (mine !== scanQueueLoadSeq) return;
+    state.scanQueue = Array.isArray(queueData.queue) ? queueData.queue : [];
+    state.scanStates = Array.isArray(stateData.states) ? stateData.states : [];
+    if (!queueData.signed_in || !stateData.signed_in)
+      state.scanQueueError = "Sign in to review the shared physical scan queue.";
+  } catch (error) {
+    if (mine === scanQueueLoadSeq)
+      state.scanQueueError = `Scan queue unavailable: ${error.message || error}`;
+  } finally {
+    if (mine === scanQueueLoadSeq) {
+      state.scanQueueLoading = false;
+      renderScanQueue();
+    }
+  }
+}
+
+async function completeScanQueueRow(rowEl) {
+  if (state.scanQueueBusy || !rowEl) return;
+  const queueId = String(rowEl.dataset.scanQueueId || "");
+  const select = rowEl.querySelector("[data-scan-match]");
+  const captureId = String((select && select.value) || "");
+  if (!queueId || !captureId) return;
+  state.scanQueueBusy = true;
+  state.scanQueueError = "";
+  renderScanQueue();
+  try {
+    const response = await fetch(
+      `/api/scan/search-queue/${encodeURIComponent(queueId)}/complete`,
+      { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capture_id: captureId }) },
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok)
+      throw new Error(data.error || `HTTP ${response.status}`);
+    state.scanQueue = state.scanQueue.filter((item) => item.id !== queueId);
+  } catch (error) {
+    state.scanQueueError = `Match failed: ${error.message || error}`;
+  } finally {
+    state.scanQueueBusy = false;
+    renderScanQueue();
+  }
+  if (!state.scanQueueError) await loadScanQueue();
 }
 
 function openCollections() {
@@ -15388,6 +15560,7 @@ function openCollections() {
   state.collectionsError = "";
   el("collections-overlay").hidden = false;
   loadCollections();
+  loadScanQueue();
   requestAnimationFrame(() => el("collections-close").focus());
 }
 
@@ -15411,8 +15584,11 @@ async function addCollection(ev) {
   ev.preventDefault();
   const name = el("collections-new-name").value.trim();
   const from = el("collections-new-from").value.trim();
+  const collection_type = el("collections-new-type").value;
   if (!name) { state.collectionsError = "Collection name is required"; renderCollections(); return; }
-  const data = await collectionApi("POST", "/api/collections", { name, from });
+  const data = await collectionApi("POST", "/api/collections", {
+    name, from, collection_type,
+  });
   if (!data) return;
   collectionReplaceCurrent(data.collection);
   el("collections-new-name").value = "";
@@ -15531,6 +15707,12 @@ function initCollections() {
   });
   el("collections-add-form").addEventListener("submit", addCollection);
   el("collections-revert").addEventListener("click", revertCollectionDrafts);
+  el("scan-queue-refresh").addEventListener("click", loadScanQueue);
+  el("scan-queue-list").addEventListener("click", (ev) => {
+    const button = ev.target.closest("[data-scan-queue-act='complete']");
+    const row = button && button.closest("[data-scan-queue-id]");
+    if (button && row) completeScanQueueRow(row);
+  });
   el("collections-list").addEventListener("input", (ev) => {
     const input = ev.target.closest("[data-collection-field]");
     const row = input && input.closest("[data-collection-id]");

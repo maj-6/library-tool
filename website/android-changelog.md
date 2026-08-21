@@ -3,6 +3,32 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.17 - 2026-08-21
+
+Android version code: `48`.
+
+### Additions
+
+- Capture-type and scan-type collections now behave as ordinary synchronized
+  collections while keeping independent active selections. Marking a book for
+  physical digitization moves it to the active scan collection and retains the
+  capture collection it came from.
+- Say **scan** or tap the scanner button during capture to mark the open book
+  when it is sealed. Sealed books can also be marked from their action menu or
+  from an Inspect multi-selection.
+- Photograph a cover or title page from Inspect to create a durable search
+  item, choose the matching existing book, and add it to the scan list.
+
+### Other Changes
+
+- Cover and title-page queue photos are read by Mistral OCR 4.1. Only bounded
+  recognized text enters the owner-scoped queue; the temporary image is deleted
+  after OCR and is never stored in the queue or uploaded as a queue asset.
+- Scan membership, source collection, destination, revision, and pending search
+  matches synchronize through the cloud and appear in Library Tool Desktop.
+- An active physical scan mark participates in the existing scanner overlay and
+  subtle highlighting everywhere Android draws a book.
+
 ## 0.5.2-alpha.16 — 2026-08-21
 
 Android version code: `47`.
