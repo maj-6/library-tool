@@ -399,7 +399,7 @@ class CollectionSyncTest {
     }
 
     @Test
-    fun tagIdsParticipateInContentHashAlongsideParents() {
+    fun tagsParentsAndImmutableTypeParticipateInContentHash() {
         val unchanged = row("Blue crate", "2026-07-19T10:00:00Z")
         val canonical = listOf(
             unchanged.id,
@@ -412,14 +412,24 @@ class CollectionSyncTest {
         val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray())
         val legacyHash = digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
-        assertEquals(legacyHash, collectionContentHash(unchanged))
+        val typedCanonical = listOf(legacyHash, "type:capture").joinToString("\u0000")
+        val typedDigest = MessageDigest.getInstance("SHA-256")
+            .digest(typedCanonical.toByteArray())
+        val typedHash = typedDigest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+        assertEquals(typedHash, collectionContentHash(unchanged))
         assertFalse(
-            legacyHash == collectionContentHash(
+            typedHash == collectionContentHash(
                 unchanged.copy(parentId = "00000000-0000-0000-0000-000000000002"),
             ),
         )
         assertFalse(
-            legacyHash == collectionContentHash(unchanged.copy(tagId = "BLUE_CRATE_2")),
+            typedHash == collectionContentHash(unchanged.copy(tagId = "BLUE_CRATE_2")),
+        )
+        assertFalse(
+            typedHash == collectionContentHash(
+                unchanged.copy(collectionType = CollectionType.SCAN),
+            ),
         )
     }
 

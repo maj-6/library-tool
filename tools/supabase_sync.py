@@ -14,7 +14,8 @@ credential as their bearer. Optional keys "table" (default "captures"),
 "bucket" (default "captures"), "books_table" (default "books"),
 "capture_book_metadata_table", "capture_reviews_table",
 "capture_corrections_table", and "capture_asset_lifecycle_table" (the latter
-four use same-named defaults).
+four use same-named defaults), plus "capture_scan_state_table" and
+"scan_search_queue_table" for physical-digitization staging.
 Errors raise
 SyncError with a readable message — callers report, they don't crash.
 """
@@ -35,6 +36,13 @@ TIMEOUT = 30.0
 CAPTURE_PHOTO_MAX_BYTES = 32 * 1024 * 1024
 CAPTURE_DISCOVERY_PAGE_SIZE = 1000
 CAPTURE_DISCOVERY_MAX_ROWS = 10_000
+CAPTURE_SCAN_STATE_PAGE_SIZE = 500
+CAPTURE_SCAN_STATE_MAX_ROWS = 10_000
+SCAN_SEARCH_QUEUE_PAGE_SIZE = 100
+SCAN_SEARCH_QUEUE_MAX_ROWS = 2_000
+SCAN_SEARCH_OCR_MAX_CHARS = 16_000
+SCAN_SEARCH_PHOTO_ROLES = frozenset({"cover", "title_page"})
+SCAN_SEARCH_STATUSES = frozenset({"pending", "matched", "failed"})
 CAPTURE_LIB_ASSOCIATION_SCHEMA = "org.whl.capture-lib-association"
 CAPTURE_LIB_ASSOCIATION_VERSION = 1
 CAPTURE_LIB_FORMAT_VERSION = "3.0"
@@ -1195,6 +1203,387 @@ def _capture_sync_ids(values) -> list[str]:
     return out
 
 
+def _canonical_uuid(value: object) -> str:
+    """Return one canonical UUID string or an empty marker."""
+
+    raw = str(value or "").strip()
+    try:
+        normalized = str(uuid.UUID(raw))
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    return normalized if raw == normalized else ""
+
+
+def _scan_user_scope(cfg: dict) -> str:
+    """Require a real authenticated-user JWT and return its owner id.
+
+    Scan-queue RPCs intentionally never accept the desktop's service key.  The
+    database functions bind their rows to ``auth.uid()``; checking the client
+    configuration here prevents a caller from accidentally bypassing that
+    owner boundary before the request leaves the workstation.
+    """
+
+    if not isinstance(cfg, dict):
+        raise SyncError("scan queue access requires a signed-in user scope")
+    token = str(cfg.get("access_token") or "").strip()
+    key = str(cfg.get("key") or "").strip()
+    owner_id = _jwt_subject(token)
+    if (
+        not token
+        or _jwt_role(token) != "authenticated"
+        or not owner_id
+        or token == key
+        or key.startswith("sb_secret_")
+        or _jwt_role(key) == "service_role"
+    ):
+        raise SyncError("scan queue access requires a signed-in user scope")
+    return owner_id
+
+
+def _bounded_page_arguments(
+    page_size: int,
+    maximum_rows: int,
+    *,
+    label: str,
+) -> None:
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= 1000
+    ):
+        raise ValueError(f"{label} page_size must be between 1 and 1000")
+    if (
+        isinstance(maximum_rows, bool)
+        or not isinstance(maximum_rows, int)
+        or not 1 <= maximum_rows <= 100_000
+    ):
+        raise ValueError(
+            f"{label} maximum_rows must be between 1 and 100000"
+        )
+
+
+def _capture_scan_state_row(raw: object, *, owner_id: str = "") -> dict:
+    if not isinstance(raw, dict):
+        raise SyncError("capture scan state returned an invalid row")
+    capture_id = _canonical_uuid(raw.get("capture_id"))
+    row_owner = _canonical_uuid(raw.get("owner_id"))
+    scan_collection_id = _canonical_uuid(raw.get("scan_collection_id"))
+    source_raw = raw.get("source_collection_id")
+    source_collection_id = (
+        _canonical_uuid(source_raw) if source_raw not in (None, "") else ""
+    )
+    revision = raw.get("revision")
+    marked_at = raw.get("marked_at")
+    updated_at = raw.get("updated_at")
+    if (
+        not capture_id
+        or not row_owner
+        or (owner_id and row_owner != owner_id)
+        or not scan_collection_id
+        or not source_collection_id
+        or source_collection_id == scan_collection_id
+        or type(raw.get("active")) is not bool
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(marked_at, str)
+        or not marked_at
+        or len(marked_at) > 80
+        or not isinstance(updated_at, str)
+        or not updated_at
+        or len(updated_at) > 80
+    ):
+        raise SyncError("capture scan state returned an invalid row")
+    return {
+        "capture_id": capture_id,
+        "owner_id": row_owner,
+        "scan_collection_id": scan_collection_id,
+        "source_collection_id": source_collection_id,
+        "active": raw["active"],
+        "revision": revision,
+        "marked_at": marked_at,
+        "updated_at": updated_at,
+    }
+
+
+def list_capture_scan_state(
+    cfg: dict,
+    capture_ids=None,
+    *,
+    page_size: int = CAPTURE_SCAN_STATE_PAGE_SIZE,
+    maximum_rows: int = CAPTURE_SCAN_STATE_MAX_ROWS,
+) -> list[dict]:
+    """Read scan marks with an explicit capture or authenticated-owner bound.
+
+    Service-role sync must provide capture ids already present in local stores.
+    An authenticated caller may omit them; the JWT subject is then included as
+    a defense-in-depth owner filter in addition to RLS.  Both paths are bounded
+    so a malformed or unexpectedly large cloud result cannot grow memory
+    without limit.
+    """
+
+    _bounded_page_arguments(
+        page_size, maximum_rows, label="capture scan state"
+    )
+    user_owner = ""
+    if str((cfg or {}).get("access_token") or "").strip():
+        user_owner = _scan_user_scope(cfg)
+    ids = None if capture_ids is None else _capture_sync_ids(capture_ids)
+    if capture_ids is not None and not ids:
+        return []
+    if ids is None and not user_owner:
+        raise SyncError(
+            "capture scan state requires capture ids or a signed-in user scope"
+        )
+
+    table = cfg.get("capture_scan_state_table") or "capture_scan_state"
+    selected = (
+        "capture_id,owner_id,scan_collection_id,source_collection_id,active,"
+        "revision,marked_at,updated_at"
+    )
+    owner_filter = (
+        f"&owner_id=eq.{urllib.parse.quote(user_owner, safe='')}"
+        if user_owner else ""
+    )
+    out: list[dict] = []
+    if ids is not None:
+        for index in range(0, len(ids), 40):
+            batch = ids[index:index + 40]
+            encoded = ",".join(
+                urllib.parse.quote(value, safe="") for value in batch
+            )
+            rows = _rest(
+                cfg,
+                "GET",
+                f"{table}?capture_id=in.({encoded}){owner_filter}"
+                f"&select={selected}&order=capture_id.asc&limit={len(batch)}",
+            )
+            if not isinstance(rows, list):
+                raise SyncError("capture scan state returned an invalid collection")
+            for raw in rows:
+                row = _capture_scan_state_row(raw, owner_id=user_owner)
+                if row["capture_id"] not in batch:
+                    raise SyncError("capture scan state escaped its capture scope")
+                out.append(row)
+                if len(out) > maximum_rows:
+                    raise SyncError(
+                        "capture scan state exceeds the "
+                        f"{maximum_rows}-row safety limit"
+                    )
+        return out
+
+    offset = 0
+    while True:
+        request_limit = min(page_size, maximum_rows + 1 - len(out))
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?owner_id=eq.{urllib.parse.quote(user_owner, safe='')}"
+            f"&select={selected}&order=capture_id.asc"
+            f"&limit={request_limit}&offset={offset}",
+        )
+        if not isinstance(rows, list):
+            raise SyncError("capture scan state returned an invalid collection")
+        out.extend(
+            _capture_scan_state_row(raw, owner_id=user_owner) for raw in rows
+        )
+        if len(out) > maximum_rows:
+            raise SyncError(
+                "capture scan state exceeds the "
+                f"{maximum_rows}-row safety limit"
+            )
+        offset += len(rows)
+        if not rows:
+            return out
+
+
+def _scan_search_queue_row(raw: object, *, owner_id: str) -> dict:
+    if not isinstance(raw, dict):
+        raise SyncError("scan search queue returned an invalid row")
+    queue_id = _canonical_uuid(raw.get("id"))
+    row_owner = _canonical_uuid(raw.get("owner_id"))
+    scan_collection_id = _canonical_uuid(raw.get("scan_collection_id"))
+    matched_raw = raw.get("matched_capture_id")
+    matched_capture_id = (
+        _canonical_uuid(matched_raw) if matched_raw not in (None, "") else ""
+    )
+    photo_role = raw.get("photo_role")
+    ocr_text = raw.get("ocr_text")
+    status = raw.get("status")
+    revision = raw.get("revision")
+    created_at = raw.get("created_at")
+    updated_at = raw.get("updated_at")
+    if (
+        not queue_id
+        or row_owner != owner_id
+        or not scan_collection_id
+        or not isinstance(photo_role, str)
+        or photo_role not in SCAN_SEARCH_PHOTO_ROLES
+        or not isinstance(ocr_text, str)
+        or not ocr_text.strip()
+        or ocr_text != ocr_text.strip()
+        or len(ocr_text) > SCAN_SEARCH_OCR_MAX_CHARS
+        or not isinstance(status, str)
+        or status not in SCAN_SEARCH_STATUSES
+        or (matched_raw not in (None, "") and not matched_capture_id)
+        or ((status == "matched") != bool(matched_capture_id))
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(created_at, str)
+        or not created_at
+        or len(created_at) > 80
+        or not isinstance(updated_at, str)
+        or not updated_at
+        or len(updated_at) > 80
+    ):
+        raise SyncError("scan search queue returned an invalid row")
+    return {
+        "id": queue_id,
+        "owner_id": row_owner,
+        "scan_collection_id": scan_collection_id,
+        "photo_role": photo_role,
+        "ocr_text": ocr_text,
+        "status": status,
+        "matched_capture_id": matched_capture_id or None,
+        "revision": revision,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def list_scan_search_queue(
+    cfg: dict,
+    *,
+    statuses=("pending",),
+    page_size: int = SCAN_SEARCH_QUEUE_PAGE_SIZE,
+    maximum_rows: int = SCAN_SEARCH_QUEUE_MAX_ROWS,
+) -> list[dict]:
+    """List a bounded authenticated user's OCR-to-book matching queue."""
+
+    owner_id = _scan_user_scope(cfg)
+    _bounded_page_arguments(page_size, maximum_rows, label="scan search queue")
+    if not isinstance(statuses, (tuple, list, set, frozenset)):
+        raise ValueError("scan search queue statuses must be a collection")
+    normalized_statuses = []
+    for value in statuses:
+        status = str(value or "").strip()
+        if status not in SCAN_SEARCH_STATUSES:
+            raise ValueError("scan search queue status is invalid")
+        if status not in normalized_statuses:
+            normalized_statuses.append(status)
+    if not normalized_statuses:
+        return []
+
+    table = cfg.get("scan_search_queue_table") or "scan_search_queue"
+    selected = (
+        "id,owner_id,scan_collection_id,photo_role,ocr_text,status,"
+        "matched_capture_id,revision,created_at,updated_at"
+    )
+    encoded_statuses = ",".join(
+        urllib.parse.quote(value, safe="") for value in normalized_statuses
+    )
+    out: list[dict] = []
+    offset = 0
+    while True:
+        request_limit = min(page_size, maximum_rows + 1 - len(out))
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?owner_id=eq.{urllib.parse.quote(owner_id, safe='')}"
+            f"&status=in.({encoded_statuses})&select={selected}"
+            "&order=created_at.asc,id.asc"
+            f"&limit={request_limit}&offset={offset}",
+        )
+        if not isinstance(rows, list):
+            raise SyncError("scan search queue returned an invalid collection")
+        out.extend(
+            _scan_search_queue_row(raw, owner_id=owner_id) for raw in rows
+        )
+        if len(out) > maximum_rows:
+            raise SyncError(
+                "scan search queue exceeds the "
+                f"{maximum_rows}-row safety limit"
+            )
+        offset += len(rows)
+        if not rows:
+            return out
+
+
+def _scan_queue_rpc_row(
+    cfg: dict,
+    path: str,
+    payload: dict,
+    *,
+    owner_id: str,
+) -> dict:
+    response = _rest(cfg, "POST", path, payload)
+    if (
+        isinstance(response, list)
+        and len(response) == 1
+        and isinstance(response[0], dict)
+    ):
+        response = response[0]
+    if not isinstance(response, dict):
+        raise SyncError("scan search queue RPC returned an invalid row")
+    return _scan_search_queue_row(response, owner_id=owner_id)
+
+
+def enqueue_scan_search(
+    cfg: dict,
+    queue_id: str,
+    scan_collection_id: str,
+    photo_role: str,
+    ocr_text: str,
+) -> dict:
+    """Idempotently enqueue one cover/title-page OCR result as its user."""
+
+    owner_id = _scan_user_scope(cfg)
+    queue_id = _canonical_uuid(queue_id)
+    scan_collection_id = _canonical_uuid(scan_collection_id)
+    if not queue_id or not scan_collection_id:
+        raise ValueError("scan queue and collection ids must be canonical UUIDs")
+    if not isinstance(photo_role, str) or photo_role not in SCAN_SEARCH_PHOTO_ROLES:
+        raise ValueError("scan queue photo_role must be cover or title_page")
+    if (
+        not isinstance(ocr_text, str)
+        or not ocr_text.strip()
+        or len(ocr_text) > SCAN_SEARCH_OCR_MAX_CHARS
+    ):
+        raise ValueError("scan queue OCR text must contain 1 to 16000 characters")
+    return _scan_queue_rpc_row(
+        cfg,
+        "rpc/enqueue_scan_search",
+        {
+            "p_id": queue_id,
+            "p_scan_collection_id": scan_collection_id,
+            "p_photo_role": photo_role,
+            "p_ocr_text": ocr_text,
+        },
+        owner_id=owner_id,
+    )
+
+
+def complete_scan_search(
+    cfg: dict,
+    queue_id: str,
+    capture_id: str,
+) -> dict:
+    """Atomically match one pending OCR row and mark/move its capture."""
+
+    owner_id = _scan_user_scope(cfg)
+    queue_id = _canonical_uuid(queue_id)
+    capture_id = _canonical_uuid(capture_id)
+    if not queue_id or not capture_id:
+        raise ValueError("scan queue and capture ids must be canonical UUIDs")
+    return _scan_queue_rpc_row(
+        cfg,
+        "rpc/complete_scan_search",
+        {"p_id": queue_id, "p_capture_id": capture_id},
+        owner_id=owner_id,
+    )
+
+
 def list_capture_book_metadata(cfg: dict, capture_ids,
                                chunk: int = 40) -> list[dict]:
     """Read desktop snapshots for only the named phone captures.
@@ -1269,6 +1658,7 @@ def _projection_vector(data: dict) -> dict[str, datetime | None] | None:
         "evidence_updated_at",
         "registration_updated_at",
         "tombstone_updated_at",
+        "scan_state_updated_at",
     )
     if any(not isinstance(source.get(key, ""), str) for key in keys):
         return None

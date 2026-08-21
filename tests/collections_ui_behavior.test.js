@@ -323,3 +323,19 @@ test("collection dialog exposes busy-safe controls, focus handling, and responsi
   assert.match(css, /#collections-list[\s\S]*height:\s*clamp\(180px, 48vh, 380px\)/);
   assert.match(css, /#collections-add-form\s*\{[^}]*flex-wrap:\s*wrap/);
 });
+
+test("scan collections and the OCR matching queue have explicit desktop controls", () => {
+  assert.match(html,
+    /id="collections-new-type"[\s\S]*value="capture"[\s\S]*value="scan"/);
+  assert.match(html, /id="scan-queue-panel"[\s\S]*Physical scan matching/);
+  assert.match(source,
+    /collectionApi\("POST", "\/api\/collections", \{[\s\S]*collection_type/);
+  assert.match(source,
+    /fetch\("\/api\/scan\/search-queue"\), fetch\("\/api\/scan\/state"\)/);
+  assert.match(source,
+    /\/api\/scan\/search-queue\/\$\{encodeURIComponent\(queueId\)\}\/complete/);
+  assert.match(source,
+    /collection && collection\.collection_type === "scan" \? "scan" : "capture"/);
+  assert.match(source, /scanQueueCandidates\(item\.ocr_text\)/);
+  assert.match(css, /#scan-queue-panel[\s\S]*max-height:\s*30vh/);
+});

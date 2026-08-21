@@ -129,7 +129,7 @@ class CollectionTagIdTest {
     }
 
     @Test
-    fun versionThreeMigrationAssignsStableUniqueTagsAndVersionFourRoundTrips() {
+    fun versionThreeMigrationAssignsStableUniqueTagsAndVersionFiveRoundTrips() {
         val legacy = collectionStoreFromJson(
             """{"version":3,"collections":[
                 {"id":"a","name":"Fungi","from":"Storage"},
@@ -141,7 +141,7 @@ class CollectionTagIdTest {
         assertTrue(legacy.valid)
         assertEquals(listOf("FUNGI_1", "FUNGI_2", "MUSHROOMS_1"), legacy.collections.map { it.tagId })
         val encoded = collectionStoreToJson(legacy)
-        assertEquals(4, JSONObject(encoded).getInt("version"))
+        assertEquals(5, JSONObject(encoded).getInt("version"))
         assertEquals(legacy, collectionStoreFromJson(encoded))
     }
 

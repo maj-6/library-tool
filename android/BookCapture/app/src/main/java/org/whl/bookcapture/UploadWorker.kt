@@ -1064,6 +1064,10 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 val delivery = uploadEntry(client, dir, prepared)
                 syncInspectMembershipAfterCaptureInsert(ctx, client, dir, uploadOwner)
                 markUploaded(ctx, dir, delivery, syncRequestId, uploadOwner)
+                // A queued cover/title-page search may have matched this book
+                // while it was still local-only. Now that its cloud row exists,
+                // retry the idempotent queue completion immediately.
+                ScanSearchQueueSyncWorker.enqueue(ctx)
                 // The capture row now exists, so an attention/review edit made
                 // before this explicit sync can be pushed instead of racing
                 // the pre-upload metadata pass started by the same button.
@@ -1343,10 +1347,13 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         }
         val createdMs = manifest.optLong("created_at", 0L)
         val createdAt = if (createdMs > 0) Instant.ofEpochMilli(createdMs).toString() else ""
-        val meta = attachCaptureNotes(withProvenance(File(dir, "meta.json").takeIf { it.isFile }
-            ?.let { try { JSONObject(it.readText()) } catch (_: Exception) { null } }
-            ?: JSONObject(), dir), prepared.captureNotes)
-            .put(PHOTO_ASSETS_META_KEY, prepared.photoAssets)
+        val meta = CaptureScanMarkStore.attachToMeta(
+            attachCaptureNotes(withProvenance(File(dir, "meta.json").takeIf { it.isFile }
+                ?.let { try { JSONObject(it.readText()) } catch (_: Exception) { null } }
+                ?: JSONObject(), dir), prepared.captureNotes)
+                .put(PHOTO_ASSETS_META_KEY, prepared.photoAssets),
+            dir,
+        )
         return deliverValidatedCapture(
             entryId = id,
             deviceFolder = deviceSafe,
@@ -1376,6 +1383,19 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         val owner = uploadOwner.trim().lowercase()
         if (!SAFE_CAPTURE_SYNC_ID.matches(owner)) {
             throw IOException("capture collection owner is invalid")
+        }
+        // A capture-flow Scan command is durable before the book is sealed.
+        // Materialize that sidecar into the ordinary membership outbox only
+        // after the capture row exists, so the scan-aware cloud RPC can record
+        // both current membership and the source collection atomically.
+        CaptureScanMarkStore.read(dir)?.let { mark ->
+            val stored = InspectBookMemberships.read(ctx)
+            if (!stored.valid) throw IOException("capture collection outbox could not be read")
+            if (dir.name !in stored.memberships &&
+                !InspectBookMemberships.move(ctx, setOf(dir.name), mark.scanCollectionId)
+            ) {
+                throw IOException("capture scan mark could not be staged")
+            }
         }
         repeat(8) {
             val stored = InspectBookMemberships.read(ctx)

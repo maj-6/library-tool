@@ -43,8 +43,19 @@ internal data class RemoteCollectionBook(
     val digitizationCandidateClassification: Boolean? = null,
     /** Present only for an explicitly classified candidate; valid values are 1..5. */
     val scanPriority: Int? = null,
+    /** Effective destination role projected by the inventory view. */
+    val collectionType: CollectionType = CollectionType.CAPTURE,
+    /** True while this physical book is set aside for digitization. */
+    val scanMarked: Boolean = false,
+    /** Capture collection the book was removed from when first marked. */
+    val scanSourceCollectionId: String = "",
+    /** Active scan-type collection, retained for audit after state changes. */
+    val scanDestinationCollectionId: String = "",
+    /** Independent server-monotonic scan-state revision. */
+    val scanRevision: Long = 0L,
 ) {
-    val digitizationCandidate: Boolean get() = digitizationCandidateClassification == true
+    val digitizationCandidate: Boolean
+        get() = digitizationCandidateClassification == true || scanMarked
 }
 
 internal data class RemoteCollectionBooksStore(
@@ -62,7 +73,7 @@ internal data class RemoteCollectionRecordResult(
 )
 
 internal const val REMOTE_COLLECTION_BOOKS_FILE = "remote_collection_books.json"
-internal const val REMOTE_COLLECTION_BOOKS_VERSION = 3
+internal const val REMOTE_COLLECTION_BOOKS_VERSION = 4
 
 /** Per-request page size. PostgREST may return fewer rows; an empty page, not a
  * short one, is the only end-of-snapshot signal. */
@@ -305,17 +316,16 @@ internal object RemoteCollectionBooks {
         owner: String = Prefs.userId(ctx),
     ): Boolean {
         val normalizedCollectionId = collectionId.trim().lowercase()
-        val collectionName = Collections.allRecords(ctx)
+        val collection = Collections.allRecords(ctx)
             .firstOrNull { it.id.equals(normalizedCollectionId, ignoreCase = true) }
-            ?.name
-            .orEmpty()
         return applyMembershipMutation(
             File(ctx.filesDir, REMOTE_COLLECTION_BOOKS_FILE),
             owner,
             ids,
             normalizedCollectionId,
-            collectionName,
+            collection?.name.orEmpty(),
             removed,
+            collection?.collectionType ?: CollectionType.CAPTURE,
         )
     }
 
@@ -326,6 +336,7 @@ internal object RemoteCollectionBooks {
         collectionId: String,
         collectionName: String,
         removed: Boolean,
+        collectionType: CollectionType = CollectionType.CAPTURE,
     ): Boolean = synchronized(this) {
         val normalizedOwner = owner.trim().lowercase()
         val normalizedCollectionId = collectionId.trim().lowercase()
@@ -348,6 +359,25 @@ internal object RemoteCollectionBooks {
                 val membershipChanged =
                     !book.collectionId.equals(normalizedCollectionId, ignoreCase = true) ||
                         book.removed != removed
+                val scanMarked = collectionType == CollectionType.SCAN && !removed
+                val scanSourceCollectionId = if (scanMarked) {
+                    book.scanSourceCollectionId.ifEmpty {
+                        book.collectionId.takeIf {
+                            book.collectionType == CollectionType.CAPTURE
+                        }.orEmpty().ifEmpty { book.originalCollectionId }
+                    }
+                } else {
+                    book.scanSourceCollectionId
+                }
+                val scanDestinationCollectionId = if (scanMarked) {
+                    normalizedCollectionId
+                } else {
+                    book.scanDestinationCollectionId
+                }
+                val scanStateChanged = book.collectionType != collectionType ||
+                    book.scanMarked != scanMarked ||
+                    book.scanSourceCollectionId != scanSourceCollectionId ||
+                    book.scanDestinationCollectionId != scanDestinationCollectionId
                 val next = book.copy(
                     collectionId = normalizedCollectionId,
                     removed = removed,
@@ -357,6 +387,15 @@ internal object RemoteCollectionBooks {
                         else -> book.membershipRevision + 1
                     },
                     collectionName = collectionName.ifEmpty { book.collectionName },
+                    collectionType = collectionType,
+                    scanMarked = scanMarked,
+                    scanSourceCollectionId = scanSourceCollectionId,
+                    scanDestinationCollectionId = scanDestinationCollectionId,
+                    scanRevision = when {
+                        !scanStateChanged -> book.scanRevision
+                        book.scanRevision == Long.MAX_VALUE -> Long.MAX_VALUE
+                        else -> book.scanRevision + 1
+                    },
                 )
                 if (next != book) changed = true
                 next
@@ -496,6 +535,11 @@ internal fun RemoteCollectionBook.toInventoryItem(): CollectionInventoryItem =
             deliveryTransport = "cloud",
             digitizationCandidateClassification = digitizationCandidateClassification,
             scanPriority = scanPriority,
+            collectionType = collectionType,
+            scanMarked = scanMarked,
+            scanSourceCollectionId = scanSourceCollectionId,
+            scanDestinationCollectionId = scanDestinationCollectionId,
+            scanRevision = scanRevision,
         ),
         current = null,
         remote = true,
@@ -543,13 +587,30 @@ private fun fillUnknownScanMetadata(
         fallbackCandidate == true -> fallback.summary.scanPriority
         else -> null
     }
-    if (candidate == preferredCandidate && priority == preferred.summary.scanPriority) {
+    val preferredScan = preferred.summary
+    val fallbackScan = fallback.summary
+    val useFallbackScan = fallbackScan.scanRevision > preferredScan.scanRevision ||
+        (fallbackScan.scanRevision == preferredScan.scanRevision &&
+            !preferredScan.scanMarked && fallbackScan.scanMarked)
+    val selectedScan = if (useFallbackScan) fallbackScan else preferredScan
+    if (candidate == preferredCandidate && priority == preferred.summary.scanPriority &&
+        selectedScan.collectionType == preferredScan.collectionType &&
+        selectedScan.scanMarked == preferredScan.scanMarked &&
+        selectedScan.scanSourceCollectionId == preferredScan.scanSourceCollectionId &&
+        selectedScan.scanDestinationCollectionId == preferredScan.scanDestinationCollectionId &&
+        selectedScan.scanRevision == preferredScan.scanRevision
+    ) {
         return preferred
     }
     return preferred.copy(
         summary = preferred.summary.copy(
             digitizationCandidateClassification = candidate,
             scanPriority = priority,
+            collectionType = selectedScan.collectionType,
+            scanMarked = selectedScan.scanMarked,
+            scanSourceCollectionId = selectedScan.scanSourceCollectionId,
+            scanDestinationCollectionId = selectedScan.scanDestinationCollectionId,
+            scanRevision = selectedScan.scanRevision,
         ),
     )
 }
@@ -561,6 +622,12 @@ internal const val CAPTURE_COLLECTION_NAME_FIELD = "collection_name"
 internal const val CAPTURE_COLLECTION_REMOVED_FIELD = "removed"
 internal const val CAPTURE_COLLECTION_REVISION_FIELD = "membership_revision"
 internal const val CAPTURE_COLLECTION_PHOTO_COUNT_FIELD = "photo_count"
+internal const val CAPTURE_COLLECTION_TYPE_FIELD = "collection_type"
+internal const val CAPTURE_SCAN_MARKED_FIELD = "scan_marked"
+internal const val CAPTURE_SCAN_SOURCE_COLLECTION_ID_FIELD = "scan_source_collection_id"
+internal const val CAPTURE_SCAN_DESTINATION_COLLECTION_ID_FIELD =
+    "scan_destination_collection_id"
+internal const val CAPTURE_SCAN_REVISION_FIELD = "scan_revision"
 
 /**
  * Read one projected `captures` row into a book summary.
@@ -595,6 +662,38 @@ internal fun remoteCollectionBookFromCaptureJson(
         row,
         CAPTURE_COLLECTION_PHOTO_COUNT_FIELD,
     )?.takeIf { it in 0L..Int.MAX_VALUE.toLong() } ?: return null
+    val collectionType = if (!row.has(CAPTURE_COLLECTION_TYPE_FIELD) ||
+        row.isNull(CAPTURE_COLLECTION_TYPE_FIELD)
+    ) {
+        CollectionType.CAPTURE
+    } else {
+        CollectionType.fromWire(captureRowString(row, CAPTURE_COLLECTION_TYPE_FIELD))
+            ?: return null
+    }
+    val scanMarked = if (!row.has(CAPTURE_SCAN_MARKED_FIELD) ||
+        row.isNull(CAPTURE_SCAN_MARKED_FIELD)
+    ) false else captureRowBoolean(row, CAPTURE_SCAN_MARKED_FIELD) ?: return null
+    val scanSourceCollectionId = captureRowString(
+        row,
+        CAPTURE_SCAN_SOURCE_COLLECTION_ID_FIELD,
+    ).lowercase()
+    val scanDestinationCollectionId = captureRowString(
+        row,
+        CAPTURE_SCAN_DESTINATION_COLLECTION_ID_FIELD,
+    ).lowercase()
+    val scanRevision = if (!row.has(CAPTURE_SCAN_REVISION_FIELD) ||
+        row.isNull(CAPTURE_SCAN_REVISION_FIELD)
+    ) 0L else captureRowWholeNumber(row, CAPTURE_SCAN_REVISION_FIELD)
+        ?.takeIf { it >= 0L } ?: return null
+    if ((scanSourceCollectionId.isNotEmpty() &&
+            !SAFE_COLLECTION_FILTER_ID.matches(scanSourceCollectionId)) ||
+        (scanDestinationCollectionId.isNotEmpty() &&
+            !SAFE_COLLECTION_FILTER_ID.matches(scanDestinationCollectionId)) ||
+        (scanMarked &&
+            (collectionType != CollectionType.SCAN || scanSourceCollectionId.isEmpty() ||
+                scanDestinationCollectionId != collectionId.lowercase() ||
+                scanSourceCollectionId == scanDestinationCollectionId))
+    ) return null
     return RemoteCollectionBook(
         captureId = captureId,
         originalCollectionId = originalCollectionId,
@@ -609,6 +708,11 @@ internal fun remoteCollectionBookFromCaptureJson(
         year = normalizeCollectionField(captureRowString(row, "year")),
         photoCount = photoCount.toInt(),
         createdAt = parseCaptureCreatedAt(captureRowString(row, "created_at")),
+        collectionType = collectionType,
+        scanMarked = scanMarked,
+        scanSourceCollectionId = scanSourceCollectionId,
+        scanDestinationCollectionId = scanDestinationCollectionId,
+        scanRevision = scanRevision,
     )
 }
 
@@ -729,6 +833,13 @@ private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject {
         book.scanPriority == null ||
             (book.digitizationCandidateClassification == true && book.scanPriority in 1..5),
     ) { "scan priority requires an explicit candidate and must be in 1..5" }
+    require(book.scanRevision >= 0L) { "scan revision must not be negative" }
+    require(!book.scanMarked ||
+        (book.collectionType == CollectionType.SCAN &&
+            book.scanSourceCollectionId.isNotBlank() &&
+            book.scanDestinationCollectionId == book.collectionId &&
+            book.scanSourceCollectionId != book.scanDestinationCollectionId)
+    ) { "invalid active scan state" }
     return JSONObject()
         .put("capture_id", book.captureId)
         .put("original_collection_id", book.originalCollectionId)
@@ -746,6 +857,11 @@ private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject {
             book.digitizationCandidateClassification ?: JSONObject.NULL,
         )
         .put("scan_priority", book.scanPriority ?: JSONObject.NULL)
+        .put("collection_type", book.collectionType.wireValue)
+        .put("scan_marked", book.scanMarked)
+        .put("scan_source_collection_id", book.scanSourceCollectionId)
+        .put("scan_destination_collection_id", book.scanDestinationCollectionId)
+        .put("scan_revision", book.scanRevision)
 }
 
 private fun remoteBookFromJson(
@@ -778,6 +894,29 @@ private fun remoteBookFromJson(
             digitizationCandidateClassification,
         )
     }
+    val collectionType = if (version < 4) CollectionType.CAPTURE else {
+        CollectionType.fromWire(requiredRemoteString(row, "collection_type"))
+            ?: throw IllegalArgumentException("invalid collection type")
+    }
+    val scanMarked = if (version < 4) false else {
+        requiredRemoteBoolean(row, "scan_marked")
+    }
+    val scanSourceCollectionId = if (version < 4) "" else {
+        requiredRemoteString(row, "scan_source_collection_id")
+    }
+    val scanDestinationCollectionId = if (version < 4) "" else {
+        requiredRemoteString(row, "scan_destination_collection_id")
+    }
+    val scanRevision = if (version < 4) 0L else {
+        requiredRemoteWholeNumber(row, "scan_revision")
+    }
+    require(scanRevision >= 0L) { "invalid scan revision" }
+    require(!scanMarked ||
+        (collectionType == CollectionType.SCAN &&
+            scanSourceCollectionId.isNotBlank() &&
+            scanDestinationCollectionId == collectionId &&
+            scanSourceCollectionId != scanDestinationCollectionId)
+    ) { "invalid active scan state" }
     return RemoteCollectionBook(
         captureId = captureId,
         originalCollectionId = originalCollectionId,
@@ -792,6 +931,11 @@ private fun remoteBookFromJson(
         createdAt = createdAt,
         digitizationCandidateClassification = digitizationCandidateClassification,
         scanPriority = scanPriority,
+        collectionType = collectionType,
+        scanMarked = scanMarked,
+        scanSourceCollectionId = scanSourceCollectionId,
+        scanDestinationCollectionId = scanDestinationCollectionId,
+        scanRevision = scanRevision,
     )
 }
 

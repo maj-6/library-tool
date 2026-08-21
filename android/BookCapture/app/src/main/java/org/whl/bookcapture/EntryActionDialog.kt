@@ -6,6 +6,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -27,6 +28,7 @@ internal fun showEntryActionDialog(
         .setTitle(Entries.titleLabel(activity, entry).take(80))
         .setItems(actions.map { RemoteUiCatalog.text(activity, it.label) }.toTypedArray()) { _, index ->
             when (actions[index]) {
+                EntryAction.MARK_SCAN -> markEntryForScan(activity, entryId, onChanged)
                 EntryAction.REMARK -> showEntryAttentionDialog(activity, entryId, onChanged)
                 EntryAction.REPROCESS -> reprocessEntry(activity, entryId, onChanged)
                 EntryAction.DELETE -> showEntryDeleteConfirmation(activity, entryId, onChanged)
@@ -39,9 +41,122 @@ internal fun showEntryActionDialog(
 }
 
 private enum class EntryAction(val label: Int) {
+    MARK_SCAN(R.string.entry_action_mark_scan),
     REMARK(R.string.entry_action_remark),
     REPROCESS(R.string.entry_action_reprocess),
     DELETE(R.string.entry_action_delete),
+}
+
+private enum class ScanMarkActionResult {
+    SYNCED,
+    QUEUED,
+    NEED_SCAN_COLLECTION,
+    ACTIVE_CAPTURE,
+    FAILED,
+}
+
+/** Mark from any ordinary book card, without reopening the capture editor. */
+private fun markEntryForScan(
+    activity: AppCompatActivity,
+    entryId: String,
+    onChanged: () -> Unit,
+) {
+    activity.lifecycleScope.launch {
+        val result = withContext(Dispatchers.IO) {
+            INSPECT_MEMBERSHIP_MUTATION_MUTEX.withLock {
+                val entry = Entries.findIncludingArchive(activity, entryId)
+                    ?: return@withLock ScanMarkActionResult.FAILED
+                if (Prefs.currentEntryId(activity) == entryId || !entry.sealed) {
+                    return@withLock ScanMarkActionResult.ACTIVE_CAPTURE
+                }
+                val destination = Collections.currentScan(activity)
+                    ?: return@withLock ScanMarkActionResult.NEED_SCAN_COLLECTION
+                val store = InspectBookMemberships.read(activity)
+                if (!store.valid) return@withLock ScanMarkActionResult.FAILED
+                val previous = store.memberships[entryId]
+                val previousCollection = previous?.collectionId
+                    ?.takeIf { it.isNotBlank() && !previous.removed }
+                    ?.let { Collections.byId(activity, it) }
+                val sourceId = when {
+                    previousCollection?.collectionType == CollectionType.CAPTURE ->
+                        previousCollection.id
+                    else -> CaptureScanMarkStore.read(entry.dir)?.sourceCollectionId
+                        ?: entry.provenance?.collectionId
+                }.orEmpty()
+                if (!CaptureScanMarkStore.write(
+                        entry.dir,
+                        sourceCollectionId = sourceId,
+                        scanCollectionId = destination.id,
+                    ) || !InspectBookMemberships.move(
+                        activity,
+                        setOf(entryId),
+                        destination.id,
+                    )
+                ) return@withLock ScanMarkActionResult.FAILED
+
+                val owner = entry.cloudOwnerId.trim().lowercase().ifEmpty {
+                    Prefs.userId(activity).trim().lowercase().takeIf {
+                        entry.uploaded && entry.deliveryTransport == "cloud"
+                    }.orEmpty()
+                }
+                val currentOwner = Prefs.userId(activity).trim().lowercase()
+                val canSyncNow = owner.isNotEmpty() && owner == currentOwner &&
+                    Prefs.configured(activity) && Auth.signedIn(activity)
+                if (!canSyncNow) return@withLock ScanMarkActionResult.QUEUED
+                if (!InspectBookMemberships.markCloud(activity, setOf(entryId), owner)) {
+                    return@withLock ScanMarkActionResult.QUEUED
+                }
+                val expected = InspectBookMemberships.read(activity)
+                    .takeIf { it.valid }
+                    ?.memberships
+                    ?.get(entryId)
+                    ?: return@withLock ScanMarkActionResult.QUEUED
+                try {
+                    val accepted = SupabaseClient(activity, owner).mutateCaptureCollection(
+                        captureIds = setOf(entryId),
+                        collectionId = destination.id,
+                        removed = false,
+                    )
+                    if (accepted != setOf(entryId) ||
+                        !RemoteCollectionBooks.applyMembershipMutation(
+                            activity,
+                            accepted,
+                            destination.id,
+                            removed = false,
+                            owner = owner,
+                        )
+                    ) return@withLock ScanMarkActionResult.QUEUED
+                    when (InspectBookMemberships.compareAndSet(
+                        activity,
+                        entryId,
+                        expected,
+                        replacement = null,
+                    )) {
+                        InspectMembershipCompareResult.UPDATED -> ScanMarkActionResult.SYNCED
+                        InspectMembershipCompareResult.CHANGED -> ScanMarkActionResult.QUEUED
+                        InspectMembershipCompareResult.FAILED -> ScanMarkActionResult.QUEUED
+                    }
+                } catch (_: Exception) {
+                    ScanMarkActionResult.QUEUED
+                }
+            }
+        }
+        val message = when (result) {
+            ScanMarkActionResult.SYNCED -> R.string.entry_scan_marked
+            ScanMarkActionResult.QUEUED -> R.string.entry_scan_marked_pending_sync
+            ScanMarkActionResult.NEED_SCAN_COLLECTION -> R.string.capture_scan_mark_needs_collection
+            ScanMarkActionResult.ACTIVE_CAPTURE -> R.string.entry_scan_mark_active_capture
+            ScanMarkActionResult.FAILED -> R.string.entry_scan_mark_failed
+        }
+        Toast.makeText(
+            activity,
+            message,
+            if (result == ScanMarkActionResult.SYNCED) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
+        ).show()
+        if (result == ScanMarkActionResult.SYNCED || result == ScanMarkActionResult.QUEUED) {
+            onChanged()
+        }
+    }
 }
 
 private enum class ReprocessRequestResult {

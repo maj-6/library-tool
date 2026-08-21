@@ -16,6 +16,7 @@ class HomeLifecyclePerformanceTest {
 
         val stopLoading = section("private fun stopHomeLoading()", "private fun configureScanRowAccessibility")
         assertTrue(stopLoading.contains("cancelScheduledWorkerRefresh()"))
+        assertTrue(stopLoading.contains("scanQueueSummaryJob?.cancel()"))
         assertTrue(stopLoading.contains("cancelScanListLoading()"))
         assertTrue(stopLoading.contains("cancelCollectionBarLoading()"))
         assertTrue(stopLoading.contains("cancelCollectionListLoading()"))

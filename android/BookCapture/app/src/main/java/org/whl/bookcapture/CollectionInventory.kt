@@ -29,8 +29,19 @@ internal data class CollectionInventorySummary(
     val digitizationCandidateClassification: Boolean? = null,
     /** Present only for an explicitly classified candidate; valid values are 1..5. */
     val scanPriority: Int? = null,
+    /** Effective collection role. Legacy rows are ordinary capture records. */
+    val collectionType: CollectionType = CollectionType.CAPTURE,
+    /** Active physical set-aside for digitization, independent of OCR/photo capture. */
+    val scanMarked: Boolean = false,
+    /** Historical capture collection retained when [scanMarked] moves the book. */
+    val scanSourceCollectionId: String = "",
+    /** Active scan-type destination, retained as audit data after later changes. */
+    val scanDestinationCollectionId: String = "",
+    /** Server-monotonic revision of scan state; zero means legacy/unknown. */
+    val scanRevision: Long = 0L,
 ) {
-    val digitizationCandidate: Boolean get() = digitizationCandidateClassification == true
+    val digitizationCandidate: Boolean
+        get() = digitizationCandidateClassification == true || scanMarked
 }
 
 /** One Inspect row. Only a still-current entry can carry live photo access. */
@@ -53,7 +64,7 @@ internal data class CollectionInventoryStore(
 )
 
 internal const val COLLECTION_INVENTORY_FILE = "collection_inventory.json"
-internal const val COLLECTION_INVENTORY_VERSION = 4
+internal const val COLLECTION_INVENTORY_VERSION = 5
 
 internal object CollectionInventory {
 
@@ -96,6 +107,7 @@ internal object CollectionInventory {
 
 internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInventorySummary {
     val desktop = entry.desktopBook
+    val scanMark = CaptureScanMarkStore.read(entry.dir)
     return CollectionInventorySummary(
         entryId = entry.id,
         collectionId = entry.provenance?.collectionId.orEmpty(),
@@ -109,6 +121,15 @@ internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInvento
         cloudOwnerId = entry.cloudOwnerId.trim().lowercase(),
         digitizationCandidateClassification = desktop?.digitizationCandidateClassification,
         scanPriority = desktop?.scanPriority,
+        collectionType = if (scanMark == null) {
+            CollectionType.CAPTURE
+        } else {
+            CollectionType.SCAN
+        },
+        scanMarked = scanMark != null,
+        scanSourceCollectionId = scanMark?.sourceCollectionId.orEmpty(),
+        scanDestinationCollectionId = scanMark?.scanCollectionId.orEmpty(),
+        scanRevision = if (scanMark == null) 0L else 1L,
     )
 }
 
@@ -153,6 +174,7 @@ internal fun collectionInventoryStoreToJson(store: CollectionInventoryStore): St
  * cloud owner so a photo-free row can never be submitted under another
  * account merely because that account is signed in later. Version 4 retains
  * the desktop's tri-state scan-candidate classification and bounded priority.
+ * Version 5 retains collection role plus the independent physical scan mark.
  */
 internal fun collectionInventoryStoreFromJson(text: String): CollectionInventoryStore = try {
     val root = JSONObject(text)
@@ -224,6 +246,12 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
             (summary.digitizationCandidateClassification == true &&
                 summary.scanPriority in 1..5),
     ) { "scan priority requires an explicit candidate and must be in 1..5" }
+    require(summary.scanRevision >= 0L) { "scan revision must not be negative" }
+    require(!summary.scanMarked ||
+        (summary.collectionType == CollectionType.SCAN &&
+            summary.scanSourceCollectionId.isNotBlank() &&
+            summary.scanDestinationCollectionId.isNotBlank())
+    ) { "an active scan mark requires scan collection provenance" }
     return JSONObject()
         .put("collection_id", summary.collectionId)
         .put("collection_name", summary.collectionName)
@@ -239,6 +267,11 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
             summary.digitizationCandidateClassification ?: JSONObject.NULL,
         )
         .put("scan_priority", summary.scanPriority ?: JSONObject.NULL)
+        .put("collection_type", summary.collectionType.wireValue)
+        .put("scan_marked", summary.scanMarked)
+        .put("scan_source_collection_id", summary.scanSourceCollectionId)
+        .put("scan_destination_collection_id", summary.scanDestinationCollectionId)
+        .put("scan_revision", summary.scanRevision)
 }
 
 private fun summaryFromJson(
@@ -275,6 +308,29 @@ private fun summaryFromJson(
             digitizationCandidateClassification,
         )
     }
+    val collectionType = if (version < 5) CollectionType.CAPTURE else {
+        CollectionType.fromWire(requiredString(row, "collection_type"))
+            ?: throw IllegalArgumentException("invalid collection type")
+    }
+    val scanMarked = if (version < 5) false else {
+        optionalInventoryBoolean(row, "scan_marked")
+            ?: throw IllegalArgumentException("scan_marked must be a boolean")
+    }
+    val scanSourceCollectionId = if (version < 5) "" else {
+        requiredString(row, "scan_source_collection_id")
+    }
+    val scanDestinationCollectionId = if (version < 5) "" else {
+        requiredString(row, "scan_destination_collection_id")
+    }
+    val scanRevision = if (version < 5) 0L else {
+        requiredWholeNumber(row, "scan_revision")
+    }
+    require(scanRevision >= 0L) { "invalid scan revision" }
+    require(!scanMarked ||
+        (collectionType == CollectionType.SCAN &&
+            scanSourceCollectionId.isNotBlank() &&
+            scanDestinationCollectionId.isNotBlank())
+    ) { "invalid active scan state" }
     return CollectionInventorySummary(
         entryId = entryId,
         collectionId = requiredString(row, "collection_id"),
@@ -288,6 +344,11 @@ private fun summaryFromJson(
         cloudOwnerId = cloudOwnerId,
         digitizationCandidateClassification = digitizationCandidateClassification,
         scanPriority = scanPriority,
+        collectionType = collectionType,
+        scanMarked = scanMarked,
+        scanSourceCollectionId = scanSourceCollectionId,
+        scanDestinationCollectionId = scanDestinationCollectionId,
+        scanRevision = scanRevision,
     )
 }
 

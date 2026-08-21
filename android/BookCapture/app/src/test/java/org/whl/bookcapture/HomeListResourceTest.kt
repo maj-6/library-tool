@@ -412,14 +412,14 @@ class HomeListResourceTest {
 
         val homeSource = source("HomeActivity")
         assertTrue(homeSource.contains("bindScanPriorityIndicator("))
-        assertTrue(homeSource.contains("desktop?.digitizationCandidateClassification"))
+        assertTrue(homeSource.contains("entryScanCandidate(this, entry)"))
         assertTrue(homeSource.contains("desktop?.scanPriority"))
         val summary = homeSource.substringAfter("val summaryIds = listOf(")
             .substringBefore(")")
         assertTrue(summary.contains("R.id.scanPriorityIndicator"))
 
         val detailSource = source("EntryDetailActivity")
-        assertTrue(detailSource.contains("if (desktop.digitizationCandidate)"))
+        assertTrue(detailSource.contains("if (entryScanCandidate(this, entry) == true)"))
         assertTrue(detailSource.contains("R.string.detail_digitization"))
         assertTrue(detailSource.contains("R.string.scan_priority_description"))
 

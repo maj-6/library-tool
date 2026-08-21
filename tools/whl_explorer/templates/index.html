@@ -1824,6 +1824,11 @@
                  aria-label="New collection name" placeholder="Collection name" />
           <input id="collections-new-from" class="cad-input" maxlength="80"
                  aria-label="New collection origin" placeholder="From (optional)" />
+          <select id="collections-new-type" class="cad-input"
+                  aria-label="New collection type">
+            <option value="capture">Capture collection</option>
+            <option value="scan">Scan collection</option>
+          </select>
           <button id="collections-add" class="cad-btn tiny" type="submit">Add</button>
           <button id="collections-revert" class="cad-btn tiny" type="button" hidden>Revert edits</button>
           <span class="tool-label" id="collections-msg" role="status" aria-live="polite"></span>
@@ -1831,9 +1836,21 @@
           <span class="tool-label" id="collections-count"></span>
         </form>
         <div id="collections-list" class="drafting"></div>
-        <p class="pane-note" id="collections-note">Collection rows are current shared state. A book's Collection and
-          From values are capture-time snapshots: they are read-only and do not change when a
-          collection is renamed, re-originated, merged, or deleted.</p>
+        <section id="scan-queue-panel" aria-labelledby="scan-queue-title">
+          <div class="pane-bar scan-queue-toolbar">
+            <strong id="scan-queue-title">Physical scan matching</strong>
+            <button id="scan-queue-refresh" class="cad-btn tiny" type="button">Refresh</button>
+            <span id="scan-queue-msg" class="tool-label" role="status"
+                  aria-live="polite"></span>
+            <span class="bar-spacer"></span>
+            <span id="scan-queue-count" class="tool-label"></span>
+          </div>
+          <div id="scan-queue-list" class="drafting"></div>
+          <div id="scan-state-list" class="drafting"></div>
+        </section>
+        <p class="pane-note" id="collections-note">Capture and scan collections are independent shared identities;
+          their type cannot be changed after creation. A book's original Collection and From
+          values remain capture-time provenance when it is moved to a scan collection.</p>
       </div>
     </div>
   </div>

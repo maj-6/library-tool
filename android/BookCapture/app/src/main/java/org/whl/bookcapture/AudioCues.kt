@@ -43,6 +43,7 @@ class AudioCues(context: Context) {
 
     fun started() { tone(ToneGenerator.TONE_PROP_BEEP, 120); buzz() }
     fun saved(@Suppress("UNUSED_PARAMETER") photos: Int) { tone(ToneGenerator.TONE_PROP_ACK, 150); buzz() }
+    fun markedForScan() { tone(ToneGenerator.TONE_PROP_ACK, 110); buzz() }
     fun cancelled() { tone(ToneGenerator.TONE_PROP_NACK, 150); buzz() }
     fun error(@Suppress("UNUSED_PARAMETER") message: String) { tone(ToneGenerator.TONE_SUP_ERROR, 200); buzz(40) }
 

@@ -218,7 +218,11 @@ class InspectResourceContractTest {
         val homeSource = source("HomeActivity")
         assertTrue(homeSource.contains("binding.scanBox.setOnClickListener"))
         assertTrue(homeSource.contains("qrScanner.launch(Intent(this, QrScannerActivity::class.java))"))
-        assertTrue(homeSource.contains("binding.scanBox.visibility = if (tab == HomeTab.INSPECT)"))
+        assertTrue(
+            homeSource.contains(
+                "binding.inspectActions.visibility = if (tab == HomeTab.INSPECT)",
+            ),
+        )
 
         val manifest = xml("src/main/AndroidManifest.xml")
         val scannerActivity = elements(manifest, "activity").first {

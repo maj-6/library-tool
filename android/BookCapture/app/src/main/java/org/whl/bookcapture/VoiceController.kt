@@ -54,7 +54,7 @@ class VoiceController(
          * so this list and COMMAND_PHRASES in StateAwareVoiceCommandPolicy must
          * be kept in step; VoiceCommandVocabularyTest asserts exactly that. */
         val COMMANDS = listOf(
-            "start", "photo", "check", "done", "cancel", "restart", "undo", "edit", "notes",
+            "start", "photo", "check", "scan", "done", "cancel", "restart", "undo", "edit", "notes",
             "end notes", "spine", "cover", "title", "title page",
         )
 

@@ -110,6 +110,9 @@ class CollectionInventoryTest {
         assertEquals("", row.getString("cloud_owner_id"))
         assertTrue(row.getBoolean("digitization_candidate"))
         assertEquals(3, row.getInt("scan_priority"))
+        assertEquals("capture", row.getString("collection_type"))
+        assertFalse(row.getBoolean("scan_marked"))
+        assertEquals(0L, row.getLong("scan_revision"))
         assertEquals(
             mapOf(original.entryId to original),
             collectionInventoryStoreFromJson(encoded).summaries,
@@ -150,7 +153,7 @@ class CollectionInventoryTest {
     fun malformedOrUnknownSchemasAreNotWritableStores() {
         val invalid = listOf(
             "{}",
-            """{"version":5,"entries":{}}""",
+            """{"version":6,"entries":{}}""",
             """{"version":1,"entries":[]}""",
             """{"version":1,"entries":{"e":{"collection_id":4}}}""",
             """{"version":1,"entries":{"e":{

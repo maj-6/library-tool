@@ -5465,17 +5465,20 @@ body[data-theme] .drafting::-webkit-scrollbar {
   gap: 7px;
 }
 #collections-add-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-#collections-new-name, #collections-new-from { flex: 1 1 180px; min-width: 110px; }
+#collections-new-name, #collections-new-from { flex: 1 1 170px; min-width: 110px; }
+#collections-new-type { flex: 0 1 160px; min-width: 135px; }
 #collections-list {
   height: clamp(180px, 48vh, 380px);
+  flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   border: var(--border-w, 1px) solid var(--canvas-line);
 }
 .collections-table { width: 100%; }
-.collections-table th:nth-child(1), .collections-table th:nth-child(2) { width: 19%; }
-.collections-table th:nth-child(3) { width: 52px; }
-.collections-table th:nth-child(4) { width: 24%; }
+.collections-table th:nth-child(1), .collections-table th:nth-child(3) { width: 17%; }
+.collections-table th:nth-child(2) { width: 74px; }
+.collections-table th:nth-child(4) { width: 52px; }
+.collections-table th:nth-child(5) { width: 21%; }
 .collections-table td { vertical-align: top; }
 .collections-table td > .cad-input { width: 100%; min-width: 90px; }
 .collection-books { text-align: right; font-variant-numeric: tabular-nums; }
@@ -5498,6 +5501,40 @@ body[data-theme] .drafting::-webkit-scrollbar {
 }
 .collection-snapshot-only { opacity: 0.8; }
 .collections-empty { padding: 12px; }
+.collection-type {
+  display: inline-block;
+  padding: 2px 5px;
+  border: var(--border-w, 1px) solid var(--canvas-line);
+  border-radius: var(--radius);
+  font-size: 9px;
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+}
+.collection-type.scan { color: var(--cyan); }
+#scan-queue-panel {
+  display: flex;
+  min-height: 130px;
+  max-height: 30vh;
+  flex-direction: column;
+  border: var(--border-w, 1px) solid var(--canvas-line);
+}
+.scan-queue-toolbar { flex: none; }
+#scan-queue-list, #scan-state-list { overflow: auto; }
+#scan-queue-list { flex: 1 1 auto; min-height: 70px; }
+#scan-state-list {
+  flex: 0 1 90px;
+  border-top: var(--border-w, 1px) solid var(--canvas-line);
+}
+.scan-queue-table { width: 100%; }
+.scan-queue-table td { vertical-align: top; white-space: normal; }
+.scan-queue-ocr {
+  max-width: 360px;
+  word-break: break-word;
+  color: var(--ink-mut);
+}
+.scan-queue-match { display: flex; gap: 4px; min-width: 260px; }
+.scan-queue-match select { flex: 1 1 auto; min-width: 140px; }
+.scan-state-inactive { opacity: 0.65; }
 
 /* These two catalogue columns are capture snapshots, never cell editors. */
 td.capture-snapshot:not(:empty) { color: var(--ink-mut); }

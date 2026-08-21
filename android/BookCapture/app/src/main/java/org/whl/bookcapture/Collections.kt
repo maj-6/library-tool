@@ -24,6 +24,18 @@ import java.util.UUID
  * [Collections.all], so a signed-out delete cannot be resurrected by the next
  * cloud pull.
  */
+enum class CollectionType(val wireValue: String) {
+    CAPTURE("capture"),
+    SCAN("scan"),
+    ;
+
+    companion object {
+        fun fromWire(value: String): CollectionType? = entries.firstOrNull {
+            it.wireValue == value.trim().lowercase()
+        }
+    }
+}
+
 data class BookCollection(
     val id: String,
     val name: String,
@@ -34,6 +46,8 @@ data class BookCollection(
     val mergedInto: String? = null,
     val parentId: String? = null,
     val tagId: String = defaultCollectionTagId(name),
+    /** Immutable role: ordinary capture destination or digitization queue. */
+    val collectionType: CollectionType = CollectionType.CAPTURE,
 )
 
 private fun BookCollection.isLive(): Boolean = !deleted && mergedInto == null
@@ -293,6 +307,7 @@ private fun collectionToJson(collection: BookCollection): JSONObject =
         .put("name", collection.name)
         .put("from", collection.from)
         .put("tag_id", canonicalCollectionTagId(collection))
+        .put("collection_type", collection.collectionType.wireValue)
         .apply {
             if (collection.updatedAt.isNotEmpty()) put("updated_at", collection.updatedAt)
             if (collection.deleted) put("deleted", true)
@@ -315,7 +330,7 @@ internal fun collectionStoreToJson(store: CollectionStore): String {
     val dirty = JSONArray()
     store.dirty.toSortedSet().forEach { dirty.put(it) }
     return JSONObject()
-        .put("version", 4)
+        .put("version", 5)
         .put("collections", array)
         .put("sync_shadow", shadow)
         .put("sync_dirty", dirty)
@@ -337,7 +352,7 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
         it.isFinite() && it % 1.0 == 0.0
     }) { "version must be an integer" }
     val version = rawVersion.toInt()
-    require(version in 1..4) { "unsupported collections version" }
+    require(version in 1..5) { "unsupported collections version" }
     val array = root.optJSONArray("collections")
         ?: throw IllegalArgumentException("collections must be an array")
     if (version >= 2 && root.has("sync_shadow") && root.optJSONObject("sync_shadow") == null) {
@@ -377,6 +392,12 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
             is String -> rawParent.trim().ifEmpty { null }
             else -> continue
         }
+        val collectionType = if (version < 5) {
+            CollectionType.CAPTURE
+        } else {
+            val rawType = item.opt("collection_type") as? String ?: continue
+            CollectionType.fromWire(rawType) ?: continue
+        }
         out += BookCollection(
             id = id,
             name = name,
@@ -386,6 +407,7 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
             mergedInto = mergedInto,
             parentId = parentId,
             tagId = tagId,
+            collectionType = collectionType,
         )
     }
     val collections = if (version >= 4) out else {
@@ -427,7 +449,7 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
             add(id)
         }
     }
-    val migratedShadow = if (version >= 4) shadow else shadow.mapValues { (id, baseline) ->
+    val tagMigratedShadow = if (version >= 4) shadow else shadow.mapValues { (id, baseline) ->
         val row = collections.firstOrNull { it.id == id }
         // Adding a synthesized tag is a format migration, not local intent. If
         // every pre-tag semantic field still matches the saved baseline, rebase
@@ -435,9 +457,22 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
         // cloud change. A genuinely edited legacy row keeps its old hash (and
         // usually its dirty marker), preserving the normal three-way merge.
         if (row != null && baseline.hash == collectionContentHashBeforeTags(row)) {
-            baseline.copy(hash = collectionContentHash(row))
+            baseline.copy(hash = collectionContentHashBeforeTypes(row))
         } else {
             baseline
+        }
+    }
+    val migratedShadow = if (version >= 5) tagMigratedShadow else {
+        tagMigratedShadow.mapValues { (id, baseline) ->
+            val row = collections.firstOrNull { it.id == id }
+            // Every pre-v5 row is a capture collection. Adding that explicit
+            // type is a format migration, not a local edit, so retain the
+            // existing three-way merge baseline whenever its old hash matches.
+            if (row != null && baseline.hash == collectionContentHashBeforeTypes(row)) {
+                baseline.copy(hash = collectionContentHash(row))
+            } else {
+                baseline
+            }
         }
     }
     CollectionStore(collections, migratedShadow, dirty)
@@ -532,6 +567,7 @@ internal fun addCollection(
     id: String = UUID.randomUUID().toString(),
     parentId: String? = null,
     tagId: String? = null,
+    collectionType: CollectionType = CollectionType.CAPTURE,
 ): CollectionEdit {
     val clean = normalizeCollectionField(name)
     if (clean.isEmpty()) return CollectionEdit(null, R.string.collections_error_name_required)
@@ -558,6 +594,7 @@ internal fun addCollection(
             from = normalizeCollectionField(from),
             parentId = cleanParentId,
             tagId = cleanTagId,
+            collectionType = collectionType,
         ),
         null,
     )
@@ -619,8 +656,11 @@ internal fun removeCollection(collections: List<BookCollection>, id: String): Li
 internal fun resolveCurrentCollection(
     collections: List<BookCollection>,
     selectedId: String?,
+    collectionType: CollectionType = CollectionType.CAPTURE,
 ): BookCollection? {
-    val live = collections.filter { it.isLive() }
+    val live = collections.filter {
+        it.isLive() && it.collectionType == collectionType
+    }
     live.firstOrNull { it.id == selectedId }?.let { return it }
     return live.singleOrNull()
 }
@@ -681,8 +721,8 @@ private fun collectionContentHashBeforeTags(collection: BookCollection): String 
     return hashCollectionFields(fields)
 }
 
-/** Stable semantic identity; timestamps are revision metadata, not content. */
-internal fun collectionContentHash(collection: BookCollection): String {
+/** Hash emitted by the tag-aware v4 store immediately before types existed. */
+private fun collectionContentHashBeforeTypes(collection: BookCollection): String {
     val fields = mutableListOf(
         collection.id,
         collection.name,
@@ -694,6 +734,15 @@ internal fun collectionContentHash(collection: BookCollection): String {
     collection.parentId?.let { fields += "parent:$it" }
     return hashCollectionFields(fields)
 }
+
+/** Stable semantic identity; timestamps are revision metadata, not content. */
+internal fun collectionContentHash(collection: BookCollection): String =
+    hashCollectionFields(
+        listOf(
+            collectionContentHashBeforeTypes(collection),
+            "type:${collection.collectionType.wireValue}",
+        ),
+    )
 
 private fun shadowOf(row: BookCollection) =
     CollectionSyncShadow(collectionContentHash(row), row.updatedAt)
@@ -967,11 +1016,16 @@ object Collections {
                     )
                     nextDirty += old.id
                 } else {
-                    val changed = replacement.name != old.name ||
-                        replacement.from != old.from ||
-                        replacement.parentId != old.parentId ||
-                        replacement.tagId != old.tagId
-                    nextRecords += replacement.copy(
+                    // A collection's role is fixed at creation. Besides
+                    // matching the database constraint, preserving it here
+                    // prevents a stale editor model from turning a physical
+                    // capture box into a digitization queue (or vice versa).
+                    val preserved = replacement.copy(collectionType = old.collectionType)
+                    val changed = preserved.name != old.name ||
+                        preserved.from != old.from ||
+                        preserved.parentId != old.parentId ||
+                        preserved.tagId != old.tagId
+                    nextRecords += preserved.copy(
                         updatedAt = if (changed) nextCollectionTimestamp(old.updatedAt, now)
                         else old.updatedAt,
                         deleted = false,
@@ -1013,6 +1067,9 @@ object Collections {
                 ))
             ) return@synchronized false
             if (Prefs.currentCollectionId(ctx) == id) Prefs.setCurrentCollectionId(ctx, null)
+            if (Prefs.currentScanCollectionId(ctx) == id) {
+                Prefs.setCurrentScanCollectionId(ctx, null)
+            }
             true
         }
         if (deleted) CollectionSyncWorker.enqueue(ctx)
@@ -1056,8 +1113,21 @@ object Collections {
             throw IOException("could not persist collection sync")
         }
         Prefs.currentCollectionId(ctx)?.let { selected ->
-            if (merge.collections.none { it.id == selected && it.isLive() }) {
+            if (merge.collections.none {
+                    it.id == selected && it.isLive() &&
+                        it.collectionType == CollectionType.CAPTURE
+                }
+            ) {
                 Prefs.setCurrentCollectionId(ctx, null)
+            }
+        }
+        Prefs.currentScanCollectionId(ctx)?.let { selected ->
+            if (merge.collections.none {
+                    it.id == selected && it.isLive() &&
+                        it.collectionType == CollectionType.SCAN
+                }
+            ) {
+                Prefs.setCurrentScanCollectionId(ctx, null)
             }
         }
         merge.writes
@@ -1080,7 +1150,19 @@ object Collections {
     /** The collection a new book would be scanned into, or null if the user
      * still has to pick one. */
     fun current(ctx: Context): BookCollection? =
-        resolveCurrentCollection(all(ctx), Prefs.currentCollectionId(ctx))
+        resolveCurrentCollection(
+            all(ctx),
+            Prefs.currentCollectionId(ctx),
+            CollectionType.CAPTURE,
+        )
+
+    /** Independently selected destination for books set aside to digitize. */
+    fun currentScan(ctx: Context): BookCollection? =
+        resolveCurrentCollection(
+            all(ctx),
+            Prefs.currentScanCollectionId(ctx),
+            CollectionType.SCAN,
+        )
 
     fun byId(ctx: Context, id: String): BookCollection? =
         all(ctx).firstOrNull { it.id == id }

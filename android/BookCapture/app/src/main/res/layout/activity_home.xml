@@ -232,6 +232,23 @@
                     android:textSize="11sp"
                     android:visibility="gone" />
 
+                <TextView
+                    android:id="@+id/scanQueueSummary"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:layout_marginTop="7dp"
+                    android:layout_marginEnd="12dp"
+                    android:background="@drawable/whl_row"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:fontFamily="monospace"
+                    android:minHeight="44dp"
+                    android:padding="10dp"
+                    android:textColor="@color/whl_ink_dim"
+                    android:textSize="11sp"
+                    android:visibility="gone" />
+
                 <LinearLayout
                     android:id="@+id/inspectLookupResults"
                     android:layout_width="match_parent"
@@ -447,21 +464,48 @@
             android:visibility="gone"
             android:text="@string/collections_new" />
 
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/scanBox"
-            style="@style/WhlButton"
+        <LinearLayout
+            android:id="@+id/inspectActions"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:fontFamily="@font/roboto_slab"
-            android:gravity="center"
-            android:text="@string/inspect_scan_box"
-            android:textAllCaps="false"
-            android:textSize="15sp"
             android:visibility="gone"
-            app:icon="@drawable/ic_qr_scan"
-            app:iconGravity="textStart"
-            app:iconPadding="8dp"
-            app:iconSize="25dp"
-            app:iconTint="@color/whl_button_text" />
+            android:baselineAligned="false"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/scanBox"
+                style="@style/WhlButton"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_marginEnd="6dp"
+                android:layout_weight="1"
+                android:fontFamily="@font/roboto_slab"
+                android:gravity="center"
+                android:text="@string/inspect_scan_box"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                app:icon="@drawable/ic_qr_scan"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp"
+                app:iconSize="22dp"
+                app:iconTint="@color/whl_button_text" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/queueScanBook"
+                style="@style/WhlButton"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:fontFamily="@font/roboto_slab"
+                android:gravity="center"
+                android:text="@string/scan_queue_add"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                app:icon="@drawable/ic_scan_priority"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp"
+                app:iconSize="22dp"
+                app:iconTint="@color/whl_button_text" />
+        </LinearLayout>
     </FrameLayout>
 </androidx.constraintlayout.widget.ConstraintLayout>

@@ -27,7 +27,7 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * One-shot Mistral cover reader for Inspect.
+ * One-shot Mistral cover/title-page reader for Inspect.
  *
  * It owns no CaptureSession and never creates a book or page. CameraX writes a
  * temporary JPEG, the existing authenticated Mistral pipeline reads it with OCR
@@ -39,6 +39,10 @@ class CoverScannerActivity : AppCompatActivity() {
     private var imageCapture: ImageCapture? = null
     private var recognitionJob: Job? = null
     private var activeTempFile: File? = null
+    private val photoRole: ScanSearchPhotoRole by lazy {
+        ScanSearchPhotoRole.fromWire(intent.getStringExtra(EXTRA_PHOTO_ROLE).orEmpty())
+            ?: ScanSearchPhotoRole.COVER
+    }
 
     /** Exactly one capture may own the temporary file and recognition task. */
     private val captureInFlight = AtomicBoolean(false)
@@ -65,6 +69,15 @@ class CoverScannerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityCoverScannerBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        if (photoRole == ScanSearchPhotoRole.TITLE_PAGE) {
+            binding.coverScannerTitle.setText(R.string.title_page_scanner_title)
+            binding.coverScannerHelp.setText(R.string.title_page_scanner_help)
+            binding.captureCover.setText(R.string.title_page_scanner_capture)
+            binding.captureCover.setContentDescription(
+                getString(R.string.title_page_scanner_capture_description),
+            )
+        }
 
         binding.closeCoverScanner.setOnClickListener { finishCancelled() }
         binding.captureCover.setOnClickListener { captureCover() }
@@ -107,7 +120,7 @@ class CoverScannerActivity : AppCompatActivity() {
                 cameraProvider = provider
                 imageCapture = capture
                 binding.captureCover.isEnabled = true
-                renderStatus(R.string.cover_scanner_ready, busy = false)
+                renderStatus(readyStatus(), busy = false)
             } catch (_: Exception) {
                 Toast.makeText(
                     this,
@@ -134,7 +147,14 @@ class CoverScannerActivity : AppCompatActivity() {
         if (!captureInFlight.compareAndSet(false, true)) return
 
         binding.captureCover.isEnabled = false
-        renderStatus(R.string.cover_scanner_capturing, busy = true)
+        renderStatus(
+            if (photoRole == ScanSearchPhotoRole.TITLE_PAGE) {
+                R.string.title_page_scanner_capturing
+            } else {
+                R.string.cover_scanner_capturing
+            },
+            busy = true,
+        )
         val target = try {
             File.createTempFile(COVER_TEMP_PREFIX, ".jpg", cacheDir)
         } catch (_: Exception) {
@@ -173,7 +193,14 @@ class CoverScannerActivity : AppCompatActivity() {
             captureInFlight.set(false)
             return
         }
-        renderStatus(R.string.cover_scanner_reading, busy = true)
+        renderStatus(
+            if (photoRole == ScanSearchPhotoRole.TITLE_PAGE) {
+                R.string.title_page_scanner_reading
+            } else {
+                R.string.cover_scanner_reading
+            },
+            busy = true,
+        )
         recognitionJob = lifecycleScope.launch {
             val recognized = try {
                 withContext(Dispatchers.IO) {
@@ -217,7 +244,9 @@ class CoverScannerActivity : AppCompatActivity() {
         if (!terminal.compareAndSet(false, true)) return
         setResult(
             Activity.RESULT_OK,
-            Intent().putExtra(EXTRA_RECOGNIZED_TEXT, recognized),
+            Intent()
+                .putExtra(EXTRA_RECOGNIZED_TEXT, recognized)
+                .putExtra(EXTRA_PHOTO_ROLE, photoRole.wireValue),
         )
         finish()
     }
@@ -229,7 +258,13 @@ class CoverScannerActivity : AppCompatActivity() {
         if (terminal.get() || isFinishing || isDestroyed) return
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         binding.captureCover.isEnabled = imageCapture != null
-        renderStatus(R.string.cover_scanner_ready, busy = false)
+        renderStatus(readyStatus(), busy = false)
+    }
+
+    private fun readyStatus(): Int = if (photoRole == ScanSearchPhotoRole.TITLE_PAGE) {
+        R.string.title_page_scanner_ready
+    } else {
+        R.string.cover_scanner_ready
     }
 
     private fun renderStatus(message: Int, busy: Boolean) {
@@ -264,6 +299,7 @@ class CoverScannerActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_RECOGNIZED_TEXT = "recognized_cover_text"
+        const val EXTRA_PHOTO_ROLE = "scan_search_photo_role"
         internal const val MAX_RECOGNIZED_TEXT_CHARS = 16_000
         internal const val MIN_COVER_READABLE_CHARS = 4
         private const val COVER_TEMP_PREFIX = "inspect-cover-"

@@ -35,6 +35,31 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
+            android:labelFor="@id/collectionType"
+            android:text="@string/collections_field_type" />
+
+        <androidx.appcompat.widget.AppCompatSpinner
+            android:id="@+id/collectionType"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:minHeight="48dp"
+            android:spinnerMode="dropdown" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:fontFamily="monospace"
+            android:text="@string/collections_type_help"
+            android:textColor="@color/whl_ink_dim"
+            android:textSize="11sp" />
+
+        <TextView
+            style="@style/WhlLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
             android:labelFor="@id/collectionTagId"
             android:text="@string/collections_field_tag_id" />
 
