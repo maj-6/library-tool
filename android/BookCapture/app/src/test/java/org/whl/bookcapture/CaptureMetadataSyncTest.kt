@@ -89,6 +89,7 @@ class CaptureMetadataSyncTest {
             )
             .put("scan_status", "needs scan")
             .put("digitization_candidate", true)
+            .put("scan_priority", 2)
             .put("remarks", JSONArray().put("First remark").put(
                 JSONObject().put("text", "Second remark"),
             ))
@@ -104,22 +105,66 @@ class CaptureMetadataSyncTest {
         assertEquals(DesktopAvailabilityState.UNAVAILABLE, parsed.internetArchive.state)
         assertEquals(false, parsed.internetArchive.available)
         assertEquals("needs scan", parsed.scanStatus)
+        assertEquals(true, parsed.digitizationCandidateClassification)
         assertTrue(parsed.digitizationCandidate)
+        assertEquals(2, parsed.scanPriority)
         assertEquals(listOf("First remark", "Second remark"), parsed.remarks)
     }
 
     @Test
-    fun legacyOrMalformedCandidateMetadataFailsClosed() {
-        assertFalse(desktopBookMetadataFromJson(desktopRow())!!.digitizationCandidate)
-        assertFalse(desktopBookMetadataFromJson(desktopRow(
-            data = JSONObject().put("digitization_candidate", false),
-        ))!!.digitizationCandidate)
-        assertFalse(desktopBookMetadataFromJson(desktopRow(
-            data = JSONObject().put("digitization_candidate", "true"),
-        ))!!.digitizationCandidate)
-        assertFalse(desktopBookMetadataFromJson(desktopRow(
-            data = JSONObject().put("digitization_candidate", 1),
-        ))!!.digitizationCandidate)
+    fun legacyMalformedAndOrphanedCandidatePrioritiesFailClosed() {
+        val legacy = desktopBookMetadataFromJson(desktopRow())!!
+        assertNull(legacy.digitizationCandidateClassification)
+        assertFalse(legacy.digitizationCandidate)
+        assertNull(legacy.scanPriority)
+
+        val explicitClear = desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject()
+                .put("digitization_candidate", false)
+                .put("scan_priority", 1),
+        ))!!
+        assertEquals(false, explicitClear.digitizationCandidateClassification)
+        assertFalse(explicitClear.digitizationCandidate)
+        assertNull(explicitClear.scanPriority)
+
+        listOf("true", 1, JSONObject.NULL).forEach { malformedCandidate ->
+            val parsed = desktopBookMetadataFromJson(desktopRow(
+                data = JSONObject()
+                    .put("digitization_candidate", malformedCandidate)
+                    .put("scan_priority", 1),
+            ))!!
+            assertNull(parsed.digitizationCandidateClassification)
+            assertFalse(parsed.digitizationCandidate)
+            assertNull(parsed.scanPriority)
+        }
+
+        val stringPriority = desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject()
+                .put("digitization_candidate", true)
+                .put("scan_priority", "4"),
+        ))!!
+        assertEquals(4, stringPriority.scanPriority)
+
+        listOf(
+            0,
+            6,
+            1.5,
+            "01",
+            "1.0",
+            " 1",
+            "n/s",
+            true,
+            JSONObject.NULL,
+        ).forEach { malformedPriority ->
+            val parsed = desktopBookMetadataFromJson(desktopRow(
+                data = JSONObject()
+                    .put("digitization_candidate", true)
+                    .put("scan_priority", malformedPriority),
+            ))!!
+            assertEquals(true, parsed.digitizationCandidateClassification)
+            assertTrue(parsed.digitizationCandidate)
+            assertNull(parsed.scanPriority)
+        }
     }
 
     @Test

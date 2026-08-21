@@ -222,6 +222,13 @@ class HomeActivity : AppCompatActivity() {
         val cloudListedCollections: Set<String>,
     )
 
+    private data class InspectLookupRenderItem(
+        val book: InspectLookupBook,
+        val snapshot: InspectBookSnapshot,
+        val collectionName: String,
+        val collectionTagId: String,
+    )
+
     private data class InspectMutationOutcome(
         val appliedCount: Int,
         val localCleanupFailures: Int,
@@ -279,6 +286,16 @@ class HomeActivity : AppCompatActivity() {
     private var inspectRenderedCollectionPaths = emptyMap<String, String>()
     private var inspectActionMode: ActionMode? = null
     private var inspectMutationInFlight = false
+    private var inspectRenderedSnapshot: InspectSnapshot? = null
+    private var inspectLookupQuery = ""
+    private var inspectCoverOcrText = ""
+    private var suppressInspectLookupWatcher = false
+    private var inspectLookupCloudBooks = emptyList<RemoteCollectionBook>()
+    private var inspectLookupCloudOwner = ""
+    private var inspectLookupCloudLoading = false
+    private var inspectLookupCloudLoaded = false
+    private var inspectLookupCloudFailed = false
+    private var inspectLookupCloudGeneration = 0L
     private var reportedTagConflict = ""
     private val expandedScanGroups = linkedSetOf<String>()
     private var scanGroupsInitialized = false
@@ -327,6 +344,34 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
+    private val coverScanner = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        val recognized = result.data
+            ?.getStringExtra(CoverScannerActivity.EXTRA_RECOGNIZED_TEXT)
+            .orEmpty()
+            .take(INSPECT_COVER_TEXT_MAX)
+        if (recognized.isBlank()) {
+            Toast.makeText(this, R.string.inspect_cover_no_text, Toast.LENGTH_LONG).show()
+            return@registerForActivityResult
+        }
+        rearmFailedRemoteInspectLookup()
+        inspectCoverOcrText = recognized
+        val displayText = recognized.lineSequence()
+            .map(String::trim)
+            .firstOrNull { it.length >= 3 }
+            .orEmpty()
+            .take(INSPECT_LOOKUP_DISPLAY_MAX)
+        suppressInspectLookupWatcher = true
+        binding.inspectBookSearch.setText(displayText)
+        binding.inspectBookSearch.setSelection(binding.inspectBookSearch.text?.length ?: 0)
+        suppressInspectLookupWatcher = false
+        inspectLookupQuery = displayText
+        renderInspectLookup()
+        ensureRemoteInspectLookup()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityHomeBinding.inflate(layoutInflater)
@@ -342,6 +387,14 @@ class HomeActivity : AppCompatActivity() {
         inspectViewMode = InspectViewMode.fromWire(
             savedInstanceState?.getString(STATE_INSPECT_VIEW_MODE) ?: Prefs.inspectViewMode(this),
         )
+        inspectLookupQuery = savedInstanceState
+            ?.getString(STATE_INSPECT_LOOKUP_QUERY)
+            .orEmpty()
+            .take(INSPECT_LOOKUP_DISPLAY_MAX)
+        inspectCoverOcrText = savedInstanceState
+            ?.getString(STATE_INSPECT_COVER_OCR)
+            .orEmpty()
+            .take(INSPECT_COVER_TEXT_MAX)
         scanGroupsInitialized =
             savedInstanceState?.getBoolean(STATE_SCAN_GROUPS_INITIALIZED) ?: false
         syncFeedbackRequestId = savedInstanceState?.getString(STATE_SYNC_FEEDBACK_REQUEST)
@@ -365,6 +418,40 @@ class HomeActivity : AppCompatActivity() {
         binding.newCollection.setOnClickListener { editCollection(null) }
         binding.scanBox.setOnClickListener {
             qrScanner.launch(Intent(this, QrScannerActivity::class.java))
+        }
+        suppressInspectLookupWatcher = true
+        binding.inspectBookSearch.setText(inspectLookupQuery)
+        binding.inspectBookSearch.setSelection(binding.inspectBookSearch.text?.length ?: 0)
+        suppressInspectLookupWatcher = false
+        binding.inspectBookSearch.doAfterTextChanged { editable ->
+            if (suppressInspectLookupWatcher) return@doAfterTextChanged
+            rearmFailedRemoteInspectLookup()
+            inspectLookupQuery = editable?.toString().orEmpty()
+                .take(INSPECT_LOOKUP_DISPLAY_MAX)
+            inspectCoverOcrText = ""
+            renderInspectLookup()
+            ensureRemoteInspectLookup()
+        }
+        binding.inspectBookSearch.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId != android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) {
+                return@setOnEditorActionListener false
+            }
+            rearmFailedRemoteInspectLookup()
+            binding.inspectBookSearch.clearFocus()
+            renderInspectLookup()
+            ensureRemoteInspectLookup()
+            true
+        }
+        binding.inspectScanCover.setOnClickListener {
+            if (Prefs.mistralKey(this).isBlank()) {
+                Toast.makeText(
+                    this,
+                    R.string.cover_scanner_requires_mistral_key,
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@setOnClickListener
+            }
+            coverScanner.launch(Intent(this, CoverScannerActivity::class.java))
         }
         binding.inspectViewModes.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
@@ -432,6 +519,8 @@ class HomeActivity : AppCompatActivity() {
         outState.putBoolean(STATE_TAB_COLLECTIONS, activeTab == HomeTab.COLLECTIONS)
         outState.putString(STATE_INSPECTED_COLLECTION, inspectedCollectionId)
         outState.putString(STATE_INSPECT_VIEW_MODE, inspectViewMode.wireValue)
+        outState.putString(STATE_INSPECT_LOOKUP_QUERY, inspectLookupQuery)
+        outState.putString(STATE_INSPECT_COVER_OCR, inspectCoverOcrText)
         outState.putStringArrayList(
             STATE_INSPECT_SELECTED_IDS,
             ArrayList(inspectSelection.selectedIds),
@@ -448,7 +537,13 @@ class HomeActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         val signedIn = Auth.signedIn(this)
-        if (signedIn) remoteBoxFetches.rearm(Prefs.userId(this))
+        if (signedIn) {
+            val owner = Prefs.userId(this)
+            remoteBoxFetches.rearm(owner)
+            if (inspectLookupCloudOwner != owner) resetRemoteInspectLookup(owner)
+        } else {
+            resetRemoteInspectLookup("")
+        }
         binding.configWarning.visibility = if (signedIn) View.GONE else View.VISIBLE
         // A previously authorized batch may resume after process death, but a
         // new upload batch is created only by the Sync captures button.
@@ -662,11 +757,15 @@ class HomeActivity : AppCompatActivity() {
         when (tab) {
             HomeTab.SCANS -> refreshHome()
             HomeTab.COLLECTIONS -> refreshCollections()
-            HomeTab.INSPECT -> refreshInspect()
+            HomeTab.INSPECT -> {
+                rearmFailedRemoteInspectLookup()
+                refreshInspect()
+            }
         }
     }
 
     private fun refreshContentTab() {
+        invalidateRemoteInspectLookup()
         when (activeTab) {
             HomeTab.SCANS -> refreshHome()
             HomeTab.COLLECTIONS -> refreshCollections()
@@ -697,6 +796,7 @@ class HomeActivity : AppCompatActivity() {
             if (collectionChanged) {
                 showCollectionTagConflictIfNeeded()
                 if (!refreshContent) {
+                    invalidateRemoteInspectLookup()
                     when (activeTab) {
                         HomeTab.COLLECTIONS -> refreshCollections()
                         HomeTab.INSPECT -> refreshInspect()
@@ -1286,6 +1386,7 @@ class HomeActivity : AppCompatActivity() {
                 Prefs.setCurrentCollectionId(this, collectionId)
                 expandedScanGroups.add(collectionId)
             }
+            invalidateRemoteInspectLookup()
             dialog.dismiss()
             refreshCollections()
         }
@@ -1302,6 +1403,8 @@ class HomeActivity : AppCompatActivity() {
                 if (!Collections.delete(this, collection.id)) {
                     Toast.makeText(this, R.string.collections_delete_failed, Toast.LENGTH_LONG)
                         .show()
+                } else {
+                    invalidateRemoteInspectLookup()
                 }
                 refreshCollections()
             }
@@ -1452,6 +1555,7 @@ class HomeActivity : AppCompatActivity() {
         resetThumbnailLoading()
         val collections = snapshot.collections
         val paths = snapshot.collectionPaths
+        inspectRenderedSnapshot = snapshot
         val counts = snapshot.itemsByCollection.mapValues { it.value.size }
         val totalBooks = counts.values.sum()
 
@@ -1475,6 +1579,16 @@ class HomeActivity : AppCompatActivity() {
         inspectBookViews.clear()
         inspectRenderedCollections = collections
         inspectRenderedCollectionPaths = paths
+
+        if (inspectLookupActive()) {
+            clearInspectSelection()
+            renderInspectLookup(snapshot)
+            return
+        }
+        binding.inspectLookupStatus.visibility = View.GONE
+        binding.inspectLookupResults.visibility = View.GONE
+        binding.inspectCollectionScroll.visibility = View.VISIBLE
+        binding.inspectBooks.visibility = View.VISIBLE
 
         if (collections.isEmpty()) {
             clearInspectSelection()
@@ -1699,6 +1813,11 @@ class HomeActivity : AppCompatActivity() {
             summary.author.ifEmpty { getString(R.string.inspect_content_missing) }
         view.findViewById<TextView>(R.id.inspectYear)?.text =
             summary.year.ifEmpty { getString(R.string.inspect_content_missing) }
+        bindScanPriorityIndicator(
+            view,
+            summary.digitizationCandidateClassification,
+            summary.scanPriority,
+        )
         val details = mutableListOf<String>()
         summary.author.takeIf { it.isNotEmpty() }?.let(details::add)
         summary.year.takeIf { it.isNotEmpty() }?.let(details::add)
@@ -1741,9 +1860,17 @@ class HomeActivity : AppCompatActivity() {
             ).show()
         }
         val entryId = summary.entryId
+        val priorityDescription = scanPriorityPresentation(
+            candidate = summary.digitizationCandidateClassification,
+            priority = summary.scanPriority,
+            candidateLabel = getString(R.string.home_digitization_candidate),
+            priorityLabel = { getString(R.string.scan_priority_description, it) },
+            priorityUnsetLabel = getString(R.string.scan_priority_unset),
+        ).accessibilityLabel
         view.contentDescription = listOf(
             snapshot.titleLabel,
             details.joinToString(" \u00b7 "),
+            priorityDescription,
         ).filter(String::isNotEmpty).joinToString(", ")
         view.setOnClickListener {
             if (inspectActionMode != null) toggleInspectSelection(entryId) else open()
@@ -1759,6 +1886,361 @@ class HomeActivity : AppCompatActivity() {
         ) { _, _ ->
             selectInspectBook(entryId)
             true
+        }
+    }
+
+    private fun inspectLookupActive(): Boolean =
+        inspectCoverOcrText.isNotBlank() ||
+            normalizeInspectBookLookupText(inspectLookupQuery).length >= 2
+
+    private fun renderInspectLookup(snapshot: InspectSnapshot? = inspectRenderedSnapshot) {
+        snapshot ?: return
+        if (!inspectLookupActive()) {
+            if (binding.inspectLookupResults.visibility == View.VISIBLE ||
+                binding.inspectCollectionScroll.visibility != View.VISIBLE
+            ) {
+                renderInspect(snapshot)
+            }
+            return
+        }
+
+        resetThumbnailLoading()
+        binding.inspectCollectionScroll.visibility = View.GONE
+        binding.inspectSelectionHeader.visibility = View.GONE
+        binding.inspectEmpty.visibility = View.GONE
+        binding.inspectBooks.visibility = View.GONE
+        binding.inspectLookupStatus.visibility = View.VISIBLE
+        binding.inspectLookupResults.visibility = View.VISIBLE
+        binding.inspectLookupResults.removeAllViews()
+
+        val renderItems = inspectLookupRenderItems(snapshot)
+        val records = renderItems.map(InspectLookupRenderItem::book)
+        val rawQuery = inspectCoverOcrText.ifBlank { inspectLookupQuery }
+        val mode = if (inspectCoverOcrText.isNotBlank()) {
+            InspectLookupMode.COVER_OCR
+        } else {
+            InspectLookupMode.TYPED
+        }
+        val matches = findInspectBookMatches(records, rawQuery, mode, INSPECT_LOOKUP_LIMIT)
+        val topScore = matches.firstOrNull()?.score
+        val ambiguous = topScore != null && matches.asSequence()
+            .takeWhile { it.score == topScore }
+            .map { it.book.collectionId }
+            .distinct()
+            .take(2)
+            .count() > 1
+        binding.inspectLookupStatus.text = when (inspectLookupStatusKind(
+            matchCount = matches.size,
+            ambiguous = ambiguous,
+            cloudLoading = inspectLookupCloudLoading,
+            cloudFailed = inspectLookupCloudFailed,
+        )) {
+            InspectLookupStatusKind.SEARCHING_CLOUD ->
+                getString(R.string.inspect_lookup_searching_cloud)
+            InspectLookupStatusKind.NO_MATCHES_CLOUD_UNAVAILABLE ->
+                getString(R.string.inspect_lookup_no_matches_cloud_unavailable)
+            InspectLookupStatusKind.NO_MATCHES -> getString(R.string.inspect_lookup_no_matches)
+            InspectLookupStatusKind.MATCHES_CLOUD_UNAVAILABLE -> resources.getQuantityString(
+                R.plurals.inspect_lookup_matches_cloud_unavailable,
+                matches.size,
+                matches.size,
+            )
+            InspectLookupStatusKind.AMBIGUOUS_MATCHES -> resources.getQuantityString(
+                R.plurals.inspect_lookup_matches_ambiguous,
+                matches.size,
+                matches.size,
+            )
+            InspectLookupStatusKind.MATCHES_SEARCHING_CLOUD -> resources.getQuantityString(
+                R.plurals.inspect_lookup_matches_searching,
+                matches.size,
+                matches.size,
+            )
+            InspectLookupStatusKind.MATCHES -> resources.getQuantityString(
+                R.plurals.inspect_lookup_matches,
+                matches.size,
+                matches.size,
+            )
+        }
+
+        val byId = renderItems.associateBy { it.book.entryId }
+        val thumbnails = mutableListOf<ThumbnailRequest>()
+        val inflater = LayoutInflater.from(this)
+        matches.forEach { match ->
+            val item = byId[match.book.entryId] ?: return@forEach
+            val row = inflater.inflate(
+                R.layout.item_inspect_lookup,
+                binding.inspectLookupResults,
+                false,
+            )
+            row.findViewById<TextView>(R.id.inspectTitle).text = item.book.title
+            row.findViewById<TextView>(R.id.inspectSubtitle).text = listOf(
+                item.book.author,
+                item.book.year,
+            ).filter(String::isNotBlank).joinToString(" \u00b7 ")
+            val collectionDescription = getString(
+                R.string.inspect_lookup_collection,
+                item.collectionName,
+                item.collectionTagId,
+            )
+            row.findViewById<TextView>(R.id.inspectLookupCollection).text =
+                collectionDescription
+            val summary = item.snapshot.item.summary
+            bindScanPriorityIndicator(
+                row,
+                summary.digitizationCandidateClassification,
+                summary.scanPriority,
+            )
+            item.snapshot.item.current?.let { entry ->
+                thumbnails += ThumbnailRequest(
+                    entry = entry,
+                    maxWidth = 256,
+                    maxHeight = 320,
+                    image = row.findViewById(R.id.inspectThumb),
+                )
+            }
+            val priorityDescription = scanPriorityPresentation(
+                candidate = summary.digitizationCandidateClassification,
+                priority = summary.scanPriority,
+                candidateLabel = getString(R.string.home_digitization_candidate),
+                priorityLabel = { getString(R.string.scan_priority_description, it) },
+                priorityUnsetLabel = getString(R.string.scan_priority_unset),
+            ).accessibilityLabel
+            row.contentDescription = listOf(
+                item.book.title,
+                item.book.author,
+                item.book.year,
+                collectionDescription,
+                priorityDescription,
+            ).filter(String::isNotBlank).joinToString(", ")
+            row.setOnClickListener { showInspectLookupCollection(item) }
+            RemoteUiCatalog.apply(row)
+            binding.inspectLookupResults.addView(row)
+        }
+        startThumbnailLoading(thumbnails, HomeTab.INSPECT)
+        ensureRemoteInspectLookup()
+    }
+
+    private fun inspectLookupRenderItems(
+        snapshot: InspectSnapshot,
+    ): List<InspectLookupRenderItem> {
+        val collections = snapshot.collections.associateBy(BookCollection::id)
+        val items = linkedMapOf<String, Pair<String, InspectBookSnapshot>>()
+        snapshot.itemsByCollection.forEach { (collectionId, books) ->
+            books.forEach { book ->
+                items[book.item.summary.entryId] = collectionId to book
+            }
+        }
+        val freshCloudById = linkedMapOf<String, RemoteCollectionBook>()
+        inspectLookupCloudBooks.asSequence()
+            .filterNot(RemoteCollectionBook::removed)
+            .forEach { remote ->
+                freshCloudById[remote.captureId] = remote
+                val existing = items[remote.captureId]
+                val remoteItem = remote.toInventoryItem()
+                if (existing == null) {
+                    items[remote.captureId] = remote.collectionId to InspectBookSnapshot(
+                        item = remoteItem,
+                        titleLabel = remote.title.ifBlank {
+                            getString(R.string.inspect_book_untitled)
+                        },
+                        statusLabel = null,
+                        cloudBacked = true,
+                        cloudOwnerId = inspectLookupCloudOwner,
+                    )
+                } else {
+                    val merged = mergeCollectionBookItems(
+                        listOf(existing.second.item, remoteItem),
+                    ).single()
+                    // The all-box response has already applied current local
+                    // membership and merge aliases, so it owns the location even
+                    // when local provenance or a selected-box cache is older.
+                    items[remote.captureId] =
+                        remote.collectionId to existing.second.copy(item = merged)
+                }
+            }
+
+        return items.mapNotNull { (entryId, located) ->
+            val (existingCollectionId, rawSnapshot) = located
+            val currentDesktop = rawSnapshot.item.current?.desktopBook
+            val rawSummary = rawSnapshot.item.summary
+            val freshCloud = freshCloudById[entryId]
+            val book = mergeInspectLookupBookSources(
+                entryId = entryId,
+                existingCollectionId = existingCollectionId,
+                existing = InspectLookupBibliography(
+                    title = rawSummary.title,
+                    author = rawSummary.author,
+                    year = rawSummary.year,
+                ),
+                currentDesktop = InspectLookupBibliography(
+                    title = currentDesktop?.bibliography?.title.orEmpty(),
+                    author = currentDesktop?.bibliography?.author.orEmpty(),
+                    year = currentDesktop?.bibliography?.year.orEmpty(),
+                ),
+                freshCloudCollectionId = freshCloud?.collectionId.orEmpty(),
+                freshCloud = InspectLookupBibliography(
+                    title = freshCloud?.title.orEmpty(),
+                    author = freshCloud?.author.orEmpty(),
+                    year = freshCloud?.year.orEmpty(),
+                ),
+                createdAt = rawSummary.createdAt,
+            )
+            val collection = collections[book.collectionId] ?: return@mapNotNull null
+            val candidate = currentDesktop?.digitizationCandidateClassification
+                ?: rawSummary.digitizationCandidateClassification
+            val priority = if (candidate == true) {
+                currentDesktop?.scanPriority ?: rawSummary.scanPriority
+            } else {
+                null
+            }
+            val summary = rawSummary.copy(
+                title = book.title,
+                author = book.author,
+                year = book.year,
+                digitizationCandidateClassification = candidate,
+                scanPriority = priority,
+            )
+            val enrichedSnapshot = rawSnapshot.copy(
+                item = rawSnapshot.item.copy(summary = summary),
+                titleLabel = book.title.ifBlank { getString(R.string.inspect_book_untitled) },
+            )
+            InspectLookupRenderItem(
+                book = book,
+                snapshot = enrichedSnapshot,
+                collectionName = snapshot.collectionPaths[book.collectionId] ?: collection.name,
+                collectionTagId = collection.tagId,
+            )
+        }
+    }
+
+    private fun showInspectLookupCollection(item: InspectLookupRenderItem) {
+        inspectedCollectionId = item.book.collectionId
+        inspectCoverOcrText = ""
+        inspectLookupQuery = ""
+        suppressInspectLookupWatcher = true
+        binding.inspectBookSearch.text?.clear()
+        suppressInspectLookupWatcher = false
+        Toast.makeText(
+            this,
+            getString(R.string.inspect_lookup_found, item.collectionName),
+            Toast.LENGTH_SHORT,
+        ).show()
+        refreshInspect()
+        binding.homeScroll.post {
+            if (activeTab == HomeTab.INSPECT) binding.homeScroll.fullScroll(View.FOCUS_UP)
+        }
+    }
+
+    private fun resetRemoteInspectLookup(owner: String) {
+        inspectLookupCloudGeneration += 1
+        inspectLookupCloudBooks = emptyList()
+        inspectLookupCloudOwner = owner
+        inspectLookupCloudLoading = false
+        inspectLookupCloudLoaded = false
+        inspectLookupCloudFailed = false
+    }
+
+    private fun currentInspectLookupOwner(): String =
+        if (Auth.signedIn(this)) Prefs.userId(this) else ""
+
+    /** Retire every in-flight request before rebuilding from changed source data. */
+    private fun invalidateRemoteInspectLookup() {
+        resetRemoteInspectLookup(currentInspectLookupOwner())
+    }
+
+    /** A failure remains visible until the operator retries or revisits Inspect. */
+    private fun rearmFailedRemoteInspectLookup() {
+        if (inspectLookupCloudFailed) invalidateRemoteInspectLookup()
+    }
+
+    /** Fetch every owner box only when lookup needs a complete cross-box answer. */
+    private fun ensureRemoteInspectLookup() {
+        if (!inspectLookupActive() || inspectLookupCloudLoading || inspectLookupCloudLoaded ||
+            inspectLookupCloudFailed || !Prefs.configured(this) || !Auth.signedIn(this)
+        ) return
+        val owner = Prefs.userId(this)
+        if (owner.isEmpty()) return
+        if (inspectLookupCloudOwner != owner) resetRemoteInspectLookup(owner)
+        inspectLookupCloudLoading = true
+        val generation = inspectLookupCloudGeneration
+        renderInspectLookup()
+        lifecycleScope.launch {
+            val loaded = try {
+                withContext(Dispatchers.IO) {
+                    val records = Collections.allRecords(this@HomeActivity)
+                    val collectionIds = records.asSequence()
+                        .map { it.id.trim().lowercase() }
+                        .filter(SAFE_COLLECTION_FILTER_ID::matches)
+                        .distinct()
+                        .toList()
+                    if (collectionIds.isEmpty()) return@withContext emptyList()
+                    val client = SupabaseClient(this@HomeActivity, owner)
+                    val byId = linkedMapOf<String, RemoteCollectionBook>()
+                    collectionIds.chunked(INSPECT_LOOKUP_COLLECTION_BATCH).forEach { batch ->
+                        currentCoroutineContext().ensureActive()
+                        client.capturesForCollections(batch).forEach { book ->
+                            val existing = byId[book.captureId]
+                            val replace = existing == null ||
+                                book.membershipRevision > existing.membershipRevision ||
+                                (book.membershipRevision == existing.membershipRevision &&
+                                    book.removed && !existing.removed)
+                            if (replace) byId[book.captureId] = book
+                        }
+                    }
+                    val books = byId.values.toList()
+                    val enriched = enrichRemoteCollectionBooks(
+                        books,
+                        client.desktopBookMetadata(books.map { it.captureId }),
+                    )
+                    val memberships = InspectBookMemberships.read(this@HomeActivity)
+                        .takeIf { it.valid }
+                        ?.memberships
+                        .orEmpty()
+                    enriched.mapNotNull { book ->
+                        currentCoroutineContext().ensureActive()
+                        val local = memberships[book.captureId]
+                        val removed = local?.removed ?: book.removed
+                        if (removed) return@mapNotNull null
+                        val requestedId = local?.collectionId?.ifEmpty { book.collectionId }
+                            ?: book.collectionId
+                        val collectionId = resolvedLiveCollectionId(requestedId, records)
+                            ?: return@mapNotNull null
+                        book.copy(collectionId = collectionId, removed = false)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+            val signedIn = Auth.signedIn(this@HomeActivity)
+            val currentOwner = Prefs.userId(this@HomeActivity).takeIf { signedIn }.orEmpty()
+            when (inspectLookupCloudCompletion(
+                requestGeneration = generation,
+                currentGeneration = inspectLookupCloudGeneration,
+                requestOwner = owner,
+                currentOwner = currentOwner,
+                signedIn = signedIn,
+            )) {
+                InspectLookupCloudCompletion.IGNORE_RETIRED_GENERATION -> return@launch
+                InspectLookupCloudCompletion.RESET_STALE_OWNER -> {
+                    // This request still owns the loading flag, but its account no
+                    // longer does. Clear it without touching a newer generation.
+                    resetRemoteInspectLookup(currentOwner)
+                    if (activeTab == HomeTab.INSPECT &&
+                        lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                    ) renderInspectLookup()
+                    return@launch
+                }
+                InspectLookupCloudCompletion.ACCEPT -> Unit
+            }
+            inspectLookupCloudLoading = false
+            inspectLookupCloudLoaded = loaded != null
+            inspectLookupCloudFailed = loaded == null
+            inspectLookupCloudBooks = loaded.orEmpty()
+            if (activeTab == HomeTab.INSPECT &&
+                lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            ) renderInspectLookup()
         }
     }
 
@@ -2192,6 +2674,7 @@ class HomeActivity : AppCompatActivity() {
                 },
             ).show()
             clearInspectSelection()
+            invalidateRemoteInspectLookup()
             refreshInspect()
         }
     }
@@ -2386,7 +2869,8 @@ class HomeActivity : AppCompatActivity() {
                 row.findViewById<View>(R.id.marker)
                     .setBackgroundColor(getColor(markerColor(state)))
                 val thumb = row.findViewById<ImageView>(R.id.thumb)
-                applyScanListLayout(row, thumb, compact)
+                val thumbFrame = row.findViewById<View>(R.id.thumbFrame)
+                applyScanListLayout(row, thumbFrame, compact)
                 thumbs += ThumbnailRequest(
                     image = thumb,
                     entry = e,
@@ -2855,6 +3339,7 @@ class HomeActivity : AppCompatActivity() {
                 remoteBoxFetches.finish(ticket, landed)
             }
             if (!landed) return@launch
+            invalidateRemoteInspectLookup()
             if (activeTab != HomeTab.INSPECT ||
                 !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
             ) return@launch
@@ -2900,7 +3385,7 @@ class HomeActivity : AppCompatActivity() {
             // reason.
             R.id.whlAvailability,
             R.id.internetArchiveAvailability,
-            R.id.digitizationCandidateStatus,
+            R.id.scanPriorityIndicator,
             R.id.scanStatus,
             R.id.remarksStatus,
             R.id.attentionStatus,
@@ -3136,14 +3621,11 @@ class HomeActivity : AppCompatActivity() {
         }
 
         bindCatalogIndicators(row, entry)
-        row.findViewById<ImageView>(R.id.digitizationCandidateStatus).apply {
-            visibility = if (desktop?.digitizationCandidate == true) {
-                View.VISIBLE
-            } else {
-                View.GONE
-            }
-            contentDescription = getString(R.string.home_digitization_candidate)
-        }
+        bindScanPriorityIndicator(
+            row,
+            desktop?.digitizationCandidateClassification,
+            desktop?.scanPriority,
+        )
         row.findViewById<ImageView>(R.id.scanStatus).apply {
             val status = desktop?.scanStatus.orEmpty().trim()
             val actionable = status.isNotEmpty() &&
@@ -3271,7 +3753,7 @@ class HomeActivity : AppCompatActivity() {
         return softened
     }
 
-    private fun applyScanListLayout(row: View, thumb: ImageView, compact: Boolean) {
+    private fun applyScanListLayout(row: View, thumbFrame: View, compact: Boolean) {
         val metrics = scanListLayoutMetrics(compact)
         row.setPaddingRelative(
             row.paddingStart,
@@ -3279,11 +3761,11 @@ class HomeActivity : AppCompatActivity() {
             row.paddingEnd,
             dp(metrics.rowVerticalPaddingDp),
         )
-        val params = thumb.layoutParams as ViewGroup.MarginLayoutParams
+        val params = thumbFrame.layoutParams as ViewGroup.MarginLayoutParams
         params.width = dp(metrics.thumbnailWidthDp)
         params.height = dp(metrics.thumbnailHeightDp)
         params.marginEnd = dp(metrics.thumbnailEndMarginDp)
-        thumb.layoutParams = params
+        thumbFrame.layoutParams = params
     }
 
     private fun dp(value: Int): Int =
@@ -3317,12 +3799,18 @@ class HomeActivity : AppCompatActivity() {
         const val STATE_INSPECTED_COLLECTION = "inspected_collection"
         const val STATE_INSPECT_VIEW_MODE = "inspect_view_mode"
         const val STATE_INSPECT_SELECTED_IDS = "inspect_selected_ids"
+        const val STATE_INSPECT_LOOKUP_QUERY = "inspect_lookup_query"
+        const val STATE_INSPECT_COVER_OCR = "inspect_cover_ocr"
         const val STATE_SCAN_GROUPS_INITIALIZED = "scan_groups_initialized"
         const val STATE_EXPANDED_SCAN_GROUPS = "expanded_scan_groups"
         const val STATE_SYNC_FEEDBACK_REQUEST = "sync_feedback_request"
         const val STATE_SYNC_FEEDBACK_PHASE = "sync_feedback_phase"
         const val WORK_REFRESH_COALESCE_MS = 200L
         const val INSPECT_BOOK_PAGE_SIZE = 48
+        const val INSPECT_LOOKUP_LIMIT = 20
+        const val INSPECT_LOOKUP_COLLECTION_BATCH = 40
+        const val INSPECT_LOOKUP_DISPLAY_MAX = 240
+        const val INSPECT_COVER_TEXT_MAX = 8_000
         const val MENU_INSPECT_MOVE = 10_201
         const val MENU_INSPECT_DELETE = 10_202
         val REMOTE_BOX_FETCHES = RemoteCollectionFetchTracker()

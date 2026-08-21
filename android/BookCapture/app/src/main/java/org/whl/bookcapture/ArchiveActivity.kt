@@ -95,7 +95,8 @@ class ArchiveActivity : AppCompatActivity() {
         val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         for (entry in entries) {
             val row = ItemArchiveBinding.inflate(inflater, list, false)
-            row.archiveEntryTitle.text = Entries.titleLabel(this, entry)
+            val title = Entries.titleLabel(this, entry)
+            row.archiveEntryTitle.text = title
             val stamp = CaptureArchive.readStamp(entry.dir)
             row.archiveEntrySubtitle.text = archiveRowSubtitle(
                 archivedOn = stamp?.archivedAt?.let { dateFormat.format(Date(it)) }.orEmpty(),
@@ -103,6 +104,16 @@ class ArchiveActivity : AppCompatActivity() {
                 recordOnly = stamp?.photosRetained == false,
                 statusLabel = Entries.statusLabel(this, entry),
             )
+            val scanPriority = bindScanPriorityIndicator(
+                bookView = row.root,
+                candidate = entry.desktopBook?.digitizationCandidateClassification,
+                priority = entry.desktopBook?.scanPriority,
+            )
+            row.root.contentDescription = listOf(
+                title,
+                row.archiveEntrySubtitle.text.toString(),
+                scanPriority.accessibilityLabel,
+            ).filter(String::isNotBlank).joinToString(". ")
             val open = {
                 startActivity(
                     Intent(this, EntryDetailActivity::class.java)

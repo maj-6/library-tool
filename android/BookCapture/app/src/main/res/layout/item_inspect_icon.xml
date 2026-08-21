@@ -9,15 +9,27 @@
     android:orientation="vertical"
     android:padding="6dp">
 
-    <ImageView
-        android:id="@+id/inspectThumb"
+    <FrameLayout
         android:layout_width="50dp"
         android:layout_height="68dp"
-        android:background="@color/whl_face_sh"
-        android:foreground="@drawable/whl_thumbnail_frame"
-        android:importantForAccessibility="no"
-        android:scaleType="centerCrop"
-        android:src="@drawable/ic_app_mark" />
+        android:importantForAccessibility="no">
+
+        <ImageView
+            android:id="@+id/inspectThumb"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/whl_face_sh"
+            android:foreground="@drawable/whl_thumbnail_frame"
+            android:importantForAccessibility="no"
+            android:scaleType="centerCrop"
+            android:src="@drawable/ic_app_mark" />
+
+        <include
+            layout="@layout/view_scan_priority_indicator"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:layout_gravity="top|end" />
+    </FrameLayout>
 
     <TextView
         android:id="@+id/inspectTitle"

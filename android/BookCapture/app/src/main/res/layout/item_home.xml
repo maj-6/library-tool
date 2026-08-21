@@ -12,15 +12,27 @@
     android:paddingBottom="9dp"
     android:background="@drawable/whl_row">
 
-    <ImageView
-        android:id="@+id/thumb"
+    <FrameLayout
+        android:id="@+id/thumbFrame"
         android:layout_width="46dp"
         android:layout_height="60dp"
-        android:layout_marginEnd="11dp"
-        android:scaleType="centerCrop"
-        android:background="@color/whl_face_sh"
-        android:foreground="@drawable/whl_thumbnail_frame"
-        android:contentDescription="@string/detail_photos" />
+        android:layout_marginEnd="11dp">
+
+        <ImageView
+            android:id="@+id/thumb"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/whl_face_sh"
+            android:contentDescription="@string/detail_photos"
+            android:foreground="@drawable/whl_thumbnail_frame"
+            android:scaleType="centerCrop" />
+
+        <include
+            layout="@layout/view_scan_priority_indicator"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:layout_gravity="top|end" />
+    </FrameLayout>
 
     <LinearLayout
         android:layout_width="0dp"
@@ -128,13 +140,6 @@
                      ids stay the same as before so existing binding and the
                      accessibility summary are unaffected. -->
                 <include layout="@layout/view_catalog_indicators" />
-
-                <ImageView
-                    android:id="@+id/digitizationCandidateStatus"
-                    style="@style/WhlMetadataIcon"
-                    android:contentDescription="@string/home_digitization_candidate"
-                    android:src="@drawable/ic_scan_candidate"
-                    android:visibility="gone" />
 
                 <ImageView
                     android:id="@+id/scanStatus"

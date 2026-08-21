@@ -12,16 +12,28 @@
     android:paddingEnd="4dp"
     android:paddingBottom="7dp">
 
-    <ImageView
-        android:id="@+id/archiveThumb"
+    <FrameLayout
+        android:id="@+id/archiveThumbFrame"
         android:layout_width="42dp"
         android:layout_height="56dp"
-        android:layout_marginEnd="10dp"
-        android:background="@color/whl_face_sh"
-        android:contentDescription="@string/detail_photos"
-        android:foreground="@drawable/whl_thumbnail_frame"
-        android:scaleType="centerCrop"
-        android:src="@drawable/ic_app_mark" />
+        android:layout_marginEnd="10dp">
+
+        <ImageView
+            android:id="@+id/archiveThumb"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/whl_face_sh"
+            android:contentDescription="@string/detail_photos"
+            android:foreground="@drawable/whl_thumbnail_frame"
+            android:scaleType="centerCrop"
+            android:src="@drawable/ic_app_mark" />
+
+        <include
+            layout="@layout/view_scan_priority_indicator"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:layout_gravity="top|end" />
+    </FrameLayout>
 
     <LinearLayout
         android:layout_width="0dp"

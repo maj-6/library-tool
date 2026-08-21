@@ -33,10 +33,12 @@
             android:padding="12dp">
 
             <LinearLayout
+                android:id="@+id/detailBookSummary"
                 style="@style/WhlPanelSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="0dp"
+                android:background="@drawable/whl_inspect_panel"
                 android:orientation="vertical">
 
                 <LinearLayout
@@ -76,6 +78,12 @@
                         android:textSize="11sp"
                         android:textStyle="bold"
                         android:visibility="gone" />
+
+                    <include
+                        layout="@layout/view_scan_priority_indicator"
+                        android:layout_width="34dp"
+                        android:layout_height="34dp"
+                        android:layout_marginStart="8dp" />
                 </LinearLayout>
 
                 <TextView

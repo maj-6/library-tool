@@ -142,6 +142,11 @@ class EntryDetailActivity : AppCompatActivity() {
             ?: return finish()
         diagnosticsEntry = entry
         val details = BookDetailPresenter.from(entry.meta)
+        bindScanPriorityIndicator(
+            bookView = binding.detailBookSummary,
+            candidate = entry.desktopBook?.digitizationCandidateClassification,
+            priority = entry.desktopBook?.scanPriority,
+        )
 
         val libMarker = captureLibMarkerPresentation(
             entry.captureLibConfirmation,
@@ -232,9 +237,18 @@ class EntryDetailActivity : AppCompatActivity() {
             desktopAvailabilityText(desktop.internetArchive),
         )
         if (desktop.digitizationCandidate) {
+            val digitization = scanPriorityPresentation(
+                candidate = true,
+                priority = desktop.scanPriority,
+                candidateLabel = getString(R.string.home_digitization_candidate),
+                priorityLabel = { priority ->
+                    getString(R.string.scan_priority_description, priority)
+                },
+                priorityUnsetLabel = getString(R.string.scan_priority_unset),
+            ).accessibilityLabel
             fields += BookDetailField(
                 getString(R.string.detail_digitization),
-                getString(R.string.home_digitization_candidate),
+                digitization,
             )
         }
         desktop.scanStatus.takeIf(String::isNotBlank)?.let {

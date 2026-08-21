@@ -83,6 +83,8 @@
     <string name="home_whl_available">Available in WHL</string>
     <string name="home_ia_available">Available in Internet Archive</string>
     <string name="home_digitization_candidate">Scan candidate</string>
+    <string name="scan_priority_description">Scan candidate, priority %1$d</string>
+    <string name="scan_priority_unset">Priority not assigned</string>
     <string name="home_scan_status">Scan status</string>
     <string name="home_scan_status_value">Scan status: %1$s</string>
     <string name="home_availability_detail">%1$s: %2$s</string>
@@ -252,6 +254,30 @@
          Never imply that the tag is the collection UUID, and never claim the
          cloud is empty when the phone is signed out and could not ask. -->
     <string name="inspect_scan_box">Scan box QR</string>
+    <string name="inspect_search_hint">Find a book by title</string>
+    <string name="inspect_scan_cover">Scan a book cover</string>
+    <string name="inspect_cover_no_text">No readable title was found on that cover. Try again in brighter, even light.</string>
+    <string name="inspect_lookup_searching_cloud">Searching every collection&#8230;</string>
+    <string name="inspect_lookup_no_matches">No matching book was found in a collection.</string>
+    <string name="inspect_lookup_no_matches_cloud_unavailable">No local match was found. Cloud collections could not be searched right now.</string>
+    <plurals name="inspect_lookup_matches">
+        <item quantity="one">%1$d matching book</item>
+        <item quantity="other">%1$d matching books</item>
+    </plurals>
+    <plurals name="inspect_lookup_matches_searching">
+        <item quantity="one">%1$d local match &#183; still searching cloud collections&#8230;</item>
+        <item quantity="other">%1$d local matches &#183; still searching cloud collections&#8230;</item>
+    </plurals>
+    <plurals name="inspect_lookup_matches_cloud_unavailable">
+        <item quantity="one">%1$d known match &#183; cloud collections could not be searched</item>
+        <item quantity="other">%1$d known matches &#183; cloud collections could not be searched</item>
+    </plurals>
+    <plurals name="inspect_lookup_matches_ambiguous">
+        <item quantity="one">%1$d possible match &#183; confirm the collection below</item>
+        <item quantity="other">%1$d possible matches &#183; confirm the collection below</item>
+    </plurals>
+    <string name="inspect_lookup_collection">In %1$s &#183; tag %2$s</string>
+    <string name="inspect_lookup_found">Found in %1$s.</string>
     <string name="inspect_summary">%1$s &#183; %2$s</string>
     <plurals name="inspect_collection_count">
         <item quantity="one">%1$d collection</item>
@@ -320,6 +346,21 @@
     <string name="qr_scanner_close">Close QR scanner</string>
     <string name="qr_scanner_permission_denied">Camera access is needed to scan a box QR code.</string>
     <string name="qr_scanner_unavailable">The QR scanner could not start on this device.</string>
+    <string name="cover_scanner_title">Scan book cover</string>
+    <string name="cover_scanner_help">Center the title and author inside the frame. The cover photo is sent to Mistral OCR 4.1 when you tap Read cover.</string>
+    <string name="cover_scanner_capture">Read cover</string>
+    <string name="cover_scanner_capture_description">Photograph and read this book cover</string>
+    <string name="cover_scanner_close">Close cover scanner</string>
+    <string name="cover_scanner_starting">Starting camera…</string>
+    <string name="cover_scanner_ready">Hold the cover steady, then tap Read cover.</string>
+    <string name="cover_scanner_capturing">Photographing cover…</string>
+    <string name="cover_scanner_reading">Reading cover text with Mistral OCR 4.1…</string>
+    <string name="cover_scanner_requires_mistral_key">Add a Mistral API key in Settings before scanning a cover.</string>
+    <string name="cover_scanner_permission_denied">Camera access is needed to scan a book cover.</string>
+    <string name="cover_scanner_unavailable">The cover scanner could not start on this device.</string>
+    <string name="cover_scanner_capture_failed">The cover photo could not be saved. Try again.</string>
+    <string name="cover_scanner_read_failed">Mistral OCR 4.1 could not read the cover. Check your connection and API key, then try again.</string>
+    <string name="cover_scanner_no_text">No readable cover text was found. Move closer and try again.</string>
 
     <string name="detail_from">From</string>
     <string name="detail_from_edit">Change</string>

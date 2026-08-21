@@ -34,7 +34,9 @@ object Pipeline {
     private const val MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
     private const val MISTRAL_CHAT_URL = "https://api.mistral.ai/v1/chat/completions"
     private const val DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
-    private const val OCR_MODEL = "mistral-ocr-latest"
+    internal const val CAPTURE_OCR_MODEL = "mistral-ocr-latest"
+    /** Cover identification is deliberately pinned to the requested OCR release. */
+    internal const val COVER_OCR_MODEL = "mistral-ocr-4-1"
     private const val MISTRAL_EXTRACT_MODEL = "mistral-small-latest"
     private const val DEEPSEEK_EXTRACT_MODEL = "deepseek-chat"
 
@@ -145,23 +147,32 @@ object Pipeline {
 
     // --- 2. OCR -----------------------------------------------------------------
 
-    /** OCR one photo via Mistral. OCR-4 responses may include typed blocks;
-     * older aliases/responses remain valid and simply return no geometry. */
-    internal fun ocrResult(file: File, mistralKey: String): OcrResult {
+    /** OCR a captured page using the established capture model contract. */
+    internal fun ocrResult(file: File, mistralKey: String): OcrResult =
+        requestOcr(file, mistralKey, CAPTURE_OCR_MODEL)
+
+    /** Read a temporary Inspect cover using exactly Mistral OCR 4.1. */
+    internal fun coverOcr(file: File, mistralKey: String): String =
+        requestOcr(file, mistralKey, COVER_OCR_MODEL).markdown
+
+    private fun requestOcr(file: File, mistralKey: String, model: String): OcrResult {
         val b64 = Base64.getEncoder().encodeToString(file.readBytes())
         val payload = JSONObject()
-            .put("model", OCR_MODEL)
+            .put("model", model)
             .put("include_blocks", true)
             .put("document", JSONObject()
                 .put("type", "image_url")
                 .put("image_url", "data:image/jpeg;base64,$b64"))
         val data = post(MISTRAL_OCR_URL, payload, mistralKey, 90_000)
-        return parseOcrResponse(data)
+        return parseOcrResponse(data, model)
     }
 
     fun ocr(file: File, mistralKey: String): String = ocrResult(file, mistralKey).markdown
 
-    internal fun parseOcrResponse(data: JSONObject): OcrResult {
+    internal fun parseOcrResponse(
+        data: JSONObject,
+        fallbackModel: String = CAPTURE_OCR_MODEL,
+    ): OcrResult {
         val response = data.toString()
         val pages = data.optJSONArray("pages") ?: return OcrResult("", providerResponse = response)
         val markdown = (0 until pages.length())
@@ -205,7 +216,7 @@ object Pipeline {
                     width = width,
                     height = height,
                     engine = "mistral",
-                    model = data.optString("model").trim().ifEmpty { OCR_MODEL },
+                    model = data.optString("model").trim().ifEmpty { fallbackModel },
                     engineVersion = "ocr-4-blocks",
                     regions = regions,
                 )

@@ -39,7 +39,13 @@ internal data class RemoteCollectionBook(
     val year: String,
     val photoCount: Int,
     val createdAt: Long,
-)
+    /** `null` means this cache row predates or lacks a curator classification. */
+    val digitizationCandidateClassification: Boolean? = null,
+    /** Present only for an explicitly classified candidate; valid values are 1..5. */
+    val scanPriority: Int? = null,
+) {
+    val digitizationCandidate: Boolean get() = digitizationCandidateClassification == true
+}
 
 internal data class RemoteCollectionBooksStore(
     /** collection id -> the books the cloud reported for it. */
@@ -56,7 +62,7 @@ internal data class RemoteCollectionRecordResult(
 )
 
 internal const val REMOTE_COLLECTION_BOOKS_FILE = "remote_collection_books.json"
-internal const val REMOTE_COLLECTION_BOOKS_VERSION = 2
+internal const val REMOTE_COLLECTION_BOOKS_VERSION = 3
 
 /** Per-request page size. PostgREST may return fewer rows; an empty page, not a
  * short one, is the only end-of-snapshot signal. */
@@ -449,7 +455,7 @@ internal fun collectRemoteCollectionBookPages(
 }
 
 /**
- * Fill blank titles from the desktop's curated bibliography.
+ * Fill blank titles and scan classification from the desktop's curated projection.
  *
  * A capture's own `meta` holds a title only when the CAPTURING phone had an
  * extraction API key, so for most rows the desktop's projection is the only
@@ -462,12 +468,14 @@ internal fun enrichRemoteCollectionBooks(
     books: List<RemoteCollectionBook>,
     desktop: Map<String, DesktopBookMetadata>,
 ): List<RemoteCollectionBook> = books.map { book ->
-    val projected = desktop[book.captureId]?.bibliography ?: DesktopBibliography.EMPTY
-    if (projected.isEmpty) return@map book
+    val metadata = desktop[book.captureId] ?: return@map book
+    val projected = metadata.bibliography
     book.copy(
         title = book.title.ifEmpty { projected.title },
         author = book.author.ifEmpty { projected.author },
         year = book.year.ifEmpty { projected.year },
+        digitizationCandidateClassification = metadata.digitizationCandidateClassification,
+        scanPriority = metadata.scanPriority,
     )
 }
 
@@ -486,6 +494,8 @@ internal fun RemoteCollectionBook.toInventoryItem(): CollectionInventoryItem =
             photoCount = photoCount,
             createdAt = createdAt,
             deliveryTransport = "cloud",
+            digitizationCandidateClassification = digitizationCandidateClassification,
+            scanPriority = scanPriority,
         ),
         current = null,
         remote = true,
@@ -495,8 +505,10 @@ internal fun RemoteCollectionBook.toInventoryItem(): CollectionInventoryItem =
  * Collapse one box's local and remote rows onto the shared capture/entry id.
  *
  * A LOCAL ROW ALWAYS WINS: it can open its photos and carries live upload status,
- * where its cloud twin is a summary. Callers pass local rows first, but the
- * preference is explicit here so ordering cannot silently invert it.
+ * where its cloud twin is a summary. Unknown legacy scan metadata on that local
+ * row may be filled from its enriched cloud twin, but an explicit local true or
+ * false classification is never overwritten. Callers pass local rows first,
+ * but the preference is explicit here so ordering cannot silently invert it.
  */
 internal fun mergeCollectionBookItems(
     items: List<CollectionInventoryItem>,
@@ -506,9 +518,40 @@ internal fun mergeCollectionBookItems(
         val id = item.summary.entryId
         if (id.isEmpty()) return@forEach
         val existing = byId[id]
-        if (existing == null || (existing.remote && !item.remote)) byId[id] = item
+        if (existing == null) {
+            byId[id] = item
+        } else {
+            val preferred = if (existing.remote && !item.remote) item else existing
+            val fallback = if (preferred === item) existing else item
+            byId[id] = fillUnknownScanMetadata(preferred, fallback)
+        }
     }
     return byId.values.toList()
+}
+
+private fun fillUnknownScanMetadata(
+    preferred: CollectionInventoryItem,
+    fallback: CollectionInventoryItem,
+): CollectionInventoryItem {
+    val preferredCandidate = preferred.summary.digitizationCandidateClassification
+    val fallbackCandidate = fallback.summary.digitizationCandidateClassification
+    val candidate = preferredCandidate ?: fallbackCandidate
+    val priority = when {
+        candidate != true -> null
+        preferredCandidate == true && preferred.summary.scanPriority != null ->
+            preferred.summary.scanPriority
+        fallbackCandidate == true -> fallback.summary.scanPriority
+        else -> null
+    }
+    if (candidate == preferredCandidate && priority == preferred.summary.scanPriority) {
+        return preferred
+    }
+    return preferred.copy(
+        summary = preferred.summary.copy(
+            digitizationCandidateClassification = candidate,
+            scanPriority = priority,
+        ),
+    )
 }
 
 /** Columns projected by the owner-scoped collection inventory view. */
@@ -681,8 +724,12 @@ internal fun saveRemoteCollectionBooksStore(
     }
 }
 
-private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject =
-    JSONObject()
+private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject {
+    require(
+        book.scanPriority == null ||
+            (book.digitizationCandidateClassification == true && book.scanPriority in 1..5),
+    ) { "scan priority requires an explicit candidate and must be in 1..5" }
+    return JSONObject()
         .put("capture_id", book.captureId)
         .put("original_collection_id", book.originalCollectionId)
         .put("collection_id", book.collectionId)
@@ -694,6 +741,12 @@ private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject =
         .put("year", book.year)
         .put("photo_count", book.photoCount)
         .put("created_at", book.createdAt)
+        .put(
+            "digitization_candidate",
+            book.digitizationCandidateClassification ?: JSONObject.NULL,
+        )
+        .put("scan_priority", book.scanPriority ?: JSONObject.NULL)
+}
 
 private fun remoteBookFromJson(
     cachedCollectionId: String,
@@ -715,6 +768,16 @@ private fun remoteBookFromJson(
     val membershipRevision = if (version == 1) 0L
     else requiredRemoteWholeNumber(row, "membership_revision")
     require(membershipRevision >= 0L) { "invalid membership revision" }
+    val digitizationCandidateClassification = if (version < 3) null else {
+        optionalRemoteBoolean(row, "digitization_candidate")
+    }
+    val scanPriority = if (version < 3) null else {
+        optionalRemotePriority(
+            row,
+            "scan_priority",
+            digitizationCandidateClassification,
+        )
+    }
     return RemoteCollectionBook(
         captureId = captureId,
         originalCollectionId = originalCollectionId,
@@ -727,7 +790,32 @@ private fun remoteBookFromJson(
         year = requiredRemoteString(row, "year"),
         photoCount = photoCount.toInt(),
         createdAt = createdAt,
+        digitizationCandidateClassification = digitizationCandidateClassification,
+        scanPriority = scanPriority,
     )
+}
+
+private fun optionalRemoteBoolean(source: JSONObject, name: String): Boolean? =
+    when (val raw = source.opt(name)) {
+        null, JSONObject.NULL -> null
+        is Boolean -> raw
+        else -> throw IllegalArgumentException("$name must be a boolean or null")
+    }
+
+private fun optionalRemotePriority(
+    source: JSONObject,
+    name: String,
+    candidate: Boolean?,
+): Int? {
+    val raw = source.opt(name)
+    if (raw == null || raw === JSONObject.NULL) return null
+    require(candidate == true) { "$name requires an explicit candidate" }
+    val value = when (raw) {
+        is Byte, is Short, is Int, is Long -> (raw as Number).toLong()
+        else -> throw IllegalArgumentException("$name must be an integer")
+    }
+    require(value in 1L..5L) { "$name must be in 1..5" }
+    return value.toInt()
 }
 
 private fun requiredRemoteString(source: JSONObject, name: String): String =

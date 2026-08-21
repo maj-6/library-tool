@@ -71,5 +71,11 @@
             android:exported="false"
             android:label="@string/inspect_scan_box"
             android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".CoverScannerActivity"
+            android:exported="false"
+            android:label="@string/cover_scanner_title"
+            android:screenOrientation="portrait" />
     </application>
 </manifest>

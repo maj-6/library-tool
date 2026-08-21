@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/scanPriorityIndicator"
+    android:layout_width="34dp"
+    android:layout_height="34dp"
+    android:importantForAccessibility="no"
+    android:visibility="gone">
+
+    <ImageView
+        android:id="@+id/scanPriorityIcon"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
+        android:layout_gravity="start|top"
+        android:background="@drawable/whl_scan_priority_plate"
+        android:importantForAccessibility="no"
+        android:padding="3dp"
+        android:src="@drawable/ic_scan_priority" />
+
+    <TextView
+        android:id="@+id/scanPriorityBadge"
+        android:layout_width="17dp"
+        android:layout_height="17dp"
+        android:layout_gravity="end|bottom"
+        android:background="@drawable/whl_scan_priority_badge"
+        android:fontFamily="monospace"
+        android:gravity="center"
+        android:includeFontPadding="false"
+        android:importantForAccessibility="no"
+        android:textColor="@color/whl_face_hi"
+        android:textSize="10sp"
+        android:textStyle="bold" />
+</FrameLayout>

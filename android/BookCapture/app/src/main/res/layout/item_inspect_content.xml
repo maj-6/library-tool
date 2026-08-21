@@ -11,13 +11,26 @@
     android:paddingEnd="8dp"
     android:paddingBottom="4dp">
 
-    <View
-        android:id="@+id/inspectCoverSwatch"
-        android:layout_width="8dp"
-        android:layout_height="26dp"
+    <FrameLayout
+        android:layout_width="34dp"
+        android:layout_height="34dp"
         android:layout_marginEnd="8dp"
-        android:background="@color/whl_face_sh2"
-        android:importantForAccessibility="no" />
+        android:importantForAccessibility="no">
+
+        <View
+            android:id="@+id/inspectCoverSwatch"
+            android:layout_width="8dp"
+            android:layout_height="26dp"
+            android:layout_gravity="start|center_vertical"
+            android:background="@color/whl_face_sh2"
+            android:importantForAccessibility="no" />
+
+        <include
+            layout="@layout/view_scan_priority_indicator"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:layout_gravity="top|end" />
+    </FrameLayout>
 
     <TextView
         android:id="@+id/inspectTitle"

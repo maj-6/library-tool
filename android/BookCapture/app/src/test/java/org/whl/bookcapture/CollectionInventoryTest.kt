@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -16,6 +17,8 @@ class CollectionInventoryTest {
         id: String,
         title: String = "The Herb Book",
         createdAt: Long = 100L,
+        digitizationCandidateClassification: Boolean? = null,
+        scanPriority: Int? = null,
     ) = CollectionInventorySummary(
         entryId = id,
         collectionId = "00000000-0000-0000-0000-000000000001",
@@ -25,6 +28,8 @@ class CollectionInventoryTest {
         year = "1982",
         photoCount = 3,
         createdAt = createdAt,
+        digitizationCandidateClassification = digitizationCandidateClassification,
+        scanPriority = scanPriority,
     )
 
     private fun entry(
@@ -35,6 +40,7 @@ class CollectionInventoryTest {
         dir: File = Files.createTempDirectory("inventory-entry").toFile(),
         deliveryTransport: String = "cloud",
         cloudOwnerId: String = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        desktopBook: DesktopBookMetadata? = null,
     ) = Entries.Entry(
         id = id,
         dir = dir,
@@ -57,6 +63,7 @@ class CollectionInventoryTest {
             updatedAt = createdAt,
         ),
         processingRecorded = true,
+        desktopBook = desktopBook,
         provenance = CaptureProvenance(
             collectionId = "00000000-0000-0000-0000-000000000002",
             collectionName = "Current fungi name",
@@ -64,9 +71,31 @@ class CollectionInventoryTest {
         ),
     )
 
+    private fun desktopMetadata(
+        captureId: String,
+        candidate: Boolean,
+        priority: Int? = null,
+    ): DesktopBookMetadata {
+        val data = JSONObject().put("digitization_candidate", candidate)
+        priority?.let { data.put("scan_priority", it) }
+        return desktopBookMetadataFromJson(
+            JSONObject()
+                .put("capture_id", captureId)
+                .put("owner_id", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                .put("book_id", "manual:book-1")
+                .put("revision", 1L)
+                .put("updated_at", "2026-08-21T12:00:00Z")
+                .put("data", data),
+        )!!
+    }
+
     @Test
     fun currentStoreIsVersionedAndKeyedByEntryId() {
-        val original = summary("entry-1")
+        val original = summary(
+            "entry-1",
+            digitizationCandidateClassification = true,
+            scanPriority = 3,
+        )
         val encoded = collectionInventoryStoreToJson(
             CollectionInventoryStore(mapOf(original.entryId to original)),
         )
@@ -79,6 +108,8 @@ class CollectionInventoryTest {
         assertEquals(3, row.getInt("photo_count"))
         assertEquals("", row.getString("delivery_transport"))
         assertEquals("", row.getString("cloud_owner_id"))
+        assertTrue(row.getBoolean("digitization_candidate"))
+        assertEquals(3, row.getInt("scan_priority"))
         assertEquals(
             mapOf(original.entryId to original),
             collectionInventoryStoreFromJson(encoded).summaries,
@@ -119,7 +150,7 @@ class CollectionInventoryTest {
     fun malformedOrUnknownSchemasAreNotWritableStores() {
         val invalid = listOf(
             "{}",
-            """{"version":4,"entries":{}}""",
+            """{"version":5,"entries":{}}""",
             """{"version":1,"entries":[]}""",
             """{"version":1,"entries":{"e":{"collection_id":4}}}""",
             """{"version":1,"entries":{"e":{
@@ -134,6 +165,82 @@ class CollectionInventoryTest {
         )
 
         invalid.forEach { assertFalse(collectionInventoryStoreFromJson(it).valid) }
+    }
+
+    @Test
+    fun currentScanMetadataRejectsMalformedTypesRangesAndOrphanedPriorities() {
+        val valid = collectionInventoryStoreToJson(
+            CollectionInventoryStore(
+                mapOf("entry-1" to summary(
+                    "entry-1",
+                    digitizationCandidateClassification = true,
+                    scanPriority = 1,
+                )),
+            ),
+        )
+        val invalidValues = listOf(
+            "true" to 1,
+            true to 0,
+            true to 6,
+            true to 1.5,
+            true to "1",
+            true to true,
+            false to 1,
+            JSONObject.NULL to 1,
+        )
+        invalidValues.forEach { (candidate, priority) ->
+            val root = JSONObject(valid)
+            val row = root.getJSONObject("entries").getJSONObject("entry-1")
+            row.put("digitization_candidate", candidate)
+            row.put("scan_priority", priority)
+            assertFalse(collectionInventoryStoreFromJson(root.toString()).valid)
+        }
+        assertFalse(collectionInventoryStoreFromJson(
+            valid.replace("\"scan_priority\":1", "\"scan_priority\":1.0"),
+        ).valid)
+
+        listOf(
+            summary(
+                "not-candidate",
+                digitizationCandidateClassification = false,
+                scanPriority = 1,
+            ),
+            summary(
+                "orphaned",
+                digitizationCandidateClassification = null,
+                scanPriority = 1,
+            ),
+            summary(
+                "out-of-range",
+                digitizationCandidateClassification = true,
+                scanPriority = 6,
+            ),
+        ).forEach { invalid ->
+            assertThrows(IllegalArgumentException::class.java) {
+                collectionInventoryStoreToJson(
+                    CollectionInventoryStore(mapOf(invalid.entryId to invalid)),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun explicitCandidateClearRoundTripsWithoutAPriority() {
+        val cleared = summary(
+            "entry-1",
+            digitizationCandidateClassification = false,
+        )
+        val encoded = collectionInventoryStoreToJson(
+            CollectionInventoryStore(mapOf(cleared.entryId to cleared)),
+        )
+        val row = JSONObject(encoded).getJSONObject("entries").getJSONObject("entry-1")
+
+        assertFalse(row.getBoolean("digitization_candidate"))
+        assertTrue(row.isNull("scan_priority"))
+        assertEquals(
+            cleared,
+            collectionInventoryStoreFromJson(encoded).summaries.getValue("entry-1"),
+        )
     }
 
     @Test
@@ -198,6 +305,25 @@ class CollectionInventoryTest {
     }
 
     @Test
+    fun versionThreeRowsRemainReadableWithUnknownScanClassification() {
+        val legacy = """{"version":3,"entries":{"legacy":{
+            "collection_id":"old-c","collection_name":"Old crate",
+            "title":"Old book","author":"A","year":"1901",
+            "photo_count":1,"created_at":10,"delivery_transport":"cloud",
+            "cloud_owner_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        }}}""".trimIndent()
+
+        val parsed = collectionInventoryStoreFromJson(legacy)
+        val summary = parsed.summaries.getValue("legacy")
+
+        assertTrue(parsed.valid)
+        assertNull(summary.digitizationCandidateClassification)
+        assertFalse(summary.digitizationCandidate)
+        assertNull(summary.scanPriority)
+        assertEquals(3, parsed.sourceVersion)
+    }
+
+    @Test
     fun cloudDeliveryOwnerUsesLegacyCreatorAndFailsClosedOnConflict() {
         val ownerA = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         val manifest = JSONObject()
@@ -256,6 +382,30 @@ class CollectionInventoryTest {
                 encoded.replace(uppercaseOwner.lowercase(), "not-a-uuid"),
             ).valid,
         )
+    }
+
+    @Test
+    fun finalizedSummaryRetainsDesktopCandidateClassificationAndPriority() {
+        val captureId = "00000000-0000-4000-8000-000000000001"
+        val candidate = collectionInventorySummary(
+            entry(
+                captureId,
+                desktopBook = desktopMetadata(captureId, candidate = true, priority = 5),
+            ),
+        )
+        assertEquals(true, candidate.digitizationCandidateClassification)
+        assertTrue(candidate.digitizationCandidate)
+        assertEquals(5, candidate.scanPriority)
+
+        val cleared = collectionInventorySummary(
+            entry(
+                captureId,
+                desktopBook = desktopMetadata(captureId, candidate = false, priority = 1),
+            ),
+        )
+        assertEquals(false, cleared.digitizationCandidateClassification)
+        assertFalse(cleared.digitizationCandidate)
+        assertNull(cleared.scanPriority)
     }
 
     @Test
