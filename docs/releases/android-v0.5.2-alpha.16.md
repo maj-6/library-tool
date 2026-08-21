@@ -8,11 +8,11 @@ queue visible wherever a book appears in the Android app.
 ## Find which collection holds a book
 
 Type a title in Inspect to search across collections, or photograph a cover and
-let Mistral OCR 4.1 read its title and author. The cover image is resized on the
-phone, sent temporarily to Mistral using the API key configured in Settings,
-and discarded after recognition. The app then ranks matches from the owner's
-local and cloud inventory and opens the selected collection without creating or
-changing a capture.
+let Mistral OCR 4.1 read its title and author. The cover image is resized into
+the app's temporary cache, sent to Mistral using the API key configured in
+Settings, then deleted from the phone after recognition. The app ranks matches
+from the owner's local and cloud inventory and opens the selected collection
+without creating or changing a capture.
 
 Exact titles rank first, author and year resolve close matches, and ambiguous
 books remain separate results instead of silently choosing a collection. Cloud
