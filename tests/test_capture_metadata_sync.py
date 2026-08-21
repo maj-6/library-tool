@@ -200,6 +200,67 @@ def test_digitization_candidate_projects_from_the_selected_active_item_only():
     assert "digitization_candidate" not in legacy["data"]
 
 
+def test_scan_priority_projects_only_a_strict_candidate_ordinal():
+    def projected(priority, *, candidate=True, include=True):
+        build = {
+            "capture_id": CAPTURE_ID,
+            "digitization_candidate": candidate,
+            "updated_at": "2026-08-21T10:00:00Z",
+        }
+        if include:
+            build["scan_priority"] = priority
+        return server._capture_book_metadata_rows(
+            builds={"book-1": build}, manual_entries={}, reviews={},
+            registration_cache={},
+        )[0]["data"]
+
+    assert projected("1")["scan_priority"] == "1"
+    assert projected(5)["scan_priority"] == "5"
+    for malformed in (True, 1.0, "01", "0", "6", "n/s", None):
+        assert projected(malformed)["scan_priority"] is None
+
+    assert "scan_priority" not in projected("2", candidate=False)
+    assert "scan_priority" not in projected(None, include=False)
+
+
+def test_scan_priority_merge_preserves_unknown_but_honors_an_explicit_clear():
+    def row(build):
+        return server._capture_book_metadata_rows(
+            builds={"book-1": {
+                "capture_id": CAPTURE_ID,
+                "updated_at": "2026-08-21T10:00:00Z",
+                **build,
+            }},
+            manual_entries={}, reviews={}, registration_cache={},
+        )[0]
+
+    known = row({"digitization_candidate": True, "scan_priority": "2"})
+    legacy = row({"digitization_candidate": True})
+    preserved = server._merge_capture_projection_with_existing(
+        legacy, {**known, "revision": 2},
+    )
+    assert preserved["data"]["scan_priority"] == "2"
+
+    explicit_clear = row({
+        "digitization_candidate": True,
+        "scan_priority": "n/s",
+    })
+    cleared = server._merge_capture_projection_with_existing(
+        explicit_clear, {**known, "revision": 2},
+    )
+    assert cleared["data"]["scan_priority"] is None
+
+    tombstone = server._capture_book_metadata_rows(
+        builds={}, manual_entries={}, reviews={}, registration_cache={},
+        tombstone_capture_ids=[CAPTURE_ID],
+        tombstone_updated_at={CAPTURE_ID: "2026-08-21T10:02:00Z"},
+    )[0]
+    retained = server._merge_capture_projection_with_existing(
+        tombstone, {**known, "revision": 2},
+    )["data"]["projection_source"]["_retained_desktop_evidence"]
+    assert retained["scan_priority"] == "2"
+
+
 def test_candidate_merge_preserves_legacy_unknown_but_explicit_false_clears():
     known = server._capture_book_metadata_rows(
         builds={"book-1": {
