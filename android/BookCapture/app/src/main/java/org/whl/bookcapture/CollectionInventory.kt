@@ -25,7 +25,13 @@ internal data class CollectionInventorySummary(
     val deliveryTransport: String = "",
     /** Verified cloud account at delivery; empty means LAN or legacy-unknown. */
     val cloudOwnerId: String = "",
-)
+    /** `null` means the retained row predates or lacks a curator classification. */
+    val digitizationCandidateClassification: Boolean? = null,
+    /** Present only for an explicitly classified candidate; valid values are 1..5. */
+    val scanPriority: Int? = null,
+) {
+    val digitizationCandidate: Boolean get() = digitizationCandidateClassification == true
+}
 
 /** One Inspect row. Only a still-current entry can carry live photo access. */
 internal data class CollectionInventoryItem(
@@ -47,7 +53,7 @@ internal data class CollectionInventoryStore(
 )
 
 internal const val COLLECTION_INVENTORY_FILE = "collection_inventory.json"
-internal const val COLLECTION_INVENTORY_VERSION = 3
+internal const val COLLECTION_INVENTORY_VERSION = 4
 
 internal object CollectionInventory {
 
@@ -88,8 +94,9 @@ internal object CollectionInventory {
         mergeCollectionInventory(read(ctx).summaries.values, Entries.recent(ctx))
 }
 
-internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInventorySummary =
-    CollectionInventorySummary(
+internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInventorySummary {
+    val desktop = entry.desktopBook
+    return CollectionInventorySummary(
         entryId = entry.id,
         collectionId = entry.provenance?.collectionId.orEmpty(),
         collectionName = entry.provenance?.collectionName.orEmpty(),
@@ -100,7 +107,10 @@ internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInvento
         createdAt = entry.createdAt,
         deliveryTransport = entry.deliveryTransport,
         cloudOwnerId = entry.cloudOwnerId.trim().lowercase(),
+        digitizationCandidateClassification = desktop?.digitizationCandidateClassification,
+        scanPriority = desktop?.scanPriority,
     )
+}
 
 /**
  * Pure union used by Inspect presentation code. Durable duplicates collapse by
@@ -141,7 +151,8 @@ internal fun collectionInventoryStoreToJson(store: CollectionInventoryStore): St
  * Reading it in memory is safe; the next successful record writes the current
  * version. Version 2 adds delivery transport. Version 3 adds the verified
  * cloud owner so a photo-free row can never be submitted under another
- * account merely because that account is signed in later.
+ * account merely because that account is signed in later. Version 4 retains
+ * the desktop's tri-state scan-candidate classification and bounded priority.
  */
 internal fun collectionInventoryStoreFromJson(text: String): CollectionInventoryStore = try {
     val root = JSONObject(text)
@@ -208,6 +219,11 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
     require(summary.deliveryTransport == "cloud" || cloudOwnerId.isEmpty()) {
         "non-cloud delivery cannot have a cloud owner"
     }
+    require(
+        summary.scanPriority == null ||
+            (summary.digitizationCandidateClassification == true &&
+                summary.scanPriority in 1..5),
+    ) { "scan priority requires an explicit candidate and must be in 1..5" }
     return JSONObject()
         .put("collection_id", summary.collectionId)
         .put("collection_name", summary.collectionName)
@@ -218,6 +234,11 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
         .put("created_at", summary.createdAt)
         .put("delivery_transport", summary.deliveryTransport)
         .put("cloud_owner_id", cloudOwnerId)
+        .put(
+            "digitization_candidate",
+            summary.digitizationCandidateClassification ?: JSONObject.NULL,
+        )
+        .put("scan_priority", summary.scanPriority ?: JSONObject.NULL)
 }
 
 private fun summaryFromJson(
@@ -244,6 +265,16 @@ private fun summaryFromJson(
     require(deliveryTransport == "cloud" || cloudOwnerId.isEmpty()) {
         "non-cloud delivery cannot have a cloud owner"
     }
+    val digitizationCandidateClassification = if (version < 4) null else {
+        optionalInventoryBoolean(row, "digitization_candidate")
+    }
+    val scanPriority = if (version < 4) null else {
+        optionalInventoryPriority(
+            row,
+            "scan_priority",
+            digitizationCandidateClassification,
+        )
+    }
     return CollectionInventorySummary(
         entryId = entryId,
         collectionId = requiredString(row, "collection_id"),
@@ -255,7 +286,32 @@ private fun summaryFromJson(
         createdAt = createdAt,
         deliveryTransport = deliveryTransport,
         cloudOwnerId = cloudOwnerId,
+        digitizationCandidateClassification = digitizationCandidateClassification,
+        scanPriority = scanPriority,
     )
+}
+
+private fun optionalInventoryBoolean(source: JSONObject, name: String): Boolean? =
+    when (val raw = source.opt(name)) {
+        null, JSONObject.NULL -> null
+        is Boolean -> raw
+        else -> throw IllegalArgumentException("$name must be a boolean or null")
+    }
+
+private fun optionalInventoryPriority(
+    source: JSONObject,
+    name: String,
+    candidate: Boolean?,
+): Int? {
+    val raw = source.opt(name)
+    if (raw == null || raw === JSONObject.NULL) return null
+    require(candidate == true) { "$name requires an explicit candidate" }
+    val value = when (raw) {
+        is Byte, is Short, is Int, is Long -> (raw as Number).toLong()
+        else -> throw IllegalArgumentException("$name must be an integer")
+    }
+    require(value in 1L..5L) { "$name must be in 1..5" }
+    return value.toInt()
 }
 
 private fun normalizedInventoryCloudOwner(value: String): String {

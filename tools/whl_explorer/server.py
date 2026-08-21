@@ -27682,11 +27682,27 @@ def _capture_retained_projection_evidence(data: dict) -> dict:
     # permanently, because the owning desktop's replay then compares "equal" and
     # push_capture_book_metadata refuses it.
     for key in ("bibliography", "copyright", "availability", "scan_status",
-                "digitization_candidate", "remarks"):
+                "digitization_candidate", "scan_priority", "remarks"):
         value = data.get(key)
         if value not in (None, "", [], {}):
             out[key] = json.loads(json.dumps(value, ensure_ascii=False))
     return out
+
+
+def _capture_scan_priority(value) -> str | None:
+    """Return the strict 1-5 ordinal Android accepts, or no priority.
+
+    Enrichment stores this field as a canonical string. Accept an integer too
+    for forward-compatible hand-authored rows, while rejecting booleans,
+    floats, padded strings and the enrichment sentinel ``n/s``.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and 1 <= value <= 5:
+        return str(value)
+    if isinstance(value, str) and value in {"1", "2", "3", "4", "5"}:
+        return value
+    return None
 
 
 def _merge_capture_projection_with_existing(row: dict,
@@ -27774,6 +27790,17 @@ def _merge_capture_projection_with_existing(row: dict,
             "digitization_candidate" not in desired and
             isinstance(old_candidate, bool)):
         desired["digitization_candidate"] = old_candidate
+
+    # Missing is legacy/unknown and may inherit a known cloud value. An
+    # explicit JSON null is a curator-authored clear (for example enrichment's
+    # ``n/s``) and must not resurrect the old rank. A non-candidate never keeps
+    # an orphaned priority in its phone-visible projection.
+    old_priority = _capture_scan_priority(previous_facts.get("scan_priority"))
+    if desired.get("digitization_candidate") is True:
+        if "scan_priority" not in desired and old_priority is not None:
+            desired["scan_priority"] = old_priority
+    else:
+        desired.pop("scan_priority", None)
 
     desired_evidence = _capture_projection_stamp(
         desired_source.get("evidence_updated_at"))
@@ -28014,6 +28041,11 @@ def _capture_book_metadata_rows(builds: dict | None = None,
         digitization_candidate = build.get("digitization_candidate")
         if isinstance(digitization_candidate, bool):
             data["digitization_candidate"] = digitization_candidate
+            if digitization_candidate and "scan_priority" in build:
+                # Preserve an explicit clear as JSON null so a merge cannot
+                # revive a stale cloud priority. Android treats it as unset.
+                data["scan_priority"] = _capture_scan_priority(
+                    build.get("scan_priority"))
         rows.append({
             "capture_id": capture_id,
             # An unregistered capture has no book id, and the phone's

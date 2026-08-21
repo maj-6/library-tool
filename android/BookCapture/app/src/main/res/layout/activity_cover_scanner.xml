@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/whl_ink">
+
+    <androidx.camera.view.PreviewView
+        android:id="@+id/coverPreview"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:importantForAccessibility="no"
+        app:implementationMode="compatible"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:scaleType="fillCenter" />
+
+    <LinearLayout
+        android:id="@+id/coverScannerHelpPanel"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="18dp"
+        android:layout_marginTop="18dp"
+        android:layout_marginEnd="18dp"
+        android:background="@drawable/whl_note_overlay"
+        android:orientation="vertical"
+        android:padding="12dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="@font/roboto_slab"
+            android:text="@string/cover_scanner_title"
+            android:textColor="@color/whl_ink_light"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:fontFamily="monospace"
+            android:text="@string/cover_scanner_help"
+            android:textColor="@color/whl_ink_light"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <View
+        android:id="@+id/coverFrame"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginStart="42dp"
+        android:layout_marginTop="18dp"
+        android:layout_marginEnd="42dp"
+        android:layout_marginBottom="18dp"
+        android:background="@drawable/whl_qr_scanner_frame"
+        android:importantForAccessibility="no"
+        app:layout_constraintBottom_toTopOf="@id/coverScannerStatusPanel"
+        app:layout_constraintDimensionRatio="5:7"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/coverScannerHelpPanel" />
+
+    <LinearLayout
+        android:id="@+id/coverScannerStatusPanel"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="18dp"
+        android:layout_marginEnd="18dp"
+        android:layout_marginBottom="12dp"
+        android:background="@drawable/whl_note_overlay"
+        android:gravity="center_vertical"
+        android:minHeight="44dp"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="8dp"
+        app:layout_constraintBottom_toTopOf="@id/closeCoverScanner"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <ProgressBar
+            android:id="@+id/coverScannerProgress"
+            style="?android:attr/progressBarStyleSmall"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:layout_marginEnd="9dp"
+            android:indeterminate="true"
+            android:indeterminateTint="@color/whl_amber"
+            android:importantForAccessibility="no" />
+
+        <TextView
+            android:id="@+id/coverScannerStatus"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:accessibilityLiveRegion="polite"
+            android:fontFamily="monospace"
+            android:textColor="@color/whl_ink_light"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/closeCoverScanner"
+        style="@style/WhlIconButton"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_marginStart="18dp"
+        android:layout_marginBottom="20dp"
+        android:contentDescription="@string/cover_scanner_close"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:srcCompat="@drawable/ic_cancel"
+        app:tint="@color/whl_icon_button_tint" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/captureCover"
+        style="@style/WhlButton"
+        android:layout_width="0dp"
+        android:layout_height="52dp"
+        android:layout_marginStart="10dp"
+        android:layout_marginEnd="18dp"
+        android:layout_marginBottom="20dp"
+        android:contentDescription="@string/cover_scanner_capture_description"
+        android:fontFamily="@font/roboto_slab"
+        android:gravity="center"
+        android:text="@string/cover_scanner_capture"
+        android:textAllCaps="false"
+        android:textSize="15sp"
+        app:icon="@drawable/ic_camera"
+        app:iconGravity="textStart"
+        app:iconPadding="8dp"
+        app:iconSize="24dp"
+        app:iconTint="@color/whl_button_text"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@id/closeCoverScanner" />
+</androidx.constraintlayout.widget.ConstraintLayout>

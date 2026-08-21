@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.15` (version code 46) is the Android
+Library Tool Capture `0.5.2-alpha.16` (version code 47) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -19,8 +19,11 @@ collection is listed first and expanded initially. Waiting work uses an
 animated indicator, delivered work uses an icon, and the colored state marker
 carries the successful/complete state.
 
-Books marked as scan candidates in desktop Corrections show a scan icon on
-Home and a **Digitization** entry in book details after metadata sync.
+Books marked as scan candidates show a scanner badge and subtle highlight in
+every book view: Home, all Inspect layouts, the archive, the last-captured card,
+and book details. A curator-assigned scan priority appears as a numbered 1–5
+tag; older candidates without an assigned priority use `?` rather than an
+invented rank.
 
 Scan-row gestures are literal:
 
@@ -107,12 +110,16 @@ encoded as its QR label; renaming a collection does not silently change a tag
 that may already be printed.
 
 The **Inspect** tab gives a compact collection overview and opens a box directly
-from its QR label. A selected box can be browsed as Windows-like **Tiles**,
-**Content**, or **Icons**. The display choice is kept on the device and scanning
-a box does not change the collection used by the next capture. Inspect retains
-only a small bibliographic summary when old delivered scan media is cleared, so
-the list remains useful without defeating the app's storage limit; cleared
-photos and their local detail view are not retained.
+from its QR label. It can also identify a book's collection from a typed title
+or a photographed cover. Cover identification sends a temporary, resized image
+to Mistral OCR 4.1 using the API key in Settings, then matches the returned text
+against the owner's collection inventory; it does not create or modify a book.
+A selected box can be browsed as Windows-like **Tiles**, **Content**, or
+**Icons**. The display choice is kept on the device and scanning a box does not
+change the collection used by the next capture. Inspect retains only a small
+bibliographic summary when old delivered scan media is cleared, so the list
+remains useful without defeating the app's storage limit; cleared photos and
+their local detail view are not retained.
 
 Long-pressing a book starts a multi-selection. Selected books can be moved to
 another collection or removed from their current collection; any local page

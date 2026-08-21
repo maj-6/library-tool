@@ -392,38 +392,40 @@ class HomeListResourceTest {
     }
 
     @Test
-    fun digitizationCandidateHasDistinctHomeAndDetailIndicators() {
-        val home = xml("src/main/res/layout/item_home.xml")
-        val indicator = elementById(home, "digitizationCandidateStatus")
-        assertEquals("@style/WhlMetadataIcon", indicator.getAttribute("style"))
-        assertEquals(
-            "@drawable/ic_scan_candidate",
-            indicator.getAttributeNS(androidNs, "src"),
-        )
-        assertEquals(
-            "@string/home_digitization_candidate",
-            indicator.getAttributeNS(androidNs, "contentDescription"),
-        )
-        assertEquals("gone", indicator.getAttributeNS(androidNs, "visibility"))
+    fun digitizationCandidateHasNumberedScannerOverlayAndDetailIndicator() {
+        val homeLayout = File("src/main/res/layout/item_home.xml").readText()
+        assertTrue(homeLayout.contains("android:id=\"@+id/thumbFrame\""))
+        assertTrue(homeLayout.contains("layout=\"@layout/view_scan_priority_indicator\""))
 
-        val candidateIcon = File("src/main/res/drawable/ic_scan_candidate.xml").readText()
+        val indicator = xml("src/main/res/layout/view_scan_priority_indicator.xml")
+        val overlay = elementById(indicator, "scanPriorityIndicator")
+        assertEquals("gone", overlay.getAttributeNS(androidNs, "visibility"))
+        assertEquals(
+            "@drawable/ic_scan_priority",
+            elementById(indicator, "scanPriorityIcon").getAttributeNS(androidNs, "src"),
+        )
+        assertNotNull(elementById(indicator, "scanPriorityBadge"))
+
+        val candidateIcon = File("src/main/res/drawable/ic_scan_priority.xml").readText()
         assertTrue(candidateIcon.contains("@color/whl_amber"))
         assertFalse(candidateIcon == File("src/main/res/drawable/ic_scan_status.xml").readText())
 
         val homeSource = source("HomeActivity")
-        assertTrue(homeSource.contains("R.id.digitizationCandidateStatus"))
-        assertTrue(homeSource.contains("desktop?.digitizationCandidate == true"))
+        assertTrue(homeSource.contains("bindScanPriorityIndicator("))
+        assertTrue(homeSource.contains("desktop?.digitizationCandidateClassification"))
+        assertTrue(homeSource.contains("desktop?.scanPriority"))
         val summary = homeSource.substringAfter("val summaryIds = listOf(")
             .substringBefore(")")
-        assertTrue(summary.contains("R.id.digitizationCandidateStatus"))
+        assertTrue(summary.contains("R.id.scanPriorityIndicator"))
 
         val detailSource = source("EntryDetailActivity")
         assertTrue(detailSource.contains("if (desktop.digitizationCandidate)"))
         assertTrue(detailSource.contains("R.string.detail_digitization"))
-        assertTrue(detailSource.contains("R.string.home_digitization_candidate"))
+        assertTrue(detailSource.contains("R.string.scan_priority_description"))
 
         val strings = File("src/main/res/values/strings.xml").readText()
         assertTrue(strings.contains(">Scan candidate</string>"))
+        assertTrue(strings.contains("name=\"scan_priority_description\""))
         assertTrue(strings.contains("name=\"detail_digitization\">Digitization</string>"))
     }
 

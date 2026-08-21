@@ -2997,6 +2997,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (entry == null) {
+            bindScanPriorityIndicator(
+                bookView = binding.lastBookPreview,
+                candidate = null,
+                priority = null,
+            )
             if (!load.thumbnailChanged) {
                 binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
             }
@@ -3031,6 +3036,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val scanPriority = bindScanPriorityIndicator(
+            bookView = binding.lastBookPreview,
+            candidate = entry.desktopBook?.digitizationCandidateClassification,
+            priority = entry.desktopBook?.scanPriority,
+        )
+
         // Entries.titleLabel is valuable while extraction is pending, but its
         // populated-metadata fallback may use a secondary/extra field. Once
         // metadata exists, keep this compact card strictly primary-only.
@@ -3056,12 +3067,15 @@ class MainActivity : AppCompatActivity() {
         binding.lastBookPrimary.isEnabled = available
         binding.lastBookPrimary.isClickable = available
         binding.lastBookPrimary.isFocusable = available
-        val bookDescription = getString(
-            R.string.capture_last_book_description,
-            title,
-            entry.author.ifEmpty { getString(R.string.capture_last_book_field_missing) },
-            entry.year.ifEmpty { getString(R.string.capture_last_book_field_missing) },
-        )
+        val bookDescription = listOf(
+            getString(
+                R.string.capture_last_book_description,
+                title,
+                entry.author.ifEmpty { getString(R.string.capture_last_book_field_missing) },
+                entry.year.ifEmpty { getString(R.string.capture_last_book_field_missing) },
+            ),
+            scanPriority.accessibilityLabel,
+        ).filter(String::isNotBlank).joinToString(". ")
         binding.lastBookPrimary.contentDescription = bookDescription
         binding.lastBookPreview.contentDescription = bookDescription
         val openBook = View.OnClickListener {

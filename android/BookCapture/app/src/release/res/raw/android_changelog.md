@@ -3,6 +3,27 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.16 — 2026-08-21
+
+Android version code: `47`.
+
+### Additions
+
+- Inspect can identify a book's collection from a typed title or a photographed
+  cover. Cover text is read through Mistral OCR 4.1, then matched against the
+  owner's local and cloud collection inventory.
+- Scan candidates now use one accessible scanner overlay and subtle highlight
+  across Home, all three Inspect layouts, the archive, the last-captured card,
+  and book details. Assigned priorities appear as numbered 1–5 tags; candidates
+  without an assigned priority show `?`.
+
+### Other Changes
+
+- Inspect's durable and cloud caches retain scan-candidate classification and
+  priority, including across collection moves, merges, pruning, and restarts.
+- Cover lookup requires the Mistral API key in Settings and clearly discloses
+  that its temporary resized cover photo is sent to Mistral OCR 4.1.
+
 ## 0.5.2-alpha.15 — 2026-08-09
 
 Android version code: `46`.

@@ -154,11 +154,17 @@ class InspectResourceContractTest {
 
         val thumbnail = elementById(layout, "inspectThumb")
         assertEquals("ImageView", thumbnail.tagName)
-        assertEquals("42dp", thumbnail.getAttributeNS(androidNs, "layout_width"))
-        assertEquals("58dp", thumbnail.getAttributeNS(androidNs, "layout_height"))
-        assertEquals("6dp", thumbnail.getAttributeNS(androidNs, "layout_marginEnd"))
+        assertEquals("match_parent", thumbnail.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("match_parent", thumbnail.getAttributeNS(androidNs, "layout_height"))
+        val thumbnailFrame = thumbnail.parentNode as Element
+        assertEquals("FrameLayout", thumbnailFrame.tagName)
+        assertEquals("42dp", thumbnailFrame.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("58dp", thumbnailFrame.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("6dp", thumbnailFrame.getAttributeNS(androidNs, "layout_marginEnd"))
         assertEquals("no", thumbnail.getAttributeNS(androidNs, "importantForAccessibility"))
         assertTrue(thumbnail.getAttributeNS(androidNs, "contentDescription").isEmpty())
+        assertTrue(File("src/main/res/layout/item_inspect_tile.xml").readText()
+            .contains("@layout/view_scan_priority_indicator"))
 
         val title = elementById(layout, "inspectTitle")
         val subtitle = elementById(layout, "inspectSubtitle")
@@ -180,10 +186,16 @@ class InspectResourceContractTest {
 
         val thumbnail = elementById(layout, "inspectThumb")
         assertEquals("ImageView", thumbnail.tagName)
-        assertEquals("50dp", thumbnail.getAttributeNS(androidNs, "layout_width"))
-        assertEquals("68dp", thumbnail.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("match_parent", thumbnail.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("match_parent", thumbnail.getAttributeNS(androidNs, "layout_height"))
+        val thumbnailFrame = thumbnail.parentNode as Element
+        assertEquals("FrameLayout", thumbnailFrame.tagName)
+        assertEquals("50dp", thumbnailFrame.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("68dp", thumbnailFrame.getAttributeNS(androidNs, "layout_height"))
         assertEquals("no", thumbnail.getAttributeNS(androidNs, "importantForAccessibility"))
         assertTrue(thumbnail.getAttributeNS(androidNs, "contentDescription").isEmpty())
+        assertTrue(File("src/main/res/layout/item_inspect_icon.xml").readText()
+            .contains("@layout/view_scan_priority_indicator"))
 
         val title = elementById(layout, "inspectTitle")
         val subtitle = elementById(layout, "inspectSubtitle")
@@ -299,6 +311,40 @@ class InspectResourceContractTest {
                 pruning.indexOf("CaptureMetadataStore.archiveIfNoUnsyncedLocalMutation"),
         )
         assertFalse(pruning.contains("deleteIfNoUnsyncedLocalMutation"))
+    }
+
+    @Test
+    fun lookupIntegrationKeepsFreshCloudAuthorityAndRetiresStaleLoads() {
+        val home = source("HomeActivity")
+        val lookupMerge = home.substringAfter("private fun inspectLookupRenderItems(")
+            .substringBefore("private fun showInspectLookupCollection(")
+        assertTrue(lookupMerge.contains("remote.collectionId to existing.second.copy"))
+        assertTrue(lookupMerge.contains("val book = mergeInspectLookupBookSources("))
+        val mergedBookArguments = lookupMerge
+            .substringAfter("val book = mergeInspectLookupBookSources(")
+            .substringBefore("val collection =")
+        assertFalse(mergedBookArguments.contains("inspect_book_untitled"))
+
+        val contentRefresh = home.substringAfter("private fun refreshContentTab()")
+            .substringBefore("private fun scheduleWorkerRefresh(")
+        assertTrue(contentRefresh.contains("invalidateRemoteInspectLookup()"))
+        val mutation = home.substringAfter("private fun mutateInspectSelection(")
+            .substringBefore("override fun onDestroy()")
+        assertTrue(mutation.contains("invalidateRemoteInspectLookup()"))
+        val remoteBoxRefresh = home.substringAfter("private fun ensureRemoteBoxListing(")
+            .substringBefore("private fun releaseDynamicThumbnails()")
+        assertTrue(remoteBoxRefresh.contains("invalidateRemoteInspectLookup()"))
+
+        val completion = home.substringAfter("when (inspectLookupCloudCompletion(")
+            .substringBefore("inspectLookupCloudLoading = false")
+        assertTrue(completion.contains("IGNORE_RETIRED_GENERATION -> return@launch"))
+        assertTrue(completion.contains("RESET_STALE_OWNER"))
+        assertTrue(completion.contains("resetRemoteInspectLookup(currentOwner)"))
+
+        val strings = xml("src/main/res/values/strings.xml")
+        assertTrue(elements(strings, "plurals").any {
+            it.getAttribute("name") == "inspect_lookup_matches_cloud_unavailable"
+        })
     }
 
     private fun source(name: String): String =

@@ -68,10 +68,37 @@ class DesktopBookMetadata internal constructor(
 
     val scanStatus: String get() = dataCopy().strictString("scan_status", 80).orEmpty()
 
-    /** Book-level curator classification. Projections written before issue #312
-     * omit the key, and malformed future/legacy values fail closed to false. */
+    /**
+     * Book-level curator classification. `null` is deliberately distinct from
+     * an explicit false: projections written before issue #312 did not know the
+     * classification, while a curator can explicitly clear it later.
+     * Malformed future/legacy values fail closed to unknown.
+     */
+    val digitizationCandidateClassification: Boolean?
+        get() = dataCopy().strictBoolean("digitization_candidate")
+
+    /** Backward-compatible convenience for existing candidate-only surfaces. */
     val digitizationCandidate: Boolean
-        get() = dataCopy().strictBoolean("digitization_candidate") ?: false
+        get() = digitizationCandidateClassification == true
+
+    /**
+     * Curator-authored scan order, from highest (1) to lowest (5). A priority
+     * has meaning only for an explicitly classified candidate. The desktop
+     * enrichment export represents this small ordinal as a canonical string,
+     * while newer cloud projections may use a JSON integer; both are accepted.
+     * Fractional, padded, out-of-range, and orphaned values fail closed.
+     */
+    val scanPriority: Int?
+        get() {
+            val data = dataCopy()
+            if (data.strictBoolean("digitization_candidate") != true) return null
+            val priority = when (val raw = data.opt("scan_priority")) {
+                is Byte, is Short, is Int, is Long -> (raw as Number).toLong()
+                is String -> raw.toLongOrNull()?.takeIf { raw == it.toString() }
+                else -> null
+            }
+            return priority?.takeIf { it in 1L..5L }?.toInt()
+        }
 
     val remarks: List<String> get() = parseDesktopRemarks(dataCopy().opt("remarks"))
 
