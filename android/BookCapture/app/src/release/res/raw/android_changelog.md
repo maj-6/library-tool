@@ -3,7 +3,7 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
-## 0.5.2-alpha.17 - 2026-08-21
+## 0.5.2-alpha.17 — 2026-08-21
 
 Android version code: `48`.
 
