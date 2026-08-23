@@ -33,8 +33,6 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 
-import cover_matching
-
 TIMEOUT = 30.0
 CAPTURE_PHOTO_MAX_BYTES = 32 * 1024 * 1024
 CAPTURE_DISCOVERY_PAGE_SIZE = 1000
@@ -1460,6 +1458,8 @@ def _scan_search_queue_row(raw: object, *, owner_id: str) -> dict:
         response=True,
     )
     if visual_signature is not None:
+        import cover_matching
+
         try:
             visual_signature = cover_matching.parse_visual_signature(
                 visual_signature,
@@ -1674,6 +1674,8 @@ def enqueue_scan_search(
         response=False,
     )
     if visual_signature is not None:
+        import cover_matching
+
         try:
             visual_signature = cover_matching.parse_visual_signature(
                 visual_signature,

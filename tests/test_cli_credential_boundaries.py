@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -248,6 +250,23 @@ def test_standalone_sources_have_no_legacy_state_or_argv_secret_fallbacks():
     for name in ("ocr_blocks_probe.py", "capture_pipeline.py"):
         source = (root / "tools" / name).read_text(encoding="utf-8")
         assert 'add_argument("--key"' not in source, name
+
+
+def test_cloud_setup_imports_before_optional_dependencies_are_installed():
+    root = Path(__file__).parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "import sys; sys.path.insert(0, 'tools'); import cloud_setup",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_worktree_seed_sanitizes_every_registered_key_without_mutating_source(
