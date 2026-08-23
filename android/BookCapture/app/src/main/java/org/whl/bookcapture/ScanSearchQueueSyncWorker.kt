@@ -15,6 +15,25 @@ import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+internal enum class ScanSearchFailureRefreshAction {
+    ACKNOWLEDGE_ABSENT,
+    RETRY_BLANK_RESERVATION,
+    MERGE_ADVANCED,
+}
+
+internal fun scanSearchFailureRefreshAction(
+    queueId: String,
+    cloudItems: List<ScanSearchQueueItem>,
+): ScanSearchFailureRefreshAction {
+    val remote = cloudItems.firstOrNull { it.id == queueId }
+        ?: return ScanSearchFailureRefreshAction.ACKNOWLEDGE_ABSENT
+    return if (remote.isBlankCloudReservation()) {
+        ScanSearchFailureRefreshAction.RETRY_BLANK_RESERVATION
+    } else {
+        ScanSearchFailureRefreshAction.MERGE_ADVANCED
+    }
+}
+
 /** Pushes durable text/cover descriptors and pulls deferred review proposals. */
 internal class ScanSearchQueueSyncWorker(ctx: Context, params: WorkerParameters) :
     CoroutineWorker(ctx, params) {
@@ -80,28 +99,88 @@ internal class ScanSearchQueueSyncWorker(ctx: Context, params: WorkerParameters)
                         return@withContext Result.success()
                     }
                     if (expected.status == ScanSearchStatus.FAILED) {
-                        try {
-                            client.fail(expected.id)
-                        } catch (error: SupabaseClient.HttpException) {
-                            if (!isStaleScanProposalError(error)) throw error
-                            // A newer cloud proposal/decision won the race. Mark
-                            // the local failure clean so the authoritative pull
-                            // below can replace it instead of being masked by an
-                            // obsolete outbox mutation.
+                        var cleanupComplete = client.fail(expected.id, expected.revision)
+                        var authoritative: List<ScanSearchQueueItem>? = null
+                        if (!cleanupComplete) {
+                            val firstSnapshot = client.queue()
+                            authoritative = firstSnapshot
+                            when (scanSearchFailureRefreshAction(expected.id, firstSnapshot)) {
+                                ScanSearchFailureRefreshAction.ACKNOWLEDGE_ABSENT -> {
+                                    // A prior delete may have committed even if its
+                                    // response was lost. Retain the clean local error
+                                    // until the inspector dismisses it.
+                                    cleanupComplete = true
+                                }
+                                ScanSearchFailureRefreshAction.RETRY_BLANK_RESERVATION -> {
+                                    // A rev-0 local failure can race its already-created
+                                    // rev-1 reservation. Retry once with the revision we
+                                    // just observed; never delete a later evidenced row.
+                                    val remote = firstSnapshot.first { it.id == expected.id }
+                                    cleanupComplete = client.fail(remote.id, remote.revision)
+                                    if (!cleanupComplete) {
+                                        val refreshedSnapshot = client.queue()
+                                        authoritative = refreshedSnapshot
+                                        when (scanSearchFailureRefreshAction(
+                                            expected.id,
+                                            refreshedSnapshot,
+                                        )) {
+                                            ScanSearchFailureRefreshAction.ACKNOWLEDGE_ABSENT ->
+                                                cleanupComplete = true
+                                            ScanSearchFailureRefreshAction.RETRY_BLANK_RESERVATION ->
+                                                return@withContext Result.retry()
+                                            ScanSearchFailureRefreshAction.MERGE_ADVANCED -> Unit
+                                        }
+                                    }
+                                }
+                                ScanSearchFailureRefreshAction.MERGE_ADVANCED -> Unit
+                            }
                         }
-                        if (!ScanSearchQueue.acknowledgeFailureCleanup(ctx, expected)) {
-                            return@withContext Result.retry()
+                        if (cleanupComplete) {
+                            if (!ScanSearchQueue.acknowledgeFailureCleanup(ctx, expected)) {
+                                return@withContext Result.retry()
+                            }
+                        } else {
+                            if (!ScanSearchQueue.mergeCloudAfterStaleMutation(
+                                    ctx,
+                                    owner,
+                                    expected,
+                                    requireNotNull(authoritative),
+                                )
+                            ) {
+                                return@withContext Result.retry()
+                            }
+                            ScanSearchNotifications.clearFailure(ctx, expected.id)
                         }
                         ScanSearchNotifications.clearSyncFailure(ctx, expected.id)
                         return@forEach
                     }
-                    val accepted = when (expected.status) {
-                        ScanSearchStatus.PENDING -> client.enqueue(expected)
-                        ScanSearchStatus.MATCHED ->
-                            client.approve(expected.id, expected.matchedCaptureId)
-                        ScanSearchStatus.REJECTED ->
-                            client.reject(expected.id, expected.candidateCaptureId)
-                        else -> error("unsupported local scan-search mutation")
+                    val accepted = try {
+                        when (expected.status) {
+                            ScanSearchStatus.PENDING -> client.enqueue(expected)
+                            ScanSearchStatus.MATCHED ->
+                                client.approve(expected.id, expected.matchedCaptureId)
+                            ScanSearchStatus.REJECTED ->
+                                client.reject(expected.id, expected.candidateCaptureId)
+                            else -> error("unsupported local scan-search mutation")
+                        }
+                    } catch (error: SupabaseClient.HttpException) {
+                        if (expected.status !in setOf(
+                                ScanSearchStatus.MATCHED,
+                                ScanSearchStatus.REJECTED,
+                            ) || !isStaleScanProposalError(error)
+                        ) throw error
+                        val authoritative = client.queue()
+                        if (!ScanSearchQueue.mergeCloudAfterStaleMutation(
+                                ctx,
+                                owner,
+                                expected,
+                                authoritative,
+                            )
+                        ) {
+                            return@withContext Result.retry()
+                        }
+                        ScanSearchNotifications.clearSyncFailure(ctx, expected.id)
+                        return@forEach
                     }
                     if (!ScanSearchQueue.acknowledge(ctx, expected, accepted)) {
                         return@withContext Result.retry()

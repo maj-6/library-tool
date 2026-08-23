@@ -103,6 +103,14 @@ class ScanWorkflowClientTest {
             409,
             "conflict",
         )))
+        assertTrue(isStaleScanProposalError(SupabaseClient.HttpException(
+            500,
+            "object is no longer reviewable",
+            JSONObject()
+                .put("code", "55000")
+                .put("message", "scan search is already complete")
+                .toString(),
+        )))
         assertFalse(isStaleScanProposalError(SupabaseClient.HttpException(
             500,
             "server error",
@@ -215,7 +223,7 @@ class ScanWorkflowClientTest {
     }
 
     @Test
-    fun cloudBlankPendingIsProcessingButBlankProposalFailsClosed() {
+    fun cloudBlankPendingNeverClaimsLocalProcessingButBlankProposalFailsClosed() {
         fun blank(status: String) = JSONObject().apply {
             put("id", queueId)
             put("owner_id", ownerId)
@@ -235,8 +243,9 @@ class ScanWorkflowClientTest {
         }
 
         val pending = checkNotNull(scanSearchQueueItemFromCloudJson(blank("pending")))
-        assertTrue(pending.processing)
+        assertFalse(pending.processing)
         assertFalse(pending.dirty)
+        assertTrue(pending.isBlankCloudReservation())
         val failed = checkNotNull(scanSearchQueueItemFromCloudJson(blank("failed")))
         assertFalse(failed.processing)
         assertEquals(ScanSearchStatus.FAILED, failed.status)
@@ -244,12 +253,19 @@ class ScanWorkflowClientTest {
     }
 
     @Test
-    fun terminalFailureBodyIsExactAndOwnerNeutral() {
-        val body = scanSearchFailureBody(queueId)
-        assertEquals(setOf("p_id"), body.keys().asSequence().toSet())
+    fun terminalFailureBodyCarriesTheExactExpectedRevision() {
+        val body = scanSearchFailureBody(queueId, 7)
+        assertEquals(
+            setOf("p_id", "p_expected_revision"),
+            body.keys().asSequence().toSet(),
+        )
         assertEquals(queueId, body.getString("p_id"))
+        assertEquals(7L, body.getLong("p_expected_revision"))
         assertThrows(IllegalArgumentException::class.java) {
-            scanSearchFailureBody("not-a-uuid")
+            scanSearchFailureBody("not-a-uuid", 7)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            scanSearchFailureBody(queueId, -1)
         }
     }
 }

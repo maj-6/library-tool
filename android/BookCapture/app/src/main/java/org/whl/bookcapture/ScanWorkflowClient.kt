@@ -42,10 +42,13 @@ internal fun scanSearchEnqueueBody(item: ScanSearchQueueItem): JSONObject {
         )
 }
 
-internal fun scanSearchFailureBody(queueId: String): JSONObject {
+internal fun scanSearchFailureBody(queueId: String, expectedRevision: Long): JSONObject {
     val queue = queueId.trim().lowercase()
     require(SAFE_CAPTURE_SYNC_ID.matches(queue)) { "invalid scan search id" }
-    return JSONObject().put("p_id", queue)
+    require(expectedRevision >= 0L) { "invalid scan search revision" }
+    return JSONObject()
+        .put("p_id", queue)
+        .put("p_expected_revision", expectedRevision)
 }
 
 internal fun scanSearchProposalDecisionBody(
@@ -66,7 +69,7 @@ internal fun isStaleScanProposalError(error: SupabaseClient.HttpException): Bool
     } catch (_: Exception) {
         ""
     }
-    return postgrestCode == "40001"
+    return postgrestCode == "40001" || postgrestCode == "55000"
 }
 
 internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueItem? {
@@ -125,8 +128,10 @@ internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueI
             createdAt = row.opt("created_at") as? String ?: return null,
             updatedAt = row.opt("updated_at") as? String ?: return null,
             dirty = false,
-            processing = status == ScanSearchStatus.PENDING &&
-                ocrText.isBlank() && visualSignature.isEmpty(),
+            // Processing ownership is device-local and is never inferred from
+            // a remote blank placeholder. The originating device preserves its
+            // bit when this row acknowledges/merges with local state.
+            processing = false,
         ),
     ) ?: return null
     return normalized.takeIf {
@@ -175,10 +180,11 @@ internal class ScanWorkflowClient(
     )
 
     /** Idempotently remove a cloud placeholder after terminal local OCR failure. */
-    fun fail(queueId: String) {
+    fun fail(queueId: String, expectedRevision: Long): Boolean {
         requireCurrentOwner()
         val normalizedId = queueId.trim().lowercase()
         require(SAFE_CAPTURE_SYNC_ID.matches(normalizedId)) { "invalid scan search id" }
+        require(expectedRevision >= 0L) { "invalid scan search revision" }
         val conn = open(
             "POST",
             "$baseUrl/rest/v1/rpc/fail_scan_search",
@@ -186,10 +192,13 @@ internal class ScanWorkflowClient(
         )
         conn.doOutput = true
         conn.outputStream.use {
-            it.write(scanSearchFailureBody(normalizedId).toString().toByteArray())
+            it.write(
+                scanSearchFailureBody(normalizedId, expectedRevision).toString().toByteArray(),
+            )
         }
-        when (finish(conn).trim()) {
-            "true", "false" -> Unit
+        return when (finish(conn).trim()) {
+            "true" -> true
+            "false" -> false
             else -> throw SupabaseClient.InvalidResponse(
                 "invalid scan search failure response",
             )

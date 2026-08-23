@@ -24,6 +24,9 @@ Android version code: `50`.
 - Temporary photos are staged in app-private storage and deleted after hosted
   processing. Cover evidence retains only a bounded, non-reversible visual
   signature for exposure-tolerant corroboration.
+- Multi-device sync keeps OCR ownership on the camera device and protects
+  failure cleanup with revision and blank-evidence checks, so a stale device
+  cannot delete evidence completed elsewhere.
 - The launcher and navigation icon plate now use a lighter neutral sage instead
   of botanical green.
 

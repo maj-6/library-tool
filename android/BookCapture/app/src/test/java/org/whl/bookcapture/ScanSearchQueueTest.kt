@@ -125,14 +125,14 @@ class ScanSearchQueueTest {
             dirty = true,
             processing = true,
         )
-        val cloudPlaceholder = local.copy(revision = 1, dirty = false)
+        val cloudPlaceholder = local.copy(revision = 1, dirty = false, processing = false)
         val acknowledged = checkNotNull(acknowledgeScanSearchQueueStore(
             ScanSearchQueueStore(listOf(local)),
             ownerId,
             local,
             cloudPlaceholder,
         )).items.single()
-        assertEquals(cloudPlaceholder, acknowledged)
+        assertEquals(cloudPlaceholder.copy(processing = true), acknowledged)
 
         val completedAfterAck = checkNotNull(completeScanSearchProcessingItem(
             acknowledged,
@@ -180,6 +180,64 @@ class ScanSearchQueueTest {
                 ownerId,
                 listOf(cloudPlaceholder),
             )?.items?.single(),
+        )
+    }
+
+    @Test
+    fun onlyTheOriginatingLocalRowKeepsProcessingOwnershipAcrossCloudMerges() {
+        val remote = item(ownerId = ownerId, revision = 1).copy(
+            ocrText = "",
+            dirty = false,
+            processing = false,
+        )
+        val originating = remote.copy(processing = true)
+
+        val originMerge = mergeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(originating)),
+            ownerId,
+            listOf(remote),
+        )?.items?.single()
+        assertTrue(checkNotNull(originMerge).processing)
+        assertEquals(1L, originMerge.revision)
+
+        val secondDeviceMerge = mergeScanSearchQueueStore(
+            ScanSearchQueueStore(),
+            ownerId,
+            listOf(remote),
+        )?.items?.single()
+        assertFalse(checkNotNull(secondDeviceMerge).processing)
+        assertTrue(secondDeviceMerge.isBlankCloudReservation())
+
+        val serverFailed = remote.copy(status = ScanSearchStatus.FAILED, revision = 2)
+        val terminalMerge = mergeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(originating)),
+            ownerId,
+            listOf(serverFailed),
+        )?.items?.single()
+        assertEquals(ScanSearchStatus.FAILED, terminalMerge?.status)
+        assertFalse(checkNotNull(terminalMerge).processing)
+    }
+
+    @Test
+    fun failureCasMissDistinguishesAbsentBlankAndAdvancedCloudState() {
+        val blank = item(ownerId = ownerId, revision = 1).copy(
+            ocrText = "",
+            dirty = false,
+            processing = false,
+        )
+        val advanced = item(ownerId = ownerId, revision = 2).copy(dirty = false)
+
+        assertEquals(
+            ScanSearchFailureRefreshAction.ACKNOWLEDGE_ABSENT,
+            scanSearchFailureRefreshAction(queueId, emptyList()),
+        )
+        assertEquals(
+            ScanSearchFailureRefreshAction.RETRY_BLANK_RESERVATION,
+            scanSearchFailureRefreshAction(queueId, listOf(blank)),
+        )
+        assertEquals(
+            ScanSearchFailureRefreshAction.MERGE_ADVANCED,
+            scanSearchFailureRefreshAction(queueId, listOf(advanced)),
         )
     }
 
@@ -671,6 +729,55 @@ class ScanSearchQueueTest {
         )
         assertEquals(listOf(normalizedScanSearchQueueItem(refreshedProposal)),
             desktopTerminalizedSibling?.items)
+    }
+
+    @Test
+    fun staleFailureOrDecisionIsAtomicallyReplacedByAuthoritativeEvidence() {
+        val processing = item(ownerId = ownerId, revision = 1).copy(
+            ocrText = "",
+            dirty = false,
+            processing = true,
+        )
+        val failed = checkNotNull(failScanSearchProcessingItem(
+            processing,
+            "Mistral OCR failed",
+            "2026-08-21T12:01:00Z",
+        )).copy(dirty = true)
+        val evidenced = item(ownerId = ownerId, revision = 2).copy(dirty = false)
+
+        assertEquals(
+            listOf(evidenced),
+            mergeScanSearchQueueStoreAfterStaleMutation(
+                ScanSearchQueueStore(listOf(failed)),
+                ownerId,
+                failed,
+                listOf(evidenced),
+            )?.items,
+        )
+
+        val decision = item(ownerId = ownerId, revision = 2).copy(
+            status = ScanSearchStatus.MATCHED,
+            candidateCaptureId = captureId,
+            matchedCaptureId = captureId,
+            matchConfidence = .9,
+            matchEvidence = legacyEvidence(),
+            dirty = true,
+        )
+        val refreshedProposal = decision.copy(
+            status = ScanSearchStatus.PROPOSED,
+            matchedCaptureId = "",
+            revision = 3,
+            dirty = false,
+        )
+        assertEquals(
+            listOf(normalizedScanSearchQueueItem(refreshedProposal)),
+            mergeScanSearchQueueStoreAfterStaleMutation(
+                ScanSearchQueueStore(listOf(decision)),
+                ownerId,
+                decision,
+                listOf(refreshedProposal),
+            )?.items,
+        )
     }
 
     @Test

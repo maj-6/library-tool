@@ -37,6 +37,15 @@ internal fun ScanSearchStatus.isLiveCloudQueueStatus(): Boolean =
         this == ScanSearchStatus.PROPOSED ||
         this == ScanSearchStatus.FAILED
 
+/** A server reservation that contains no evidence and is safe to CAS-cancel. */
+internal fun ScanSearchQueueItem.isBlankCloudReservation(): Boolean =
+    !processing && !dirty && errorMessage.isEmpty() && revision > 0L &&
+        scanCollectionId.isNotEmpty() &&
+        status in setOf(ScanSearchStatus.PENDING, ScanSearchStatus.FAILED) &&
+        ocrText.isEmpty() && visualSignature.isEmpty() &&
+        candidateCaptureId.isEmpty() && matchedCaptureId.isEmpty() &&
+        matchConfidence == null && matchEvidence.isEmpty()
+
 /**
  * A privacy-conscious search request. The temporary camera image is sent to
  * Mistral OCR 4.1 and deleted as before; only the bounded recognized text and
@@ -348,7 +357,7 @@ internal object ScanSearchQueue {
     }
 
     /** Remove only local OCR/staging failures; cloud-authored rows are retained. */
-    fun dismissLocalFailures(ctx: Context, sessionId: String): Int? = synchronized(lock) {
+    fun dismissLocalFailures(ctx: Context, sessionId: String): List<String>? = synchronized(lock) {
         val owner = currentScanSearchOwner(ctx) ?: return@synchronized null
         val session = sessionId.trim().lowercase()
         if (!SAFE_CAPTURE_SYNC_ID.matches(session)) return@synchronized null
@@ -357,12 +366,13 @@ internal object ScanSearchQueue {
         if (!store.valid) return@synchronized null
         val next = dismissLocalScanSearchFailures(store, owner, session)
             ?: return@synchronized null
-        val removed = store.items.size - next.items.size
-        if (removed == 0) return@synchronized 0
+        val retainedIds = next.items.mapTo(mutableSetOf(), ScanSearchQueueItem::id)
+        val removedIds = store.items.map(ScanSearchQueueItem::id).filterNot(retainedIds::contains)
+        if (removedIds.isEmpty()) return@synchronized emptyList()
         if (currentScanSearchOwner(ctx) != owner || !saveScanSearchQueueStore(target, next)) {
             return@synchronized null
         }
-        removed
+        removedIds
     }
 
     fun oldestDraftSession(ctx: Context): String? = read(ctx).items
@@ -455,6 +465,33 @@ internal object ScanSearchQueue {
         if (!store.valid) return@synchronized false
         val merged = mergeScanSearchQueueStore(store, owner, cloudItems)
             ?: return@synchronized false
+        if (currentScanSearchOwner(ctx) != owner || merged == store) true
+        else saveScanSearchQueueStore(target, merged)
+    }
+
+    /**
+     * Drop one exact stale outbox intent and merge the snapshot that proved it
+     * stale. This is atomic locally, so a dirty decision/failure cannot mask the
+     * authoritative row (or its authoritative absence).
+     */
+    fun mergeCloudAfterStaleMutation(
+        ctx: Context,
+        ownerId: String,
+        expected: ScanSearchQueueItem,
+        cloudItems: List<ScanSearchQueueItem>,
+    ): Boolean = synchronized(lock) {
+        val owner = ownerId.trim().lowercase()
+        if (!SAFE_CAPTURE_SYNC_ID.matches(owner)) return@synchronized false
+        if (currentScanSearchOwner(ctx) != owner) return@synchronized true
+        val target = file(ctx)
+        val store = readScanSearchQueueStore(target)
+        if (!store.valid) return@synchronized false
+        val merged = mergeScanSearchQueueStoreAfterStaleMutation(
+            store,
+            owner,
+            expected,
+            cloudItems,
+        ) ?: return@synchronized false
         if (currentScanSearchOwner(ctx) != owner || merged == store) true
         else saveScanSearchQueueStore(target, merged)
     }
@@ -589,9 +626,24 @@ internal fun acknowledgeScanSearchQueueStore(
     }
     if (index < 0 || store.items[index] != expected) return store
     if (cloud.errorMessage.isNotEmpty()) return null
-    val normalized = normalizedScanSearchQueueItem(cloud.copy(dirty = false)) ?: return null
+    val remote = normalizedScanSearchQueueItem(
+        cloud.copy(dirty = false, processing = false),
+    ) ?: return null
+    val normalized = if (expected.processing && remote.status == ScanSearchStatus.PENDING &&
+        remote.isBlankCloudReservation() &&
+        remote.id == expected.id && remote.ownerId == owner &&
+        remote.sessionId == expected.sessionId &&
+        remote.scanCollectionId == expected.scanCollectionId &&
+        remote.photoRole == expected.photoRole
+    ) {
+        normalizedScanSearchQueueItem(remote.copy(processing = true)) ?: return null
+    } else {
+        remote
+    }
     if (normalized.id != expected.id || normalized.ownerId != owner ||
         normalized.sessionId != expected.sessionId ||
+        normalized.scanCollectionId != expected.scanCollectionId ||
+        normalized.photoRole != expected.photoRole ||
         normalized.revision < expected.revision ||
         (!expected.processing && expected.status == ScanSearchStatus.PENDING &&
             (normalized.processing || normalized.ocrText != expected.ocrText ||
@@ -641,7 +693,7 @@ internal fun mergeScanSearchQueueStore(
     if (localItems.map(ScanSearchQueueItem::id).toSet().size != localItems.size) return null
     val normalizedCloud = cloudItems.map {
         if (it.errorMessage.isNotEmpty()) return null
-        normalizedScanSearchQueueItem(it.copy(dirty = false)) ?: return null
+        normalizedScanSearchQueueItem(it.copy(dirty = false, processing = false)) ?: return null
     }
     if (normalizedCloud.any { it.ownerId != owner } ||
         normalizedCloud.any { !it.status.isLiveCloudQueueStatus() } ||
@@ -661,6 +713,13 @@ internal fun mergeScanSearchQueueStore(
                 (left.processing || left.errorMessage.isNotEmpty()) -> left
             right == null && left?.dirty == false -> null
             right == null -> left
+            left?.processing == true && right.status == ScanSearchStatus.PENDING &&
+                right.revision >= left.revision &&
+                right.isBlankCloudReservation() &&
+                right.ownerId == left.ownerId && right.sessionId == left.sessionId &&
+                right.scanCollectionId == left.scanCollectionId &&
+                right.photoRole == left.photoRole ->
+                normalizedScanSearchQueueItem(right.copy(processing = true)) ?: return null
             left == null || right.revision >= left.revision -> right
             else -> left
         }
@@ -669,6 +728,30 @@ internal fun mergeScanSearchQueueStore(
         .sortedWith(compareBy(ScanSearchQueueItem::createdAt, ScanSearchQueueItem::id))
     if (merged.size > ScanSearchQueue.MAX_ITEMS) return null
     return ScanSearchQueueStore(merged)
+}
+
+/** Merge a pull only after proving that the exact local mutation became stale. */
+internal fun mergeScanSearchQueueStoreAfterStaleMutation(
+    store: ScanSearchQueueStore,
+    ownerId: String,
+    expected: ScanSearchQueueItem,
+    cloudItems: List<ScanSearchQueueItem>,
+): ScanSearchQueueStore? {
+    if (!store.valid) return null
+    val owner = ownerId.trim().lowercase()
+    if (!SAFE_CAPTURE_SYNC_ID.matches(owner) || expected.ownerId != owner ||
+        !expected.dirty || expected.status !in setOf(
+            ScanSearchStatus.FAILED,
+            ScanSearchStatus.MATCHED,
+            ScanSearchStatus.REJECTED,
+        )
+    ) return null
+    val index = store.items.indexOfFirst { it.id == expected.id && it.ownerId == owner }
+    if (index < 0 || store.items[index] != expected) return store
+    val withoutExpected = ScanSearchQueueStore(
+        store.items.toMutableList().apply { removeAt(index) },
+    )
+    return mergeScanSearchQueueStore(withoutExpected, owner, cloudItems)
 }
 
 internal fun scanSearchQueueStoreToJson(store: ScanSearchQueueStore): String {
@@ -905,6 +988,11 @@ internal fun normalizedScanSearchQueueItem(raw: ScanSearchQueueItem): ScanSearch
     val createdAt = raw.createdAt.trim()
     val updatedAt = raw.updatedAt.trim()
     val localFailure = raw.status == ScanSearchStatus.FAILED && error.isNotEmpty()
+    val blankCloudReservation = !raw.processing && !raw.dirty && error.isEmpty() &&
+        raw.revision > 0L && collection.isNotEmpty() &&
+        raw.status in setOf(ScanSearchStatus.PENDING, ScanSearchStatus.FAILED) &&
+        ocr.isEmpty() && visual.isEmpty() && candidate.isEmpty() && matched.isEmpty() &&
+        raw.matchConfidence == null && evidence.isEmpty()
     val statusShapeValid = when {
         raw.processing ->
             raw.status == ScanSearchStatus.PENDING && error.isEmpty() &&
@@ -936,7 +1024,8 @@ internal fun normalizedScanSearchQueueItem(raw: ScanSearchQueueItem): ScanSearch
         !SAFE_CAPTURE_SYNC_ID.matches(session) ||
         (collection.isNotEmpty() && !SAFE_CAPTURE_SYNC_ID.matches(collection)) ||
         (collection.isEmpty() && raw.status != ScanSearchStatus.PENDING && !localFailure) ||
-        (!raw.processing && !localFailure && raw.status != ScanSearchStatus.FAILED &&
+        (!raw.processing && !localFailure && !blankCloudReservation &&
+            raw.status != ScanSearchStatus.FAILED &&
             ocr.isBlank() &&
             (raw.photoRole != ScanSearchPhotoRole.COVER || visual.isEmpty())) ||
         ocr.length > ScanSearchQueue.MAX_OCR_CHARS ||

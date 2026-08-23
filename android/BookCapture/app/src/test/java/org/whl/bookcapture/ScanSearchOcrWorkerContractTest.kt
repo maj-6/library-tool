@@ -31,6 +31,7 @@ class ScanSearchOcrWorkerContractTest {
         assertTrue(worker.contains("ScanSearchQueue.failProcessing("))
         assertTrue(worker.contains("ScanSearchQueueSyncWorker.enqueue(ctx)"))
         assertTrue(worker.contains("fun resumePending(ctx: Context)"))
+        assertTrue(worker.contains("filter(ScanSearchQueueItem::processing)"))
         assertTrue(worker.contains("fun abandonOwner(ctx: Context, ownerId: String)"))
         assertTrue(worker.contains("ScanSearchQueue.failProcessingForWorker("))
         assertTrue(worker.contains("scan_queue_notification_key_missing"))
@@ -68,6 +69,13 @@ class ScanSearchOcrWorkerContractTest {
         assertTrue(syncWorker.contains(
             "notificationItemIds.forEach { ScanSearchNotifications.clearSyncFailure(ctx, it) }",
         ))
+        assertTrue(syncWorker.contains("client.fail(expected.id, expected.revision)"))
+        assertTrue(syncWorker.contains("client.fail(remote.id, remote.revision)"))
+        assertTrue(syncWorker.contains("ScanSearchQueue.mergeCloudAfterStaleMutation("))
+
+        val home = source("HomeActivity")
+        assertTrue(home.contains("ScanSearchNotifications.clearFailure(this@HomeActivity, it)"))
+        assertTrue(notifications.contains("cancel(scanSearchNotificationId(id))"))
     }
 
     private fun source(name: String): String =

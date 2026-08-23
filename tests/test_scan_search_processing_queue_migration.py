@@ -30,13 +30,13 @@ def _acl(signature: str) -> None:
     assert f"grant execute on function {signature} to authenticated;" in FLAT
 
 
-def test_processing_queue_migration_is_latest_and_reuses_the_existing_table():
+def test_processing_queue_migration_precedes_cas_hardening_and_reuses_existing_table():
     assert FLAT.endswith(
         "insert into schema_migrations (id) values "
         "('032_scan_search_processing_queue') on conflict do nothing;"
     )
     assert cloud_setup.migration_files()[-1].name == (
-        "032_scan_search_processing_queue.sql"
+        "033_scan_search_queue_cas_hardening.sql"
     )
     assert cloud_setup.expected_schema(SQL) == {}
     assert "create table" not in FLAT

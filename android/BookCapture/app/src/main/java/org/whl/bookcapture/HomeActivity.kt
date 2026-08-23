@@ -903,22 +903,24 @@ class HomeActivity : AppCompatActivity() {
 
     private fun dismissScanQueueFailures(sessionId: String) {
         lifecycleScope.launch {
-            val removed = withContext(Dispatchers.IO) {
-                ScanSearchQueue.dismissLocalFailures(this@HomeActivity, sessionId)
+            val removedIds = withContext(Dispatchers.IO) {
+                ScanSearchQueue.dismissLocalFailures(this@HomeActivity, sessionId)?.also { ids ->
+                    ids.forEach { ScanSearchNotifications.clearFailure(this@HomeActivity, it) }
+                }
             }
-            if (removed == null) {
+            if (removedIds == null) {
                 Toast.makeText(
                     this@HomeActivity,
                     R.string.scan_queue_failure_dismiss_failed,
                     Toast.LENGTH_LONG,
                 ).show()
-            } else if (removed > 0) {
+            } else if (removedIds.isNotEmpty()) {
                 Toast.makeText(
                     this@HomeActivity,
                     resources.getQuantityString(
                         R.plurals.scan_queue_failure_dismissed,
-                        removed,
-                        removed,
+                        removedIds.size,
+                        removedIds.size,
                     ),
                     Toast.LENGTH_SHORT,
                 ).show()

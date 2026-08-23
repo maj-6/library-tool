@@ -48,6 +48,12 @@ internal object ScanSearchNotifications {
         NotificationManagerCompat.from(ctx).cancel(scanSearchSyncNotificationId(id))
     }
 
+    fun clearFailure(ctx: Context, itemId: String) {
+        val id = itemId.trim().lowercase()
+        if (!SAFE_CAPTURE_SYNC_ID.matches(id)) return
+        NotificationManagerCompat.from(ctx).cancel(scanSearchNotificationId(id))
+    }
+
     @SuppressLint("MissingPermission")
     private fun show(
         ctx: Context,

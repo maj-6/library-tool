@@ -34,7 +34,7 @@ def test_scan_workflow_migration_records_itself_and_discovers_latest():
         "('029_scan_collection_workflow') on conflict do nothing;"
     )
     assert cloud_setup.migration_files()[-1].stem == (
-        "032_scan_search_processing_queue"
+        "033_scan_search_queue_cas_hardening"
     )
     schema = cloud_setup.expected_schema(SQL)
     assert schema["collections"] == {"collection_type"}
