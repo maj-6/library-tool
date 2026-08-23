@@ -3,6 +3,28 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.18 — 2026-08-22
+
+Android version code: `49`.
+
+### Additions
+
+- Physical-scan capture now queues consecutive cover and title-page observations
+  without confirmation dialogs. Say **cover** or **title** for each photo, then
+  say **A**, **B**, or **C** to finish and route the session.
+- Up to three scan collections can be active independently of the capture
+  collection. Deferred match proposals include confidence and supporting
+  evidence for later approval or rejection on Android or desktop.
+
+### Other Changes
+
+- Every temporary identifying photo is read by hosted Mistral OCR 4.1 and then
+  deleted. Covers add a non-reversible color and structure descriptor that
+  tolerates exposure differences; queue records never contain the photo.
+- Match review protects the exact captured session and proposed book from
+  concurrent changes, and stale decisions refresh from the synchronized queue
+  instead of applying an outdated move.
+
 ## 0.5.2-alpha.17 — 2026-08-21
 
 Android version code: `48`.
