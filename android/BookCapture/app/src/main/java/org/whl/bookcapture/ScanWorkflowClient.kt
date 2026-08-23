@@ -52,6 +52,16 @@ internal fun scanSearchProposalDecisionBody(
     return JSONObject().put("p_id", queue).put("p_capture_id", capture)
 }
 
+internal fun isStaleScanProposalError(error: SupabaseClient.HttpException): Boolean {
+    if (error.code == HttpURLConnection.HTTP_CONFLICT) return true
+    val postgrestCode = try {
+        JSONObject(error.responseBody).optString("code")
+    } catch (_: Exception) {
+        ""
+    }
+    return postgrestCode == "40001"
+}
+
 internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueItem? {
     val revision = when (val raw = row.opt("revision")) {
         is Byte -> raw.toLong()

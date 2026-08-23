@@ -2661,7 +2661,7 @@ class HomeActivity : AppCompatActivity() {
                         val accepted = try {
                             client.approve(queue.id, captureId)
                         } catch (error: SupabaseClient.HttpException) {
-                            if (error.code == 409) {
+                            if (isStaleScanProposalError(error)) {
                                 refreshLiveScanSearchQueue(client, owner)
                                 return@withLock ScanProposalDecisionOutcome.STALE
                             }
@@ -2752,7 +2752,7 @@ class HomeActivity : AppCompatActivity() {
                         val accepted = try {
                             client.reject(queue.id, captureId)
                         } catch (error: SupabaseClient.HttpException) {
-                            if (error.code == 409) {
+                            if (isStaleScanProposalError(error)) {
                                 refreshLiveScanSearchQueue(client, owner)
                                 return@withLock ScanProposalDecisionOutcome.STALE
                             }

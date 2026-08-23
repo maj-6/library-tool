@@ -90,6 +90,32 @@ class ScanWorkflowClientTest {
     }
 
     @Test
+    fun staleProposalRecognizesPostgrestSqlStateAndExplicitConflict() {
+        assertTrue(isStaleScanProposalError(SupabaseClient.HttpException(
+            500,
+            "transaction conflict",
+            JSONObject()
+                .put("code", "40001")
+                .put("message", "scan proposal changed")
+                .toString(),
+        )))
+        assertTrue(isStaleScanProposalError(SupabaseClient.HttpException(
+            409,
+            "conflict",
+        )))
+        assertFalse(isStaleScanProposalError(SupabaseClient.HttpException(
+            500,
+            "server error",
+            JSONObject().put("code", "PGRST000").toString(),
+        )))
+        assertFalse(isStaleScanProposalError(SupabaseClient.HttpException(
+            500,
+            "server error",
+            "not json",
+        )))
+    }
+
+    @Test
     fun cloudProposalAndMatchedRowsFailClosedWhenProposalEvidenceIsMissing() {
         fun base(status: String) = JSONObject().apply {
             put("id", queueId)
