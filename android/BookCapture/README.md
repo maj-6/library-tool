@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.18` (version code 49) is the Android
+Library Tool Capture `0.5.2-alpha.19` (version code 50) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -11,8 +11,9 @@ APK.
 
 ## Home and book details
 
-The app opens on **Home**, which has **Scans**, **Collections**, and **Inspect**
-tabs.
+The app opens on **Home**, whose icon-only navigation provides **Scans**,
+**Physical Scan Queue**, **Collections**, and **Inspect**. Every icon has an
+accessible label even though the visible tab text is omitted.
 
 The Scans tab groups books into collapsible collection sections. The current
 collection is listed first and expanded initially. Waiting work uses an
@@ -125,21 +126,28 @@ bibliographic summary when old delivered scan media is cleared, so the list
 remains useful without defeating the app's storage limit; cleared photos and
 their local detail view are not retained.
 
-The camera action beside Inspect opens a role-neutral physical-scan capture
-flow. There is no visual cover/title chooser and no confirmation between
-shots: say **cover** or **title** to capture that evidence, then continue taking
-either kind of shot. Each temporary image is read through the hosted Mistral
-OCR 4.1 service, never an on-device OCR engine. A cover also produces a small,
-non-reversible color/feature descriptor; the matcher normalizes tone and uses
-both chromatic and structural evidence so exposure differences do not create
-easy false negatives. The image itself is deleted immediately and is never
-stored in the local or cloud queue.
+The **Physical Scan Queue** tab opens a role-neutral capture flow and groups
+queued sessions by status, destination, match confidence, and corroborating
+evidence. There is no visual cover/title chooser and no confirmation between
+shots: say **cover** or **title** to capture that evidence. The capture view
+stays open for the next shot. When exactly one scan collection is active, each
+shot is routed and submitted automatically; with two or three active scan
+collections, continue taking evidence and say **A**, **B**, or **C** to route
+the session.
 
-Say **A**, **B**, or **C** to finish the evidence session and route it to that
-active scan collection. The observations are synchronized as one session and
-matched later against existing book records. Candidate, confidence, text,
-color/feature corroboration, and ambiguity evidence are shown in the review
-queue; approval or rejection happens there rather than between camera shots.
+The routed queue record appears immediately, before analysis completes. Its
+temporary image remains only in app-private staging while the hosted Mistral
+OCR 4.1 service reads it; no on-device OCR engine is used and no raw image is
+uploaded with the queue record. A cover also produces a small, non-reversible
+color/feature descriptor; the matcher normalizes tone and uses both chromatic
+and structural evidence so exposure differences do not create easy false
+negatives. The temporary image is deleted after processing. Failures remain
+visible in the queue and raise a notification that opens the queue inspector.
+
+The observations are matched later against existing book records. Candidate,
+confidence, text, color/feature corroboration, and ambiguity evidence are shown
+in the review queue; approval or rejection happens there rather than between
+camera shots.
 Approval atomically moves the exact proposed book to the selected scan
 collection while retaining its original capture collection as provenance.
 

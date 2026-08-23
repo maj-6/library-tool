@@ -378,6 +378,17 @@ test("scan review groups a capture session and blocks conflicting proposals", ()
   ]))[0];
   assert.equal(conflict.status, "failed");
   assert.equal(conflict._proposal_conflict, true);
+
+  const failed = plain(context.group([
+    { id: "waiting", session_id: "session-3", status: "pending", ocr_text: "" },
+    { id: "candidate", session_id: "session-3", status: "proposed",
+      candidate_capture_id: "capture-c" },
+    { id: "error", session_id: "session-3", status: "failed" },
+  ]))[0];
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.candidate_capture_id || "", "");
+  assert.equal(failed._stale_proposal, false);
+  assert.match(source, /Waiting for capture analysis\./);
 });
 
 test("scan review presents bounded escaped confidence and visual evidence", () => {

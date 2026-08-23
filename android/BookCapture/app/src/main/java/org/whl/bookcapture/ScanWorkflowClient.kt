@@ -24,7 +24,8 @@ internal fun scanSearchEnqueueBody(item: ScanSearchQueueItem): JSONObject {
     require(normalized.status != ScanSearchStatus.FAILED) {
         "failed scan searches are server-authored"
     }
-    require(normalized.status == ScanSearchStatus.PENDING &&
+    require(normalized.errorMessage.isEmpty() &&
+        normalized.status == ScanSearchStatus.PENDING &&
         normalized.scanCollectionId.isNotEmpty()) {
         "only routed pending scan searches may be enqueued"
     }
@@ -39,6 +40,15 @@ internal fun scanSearchEnqueueBody(item: ScanSearchQueueItem): JSONObject {
             normalized.visualSignature.takeIf(String::isNotEmpty)
                 ?.let(::JSONObject) ?: JSONObject.NULL,
         )
+}
+
+internal fun scanSearchFailureBody(queueId: String, expectedRevision: Long): JSONObject {
+    val queue = queueId.trim().lowercase()
+    require(SAFE_CAPTURE_SYNC_ID.matches(queue)) { "invalid scan search id" }
+    require(expectedRevision >= 0L) { "invalid scan search revision" }
+    return JSONObject()
+        .put("p_id", queue)
+        .put("p_expected_revision", expectedRevision)
 }
 
 internal fun scanSearchProposalDecisionBody(
@@ -59,7 +69,7 @@ internal fun isStaleScanProposalError(error: SupabaseClient.HttpException): Bool
     } catch (_: Exception) {
         ""
     }
-    return postgrestCode == "40001"
+    return postgrestCode == "40001" || postgrestCode == "55000"
 }
 
 internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueItem? {
@@ -94,6 +104,10 @@ internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueI
         is Number -> raw.toDouble()
         else -> return null
     }
+    val status = ScanSearchStatus.fromWire(
+        row.opt("status") as? String ?: return null,
+    ) ?: return null
+    val ocrText = row.opt("ocr_text") as? String ?: return null
     val normalized = normalizedScanSearchQueueItem(
         ScanSearchQueueItem(
             id = row.opt("id") as? String ?: return null,
@@ -103,11 +117,9 @@ internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueI
             photoRole = ScanSearchPhotoRole.fromWire(
                 row.opt("photo_role") as? String ?: return null,
             ) ?: return null,
-            ocrText = row.opt("ocr_text") as? String ?: return null,
+            ocrText = ocrText,
             visualSignature = visualSignature,
-            status = ScanSearchStatus.fromWire(
-                row.opt("status") as? String ?: return null,
-            ) ?: return null,
+            status = status,
             candidateCaptureId = candidate,
             matchConfidence = confidence,
             matchEvidence = matchEvidence,
@@ -116,6 +128,10 @@ internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueI
             createdAt = row.opt("created_at") as? String ?: return null,
             updatedAt = row.opt("updated_at") as? String ?: return null,
             dirty = false,
+            // Processing ownership is device-local and is never inferred from
+            // a remote blank placeholder. The originating device preserves its
+            // bit when this row acknowledges/merges with local state.
+            processing = false,
         ),
     ) ?: return null
     return normalized.takeIf {
@@ -126,8 +142,9 @@ internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueI
 
 /**
  * Narrow, user-JWT client for the scan-search workflow. No service key and no
- * camera image reaches this API: only bounded Mistral OCR text and the
- * non-reversible whl-cover-v1 descriptor are persisted remotely.
+ * camera image reaches this API: routing metadata is reserved immediately,
+ * then bounded Mistral OCR text and the non-reversible whl-cover-v1 descriptor
+ * fill that same row when analysis finishes.
  */
 internal class ScanWorkflowClient(
     private val ctx: Context,
@@ -161,6 +178,32 @@ internal class ScanWorkflowClient(
         scanSearchProposalDecisionBody(queueId, captureId),
         queueId,
     )
+
+    /** Idempotently remove a cloud placeholder after terminal local OCR failure. */
+    fun fail(queueId: String, expectedRevision: Long): Boolean {
+        requireCurrentOwner()
+        val normalizedId = queueId.trim().lowercase()
+        require(SAFE_CAPTURE_SYNC_ID.matches(normalizedId)) { "invalid scan search id" }
+        require(expectedRevision >= 0L) { "invalid scan search revision" }
+        val conn = open(
+            "POST",
+            "$baseUrl/rest/v1/rpc/fail_scan_search",
+            "application/json",
+        )
+        conn.doOutput = true
+        conn.outputStream.use {
+            it.write(
+                scanSearchFailureBody(normalizedId, expectedRevision).toString().toByteArray(),
+            )
+        }
+        return when (finish(conn).trim()) {
+            "true" -> true
+            "false" -> false
+            else -> throw SupabaseClient.InvalidResponse(
+                "invalid scan search failure response",
+            )
+        }
+    }
 
     fun queue(): List<ScanSearchQueueItem> {
         requireCurrentOwner()

@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
@@ -31,10 +32,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Mistral cover/title-page reader for Inspect and physical-scan search.
  *
  * It owns no CaptureSession and never creates a book or page. CameraX writes a
- * temporary JPEG, the existing authenticated Mistral pipeline reads it with OCR
- * 4.1, and only bounded text plus a non-reversible cover signature survives.
- * Physical-scan mode is hands-free: cover/title take successive shots and
- * A/B/C routes the whole session without a per-shot dialog or confirmation.
+ * temporary JPEG. Inspect reads it immediately with authenticated Mistral OCR
+ * 4.1; physical-scan mode first persists a queue placeholder and hands the JPEG
+ * to durable background OCR. Only bounded text plus a non-reversible cover
+ * signature survives. Cover/title take successive shots and A/B/C routes the
+ * whole session without a per-shot dialog or confirmation.
  */
 class CoverScannerActivity : AppCompatActivity() {
     private lateinit var binding: ActivityCoverScannerBinding
@@ -45,18 +47,14 @@ class CoverScannerActivity : AppCompatActivity() {
     private var voice: VoiceController? = null
     private lateinit var cues: AudioCues
     private var queuedCount = 0
+    private var submittedCaptureCount = 0
     private var pendingRouteSlot: ScanCollectionSlot? = null
     private var microphonePermissionRequested = false
+    private var notificationPermissionRequested = false
     private val queueMode: Boolean by lazy {
         intent.getBooleanExtra(EXTRA_QUEUE_SESSION, false)
     }
-    private val queueSessionId: String by lazy {
-        intent.getStringExtra(EXTRA_SESSION_ID)
-            ?.trim()
-            ?.lowercase()
-            ?.takeIf(SAFE_CAPTURE_SYNC_ID::matches)
-            ?: UUID.randomUUID().toString()
-    }
+    private var queueSessionId = ""
     private val photoRole: ScanSearchPhotoRole by lazy {
         ScanSearchPhotoRole.fromWire(intent.getStringExtra(EXTRA_PHOTO_ROLE).orEmpty())
             ?: ScanSearchPhotoRole.COVER
@@ -73,6 +71,7 @@ class CoverScannerActivity : AppCompatActivity() {
     ) { granted ->
         if (granted) {
             bindCamera()
+            requestQueueNotificationPermission()
         } else {
             Toast.makeText(
                 this,
@@ -88,12 +87,21 @@ class CoverScannerActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         microphonePermissionRequested = false
-        if (granted) startQueueVoice()
-        else {
+        if (granted) {
+            startQueueVoice()
+            requestQueueNotificationPermission()
+        } else {
             Toast.makeText(this, R.string.scan_queue_voice_permission_denied, Toast.LENGTH_LONG)
                 .show()
             finishCancelled()
         }
+    }
+
+    /** Queue completion/failure alerts are useful but never a capture gate. */
+    private val notificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        // Denial deliberately has no side effect; in-app status remains available.
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -108,9 +116,18 @@ class CoverScannerActivity : AppCompatActivity() {
             binding.captureCover.visibility = View.GONE
             binding.closeCoverScanner.contentDescription =
                 getString(R.string.scan_queue_close)
-            queuedCount = ScanSearchQueue.read(this).items.count {
-                it.sessionId == queueSessionId && it.scanCollectionId.isEmpty()
+            val requestedSession = intent.getStringExtra(EXTRA_SESSION_ID)
+                ?.trim()
+                ?.lowercase()
+                ?.takeIf(SAFE_CAPTURE_SYNC_ID::matches)
+                ?: UUID.randomUUID().toString()
+            val drafts = ScanSearchQueue.read(this).items.filter {
+                it.sessionId == requestedSession && it.scanCollectionId.isEmpty()
             }
+            queuedCount = drafts.size
+            queueSessionId = if (drafts.isEmpty()) UUID.randomUUID().toString()
+            else requestedSession
+            intent.putExtra(EXTRA_SESSION_ID, queueSessionId)
         } else if (photoRole == ScanSearchPhotoRole.TITLE_PAGE) {
             binding.coverScannerTitle.setText(R.string.title_page_scanner_title)
             binding.coverScannerHelp.setText(R.string.title_page_scanner_help)
@@ -180,6 +197,7 @@ class CoverScannerActivity : AppCompatActivity() {
             },
         )
         voice = controller
+        requestQueueNotificationPermission()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 if (!controller.modelReady) {
@@ -200,6 +218,20 @@ class CoverScannerActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun requestQueueNotificationPermission() {
+        if (!queueMode || terminal.get() || notificationPermissionRequested ||
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return
+        notificationPermissionRequested = true
+        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
     private fun handleQueueVoiceCommand(command: String) {
@@ -253,12 +285,11 @@ class CoverScannerActivity : AppCompatActivity() {
     private fun captureCover(role: ScanSearchPhotoRole) {
         if (terminal.get()) return
         val capture = imageCapture ?: return
-        val mistralKey = Prefs.mistralKey(this).trim()
-        if (mistralKey.isEmpty()) {
+        val mistralKey = if (queueMode) "" else Prefs.mistralKey(this).trim()
+        if (!queueMode && mistralKey.isEmpty()) {
             Toast.makeText(
                 this,
-                if (queueMode) R.string.scan_queue_requires_mistral_key
-                else R.string.cover_scanner_requires_mistral_key,
+                R.string.cover_scanner_requires_mistral_key,
                 Toast.LENGTH_LONG,
             ).show()
             return
@@ -297,7 +328,8 @@ class CoverScannerActivity : AppCompatActivity() {
                             return
                         }
                         cues.photoStarted()
-                        recognizeCover(target, mistralKey, role)
+                        if (queueMode) queueCapturedPhoto(target, role)
+                        else recognizeCover(target, mistralKey, role)
                     }
 
                     override fun onError(exception: ImageCaptureException) {
@@ -321,9 +353,7 @@ class CoverScannerActivity : AppCompatActivity() {
             return
         }
         renderStatus(
-            if (queueMode) {
-                R.string.scan_queue_reading
-            } else if (role == ScanSearchPhotoRole.TITLE_PAGE) {
+            if (role == ScanSearchPhotoRole.TITLE_PAGE) {
                 R.string.title_page_scanner_reading
             } else {
                 R.string.cover_scanner_reading
@@ -336,17 +366,7 @@ class CoverScannerActivity : AppCompatActivity() {
                     // This is a disposable cache image. Bound its upload size
                     // without touching any capture/session data.
                     Pipeline.standardizeInPlace(target)
-                    val signature = if (role == ScanSearchPhotoRole.COVER) {
-                        extractCoverVisualSignature(target).orEmpty()
-                    } else {
-                        ""
-                    }
-                    val recognized = try {
-                        boundedCoverText(Pipeline.coverOcr(target, mistralKey))
-                    } catch (error: Exception) {
-                        if (signature.isEmpty()) throw error else ""
-                    }
-                    recognized to signature
+                    boundedCoverText(Pipeline.coverOcr(target, mistralKey))
                 }
             } catch (cancelled: CancellationException) {
                 discardTemp(target)
@@ -366,64 +386,111 @@ class CoverScannerActivity : AppCompatActivity() {
                 captureInFlight.compareAndSet(true, false)
                 return@launch
             }
-            val (recognized, signature) = result
-            if (!hasReadableCoverText(recognized) && signature.isEmpty()) {
+            val recognized = result
+            if (!hasReadableCoverText(recognized)) {
                 recoverAttempt(
                     target,
-                    if (queueMode) R.string.scan_queue_no_evidence
-                    else R.string.cover_scanner_no_text,
+                    R.string.cover_scanner_no_text,
                 )
-            } else if (queueMode) {
-                queueResult(target, role, recognized, signature)
             } else {
                 deliverResult(target, recognized)
             }
         }
     }
 
-    private fun queueResult(
+    /**
+     * The durable placeholder is the shutter acknowledgement for physical-scan
+     * mode. OCR owns the temporary image only after that write succeeds, so the
+     * operator can move straight on while Mistral runs in background work.
+     */
+    private fun queueCapturedPhoto(
         target: File,
         role: ScanSearchPhotoRole,
-        recognized: String,
-        signature: String,
     ) {
-        if (!captureInFlight.compareAndSet(true, false)) {
-            discardTemp(target)
-            return
-        }
-        discardTemp(target)
-        val queued = ScanSearchQueue.enqueueDraft(
-            this,
-            sessionId = queueSessionId,
-            photoRole = role,
-            ocrText = recognized,
-            visualSignature = signature,
-        )
-        if (queued == null) {
-            recoverQueuedSaveFailure()
-            return
-        }
-        queuedCount += 1
-        cues.saved(queuedCount)
-        val route = pendingRouteSlot
-        pendingRouteSlot = null
-        if (route != null) {
-            routeQueueSession(route)
-        } else {
-            binding.captureCover.isEnabled = imageCapture != null
-            binding.coverScannerStatus.text = getString(
-                R.string.scan_queue_capture_saved,
-                queuedCount,
-            )
-            binding.coverScannerProgress.visibility = View.GONE
+        val handedToWorker = AtomicBoolean(false)
+        lifecycleScope.launch {
+            val queued = try {
+                withContext(Dispatchers.IO) {
+                    val owner = Prefs.userId(this@CoverScannerActivity).trim().lowercase()
+                    require(SAFE_CAPTURE_SYNC_ID.matches(owner))
+                    val automatic = Collections.currentScans(this@CoverScannerActivity)
+                        .entries
+                        .singleOrNull()
+                    val item = ScanSearchQueue.enqueueProcessing(
+                        this@CoverScannerActivity,
+                        ownerId = owner,
+                        sessionId = queueSessionId,
+                        scanCollectionId = automatic?.value?.id.orEmpty(),
+                        photoRole = role,
+                    ) ?: error("scan queue placeholder could not be saved")
+                    check(ScanSearchOcrWorker.enqueue(
+                        this@CoverScannerActivity,
+                        item.id,
+                        target.absolutePath,
+                    )) { "scan queue OCR work could not be staged" }
+                    handedToWorker.set(true)
+                    // enqueue() has atomically moved the image into durable
+                    // worker-owned storage; Activity teardown must not own it.
+                    if (activeTempFile?.absolutePath == target.absolutePath) {
+                        activeTempFile = null
+                    }
+                    val routedCount = automatic?.let { destination ->
+                        ScanSearchQueue.routeSession(
+                            this@CoverScannerActivity,
+                            item.sessionId,
+                            destination.value.id,
+                        )?.takeIf { it.isNotEmpty() }?.size
+                            ?: error("automatic scan queue routing could not be saved")
+                    }
+                    QueuedPhoto(item, automatic?.key, automatic?.value, routedCount)
+                }
+            } catch (cancelled: CancellationException) {
+                if (!handedToWorker.get()) discardTemp(target)
+                captureInFlight.compareAndSet(true, false)
+                throw cancelled
+            } catch (_: Exception) {
+                recoverAttempt(
+                    target.takeUnless { handedToWorker.get() },
+                    R.string.scan_queue_save_failed,
+                )
+                return@launch
+            }
+
+            if (!captureInFlight.compareAndSet(true, false) || terminal.get() ||
+                isFinishing || isDestroyed
+            ) return@launch
+            queuedCount += 1
+            cues.saved(queuedCount)
+            val automaticSlot = queued.automaticSlot
+            if (automaticSlot != null && queued.automaticCollection != null) {
+                pendingRouteSlot = null
+                ScanSearchQueueSyncWorker.enqueue(this@CoverScannerActivity)
+                completeQueueSession(
+                    sessionId = queued.item.sessionId,
+                    slot = automaticSlot,
+                    destination = queued.automaticCollection,
+                    captureCount = checkNotNull(queued.routedCaptureCount),
+                )
+                return@launch
+            }
+            val route = pendingRouteSlot
+            pendingRouteSlot = null
+            if (route != null) {
+                routeQueueSession(route)
+            } else {
+                renderQueueReady(R.string.scan_queue_capture_saved, queuedCount)
+            }
         }
     }
 
-    private fun recoverQueuedSaveFailure() {
-        pendingRouteSlot = null
-        Toast.makeText(this, R.string.scan_queue_save_failed, Toast.LENGTH_LONG).show()
+    private fun renderQueueReady(message: Int, count: Int, slot: ScanCollectionSlot? = null) {
         binding.captureCover.isEnabled = imageCapture != null
-        renderStatus(readyStatus(), busy = false)
+        binding.coverScannerStatus.text = if (slot == null) {
+            getString(message, count)
+        } else {
+            getString(message, count, slot.name)
+        }
+        binding.coverScannerProgress.visibility = View.GONE
     }
 
     private fun captureFailureMessage(): Int = if (queueMode) {
@@ -467,16 +534,34 @@ class CoverScannerActivity : AppCompatActivity() {
         }
         ScanSearchQueueSyncWorker.enqueue(this)
         cues.saved(routed.size)
-        if (!terminal.compareAndSet(false, true)) return
+        completeQueueSession(
+            sessionId = queueSessionId,
+            slot = slot,
+            destination = destination,
+            captureCount = routed.size,
+        )
+    }
+
+    private fun completeQueueSession(
+        sessionId: String,
+        slot: ScanCollectionSlot,
+        destination: BookCollection,
+        captureCount: Int,
+    ) {
+        submittedCaptureCount += captureCount
         setResult(
             Activity.RESULT_OK,
             Intent()
-                .putExtra(EXTRA_SESSION_ID, queueSessionId)
-                .putExtra(EXTRA_CAPTURE_COUNT, routed.size)
+                .putExtra(EXTRA_SESSION_ID, sessionId)
+                .putExtra(EXTRA_CAPTURE_COUNT, captureCount)
                 .putExtra(EXTRA_SCAN_SLOT, slot.wireValue)
                 .putExtra(EXTRA_SCAN_COLLECTION_ID, destination.id),
         )
-        finish()
+        queueSessionId = UUID.randomUUID().toString()
+        intent.putExtra(EXTRA_SESSION_ID, queueSessionId)
+        queuedCount = 0
+        pendingRouteSlot = null
+        renderQueueReady(R.string.scan_queue_session_saved, captureCount, slot)
     }
 
     private fun deliverResult(target: File, recognized: String) {
@@ -521,7 +606,7 @@ class CoverScannerActivity : AppCompatActivity() {
 
     private fun finishCancelled() {
         if (!terminal.compareAndSet(false, true)) return
-        setResult(Activity.RESULT_CANCELED)
+        if (!queueMode || submittedCaptureCount <= 0) setResult(Activity.RESULT_CANCELED)
         finish()
     }
 
@@ -569,4 +654,11 @@ class CoverScannerActivity : AppCompatActivity() {
         internal fun hasReadableCoverText(value: String): Boolean =
             Pipeline.readableOcrChars(value) >= MIN_COVER_READABLE_CHARS
     }
+
+    private data class QueuedPhoto(
+        val item: ScanSearchQueueItem,
+        val automaticSlot: ScanCollectionSlot?,
+        val automaticCollection: BookCollection?,
+        val routedCaptureCount: Int?,
+    )
 }

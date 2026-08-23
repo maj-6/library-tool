@@ -103,6 +103,14 @@ class ScanWorkflowClientTest {
             409,
             "conflict",
         )))
+        assertTrue(isStaleScanProposalError(SupabaseClient.HttpException(
+            500,
+            "object is no longer reviewable",
+            JSONObject()
+                .put("code", "55000")
+                .put("message", "scan search is already complete")
+                .toString(),
+        )))
         assertFalse(isStaleScanProposalError(SupabaseClient.HttpException(
             500,
             "server error",
@@ -193,6 +201,71 @@ class ScanWorkflowClientTest {
         )
         assertThrows(IllegalArgumentException::class.java) {
             scanSearchEnqueueBody(failed)
+        }
+    }
+
+    @Test
+    fun routedProcessingPlaceholderCrossesTheWireWithoutPixelsOrEvidence() {
+        val processing = ScanSearchQueueItem(
+            id = queueId,
+            ownerId = ownerId,
+            scanCollectionId = collectionId,
+            photoRole = ScanSearchPhotoRole.COVER,
+            ocrText = "",
+            createdAt = "2026-08-21T12:00:00Z",
+            dirty = false,
+            processing = true,
+        )
+        val body = scanSearchEnqueueBody(processing)
+        assertEquals(queueId, body.getString("p_id"))
+        assertEquals("", body.getString("p_ocr_text"))
+        assertTrue(body.isNull("p_visual_signature"))
+    }
+
+    @Test
+    fun cloudBlankPendingNeverClaimsLocalProcessingButBlankProposalFailsClosed() {
+        fun blank(status: String) = JSONObject().apply {
+            put("id", queueId)
+            put("owner_id", ownerId)
+            put("session_id", queueId)
+            put("scan_collection_id", collectionId)
+            put("photo_role", "cover")
+            put("ocr_text", "")
+            put("visual_signature", JSONObject.NULL)
+            put("status", status)
+            put("candidate_capture_id", JSONObject.NULL)
+            put("match_confidence", JSONObject.NULL)
+            put("match_evidence", JSONObject.NULL)
+            put("matched_capture_id", JSONObject.NULL)
+            put("revision", 1)
+            put("created_at", "2026-08-21T12:00:00Z")
+            put("updated_at", "2026-08-21T12:00:00Z")
+        }
+
+        val pending = checkNotNull(scanSearchQueueItemFromCloudJson(blank("pending")))
+        assertFalse(pending.processing)
+        assertFalse(pending.dirty)
+        assertTrue(pending.isBlankCloudReservation())
+        val failed = checkNotNull(scanSearchQueueItemFromCloudJson(blank("failed")))
+        assertFalse(failed.processing)
+        assertEquals(ScanSearchStatus.FAILED, failed.status)
+        assertNull(scanSearchQueueItemFromCloudJson(blank("proposed")))
+    }
+
+    @Test
+    fun terminalFailureBodyCarriesTheExactExpectedRevision() {
+        val body = scanSearchFailureBody(queueId, 7)
+        assertEquals(
+            setOf("p_id", "p_expected_revision"),
+            body.keys().asSequence().toSet(),
+        )
+        assertEquals(queueId, body.getString("p_id"))
+        assertEquals(7L, body.getLong("p_expected_revision"))
+        assertThrows(IllegalArgumentException::class.java) {
+            scanSearchFailureBody("not-a-uuid", 7)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            scanSearchFailureBody(queueId, -1)
         }
     }
 }

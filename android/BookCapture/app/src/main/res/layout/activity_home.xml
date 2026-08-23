@@ -30,9 +30,9 @@
             android:scaleType="fitCenter"
             android:src="@drawable/ic_app_mark" />
 
-        <!-- The mark is a separate menu plate, not a third tab. This quiet
-             rule keeps it visually distinct without putting a border around
-             the botanical-green square. -->
+        <!-- The mark is a separate menu plate, not a navigation tab. This
+             quiet rule keeps it visually distinct without putting a second
+             border around its neutral icon background. -->
         <View
             android:layout_width="1dp"
             android:layout_height="match_parent"
@@ -46,14 +46,33 @@
             android:layout_weight="1"
             android:paddingStart="4dp"
             android:paddingEnd="4dp"
-            android:fontFamily="@font/roboto_slab"
-            android:textAllCaps="false"
-            android:textSize="12sp"
-            android:text="@string/home_tab_scans"
+            android:contentDescription="@string/home_tab_scans"
+            android:text=""
             app:icon="@drawable/ic_scans"
             app:iconGravity="textStart"
-            app:iconPadding="7dp"
-            app:iconSize="20dp"
+            app:iconPadding="0dp"
+            app:iconSize="24dp"
+            app:iconTint="@color/whl_ink" />
+
+        <View
+            android:layout_width="1dp"
+            android:layout_height="32dp"
+            android:background="@color/whl_face_sh2" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tabScanQueue"
+            style="@style/WhlToolbarAction"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/home_tab_scan_queue"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:text=""
+            app:icon="@drawable/ic_scan_queue"
+            app:iconGravity="textStart"
+            app:iconPadding="0dp"
+            app:iconSize="24dp"
             app:iconTint="@color/whl_ink" />
 
         <View
@@ -69,14 +88,12 @@
             android:layout_weight="1"
             android:paddingStart="4dp"
             android:paddingEnd="4dp"
-            android:fontFamily="@font/roboto_slab"
-            android:textAllCaps="false"
-            android:textSize="12sp"
-            android:text="@string/home_tab_collections"
+            android:contentDescription="@string/home_tab_collections"
+            android:text=""
             app:icon="@drawable/ic_collections"
             app:iconGravity="textStart"
-            app:iconPadding="7dp"
-            app:iconSize="20dp"
+            app:iconPadding="0dp"
+            app:iconSize="24dp"
             app:iconTint="@color/whl_ink" />
 
         <View
@@ -92,14 +109,12 @@
             android:layout_weight="1"
             android:paddingStart="4dp"
             android:paddingEnd="4dp"
-            android:fontFamily="@font/roboto_slab"
-            android:textAllCaps="false"
-            android:textSize="12sp"
-            android:text="@string/home_tab_inspect"
+            android:contentDescription="@string/home_tab_inspect"
+            android:text=""
             app:icon="@drawable/ic_inspect"
             app:iconGravity="textStart"
-            app:iconPadding="7dp"
-            app:iconSize="20dp"
+            app:iconPadding="0dp"
+            app:iconSize="24dp"
             app:iconTint="@color/whl_ink" />
     </LinearLayout>
 
@@ -168,6 +183,50 @@
                 android:paddingBottom="8dp" />
 
             <LinearLayout
+                android:id="@+id/scanQueuePane"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingTop="10dp"
+                android:paddingBottom="8dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/scanQueueSummary"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:accessibilityLiveRegion="polite"
+                    android:fontFamily="monospace"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp"
+                    android:textColor="@color/whl_ink_dim"
+                    android:textSize="11sp" />
+
+                <TextView
+                    android:id="@+id/scanQueueEmpty"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="monospace"
+                    android:paddingStart="28dp"
+                    android:paddingTop="30dp"
+                    android:paddingEnd="28dp"
+                    android:paddingBottom="20dp"
+                    android:text="@string/scan_queue_inspector_empty"
+                    android:textColor="@color/whl_ink_dim"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+
+                <LinearLayout
+                    android:id="@+id/scanQueueList"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="vertical"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+            </LinearLayout>
+
+            <LinearLayout
                 android:id="@+id/inspectPane"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -228,23 +287,6 @@
                     android:paddingStart="14dp"
                     android:paddingTop="7dp"
                     android:paddingEnd="14dp"
-                    android:textColor="@color/whl_ink_dim"
-                    android:textSize="11sp"
-                    android:visibility="gone" />
-
-                <TextView
-                    android:id="@+id/scanQueueSummary"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="12dp"
-                    android:layout_marginTop="7dp"
-                    android:layout_marginEnd="12dp"
-                    android:background="@drawable/whl_row"
-                    android:clickable="true"
-                    android:focusable="true"
-                    android:fontFamily="monospace"
-                    android:minHeight="44dp"
-                    android:padding="10dp"
                     android:textColor="@color/whl_ink_dim"
                     android:textSize="11sp"
                     android:visibility="gone" />
@@ -475,10 +517,8 @@
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/scanBox"
                 style="@style/WhlButton"
-                android:layout_width="0dp"
+                android:layout_width="match_parent"
                 android:layout_height="match_parent"
-                android:layout_marginEnd="6dp"
-                android:layout_weight="1"
                 android:fontFamily="@font/roboto_slab"
                 android:gravity="center"
                 android:text="@string/inspect_scan_box"
@@ -489,13 +529,21 @@
                 app:iconPadding="6dp"
                 app:iconSize="22dp"
                 app:iconTint="@color/whl_button_text" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/scanQueueActions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:baselineAligned="false"
+            android:orientation="horizontal"
+            android:visibility="gone">
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/queueScanBook"
                 style="@style/WhlButton"
-                android:layout_width="0dp"
+                android:layout_width="match_parent"
                 android:layout_height="match_parent"
-                android:layout_weight="1"
                 android:fontFamily="@font/roboto_slab"
                 android:gravity="center"
                 android:text="@string/scan_queue_add"

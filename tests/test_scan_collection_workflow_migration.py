@@ -28,13 +28,13 @@ def _function(name: str, following: str) -> str:
     )[0]
 
 
-def test_scan_workflow_migration_records_itself_last_and_is_discoverable():
+def test_scan_workflow_migration_records_itself_and_discovers_latest():
     assert SQL.rstrip().endswith(
         "insert into schema_migrations (id) values "
         "('029_scan_collection_workflow') on conflict do nothing;"
     )
     assert cloud_setup.migration_files()[-1].stem == (
-        "031_scan_search_deferred_review"
+        "033_scan_search_queue_cas_hardening"
     )
     schema = cloud_setup.expected_schema(SQL)
     assert schema["collections"] == {"collection_type"}

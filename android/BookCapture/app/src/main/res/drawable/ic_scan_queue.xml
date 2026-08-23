@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- A scanner with its source sheet and queued output page. Even-odd
+         cut-outs keep the glyph legible when MaterialButton applies a tint. -->
+    <path
+        android:fillColor="@color/whl_ink"
+        android:fillType="evenOdd"
+        android:pathData="M6,2L18,2L18,7L20,7C21.1,7 22,7.9 22,9L22,17L18,17L18,22L6,22L6,17L2,17L2,9C2,7.9 2.9,7 4,7L6,7ZM8,4L8,9L16,9L16,4ZM8,14L8,20L16,20L16,14ZM18,9.5A1,1 0,1 0,18,11.5A1,1 0,1 0,18,9.5" />
+</vector>

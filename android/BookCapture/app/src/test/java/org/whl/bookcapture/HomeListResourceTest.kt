@@ -128,15 +128,26 @@ class HomeListResourceTest {
         assertEquals("56dp", appMenu.getAttributeNS(androidNs, "layout_width"))
         assertEquals("56dp", appMenu.getAttributeNS(androidNs, "layout_height"))
         assertEquals("@drawable/ic_app_mark", appMenu.getAttributeNS(androidNs, "src"))
-        for ((id, icon) in listOf(
-            "tabScans" to "@drawable/ic_scans",
-            "tabCollections" to "@drawable/ic_collections",
-            "tabInspect" to "@drawable/ic_inspect",
+        for ((id, icon, description) in listOf(
+            Triple("tabScans", "@drawable/ic_scans", "@string/home_tab_scans"),
+            Triple(
+                "tabScanQueue",
+                "@drawable/ic_scan_queue",
+                "@string/home_tab_scan_queue",
+            ),
+            Triple(
+                "tabCollections",
+                "@drawable/ic_collections",
+                "@string/home_tab_collections",
+            ),
+            Triple("tabInspect", "@drawable/ic_inspect", "@string/home_tab_inspect"),
         )) {
             val tab = elementById(home, id)
             assertEquals(icon, tab.getAttributeNS(appNs, "icon"))
-            assertEquals("false", tab.getAttributeNS(androidNs, "textAllCaps"))
-            assertEquals("@font/roboto_slab", tab.getAttributeNS(androidNs, "fontFamily"))
+            assertEquals("", tab.getAttributeNS(androidNs, "text"))
+            assertEquals(description, tab.getAttributeNS(androidNs, "contentDescription"))
+            assertEquals("0dp", tab.getAttributeNS(appNs, "iconPadding"))
+            assertEquals("24dp", tab.getAttributeNS(appNs, "iconSize"))
         }
         val source = source("HomeActivity")
         assertTrue(source.contains("val openBook = {"))
@@ -183,7 +194,9 @@ class HomeListResourceTest {
         val solids = plate.getElementsByTagName("solid")
         assertTrue((0 until solids.length)
             .map { solids.item(it) as Element }
-            .any { it.getAttributeNS(androidNs, "color") == "@color/whl_green" })
+            .any {
+                it.getAttributeNS(androidNs, "color") == "@color/whl_icon_background"
+            })
 
         val strings = File("src/main/res/values/strings.xml").readText()
         assertTrue(strings.contains("<string name=\"app_name\">Library Tool Capture</string>"))

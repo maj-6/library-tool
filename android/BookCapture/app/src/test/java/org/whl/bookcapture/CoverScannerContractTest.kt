@@ -35,6 +35,36 @@ class CoverScannerContractTest {
     }
 
     @Test
+    fun queueCaptureHandsOffBeforeOcrWhileInspectStillReadsDirectly() {
+        val scanner = source("CoverScannerActivity")
+        val queueCapture = scanner.substringAfter("private fun queueCapturedPhoto(")
+            .substringBefore("private fun renderQueueReady(")
+        val inspectRecognition = scanner.substringAfter("private fun recognizeCover(")
+            .substringBefore("private fun queueCapturedPhoto(")
+
+        assertTrue(
+            queueCapture.indexOf("ScanSearchQueue.enqueueProcessing(") in
+                0 until queueCapture.indexOf("ScanSearchOcrWorker.enqueue("),
+        )
+        assertFalse(queueCapture.contains("Pipeline.coverOcr("))
+        assertTrue(inspectRecognition.contains("Pipeline.coverOcr(target, mistralKey)"))
+        assertFalse(inspectRecognition.contains("ScanSearchOcrWorker.enqueue("))
+    }
+
+    @Test
+    fun queueNotificationPermissionIsOptionalAndApiGated() {
+        val scanner = source("CoverScannerActivity")
+        val request = scanner.substringAfter("private fun requestQueueNotificationPermission()")
+            .substringBefore("private fun handleQueueVoiceCommand(")
+
+        assertTrue(scanner.contains("Manifest.permission.POST_NOTIFICATIONS"))
+        assertTrue(request.contains("Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU"))
+        assertTrue(request.contains("notificationPermissionRequested"))
+        assertTrue(request.contains("notificationPermission.launch("))
+        assertFalse(request.contains("finishCancelled()"))
+    }
+
+    @Test
     fun buildKeepsOfflineQrDecoderButDoesNotBundleTextRecognition() {
         val gradle = File("build.gradle.kts").readText()
 

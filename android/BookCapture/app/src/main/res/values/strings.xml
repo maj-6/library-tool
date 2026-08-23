@@ -180,6 +180,7 @@
     <!-- Collections: the batch a book is scanned into, and where that batch
          came from. A collection must be chosen before a book scan can start. -->
     <string name="home_tab_scans">Scans</string>
+    <string name="home_tab_scan_queue">Physical scan queue</string>
     <string name="home_tab_collections">Collections</string>
     <string name="home_tab_inspect">Inspect</string>
     <string name="collections_new">New collection</string>
@@ -283,7 +284,6 @@
     <string name="scan_queue_close">Close physical scan capture</string>
     <string name="scan_queue_camera_permission_denied">Camera access is required for physical scan capture.</string>
     <string name="scan_queue_camera_unavailable">The physical scan camera could not start on this device.</string>
-    <string name="scan_queue_requires_mistral_key">Add a Mistral API key in Settings before physical scan capture.</string>
     <string name="scan_queue_needs_collection">Create or select a physical scan collection first.</string>
     <string name="scan_queue_requires_sign_in">Sign in before adding a photo to the synced scan search queue.</string>
     <string name="scan_queue_saved">Capture saved for deferred matching.</string>
@@ -302,7 +302,34 @@
     <string name="scan_queue_save_failed">The OCR search could not be saved. Free storage and try again.</string>
     <string name="scan_queue_summary">%1$s &#183; %2$d waiting to be matched</string>
     <string name="scan_queue_summary_empty">%1$s &#183; no books waiting to be matched</string>
-    <string name="scan_queue_open_oldest">Open the oldest book waiting for a match</string>
+    <string name="scan_queue_inspector_empty">No physical scan books are waiting for review.</string>
+    <string name="scan_queue_inspector_invalid">The physical scan queue could not be read. Free storage, then refresh.</string>
+    <plurals name="scan_queue_inspector_title">
+        <item quantity="one">Physical scan book &#183; %1$d identifying photo</item>
+        <item quantity="other">Physical scan book &#183; %1$d identifying photos</item>
+    </plurals>
+    <string name="scan_queue_inspector_destination">Destination: %1$s</string>
+    <string name="scan_queue_inspector_no_destination">Destination not chosen</string>
+    <string name="scan_queue_state_draft">Choose A, B, or C</string>
+    <string name="scan_queue_state_queued">Queued on this phone</string>
+    <string name="scan_queue_state_matching">Matching</string>
+    <string name="scan_queue_state_ready">Ready for review</string>
+    <string name="scan_queue_state_failed">Needs attention</string>
+    <string name="scan_queue_state_saving_approval">Saving approval</string>
+    <string name="scan_queue_state_saving_rejection">Saving rejection</string>
+    <string name="scan_queue_state_approved">Approved</string>
+    <string name="scan_queue_state_rejected">Rejected</string>
+    <string name="scan_queue_review_action">Review proposed match</string>
+    <string name="scan_queue_resume_action">Resume capture and choose A, B, or C</string>
+    <string name="scan_queue_dismiss_failure_action">Dismiss failed capture</string>
+    <plurals name="scan_queue_failure_dismissed">
+        <item quantity="one">Dismissed %d failed capture.</item>
+        <item quantity="other">Dismissed %d failed captures.</item>
+    </plurals>
+    <string name="scan_queue_failure_dismiss_failed">The failed capture could not be dismissed. Free storage and try again.</string>
+    <string name="scan_queue_visual_only_detail">Visual identifying evidence captured</string>
+    <string name="scan_queue_ocr_detail">Recognized text: %1$s</string>
+    <string name="scan_queue_error_detail">Error: %1$s</string>
     <string name="scan_queue_match_saved">Matched and moved to the physical scan queue.</string>
     <string name="scan_queue_match_failed">The match could not be saved. Refresh and try again.</string>
     <string name="scan_queue_proposal_stale">This proposal changed on another device. The review queue was refreshed.</string>
@@ -313,6 +340,17 @@
     <string name="scan_queue_approve_action">Approve</string>
     <string name="scan_queue_reject_action">Reject</string>
     <string name="scan_queue_rejected">Proposal rejected.</string>
+    <string name="scan_queue_notification_channel">Physical scan queue</string>
+    <string name="scan_queue_notification_channel_description">Errors while identifying books for physical scans</string>
+    <string name="scan_queue_notification_title">Physical scan needs attention</string>
+    <string name="scan_queue_notification_staging_failed">The identifying photo could not be staged.</string>
+    <string name="scan_queue_notification_enqueue_failed">The identifying photo could not be queued.</string>
+    <string name="scan_queue_notification_photo_missing">The identifying photo is missing. Capture it again.</string>
+    <string name="scan_queue_notification_key_missing">Mistral OCR 4.1 needs an API key. Add it in Settings and capture again.</string>
+    <string name="scan_queue_notification_visual_fallback">Mistral OCR 4.1 failed; the cover was queued using visual evidence.</string>
+    <string name="scan_queue_notification_ocr_failed">Mistral OCR 4.1 could not read this photo. Check the connection and API key.</string>
+    <string name="scan_queue_notification_account_changed">Capture stopped because the account changed. Capture the book again.</string>
+    <string name="scan_queue_notification_sync_failed">The book remains queued on this phone, but cloud sync failed. Open the queue and try again.</string>
     <string name="inspect_cover_no_text">No readable title was found on that cover. Try again in brighter, even light.</string>
     <string name="inspect_lookup_searching_cloud">Searching every collection&#8230;</string>
     <string name="inspect_lookup_no_matches">No matching book was found in a collection.</string>

@@ -80,7 +80,8 @@ class ScanMarkIntegrationContractTest {
         val scanner = source("CoverScannerActivity")
         assertTrue(scanner.contains("Pipeline.coverOcr(target, mistralKey)"))
         assertTrue(scanner.contains("discardTemp(target)"))
-        assertTrue(scanner.contains("ScanSearchQueue.enqueueDraft("))
+        assertTrue(scanner.contains("ScanSearchQueue.enqueueProcessing("))
+        assertTrue(scanner.contains("ScanSearchOcrWorker.enqueue("))
         assertTrue(scanner.contains("ScanSearchQueue.routeSession("))
         assertTrue(scanner.contains("\"a\", \"b\", \"c\""))
         assertTrue(scanner.contains("ScanSearchPhotoRole.TITLE_PAGE"))
@@ -88,6 +89,25 @@ class ScanMarkIntegrationContractTest {
         assertTrue(scanner.contains("captureCover.visibility = View.GONE"))
         assertTrue(scanner.contains("R.string.scan_queue_capture_title"))
         assertEquals("mistral-ocr-4-1", Pipeline.COVER_OCR_MODEL)
+
+        val queueCapture = scanner.substringAfter("private fun queueCapturedPhoto(")
+            .substringBefore("private fun renderQueueReady(")
+        assertTrue(
+            queueCapture.indexOf("ScanSearchQueue.enqueueProcessing(") in
+                0 until queueCapture.indexOf("ScanSearchOcrWorker.enqueue("),
+        )
+        assertTrue(queueCapture.contains("Collections.currentScans("))
+        assertTrue(queueCapture.contains(".singleOrNull()"))
+        assertTrue(queueCapture.contains("scanCollectionId = automatic?.value?.id.orEmpty()"))
+        assertTrue(queueCapture.contains("completeQueueSession("))
+        assertFalse(queueCapture.contains("Pipeline.coverOcr("))
+
+        val route = scanner.substringAfter("private fun routeQueueSession(")
+            .substringBefore("private fun deliverResult(")
+        assertTrue(route.contains("queueSessionId = UUID.randomUUID().toString()"))
+        assertTrue(route.contains("queuedCount = 0"))
+        assertFalse(route.contains("terminal.compareAndSet(false, true)"))
+        assertFalse(route.contains("finish()"))
 
         val queue = source("ScanSearchQueue")
         assertTrue(queue.contains("val ocrText: String"))
@@ -100,13 +120,19 @@ class ScanMarkIntegrationContractTest {
         val client = source("ScanWorkflowClient")
         assertTrue(client.contains("approve_scan_search"))
         assertTrue(client.contains("reject_scan_search"))
+        assertTrue(client.contains("fail_scan_search"))
         assertFalse(client.contains("complete_scan_search"))
 
         val strings = xml("src/main/res/values/strings.xml")
         val all = strings.getElementsByTagName("string")
         (0 until all.length)
             .map { all.item(it) as Element }
-            .filter { it.getAttribute("name").startsWith("scan_queue_") }
+            // Error notifications may identify which evidence fell back; the
+            // no-cover/title rule applies to live capture prompts only.
+            .filter {
+                it.getAttribute("name").startsWith("scan_queue_") &&
+                    !it.getAttribute("name").startsWith("scan_queue_notification_")
+            }
             .forEach { value ->
                 val visible = value.textContent.lowercase()
                 assertFalse("queue prompt names a cover: $visible", visible.contains("cover"))

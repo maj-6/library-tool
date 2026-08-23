@@ -136,7 +136,7 @@ class ResourceContractTest {
     fun chromeTextActionsUseSemanticMaterialButtons() {
         val expected = mapOf(
             "src/main/res/layout/activity_home.xml" to
-                listOf("tabScans", "tabCollections", "tabInspect"),
+                listOf("tabScans", "tabScanQueue", "tabCollections", "tabInspect"),
         )
         for ((path, ids) in expected) {
             val layout = xml(path)
@@ -367,7 +367,7 @@ class ResourceContractTest {
         val launcherColor = (0 until theme.getElementsByTagName("color").length)
             .map { theme.getElementsByTagName("color").item(it) as Element }
             .first { it.getAttribute("name") == "ic_launcher_bg" }
-        assertEquals("#4A743A", launcherColor.textContent.trim())
+        assertEquals("#B8B9AE", launcherColor.textContent.trim())
 
         val legacy = xml("src/main/res/mipmap-anydpi/ic_launcher.xml")
         val legacyItems = legacy.getElementsByTagName("item")

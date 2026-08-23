@@ -57,6 +57,7 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.math.roundToInt
 
 internal const val INSPECT_MEMBERSHIP_ISOLATION_MAX_ATTEMPTS = 32
+internal const val HOME_EXTRA_OPEN_SCAN_QUEUE = "open_scan_search_queue"
 
 private class CollectionNameSuggestionAdapter(
     context: Context,
@@ -252,11 +253,13 @@ class HomeActivity : AppCompatActivity() {
 
     private data class ScanQueueSummarySnapshot(
         val activeCollections: Map<ScanCollectionSlot, BookCollection>,
-        val waitingItems: List<ScanSearchQueueItem>,
+        val collectionPaths: Map<String, String>,
+        val queueItems: List<ScanSearchQueueItem>,
+        val presentations: List<ScanQueueSessionPresentation>,
         val valid: Boolean,
     )
 
-    private enum class HomeTab { SCANS, COLLECTIONS, INSPECT }
+    private enum class HomeTab { SCANS, SCAN_QUEUE, COLLECTIONS, INSPECT }
 
     private enum class ScanProposalDecisionOutcome { APPLIED, STALE, FAILED }
 
@@ -409,13 +412,19 @@ class HomeActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityHomeBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        activeTab = savedInstanceState?.getString(STATE_ACTIVE_TAB)
-            ?.let { runCatching { HomeTab.valueOf(it) }.getOrNull() }
-            ?: if (savedInstanceState?.getBoolean(STATE_TAB_COLLECTIONS) == true) {
-                HomeTab.COLLECTIONS
-            } else {
-                HomeTab.SCANS
-            }
+        val openScanQueue = intent.getBooleanExtra(HOME_EXTRA_OPEN_SCAN_QUEUE, false)
+        activeTab = if (openScanQueue) {
+            HomeTab.SCAN_QUEUE
+        } else {
+            savedInstanceState?.getString(STATE_ACTIVE_TAB)
+                ?.let { runCatching { HomeTab.valueOf(it) }.getOrNull() }
+                ?: if (savedInstanceState?.getBoolean(STATE_TAB_COLLECTIONS) == true) {
+                    HomeTab.COLLECTIONS
+                } else {
+                    HomeTab.SCANS
+                }
+        }
+        if (openScanQueue) intent.removeExtra(HOME_EXTRA_OPEN_SCAN_QUEUE)
         inspectedCollectionId = savedInstanceState?.getString(STATE_INSPECTED_COLLECTION)
         inspectViewMode = InspectViewMode.fromWire(
             savedInstanceState?.getString(STATE_INSPECT_VIEW_MODE) ?: Prefs.inspectViewMode(this),
@@ -448,6 +457,7 @@ class HomeActivity : AppCompatActivity() {
         }
 
         binding.tabScans.setOnClickListener { showTab(HomeTab.SCANS) }
+        binding.tabScanQueue.setOnClickListener { showTab(HomeTab.SCAN_QUEUE) }
         binding.tabCollections.setOnClickListener { showTab(HomeTab.COLLECTIONS) }
         binding.tabInspect.setOnClickListener { showTab(HomeTab.INSPECT) }
         binding.collectionBar.setOnClickListener { showTab(HomeTab.COLLECTIONS) }
@@ -456,7 +466,6 @@ class HomeActivity : AppCompatActivity() {
             qrScanner.launch(Intent(this, QrScannerActivity::class.java))
         }
         binding.queueScanBook.setOnClickListener { startScanSearchSession() }
-        binding.scanQueueSummary.setOnClickListener { openOldestScanSearchQueueItem() }
         suppressInspectLookupWatcher = true
         binding.inspectBookSearch.setText(inspectLookupQuery)
         binding.inspectBookSearch.setSelection(binding.inspectBookSearch.text?.length ?: 0)
@@ -556,6 +565,19 @@ class HomeActivity : AppCompatActivity() {
             .observe(this) {
                 refreshScanSearchQueueSummary()
             }
+        workManager.getWorkInfosByTagLiveData(ScanSearchOcrWorker.WORK_TAG)
+            .observe(this) {
+                refreshScanSearchQueueSummary()
+            }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(HOME_EXTRA_OPEN_SCAN_QUEUE, false)) {
+            showTab(HomeTab.SCAN_QUEUE)
+            intent.removeExtra(HOME_EXTRA_OPEN_SCAN_QUEUE)
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -606,6 +628,9 @@ class HomeActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             ProcessWorker.resumePendingForcedRetries(this@HomeActivity)
         }
+        lifecycleScope.launch(Dispatchers.IO) {
+            ScanSearchOcrWorker.resumePending(this@HomeActivity)
+        }
         CollectionSyncWorker.enqueueCoalesced(this)
         ScanSearchQueueSyncWorker.enqueue(this, guaranteed = false)
         CaptureMetadataSyncWorker.enqueuePull(this)
@@ -622,7 +647,7 @@ class HomeActivity : AppCompatActivity() {
         showTab(activeTab)
     }
 
-    private fun startScanSearchSession() {
+    private fun startScanSearchSession(preferredSessionId: String? = null) {
         if (!Auth.signedIn(this) || !SAFE_CAPTURE_SYNC_ID.matches(Prefs.userId(this))) {
             Toast.makeText(
                 this,
@@ -631,22 +656,25 @@ class HomeActivity : AppCompatActivity() {
             ).show()
             return
         }
-        if (Prefs.mistralKey(this).isBlank()) {
-            Toast.makeText(
-                this,
-                R.string.scan_queue_requires_mistral_key,
-                Toast.LENGTH_LONG,
-            ).show()
-            return
-        }
         lifecycleScope.launch {
             val launch = withContext(Dispatchers.IO) {
                 val destinations = Collections.currentScans(this@HomeActivity)
                 val store = ScanSearchQueue.read(this@HomeActivity)
+                val requestedSession = preferredSessionId
+                    ?.trim()
+                    ?.lowercase()
+                    ?.takeIf(SAFE_CAPTURE_SYNC_ID::matches)
+                    ?.takeIf { sessionId ->
+                        store.items.any {
+                            it.sessionId == sessionId &&
+                                it.status == ScanSearchStatus.PENDING &&
+                                it.scanCollectionId.isEmpty()
+                        }
+                    }
                 Triple(
                     destinations,
                     store.valid,
-                    store.items.firstOrNull {
+                    requestedSession ?: store.items.firstOrNull {
                         it.status == ScanSearchStatus.PENDING &&
                             it.scanCollectionId.isEmpty()
                     }?.sessionId ?: UUID.randomUUID().toString(),
@@ -706,16 +734,16 @@ class HomeActivity : AppCompatActivity() {
             val snapshot = withContext(Dispatchers.IO) {
                 val owner = Prefs.userId(this@HomeActivity).trim().lowercase()
                 val store = ScanSearchQueue.read(this@HomeActivity)
+                val queueItems = if (!store.valid) emptyList() else store.items.filter {
+                    it.ownerId.isEmpty() ||
+                        (owner.isNotEmpty() && it.ownerId == owner)
+                }
+                val records = Collections.allRecords(this@HomeActivity)
                 ScanQueueSummarySnapshot(
                     activeCollections = Collections.currentScans(this@HomeActivity),
-                    waitingItems = if (!store.valid) emptyList() else store.items.filter {
-                        it.status in setOf(
-                            ScanSearchStatus.PENDING,
-                            ScanSearchStatus.PROPOSED,
-                        ) && it.scanCollectionId.isNotEmpty() &&
-                            (it.ownerId.isEmpty() ||
-                                (owner.isNotEmpty() && it.ownerId == owner))
-                    },
+                    collectionPaths = collectionDisplayPaths(records),
+                    queueItems = queueItems,
+                    presentations = scanQueueSessionPresentations(queueItems),
                     valid = store.valid,
                 )
             }
@@ -723,8 +751,11 @@ class HomeActivity : AppCompatActivity() {
             if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
             val activeQueueId = activeScanSearchQueueId
             if (snapshot.valid && activeQueueId != null) {
-                val refreshedProposal = snapshot.waitingItems.firstOrNull {
-                    it.id == activeQueueId
+                val refreshedProposal = snapshot.queueItems.firstOrNull {
+                    it.id == activeQueueId && it.status in setOf(
+                        ScanSearchStatus.PENDING,
+                        ScanSearchStatus.PROPOSED,
+                    )
                 }
                 activeScanSearchProposal = refreshedProposal
                 if (refreshedProposal == null) activeScanSearchQueueId = null
@@ -734,16 +765,12 @@ class HomeActivity : AppCompatActivity() {
             val destinationLabel = ScanCollectionSlot.entries.mapNotNull { slot ->
                 destinations[slot]?.let { "${slot.name}: ${it.name}" }
             }.joinToString(" \u00b7 ")
-            val sessionCount = snapshot.waitingItems.map(ScanSearchQueueItem::sessionId)
-                .distinct()
-                .size
+            val sessionCount = snapshot.presentations.size
             binding.scanQueueSummary.visibility = View.VISIBLE
-            binding.scanQueueSummary.isEnabled = snapshot.valid &&
-                snapshot.waitingItems.isNotEmpty()
             binding.scanQueueSummary.text = when {
                 !snapshot.valid -> getString(R.string.scan_queue_save_failed)
                 destinations.isEmpty() -> getString(R.string.scan_queue_needs_collection)
-                snapshot.waitingItems.isEmpty() -> getString(
+                snapshot.presentations.isEmpty() -> getString(
                     R.string.scan_queue_summary_empty,
                     destinationLabel,
                 )
@@ -753,37 +780,152 @@ class HomeActivity : AppCompatActivity() {
                     sessionCount,
                 )
             }
-            binding.scanQueueSummary.contentDescription = if (snapshot.waitingItems.isEmpty()) {
-                binding.scanQueueSummary.text
-            } else {
-                listOf(
-                    binding.scanQueueSummary.text,
-                    getString(R.string.scan_queue_open_oldest),
-                ).joinToString(". ")
-            }
+            binding.scanQueueSummary.contentDescription = binding.scanQueueSummary.text
+            renderScanQueueInspector(snapshot)
         }
     }
 
-    private fun openOldestScanSearchQueueItem() {
+    private fun renderScanQueueInspector(snapshot: ScanQueueSummarySnapshot) {
+        val list = binding.scanQueueList
+        list.removeAllViews()
+        binding.scanQueueEmpty.visibility = if (!snapshot.valid ||
+            snapshot.presentations.isEmpty()
+        ) View.VISIBLE else View.GONE
+        binding.scanQueueEmpty.setText(
+            if (snapshot.valid) R.string.scan_queue_inspector_empty
+            else R.string.scan_queue_inspector_invalid,
+        )
+        if (!snapshot.valid) return
+
+        val inflater = LayoutInflater.from(this)
+        snapshot.presentations.forEach { presentation ->
+            val row = inflater.inflate(R.layout.item_scan_queue, list, false)
+            val title = row.findViewById<TextView>(R.id.scanQueueRowTitle)
+            val status = row.findViewById<TextView>(R.id.scanQueueRowStatus)
+            val detail = row.findViewById<TextView>(R.id.scanQueueRowDetail)
+            val action = row.findViewById<MaterialButton>(R.id.scanQueueRowAction)
+
+            title.text = resources.getQuantityString(
+                R.plurals.scan_queue_inspector_title,
+                presentation.captureCount,
+                presentation.captureCount,
+            )
+            val stateText = getString(scanQueueInspectorStateLabel(presentation.state))
+            status.text = presentation.confidencePercent?.let { confidence ->
+                listOf(
+                    stateText,
+                    getString(R.string.scan_queue_match_confidence, confidence),
+                ).joinToString(" \u00b7 ")
+            } ?: stateText
+            status.setTextColor(getColor(when (presentation.state) {
+                ScanQueueInspectorState.READY,
+                ScanQueueInspectorState.APPROVED -> R.color.whl_green
+                ScanQueueInspectorState.FAILED -> R.color.whl_red
+                ScanQueueInspectorState.DRAFT,
+                ScanQueueInspectorState.QUEUED,
+                ScanQueueInspectorState.SAVING_APPROVAL,
+                ScanQueueInspectorState.SAVING_REJECTION -> R.color.whl_amber
+                ScanQueueInspectorState.MATCHING -> R.color.whl_cyan
+                ScanQueueInspectorState.REJECTED -> R.color.whl_ink_dim
+            }))
+
+            val destination = presentation.destinationCollectionId
+                .takeIf(String::isNotEmpty)
+                ?.let { id -> snapshot.collectionPaths[id] ?: id.take(8) }
+                ?.let { getString(R.string.scan_queue_inspector_destination, it) }
+                ?: getString(R.string.scan_queue_inspector_no_destination)
+            val recognized = presentation.items.asSequence()
+                .map(ScanSearchQueueItem::ocrText)
+                .map { it.replace(Regex("\\s+"), " ").trim() }
+                .firstOrNull(String::isNotEmpty)
+                ?.take(SCAN_QUEUE_INSPECTOR_OCR_EXCERPT_MAX)
+            val evidence = when {
+                presentation.errorMessage.isNotEmpty() -> getString(
+                    R.string.scan_queue_error_detail,
+                    presentation.errorMessage,
+                )
+                recognized != null -> getString(R.string.scan_queue_ocr_detail, recognized)
+                presentation.items.any { it.visualSignature.isNotEmpty() } ->
+                    getString(R.string.scan_queue_visual_only_detail)
+                else -> stateText
+            }
+            detail.text = "$destination\n$evidence"
+
+            when {
+                presentation.reviewable -> {
+                    action.visibility = View.VISIBLE
+                    action.contentDescription = getString(R.string.scan_queue_review_action)
+                    action.setOnClickListener {
+                        showScanSearchQueueItem(presentation.representative)
+                    }
+                }
+                presentation.state == ScanQueueInspectorState.DRAFT -> {
+                    action.visibility = View.VISIBLE
+                    action.contentDescription = getString(R.string.scan_queue_resume_action)
+                    action.setOnClickListener {
+                        startScanSearchSession(presentation.sessionId)
+                    }
+                }
+                presentation.state == ScanQueueInspectorState.FAILED &&
+                    presentation.errorMessage.isNotEmpty() &&
+                    presentation.items.none {
+                        it.errorMessage.isNotEmpty() && it.dirty
+                    } -> {
+                    action.visibility = View.VISIBLE
+                    action.setIconResource(R.drawable.ic_delete)
+                    action.contentDescription = getString(
+                        R.string.scan_queue_dismiss_failure_action,
+                    )
+                    action.setOnClickListener {
+                        dismissScanQueueFailures(presentation.sessionId)
+                    }
+                }
+                else -> action.visibility = View.GONE
+            }
+            row.contentDescription = listOf(title.text, status.text, destination, evidence)
+                .joinToString(". ")
+            RemoteUiCatalog.apply(row)
+            list.addView(row)
+        }
+    }
+
+    private fun scanQueueInspectorStateLabel(state: ScanQueueInspectorState): Int = when (state) {
+        ScanQueueInspectorState.DRAFT -> R.string.scan_queue_state_draft
+        ScanQueueInspectorState.QUEUED -> R.string.scan_queue_state_queued
+        ScanQueueInspectorState.MATCHING -> R.string.scan_queue_state_matching
+        ScanQueueInspectorState.READY -> R.string.scan_queue_state_ready
+        ScanQueueInspectorState.FAILED -> R.string.scan_queue_state_failed
+        ScanQueueInspectorState.SAVING_APPROVAL -> R.string.scan_queue_state_saving_approval
+        ScanQueueInspectorState.SAVING_REJECTION -> R.string.scan_queue_state_saving_rejection
+        ScanQueueInspectorState.APPROVED -> R.string.scan_queue_state_approved
+        ScanQueueInspectorState.REJECTED -> R.string.scan_queue_state_rejected
+    }
+
+    private fun dismissScanQueueFailures(sessionId: String) {
         lifecycleScope.launch {
-            val item = withContext(Dispatchers.IO) {
-                val owner = Prefs.userId(this@HomeActivity).trim().lowercase()
-                ScanSearchQueue.read(this@HomeActivity)
-                    .takeIf { it.valid }
-                    ?.items
-                    ?.sortedByDescending {
-                        if (it.status == ScanSearchStatus.PROPOSED) 1 else 0
-                    }
-                    ?.firstOrNull {
-                        it.status in setOf(
-                            ScanSearchStatus.PENDING,
-                            ScanSearchStatus.PROPOSED,
-                        ) && it.scanCollectionId.isNotEmpty() &&
-                            (it.ownerId.isEmpty() ||
-                                (owner.isNotEmpty() && it.ownerId == owner))
-                    }
-            } ?: return@launch
-            showScanSearchQueueItem(item)
+            val removedIds = withContext(Dispatchers.IO) {
+                ScanSearchQueue.dismissLocalFailures(this@HomeActivity, sessionId)?.also { ids ->
+                    ids.forEach { ScanSearchNotifications.clearFailure(this@HomeActivity, it) }
+                }
+            }
+            if (removedIds == null) {
+                Toast.makeText(
+                    this@HomeActivity,
+                    R.string.scan_queue_failure_dismiss_failed,
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else if (removedIds.isNotEmpty()) {
+                Toast.makeText(
+                    this@HomeActivity,
+                    resources.getQuantityString(
+                        R.plurals.scan_queue_failure_dismissed,
+                        removedIds.size,
+                        removedIds.size,
+                    ),
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+            refreshScanSearchQueueSummary()
         }
     }
 
@@ -958,17 +1100,23 @@ class HomeActivity : AppCompatActivity() {
         binding.homeList.visibility = if (tab == HomeTab.SCANS) View.VISIBLE else View.GONE
         binding.collectionsList.visibility =
             if (tab == HomeTab.COLLECTIONS) View.VISIBLE else View.GONE
+        binding.scanQueuePane.visibility =
+            if (tab == HomeTab.SCAN_QUEUE) View.VISIBLE else View.GONE
         binding.inspectPane.visibility = if (tab == HomeTab.INSPECT) View.VISIBLE else View.GONE
         binding.scanActions.visibility = if (tab == HomeTab.SCANS) View.VISIBLE else View.GONE
         binding.newCollection.visibility =
             if (tab == HomeTab.COLLECTIONS) View.VISIBLE else View.GONE
         binding.inspectActions.visibility = if (tab == HomeTab.INSPECT) View.VISIBLE else View.GONE
+        binding.scanQueueActions.visibility =
+            if (tab == HomeTab.SCAN_QUEUE) View.VISIBLE else View.GONE
         binding.collectionBar.visibility = if (tab == HomeTab.SCANS) View.VISIBLE else View.GONE
         emphasizeTab(binding.tabScans, tab == HomeTab.SCANS)
+        emphasizeTab(binding.tabScanQueue, tab == HomeTab.SCAN_QUEUE)
         emphasizeTab(binding.tabCollections, tab == HomeTab.COLLECTIONS)
         emphasizeTab(binding.tabInspect, tab == HomeTab.INSPECT)
         when (tab) {
             HomeTab.SCANS -> refreshHome()
+            HomeTab.SCAN_QUEUE -> refreshScanSearchQueueSummary()
             HomeTab.COLLECTIONS -> refreshCollections()
             HomeTab.INSPECT -> {
                 rearmFailedRemoteInspectLookup()
@@ -982,6 +1130,7 @@ class HomeActivity : AppCompatActivity() {
         invalidateRemoteInspectLookup()
         when (activeTab) {
             HomeTab.SCANS -> refreshHome()
+            HomeTab.SCAN_QUEUE -> refreshScanSearchQueueSummary()
             HomeTab.COLLECTIONS -> refreshCollections()
             HomeTab.INSPECT -> refreshInspect()
         }
@@ -1014,6 +1163,7 @@ class HomeActivity : AppCompatActivity() {
                     when (activeTab) {
                         HomeTab.COLLECTIONS -> refreshCollections()
                         HomeTab.INSPECT -> refreshInspect()
+                        HomeTab.SCAN_QUEUE -> refreshScanSearchQueueSummary()
                         HomeTab.SCANS -> refreshCollectionBar()
                     }
                 }
@@ -4578,6 +4728,7 @@ class HomeActivity : AppCompatActivity() {
         const val INSPECT_LOOKUP_COLLECTION_BATCH = 40
         const val INSPECT_LOOKUP_DISPLAY_MAX = 240
         const val INSPECT_COVER_TEXT_MAX = 8_000
+        const val SCAN_QUEUE_INSPECTOR_OCR_EXCERPT_MAX = 240
         const val MENU_INSPECT_MARK_SCAN = 10_200
         const val MENU_INSPECT_MOVE = 10_201
         const val MENU_INSPECT_DELETE = 10_202

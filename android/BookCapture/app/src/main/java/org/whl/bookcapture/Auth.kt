@@ -50,6 +50,7 @@ object Auth {
     /** Revoke the server-side session when reachable, then always leave the
      * device in local mode. Blocking; callers run this off the main thread. */
     fun signOut(ctx: Context): String? {
+        val owner = Prefs.userId(ctx)
         val token = accessToken(ctx)
         var error: String? = null
         if (token != null) {
@@ -69,7 +70,7 @@ object Auth {
                 error = e.message ?: e.javaClass.simpleName
             }
         }
-        Prefs.clearSession(ctx)
+        clearSession(ctx, owner)
         return error
     }
 
@@ -95,8 +96,9 @@ object Auth {
         } catch (e: HttpError) {
             // 400/401 on refresh = the session is dead for good: force re-login
             // rather than failing every upload forever with a stale token
-            if (path.startsWith("token?grant_type=refresh") && e.code in 400..401)
-                Prefs.clearSession(ctx)
+            if (path.startsWith("token?grant_type=refresh") && e.code in 400..401) {
+                clearSession(ctx, Prefs.userId(ctx))
+            }
             return e.readable()
         } catch (e: Exception) {
             return e.message ?: e.javaClass.simpleName
@@ -111,6 +113,11 @@ object Auth {
             user.optString("id"), user.optString("email"))
         try { pullProfile(ctx) } catch (_: Exception) { /* cache fills next time */ }
         return null
+    }
+
+    private fun clearSession(ctx: Context, ownerId: String) {
+        ScanSearchOcrWorker.abandonOwner(ctx, ownerId)
+        Prefs.clearSession(ctx)
     }
 
     // --- cloud profile ----------------------------------------------------------
