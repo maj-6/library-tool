@@ -15,6 +15,7 @@ class ScanSearchQueueTest {
     private val captureId = "33333333-3333-4333-8333-333333333333"
     private val ownerId = "44444444-4444-4444-8444-444444444444"
     private val otherOwnerId = "55555555-5555-4555-8555-555555555555"
+    private val secondQueueId = "66666666-6666-4666-8666-666666666666"
 
     @Test
     fun strictVersionedQueueRoundTrips() {
@@ -27,7 +28,7 @@ class ScanSearchQueueTest {
         )
         val store = ScanSearchQueueStore(listOf(item))
         val encoded = scanSearchQueueStoreToJson(store)
-        assertEquals(1, JSONObject(encoded).getInt("version"))
+        assertEquals(2, JSONObject(encoded).getInt("version"))
         assertEquals(store, scanSearchQueueStoreFromJson(encoded))
     }
 
@@ -40,11 +41,13 @@ class ScanSearchQueueTest {
             "created_at":"2026-08-21T12:00:00Z","updated_at":"2026-08-21T12:00:00Z",
             "dirty":true}]}""".trimIndent()
         assertFalse(scanSearchQueueStoreFromJson(base).valid)
-        assertTrue(
-            scanSearchQueueStoreFromJson(
-                base.replace("\"pending\"", "\"matched\""),
-            ).valid,
+        val migrated = scanSearchQueueStoreFromJson(
+            base.replace("\"pending\"", "\"matched\""),
         )
+        assertTrue(migrated.valid)
+        assertEquals(captureId, migrated.items.single().candidateCaptureId)
+        assertEquals(1.0, migrated.items.single().matchConfidence!!, 0.0)
+        assertTrue(migrated.items.single().matchEvidence.isNotEmpty())
     }
 
     @Test
@@ -60,7 +63,9 @@ class ScanSearchQueueTest {
     @Test
     fun localStatusesExactlyMatchTheCloudContract() {
         assertEquals(ScanSearchStatus.PENDING, ScanSearchStatus.fromWire("pending"))
+        assertEquals(ScanSearchStatus.PROPOSED, ScanSearchStatus.fromWire("proposed"))
         assertEquals(ScanSearchStatus.MATCHED, ScanSearchStatus.fromWire("matched"))
+        assertEquals(ScanSearchStatus.REJECTED, ScanSearchStatus.fromWire("rejected"))
         assertEquals(ScanSearchStatus.FAILED, ScanSearchStatus.fromWire("failed"))
         assertNull(ScanSearchStatus.fromWire("review"))
     }
@@ -116,6 +121,9 @@ class ScanSearchQueueTest {
         )
         val dirty = mine.copy(
             status = ScanSearchStatus.MATCHED,
+            candidateCaptureId = captureId,
+            matchConfidence = 1.0,
+            matchEvidence = legacyEvidence(),
             matchedCaptureId = captureId,
             dirty = true,
         )
@@ -129,7 +137,7 @@ class ScanSearchQueueTest {
             )?.items?.toSet(),
         )
         assertEquals(
-            dirty,
+            normalizedScanSearchQueueItem(dirty),
             mergeScanSearchQueueStore(
                 ScanSearchQueueStore(listOf(dirty, other)),
                 ownerId,
@@ -169,6 +177,9 @@ class ScanSearchQueueTest {
 
         val matched = pending.copy(
             status = ScanSearchStatus.MATCHED,
+            candidateCaptureId = captureId,
+            matchConfidence = 1.0,
+            matchEvidence = legacyEvidence(),
             matchedCaptureId = captureId,
             revision = 1,
         )
@@ -192,6 +203,205 @@ class ScanSearchQueueTest {
         )
     }
 
+    @Test
+    fun successiveDraftCapturesShareSessionAndRouteAtomically() {
+        val cover = item(ownerId = ownerId).copy(
+            scanCollectionId = "",
+            sessionId = queueId,
+            visualSignature = validSignature(),
+        )
+        val title = item(id = captureId, ownerId = ownerId).copy(
+            scanCollectionId = "",
+            sessionId = queueId,
+            photoRole = ScanSearchPhotoRole.TITLE_PAGE,
+            ocrText = "A New Herbal",
+        )
+        val routed = routeScanSearchSessionStore(
+            ScanSearchQueueStore(listOf(cover, title)),
+            ownerId,
+            queueId,
+            collectionId,
+            "2026-08-21T12:05:00Z",
+        )
+
+        assertEquals(2, routed?.items?.size)
+        assertTrue(routed!!.items.all { it.sessionId == queueId })
+        assertTrue(routed.items.all { it.scanCollectionId == collectionId && it.dirty })
+        assertNull(routeScanSearchSessionStore(
+            routed,
+            ownerId,
+            queueId,
+            otherOwnerId,
+            "2026-08-21T12:06:00Z",
+        ))
+    }
+
+    @Test
+    fun coverCanQueueWithoutOcrOnlyWhenVisualSignatureIsValid() {
+        val cover = item(ownerId = ownerId).copy(
+            scanCollectionId = "",
+            ocrText = "",
+            visualSignature = validSignature(),
+        )
+        assertEquals(cover, normalizedScanSearchQueueItem(cover))
+        assertNull(normalizedScanSearchQueueItem(cover.copy(visualSignature = "")))
+        assertNull(normalizedScanSearchQueueItem(
+            cover.copy(photoRole = ScanSearchPhotoRole.TITLE_PAGE),
+        ))
+    }
+
+    @Test
+    fun confidenceRatedProposalRoundTripsAndRejectDecisionIsProtected() {
+        val proposed = item(ownerId = ownerId).copy(
+            status = ScanSearchStatus.PROPOSED,
+            candidateCaptureId = captureId,
+            matchConfidence = .91,
+            matchEvidence = """{"version":1,"components":{"text":0.9}}""",
+            revision = 2,
+            dirty = false,
+        )
+        val encoded = scanSearchQueueStoreToJson(ScanSearchQueueStore(listOf(proposed)))
+        val parsed = scanSearchQueueStoreFromJson(encoded)
+        assertTrue("failed to decode $encoded", parsed.valid)
+        val decoded = parsed.items.single()
+        assertEquals(.91, decoded.matchConfidence!!, 0.0)
+        assertEquals(captureId, decoded.candidateCaptureId)
+
+        val rejected = proposed.copy(status = ScanSearchStatus.REJECTED, dirty = true)
+        assertNull(acknowledgeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(rejected)),
+            ownerId,
+            rejected,
+            proposed.copy(revision = 3),
+        ))
+    }
+
+    @Test
+    fun proposalAndTerminalShapesExactlyMatchSqlConstraints() {
+        val base = item(ownerId = ownerId)
+        val evidence = legacyEvidence()
+        assertNull(normalizedScanSearchQueueItem(base.copy(
+            status = ScanSearchStatus.PROPOSED,
+            candidateCaptureId = captureId,
+        )))
+        assertNull(normalizedScanSearchQueueItem(base.copy(
+            status = ScanSearchStatus.REJECTED,
+            candidateCaptureId = captureId,
+            matchConfidence = .8,
+        )))
+        assertNull(normalizedScanSearchQueueItem(base.copy(
+            status = ScanSearchStatus.MATCHED,
+            candidateCaptureId = secondQueueId,
+            matchedCaptureId = captureId,
+            matchConfidence = .8,
+            matchEvidence = evidence,
+        )))
+        assertNull(normalizedScanSearchQueueItem(base.copy(
+            status = ScanSearchStatus.FAILED,
+            candidateCaptureId = captureId,
+            matchConfidence = .8,
+            matchEvidence = evidence,
+            dirty = false,
+        )))
+        assertEquals(
+            ScanSearchStatus.MATCHED,
+            normalizedScanSearchQueueItem(base.copy(
+                status = ScanSearchStatus.MATCHED,
+                candidateCaptureId = captureId,
+                matchedCaptureId = captureId,
+                matchConfidence = .8,
+                matchEvidence = evidence,
+            ))?.status,
+        )
+    }
+
+    @Test
+    fun evidenceLimitIsMeasuredAsUtf8Bytes() {
+        val unicodeEvidence = """{"note":"${"🙂".repeat(2_100)}"}"""
+        assertTrue(unicodeEvidence.length < ScanSearchQueue.MAX_MATCH_EVIDENCE_BYTES)
+        assertTrue(
+            unicodeEvidence.toByteArray(Charsets.UTF_8).size >
+                ScanSearchQueue.MAX_MATCH_EVIDENCE_BYTES,
+        )
+        assertNull(normalizedScanSearchQueueItem(item(ownerId = ownerId).copy(
+            status = ScanSearchStatus.PROPOSED,
+            candidateCaptureId = captureId,
+            matchConfidence = .8,
+            matchEvidence = unicodeEvidence,
+            dirty = false,
+        )))
+    }
+
+    @Test
+    fun liveCloudMergePrunesCleanAcknowledgedDecisionsButRetainsDirtyIntent() {
+        val proposal = item(ownerId = ownerId).copy(
+            status = ScanSearchStatus.PROPOSED,
+            candidateCaptureId = captureId,
+            matchConfidence = .8,
+            matchEvidence = legacyEvidence(),
+            revision = 2,
+            dirty = false,
+        )
+        val cleanMatched = proposal.copy(
+            status = ScanSearchStatus.MATCHED,
+            matchedCaptureId = captureId,
+            revision = 3,
+        )
+        val cleanRejected = proposal.copy(
+            id = secondQueueId,
+            status = ScanSearchStatus.REJECTED,
+            revision = 3,
+        )
+        val live = item(id = otherOwnerId, ownerId = ownerId, revision = 4)
+            .copy(dirty = false)
+
+        val pruned = mergeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(cleanMatched, cleanRejected, live)),
+            ownerId,
+            listOf(live),
+        )
+        assertEquals(listOf(live), pruned?.items)
+
+        val dirtyMatched = cleanMatched.copy(dirty = true)
+        val retained = mergeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(dirtyMatched, live)),
+            ownerId,
+            listOf(live),
+        )
+        assertEquals(
+            setOf(normalizedScanSearchQueueItem(dirtyMatched), live),
+            retained?.items?.toSet(),
+        )
+        assertNull(mergeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(live)),
+            ownerId,
+            listOf(cleanMatched),
+        ))
+
+        val siblingProposal = proposal.copy(id = secondQueueId, sessionId = queueId)
+        val refreshedProposal = proposal.copy(revision = proposal.revision + 1)
+        val desktopTerminalizedSibling = mergeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(proposal, siblingProposal)),
+            ownerId,
+            listOf(refreshedProposal),
+        )
+        assertEquals(listOf(normalizedScanSearchQueueItem(refreshedProposal)),
+            desktopTerminalizedSibling?.items)
+    }
+
+    @Test
+    fun versionOneQueueMigratesEachLegacyRowToItsOwnSession() {
+        val legacy = """{"version":1,"items":[{
+            "id":"$queueId","owner_id":"$ownerId","scan_collection_id":"$collectionId",
+            "photo_role":"cover","ocr_text":"Herbal","status":"pending",
+            "matched_capture_id":"","revision":0,
+            "created_at":"2026-08-21T12:00:00Z","updated_at":"2026-08-21T12:00:00Z",
+            "dirty":true}]}""".trimIndent()
+        val parsed = scanSearchQueueStoreFromJson(legacy)
+        assertTrue(parsed.valid)
+        assertEquals(queueId, parsed.items.single().sessionId)
+    }
+
     private fun item(
         id: String = queueId,
         ownerId: String,
@@ -205,4 +415,13 @@ class ScanSearchQueueTest {
         revision = revision,
         createdAt = "2026-08-21T12:00:00Z",
     )
+
+    private fun validSignature(): String = checkNotNull(coverVisualSignature(
+        48,
+        64,
+        IntArray(48 * 64) { 0xff336699.toInt() },
+    ))
+
+    private fun legacyEvidence(): String =
+        """{"version":1,"components":{"legacy":1.0}}"""
 }

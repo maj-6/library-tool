@@ -1838,13 +1838,16 @@
         <div id="collections-list" class="drafting"></div>
         <section id="scan-queue-panel" aria-labelledby="scan-queue-title">
           <div class="pane-bar scan-queue-toolbar">
-            <strong id="scan-queue-title">Physical scan matching</strong>
+            <strong id="scan-queue-title">Physical scan review queue</strong>
             <button id="scan-queue-refresh" class="cad-btn tiny" type="button">Refresh</button>
             <span id="scan-queue-msg" class="tool-label" role="status"
                   aria-live="polite"></span>
             <span class="bar-spacer"></span>
             <span id="scan-queue-count" class="tool-label"></span>
           </div>
+          <p class="pane-note scan-queue-note">Captured photos stay in this queue while the server
+            proposes an existing book. Review its confidence and OCR, color, and feature evidence,
+            then approve or reject the proposal.</p>
           <div id="scan-queue-list" class="drafting"></div>
           <div id="scan-state-list" class="drafting"></div>
         </section>

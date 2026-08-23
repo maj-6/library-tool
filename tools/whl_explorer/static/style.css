@@ -5519,6 +5519,12 @@ body[data-theme] .drafting::-webkit-scrollbar {
   border: var(--border-w, 1px) solid var(--canvas-line);
 }
 .scan-queue-toolbar { flex: none; }
+.scan-queue-note {
+  flex: none;
+  margin: 0;
+  padding: 5px 8px;
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
+}
 #scan-queue-list, #scan-state-list { overflow: auto; }
 #scan-queue-list { flex: 1 1 auto; min-height: 70px; }
 #scan-state-list {
@@ -5528,12 +5534,53 @@ body[data-theme] .drafting::-webkit-scrollbar {
 .scan-queue-table { width: 100%; }
 .scan-queue-table td { vertical-align: top; white-space: normal; }
 .scan-queue-ocr {
-  max-width: 360px;
+  max-width: 300px;
   word-break: break-word;
   color: var(--ink-mut);
 }
-.scan-queue-match { display: flex; gap: 4px; min-width: 260px; }
-.scan-queue-match select { flex: 1 1 auto; min-width: 140px; }
+.scan-queue-status {
+  display: block;
+  width: max-content;
+  margin-bottom: 3px;
+  color: var(--ink);
+  font-size: 9px;
+  font-weight: bold;
+  letter-spacing: 0.45px;
+  text-transform: uppercase;
+}
+.scan-queue-status.proposed, .scan-confidence.high { color: var(--green); }
+.scan-queue-status.failed, .scan-queue-error, .scan-confidence.low { color: var(--amber); }
+.scan-queue-status.rejected { color: var(--red); }
+.scan-queue-error, .scan-proposal-detail, .scan-proposal-id,
+.scan-evidence-empty, .scan-queue-decision {
+  display: block;
+  margin-top: 3px;
+  color: var(--ink-mut);
+  font-size: 10px;
+}
+.scan-capture-count { display: block; color: var(--ink); font-weight: bold; }
+.scan-capture-details { margin: 3px 0 0; padding-left: 16px; }
+.scan-capture-details li + li { margin-top: 3px; }
+.scan-queue-proposal { min-width: 170px; }
+.scan-proposal-title { display: block; color: var(--ink); }
+.scan-queue-evidence { min-width: 190px; }
+.scan-confidence {
+  display: inline-block;
+  padding: 2px 5px;
+  border: var(--border-w, 1px) solid currentColor;
+  border-radius: var(--radius);
+  font-size: 9px;
+  font-weight: bold;
+  letter-spacing: 0.25px;
+}
+.scan-confidence.medium { color: var(--cyan); }
+.scan-confidence.unavailable { color: var(--ink-mut); }
+.scan-match-evidence { margin: 5px 0 0; }
+.scan-match-evidence div { display: flex; gap: 8px; justify-content: space-between; }
+.scan-match-evidence dt { color: var(--ink-mut); }
+.scan-match-evidence dd { margin: 0; color: var(--ink); text-align: right; }
+.scan-queue-actions { min-width: 120px; white-space: nowrap !important; }
+.scan-queue-actions .cad-btn { margin: 0 3px 3px 0; }
 .scan-state-inactive { opacity: 0.65; }
 
 /* These two catalogue columns are capture snapshots, never cell editors. */

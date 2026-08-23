@@ -20,7 +20,7 @@ class StateAwareVoiceCommandPolicyTest {
         )
 
         for (command in listOf(
-                "check", "scan", "done", "cancel", "restart", "undo", "notes",
+                "check", "scan", "a", "b", "c", "done", "cancel", "restart", "undo", "notes",
             )
         ) {
             assertNull(evaluate(command, VoiceRecognitionStability.STABLE_PARTIAL))
@@ -34,6 +34,9 @@ class StateAwareVoiceCommandPolicyTest {
             "photo" to PolicyVoiceCommand.PHOTO,
             "check" to PolicyVoiceCommand.CHECK,
             "scan" to PolicyVoiceCommand.SCAN,
+            "a" to PolicyVoiceCommand.SCAN_A,
+            "b" to PolicyVoiceCommand.SCAN_B,
+            "c" to PolicyVoiceCommand.SCAN_C,
             "done" to PolicyVoiceCommand.DONE,
             "cancel" to PolicyVoiceCommand.CANCEL,
             "restart" to PolicyVoiceCommand.RESTART,
@@ -42,11 +45,32 @@ class StateAwareVoiceCommandPolicyTest {
         )
 
         expected.forEach { (spoken, command) ->
+            val transcript = if (command in setOf(
+                    PolicyVoiceCommand.SCAN_A,
+                    PolicyVoiceCommand.SCAN_B,
+                    PolicyVoiceCommand.SCAN_C,
+                )
+            ) "  $spoken! " else "please, $spoken!"
             assertEquals(
                 command,
-                evaluate("please, $spoken!", VoiceRecognitionStability.FINAL)?.command,
+                evaluate(transcript, VoiceRecognitionStability.FINAL)?.command,
             )
         }
+    }
+
+    @Test
+    fun scanSlotsRequireAnExactFinalOneLetterTranscript() {
+        assertEquals(
+            PolicyVoiceCommand.SCAN_A,
+            evaluate(" A! ", VoiceRecognitionStability.FINAL)?.command,
+        )
+        assertNull(evaluate("please a", VoiceRecognitionStability.FINAL))
+        assertEquals(
+            PolicyVoiceCommand.PHOTO,
+            evaluate("photo a", VoiceRecognitionStability.FINAL)?.command,
+        )
+        assertNull(evaluate("book b please", VoiceRecognitionStability.FINAL))
+        assertNull(evaluate("slot c", VoiceRecognitionStability.FINAL))
     }
 
     @Test

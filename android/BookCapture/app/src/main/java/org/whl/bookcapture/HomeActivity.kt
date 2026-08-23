@@ -189,7 +189,7 @@ class HomeActivity : AppCompatActivity() {
         val items: List<ScanListItem>,
         val collectionPaths: Map<String, String>,
         val currentCollection: BookCollection?,
-        val currentScanCollection: BookCollection?,
+        val currentScanCollections: Map<ScanCollectionSlot, BookCollection>,
     )
 
     private data class InspectBookSnapshot(
@@ -239,24 +239,26 @@ class HomeActivity : AppCompatActivity() {
     private data class CollectionListSnapshot(
         val collections: List<BookCollection>,
         val currentCaptureCollection: BookCollection?,
-        val currentScanCollection: BookCollection?,
+        val currentScanCollections: Map<ScanCollectionSlot, BookCollection>,
         val collectionPaths: Map<String, String>,
         val bookCounts: Map<String, Int>,
     )
 
     private data class CollectionBarSnapshot(
         val currentCaptureCollection: BookCollection?,
-        val currentScanCollection: BookCollection?,
+        val currentScanCollections: Map<ScanCollectionSlot, BookCollection>,
         val collectionPaths: Map<String, String>,
     )
 
     private data class ScanQueueSummarySnapshot(
-        val activeCollection: BookCollection?,
+        val activeCollections: Map<ScanCollectionSlot, BookCollection>,
         val waitingItems: List<ScanSearchQueueItem>,
         val valid: Boolean,
     )
 
     private enum class HomeTab { SCANS, COLLECTIONS, INSPECT }
+
+    private enum class ScanProposalDecisionOutcome { APPLIED, STALE, FAILED }
 
     private enum class InspectViewMode(val wireValue: String, val columns: Int, val layout: Int) {
         TILES("tiles", 2, R.layout.item_inspect_tile),
@@ -307,8 +309,7 @@ class HomeActivity : AppCompatActivity() {
     private var inspectLookupCloudGeneration = 0L
     private var scanQueueSummaryJob: Job? = null
     private var activeScanSearchQueueId: String? = null
-    private var pendingScanSearchRole: ScanSearchPhotoRole? = null
-    private var pendingScanSearchCollectionId: String? = null
+    private var activeScanSearchProposal: ScanSearchQueueItem? = null
     private var scanQueueMutationInFlight = false
     private var reportedTagConflict = ""
     private val expandedScanGroups = linkedSetOf<String>()
@@ -371,6 +372,7 @@ class HomeActivity : AppCompatActivity() {
             return@registerForActivityResult
         }
         activeScanSearchQueueId = null
+        activeScanSearchProposal = null
         rearmFailedRemoteInspectLookup()
         inspectCoverOcrText = recognized
         val displayText = recognized.lineSequence()
@@ -390,33 +392,16 @@ class HomeActivity : AppCompatActivity() {
     private val scanSearchCamera = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        val role = result.data
-            ?.getStringExtra(CoverScannerActivity.EXTRA_PHOTO_ROLE)
-            ?.let(ScanSearchPhotoRole::fromWire)
-            ?: pendingScanSearchRole
-        val destinationId = pendingScanSearchCollectionId
-        pendingScanSearchRole = null
-        pendingScanSearchCollectionId = null
-        if (result.resultCode != Activity.RESULT_OK || role == null || destinationId == null) {
-            return@registerForActivityResult
-        }
-        val recognized = result.data
-            ?.getStringExtra(CoverScannerActivity.EXTRA_RECOGNIZED_TEXT)
-            .orEmpty()
-            .take(ScanSearchQueue.MAX_OCR_CHARS)
-        if (recognized.isBlank()) {
-            Toast.makeText(this, R.string.inspect_cover_no_text, Toast.LENGTH_LONG).show()
-            return@registerForActivityResult
-        }
-        val queued = ScanSearchQueue.enqueue(this, destinationId, role, recognized)
-        if (queued == null) {
-            Toast.makeText(this, R.string.scan_queue_save_failed, Toast.LENGTH_LONG).show()
-            return@registerForActivityResult
-        }
-        activeScanSearchQueueId = queued.id
-        showScanSearchQueueItem(queued)
-        ScanSearchQueueSyncWorker.enqueue(this)
-        Toast.makeText(this, R.string.scan_queue_saved, Toast.LENGTH_LONG).show()
+        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        val count = result.data?.getIntExtra(CoverScannerActivity.EXTRA_CAPTURE_COUNT, 0) ?: 0
+        val slot = result.data?.getStringExtra(CoverScannerActivity.EXTRA_SCAN_SLOT)
+            ?.let(ScanCollectionSlot::fromWire)
+            ?: return@registerForActivityResult
+        Toast.makeText(
+            this,
+            getString(R.string.scan_queue_session_saved, count, slot.name),
+            Toast.LENGTH_LONG,
+        ).show()
         refreshScanSearchQueueSummary()
     }
 
@@ -446,12 +431,6 @@ class HomeActivity : AppCompatActivity() {
         activeScanSearchQueueId = savedInstanceState
             ?.getString(STATE_ACTIVE_SCAN_SEARCH_QUEUE)
             ?.takeIf(SAFE_CAPTURE_SYNC_ID::matches)
-        pendingScanSearchRole = savedInstanceState
-            ?.getString(STATE_PENDING_SCAN_SEARCH_ROLE)
-            ?.let(ScanSearchPhotoRole::fromWire)
-        pendingScanSearchCollectionId = savedInstanceState
-            ?.getString(STATE_PENDING_SCAN_SEARCH_COLLECTION)
-            ?.takeIf(SAFE_COLLECTION_FILTER_ID::matches)
         scanGroupsInitialized =
             savedInstanceState?.getBoolean(STATE_SCAN_GROUPS_INITIALIZED) ?: false
         syncFeedbackRequestId = savedInstanceState?.getString(STATE_SYNC_FEEDBACK_REQUEST)
@@ -476,7 +455,7 @@ class HomeActivity : AppCompatActivity() {
         binding.scanBox.setOnClickListener {
             qrScanner.launch(Intent(this, QrScannerActivity::class.java))
         }
-        binding.queueScanBook.setOnClickListener { chooseScanSearchPhotoRole() }
+        binding.queueScanBook.setOnClickListener { startScanSearchSession() }
         binding.scanQueueSummary.setOnClickListener { openOldestScanSearchQueueItem() }
         suppressInspectLookupWatcher = true
         binding.inspectBookSearch.setText(inspectLookupQuery)
@@ -485,6 +464,7 @@ class HomeActivity : AppCompatActivity() {
         binding.inspectBookSearch.doAfterTextChanged { editable ->
             if (suppressInspectLookupWatcher) return@doAfterTextChanged
             activeScanSearchQueueId = null
+            activeScanSearchProposal = null
             rearmFailedRemoteInspectLookup()
             inspectLookupQuery = editable?.toString().orEmpty()
                 .take(INSPECT_LOOKUP_DISPLAY_MAX)
@@ -587,11 +567,6 @@ class HomeActivity : AppCompatActivity() {
         outState.putString(STATE_INSPECT_LOOKUP_QUERY, inspectLookupQuery)
         outState.putString(STATE_INSPECT_COVER_OCR, inspectCoverOcrText)
         outState.putString(STATE_ACTIVE_SCAN_SEARCH_QUEUE, activeScanSearchQueueId)
-        outState.putString(STATE_PENDING_SCAN_SEARCH_ROLE, pendingScanSearchRole?.wireValue)
-        outState.putString(
-            STATE_PENDING_SCAN_SEARCH_COLLECTION,
-            pendingScanSearchCollectionId,
-        )
         outState.putStringArrayList(
             STATE_INSPECT_SELECTED_IDS,
             ArrayList(inspectSelection.selectedIds),
@@ -647,7 +622,7 @@ class HomeActivity : AppCompatActivity() {
         showTab(activeTab)
     }
 
-    private fun chooseScanSearchPhotoRole() {
+    private fun startScanSearchSession() {
         if (!Auth.signedIn(this) || !SAFE_CAPTURE_SYNC_ID.matches(Prefs.userId(this))) {
             Toast.makeText(
                 this,
@@ -659,17 +634,34 @@ class HomeActivity : AppCompatActivity() {
         if (Prefs.mistralKey(this).isBlank()) {
             Toast.makeText(
                 this,
-                R.string.cover_scanner_requires_mistral_key,
+                R.string.scan_queue_requires_mistral_key,
                 Toast.LENGTH_LONG,
             ).show()
             return
         }
         lifecycleScope.launch {
-            val destination = withContext(Dispatchers.IO) {
-                Collections.currentScan(this@HomeActivity)
+            val launch = withContext(Dispatchers.IO) {
+                val destinations = Collections.currentScans(this@HomeActivity)
+                val store = ScanSearchQueue.read(this@HomeActivity)
+                Triple(
+                    destinations,
+                    store.valid,
+                    store.items.firstOrNull {
+                        it.status == ScanSearchStatus.PENDING &&
+                            it.scanCollectionId.isEmpty()
+                    }?.sessionId ?: UUID.randomUUID().toString(),
+                )
             }
             if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
-            if (destination == null) {
+            if (!launch.second) {
+                Toast.makeText(
+                    this@HomeActivity,
+                    R.string.scan_queue_save_failed,
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@launch
+            }
+            if (launch.first.isEmpty()) {
                 Toast.makeText(
                     this@HomeActivity,
                     R.string.scan_queue_needs_collection,
@@ -677,34 +669,17 @@ class HomeActivity : AppCompatActivity() {
                 ).show()
                 return@launch
             }
-            val roles = arrayOf(
-                getString(R.string.scan_queue_photo_cover),
-                getString(R.string.scan_queue_photo_title_page),
+            scanSearchCamera.launch(
+                Intent(this@HomeActivity, CoverScannerActivity::class.java)
+                    .putExtra(CoverScannerActivity.EXTRA_QUEUE_SESSION, true)
+                    .putExtra(CoverScannerActivity.EXTRA_SESSION_ID, launch.third),
             )
-            val dialog = AlertDialog.Builder(this@HomeActivity)
-                .setTitle(R.string.scan_queue_photo_title)
-                .setItems(roles) { _, index ->
-                    val role = if (index == 1) {
-                        ScanSearchPhotoRole.TITLE_PAGE
-                    } else {
-                        ScanSearchPhotoRole.COVER
-                    }
-                    pendingScanSearchRole = role
-                    pendingScanSearchCollectionId = destination.id
-                    scanSearchCamera.launch(
-                        Intent(this@HomeActivity, CoverScannerActivity::class.java)
-                            .putExtra(CoverScannerActivity.EXTRA_PHOTO_ROLE, role.wireValue),
-                    )
-                }
-                .setNegativeButton(android.R.string.cancel, null)
-                .create()
-            dialog.show()
-            RemoteUiCatalog.apply(dialog)
         }
     }
 
     private fun showScanSearchQueueItem(item: ScanSearchQueueItem) {
         activeScanSearchQueueId = item.id
+        activeScanSearchProposal = item
         rearmFailedRemoteInspectLookup()
         inspectCoverOcrText = item.ocrText.take(INSPECT_COVER_TEXT_MAX)
         val displayText = inspectCoverOcrText.lineSequence()
@@ -732,9 +707,12 @@ class HomeActivity : AppCompatActivity() {
                 val owner = Prefs.userId(this@HomeActivity).trim().lowercase()
                 val store = ScanSearchQueue.read(this@HomeActivity)
                 ScanQueueSummarySnapshot(
-                    activeCollection = Collections.currentScan(this@HomeActivity),
+                    activeCollections = Collections.currentScans(this@HomeActivity),
                     waitingItems = if (!store.valid) emptyList() else store.items.filter {
-                        it.status == ScanSearchStatus.PENDING &&
+                        it.status in setOf(
+                            ScanSearchStatus.PENDING,
+                            ScanSearchStatus.PROPOSED,
+                        ) && it.scanCollectionId.isNotEmpty() &&
                             (it.ownerId.isEmpty() ||
                                 (owner.isNotEmpty() && it.ownerId == owner))
                     },
@@ -743,21 +721,36 @@ class HomeActivity : AppCompatActivity() {
             }
             scanQueueSummaryJob = null
             if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
-            val destination = snapshot.activeCollection
+            val activeQueueId = activeScanSearchQueueId
+            if (snapshot.valid && activeQueueId != null) {
+                val refreshedProposal = snapshot.waitingItems.firstOrNull {
+                    it.id == activeQueueId
+                }
+                activeScanSearchProposal = refreshedProposal
+                if (refreshedProposal == null) activeScanSearchQueueId = null
+                if (activeTab == HomeTab.INSPECT) renderInspectLookup()
+            }
+            val destinations = snapshot.activeCollections
+            val destinationLabel = ScanCollectionSlot.entries.mapNotNull { slot ->
+                destinations[slot]?.let { "${slot.name}: ${it.name}" }
+            }.joinToString(" \u00b7 ")
+            val sessionCount = snapshot.waitingItems.map(ScanSearchQueueItem::sessionId)
+                .distinct()
+                .size
             binding.scanQueueSummary.visibility = View.VISIBLE
             binding.scanQueueSummary.isEnabled = snapshot.valid &&
                 snapshot.waitingItems.isNotEmpty()
             binding.scanQueueSummary.text = when {
                 !snapshot.valid -> getString(R.string.scan_queue_save_failed)
-                destination == null -> getString(R.string.scan_queue_needs_collection)
+                destinations.isEmpty() -> getString(R.string.scan_queue_needs_collection)
                 snapshot.waitingItems.isEmpty() -> getString(
                     R.string.scan_queue_summary_empty,
-                    destination.name,
+                    destinationLabel,
                 )
                 else -> getString(
                     R.string.scan_queue_summary,
-                    destination.name,
-                    snapshot.waitingItems.size,
+                    destinationLabel,
+                    sessionCount,
                 )
             }
             binding.scanQueueSummary.contentDescription = if (snapshot.waitingItems.isEmpty()) {
@@ -778,8 +771,14 @@ class HomeActivity : AppCompatActivity() {
                 ScanSearchQueue.read(this@HomeActivity)
                     .takeIf { it.valid }
                     ?.items
+                    ?.sortedByDescending {
+                        if (it.status == ScanSearchStatus.PROPOSED) 1 else 0
+                    }
                     ?.firstOrNull {
-                        it.status == ScanSearchStatus.PENDING &&
+                        it.status in setOf(
+                            ScanSearchStatus.PENDING,
+                            ScanSearchStatus.PROPOSED,
+                        ) && it.scanCollectionId.isNotEmpty() &&
                             (it.ownerId.isEmpty() ||
                                 (owner.isNotEmpty() && it.ownerId == owner))
                     }
@@ -1334,10 +1333,11 @@ class HomeActivity : AppCompatActivity() {
                         Prefs.currentCollectionId(this@HomeActivity),
                         CollectionType.CAPTURE,
                     ),
-                    currentScanCollection = resolveCurrentCollection(
+                    currentScanCollections = resolveScanCollectionSlots(
                         records,
-                        Prefs.currentScanCollectionId(this@HomeActivity),
-                        CollectionType.SCAN,
+                        ScanCollectionSlot.entries.associateWith {
+                            Prefs.currentScanCollectionId(this@HomeActivity, it)
+                        },
                     ),
                     collectionPaths = collectionDisplayPaths(records),
                 )
@@ -1348,7 +1348,7 @@ class HomeActivity : AppCompatActivity() {
             ) return@launch
             renderCollectionBar(
                 snapshot.currentCaptureCollection,
-                snapshot.currentScanCollection,
+                snapshot.currentScanCollections,
                 snapshot.collectionPaths,
             )
         }
@@ -1356,13 +1356,15 @@ class HomeActivity : AppCompatActivity() {
 
     private fun renderCollectionBar(
         currentCapture: BookCollection?,
-        currentScan: BookCollection?,
+        currentScans: Map<ScanCollectionSlot, BookCollection>,
         paths: Map<String, String>,
     ) {
         val captureLabel = currentCapture?.let { paths[it.id] ?: it.name }
             ?: getString(R.string.collections_none_selected)
-        val scanLabel = currentScan?.let { paths[it.id] ?: it.name }
-            ?: getString(R.string.collections_none_selected)
+        val scanLabel = ScanCollectionSlot.entries.joinToString("  \u00b7  ") { slot ->
+            val collection = currentScans[slot]
+            "${slot.name}: ${collection?.let { paths[it.id] ?: it.name } ?: "\u2014"}"
+        }
         binding.collectionBar.text = getString(
             R.string.collections_active_pair,
             captureLabel,
@@ -1370,7 +1372,7 @@ class HomeActivity : AppCompatActivity() {
         )
         binding.collectionBar.setTextColor(
             getColor(
-                if (currentCapture == null || currentScan == null) R.color.whl_amber
+                if (currentCapture == null || currentScans.isEmpty()) R.color.whl_amber
                 else R.color.whl_ink_dim,
             ),
         )
@@ -1396,10 +1398,11 @@ class HomeActivity : AppCompatActivity() {
                     Prefs.currentCollectionId(this@HomeActivity),
                     CollectionType.CAPTURE,
                 )
-                val currentScan = resolveCurrentCollection(
+                val currentScans = resolveScanCollectionSlots(
                     records,
-                    Prefs.currentScanCollectionId(this@HomeActivity),
-                    CollectionType.SCAN,
+                    ScanCollectionSlot.entries.associateWith {
+                        Prefs.currentScanCollectionId(this@HomeActivity, it)
+                    },
                 )
                 val counts = CollectionInventory.items(this@HomeActivity)
                     .also { loadContext.ensureActive() }
@@ -1412,7 +1415,7 @@ class HomeActivity : AppCompatActivity() {
                 CollectionListSnapshot(
                     collections = live + retiredConflict,
                     currentCaptureCollection = currentCapture,
-                    currentScanCollection = currentScan,
+                    currentScanCollections = currentScans,
                     collectionPaths = collectionDisplayPaths(records),
                     bookCounts = counts,
                 )
@@ -1430,10 +1433,10 @@ class HomeActivity : AppCompatActivity() {
         list.removeAllViews()
         val collections = snapshot.collections
         val currentCapture = snapshot.currentCaptureCollection
-        val currentScan = snapshot.currentScanCollection
+        val currentScans = snapshot.currentScanCollections
         val collectionPaths = snapshot.collectionPaths
         val counts = snapshot.bookCounts
-        renderCollectionBar(currentCapture, currentScan, collectionPaths)
+        renderCollectionBar(currentCapture, currentScans, collectionPaths)
         if (collections.isEmpty()) {
             list.addView(emptyNotice(getString(R.string.collections_empty)))
             return
@@ -1442,16 +1445,22 @@ class HomeActivity : AppCompatActivity() {
         for (c in collections) {
             val row = inflater.inflate(R.layout.item_collection, list, false)
             val isRetiredConflict = c.deleted && c.mergedInto == null
-            val isCurrent = !isRetiredConflict && c.id == when (c.collectionType) {
-                CollectionType.CAPTURE -> currentCapture?.id
-                CollectionType.SCAN -> currentScan?.id
+            val assignedScanSlots = currentScans.entries
+                .filter { it.value.id == c.id }
+                .map { it.key }
+            val isCurrent = !isRetiredConflict && when (c.collectionType) {
+                CollectionType.CAPTURE -> c.id == currentCapture?.id
+                CollectionType.SCAN -> assignedScanSlots.isNotEmpty()
             }
             row.isSelected = isCurrent
             ViewCompat.setStateDescription(
                 row,
                 when {
                     isCurrent && c.collectionType == CollectionType.SCAN ->
-                        getString(R.string.collections_current_scan_state)
+                        getString(
+                            R.string.collections_current_scan_slots_state,
+                            assignedScanSlots.joinToString { it.name },
+                        )
                     isCurrent -> getString(R.string.collections_current_state)
                     isRetiredConflict -> getString(R.string.collections_retired_conflict_state)
                     else -> null
@@ -1468,6 +1477,10 @@ class HomeActivity : AppCompatActivity() {
             row.setBackgroundResource(
                 if (isCurrent) R.drawable.whl_collection_current else R.drawable.whl_row)
             row.findViewById<TextView>(R.id.sub).text = listOf(
+                if (assignedScanSlots.isEmpty()) "" else getString(
+                    R.string.collections_scan_slot_badge,
+                    assignedScanSlots.joinToString("/") { it.name },
+                ),
                 getString(
                     if (c.collectionType == CollectionType.SCAN) {
                         R.string.collections_type_scan_short
@@ -1480,7 +1493,7 @@ class HomeActivity : AppCompatActivity() {
                 else getString(R.string.collections_row_from, c.from),
                 resources.getQuantityString(
                     R.plurals.collections_row_books, counts[c.id] ?: 0, counts[c.id] ?: 0),
-            ).filter { it.isNotEmpty() }.joinToString(" · ")
+            ).filter { it.isNotEmpty() }.joinToString(" \u00b7 ")
             val edit = row.findViewById<View>(R.id.editCollection)
             edit.contentDescription = getString(
                 if (isRetiredConflict) R.string.collections_retag_retired_description
@@ -1500,29 +1513,86 @@ class HomeActivity : AppCompatActivity() {
                 }
                 row.setOnClickListener {
                     if (c.collectionType == CollectionType.SCAN) {
-                        Prefs.setCurrentScanCollectionId(this, c.id)
+                        chooseScanCollectionSlot(c, currentScans)
                     } else {
                         Prefs.setCurrentCollectionId(this, c.id)
                         expandedScanGroups.add(c.id)
                     }
-                    Toast.makeText(
+                    if (c.collectionType != CollectionType.SCAN) Toast.makeText(
                         this,
                         getString(
-                            if (c.collectionType == CollectionType.SCAN) {
-                                R.string.collections_current_scan
-                            } else {
-                                R.string.collections_current
-                            },
+                            R.string.collections_current,
                             displayName,
                         ),
                         Toast.LENGTH_SHORT,
                     ).show()
-                    refreshCollections()
+                    if (c.collectionType != CollectionType.SCAN) refreshCollections()
                 }
             }
             RemoteUiCatalog.apply(row)
             list.addView(row)
         }
+    }
+
+    private fun chooseScanCollectionSlot(
+        collection: BookCollection,
+        current: Map<ScanCollectionSlot, BookCollection>,
+    ) {
+        val slots = ScanCollectionSlot.entries
+        val currentlyAssigned = current.entries.firstOrNull {
+            it.value.id == collection.id
+        }?.key
+        val choices = buildList {
+            slots.forEach { slot ->
+                val occupant = current[slot]
+                add(if (occupant == null || occupant.id == collection.id) {
+                    slot.name
+                } else {
+                    getString(R.string.collections_scan_slot_replace, slot.name, occupant.name)
+                })
+            }
+            if (currentlyAssigned != null) add(getString(R.string.collections_scan_slot_clear))
+        }.toTypedArray()
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(getString(R.string.collections_scan_slot_title, collection.name))
+            .setItems(choices) { _, index ->
+                val existing = ScanCollectionSlot.entries.associateWith {
+                    current[it]?.id
+                }
+                val selections = if (index < slots.size) {
+                    assignScanCollectionSlot(existing, slots[index], collection.id)
+                } else {
+                    existing.mapValues { (_, id) ->
+                        id.takeUnless { it == collection.id }
+                    }
+                }
+                if (!Prefs.setCurrentScanCollectionIds(this, selections)) {
+                    Toast.makeText(
+                        this,
+                        R.string.collections_scan_slot_save_failed,
+                        Toast.LENGTH_LONG,
+                    ).show()
+                } else {
+                    Toast.makeText(
+                        this,
+                        if (index < slots.size) {
+                            getString(
+                                R.string.collections_current_scan_slot,
+                                slots[index].name,
+                                collection.name,
+                            )
+                        } else {
+                            getString(R.string.collections_scan_slot_cleared, collection.name)
+                        },
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+                refreshCollections()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        dialog.show()
+        RemoteUiCatalog.apply(dialog)
     }
 
     private fun emptyNotice(text: String): TextView = TextView(this).apply {
@@ -1668,7 +1738,10 @@ class HomeActivity : AppCompatActivity() {
             // they are about to scan into; select it so the next tap works.
             if (existing == null) {
                 if (collectionType == CollectionType.SCAN) {
-                    Prefs.setCurrentScanCollectionId(this, collectionId)
+                    val active = Collections.currentScans(this)
+                    ScanCollectionSlot.entries.firstOrNull { it !in active }?.let { slot ->
+                        Prefs.setCurrentScanCollectionId(this, collectionId, slot)
+                    }
                 } else {
                     Prefs.setCurrentCollectionId(this, collectionId)
                     expandedScanGroups.add(collectionId)
@@ -2202,7 +2275,8 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun inspectLookupActive(): Boolean =
-        inspectCoverOcrText.isNotBlank() ||
+        activeScanSearchProposal?.candidateCaptureId?.isNotBlank() == true ||
+            inspectCoverOcrText.isNotBlank() ||
             normalizeInspectBookLookupText(inspectLookupQuery).length >= 2
 
     private fun renderInspectLookup(snapshot: InspectSnapshot? = inspectRenderedSnapshot) {
@@ -2233,7 +2307,14 @@ class HomeActivity : AppCompatActivity() {
         } else {
             InspectLookupMode.TYPED
         }
-        val matches = findInspectBookMatches(records, rawQuery, mode, INSPECT_LOOKUP_LIMIT)
+        val proposalId = activeScanSearchProposal?.candidateCaptureId.orEmpty()
+        val matches = if (proposalId.isNotEmpty()) {
+            records.firstOrNull { it.entryId == proposalId }?.let {
+                listOf(InspectLookupMatch(it, Int.MAX_VALUE, InspectBookMatchKind.EXACT))
+            }.orEmpty()
+        } else {
+            findInspectBookMatches(records, rawQuery, mode, INSPECT_LOOKUP_LIMIT)
+        }
         val topScore = matches.firstOrNull()?.score
         val ambiguous = topScore != null && matches.asSequence()
             .takeWhile { it.score == topScore }
@@ -2285,9 +2366,17 @@ class HomeActivity : AppCompatActivity() {
                 false,
             )
             row.findViewById<TextView>(R.id.inspectTitle).text = item.book.title
+            val proposal = activeScanSearchProposal?.takeIf {
+                it.status == ScanSearchStatus.PROPOSED &&
+                    it.candidateCaptureId == item.book.entryId
+            }
+            val confidenceLabel = proposal?.matchConfidence?.let {
+                getString(R.string.scan_queue_match_confidence, (it * 100).roundToInt())
+            }.orEmpty()
             row.findViewById<TextView>(R.id.inspectSubtitle).text = listOf(
                 item.book.author,
                 item.book.year,
+                confidenceLabel,
             ).filter(String::isNotBlank).joinToString(" \u00b7 ")
             val collectionDescription = getString(
                 R.string.inspect_lookup_collection,
@@ -2328,8 +2417,14 @@ class HomeActivity : AppCompatActivity() {
                 val queueId = activeScanSearchQueueId
                 if (queueId == null) {
                     showInspectLookupCollection(item)
+                } else if (proposal == null) {
+                    Toast.makeText(
+                        this,
+                        R.string.scan_queue_waiting_for_proposal,
+                        Toast.LENGTH_SHORT,
+                    ).show()
                 } else {
-                    showScanSearchMatchConfirmation(queueId, item)
+                    showScanSearchProposalReview(queueId, item)
                 }
             }
             RemoteUiCatalog.apply(row)
@@ -2454,7 +2549,7 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
-    private fun showScanSearchMatchConfirmation(
+    private fun showScanSearchProposalReview(
         queueId: String,
         item: InspectLookupRenderItem,
     ) {
@@ -2464,7 +2559,10 @@ class HomeActivity : AppCompatActivity() {
                 val queue = ScanSearchQueue.read(this@HomeActivity)
                     .takeIf { it.valid }
                     ?.items
-                    ?.firstOrNull { it.id == queueId && it.status != ScanSearchStatus.MATCHED }
+                    ?.firstOrNull {
+                        it.id == queueId && it.status == ScanSearchStatus.PROPOSED &&
+                            it.candidateCaptureId == item.book.entryId
+                    }
                     ?: return@withContext null
                 val records = Collections.allRecords(this@HomeActivity)
                 val destination = records.firstOrNull {
@@ -2491,18 +2589,23 @@ class HomeActivity : AppCompatActivity() {
                 inspectRenderedCollectionPaths[it.id] ?: it.name
             } ?: item.collectionName
             val dialog = AlertDialog.Builder(this@HomeActivity)
-                .setTitle(R.string.scan_queue_match_title)
+                .setTitle(R.string.scan_queue_review_title)
                 .setMessage(
                     getString(
-                        R.string.scan_queue_match_message,
+                        R.string.scan_queue_review_message,
                         item.book.title,
+                        queue.matchConfidence?.let { (it * 100).roundToInt() }
+                            ?.toString() ?: "?",
                         sourceName,
                         inspectRenderedCollectionPaths[destination.id] ?: destination.name,
                     ),
                 )
-                .setNegativeButton(android.R.string.cancel, null)
-                .setPositiveButton(R.string.scan_queue_match_action) { _, _ ->
-                    completeScanSearchMatch(queue, destination, item)
+                .setNeutralButton(android.R.string.cancel, null)
+                .setNegativeButton(R.string.scan_queue_reject_action) { _, _ ->
+                    rejectScanSearchProposal(queue)
+                }
+                .setPositiveButton(R.string.scan_queue_approve_action) { _, _ ->
+                    approveScanSearchProposal(queue, destination, item)
                 }
                 .create()
             dialog.show()
@@ -2510,7 +2613,7 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
-    private fun completeScanSearchMatch(
+    private fun approveScanSearchProposal(
         queue: ScanSearchQueueItem,
         destination: BookCollection,
         item: InspectLookupRenderItem,
@@ -2523,18 +2626,24 @@ class HomeActivity : AppCompatActivity() {
                     try {
                         val captureId = item.book.entryId.trim().lowercase()
                         require(SAFE_CAPTURE_SYNC_ID.matches(captureId))
+                        val owner = queue.ownerId.trim().lowercase()
+                        require(SAFE_CAPTURE_SYNC_ID.matches(owner))
+                        require(Prefs.userId(this@HomeActivity).trim().lowercase() == owner)
+                        require(queue.candidateCaptureId == captureId)
+                        require(queue.scanCollectionId == destination.id)
+                        if (Prefs.currentEntryId(this@HomeActivity) == captureId) {
+                            return@withLock ScanProposalDecisionOutcome.FAILED
+                        }
+
                         val records = Collections.allRecords(this@HomeActivity)
                         val liveDestination = records.firstOrNull {
                             it.id == destination.id && !it.deleted && it.mergedInto == null &&
                                 it.collectionType == CollectionType.SCAN
-                        } ?: throw IllegalStateException("scan collection is no longer live")
+                        }
                         val storedEntry = Entries.findIncludingArchive(
                             this@HomeActivity,
                             captureId,
                         )
-                        if (Prefs.currentEntryId(this@HomeActivity) == captureId) {
-                            throw IllegalStateException("capture is active")
-                        }
                         val summary = item.snapshot.item.summary
                         val sourceId = sequenceOf(
                             summary.scanSourceCollectionId,
@@ -2548,61 +2657,55 @@ class HomeActivity : AppCompatActivity() {
                                             it.collectionType == CollectionType.CAPTURE
                                     }
                             }
-                            ?: throw IllegalStateException("capture provenance is unavailable")
-
-                        if (storedEntry != null && !CaptureScanMarkStore.write(
-                                storedEntry.dir,
-                                sourceId,
-                                liveDestination.id,
-                            )
-                        ) throw IllegalStateException("scan mark could not be saved")
-
-                        check(InspectBookMemberships.move(
-                            this@HomeActivity,
-                            setOf(captureId),
-                            liveDestination.id,
-                        )) { "membership intent could not be saved" }
-
-                        val owner = sequenceOf(
-                            item.snapshot.cloudOwnerId,
-                            summary.cloudOwnerId,
-                            storedEntry?.cloudOwnerId.orEmpty(),
-                            queue.ownerId,
-                        ).map { it.trim().lowercase() }
-                            .firstOrNull(SAFE_CAPTURE_SYNC_ID::matches)
-                            .orEmpty()
-                        if (owner.isNotEmpty()) {
-                            check(InspectBookMemberships.markCloud(
-                                this@HomeActivity,
-                                setOf(captureId),
-                                owner,
-                            )) { "cloud owner could not be saved" }
+                        val client = ScanWorkflowClient(this@HomeActivity, owner)
+                        val accepted = try {
+                            client.approve(queue.id, captureId)
+                        } catch (error: SupabaseClient.HttpException) {
+                            if (error.code == 409) {
+                                refreshLiveScanSearchQueue(client, owner)
+                                return@withLock ScanProposalDecisionOutcome.STALE
+                            }
+                            throw error
                         }
-                        check(ScanSearchQueue.match(
-                            this@HomeActivity,
-                            queue.id,
-                            captureId,
-                        )) { "scan search match could not be saved" }
+                        check(accepted.status == ScanSearchStatus.MATCHED &&
+                            accepted.candidateCaptureId == captureId &&
+                            accepted.matchedCaptureId == captureId)
 
-                        if (owner.isNotEmpty() && owner == Prefs.userId(this@HomeActivity)) {
-                            RemoteCollectionBooks.applyMembershipMutation(
-                                this@HomeActivity,
-                                setOf(captureId),
-                                liveDestination.id,
-                                removed = false,
-                                owner = owner,
-                            )
+                        // The approval RPC has already moved cloud membership and
+                        // recorded provenance atomically. These local projections
+                        // are best-effort cache/sidecar updates, never an outbox.
+                        if (storedEntry != null && sourceId != null && liveDestination != null) {
+                            runCatching {
+                                CaptureScanMarkStore.write(
+                                    storedEntry.dir,
+                                    sourceId,
+                                    liveDestination.id,
+                                )
+                            }
                         }
-                        owner
+                        if (liveDestination != null) {
+                            runCatching {
+                                RemoteCollectionBooks.applyMembershipMutation(
+                                    this@HomeActivity,
+                                    setOf(captureId),
+                                    liveDestination.id,
+                                    removed = false,
+                                    owner = owner,
+                                )
+                            }
+                        }
+                        ScanSearchQueue.acknowledge(this@HomeActivity, queue, accepted)
+                        refreshLiveScanSearchQueue(client, owner)
+                        ScanProposalDecisionOutcome.APPLIED
                     } catch (e: CancellationException) {
                         throw e
-                    } catch (e: Exception) {
-                        null
+                    } catch (_: Exception) {
+                        ScanProposalDecisionOutcome.FAILED
                     }
                 }
             }
             scanQueueMutationInFlight = false
-            if (outcome == null) {
+            if (outcome == ScanProposalDecisionOutcome.FAILED) {
                 Toast.makeText(
                     this@HomeActivity,
                     R.string.scan_queue_match_failed,
@@ -2611,6 +2714,7 @@ class HomeActivity : AppCompatActivity() {
                 return@launch
             }
             activeScanSearchQueueId = null
+            activeScanSearchProposal = null
             inspectCoverOcrText = ""
             inspectLookupQuery = ""
             suppressInspectLookupWatcher = true
@@ -2622,14 +2726,91 @@ class HomeActivity : AppCompatActivity() {
             refreshInspect()
             Toast.makeText(
                 this@HomeActivity,
-                if (outcome.isEmpty()) {
-                    R.string.scan_queue_match_pending
+                if (outcome == ScanProposalDecisionOutcome.STALE) {
+                    R.string.scan_queue_proposal_stale
                 } else {
                     R.string.scan_queue_match_saved
                 },
                 Toast.LENGTH_LONG,
             ).show()
         }
+    }
+
+    private fun rejectScanSearchProposal(queue: ScanSearchQueueItem) {
+        if (scanQueueMutationInFlight) return
+        scanQueueMutationInFlight = true
+        lifecycleScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                INSPECT_MEMBERSHIP_MUTATION_MUTEX.withLock {
+                    try {
+                        val owner = queue.ownerId.trim().lowercase()
+                        val captureId = queue.candidateCaptureId.trim().lowercase()
+                        require(SAFE_CAPTURE_SYNC_ID.matches(owner))
+                        require(SAFE_CAPTURE_SYNC_ID.matches(captureId))
+                        require(Prefs.userId(this@HomeActivity).trim().lowercase() == owner)
+                        val client = ScanWorkflowClient(this@HomeActivity, owner)
+                        val accepted = try {
+                            client.reject(queue.id, captureId)
+                        } catch (error: SupabaseClient.HttpException) {
+                            if (error.code == 409) {
+                                refreshLiveScanSearchQueue(client, owner)
+                                return@withLock ScanProposalDecisionOutcome.STALE
+                            }
+                            throw error
+                        }
+                        check(accepted.status == ScanSearchStatus.REJECTED &&
+                            accepted.candidateCaptureId == captureId)
+                        ScanSearchQueue.acknowledge(this@HomeActivity, queue, accepted)
+                        refreshLiveScanSearchQueue(client, owner)
+                        ScanProposalDecisionOutcome.APPLIED
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        ScanProposalDecisionOutcome.FAILED
+                    }
+                }
+            }
+            scanQueueMutationInFlight = false
+            if (outcome == ScanProposalDecisionOutcome.FAILED) {
+                Toast.makeText(
+                    this@HomeActivity,
+                    R.string.scan_queue_match_failed,
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@launch
+            }
+            activeScanSearchQueueId = null
+            activeScanSearchProposal = null
+            inspectCoverOcrText = ""
+            inspectLookupQuery = ""
+            suppressInspectLookupWatcher = true
+            binding.inspectBookSearch.text?.clear()
+            suppressInspectLookupWatcher = false
+            ScanSearchQueueSyncWorker.enqueue(this@HomeActivity)
+            refreshScanSearchQueueSummary()
+            refreshInspect()
+            Toast.makeText(
+                this@HomeActivity,
+                if (outcome == ScanProposalDecisionOutcome.STALE) {
+                    R.string.scan_queue_proposal_stale
+                } else {
+                    R.string.scan_queue_rejected
+                },
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+
+    /** Pull the complete live snapshot so accepted/rejected session siblings vanish locally. */
+    private fun refreshLiveScanSearchQueue(
+        client: ScanWorkflowClient,
+        owner: String,
+    ): Boolean = try {
+        ScanSearchQueue.mergeCloud(this, owner, client.queue())
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        false
     }
 
     private fun resetRemoteInspectLookup(owner: String) {
@@ -3288,10 +3469,11 @@ class HomeActivity : AppCompatActivity() {
                         Prefs.currentCollectionId(this@HomeActivity),
                         CollectionType.CAPTURE,
                     ),
-                    currentScanCollection = resolveCurrentCollection(
+                    currentScanCollections = resolveScanCollectionSlots(
                         records,
-                        Prefs.currentScanCollectionId(this@HomeActivity),
-                        CollectionType.SCAN,
+                        ScanCollectionSlot.entries.associateWith {
+                            Prefs.currentScanCollectionId(this@HomeActivity, it)
+                        },
                     ),
                 )
             }
@@ -3328,7 +3510,7 @@ class HomeActivity : AppCompatActivity() {
         if (updateCollectionBar) {
             renderCollectionBar(
                 snapshot.currentCollection,
-                snapshot.currentScanCollection,
+                snapshot.currentScanCollections,
                 snapshot.collectionPaths,
             )
         }
@@ -4386,8 +4568,6 @@ class HomeActivity : AppCompatActivity() {
         const val STATE_INSPECT_LOOKUP_QUERY = "inspect_lookup_query"
         const val STATE_INSPECT_COVER_OCR = "inspect_cover_ocr"
         const val STATE_ACTIVE_SCAN_SEARCH_QUEUE = "active_scan_search_queue"
-        const val STATE_PENDING_SCAN_SEARCH_ROLE = "pending_scan_search_role"
-        const val STATE_PENDING_SCAN_SEARCH_COLLECTION = "pending_scan_search_collection"
         const val STATE_SCAN_GROUPS_INITIALIZED = "scan_groups_initialized"
         const val STATE_EXPANDED_SCAN_GROUPS = "expanded_scan_groups"
         const val STATE_SYNC_FEEDBACK_REQUEST = "sync_feedback_request"

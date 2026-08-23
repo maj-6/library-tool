@@ -94,6 +94,12 @@ internal fun formatCaptureElapsed(elapsedMillis: Long): String {
     }
 }
 
+internal fun scanSlotForCaptureCommand(command: String): ScanCollectionSlot? =
+    ScanCollectionSlot.fromWire(command)
+
+internal fun isCaptureSaveTerminalCommand(command: String?): Boolean =
+    command == "done" || command?.let(::scanSlotForCaptureCommand) != null
+
 /**
  * Hands-free book capture:
  *
@@ -379,7 +385,7 @@ class MainActivity : AppCompatActivity() {
         // Normally an unsubmitted request should not fire after the user leaves.
         // Done is different: it explicitly promises to finish every accepted
         // capture, so keep its one queued reservation for the next resume.
-        if (pendingCommand != "done") cancelQueuedCapture()
+        if (!isCaptureSaveTerminalCommand(pendingCommand)) cancelQueuedCapture()
         backgroundRefreshJob?.cancel()
         backgroundRefreshJob = null
         super.onStop()
@@ -1617,7 +1623,8 @@ class MainActivity : AppCompatActivity() {
         // it. Done waits for both accepted shots. Cancel/restart drop the
         // queued shot. Undo drops the queued shot immediately, or waits for the
         // active shot and then removes that newly committed final page.
-        val waitsForCapture = word in setOf("done", "cancel", "restart", "undo")
+        val waitsForCapture = isCaptureSaveTerminalCommand(word) ||
+            word in setOf("cancel", "restart", "undo")
         if ((captureQueue.busy || session.hasActiveCaptureWrites()) && waitsForCapture) {
             if (word == "undo" && captureQueue.queued != null) {
                 cancelQueuedCapture()
@@ -1635,10 +1642,10 @@ class MainActivity : AppCompatActivity() {
                 word,
                 targetPage = pendingUndoTargetPage,
             )
-            if (word != "done") cancelQueuedCapture()
+            if (!isCaptureSaveTerminalCommand(word)) cancelQueuedCapture()
             setStatus(
                 when (word) {
-                    "done" -> getString(R.string.capture_waiting_done)
+                    "done", "a", "b", "c" -> getString(R.string.capture_waiting_done)
                     "cancel" -> getString(R.string.capture_waiting_cancel)
                     "restart" -> getString(R.string.capture_waiting_restart)
                     else -> getString(R.string.capture_waiting_undo)
@@ -1687,40 +1694,9 @@ class MainActivity : AppCompatActivity() {
                 else takePhoto(checkCatalogs = true)
             }
             "scan" -> markCurrentBookForScan()
-            "done" -> {
-                if (!session.active) cues.error("nothing to save")
-                else {
-                    val photos = session.photoCount
-                    val hasNotes = session.entryId?.let { id ->
-                        CaptureNotes.read(session.entryDir(id)).notes.isNotEmpty()
-                    } == true
-                    val id = session.done()
-                    when {
-                        id != null -> {
-                            val hasScanMark = Entries.findIncludingArchive(this, id)
-                                ?.dir
-                                ?.let(CaptureScanMarkStore::read) != null
-                            val markStaged = !hasScanMark ||
-                                CaptureScanMarkStore.stageMembership(this, id)
-                            cues.saved(photos)
-                            ProcessWorker.enqueuePending(this, id)
-                            UploadWorker.enqueue(this)
-                            refreshLastCapturedBook()
-                            if (!markStaged) {
-                                setStatus(getString(R.string.capture_scan_mark_stage_failed))
-                            }
-                        }
-                        // null + still active = the manifest write failed
-                        // (disk full); the pages are kept and "done" can retry
-                        session.active && photos == 0 && hasNotes -> {
-                            cues.error("take a page photo before finishing")
-                            setStatus(getString(R.string.capture_note_needs_photo))
-                        }
-                        session.active -> cues.error("could not save, still open")
-                        else -> cues.error("no captures, entry dropped")
-                    }
-                }
-            }
+            "done", "a", "b", "c" -> finishCurrentBook(
+                scanSlotForCaptureCommand(word),
+            )
             "cancel" -> {
                 val discarded = session.cancel()
                 if (discarded != null) {
@@ -1744,18 +1720,22 @@ class MainActivity : AppCompatActivity() {
      * shutter. The source is recorded while the entry is open, but membership
      * changes only after Done, so Cancel cannot leave a ghost scan-list row.
      */
-    private fun markCurrentBookForScan() {
+    private fun markCurrentBookForScan(
+        slot: ScanCollectionSlot = ScanCollectionSlot.A,
+    ): Boolean {
         val entryId = session.entryId
         val provenance = session.provenance
-        val destination = Collections.currentScan(this)
-        when {
+        val destination = Collections.currentScan(this, slot)
+        val marked = when {
             entryId == null || provenance == null || !session.active -> {
                 cues.error("no entry open")
                 setStatus(getString(R.string.capture_scan_mark_needs_capture))
+                false
             }
             destination == null -> {
-                cues.error("choose a scan collection first")
-                setStatus(getString(R.string.capture_scan_mark_needs_collection))
+                cues.error("choose scan collection ${slot.name} first")
+                setStatus(getString(R.string.capture_scan_mark_needs_slot, slot.name))
+                false
             }
             !CaptureScanMarkStore.write(
                 session.entryDir(entryId),
@@ -1764,13 +1744,57 @@ class MainActivity : AppCompatActivity() {
             ) -> {
                 cues.error("could not mark for scan")
                 setStatus(getString(R.string.capture_scan_mark_failed))
+                false
             }
             else -> {
                 cues.markedForScan()
-                setStatus(getString(R.string.capture_scan_marked, destination.name))
+                setStatus(getString(
+                    R.string.capture_scan_marked_slot,
+                    slot.name,
+                    destination.name,
+                ))
+                true
             }
         }
         updateUi()
+        return marked
+    }
+
+    /** A/B/C is Done plus an atomic local scan mark for the selected slot. */
+    private fun finishCurrentBook(scanSlot: ScanCollectionSlot?) {
+        if (!session.active) {
+            cues.error("nothing to save")
+            return
+        }
+        if (scanSlot != null && !markCurrentBookForScan(scanSlot)) return
+        val photos = session.photoCount
+        val hasNotes = session.entryId?.let { id ->
+            CaptureNotes.read(session.entryDir(id)).notes.isNotEmpty()
+        } == true
+        val id = session.done()
+        when {
+            id != null -> {
+                val hasScanMark = Entries.findIncludingArchive(this, id)
+                    ?.dir
+                    ?.let(CaptureScanMarkStore::read) != null
+                val markStaged = !hasScanMark || CaptureScanMarkStore.stageMembership(this, id)
+                cues.saved(photos)
+                ProcessWorker.enqueuePending(this, id)
+                UploadWorker.enqueue(this)
+                refreshLastCapturedBook()
+                if (!markStaged) {
+                    setStatus(getString(R.string.capture_scan_mark_stage_failed))
+                }
+            }
+            // null + still active = the manifest write failed (disk full); the
+            // pages and slot mark are retained so the same terminal command can retry.
+            session.active && photos == 0 && hasNotes -> {
+                cues.error("take a page photo before finishing")
+                setStatus(getString(R.string.capture_note_needs_photo))
+            }
+            session.active -> cues.error("could not save, still open")
+            else -> cues.error("no captures, entry dropped")
+        }
     }
 
     /** Reopen the newest sealed capture which has not left this device. The
@@ -2448,7 +2472,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-            if (pendingCommand == "done") {
+            if (isCaptureSaveTerminalCommand(pendingCommand)) {
                 deferredCaptureSubmission = true
                 Log.i(
                     CAMERA_LOG_TAG,

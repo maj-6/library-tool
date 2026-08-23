@@ -15431,47 +15431,228 @@ function scanQueueCaptureLabel(captureId, candidates = scanQueueCandidates()) {
   return candidate ? candidate.title : `Capture ${String(captureId || "").slice(0, 8)}`;
 }
 
+const SCAN_QUEUE_STATUSES = new Set([
+  "pending", "proposed", "matched", "rejected", "failed",
+]);
+
+function scanQueueStatus(item) {
+  const value = String((item && item.status) || "pending").toLocaleLowerCase();
+  return SCAN_QUEUE_STATUSES.has(value) ? value : "pending";
+}
+
+function scanQueueConfidence(value) {
+  if (value == null || value === "") return null;
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0 || numeric > 1) return null;
+  const percent = Math.round(numeric * 100);
+  const rating = percent >= 85 ? "high" : percent >= 65 ? "medium" : "low";
+  return { value: numeric, percent, rating };
+}
+
+function scanQueueEvidenceLabel(key) {
+  const labels = {
+    ocr: "OCR similarity", ocr_similarity: "OCR similarity",
+    text: "OCR/title similarity",
+    title: "Title similarity", title_similarity: "Title similarity",
+    author: "Author similarity", author_similarity: "Author similarity",
+    color: "Color similarity", colour: "Color similarity",
+    color_similarity: "Color similarity", colour_similarity: "Color similarity",
+    cover_color_similarity: "Color similarity",
+    feature: "Feature similarity", features: "Feature similarity",
+    feature_similarity: "Feature similarity", cover_feature_similarity: "Feature similarity",
+    visual_feature_similarity: "Feature similarity",
+    visual: "Visual similarity", visual_similarity: "Visual similarity",
+    structure: "Structure similarity", gradient: "Edge-feature similarity",
+    aspect: "Aspect similarity", band: "Confidence band",
+    exposure_adjusted: "Exposure adjusted", exposure_invariant: "Exposure tolerant",
+    reason: "Matcher note", reasons: "Matcher notes", notes: "Matcher notes",
+  };
+  if (labels[key]) return labels[key];
+  return String(key || "Evidence").replace(/_/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toLocaleUpperCase()).slice(0, 80);
+}
+
+function scanQueueEvidenceValue(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value >= 0 && value <= 1 ? `${Math.round(value * 100)}%` : String(value);
+  }
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (typeof value === "string") return value.replace(/\s+/g, " ").trim().slice(0, 180);
+  if (Array.isArray(value)) {
+    return value.filter((item) => ["string", "number", "boolean"].includes(typeof item))
+      .map((item) => scanQueueEvidenceValue(item)).filter(Boolean).join("; ").slice(0, 240);
+  }
+  return "";
+}
+
+function scanQueueEvidenceEntries(evidence) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return [];
+  const nested = evidence.components && typeof evidence.components === "object" &&
+    !Array.isArray(evidence.components) ? evidence.components : {};
+  const merged = { ...nested, ...evidence };
+  delete merged.components;
+  delete merged.version;
+  const order = [
+    "text", "ocr_similarity", "ocr", "title_similarity", "title",
+    "author_similarity", "author",
+    "color_similarity", "colour_similarity", "cover_color_similarity", "color", "colour",
+    "feature_similarity", "cover_feature_similarity", "visual_feature_similarity",
+    "feature", "features", "structure", "gradient", "visual_similarity", "visual", "aspect",
+    "exposure_adjusted", "exposure_invariant", "band", "reason", "reasons", "notes",
+  ];
+  return Object.entries(merged).map(([key, value], index) => ({
+    key, label: scanQueueEvidenceLabel(key), value: scanQueueEvidenceValue(value),
+    order: order.indexOf(key) < 0 ? order.length + index : order.indexOf(key),
+  })).filter((item) => item.value).sort((a, b) => a.order - b.order).slice(0, 10);
+}
+
+function scanQueueReviewItems(items) {
+  const groups = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    const sessionId = String(item.session_id || "");
+    const key = sessionId ? `session:${sessionId}` : `item:${String(item.id || "")}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  return [...groups.values()].map((rows) => {
+    const proposals = rows.filter((row) =>
+      scanQueueStatus(row) === "proposed" && row.candidate_capture_id);
+    const candidateIds = new Set(proposals.map((row) => String(row.candidate_capture_id)));
+    const representative = proposals[0] || rows.find((row) =>
+      scanQueueStatus(row) === "pending") || rows[0];
+    const statuses = rows.map(scanQueueStatus);
+    const hasPending = statuses.includes("pending");
+    const status = candidateIds.size > 1 ? "failed" : hasPending ? "pending" :
+      proposals.length ? "proposed" : statuses.includes("failed") ? "failed" :
+        statuses.includes("matched") ? "matched" : "rejected";
+    return {
+      ...representative,
+      status,
+      candidate_capture_id: hasPending && proposals.length ? "" : candidateIds.size === 1
+        ? [...candidateIds][0] :
+        representative.candidate_capture_id,
+      _review_items: rows,
+      _proposal_conflict: candidateIds.size > 1,
+      _stale_proposal: hasPending && proposals.length > 0,
+    };
+  });
+}
+
+function scanQueueCaptureHtml(item) {
+  const rows = Array.isArray(item._review_items) ? item._review_items : [item];
+  const label = `${rows.length} captured photo${rows.length === 1 ? "" : "s"}`;
+  const details = rows.map((row) => {
+    const excerpt = String(row.ocr_text || "").replace(/\s+/g, " ").trim().slice(0, 320);
+    const captureText = excerpt || (row.visual_signature
+      ? "Visual match evidence captured; no OCR text was returned."
+      : "Waiting for capture analysis.");
+    const errorText = scanQueueStatus(row) === "failed" && row.error
+      ? `<span class="scan-queue-error">${esc(String(row.error).slice(0, 240))}</span>` : "";
+    return `<li>${esc(captureText)}${errorText}</li>`;
+  }).join("");
+  return `<span class="scan-capture-count">${esc(label)}</span>` +
+    `<ul class="scan-capture-details">${details}</ul>`;
+}
+
+function scanQueueProposalHtml(item, capturedBooks) {
+  const status = scanQueueStatus(item);
+  if (item._proposal_conflict) {
+    return `<span class="scan-proposal-empty">Conflicting proposals need a new match.</span>`;
+  }
+  if (item._stale_proposal) {
+    return `<span class="scan-proposal-empty">New capture evidence is still being analyzed.</span>`;
+  }
+  const candidateId = String(item.candidate_capture_id ||
+    (status === "matched" ? item.matched_capture_id : "") || "");
+  if (!candidateId) {
+    const empty = status === "failed" ? "Matching failed" :
+      status === "rejected" ? "Proposal rejected" : "Awaiting a match proposal";
+    return `<span class="scan-proposal-empty">${empty}</span>`;
+  }
+  const candidate = capturedBooks.find((row) => row.captureId === candidateId);
+  const title = candidate ? candidate.title : scanQueueCaptureLabel(candidateId, capturedBooks);
+  const detail = candidate ? [candidate.author, candidate.year].filter(Boolean).join(" · ") : "";
+  return `<strong class="scan-proposal-title">${esc(title)}</strong>` +
+    (detail ? `<span class="scan-proposal-detail">${esc(detail)}</span>` : "") +
+    `<span class="scan-proposal-id">Capture ${esc(candidateId.slice(0, 8))}</span>`;
+}
+
+function scanQueueEvidenceHtml(item) {
+  const confidence = scanQueueConfidence(item.match_confidence);
+  const rows = Array.isArray(item._review_items) ? item._review_items : [item];
+  const evidenceByLabel = new Map();
+  for (const row of rows) {
+    for (const entry of scanQueueEvidenceEntries(row.match_evidence)) {
+      if (!evidenceByLabel.has(entry.label)) evidenceByLabel.set(entry.label, []);
+      const values = evidenceByLabel.get(entry.label);
+      if (!values.includes(entry.value)) values.push(entry.value);
+    }
+  }
+  const evidence = [...evidenceByLabel].map(([label, values]) => ({
+    label, value: values.join("; "),
+  })).slice(0, 10);
+  let html = confidence
+    ? `<span class="scan-confidence ${confidence.rating}" ` +
+      `aria-label="Match confidence ${confidence.percent} percent, ${confidence.rating}">` +
+      `Confidence ${confidence.percent}% · ${confidence.rating}</span>`
+    : `<span class="scan-confidence unavailable">Confidence not rated</span>`;
+  if (evidence.length) {
+    html += `<dl class="scan-match-evidence" aria-label="Match evidence">` +
+      evidence.map((entry) => `<div><dt>${esc(entry.label)}</dt><dd>${esc(entry.value)}</dd></div>`)
+        .join("") + `</dl>`;
+  } else {
+    html += `<span class="scan-evidence-empty">No component evidence reported</span>`;
+  }
+  return html;
+}
+
 function renderScanQueue() {
   const queueHost = el("scan-queue-list");
   const stateHost = el("scan-state-list");
-  const pending = Array.isArray(state.scanQueue) ? state.scanQueue : [];
+  const queueItems = scanQueueReviewItems(state.scanQueue);
   const marks = Array.isArray(state.scanStates) ? state.scanStates : [];
   const capturedBooks = scanQueueCandidates();
+  const proposed = queueItems.filter((item) => scanQueueStatus(item) === "proposed").length;
+  const waiting = queueItems.filter((item) => scanQueueStatus(item) === "pending").length;
   el("scan-queue-refresh").disabled = state.scanQueueLoading || state.scanQueueBusy;
   el("scan-queue-msg").textContent = state.scanQueueError ||
     (state.scanQueueLoading ? "Loading scan queue…" :
-      state.scanQueueBusy ? "Matching book…" : "");
-  el("scan-queue-count").textContent = `${pending.length} pending · ` +
+      state.scanQueueBusy ? "Saving review decision…" : "");
+  el("scan-queue-count").textContent = `${proposed} ready · ${waiting} matching · ` +
     `${marks.filter((row) => row.active).length} marked`;
 
-  if (!pending.length) {
+  if (!queueItems.length) {
     queueHost.innerHTML = `<p class="pane-note">${state.scanQueueLoading
-      ? "Loading pending cover and title-page searches…"
-      : "No pending cover or title-page searches."}</p>`;
+      ? "Loading physical scan match reviews…"
+      : "No physical scan captures are awaiting review."}</p>`;
   } else {
     let html = `<table class="grid scan-queue-table"><thead><tr>` +
-      `<th>OCR search</th><th>Destination</th><th>Existing captured book</th>` +
+      `<th>Captured photo</th><th>Destination</th><th>Proposed existing book</th>` +
+      `<th>Confidence and evidence</th><th>Decision</th>` +
       `</tr></thead><tbody>`;
-    for (const item of pending) {
-      const candidates = scanQueueCandidates(item.ocr_text);
-      const options = candidates.map((candidate) => {
-        const detail = [candidate.author, candidate.year].filter(Boolean).join(" · ");
-        const label = `${candidate.title}${detail ? ` — ${detail}` : ""} ` +
-          `[${candidate.captureId.slice(0, 8)}]`;
-        return `<option value="${esc(candidate.captureId)}">${esc(label)}</option>`;
-      }).join("");
-      const excerpt = String(item.ocr_text || "").replace(/\s+/g, " ").trim().slice(0, 600);
-      html += `<tr data-scan-queue-id="${esc(item.id)}">` +
-        `<td class="scan-queue-ocr"><strong>${esc(item.photo_role === "title_page"
-          ? "Title page" : "Cover")}</strong><br>${esc(excerpt)}</td>` +
+    for (const item of queueItems) {
+      const itemStatus = scanQueueStatus(item);
+      const candidateId = String(item.candidate_capture_id || "");
+      const canDecide = itemStatus === "proposed" && Boolean(candidateId) &&
+        !state.scanQueueBusy;
+      html += `<tr class="scan-queue-${itemStatus}" data-scan-queue-id="${esc(item.id)}">` +
+        `<td class="scan-queue-ocr"><span class="scan-queue-status ${itemStatus}">` +
+          `${esc(itemStatus)}</span>${scanQueueCaptureHtml(item)}</td>` +
         `<td>${esc(scanQueueCollectionName(item.scan_collection_id))}</td>` +
-        `<td><span class="scan-queue-match"><select class="cad-input" ` +
-          `data-scan-match aria-label="Match OCR row to an existing captured book"` +
-          `${state.scanQueueBusy || !candidates.length ? " disabled" : ""}>` +
-          `${options || '<option value="">No captured books available</option>'}</select>` +
-          `<button class="cad-btn tiny" type="button" data-scan-queue-act="complete"` +
-          `${state.scanQueueBusy || !candidates.length ? " disabled" : ""}>Match</button>` +
-          `</span></td></tr>`;
+        `<td class="scan-queue-proposal">${scanQueueProposalHtml(item, capturedBooks)}</td>` +
+        `<td class="scan-queue-evidence">${scanQueueEvidenceHtml(item)}</td>` +
+        `<td class="scan-queue-actions">` +
+          (itemStatus === "proposed"
+            ? `<button class="cad-btn tiny" type="button" data-scan-queue-act="approve" ` +
+                `aria-label="${esc(`Approve proposed match for queue item ${item.id}`)}"` +
+                `${canDecide ? "" : " disabled"}>Approve</button>` +
+              `<button class="cad-btn tiny danger" type="button" data-scan-queue-act="reject" ` +
+                `aria-label="${esc(`Reject proposed match for queue item ${item.id}`)}"` +
+                `${canDecide ? "" : " disabled"}>Reject</button>`
+            : `<span class="scan-queue-decision">${itemStatus === "matched" ? "Approved" :
+                itemStatus === "rejected" ? "Rejected" :
+                itemStatus === "failed" ? "Needs a new proposal" : "Not ready"}</span>`) +
+        `</td></tr>`;
     }
     queueHost.innerHTML = html + `</tbody></table>`;
   }
@@ -15525,27 +15706,37 @@ async function loadScanQueue() {
   }
 }
 
-async function completeScanQueueRow(rowEl) {
+async function decideScanQueueRow(rowEl, decision) {
   if (state.scanQueueBusy || !rowEl) return;
+  if (decision !== "approve" && decision !== "reject") return;
   const queueId = String(rowEl.dataset.scanQueueId || "");
-  const select = rowEl.querySelector("[data-scan-match]");
-  const captureId = String((select && select.value) || "");
-  if (!queueId || !captureId) return;
+  const queueItem = state.scanQueue.find((item) => String(item.id || "") === queueId);
+  if (!queueId || !queueItem || scanQueueStatus(queueItem) !== "proposed" ||
+      !queueItem.candidate_capture_id) return;
   state.scanQueueBusy = true;
   state.scanQueueError = "";
   renderScanQueue();
   try {
     const response = await fetch(
-      `/api/scan/search-queue/${encodeURIComponent(queueId)}/complete`,
+      `/api/scan-search-queue/${encodeURIComponent(queueId)}/${decision}`,
       { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ capture_id: captureId }) },
+        body: JSON.stringify({ capture_id: queueItem.candidate_capture_id }) },
     );
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok)
       throw new Error(data.error || `HTTP ${response.status}`);
-    state.scanQueue = state.scanQueue.filter((item) => item.id !== queueId);
+    const sessionId = String(queueItem.session_id || "");
+    state.scanQueue = state.scanQueue.map((item) => {
+      const sameReview = sessionId
+        ? String(item.session_id || "") === sessionId : String(item.id || "") === queueId;
+      return sameReview
+        ? { ...item, status: decision === "approve" ? "matched" : "rejected",
+            matched_capture_id: decision === "approve" ? queueItem.candidate_capture_id : null }
+        : item;
+    });
   } catch (error) {
-    state.scanQueueError = `Match failed: ${error.message || error}`;
+    state.scanQueueError = `${decision === "approve" ? "Approval" : "Rejection"} failed: ` +
+      `${error.message || error}`;
   } finally {
     state.scanQueueBusy = false;
     renderScanQueue();
@@ -15709,9 +15900,9 @@ function initCollections() {
   el("collections-revert").addEventListener("click", revertCollectionDrafts);
   el("scan-queue-refresh").addEventListener("click", loadScanQueue);
   el("scan-queue-list").addEventListener("click", (ev) => {
-    const button = ev.target.closest("[data-scan-queue-act='complete']");
+    const button = ev.target.closest("[data-scan-queue-act]");
     const row = button && button.closest("[data-scan-queue-id]");
-    if (button && row) completeScanQueueRow(row);
+    if (button && row) decideScanQueueRow(row, button.dataset.scanQueueAct);
   });
   el("collections-list").addEventListener("input", (ev) => {
     const input = ev.target.closest("[data-collection-field]");
