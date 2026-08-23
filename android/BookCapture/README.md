@@ -79,9 +79,10 @@ preview and the bottom controls contains one **last captured book** card:
 
 A capture-type collection represents the catalog batch into which a book was
 photographed. A scan-type collection instead represents books physically set
-aside for full-book digitization. The current capture collection and current
-scan collection are selected independently, and every collection has two
-deliberately separate location concepts:
+aside for full-book digitization. The current capture collection and up to
+three active scan collections, named **A**, **B**, and **C**, are selected
+independently. An active scan collection cannot occupy more than one slot.
+Every collection has two deliberately separate location concepts:
 
 - `parentId` is the durable collection-to-collection hierarchy edge. It builds
   paths such as `Office > Periodicals` and is synchronized as `parent_id`.
@@ -124,11 +125,23 @@ bibliographic summary when old delivered scan media is cleared, so the list
 remains useful without defeating the app's storage limit; cleared photos and
 their local detail view are not retained.
 
-The camera action beside Inspect can photograph either a cover or title page,
-read it with Mistral OCR 4.1, and add only the recognized text to a durable
-owner-scoped search queue. Choosing the matching existing record moves that
-book into the independently active scan-type collection. The temporary image
-is deleted after OCR and is never stored in the local or cloud queue.
+The camera action beside Inspect opens a role-neutral physical-scan capture
+flow. There is no visual cover/title chooser and no confirmation between
+shots: say **cover** or **title** to capture that evidence, then continue taking
+either kind of shot. Each temporary image is read through the hosted Mistral
+OCR 4.1 service, never an on-device OCR engine. A cover also produces a small,
+non-reversible color/feature descriptor; the matcher normalizes tone and uses
+both chromatic and structural evidence so exposure differences do not create
+easy false negatives. The image itself is deleted immediately and is never
+stored in the local or cloud queue.
+
+Say **A**, **B**, or **C** to finish the evidence session and route it to that
+active scan collection. The observations are synchronized as one session and
+matched later against existing book records. Candidate, confidence, text,
+color/feature corroboration, and ambiguity evidence are shown in the review
+queue; approval or rejection happens there rather than between camera shots.
+Approval atomically moves the exact proposed book to the selected scan
+collection while retaining its original capture collection as provenance.
 
 Long-pressing a book starts a multi-selection. Selected books can be moved to
 another collection or removed from their current collection; any local page
@@ -158,7 +171,10 @@ owns the microphone.
 | **start** | Begin a capture in the current collection. |
 | **photo** | Photograph the page shown in the preview. |
 | **check** | Photograph the page, extract its bibliography, and check the bundled CH and WHL lists. |
-| **scan** | Mark the open book for physical digitization in the active scan-type collection when it is sealed. |
+| **scan** | Mark the open book for physical digitization in scan slot A without sealing it. |
+| **A**, **B**, or **C** | In regular capture, mark the book for that scan slot and seal it (the scan equivalent of **done**). In physical-scan capture, finish and route the queued cover/title evidence to that slot. |
+| **cover** | Photograph a declared cover in regular capture, or queue cover evidence in physical-scan capture. |
+| **title** | Photograph a declared title page in regular capture, or queue title-page evidence in physical-scan capture. |
 | **done** | Seal the capture and submit it for background processing/upload. |
 | **cancel** | Discard the open capture immediately; no confirmation dialog. |
 | **restart** | Discard the open capture and start a fresh one in the same/current collection. |

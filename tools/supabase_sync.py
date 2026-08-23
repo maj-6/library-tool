@@ -23,14 +23,17 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import secrets
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+
+import cover_matching
 
 TIMEOUT = 30.0
 CAPTURE_PHOTO_MAX_BYTES = 32 * 1024 * 1024
@@ -41,8 +44,16 @@ CAPTURE_SCAN_STATE_MAX_ROWS = 10_000
 SCAN_SEARCH_QUEUE_PAGE_SIZE = 100
 SCAN_SEARCH_QUEUE_MAX_ROWS = 2_000
 SCAN_SEARCH_OCR_MAX_CHARS = 16_000
+SCAN_SEARCH_OCR_MAX_BYTES = 65_536
+SCAN_SEARCH_VISUAL_SIGNATURE_MAX_BYTES = 4_096
+SCAN_SEARCH_MATCH_EVIDENCE_MAX_BYTES = 8_192
 SCAN_SEARCH_PHOTO_ROLES = frozenset({"cover", "title_page"})
-SCAN_SEARCH_STATUSES = frozenset({"pending", "matched", "failed"})
+SCAN_SEARCH_STATUSES = frozenset({
+    "pending", "proposed", "matched", "rejected", "failed",
+})
+SCAN_SEARCH_REVIEW_STATUSES = ("pending", "proposed", "failed")
+SCAN_MATCH_CANDIDATE_PAGE_SIZE = 500
+SCAN_MATCH_CANDIDATE_MAX_ROWS = 10_000
 CAPTURE_LIB_ASSOCIATION_SCHEMA = "org.whl.capture-lib-association"
 CAPTURE_LIB_ASSOCIATION_VERSION = 1
 CAPTURE_LIB_FORMAT_VERSION = "3.0"
@@ -1397,36 +1408,128 @@ def list_capture_scan_state(
             return out
 
 
+def _scan_json_object(
+    value: object,
+    *,
+    maximum_bytes: int,
+    label: str,
+    response: bool,
+) -> dict | None:
+    """Return one detached bounded JSON object, or fail with the right error."""
+
+    if value is None:
+        return None
+    error = SyncError if response else ValueError
+    if not isinstance(value, Mapping):
+        raise error(f"{label} must be a JSON object")
+    try:
+        # PostgreSQL jsonb text includes separator whitespace, so the default
+        # separators deliberately provide a conservative byte-size check.
+        encoded = json.dumps(
+            dict(value), ensure_ascii=False, sort_keys=True, allow_nan=False,
+        ).encode("utf-8")
+        detached = json.loads(encoded.decode("utf-8"))
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
+        raise error(f"{label} must be a JSON object") from exc
+    if len(encoded) > maximum_bytes:
+        raise error(f"{label} exceeds the {maximum_bytes}-byte limit")
+    return detached
+
+
 def _scan_search_queue_row(raw: object, *, owner_id: str) -> dict:
     if not isinstance(raw, dict):
         raise SyncError("scan search queue returned an invalid row")
     queue_id = _canonical_uuid(raw.get("id"))
+    session_id = _canonical_uuid(raw.get("session_id"))
     row_owner = _canonical_uuid(raw.get("owner_id"))
     scan_collection_id = _canonical_uuid(raw.get("scan_collection_id"))
+    candidate_raw = raw.get("candidate_capture_id")
+    candidate_capture_id = (
+        _canonical_uuid(candidate_raw) if candidate_raw not in (None, "") else ""
+    )
     matched_raw = raw.get("matched_capture_id")
     matched_capture_id = (
         _canonical_uuid(matched_raw) if matched_raw not in (None, "") else ""
     )
     photo_role = raw.get("photo_role")
     ocr_text = raw.get("ocr_text")
+    visual_signature = _scan_json_object(
+        raw.get("visual_signature"),
+        maximum_bytes=SCAN_SEARCH_VISUAL_SIGNATURE_MAX_BYTES,
+        label="scan search visual signature",
+        response=True,
+    )
+    if visual_signature is not None:
+        try:
+            visual_signature = cover_matching.parse_visual_signature(
+                visual_signature,
+            )
+        except cover_matching.CoverSignatureError as exc:
+            raise SyncError("scan search queue returned an invalid visual signature") from exc
     status = raw.get("status")
+    confidence_raw = raw.get("match_confidence")
+    match_confidence = (
+        float(confidence_raw)
+        if isinstance(confidence_raw, (int, float))
+        and not isinstance(confidence_raw, bool)
+        else None
+    )
+    match_evidence = _scan_json_object(
+        raw.get("match_evidence"),
+        maximum_bytes=SCAN_SEARCH_MATCH_EVIDENCE_MAX_BYTES,
+        label="scan search match evidence",
+        response=True,
+    )
     revision = raw.get("revision")
     created_at = raw.get("created_at")
     updated_at = raw.get("updated_at")
     if (
         not queue_id
+        or not session_id
         or row_owner != owner_id
         or not scan_collection_id
         or not isinstance(photo_role, str)
         or photo_role not in SCAN_SEARCH_PHOTO_ROLES
         or not isinstance(ocr_text, str)
-        or not ocr_text.strip()
         or ocr_text != ocr_text.strip()
         or len(ocr_text) > SCAN_SEARCH_OCR_MAX_CHARS
+        or len(ocr_text.encode("utf-8")) > SCAN_SEARCH_OCR_MAX_BYTES
+        or (not ocr_text and visual_signature is None)
         or not isinstance(status, str)
         or status not in SCAN_SEARCH_STATUSES
+        or (candidate_raw not in (None, "") and not candidate_capture_id)
         or (matched_raw not in (None, "") and not matched_capture_id)
-        or ((status == "matched") != bool(matched_capture_id))
+        or (
+            confidence_raw is not None
+            and (
+                match_confidence is None
+                or not math.isfinite(match_confidence)
+                or not 0 <= match_confidence <= 1
+            )
+        )
+        or (
+            status in {"pending", "failed"}
+            and any((candidate_capture_id, matched_capture_id,
+                     match_confidence is not None, match_evidence is not None))
+        )
+        or (
+            status in {"proposed", "rejected"}
+            and (
+                not candidate_capture_id
+                or bool(matched_capture_id)
+                or match_confidence is None
+                or match_evidence is None
+            )
+        )
+        or (
+            status == "matched"
+            and (
+                not candidate_capture_id
+                or matched_capture_id != candidate_capture_id
+                or match_confidence is None
+                or match_evidence is None
+            )
+        )
         or isinstance(revision, bool)
         or not isinstance(revision, int)
         or revision < 1
@@ -1440,12 +1543,17 @@ def _scan_search_queue_row(raw: object, *, owner_id: str) -> dict:
         raise SyncError("scan search queue returned an invalid row")
     return {
         "id": queue_id,
+        "session_id": session_id,
         "owner_id": row_owner,
         "scan_collection_id": scan_collection_id,
         "photo_role": photo_role,
         "ocr_text": ocr_text,
+        "visual_signature": visual_signature,
         "status": status,
+        "candidate_capture_id": candidate_capture_id or None,
         "matched_capture_id": matched_capture_id or None,
+        "match_confidence": match_confidence,
+        "match_evidence": match_evidence,
         "revision": revision,
         "created_at": created_at,
         "updated_at": updated_at,
@@ -1455,7 +1563,7 @@ def _scan_search_queue_row(raw: object, *, owner_id: str) -> dict:
 def list_scan_search_queue(
     cfg: dict,
     *,
-    statuses=("pending",),
+    statuses=SCAN_SEARCH_REVIEW_STATUSES,
     page_size: int = SCAN_SEARCH_QUEUE_PAGE_SIZE,
     maximum_rows: int = SCAN_SEARCH_QUEUE_MAX_ROWS,
 ) -> list[dict]:
@@ -1477,8 +1585,9 @@ def list_scan_search_queue(
 
     table = cfg.get("scan_search_queue_table") or "scan_search_queue"
     selected = (
-        "id,owner_id,scan_collection_id,photo_role,ocr_text,status,"
-        "matched_capture_id,revision,created_at,updated_at"
+        "id,session_id,owner_id,scan_collection_id,photo_role,ocr_text,"
+        "visual_signature,status,candidate_capture_id,matched_capture_id,"
+        "match_confidence,match_evidence,revision,created_at,updated_at"
     )
     encoded_statuses = ",".join(
         urllib.parse.quote(value, safe="") for value in normalized_statuses
@@ -1535,32 +1644,160 @@ def enqueue_scan_search(
     scan_collection_id: str,
     photo_role: str,
     ocr_text: str,
+    *,
+    session_id: str | None = None,
+    visual_signature: Mapping | None = None,
 ) -> dict:
-    """Idempotently enqueue one cover/title-page OCR result as its user."""
+    """Idempotently append one cover/title observation to a review session."""
 
     owner_id = _scan_user_scope(cfg)
     queue_id = _canonical_uuid(queue_id)
+    session_id = _canonical_uuid(session_id or queue_id)
     scan_collection_id = _canonical_uuid(scan_collection_id)
-    if not queue_id or not scan_collection_id:
-        raise ValueError("scan queue and collection ids must be canonical UUIDs")
+    if not queue_id or not session_id or not scan_collection_id:
+        raise ValueError(
+            "scan queue, session, and collection ids must be canonical UUIDs"
+        )
     if not isinstance(photo_role, str) or photo_role not in SCAN_SEARCH_PHOTO_ROLES:
         raise ValueError("scan queue photo_role must be cover or title_page")
     if (
         not isinstance(ocr_text, str)
-        or not ocr_text.strip()
-        or len(ocr_text) > SCAN_SEARCH_OCR_MAX_CHARS
+        or len(ocr_text.strip()) > SCAN_SEARCH_OCR_MAX_CHARS
+        or len(ocr_text.strip().encode("utf-8")) > SCAN_SEARCH_OCR_MAX_BYTES
     ):
-        raise ValueError("scan queue OCR text must contain 1 to 16000 characters")
+        raise ValueError("scan queue OCR text exceeds its bounded text limit")
+    ocr_text = ocr_text.strip()
+    visual_signature = _scan_json_object(
+        visual_signature,
+        maximum_bytes=SCAN_SEARCH_VISUAL_SIGNATURE_MAX_BYTES,
+        label="scan search visual signature",
+        response=False,
+    )
+    if visual_signature is not None:
+        try:
+            visual_signature = cover_matching.parse_visual_signature(
+                visual_signature,
+            )
+        except cover_matching.CoverSignatureError as exc:
+            raise ValueError("scan queue visual signature is invalid") from exc
+    if not ocr_text and visual_signature is None:
+        raise ValueError("scan queue requires OCR text or a visual signature")
     return _scan_queue_rpc_row(
         cfg,
         "rpc/enqueue_scan_search",
         {
             "p_id": queue_id,
+            "p_session_id": session_id,
             "p_scan_collection_id": scan_collection_id,
             "p_photo_role": photo_role,
             "p_ocr_text": ocr_text,
+            "p_visual_signature": visual_signature,
         },
         owner_id=owner_id,
+    )
+
+
+def propose_scan_search(
+    cfg: dict,
+    queue_id: str,
+    capture_id: str,
+    match_confidence: float,
+    match_evidence: Mapping,
+    *,
+    expected_rows: Sequence[Mapping],
+) -> dict:
+    """Persist one candidate for the exact observed session snapshot."""
+
+    owner_id = _scan_user_scope(cfg)
+    queue_id = _canonical_uuid(queue_id)
+    capture_id = _canonical_uuid(capture_id)
+    if not queue_id or not capture_id:
+        raise ValueError("scan queue and capture ids must be canonical UUIDs")
+    if (
+        isinstance(match_confidence, bool)
+        or not isinstance(match_confidence, (int, float))
+        or not math.isfinite(float(match_confidence))
+        or not 0 <= float(match_confidence) <= 1
+    ):
+        raise ValueError("scan match confidence must be between zero and one")
+    evidence = _scan_json_object(
+        match_evidence,
+        maximum_bytes=SCAN_SEARCH_MATCH_EVIDENCE_MAX_BYTES,
+        label="scan search match evidence",
+        response=False,
+    )
+    if evidence is None:
+        raise ValueError("scan search match evidence is required")
+    if (
+        isinstance(expected_rows, (str, bytes))
+        or not isinstance(expected_rows, Sequence)
+        or not 1 <= len(expected_rows) <= 500
+    ):
+        raise ValueError("one to 500 expected scan queue rows are required")
+    expected_row_ids = []
+    for row in expected_rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("expected scan queue rows must be objects")
+        expected_id = _canonical_uuid(row.get("id"))
+        if not expected_id:
+            raise ValueError("expected scan queue row ids must be canonical UUIDs")
+        expected_row_ids.append(expected_id)
+    if queue_id not in expected_row_ids or len(set(expected_row_ids)) != len(
+        expected_row_ids,
+    ):
+        raise ValueError(
+            "expected scan queue rows must uniquely include the proposal row",
+        )
+    expected_row_ids.sort()
+    return _scan_queue_rpc_row(
+        cfg,
+        "rpc/propose_scan_search",
+        {
+            "p_id": queue_id,
+            "p_capture_id": capture_id,
+            "p_match_confidence": round(float(match_confidence), 4),
+            "p_match_evidence": evidence,
+            "p_expected_row_ids": expected_row_ids,
+        },
+        owner_id=owner_id,
+    )
+
+
+def _decide_scan_search(
+    cfg: dict,
+    queue_id: str,
+    capture_id: str,
+    *,
+    decision: str,
+) -> dict:
+    owner_id = _scan_user_scope(cfg)
+    queue_id = _canonical_uuid(queue_id)
+    capture_id = _canonical_uuid(capture_id)
+    if not queue_id or not capture_id:
+        raise ValueError("scan queue and capture ids must be canonical UUIDs")
+    if decision not in {"approve", "reject"}:
+        raise ValueError("scan search decision is invalid")
+    return _scan_queue_rpc_row(
+        cfg,
+        f"rpc/{decision}_scan_search",
+        {"p_id": queue_id, "p_capture_id": capture_id},
+        owner_id=owner_id,
+    )
+
+
+def approve_scan_search(cfg: dict, queue_id: str, capture_id: str) -> dict:
+    """Approve the exact current session proposal and move/mark the book."""
+
+    return _decide_scan_search(
+        cfg, queue_id, capture_id, decision="approve",
+    )
+
+
+def reject_scan_search(cfg: dict, queue_id: str, capture_id: str) -> dict:
+    """Reject the exact current session proposal without moving the book."""
+
+    return _decide_scan_search(
+        cfg, queue_id, capture_id, decision="reject",
     )
 
 
@@ -1582,6 +1819,79 @@ def complete_scan_search(
         {"p_id": queue_id, "p_capture_id": capture_id},
         owner_id=owner_id,
     )
+
+
+def _scan_match_candidate_row(raw: object, *, owner_id: str) -> dict:
+    if not isinstance(raw, dict):
+        raise SyncError("scan match inventory returned an invalid row")
+    capture_id = _canonical_uuid(raw.get("id"))
+    row_owner = _canonical_uuid(raw.get("created_by"))
+    title = raw.get("title")
+    author = raw.get("author")
+    year = raw.get("year")
+    photo_count = raw.get("photo_count")
+    if (
+        not capture_id
+        or row_owner != owner_id
+        or not isinstance(title, str)
+        or len(title) > 4_000
+        or not isinstance(author, str)
+        or len(author) > 4_000
+        or not isinstance(year, str)
+        or len(year) > 200
+        or isinstance(photo_count, bool)
+        or not isinstance(photo_count, int)
+        or not 0 <= photo_count <= 10_000
+        or type(raw.get("removed")) is not bool
+        or raw["removed"]
+    ):
+        raise SyncError("scan match inventory returned an invalid row")
+    return {
+        "capture_id": capture_id,
+        "title": title,
+        "author": author,
+        "year": year,
+        "photo_count": photo_count,
+    }
+
+
+def list_scan_match_candidates(
+    cfg: dict,
+    *,
+    page_size: int = SCAN_MATCH_CANDIDATE_PAGE_SIZE,
+    maximum_rows: int = SCAN_MATCH_CANDIDATE_MAX_ROWS,
+) -> list[dict]:
+    """List the signed-in user's bounded, non-removed capture inventory."""
+
+    owner_id = _scan_user_scope(cfg)
+    _bounded_page_arguments(page_size, maximum_rows, label="scan match inventory")
+    table = cfg.get("capture_collection_inventory_view") \
+        or "capture_collection_inventory"
+    selected = "id,created_by,title,author,year,photo_count,removed"
+    out: list[dict] = []
+    offset = 0
+    while True:
+        request_limit = min(page_size, maximum_rows + 1 - len(out))
+        rows = _rest(
+            cfg,
+            "GET",
+            f"{table}?created_by=eq.{urllib.parse.quote(owner_id, safe='')}"
+            f"&removed=eq.false&select={selected}&order=id.asc"
+            f"&limit={request_limit}&offset={offset}",
+        )
+        if not isinstance(rows, list):
+            raise SyncError("scan match inventory returned an invalid collection")
+        out.extend(
+            _scan_match_candidate_row(raw, owner_id=owner_id) for raw in rows
+        )
+        if len(out) > maximum_rows:
+            raise SyncError(
+                "scan match inventory exceeds the "
+                f"{maximum_rows}-row safety limit"
+            )
+        offset += len(rows)
+        if not rows:
+            return out
 
 
 def list_capture_book_metadata(cfg: dict, capture_ids,

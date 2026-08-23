@@ -15,7 +15,7 @@ import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-/** Pushes durable OCR-only search requests and pulls decisions from cloud. */
+/** Pushes durable text/cover descriptors and pulls deferred review proposals. */
 internal class ScanSearchQueueSyncWorker(ctx: Context, params: WorkerParameters) :
     CoroutineWorker(ctx, params) {
 
@@ -55,15 +55,21 @@ internal class ScanSearchQueueSyncWorker(ctx: Context, params: WorkerParameters)
                 .filter {
                     it.dirty && it.ownerId == owner &&
                         (it.status == ScanSearchStatus.PENDING ||
-                            it.status == ScanSearchStatus.MATCHED)
+                            it.status == ScanSearchStatus.MATCHED ||
+                            it.status == ScanSearchStatus.REJECTED) &&
+                        it.scanCollectionId.isNotEmpty()
                 }
                 .forEach { expected ->
                     if (!Auth.signedIn(ctx) || Prefs.userId(ctx).trim().lowercase() != owner) {
                         return@withContext Result.success()
                     }
-                    var accepted = client.enqueue(expected)
-                    if (expected.status == ScanSearchStatus.MATCHED) {
-                        accepted = client.complete(expected.id, expected.matchedCaptureId)
+                    val accepted = when (expected.status) {
+                        ScanSearchStatus.PENDING -> client.enqueue(expected)
+                        ScanSearchStatus.MATCHED ->
+                            client.approve(expected.id, expected.matchedCaptureId)
+                        ScanSearchStatus.REJECTED ->
+                            client.reject(expected.id, expected.candidateCaptureId)
+                        else -> error("unsupported local scan-search mutation")
                     }
                     if (!ScanSearchQueue.acknowledge(ctx, expected, accepted)) {
                         return@withContext Result.retry()

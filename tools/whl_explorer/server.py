@@ -72,6 +72,7 @@ import capture_pipeline as capture  # noqa: E402
 import capture_lib as capture_lib_compat  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
+import cover_matching  # noqa: E402
 import layout_roles  # noqa: E402
 import libformat  # noqa: E402
 import replica_service  # noqa: E402
@@ -1563,6 +1564,318 @@ def _scan_cloud_error(exc: sbase.SyncError):
     return jsonify({"ok": False, "error": str(exc)}), status
 
 
+def _scan_match_member_bytes(
+        directory: Path, name: str, maximum: int) -> bytes | None:
+    """Read one unchanged regular capture member without following a redirect."""
+
+    if (
+        not isinstance(name, str)
+        or not re.fullmatch(r"[A-Za-z0-9._-]{1,160}", name)
+        or isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum < 1
+    ):
+        return None
+    path = directory / name
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _capture_path_is_redirecting(path)
+            or before.st_size > maximum
+        ):
+            return None
+        flags = os.O_RDONLY
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        def identity(info):
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_size,
+                getattr(
+                    info,
+                    "st_mtime_ns",
+                    int(info.st_mtime * 1_000_000_000),
+                ),
+            )
+        if identity(opened) != identity(before):
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, min(1 << 20, maximum + 1 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > maximum:
+                return None
+        after_open = os.fstat(descriptor)
+        after_name = path.lstat()
+        if identity(after_open) != identity(before) or identity(after_name) != identity(before):
+            return None
+        return b"".join(chunks)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _scan_match_cover_names(manifest: object) -> tuple[str, ...]:
+    """Resolve explicit cover-role assets to their imported display members."""
+
+    if not isinstance(manifest, Mapping):
+        return ()
+    assets = manifest.get("assets")
+    if not isinstance(assets, list):
+        return ()
+    covers: list[tuple[int, str]] = []
+    for asset in assets:
+        if not isinstance(asset, Mapping):
+            continue
+        order = asset.get("capture_order")
+        role = asset.get("role")
+        if (
+            isinstance(order, bool)
+            or not isinstance(order, int)
+            or not 1 <= order <= 500
+            or not isinstance(role, Mapping)
+        ):
+            continue
+        manual = role.get("manual_override")
+        suggested = role.get("suggested")
+        resolved = manual if isinstance(manual, str) and manual else suggested
+        if resolved == "cover":
+            covers.append((order, f"photo_{order}.jpg"))
+    return tuple(name for _order, name in sorted(covers)[:3])
+
+
+_SCAN_MATCH_CACHE_MAX_ENTRIES = 10_000
+_SCAN_MATCH_CACHE_MAX_BYTES = 64 * 1024 * 1024
+
+
+class _BoundedScanMatchCandidateCache:
+    """Thread-safe LRU of aggregate local evidence, never source pixels."""
+
+    def __init__(self, *, max_entries: int, max_bytes: int):
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._entries: collections.OrderedDict[object, tuple[dict | None, int]] = (
+            collections.OrderedDict()
+        )
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: object) -> tuple[bool, dict | None]:
+        with self._lock:
+            if key not in self._entries:
+                return False, None
+            value, weight = self._entries.pop(key)
+            self._entries[key] = (value, weight)
+            return True, copy.deepcopy(value)
+
+    def put(self, key: object, value: dict | None) -> None:
+        try:
+            weight = len(json.dumps(
+                [key, value],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+        except (TypeError, ValueError):
+            return
+        if weight > self._max_bytes:
+            return
+        stored = copy.deepcopy(value)
+        with self._lock:
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._bytes -= previous[1]
+            self._entries[key] = (stored, weight)
+            self._bytes += weight
+            while (
+                len(self._entries) > self._max_entries
+                or self._bytes > self._max_bytes
+            ):
+                _old_key, (_old_value, old_weight) = self._entries.popitem(last=False)
+                self._bytes -= old_weight
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
+
+
+_scan_match_candidate_cache = _BoundedScanMatchCandidateCache(
+    max_entries=_SCAN_MATCH_CACHE_MAX_ENTRIES,
+    max_bytes=_SCAN_MATCH_CACHE_MAX_BYTES,
+)
+
+
+def _scan_match_stat_identity(info) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000)),
+        getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000)),
+    )
+
+
+def _scan_match_candidate_file_identity(directory: Path) -> tuple:
+    """Fingerprint every local member that can affect candidate evidence."""
+
+    directory_identity = _scan_match_stat_identity(directory.lstat())
+    members = []
+    for child in directory.iterdir():
+        name = child.name
+        photo = re.fullmatch(r"photo_([1-9]\d{0,2})\.jpg", name)
+        if name not in {"ocr.txt", "photo_assets.json"} and not (
+            photo and int(photo.group(1)) <= 500
+        ):
+            continue
+        members.append((name, _scan_match_stat_identity(child.lstat())))
+    members.sort(key=lambda item: item[0])
+    return directory_identity, tuple(members)
+
+
+def _scan_match_candidate_cache_key(row: Mapping, directory: Path) -> tuple:
+    metadata = (
+        str(row.get("capture_id") or ""),
+        str(row.get("title") or ""),
+        str(row.get("author") or ""),
+        str(row.get("year") or ""),
+        row.get("photo_count"),
+    )
+    return (
+        str(directory.absolute()),
+        metadata,
+        _scan_match_candidate_file_identity(directory),
+    )
+
+
+def _scan_match_candidate_record(row: Mapping) -> dict | None:
+    """Cache bounded inventory metadata, local OCR, and cover signatures."""
+
+    capture_id = str(row.get("capture_id") or "")
+    if _scan_api_uuid(capture_id, "capture id") != capture_id:
+        return None
+    record = {
+        "capture_id": capture_id,
+        "title": str(row.get("title") or "")[:4_000],
+        "author": str(row.get("author") or "")[:4_000],
+        "year": str(row.get("year") or "")[:200],
+    }
+    has_metadata = any(record[field] for field in ("title", "author", "year"))
+    directory = CAPTURES_DIR / capture_id
+    try:
+        if directory.parent != CAPTURES_DIR or not directory.exists():
+            return record if has_metadata else None
+        _verify_capture_asset_directory(directory)
+        cache_key = _scan_match_candidate_cache_key(row, directory)
+    except (OSError, ValueError):
+        return record if has_metadata else None
+
+    cached, cached_record = _scan_match_candidate_cache.get(cache_key)
+    if cached:
+        return cached_record
+
+    ocr = _scan_match_member_bytes(directory, "ocr.txt", 256 * 1024)
+    if ocr:
+        record["ocr_text"] = ocr.decode("utf-8", "replace")[:32_000]
+    manifest_bytes = _scan_match_member_bytes(
+        directory, "photo_assets.json", 2 * 1024 * 1024)
+    manifest = None
+    if manifest_bytes:
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            pass
+    signatures = []
+    for name in _scan_match_cover_names(manifest):
+        image = _scan_match_member_bytes(
+            directory, name, cover_matching.MAX_SOURCE_BYTES)
+        if image is None:
+            continue
+        try:
+            signatures.append(cover_matching.build_visual_signature(image))
+        except cover_matching.CoverSignatureError:
+            continue
+    if signatures:
+        record["visual_signatures"] = signatures
+    result = record if has_metadata or record.get("ocr_text") or signatures else None
+    _scan_match_candidate_cache.put(cache_key, result)
+    return result
+
+
+def _scan_propose_pending_sessions(cfg: dict, rows: list[dict]) -> bool:
+    """Match every newly appended session and persist its review proposal."""
+
+    groups: dict[str, list[dict]] = collections.defaultdict(list)
+    for row in rows:
+        if row.get("status") in {"pending", "proposed"}:
+            groups[str(row.get("session_id") or row.get("id") or "")].append(row)
+    groups = {
+        session_id: session_rows
+        for session_id, session_rows in groups.items()
+        if session_id and any(row.get("status") == "pending" for row in session_rows)
+    }
+    if not groups:
+        return False
+
+    inventory = sbase.list_scan_match_candidates(cfg)
+    candidates = []
+    for row in inventory:
+        try:
+            candidate = _scan_match_candidate_record(row)
+        except ValueError:
+            candidate = None
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates:
+        return False
+
+    changed = False
+    for session_id in sorted(groups):
+        session_rows = sorted(groups[session_id], key=lambda row: row["id"])
+        try:
+            ranked = cover_matching.rank_cover_session_matches(
+                rows=session_rows,
+                candidates=candidates,
+                limit=1,
+            )
+        except (ValueError, cover_matching.CoverSignatureError):
+            continue
+        if not ranked:
+            continue
+        best = ranked[0]
+        try:
+            sbase.propose_scan_search(
+                cfg,
+                session_rows[0]["id"],
+                best["candidate_capture_id"],
+                best["match_confidence"],
+                best["match_evidence"],
+                expected_rows=session_rows,
+            )
+        except sbase.SyncError as exc:
+            if exc.error_code == "40001":
+                # An observation was appended after this snapshot.  Leave the
+                # session pending so the next queue refresh ranks all rows.
+                continue
+            raise
+        changed = True
+    return changed
+
+
 @app.route("/api/scan/state")
 def api_scan_state_list():
     """List this contributor's bounded current physical-scan state."""
@@ -1583,14 +1896,17 @@ def api_scan_state_list():
 
 @app.route("/api/scan/search-queue")
 def api_scan_search_queue_list():
-    """List pending cover/title-page OCR rows for desktop matching."""
+    """List review rows, proposing confidence-rated matches for new sessions."""
     auth = _scan_cloud_auth()
     if not auth:
         return jsonify({"ok": True, "signed_in": False, "queue": []})
     cfg, _ses = auth
-    statuses = request.args.getlist("status") or ["pending"]
+    statuses = request.args.getlist("status") or list(
+        sbase.SCAN_SEARCH_REVIEW_STATUSES)
     try:
         rows = sbase.list_scan_search_queue(cfg, statuses=statuses)
+        if _scan_propose_pending_sessions(cfg, rows):
+            rows = sbase.list_scan_search_queue(cfg, statuses=statuses)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except sbase.SyncError as exc:
@@ -1609,16 +1925,64 @@ def api_scan_search_queue_add():
     try:
         payload = _collection_payload()
         queue_id = _scan_api_uuid(payload.get("id"), "scan queue id")
+        session_id = _scan_api_uuid(
+            payload.get("session_id") or queue_id, "scan session id")
         scan_collection_id = _scan_api_uuid(
             payload.get("scan_collection_id"), "scan collection id")
         photo_role = str(payload.get("photo_role") or "").strip()
         ocr_text = payload.get("ocr_text")
+        visual_signature = payload.get("visual_signature")
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     cfg, _ses = auth
     try:
         row = sbase.enqueue_scan_search(
-            cfg, queue_id, scan_collection_id, photo_role, ocr_text)
+            cfg,
+            queue_id,
+            scan_collection_id,
+            photo_role,
+            ocr_text,
+            session_id=session_id,
+            visual_signature=visual_signature,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except sbase.SyncError as exc:
+        return _scan_cloud_error(exc)
+    finally:
+        cfg.pop("access_token", None)
+    return jsonify({"ok": True, "queue_item": row})
+
+
+@app.route(
+    "/api/scan/search-queue/<queue_id>/<decision>", methods=["POST"])
+@app.route(
+    "/api/scan-search-queue/<queue_id>/<decision>", methods=["POST"])
+def api_scan_search_queue_decide(queue_id: str, decision: str):
+    """Approve or reject the exact proposal currently pinned to a session."""
+
+    if decision not in {"approve", "reject"}:
+        return jsonify({"ok": False, "error": "invalid scan review decision"}), 404
+    auth = _scan_cloud_auth()
+    if not auth:
+        return jsonify({
+            "ok": False,
+            "error": f"sign in to {decision} a scan match",
+        }), 401
+    try:
+        payload = _collection_payload()
+        normalized_queue_id = _scan_api_uuid(queue_id, "scan queue id")
+        capture_id = _scan_api_uuid(payload.get("capture_id"), "capture id")
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    cfg, _ses = auth
+    try:
+        action = (
+            sbase.approve_scan_search
+            if decision == "approve"
+            else sbase.reject_scan_search
+        )
+        row = action(cfg, normalized_queue_id, capture_id)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except sbase.SyncError as exc:

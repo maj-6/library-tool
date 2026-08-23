@@ -407,11 +407,36 @@ object Prefs {
         str(ctx, "current_collection").ifEmpty { null }
     fun setCurrentCollectionId(ctx: Context, id: String?) = put(ctx, "current_collection" to id)
 
-    /** The independently active queue for books set aside for digitization. */
-    fun currentScanCollectionId(ctx: Context): String? =
-        str(ctx, "current_scan_collection").ifEmpty { null }
-    fun setCurrentScanCollectionId(ctx: Context, id: String?) =
-        put(ctx, "current_scan_collection" to id)
+    /**
+     * The three independently active physical-scan destinations. Slot A keeps
+     * the original preference key so an upgrade preserves the previously
+     * selected scan collection without a migration window.
+     */
+    fun currentScanCollectionId(
+        ctx: Context,
+        slot: ScanCollectionSlot = ScanCollectionSlot.A,
+    ): String? = str(ctx, scanCollectionPreferenceKey(slot)).ifEmpty { null }
+
+    fun setCurrentScanCollectionId(
+        ctx: Context,
+        id: String?,
+        slot: ScanCollectionSlot = ScanCollectionSlot.A,
+    ) = put(ctx, scanCollectionPreferenceKey(slot) to id)
+
+    /** Replace all slots in one durable preference commit. */
+    fun setCurrentScanCollectionIds(
+        ctx: Context,
+        selections: Map<ScanCollectionSlot, String?>,
+    ): Boolean {
+        val editor = sp(ctx).edit()
+        ScanCollectionSlot.entries.forEach { slot ->
+            editor.putString(
+                scanCollectionPreferenceKey(slot),
+                selections[slot].orEmpty(),
+            )
+        }
+        return editor.commit()
+    }
 
     /** A terminal command accepted while CameraX owns a file must survive an
      * Activity replacement. Commit synchronously because this is a tiny state
@@ -459,7 +484,9 @@ object Prefs {
         }
     }
 
-    private val PENDING_CAPTURE_COMMANDS = setOf("done", "cancel", "restart", "undo")
+    private val PENDING_CAPTURE_COMMANDS = setOf(
+        "done", "a", "b", "c", "cancel", "restart", "undo",
+    )
 
     /** Last failure that retrying can't fix; the main screen shows these
      *  instead of counting work forever. */

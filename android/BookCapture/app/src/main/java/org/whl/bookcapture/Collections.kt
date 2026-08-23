@@ -36,6 +36,64 @@ enum class CollectionType(val wireValue: String) {
     }
 }
 
+/** Hands-free destinations for books selected for physical digitization. */
+enum class ScanCollectionSlot(val wireValue: String) {
+    A("a"),
+    B("b"),
+    C("c"),
+    ;
+
+    companion object {
+        fun fromWire(value: String): ScanCollectionSlot? = entries.firstOrNull {
+            it.wireValue == value.trim().lowercase()
+        }
+    }
+}
+
+internal fun scanCollectionPreferenceKey(slot: ScanCollectionSlot): String = when (slot) {
+    ScanCollectionSlot.A -> "current_scan_collection"
+    ScanCollectionSlot.B -> "current_scan_collection_b"
+    ScanCollectionSlot.C -> "current_scan_collection_c"
+}
+
+/** One physical collection occupies at most one spoken slot. */
+internal fun assignScanCollectionSlot(
+    current: Map<ScanCollectionSlot, String?>,
+    slot: ScanCollectionSlot,
+    collectionId: String?,
+): Map<ScanCollectionSlot, String?> {
+    val normalized = collectionId?.trim()?.lowercase()?.takeIf(String::isNotEmpty)
+    return ScanCollectionSlot.entries.associateWith { candidate ->
+        when {
+            candidate == slot -> normalized
+            normalized != null && current[candidate]?.trim()?.lowercase() == normalized -> null
+            else -> current[candidate]?.trim()?.lowercase()?.takeIf(String::isNotEmpty)
+        }
+    }
+}
+
+internal fun resolveScanCollectionSlots(
+    collections: List<BookCollection>,
+    selected: Map<ScanCollectionSlot, String?>,
+): Map<ScanCollectionSlot, BookCollection> {
+    val live = collections.filter {
+        it.isLive() && it.collectionType == CollectionType.SCAN
+    }
+    val claimed = linkedSetOf<String>()
+    return buildMap {
+        ScanCollectionSlot.entries.forEach { slot ->
+            val requested = selected[slot]?.trim()?.lowercase()
+            val match = live.firstOrNull { it.id == requested }
+                ?: if (slot == ScanCollectionSlot.A && requested == null && live.size == 1) {
+                    live.single()
+                } else {
+                    null
+                }
+            if (match != null && claimed.add(match.id)) put(slot, match)
+        }
+    }
+}
+
 data class BookCollection(
     val id: String,
     val name: String,
@@ -1067,8 +1125,10 @@ object Collections {
                 ))
             ) return@synchronized false
             if (Prefs.currentCollectionId(ctx) == id) Prefs.setCurrentCollectionId(ctx, null)
-            if (Prefs.currentScanCollectionId(ctx) == id) {
-                Prefs.setCurrentScanCollectionId(ctx, null)
+            ScanCollectionSlot.entries.forEach { slot ->
+                if (Prefs.currentScanCollectionId(ctx, slot) == id) {
+                    Prefs.setCurrentScanCollectionId(ctx, null, slot)
+                }
             }
             true
         }
@@ -1121,13 +1181,15 @@ object Collections {
                 Prefs.setCurrentCollectionId(ctx, null)
             }
         }
-        Prefs.currentScanCollectionId(ctx)?.let { selected ->
-            if (merge.collections.none {
-                    it.id == selected && it.isLive() &&
-                        it.collectionType == CollectionType.SCAN
+        ScanCollectionSlot.entries.forEach { slot ->
+            Prefs.currentScanCollectionId(ctx, slot)?.let { selected ->
+                if (merge.collections.none {
+                        it.id == selected && it.isLive() &&
+                            it.collectionType == CollectionType.SCAN
+                    }
+                ) {
+                    Prefs.setCurrentScanCollectionId(ctx, null, slot)
                 }
-            ) {
-                Prefs.setCurrentScanCollectionId(ctx, null)
             }
         }
         merge.writes
@@ -1157,11 +1219,17 @@ object Collections {
         )
 
     /** Independently selected destination for books set aside to digitize. */
-    fun currentScan(ctx: Context): BookCollection? =
-        resolveCurrentCollection(
+    fun currentScan(
+        ctx: Context,
+        slot: ScanCollectionSlot = ScanCollectionSlot.A,
+    ): BookCollection? = currentScans(ctx)[slot]
+
+    fun currentScans(ctx: Context): Map<ScanCollectionSlot, BookCollection> =
+        resolveScanCollectionSlots(
             all(ctx),
-            Prefs.currentScanCollectionId(ctx),
-            CollectionType.SCAN,
+            ScanCollectionSlot.entries.associateWith {
+                Prefs.currentScanCollectionId(ctx, it)
+            },
         )
 
     fun byId(ctx: Context, id: String): BookCollection? =

@@ -7,8 +7,15 @@ import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 
-private const val SCAN_SEARCH_PAGE_SIZE = 25
+internal const val SCAN_SEARCH_PAGE_SIZE = 25
+internal const val SCAN_SEARCH_LIVE_STATUS_FILTER = "pending,proposed,failed"
 private const val SCAN_SEARCH_RESPONSE_MAX_BYTES = 3 * 1024 * 1024
+
+/** Includes one sentinel row so an exactly-full queue cannot hide overflow. */
+internal fun scanSearchQueuePageLimit(offset: Int): Int? {
+    if (offset !in 0..ScanSearchQueue.MAX_ITEMS) return null
+    return minOf(SCAN_SEARCH_PAGE_SIZE, ScanSearchQueue.MAX_ITEMS + 1 - offset)
+}
 
 internal fun scanSearchEnqueueBody(item: ScanSearchQueueItem): JSONObject {
     val normalized = requireNotNull(normalizedScanSearchQueueItem(item)) {
@@ -17,19 +24,42 @@ internal fun scanSearchEnqueueBody(item: ScanSearchQueueItem): JSONObject {
     require(normalized.status != ScanSearchStatus.FAILED) {
         "failed scan searches are server-authored"
     }
+    require(normalized.status == ScanSearchStatus.PENDING &&
+        normalized.scanCollectionId.isNotEmpty()) {
+        "only routed pending scan searches may be enqueued"
+    }
     return JSONObject()
         .put("p_id", normalized.id)
+        .put("p_session_id", normalized.sessionId)
         .put("p_scan_collection_id", normalized.scanCollectionId)
         .put("p_photo_role", normalized.photoRole.wireValue)
         .put("p_ocr_text", normalized.ocrText)
+        .put(
+            "p_visual_signature",
+            normalized.visualSignature.takeIf(String::isNotEmpty)
+                ?.let(::JSONObject) ?: JSONObject.NULL,
+        )
 }
 
-internal fun scanSearchCompleteBody(queueId: String, captureId: String): JSONObject {
+internal fun scanSearchProposalDecisionBody(
+    queueId: String,
+    captureId: String,
+): JSONObject {
     val queue = queueId.trim().lowercase()
     val capture = captureId.trim().lowercase()
     require(SAFE_CAPTURE_SYNC_ID.matches(queue)) { "invalid scan search id" }
     require(SAFE_CAPTURE_SYNC_ID.matches(capture)) { "invalid capture id" }
     return JSONObject().put("p_id", queue).put("p_capture_id", capture)
+}
+
+internal fun isStaleScanProposalError(error: SupabaseClient.HttpException): Boolean {
+    if (error.code == HttpURLConnection.HTTP_CONFLICT) return true
+    val postgrestCode = try {
+        JSONObject(error.responseBody).optString("code")
+    } catch (_: Exception) {
+        ""
+    }
+    return postgrestCode == "40001"
 }
 
 internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueItem? {
@@ -41,35 +71,63 @@ internal fun scanSearchQueueItemFromCloudJson(row: JSONObject): ScanSearchQueueI
         else -> return null
     }
     if (revision <= 0L) return null
-    val matched = when (val raw = row.opt("matched_capture_id")) {
+    fun nullableId(field: String): String? = when (val raw = row.opt(field)) {
         null, JSONObject.NULL -> ""
         is String -> raw
+        else -> null
+    }
+    val matched = nullableId("matched_capture_id") ?: return null
+    val candidate = nullableId("candidate_capture_id") ?: return null
+    val session = nullableId("session_id")?.ifEmpty {
+        row.opt("id") as? String ?: return null
+    } ?: return null
+    fun nullableJson(field: String): String? = when (val raw = row.opt(field)) {
+        null, JSONObject.NULL -> ""
+        is JSONObject -> raw.toString()
+        is String -> raw
+        else -> null
+    }
+    val visualSignature = nullableJson("visual_signature") ?: return null
+    val matchEvidence = nullableJson("match_evidence") ?: return null
+    val confidence = when (val raw = row.opt("match_confidence")) {
+        null, JSONObject.NULL -> null
+        is Number -> raw.toDouble()
         else -> return null
     }
-    return normalizedScanSearchQueueItem(
+    val normalized = normalizedScanSearchQueueItem(
         ScanSearchQueueItem(
             id = row.opt("id") as? String ?: return null,
             ownerId = row.opt("owner_id") as? String ?: return null,
+            sessionId = session,
             scanCollectionId = row.opt("scan_collection_id") as? String ?: return null,
             photoRole = ScanSearchPhotoRole.fromWire(
                 row.opt("photo_role") as? String ?: return null,
             ) ?: return null,
             ocrText = row.opt("ocr_text") as? String ?: return null,
+            visualSignature = visualSignature,
             status = ScanSearchStatus.fromWire(
                 row.opt("status") as? String ?: return null,
             ) ?: return null,
+            candidateCaptureId = candidate,
+            matchConfidence = confidence,
+            matchEvidence = matchEvidence,
             matchedCaptureId = matched,
             revision = revision,
             createdAt = row.opt("created_at") as? String ?: return null,
             updatedAt = row.opt("updated_at") as? String ?: return null,
             dirty = false,
         ),
-    )
+    ) ?: return null
+    return normalized.takeIf {
+        SAFE_CAPTURE_SYNC_ID.matches(it.ownerId) &&
+            SAFE_CAPTURE_SYNC_ID.matches(it.scanCollectionId)
+    }
 }
 
 /**
  * Narrow, user-JWT client for the scan-search workflow. No service key and no
- * camera image reaches this API: only Mistral OCR text is persisted remotely.
+ * camera image reaches this API: only bounded Mistral OCR text and the
+ * non-reversible whl-cover-v1 descriptor are persisted remotely.
  */
 internal class ScanWorkflowClient(
     private val ctx: Context,
@@ -92,25 +150,34 @@ internal class ScanWorkflowClient(
         )
     }
 
-    fun complete(queueId: String, captureId: String): ScanSearchQueueItem = rpc(
-        "complete_scan_search",
-        scanSearchCompleteBody(queueId, captureId),
+    fun approve(queueId: String, captureId: String): ScanSearchQueueItem = rpc(
+        "approve_scan_search",
+        scanSearchProposalDecisionBody(queueId, captureId),
+        queueId,
+    )
+
+    fun reject(queueId: String, captureId: String): ScanSearchQueueItem = rpc(
+        "reject_scan_search",
+        scanSearchProposalDecisionBody(queueId, captureId),
         queueId,
     )
 
     fun queue(): List<ScanSearchQueueItem> {
         requireCurrentOwner()
         val owner = URLEncoder.encode(ownerId, Charsets.UTF_8.name())
-        val select = "id,owner_id,scan_collection_id,photo_role,ocr_text,status," +
-            "matched_capture_id,revision,created_at,updated_at"
+        val select = "id,owner_id,session_id,scan_collection_id,photo_role,ocr_text," +
+            "visual_signature,status,candidate_capture_id,match_confidence," +
+            "match_evidence,matched_capture_id,revision,created_at,updated_at"
         val seen = linkedSetOf<String>()
         return buildList {
             var offset = 0
-            while (offset < ScanSearchQueue.MAX_ITEMS) {
-                val limit = minOf(SCAN_SEARCH_PAGE_SIZE, ScanSearchQueue.MAX_ITEMS - offset)
+            while (true) {
+                val limit = scanSearchQueuePageLimit(offset)
+                    ?: throw SupabaseClient.InvalidResponse("too many unresolved scan searches")
                 val conn = open(
                     "GET",
                     "$baseUrl/rest/v1/scan_search_queue?owner_id=eq.$owner" +
+                        "&status=in.($SCAN_SEARCH_LIVE_STATUS_FILTER)" +
                         "&select=$select&order=created_at.asc,id.asc" +
                         "&limit=$limit&offset=$offset",
                     null,
@@ -126,7 +193,15 @@ internal class ScanWorkflowClient(
                     if (item.ownerId != ownerId || !seen.add(item.id)) {
                         throw SupabaseClient.InvalidResponse("out-of-scope scan search queue row")
                     }
+                    if (!item.status.isLiveCloudQueueStatus()) {
+                        throw SupabaseClient.InvalidResponse("terminal scan search in live queue")
+                    }
                     add(item)
+                    if (size > ScanSearchQueue.MAX_ITEMS) {
+                        throw SupabaseClient.InvalidResponse(
+                            "too many unresolved scan searches",
+                        )
+                    }
                 }
                 offset += rows.length()
                 if (rows.length() < limit) break

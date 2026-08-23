@@ -16,6 +16,9 @@ internal enum class PolicyVoiceCommand(val wireValue: String) {
     PHOTO("photo"),
     CHECK("check"),
     SCAN("scan"),
+    SCAN_A("a"),
+    SCAN_B("b"),
+    SCAN_C("c"),
     DONE("done"),
     CANCEL("cancel"),
     RESTART("restart"),
@@ -72,6 +75,9 @@ internal object StateAwareVoiceCommandPolicy {
         PolicyVoiceCommand.PHOTO,
         PolicyVoiceCommand.CHECK,
         PolicyVoiceCommand.SCAN,
+        PolicyVoiceCommand.SCAN_A,
+        PolicyVoiceCommand.SCAN_B,
+        PolicyVoiceCommand.SCAN_C,
         PolicyVoiceCommand.DONE,
         PolicyVoiceCommand.CANCEL,
         PolicyVoiceCommand.RESTART,
@@ -95,6 +101,11 @@ internal object StateAwareVoiceCommandPolicy {
         PolicyVoiceCommand.SPINE,
         PolicyVoiceCommand.COVER,
         PolicyVoiceCommand.TITLE,
+    )
+    private val exactFinalCommands = setOf(
+        PolicyVoiceCommand.SCAN_A,
+        PolicyVoiceCommand.SCAN_B,
+        PolicyVoiceCommand.SCAN_C,
     )
 
     fun evaluate(
@@ -126,6 +137,13 @@ internal object StateAwareVoiceCommandPolicy {
             .filter { candidate ->
                 stability == VoiceRecognitionStability.FINAL ||
                     candidate.phrase.command in stablePartialCommands
+            }
+            .filter { candidate ->
+                candidate.phrase.command !in exactFinalCommands ||
+                    (transcript.substring(0, candidate.match.range.first)
+                        .matches(TRAILING_COMMAND_DECORATION) &&
+                        transcript.substring(candidate.match.range.last + 1)
+                            .matches(TRAILING_COMMAND_DECORATION))
             }
             .filter { candidate ->
                 state != VoiceCommandState.NOTE_ACTIVE ||
@@ -192,6 +210,9 @@ private val COMMAND_PHRASES = listOf(
     CommandPhrase(PolicyVoiceCommand.PHOTO, "photo"),
     CommandPhrase(PolicyVoiceCommand.CHECK, "check"),
     CommandPhrase(PolicyVoiceCommand.SCAN, "scan"),
+    CommandPhrase(PolicyVoiceCommand.SCAN_A, "a"),
+    CommandPhrase(PolicyVoiceCommand.SCAN_B, "b"),
+    CommandPhrase(PolicyVoiceCommand.SCAN_C, "c"),
     CommandPhrase(PolicyVoiceCommand.DONE, "done"),
     CommandPhrase(PolicyVoiceCommand.UNDO, "undo"),
     CommandPhrase(PolicyVoiceCommand.NOTES, "notes"),

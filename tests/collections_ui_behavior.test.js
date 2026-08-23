@@ -324,18 +324,156 @@ test("collection dialog exposes busy-safe controls, focus handling, and responsi
   assert.match(css, /#collections-add-form\s*\{[^}]*flex-wrap:\s*wrap/);
 });
 
-test("scan collections and the OCR matching queue have explicit desktop controls", () => {
+test("scan collections and the deferred match review queue have explicit desktop controls", () => {
   assert.match(html,
     /id="collections-new-type"[\s\S]*value="capture"[\s\S]*value="scan"/);
-  assert.match(html, /id="scan-queue-panel"[\s\S]*Physical scan matching/);
+  assert.match(html, /id="scan-queue-panel"[\s\S]*Physical scan review queue/);
+  assert.match(html, /confidence and OCR, color, and feature evidence/);
   assert.match(source,
     /collectionApi\("POST", "\/api\/collections", \{[\s\S]*collection_type/);
   assert.match(source,
     /fetch\("\/api\/scan\/search-queue"\), fetch\("\/api\/scan\/state"\)/);
   assert.match(source,
-    /\/api\/scan\/search-queue\/\$\{encodeURIComponent\(queueId\)\}\/complete/);
+    /\/api\/scan-search-queue\/\$\{encodeURIComponent\(queueId\)\}\/\$\{decision\}/);
+  assert.match(source, /JSON\.stringify\(\{ capture_id: queueItem\.candidate_capture_id \}\)/);
   assert.match(source,
     /collection && collection\.collection_type === "scan" \? "scan" : "capture"/);
-  assert.match(source, /scanQueueCandidates\(item\.ocr_text\)/);
+  assert.match(source, /scanQueueReviewItems\(state\.scanQueue\)/);
+  assert.match(source, /data-scan-queue-act="approve"/);
+  assert.match(source, /data-scan-queue-act="reject"/);
+  assert.doesNotMatch(source, /data-scan-match|data-scan-queue-act="complete"/);
   assert.match(css, /#scan-queue-panel[\s\S]*max-height:\s*30vh/);
+  assert.match(css, /\.scan-match-evidence[\s\S]*\.scan-queue-actions/);
+});
+
+test("scan review groups a capture session and blocks conflicting proposals", () => {
+  const context = vm.createContext({
+    SCAN_QUEUE_STATUSES: new Set(["pending", "proposed", "matched", "rejected", "failed"]),
+  });
+  vm.runInContext([
+    declaration("scanQueueStatus"),
+    declaration("scanQueueReviewItems"),
+    "this.group = scanQueueReviewItems;",
+  ].join("\n"), context);
+
+  const grouped = plain(context.group([
+    { id: "cover", session_id: "session-1", status: "pending" },
+    { id: "title", session_id: "session-1", status: "proposed",
+      candidate_capture_id: "capture-a", match_confidence: 0.91 },
+    { id: "solo", status: "pending", ocr_text: "" },
+  ]));
+  assert.equal(grouped.length, 2);
+  assert.equal(grouped[0].id, "title");
+  assert.equal(grouped[0].status, "pending");
+  assert.equal(grouped[0].candidate_capture_id, "");
+  assert.equal(grouped[0]._stale_proposal, true);
+  assert.equal(grouped[0]._review_items.length, 2);
+  assert.equal(grouped[1].status, "pending");
+
+  const conflict = plain(context.group([
+    { id: "one", session_id: "session-2", status: "proposed",
+      candidate_capture_id: "capture-a" },
+    { id: "two", session_id: "session-2", status: "proposed",
+      candidate_capture_id: "capture-b" },
+  ]))[0];
+  assert.equal(conflict.status, "failed");
+  assert.equal(conflict._proposal_conflict, true);
+});
+
+test("scan review presents bounded escaped confidence and visual evidence", () => {
+  const escapeHtml = (value) => String(value == null ? "" : value)
+    .replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[character]));
+  const context = vm.createContext({
+    esc: escapeHtml,
+    SCAN_QUEUE_STATUSES: new Set(["pending", "proposed", "matched", "rejected", "failed"]),
+  });
+  vm.runInContext([
+    declaration("scanQueueStatus"),
+    declaration("scanQueueConfidence"),
+    declaration("scanQueueEvidenceLabel"),
+    declaration("scanQueueEvidenceValue"),
+    declaration("scanQueueEvidenceEntries"),
+    declaration("scanQueueEvidenceHtml"),
+    "this.confidence = scanQueueConfidence;",
+    "this.evidence = scanQueueEvidenceHtml;",
+  ].join("\n"), context);
+
+  assert.deepEqual(plain(context.confidence(0.91)), {
+    value: 0.91, percent: 91, rating: "high",
+  });
+  assert.equal(context.confidence(null), null);
+  assert.equal(context.confidence(1.1), null);
+  const rendered = context.evidence({
+    match_confidence: 0.74,
+    match_evidence: { components: {
+      text: 0.92,
+      color: 0.71,
+      structure: 0.86,
+      gradient: 0.82,
+    }, band: "review", reasons: ['<img src=x onerror="bad">'] },
+  });
+  assert.match(rendered, /Confidence 74% · medium/);
+  assert.match(rendered, /OCR\/title similarity<\/dt><dd>92%/);
+  assert.match(rendered, /Color similarity<\/dt><dd>71%/);
+  assert.match(rendered, /Structure similarity<\/dt><dd>86%/);
+  assert.match(rendered, /Edge-feature similarity<\/dt><dd>82%/);
+  assert.match(rendered, /Confidence band<\/dt><dd>review/);
+  assert.doesNotMatch(rendered, /<img src=/);
+  assert.match(rendered, /&lt;img src=x onerror=&quot;bad&quot;&gt;/);
+});
+
+test("scan proposal decisions pin the candidate and update the whole session", async () => {
+  const calls = [];
+  let loads = 0;
+  const state = {
+    scanQueueBusy: false, scanQueueError: "",
+    scanQueue: [
+      { id: "queue/one", session_id: "session-1", status: "proposed",
+        candidate_capture_id: "capture-a" },
+      { id: "queue-two", session_id: "session-1", status: "proposed",
+        candidate_capture_id: "capture-a" },
+    ],
+  };
+  const context = vm.createContext({
+    state,
+    SCAN_QUEUE_STATUSES: new Set(["pending", "proposed", "matched", "rejected", "failed"]),
+    renderScanQueue: () => {},
+    loadScanQueue: async () => { loads += 1; },
+    fetch: async (url, init) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    },
+  });
+  vm.runInContext([
+    declaration("scanQueueStatus"),
+    declaration("decideScanQueueRow"),
+    "this.decide = decideScanQueueRow;",
+  ].join("\n"), context);
+
+  await context.decide({ dataset: { scanQueueId: "queue/one" } }, "approve");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "/api/scan-search-queue/queue%2Fone/approve");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers["Content-Type"], "application/json");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { capture_id: "capture-a" });
+  assert.deepEqual(state.scanQueue.map((item) => item.status), ["matched", "matched"]);
+  assert.deepEqual(state.scanQueue.map((item) => item.matched_capture_id),
+    ["capture-a", "capture-a"]);
+  assert.equal(loads, 1);
+
+  state.scanQueue = state.scanQueue.map((item) => ({
+    ...item, status: "proposed", matched_capture_id: null,
+  }));
+  await context.decide({ dataset: { scanQueueId: "queue-two" } }, "reject");
+  assert.equal(calls[1].url, "/api/scan-search-queue/queue-two/reject");
+  assert.deepEqual(JSON.parse(calls[1].init.body), { capture_id: "capture-a" });
+  assert.deepEqual(state.scanQueue.map((item) => item.status), ["rejected", "rejected"]);
+  assert.deepEqual(state.scanQueue.map((item) => item.matched_capture_id), [null, null]);
+  assert.equal(loads, 2);
+
+  state.scanQueue[0].status = "pending";
+  await context.decide({ dataset: { scanQueueId: "queue/one" } }, "approve");
+  assert.equal(calls.length, 2, "pending items cannot be approved before a proposal exists");
 });
