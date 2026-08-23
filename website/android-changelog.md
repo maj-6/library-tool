@@ -3,6 +3,30 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.19 — 2026-08-22
+
+Android version code: `50`.
+
+### Additions
+
+- Home now uses icon-only navigation and includes a dedicated physical scan
+  queue inspector with session status, destination, confidence, evidence, and
+  review, resume, or dismiss actions.
+- When exactly one scan collection is active, saying **cover** or **title**
+  takes and routes the photo immediately. Capture stays open for the next book
+  instead of returning to Inspect.
+
+### Other Changes
+
+- A queue placeholder synchronizes as soon as a photo is routed. Hosted Mistral
+  OCR 4.1 fills that same item later; processing and cloud-sync failures raise
+  durable notifications that open the queue inspector.
+- Temporary photos are staged in app-private storage and deleted after hosted
+  processing. Cover evidence retains only a bounded, non-reversible visual
+  signature for exposure-tolerant corroboration.
+- The launcher and navigation icon plate now use a lighter neutral sage instead
+  of botanical green.
+
 ## 0.5.2-alpha.18 — 2026-08-22
 
 Android version code: `49`.

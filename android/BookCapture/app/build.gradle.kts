@@ -29,8 +29,8 @@ android {
         applicationId = "org.whl.bookcapture"
         minSdk = 26
         targetSdk = 34
-        versionCode = 49
-        versionName = "0.5.2-alpha.18"
+        versionCode = 50
+        versionName = "0.5.2-alpha.19"
         buildConfigField("String", "SUPABASE_URL", "\"${env("WHL_SUPABASE_URL")}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${env("WHL_SUPABASE_ANON_KEY")}\"")
     }
