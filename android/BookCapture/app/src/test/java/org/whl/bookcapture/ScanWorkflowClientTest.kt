@@ -195,4 +195,61 @@ class ScanWorkflowClientTest {
             scanSearchEnqueueBody(failed)
         }
     }
+
+    @Test
+    fun routedProcessingPlaceholderCrossesTheWireWithoutPixelsOrEvidence() {
+        val processing = ScanSearchQueueItem(
+            id = queueId,
+            ownerId = ownerId,
+            scanCollectionId = collectionId,
+            photoRole = ScanSearchPhotoRole.COVER,
+            ocrText = "",
+            createdAt = "2026-08-21T12:00:00Z",
+            dirty = false,
+            processing = true,
+        )
+        val body = scanSearchEnqueueBody(processing)
+        assertEquals(queueId, body.getString("p_id"))
+        assertEquals("", body.getString("p_ocr_text"))
+        assertTrue(body.isNull("p_visual_signature"))
+    }
+
+    @Test
+    fun cloudBlankPendingIsProcessingButBlankProposalFailsClosed() {
+        fun blank(status: String) = JSONObject().apply {
+            put("id", queueId)
+            put("owner_id", ownerId)
+            put("session_id", queueId)
+            put("scan_collection_id", collectionId)
+            put("photo_role", "cover")
+            put("ocr_text", "")
+            put("visual_signature", JSONObject.NULL)
+            put("status", status)
+            put("candidate_capture_id", JSONObject.NULL)
+            put("match_confidence", JSONObject.NULL)
+            put("match_evidence", JSONObject.NULL)
+            put("matched_capture_id", JSONObject.NULL)
+            put("revision", 1)
+            put("created_at", "2026-08-21T12:00:00Z")
+            put("updated_at", "2026-08-21T12:00:00Z")
+        }
+
+        val pending = checkNotNull(scanSearchQueueItemFromCloudJson(blank("pending")))
+        assertTrue(pending.processing)
+        assertFalse(pending.dirty)
+        val failed = checkNotNull(scanSearchQueueItemFromCloudJson(blank("failed")))
+        assertFalse(failed.processing)
+        assertEquals(ScanSearchStatus.FAILED, failed.status)
+        assertNull(scanSearchQueueItemFromCloudJson(blank("proposed")))
+    }
+
+    @Test
+    fun terminalFailureBodyIsExactAndOwnerNeutral() {
+        val body = scanSearchFailureBody(queueId)
+        assertEquals(setOf("p_id"), body.keys().asSequence().toSet())
+        assertEquals(queueId, body.getString("p_id"))
+        assertThrows(IllegalArgumentException::class.java) {
+            scanSearchFailureBody("not-a-uuid")
+        }
+    }
 }

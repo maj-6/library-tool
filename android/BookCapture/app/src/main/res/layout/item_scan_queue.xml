@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/whl_row"
+    android:gravity="center_vertical"
+    android:minHeight="84dp"
+    android:orientation="horizontal"
+    android:paddingStart="10dp"
+    android:paddingTop="8dp"
+    android:paddingEnd="4dp"
+    android:paddingBottom="8dp">
+
+    <ImageView
+        android:layout_width="28dp"
+        android:layout_height="28dp"
+        android:layout_marginEnd="10dp"
+        android:importantForAccessibility="no"
+        android:src="@drawable/ic_scan_queue"
+        app:tint="@color/whl_ink_dim" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/scanQueueRowTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:textColor="@color/whl_ink"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/scanQueueRowStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:ellipsize="end"
+            android:fontFamily="@font/roboto_slab"
+            android:maxLines="1"
+            android:textColor="@color/whl_cyan"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/scanQueueRowDetail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:ellipsize="end"
+            android:fontFamily="monospace"
+            android:maxLines="3"
+            android:textColor="@color/whl_ink_dim"
+            android:textSize="10sp" />
+    </LinearLayout>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/scanQueueRowAction"
+        style="@style/WhlToolbarAction"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:contentDescription="@string/scan_queue_review_action"
+        android:text=""
+        app:icon="@drawable/ic_chevron_right"
+        app:iconGravity="textStart"
+        app:iconPadding="0dp"
+        app:iconSize="24dp"
+        app:iconTint="@color/whl_ink" />
+</LinearLayout>

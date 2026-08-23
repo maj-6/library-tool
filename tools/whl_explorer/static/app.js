@@ -15522,18 +15522,18 @@ function scanQueueReviewItems(items) {
       scanQueueStatus(row) === "pending") || rows[0];
     const statuses = rows.map(scanQueueStatus);
     const hasPending = statuses.includes("pending");
-    const status = candidateIds.size > 1 ? "failed" : hasPending ? "pending" :
-      proposals.length ? "proposed" : statuses.includes("failed") ? "failed" :
+    const hasFailed = statuses.includes("failed");
+    const status = candidateIds.size > 1 || hasFailed ? "failed" : hasPending ? "pending" :
+      proposals.length ? "proposed" :
         statuses.includes("matched") ? "matched" : "rejected";
     return {
       ...representative,
       status,
-      candidate_capture_id: hasPending && proposals.length ? "" : candidateIds.size === 1
-        ? [...candidateIds][0] :
-        representative.candidate_capture_id,
+      candidate_capture_id: hasFailed ? "" : hasPending && proposals.length ? "" :
+        candidateIds.size === 1 ? [...candidateIds][0] : representative.candidate_capture_id,
       _review_items: rows,
       _proposal_conflict: candidateIds.size > 1,
-      _stale_proposal: hasPending && proposals.length > 0,
+      _stale_proposal: !hasFailed && hasPending && proposals.length > 0,
     };
   });
 }

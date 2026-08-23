@@ -30,13 +30,13 @@ def _acl(signature: str) -> None:
     assert f"grant execute on function {signature} to authenticated;" in FLAT
 
 
-def test_deferred_review_migration_is_last_and_declares_its_delta():
+def test_deferred_review_migration_declares_its_delta():
     assert SQL.rstrip().endswith(
         "insert into schema_migrations (id) values "
         "('031_scan_search_deferred_review') on conflict do nothing;"
     )
     assert cloud_setup.migration_files()[-1].name == (
-        "031_scan_search_deferred_review.sql"
+        "032_scan_search_processing_queue.sql"
     )
     assert cloud_setup.expected_schema(SQL) == {
         "scan_search_queue": {

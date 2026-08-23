@@ -1,15 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Borderless botanical-green square behind the full-size app mark. The
+<!-- Borderless neutral-sage square behind the full-size app mark. The
      neighboring one-pixel rule in activity_home is its only divider. -->
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:state_pressed="true">
         <shape>
-            <solid android:color="@color/whl_green_pressed" />
+            <solid android:color="@color/whl_icon_background_pressed" />
         </shape>
     </item>
     <item>
         <shape>
-            <solid android:color="@color/whl_green" />
+            <solid android:color="@color/whl_icon_background" />
         </shape>
     </item>
 </selector>

@@ -1821,12 +1821,21 @@ def _scan_propose_pending_sessions(cfg: dict, rows: list[dict]) -> bool:
 
     groups: dict[str, list[dict]] = collections.defaultdict(list)
     for row in rows:
-        if row.get("status") in {"pending", "proposed"}:
+        if row.get("status") in {"pending", "proposed", "failed"}:
             groups[str(row.get("session_id") or row.get("id") or "")].append(row)
     groups = {
         session_id: session_rows
         for session_id, session_rows in groups.items()
-        if session_id and any(row.get("status") == "pending" for row in session_rows)
+        if session_id
+        and any(row.get("status") == "pending" for row in session_rows)
+        and all(
+            row.get("status") != "failed"
+            and (
+                bool(str(row.get("ocr_text") or "").strip())
+                or row.get("visual_signature") is not None
+            )
+            for row in session_rows
+        )
     }
     if not groups:
         return False

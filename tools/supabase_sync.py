@@ -1494,9 +1494,13 @@ def _scan_search_queue_row(raw: object, *, owner_id: str) -> dict:
         or ocr_text != ocr_text.strip()
         or len(ocr_text) > SCAN_SEARCH_OCR_MAX_CHARS
         or len(ocr_text.encode("utf-8")) > SCAN_SEARCH_OCR_MAX_BYTES
-        or (not ocr_text and visual_signature is None)
         or not isinstance(status, str)
         or status not in SCAN_SEARCH_STATUSES
+        or (
+            not ocr_text
+            and visual_signature is None
+            and status not in {"pending", "failed"}
+        )
         or (candidate_raw not in (None, "") and not candidate_capture_id)
         or (matched_raw not in (None, "") and not matched_capture_id)
         or (

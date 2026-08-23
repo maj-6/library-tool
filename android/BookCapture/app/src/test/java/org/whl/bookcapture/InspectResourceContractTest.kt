@@ -22,7 +22,11 @@ class InspectResourceContractTest {
 
         assertEquals("com.google.android.material.button.MaterialButton", inspectTab.tagName)
         assertEquals("@style/WhlToolbarAction", inspectTab.getAttribute("style"))
-        assertEquals("@string/home_tab_inspect", inspectTab.getAttributeNS(androidNs, "text"))
+        assertEquals("", inspectTab.getAttributeNS(androidNs, "text"))
+        assertEquals(
+            "@string/home_tab_inspect",
+            inspectTab.getAttributeNS(androidNs, "contentDescription"),
+        )
         assertEquals("@drawable/ic_inspect", inspectTab.getAttributeNS(appNs, "icon"))
 
         assertEquals("LinearLayout", elementById(home, "inspectPane").tagName)
@@ -37,7 +41,9 @@ class InspectResourceContractTest {
         assertNotNull(elementById(home, "inspectBooks"))
 
         val source = source("HomeActivity")
-        assertTrue(source.contains("private enum class HomeTab { SCANS, COLLECTIONS, INSPECT }"))
+        assertTrue(source.contains(
+            "private enum class HomeTab { SCANS, SCAN_QUEUE, COLLECTIONS, INSPECT }",
+        ))
         assertTrue(source.contains("binding.tabInspect.setOnClickListener { showTab(HomeTab.INSPECT) }"))
         assertTrue(source.contains("binding.inspectPane.visibility = if (tab == HomeTab.INSPECT)"))
     }

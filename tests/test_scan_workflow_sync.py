@@ -278,6 +278,36 @@ def test_scan_queue_accepts_visual_only_cover_and_rejects_unshaped_proposal(
         )
 
 
+@pytest.mark.parametrize("status", ["pending", "failed"])
+def test_scan_queue_accepts_evidence_less_pending_or_failed_row(status):
+    placeholder = {
+        **_queue_row(status=status),
+        "ocr_text": "",
+        "visual_signature": None,
+    }
+
+    parsed = supabase_sync._scan_search_queue_row(
+        placeholder,
+        owner_id=OWNER_ID,
+    )
+
+    assert parsed["status"] == status
+    assert parsed["ocr_text"] == ""
+    assert parsed["visual_signature"] is None
+
+
+@pytest.mark.parametrize("status", ["proposed", "matched", "rejected"])
+def test_scan_queue_rejects_evidence_less_review_or_terminal_row(status):
+    malformed = {
+        **_queue_row(status=status),
+        "ocr_text": "",
+        "visual_signature": None,
+    }
+
+    with pytest.raises(supabase_sync.SyncError, match="invalid row"):
+        supabase_sync._scan_search_queue_row(malformed, owner_id=OWNER_ID)
+
+
 @pytest.mark.parametrize(
     "expected_rows",
     [
@@ -404,6 +434,28 @@ def test_desktop_matcher_retries_a_changed_session_snapshot(monkeypatch):
 
     assert server._scan_propose_pending_sessions(_user_cfg(), [row]) is False
     assert expected == [row]
+
+
+@pytest.mark.parametrize("blocked_status", ["pending", "failed"])
+def test_desktop_matcher_skips_session_with_blank_or_failed_row(
+        monkeypatch, blocked_status):
+    monkeypatch.setattr(
+        server.sbase,
+        "list_scan_match_candidates",
+        lambda _cfg: pytest.fail("blocked sessions must not load match candidates"),
+    )
+    ready = {**_queue_row(), "visual_signature": None}
+    blocked = {
+        **_queue_row(status=blocked_status),
+        "id": CAPTURE_ID,
+    }
+    if blocked_status == "pending":
+        blocked.update(ocr_text="", visual_signature=None)
+
+    assert server._scan_propose_pending_sessions(
+        _user_cfg(),
+        [ready, blocked],
+    ) is False
 
 
 def test_local_match_candidate_carries_inventory_metadata(monkeypatch, tmp_path):

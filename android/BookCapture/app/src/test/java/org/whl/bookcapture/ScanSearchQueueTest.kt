@@ -28,8 +28,205 @@ class ScanSearchQueueTest {
         )
         val store = ScanSearchQueueStore(listOf(item))
         val encoded = scanSearchQueueStoreToJson(store)
-        assertEquals(2, JSONObject(encoded).getInt("version"))
+        assertEquals(3, JSONObject(encoded).getInt("version"))
         assertEquals(store, scanSearchQueueStoreFromJson(encoded))
+    }
+
+    @Test
+    fun processingPlaceholderRoundTripsAndCompletesToASyncableObservation() {
+        val processing = item(ownerId = ownerId).copy(
+            scanCollectionId = "",
+            photoRole = ScanSearchPhotoRole.TITLE_PAGE,
+            ocrText = "",
+            dirty = false,
+            processing = true,
+        )
+        val encoded = scanSearchQueueStoreToJson(ScanSearchQueueStore(listOf(processing)))
+        assertEquals(processing, scanSearchQueueStoreFromJson(encoded).items.single())
+        assertNull(normalizedScanSearchQueueItem(processing.copy(dirty = true)))
+        assertNull(normalizedScanSearchQueueItem(processing.copy(ocrText = "premature")))
+
+        val completed = completeScanSearchProcessingItem(
+            processing,
+            "  A New Herbal\u0000  ",
+            "",
+            "2026-08-21T12:01:00Z",
+        )
+        assertEquals("A New Herbal", completed?.ocrText)
+        assertFalse(checkNotNull(completed).processing)
+        assertTrue(completed.dirty)
+        assertEquals(ScanSearchStatus.PENDING, completed.status)
+        assertEquals("", completed.errorMessage)
+        assertEquals(completed, completeScanSearchProcessingItem(
+            completed,
+            "A New Herbal",
+            "",
+            "2026-08-21T12:02:00Z",
+        ))
+    }
+
+    @Test
+    fun processingFailureIsBoundedLocalAndSurvivesAnEmptyCloudSnapshot() {
+        val processing = item(ownerId = ownerId).copy(
+            scanCollectionId = "",
+            ocrText = "",
+            dirty = false,
+            processing = true,
+        )
+        val failed = failScanSearchProcessingItem(
+            processing,
+            "  Mistral\nOCR failed ${"🙂".repeat(1_000)}  ",
+            "2026-08-21T12:01:00Z",
+        )
+        assertEquals(ScanSearchStatus.FAILED, failed?.status)
+        assertFalse(checkNotNull(failed).processing)
+        assertFalse(failed.dirty)
+        assertTrue(failed.errorMessage.startsWith("Mistral OCR failed"))
+        assertTrue(failed.errorMessage.length <= ScanSearchQueue.MAX_ERROR_CHARS)
+        assertTrue(
+            failed.errorMessage.toByteArray(Charsets.UTF_8).size <=
+                ScanSearchQueue.MAX_ERROR_BYTES,
+        )
+        val parsed = scanSearchQueueStoreFromJson(
+            scanSearchQueueStoreToJson(ScanSearchQueueStore(listOf(failed))),
+        )
+        assertEquals(failed, parsed.items.single())
+        assertEquals(
+            listOf(failed),
+            mergeScanSearchQueueStore(parsed, ownerId, emptyList())?.items,
+        )
+    }
+
+    @Test
+    fun routingAProcessingPlaceholderPublishesItBeforeOcrCompletes() {
+        val processing = item(ownerId = ownerId).copy(
+            scanCollectionId = "",
+            ocrText = "",
+            dirty = false,
+            processing = true,
+        )
+        val routed = routeScanSearchSessionStore(
+            ScanSearchQueueStore(listOf(processing)),
+            ownerId,
+            queueId,
+            collectionId,
+            "2026-08-21T12:01:00Z",
+        )?.items?.single()
+        assertEquals(collectionId, routed?.scanCollectionId)
+        assertTrue(checkNotNull(routed).processing)
+        assertTrue(routed.dirty)
+    }
+
+    @Test
+    fun cloudPlaceholderAckAndOcrCompletionAreRaceSafe() {
+        val local = item(ownerId = ownerId).copy(
+            scanCollectionId = collectionId,
+            ocrText = "",
+            dirty = true,
+            processing = true,
+        )
+        val cloudPlaceholder = local.copy(revision = 1, dirty = false)
+        val acknowledged = checkNotNull(acknowledgeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(local)),
+            ownerId,
+            local,
+            cloudPlaceholder,
+        )).items.single()
+        assertEquals(cloudPlaceholder, acknowledged)
+
+        val completedAfterAck = checkNotNull(completeScanSearchProcessingItem(
+            acknowledged,
+            "A New Herbal",
+            "",
+            "2026-08-21T12:02:00Z",
+        ))
+        assertEquals(1L, completedAfterAck.revision)
+        assertFalse(completedAfterAck.processing)
+        assertTrue(completedAfterAck.dirty)
+
+        val completedBeforeAck = checkNotNull(completeScanSearchProcessingItem(
+            local,
+            "A New Herbal",
+            "",
+            "2026-08-21T12:01:00Z",
+        ))
+        assertEquals(
+            completedBeforeAck,
+            acknowledgeScanSearchQueueStore(
+                ScanSearchQueueStore(listOf(completedBeforeAck)),
+                ownerId,
+                local,
+                cloudPlaceholder,
+            )?.items?.single(),
+        )
+        assertEquals(
+            cloudPlaceholder,
+            mergeScanSearchQueueStore(
+                ScanSearchQueueStore(),
+                ownerId,
+                listOf(cloudPlaceholder),
+            )?.items?.single(),
+        )
+        assertNull(acknowledgeScanSearchQueueStore(
+            ScanSearchQueueStore(listOf(completedBeforeAck)),
+            ownerId,
+            completedBeforeAck,
+            cloudPlaceholder,
+        ))
+        assertEquals(
+            completedBeforeAck,
+            mergeScanSearchQueueStore(
+                ScanSearchQueueStore(listOf(completedBeforeAck)),
+                ownerId,
+                listOf(cloudPlaceholder),
+            )?.items?.single(),
+        )
+    }
+
+    @Test
+    fun routedOcrFailureKeepsLocalDetailUntilRemotePlaceholderIsCancelled() {
+        val processing = item(ownerId = ownerId).copy(
+            scanCollectionId = collectionId,
+            ocrText = "",
+            dirty = true,
+            processing = true,
+        )
+        val failed = checkNotNull(failScanSearchProcessingItem(
+            processing,
+            "Mistral OCR failed",
+            "2026-08-21T12:01:00Z",
+        ))
+        assertTrue(failed.dirty)
+        assertEquals(ScanSearchStatus.FAILED, failed.status)
+        assertEquals(
+            listOf(failed),
+            dismissLocalScanSearchFailures(
+                ScanSearchQueueStore(listOf(failed)),
+                ownerId,
+                queueId,
+            )?.items,
+        )
+
+        val cleaned = checkNotNull(acknowledgeScanSearchFailureCleanupStore(
+            ScanSearchQueueStore(listOf(failed)),
+            ownerId,
+            failed,
+        )).items.single()
+        assertFalse(cleaned.dirty)
+        assertEquals("Mistral OCR failed", cleaned.errorMessage)
+        assertTrue(dismissLocalScanSearchFailures(
+            ScanSearchQueueStore(listOf(cleaned)),
+            ownerId,
+            queueId,
+        )?.items?.isEmpty() == true)
+        assertEquals(
+            listOf(cleaned),
+            mergeScanSearchQueueStore(
+                ScanSearchQueueStore(listOf(cleaned)),
+                ownerId,
+                emptyList(),
+            )?.items,
+        )
     }
 
     @Test
@@ -233,6 +430,93 @@ class ScanSearchQueueTest {
             queueId,
             otherOwnerId,
             "2026-08-21T12:06:00Z",
+        ))
+    }
+
+    @Test
+    fun routingARecaptureLeavesLocalFailureForExplicitDismissal() {
+        val failed = checkNotNull(failScanSearchProcessingItem(
+            item(ownerId = ownerId).copy(
+                scanCollectionId = "",
+                sessionId = queueId,
+                ocrText = "",
+                dirty = false,
+                processing = true,
+            ),
+            "Mistral OCR failed",
+            "2026-08-21T12:01:00Z",
+        ))
+        val recapture = item(id = secondQueueId, ownerId = ownerId).copy(
+            scanCollectionId = "",
+            sessionId = queueId,
+            createdAt = "2026-08-21T12:02:00Z",
+            updatedAt = "2026-08-21T12:02:00Z",
+        )
+
+        val routed = checkNotNull(routeScanSearchSessionStore(
+            ScanSearchQueueStore(listOf(failed, recapture)),
+            ownerId,
+            queueId,
+            collectionId,
+            "2026-08-21T12:03:00Z",
+        ))
+
+        assertEquals(failed, routed.items.first { it.id == failed.id })
+        assertEquals(
+            collectionId,
+            routed.items.first { it.id == recapture.id }.scanCollectionId,
+        )
+        assertTrue(routed.items.first { it.id == recapture.id }.dirty)
+
+        val dismissed = checkNotNull(dismissLocalScanSearchFailures(
+            routed,
+            ownerId,
+            queueId,
+        ))
+        assertEquals(listOf(recapture.id), dismissed.items.map { it.id })
+    }
+
+    @Test
+    fun dismissingLocalFailuresNeverDeletesCloudOrAnotherOwnersFailure() {
+        val local = checkNotNull(failScanSearchProcessingItem(
+            item(ownerId = ownerId).copy(
+                scanCollectionId = "",
+                sessionId = queueId,
+                ocrText = "",
+                dirty = false,
+                processing = true,
+            ),
+            "staging failed",
+            "2026-08-21T12:01:00Z",
+        ))
+        val cloud = item(id = secondQueueId, ownerId = ownerId).copy(
+            sessionId = queueId,
+            status = ScanSearchStatus.FAILED,
+            dirty = false,
+        )
+        val foreign = checkNotNull(failScanSearchProcessingItem(
+            item(id = captureId, ownerId = otherOwnerId).copy(
+                scanCollectionId = "",
+                sessionId = queueId,
+                ocrText = "",
+                dirty = false,
+                processing = true,
+            ),
+            "foreign failure",
+            "2026-08-21T12:01:00Z",
+        ))
+
+        val dismissed = checkNotNull(dismissLocalScanSearchFailures(
+            ScanSearchQueueStore(listOf(local, cloud, foreign)),
+            ownerId,
+            queueId,
+        ))
+
+        assertEquals(setOf(cloud.id, foreign.id), dismissed.items.mapTo(mutableSetOf()) { it.id })
+        assertNull(dismissLocalScanSearchFailures(
+            ScanSearchQueueStore(listOf(local)),
+            "invalid-owner",
+            queueId,
         ))
     }
 
