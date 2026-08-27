@@ -70,6 +70,9 @@ _STRING_FIELDS = frozenset(
         "group_id",
         "language",
         "pages",
+        "marked_price",
+        "scan_priority",
+        "scan_verdict",
         "categories",
         "description",
         "pdf_source",
@@ -78,6 +81,13 @@ _STRING_FIELDS = frozenset(
         "rights",
         "attention",
     }
+)
+_SCAN_PRIORITY_VALUES = frozenset(
+    {"n/s (no scan)", "Low", "Medium", "High"}
+)
+_SCAN_VERDICT_MAX_CHARACTERS = 500
+_SCAN_VERDICT_LINE_BREAKS = frozenset(
+    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 )
 _STATUSES = frozenset({"draft", "ready", "uploaded"})
 _RIGHTS = frozenset(
@@ -200,6 +210,24 @@ class WhlCatalogueItemCodec:
             ):
                 raise ValueError(
                     f"metadata.{field} must not have outer whitespace"
+                )
+        priority = metadata.get("scan_priority")
+        if priority and priority not in _SCAN_PRIORITY_VALUES:
+            raise ValueError("metadata.scan_priority is invalid")
+        verdict = metadata.get("scan_verdict")
+        if isinstance(verdict, str):
+            normalized_verdict = verdict.strip()
+            if any(
+                character in _SCAN_VERDICT_LINE_BREAKS
+                for character in normalized_verdict
+            ):
+                raise ValueError(
+                    "metadata.scan_verdict must be a single line"
+                )
+            if len(normalized_verdict) > _SCAN_VERDICT_MAX_CHARACTERS:
+                raise ValueError(
+                    "metadata.scan_verdict must be at most "
+                    f"{_SCAN_VERDICT_MAX_CHARACTERS} characters"
                 )
         if "status" in metadata and metadata["status"] not in _STATUSES:
             raise ValueError("metadata.status is invalid")

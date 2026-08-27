@@ -145,7 +145,7 @@ class EntryDetailActivity : AppCompatActivity() {
         bindScanPriorityIndicator(
             bookView = binding.detailBookSummary,
             candidate = entryScanCandidate(this, entry),
-            priority = entry.desktopBook?.scanPriority,
+            rank = entry.desktopBook?.scanPriorityRank,
         )
 
         val libMarker = captureLibMarkerPresentation(
@@ -239,12 +239,12 @@ class EntryDetailActivity : AppCompatActivity() {
         if (entryScanCandidate(this, entry) == true) {
             val digitization = scanPriorityPresentation(
                 candidate = true,
-                priority = desktop.scanPriority,
+                rank = desktop.scanPriorityRank,
                 candidateLabel = getString(R.string.home_digitization_candidate),
-                priorityLabel = { priority ->
-                    getString(R.string.scan_priority_description, priority)
+                rankLabel = { rank ->
+                    getString(R.string.scan_priority_description, rank)
                 },
-                priorityUnsetLabel = getString(R.string.scan_priority_unset),
+                rankUnsetLabel = getString(R.string.scan_priority_unset),
             ).accessibilityLabel
             fields += BookDetailField(
                 getString(R.string.detail_digitization),

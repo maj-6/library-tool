@@ -3076,7 +3076,7 @@ class MainActivity : AppCompatActivity() {
             bindScanPriorityIndicator(
                 bookView = binding.lastBookPreview,
                 candidate = null,
-                priority = null,
+                rank = null,
             )
             if (!load.thumbnailChanged) {
                 binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
@@ -3115,7 +3115,7 @@ class MainActivity : AppCompatActivity() {
         val scanPriority = bindScanPriorityIndicator(
             bookView = binding.lastBookPreview,
             candidate = entryScanCandidate(this, entry),
-            priority = entry.desktopBook?.scanPriority,
+            rank = entry.desktopBook?.scanPriorityRank,
         )
 
         // Entries.titleLabel is valuable while extraction is pending, but its

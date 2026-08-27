@@ -14,6 +14,7 @@ from .canvas_preparation_repository import (
     FilesystemCanvasPreparationRepository,
 )
 from .canvas_query_repository import FilesystemCanvasQueryRepository
+from .book_review_import import FilesystemBookReviewImportAdapter
 from .capture_archive_repository import FilesystemCaptureArchiveRepository
 from .capture_document_artifact_repository import (
     FilesystemCaptureDocumentArtifactRepository,
@@ -60,6 +61,20 @@ from .recoverable_write_set import (
     UnsafeTargetError,
     WriteSetError,
 )
+from .scan_assessment_repository import (
+    SCAN_ASSESSMENT_MANIFEST_NAME,
+    SCAN_ASSESSMENT_RELATIVE_ROOT,
+    SCAN_ASSESSMENT_TEXT_NAME,
+    FilesystemScanAssessmentRepository,
+)
+from .portable_book_bundle import (
+    FilesystemPortableBookBundleService,
+    PortableBookBundleZipCodec,
+    ResolvedManualBookAuthority,
+    catalogue_source_evidence,
+    catalogue_source_sha256,
+    resolve_manual_book_authority,
+)
 from .representation_command_repository import (
     FilesystemRepresentationCommandRepository,
 )
@@ -86,6 +101,7 @@ __all__ = [
     "EMPTY_MANAGED_TREE_REVISION",
     "FilesystemAttachedPdfAssetSnapshot",
     "FilesystemAttachedPdfInspector",
+    "FilesystemBookReviewImportAdapter",
     "FilesystemCanvasEvidence",
     "FilesystemCanvasInspection",
     "FilesystemCanvasObservation",
@@ -115,9 +131,19 @@ __all__ = [
     "ManualEntryItemCodec",
     "FilesystemReplicaRepository",
     "FilesystemRepresentationCommandRepository",
+    "FilesystemScanAssessmentRepository",
+    "FilesystemPortableBookBundleService",
     "FilesystemTranslationRepository",
     "FilesystemTextLayerAggregateRepository",
     "RecoverableWriteSet",
+    "SCAN_ASSESSMENT_MANIFEST_NAME",
+    "SCAN_ASSESSMENT_RELATIVE_ROOT",
+    "SCAN_ASSESSMENT_TEXT_NAME",
+    "PortableBookBundleZipCodec",
+    "ResolvedManualBookAuthority",
+    "catalogue_source_evidence",
+    "catalogue_source_sha256",
+    "resolve_manual_book_authority",
     "ResolvedRasterResource",
     "RecoveryResult",
     "RecoveryRequiredError",

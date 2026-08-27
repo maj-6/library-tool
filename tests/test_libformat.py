@@ -696,6 +696,9 @@ def test_lib_open_ignores_operational_meta_fields(client, data_root, tmp_path):
         book={"format_version": "2.0", "source": "primary",
               "meta": {"title": "Crafted", "authors": "X. Author",
                        "rights": "public-domain", "status": "ready",
+                       "marked_price": "7/6 in pencil",
+                       "scan_priority": "High",
+                       "scan_verdict": "Private condition assessment.",
                        "pdf_sources": [{"id": "x",
                                         "path": str(tmp_path / "secret.pdf")}],
                        "ocr_verified": True}},
@@ -710,6 +713,9 @@ def test_lib_open_ignores_operational_meta_fields(client, data_root, tmp_path):
     assert b["title"] == "Crafted" and b["authors"] == "X. Author"
     assert b["rights"] == ""            # the rights gate stays undecided
     assert b["status"] == "draft"
+    assert b["marked_price"] == ""
+    assert b["scan_priority"] == ""
+    assert b["scan_verdict"] == ""
     assert b["pdf_sources"] == []
 
 

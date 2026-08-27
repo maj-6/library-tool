@@ -39,6 +39,10 @@ def test_profile_accepts_valid_book_extensions_without_normalizing_candidate():
         metadata={
             "authors": "Ada Curator",
             "rights": "public-domain",
+            "price": "$40 paid at acquisition",
+            "marked_price": "£1/10/- (pencil)",
+            "scan_priority": "Medium",
+            "scan_verdict": "Scan the annotated plates before the text.",
             "category_ids": ["plants"],
             "bundle": {
                 "about": True,
@@ -88,6 +92,17 @@ def test_profile_rejects_non_book_representation_and_managed_create_fields(
     [
         ({"authors": ["Ada"]}, "authors", "string_required"),
         ({"authors": " Ada "}, "authors", "outer_whitespace"),
+        ({"marked_price": 12}, "marked_price", "string_required"),
+        ({"marked_price": " £1/10/- "}, "marked_price", "outer_whitespace"),
+        ({"scan_priority": 2}, "scan_priority", "string_required"),
+        ({"scan_priority": "high"}, "scan_priority", "invalid_value"),
+        ({"scan_priority": "3"}, "scan_priority", "invalid_value"),
+        (
+            {"scan_verdict": "Scan plates.\nThen scan text."},
+            "scan_verdict",
+            "line_break",
+        ),
+        ({"scan_verdict": "x" * 501}, "scan_verdict", "too_long"),
         ({"rights": "unknown"}, "rights", "invalid_value"),
         ({"category_ids": "plants"}, "category_ids", "array_required"),
         (
@@ -122,6 +137,17 @@ def test_profile_validates_known_whl_metadata_shapes(metadata, field, reason):
     assert caught.value.code == "invalid_item_metadata"
     assert caught.value.details["field"] == field
     assert caught.value.details["reason"] == reason
+
+
+def test_profile_accepts_blank_priority_and_500_unicode_code_point_verdict():
+    candidate = ItemDraft(
+        metadata={
+            "scan_priority": "",
+            "scan_verdict": chr(0x1F33F) * 500,
+        }
+    )
+
+    assert _policy().validate_create(candidate) is None
 
 
 def test_profile_rejects_outer_title_whitespace_and_unknown_categories():

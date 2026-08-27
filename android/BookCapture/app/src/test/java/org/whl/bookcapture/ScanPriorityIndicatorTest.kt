@@ -6,12 +6,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ScanPriorityIndicatorTest {
-    private fun presentation(candidate: Boolean?, priority: Int?) = scanPriorityPresentation(
+    private fun presentation(candidate: Boolean?, rank: Int?) = scanPriorityPresentation(
         candidate = candidate,
-        priority = priority,
+        rank = rank,
         candidateLabel = "Scan candidate",
-        priorityLabel = { "Scan candidate, priority $it" },
-        priorityUnsetLabel = "Priority not assigned",
+        rankLabel = { "Scan candidate, priority $it" },
+        rankUnsetLabel = "Priority not assigned",
     )
 
     @Test

@@ -18,7 +18,7 @@ class CollectionInventoryTest {
         title: String = "The Herb Book",
         createdAt: Long = 100L,
         digitizationCandidateClassification: Boolean? = null,
-        scanPriority: Int? = null,
+        scanPriorityRank: Int? = null,
     ) = CollectionInventorySummary(
         entryId = id,
         collectionId = "00000000-0000-0000-0000-000000000001",
@@ -29,7 +29,7 @@ class CollectionInventoryTest {
         photoCount = 3,
         createdAt = createdAt,
         digitizationCandidateClassification = digitizationCandidateClassification,
-        scanPriority = scanPriority,
+        scanPriorityRank = scanPriorityRank,
     )
 
     private fun entry(
@@ -77,7 +77,7 @@ class CollectionInventoryTest {
         priority: Int? = null,
     ): DesktopBookMetadata {
         val data = JSONObject().put("digitization_candidate", candidate)
-        priority?.let { data.put("scan_priority", it) }
+        priority?.let { data.put("scan_priority_rank", it) }
         return desktopBookMetadataFromJson(
             JSONObject()
                 .put("capture_id", captureId)
@@ -94,7 +94,7 @@ class CollectionInventoryTest {
         val original = summary(
             "entry-1",
             digitizationCandidateClassification = true,
-            scanPriority = 3,
+            scanPriorityRank = 3,
         )
         val encoded = collectionInventoryStoreToJson(
             CollectionInventoryStore(mapOf(original.entryId to original)),
@@ -109,13 +109,56 @@ class CollectionInventoryTest {
         assertEquals("", row.getString("delivery_transport"))
         assertEquals("", row.getString("cloud_owner_id"))
         assertTrue(row.getBoolean("digitization_candidate"))
-        assertEquals(3, row.getInt("scan_priority"))
+        assertEquals(3, row.getInt("scan_priority_rank"))
+        assertFalse(row.has("scan_priority"))
         assertEquals("capture", row.getString("collection_type"))
         assertFalse(row.getBoolean("scan_marked"))
         assertEquals(0L, row.getLong("scan_revision"))
         assertEquals(
             mapOf(original.entryId to original),
             collectionInventoryStoreFromJson(encoded).summaries,
+        )
+    }
+
+    @Test
+    fun legacyPriorityKeyOnlyFallsBackForAnActualInteger() {
+        val encoded = collectionInventoryStoreToJson(
+            CollectionInventoryStore(
+                mapOf("entry-1" to summary(
+                    "entry-1",
+                    digitizationCandidateClassification = true,
+                    scanPriorityRank = 2,
+                )),
+            ),
+        )
+
+        val legacyNumeric = JSONObject(encoded)
+        legacyNumeric.getJSONObject("entries").getJSONObject("entry-1").apply {
+            remove("scan_priority_rank")
+            put("scan_priority", 4)
+        }
+        val migrated = collectionInventoryStoreFromJson(legacyNumeric.toString())
+        assertTrue(migrated.valid)
+        assertEquals(4, migrated.summaries.getValue("entry-1").scanPriorityRank)
+
+        listOf("4", "High", "Medium", "Low", "n/s (no scan)").forEach { label ->
+            val textual = JSONObject(encoded)
+            textual.getJSONObject("entries").getJSONObject("entry-1").apply {
+                remove("scan_priority_rank")
+                put("scan_priority", label)
+            }
+            val parsed = collectionInventoryStoreFromJson(textual.toString())
+            assertTrue(parsed.valid)
+            assertNull(parsed.summaries.getValue("entry-1").scanPriorityRank)
+        }
+
+        val both = JSONObject(encoded)
+        both.getJSONObject("entries").getJSONObject("entry-1")
+            .put("scan_priority", 5)
+        assertEquals(
+            2,
+            collectionInventoryStoreFromJson(both.toString())
+                .summaries.getValue("entry-1").scanPriorityRank,
         )
     }
 
@@ -177,7 +220,7 @@ class CollectionInventoryTest {
                 mapOf("entry-1" to summary(
                     "entry-1",
                     digitizationCandidateClassification = true,
-                    scanPriority = 1,
+                    scanPriorityRank = 1,
                 )),
             ),
         )
@@ -195,28 +238,28 @@ class CollectionInventoryTest {
             val root = JSONObject(valid)
             val row = root.getJSONObject("entries").getJSONObject("entry-1")
             row.put("digitization_candidate", candidate)
-            row.put("scan_priority", priority)
+            row.put("scan_priority_rank", priority)
             assertFalse(collectionInventoryStoreFromJson(root.toString()).valid)
         }
         assertFalse(collectionInventoryStoreFromJson(
-            valid.replace("\"scan_priority\":1", "\"scan_priority\":1.0"),
+            valid.replace("\"scan_priority_rank\":1", "\"scan_priority_rank\":1.0"),
         ).valid)
 
         listOf(
             summary(
                 "not-candidate",
                 digitizationCandidateClassification = false,
-                scanPriority = 1,
+                scanPriorityRank = 1,
             ),
             summary(
                 "orphaned",
                 digitizationCandidateClassification = null,
-                scanPriority = 1,
+                scanPriorityRank = 1,
             ),
             summary(
                 "out-of-range",
                 digitizationCandidateClassification = true,
-                scanPriority = 6,
+                scanPriorityRank = 6,
             ),
         ).forEach { invalid ->
             assertThrows(IllegalArgumentException::class.java) {
@@ -239,7 +282,8 @@ class CollectionInventoryTest {
         val row = JSONObject(encoded).getJSONObject("entries").getJSONObject("entry-1")
 
         assertFalse(row.getBoolean("digitization_candidate"))
-        assertTrue(row.isNull("scan_priority"))
+        assertTrue(row.isNull("scan_priority_rank"))
+        assertFalse(row.has("scan_priority"))
         assertEquals(
             cleared,
             collectionInventoryStoreFromJson(encoded).summaries.getValue("entry-1"),
@@ -322,7 +366,7 @@ class CollectionInventoryTest {
         assertTrue(parsed.valid)
         assertNull(summary.digitizationCandidateClassification)
         assertFalse(summary.digitizationCandidate)
-        assertNull(summary.scanPriority)
+        assertNull(summary.scanPriorityRank)
         assertEquals(3, parsed.sourceVersion)
     }
 
@@ -398,7 +442,7 @@ class CollectionInventoryTest {
         )
         assertEquals(true, candidate.digitizationCandidateClassification)
         assertTrue(candidate.digitizationCandidate)
-        assertEquals(5, candidate.scanPriority)
+        assertEquals(5, candidate.scanPriorityRank)
 
         val cleared = collectionInventorySummary(
             entry(
@@ -408,7 +452,7 @@ class CollectionInventoryTest {
         )
         assertEquals(false, cleared.digitizationCandidateClassification)
         assertFalse(cleared.digitizationCandidate)
-        assertNull(cleared.scanPriority)
+        assertNull(cleared.scanPriorityRank)
     }
 
     @Test

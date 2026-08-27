@@ -82,22 +82,27 @@ class DesktopBookMetadata internal constructor(
         get() = digitizationCandidateClassification == true
 
     /**
-     * Curator-authored scan order, from highest (1) to lowest (5). A priority
-     * has meaning only for an explicitly classified candidate. The desktop
-     * enrichment export represents this small ordinal as a canonical string,
-     * while newer cloud projections may use a JSON integer; both are accepted.
-     * Fractional, padded, out-of-range, and orphaned values fail closed.
+     * Curator-authored scan-order rank, from highest (1) to lowest (5). A rank
+     * has meaning only for an explicitly classified candidate. The renamed
+     * `scan_priority_rank` field is authoritative when present. During the
+     * compatibility window, an integer in the legacy `scan_priority` field is
+     * accepted; textual scan-assessment labels are deliberately never mapped
+     * to this unrelated ordinal. Malformed and orphaned values fail closed.
      */
-    val scanPriority: Int?
+    val scanPriorityRank: Int?
         get() {
             val data = dataCopy()
             if (data.strictBoolean("digitization_candidate") != true) return null
-            val priority = when (val raw = data.opt("scan_priority")) {
+            val field = if (data.has("scan_priority_rank")) {
+                "scan_priority_rank"
+            } else {
+                "scan_priority"
+            }
+            val rank = when (val raw = data.opt(field)) {
                 is Byte, is Short, is Int, is Long -> (raw as Number).toLong()
-                is String -> raw.toLongOrNull()?.takeIf { raw == it.toString() }
                 else -> null
             }
-            return priority?.takeIf { it in 1L..5L }?.toInt()
+            return rank?.takeIf { it in 1L..5L }?.toInt()
         }
 
     val remarks: List<String> get() = parseDesktopRemarks(dataCopy().opt("remarks"))

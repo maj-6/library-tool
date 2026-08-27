@@ -11,6 +11,7 @@ import pytest
 import server
 import whl_client
 from PIL import Image
+from librarytool.catalog_enrichment.importers import iter_manual_records
 
 
 # The three fixture rows exercise, in order: a canonical match target, a
@@ -69,6 +70,11 @@ def ch_workspace(monkeypatch, tmp_path):
         workspace / "manual_entries.json",
     )
     monkeypatch.setattr(lib, "CH_LIBRARY_JSON_PATH", tmp_path / "ch_library.json")
+    monkeypatch.setattr(
+        lib,
+        "CH_ANNOTATIONS_PATH",
+        workspace / "ch_annotations.json",
+    )
     monkeypatch.setattr(server, "BUILDS_PATH", workspace / "whl_builds.json")
     monkeypatch.setattr(server, "ENTRIES_DIR", workspace / "entries")
     monkeypatch.setattr(server, "CAPTURES_DIR", workspace / "captures")
@@ -151,6 +157,323 @@ def _state(client, item_id: str):
 
 def _manual_entry(entry_id: str) -> dict:
     return lib.load_json(lib.MANUAL_ENTRIES_PATH, {})[entry_id]
+
+
+def test_private_ch_annotations_overlay_without_rewriting_shipped_catalogue(
+        ch_workspace):
+    _write_ch_rows()
+    shipped_bytes = lib.CH_LIBRARY_JSON_PATH.read_bytes()
+    client = _client()
+
+    before = client.get("/api/books").get_json()["books"][0]
+    assert before["source_sha256"]
+    assert "scan_priority" not in before
+
+    created = client.put(
+        "/api/v1/ch-annotations/0",
+        json={
+            "source_sha256": before["source_sha256"],
+            "fields": {
+                "marked_price": "  £ 2/6  ",
+                "scan_priority": "n/s (no scan)",
+                "scan_verdict": "  This copy should not be scanned.  ",
+            },
+        },
+        headers={
+            "If-None-Match": "*",
+            "Idempotency-Key": "annotate-ch-row-0",
+        },
+    )
+
+    assert created.status_code == 200
+    annotation = created.get_json()["annotation"]
+    assert annotation["fields"] == {
+        "marked_price": "£ 2/6",
+        "scan_priority": "n/s (no scan)",
+        "scan_verdict": "This copy should not be scanned.",
+    }
+    assert created.headers["ETag"] == f'"{annotation["revision"]}"'
+    assert lib.CH_LIBRARY_JSON_PATH.read_bytes() == shipped_bytes
+    assert lib.CH_ANNOTATIONS_PATH.is_file()
+
+    projected = client.get("/api/books").get_json()["books"][0]
+    assert projected["price"] == "12"
+    assert projected["marked_price"] == "£ 2/6"
+    assert projected["scan_priority"] == "n/s (no scan)"
+    assert projected["scan_verdict"] == "This copy should not be scanned."
+    assert projected["annotation_revision"] == annotation["revision"]
+
+    replay = client.put(
+        "/api/v1/ch-annotations/0",
+        json={
+            "source_sha256": before["source_sha256"],
+            "fields": annotation["fields"],
+        },
+        headers={
+            "If-None-Match": "*",
+            "Idempotency-Key": "annotate-ch-row-0",
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.get_json()["replayed"] is True
+
+    sidecar = lib.load_json(lib.CH_ANNOTATIONS_PATH, {})
+    sidecar["annotations"]["0"]["future_extension"] = {
+        "preserve": ["unknown", "metadata"],
+    }
+    lib.save_json(lib.CH_ANNOTATIONS_PATH, sidecar)
+    updated = client.put(
+        "/api/v1/ch-annotations/0",
+        json={
+            "source_sha256": before["source_sha256"],
+            "fields": {**annotation["fields"], "scan_priority": "Low"},
+        },
+        headers={
+            "If-Match": f'"{annotation["revision"]}"',
+            "Idempotency-Key": "update-ch-row-0",
+        },
+    )
+    assert updated.status_code == 200
+    preserved = lib.load_json(lib.CH_ANNOTATIONS_PATH, {})[
+        "annotations"
+    ]["0"]
+    assert preserved["future_extension"] == {
+        "preserve": ["unknown", "metadata"],
+    }
+
+
+@pytest.mark.parametrize(
+    "priority",
+    ["high", "N/S", "1", 4, None, "Critical"],
+)
+def test_ch_annotation_rejects_noncanonical_priority(ch_workspace, priority):
+    _write_ch_rows()
+    source = _client().get("/api/books").get_json()["books"][0]
+
+    response = _client().put(
+        "/api/v1/ch-annotations/0",
+        json={
+            "source_sha256": source["source_sha256"],
+            "fields": {"scan_priority": priority},
+        },
+        headers={
+            "If-None-Match": "*",
+            "Idempotency-Key": "invalid-priority-test",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_ch_annotation"
+
+
+def test_ch_annotation_requires_exact_current_source_hash(ch_workspace):
+    _write_ch_rows()
+    client = _client()
+    common = {
+        "json": {"fields": {"scan_priority": "Low"}},
+        "headers": {
+            "If-None-Match": "*",
+            "Idempotency-Key": "source-hash-required",
+        },
+    }
+
+    missing = client.put("/api/v1/ch-annotations/0", **common)
+    stale = client.put(
+        "/api/v1/ch-annotations/0",
+        json={
+            "source_sha256": "0" * 64,
+            "fields": {"scan_priority": "Low"},
+        },
+        headers={
+            "If-None-Match": "*",
+            "Idempotency-Key": "source-hash-stale",
+        },
+    )
+
+    assert missing.status_code == 400
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "ch_annotation_source_conflict"
+    assert not lib.CH_ANNOTATIONS_PATH.exists()
+
+
+def test_ch_source_drift_surfaces_conflict_and_drops_stale_overlay(ch_workspace):
+    _write_ch_rows()
+    client = _client()
+    source = client.get("/api/books").get_json()["books"][0]
+    created = client.put(
+        "/api/v1/ch-annotations/0",
+        json={
+            "source_sha256": source["source_sha256"],
+            "fields": {"scan_priority": "High"},
+        },
+        headers={
+            "If-None-Match": "*",
+            "Idempotency-Key": "create-before-source-drift",
+        },
+    )
+    assert created.status_code == 200
+    changed = [dict(row) for row in CH_ROWS]
+    changed[0]["publisher"] = "A changed publisher"
+    _write_ch_rows(changed)
+
+    projected = client.get("/api/books").get_json()["books"][0]
+    detail = client.get("/api/v1/ch-annotations/0")
+
+    assert projected["annotation_conflict"] is True
+    assert "scan_priority" not in projected
+    assert detail.status_code == 409
+    assert detail.get_json()["code"] == "ch_annotation_source_conflict"
+
+
+def test_copy_curation_patch_preserves_manual_evidence_and_unknown_metadata(
+        monkeypatch, ch_workspace):
+    entry = {
+        "id": "manual-one",
+        "title": "A Herbal",
+        "price": "retail price",
+        "checks": {"isbn": "verified"},
+        "scans": {"internet_archive": ["match"]},
+        "verify": {"internet_archive": "approved"},
+        "extra": {"shelf": "B4", "custom": {"future": True}},
+        "future_extension": {"untouched": [1, 2, 3]},
+    }
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, {"manual-one": entry})
+    monkeypatch.setattr(
+        server,
+        "_entry_checks",
+        lambda _entry: pytest.fail("copy curation must not rerun checks"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_mark_capture_archive_stale",
+        lambda _capture_id: pytest.fail(
+            "copy curation must not stale a capture archive"
+        ),
+    )
+
+    response = _client().patch(
+        "/api/manual/manual-one",
+        json={
+            "marked_price": "  7/6 in pencil  ",
+            "scan_priority": "High",
+            "scan_verdict": "  Unique annotations justify scanning.  ",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["bibliographic_changed"] is False
+    assert body["changed_fields"] == [
+        "marked_price",
+        "scan_priority",
+        "scan_verdict",
+    ]
+    saved = _manual_entry("manual-one")
+    assert saved["price"] == "retail price"
+    assert saved["marked_price"] == "7/6 in pencil"
+    assert saved["checks"] == entry["checks"]
+    assert saved["scans"] == entry["scans"]
+    assert saved["verify"] == entry["verify"]
+    assert saved["extra"] == entry["extra"]
+    assert saved["future_extension"] == entry["future_extension"]
+
+
+def test_desktop_scan_assessment_api_uses_mutable_workspace(ch_workspace):
+    client = _client()
+    row = {"id": "manual-one", "title": "A source-bound herbal"}
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, {"manual-one": row})
+    source_sha256 = client.get(
+        "/api/manual/manual-one"
+    ).get_json()["entry"]["source_sha256"]
+    created = client.put(
+        "/api/v1/scan-assessments/manual_entries/manual-one",
+        json={
+            "text": "# Assessment\n\nThe annotations are locally significant.",
+            "provenance": {"source_row_sha256": source_sha256},
+        },
+        headers={
+            "If-None-Match": "*",
+            "Idempotency-Key": "create-manual-one-assessment",
+        },
+    )
+
+    assert created.status_code == 201
+    revision = created.get_json()["assessment"]["manifest"]["revision"]
+    assert created.headers["ETag"] == f'"{revision}"'
+    fetched = client.get(
+        "/api/v1/scan-assessments/manual_entries/manual-one"
+    )
+    assert fetched.status_code == 200
+    assert fetched.get_json()["assessment"]["text"].startswith("# Assessment")
+    assert "path" not in json.dumps(fetched.get_json()).lower()
+    assert (ch_workspace / "scan_assessments").is_dir()
+    assert not (ch_workspace / "output" / "scan_assessments").exists()
+
+
+def test_manual_api_source_hash_matches_enrichment_projection(ch_workspace):
+    capture_id = "11111111-1111-4111-8111-111111111111"
+    capture_dir = server.CAPTURES_DIR / capture_id
+    capture_dir.mkdir(parents=True)
+    (capture_dir / "ocr.txt").write_text("ISBN 9780123456789\n", encoding="utf-8")
+    row = {
+        "id": "manual-hash",
+        "title": "Hash-bound Herbal",
+        "capture_id": capture_id,
+        "marked_price": "7/6",
+        "scan_priority": "High",
+        "scan_verdict": "This copy warrants scanning.",
+        "future_extension": {"keep": True},
+    }
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, {"manual-hash": row})
+    source = next(iter_manual_records(
+        lib.MANUAL_ENTRIES_PATH,
+        captures_dir=server.CAPTURES_DIR,
+    ))
+    expected = hashlib.sha256(json.dumps(
+        dict(source.data),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+    projected = _client().get(
+        "/api/manual/manual-hash"
+    ).get_json()["entry"]
+
+    assert projected["source_sha256"] == expected
+
+
+def test_desktop_reasoning_get_fails_after_bound_source_changes(ch_workspace):
+    row = {"id": "manual-bound", "title": "Bound Herbal"}
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, {"manual-bound": row})
+    client = _client()
+    current_hash = client.get(
+        "/api/manual/manual-bound"
+    ).get_json()["entry"]["source_sha256"]
+    created = client.put(
+        "/api/v1/scan-assessments/manual_entries/manual-bound",
+        json={
+            "text": "Reasoning bound to the reviewed source.",
+            "provenance": {"source_row_sha256": current_hash},
+        },
+        headers={
+            "If-None-Match": "*",
+            "Idempotency-Key": "create-source-bound-reasoning",
+        },
+    )
+    assert created.status_code == 201
+    assert client.get(
+        "/api/v1/scan-assessments/manual_entries/manual-bound"
+    ).status_code == 200
+
+    row["publisher"] = "Changed after review"
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, {"manual-bound": row})
+    stale = client.get(
+        "/api/v1/scan-assessments/manual_entries/manual-bound"
+    )
+
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "scan_assessment_source_conflict"
 
 
 # --- key math ------------------------------------------------------------------

@@ -25,13 +25,16 @@ import collections
 import copy
 import contextlib
 import functools
+import hmac
 import hashlib
 import importlib.util
+import io
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import sys
@@ -121,6 +124,15 @@ from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
 from librarytool.adapters.filesystem.manual_entry_item_codec import (  # noqa: E402
     ManualEntryItemCodec,
 )
+from librarytool.adapters.filesystem.scan_assessment_repository import (  # noqa: E402
+    FilesystemScanAssessmentRepository,
+)
+from librarytool.adapters.filesystem.portable_book_bundle import (  # noqa: E402
+    FilesystemPortableBookBundleService,
+    ResolvedManualBookAuthority,
+    catalogue_source_sha256,
+    resolve_manual_book_authority,
+)
 from librarytool.adapters.windows.secret_store import (  # noqa: E402
     SecretCredentialNotConfiguredError,
     SecretIdRegistry,
@@ -131,7 +143,20 @@ from librarytool_http import (  # noqa: E402
     create_corrections_blueprint,
     create_provider_discovery_blueprint,
     create_processing_preset_blueprint,
+    create_scan_assessment_blueprint,
     create_text_layer_blueprint,
+)
+from librarytool.engine.scan_assessments import (  # noqa: E402
+    ScanAssessmentKey,
+    ScanAssessmentService,
+)
+from librarytool.engine.portable_book_bundle import (  # noqa: E402
+    MAX_PORTABLE_BOOK_BUNDLE_BYTES,
+    MAX_PORTABLE_BOOK_RECORDS,
+    PortableBookBundleConflict,
+    PortableBookBundleError,
+    PortableBookImportPlan,
+    portable_book_canonical_json,
 )
 from librarytool.composition.filesystem import (  # noqa: E402
     CatalogueBindings,
@@ -308,6 +333,17 @@ app.register_blueprint(
 app.register_blueprint(create_text_layer_blueprint(lambda: _library_engine()))
 app.register_blueprint(
     create_processing_preset_blueprint(lambda: _library_engine())
+)
+app.register_blueprint(
+    create_scan_assessment_blueprint(
+        lambda: _scan_assessment_service(),
+        source_sha256_for_request=(
+            lambda key: _scan_assessment_source_sha256(key)
+        ),
+        source_aliases_for_request=(
+            lambda key: _scan_assessment_source_aliases(key)
+        ),
+    )
 )
 app.register_blueprint(
     create_corrections_blueprint(
@@ -2524,8 +2560,158 @@ def _categories(row: dict) -> str:
     return ", ".join(cats)
 
 
-def _ch_row(idx: int, row: dict) -> dict:
+_COPY_CURATION_FIELDS = frozenset({
+    "marked_price",
+    "scan_priority",
+    "scan_verdict",
+})
+_CH_ANNOTATIONS_SCHEMA = "librarytool.ch-annotations/1"
+_CH_ANNOTATIONS_OPERATION_LIMIT = 256
+_ch_annotations_lock = threading.Lock()
+
+
+def _catalog_source_data_sha256(namespace: str, row: Mapping) -> str:
+    """Hash the same source snapshot consumed by catalog enrichment.
+
+    The import projection marker is deliberately part of the source hash.  A
+    later selective review import can therefore compare its recorded
+    ``source_links.source_hash`` directly with the live Desktop source rather
+    than inventing a second, subtly different row fingerprint.
+    """
+
+    capture_root = globals().get("CAPTURES_DIR")
+    return catalogue_source_sha256(
+        namespace,
+        row,
+        captures_path=(
+            capture_root
+            if namespace == "manual_entries" and isinstance(capture_root, Path)
+            else None
+        ),
+    )
+
+
+def _copy_curation_field_value(field: str, value) -> str:
+    """Validate one short private review field at a Desktop write boundary."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    try:
+        if field == "marked_price":
+            return lib.normalize_marked_price(value)
+        if field == "scan_priority":
+            return lib.validate_scan_priority(value)
+        if field == "scan_verdict":
+            return lib.normalize_scan_verdict(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    raise ValueError(f"unsupported copy-curation field: {field}")
+
+
+def _validated_copy_curation_fields(
+        value: Mapping | None, *, omit_blank: bool = False) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("copy-curation fields must be an object")
+    unknown = set(value) - _COPY_CURATION_FIELDS
+    if unknown:
+        raise ValueError("unsupported copy-curation fields: " + ", ".join(
+            sorted(str(field) for field in unknown)
+        ))
+    out: dict[str, str] = {}
+    for field in _COPY_CURATION_FIELDS:
+        if field not in value:
+            continue
+        cleaned = _copy_curation_field_value(field, value[field])
+        if cleaned or not omit_blank:
+            out[field] = cleaned
+    return out
+
+
+def _empty_ch_annotations() -> dict:
     return {
+        "schema": _CH_ANNOTATIONS_SCHEMA,
+        "annotations": {},
+        "operations": {},
+    }
+
+
+def _load_ch_annotations() -> dict:
+    document = lib.load_json(lib.CH_ANNOTATIONS_PATH, None)
+    if document is None:
+        return _empty_ch_annotations()
+    if (
+        not isinstance(document, dict)
+        or document.get("schema") != _CH_ANNOTATIONS_SCHEMA
+        or not isinstance(document.get("annotations"), dict)
+        or not isinstance(document.get("operations", {}), dict)
+    ):
+        raise ValueError("the CH annotation sidecar is invalid")
+    document.setdefault("operations", {})
+    return document
+
+
+def _save_ch_annotations(document: Mapping, *, operation_id: str) -> None:
+    """Publish the mutable CH sidecar through the workspace write journal."""
+
+    write_set = _ensure_engine_session().write_set
+    configured = Path(os.path.abspath(lib.CH_ANNOTATIONS_PATH))
+    try:
+        relative = configured.relative_to(write_set.root)
+    except ValueError as exc:
+        raise ValueError(
+            "the CH annotation sidecar is outside the mutable workspace"
+        ) from exc
+    payload = json.dumps(
+        document,
+        indent=2,
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    transaction = write_set.begin(
+        operation_id=operation_id,
+        scope="ch_annotation_write",
+        metadata={"source": "ch_library"},
+    )
+    transaction.stage_write(relative, payload)
+    transaction.commit(receipt={"kind": "ch_annotation_write"})
+
+
+def _ch_annotation_projection(
+        idx: int, source_row: Mapping, stored) -> dict | None:
+    """Return only a verified, still-bound CH annotation record."""
+
+    if not isinstance(stored, Mapping):
+        return None
+    source_id = str(idx)
+    source_sha256 = _catalog_source_data_sha256("ch_library", source_row)
+    if (
+        stored.get("namespace") != "ch_library"
+        or stored.get("source_id") != source_id
+        or stored.get("source_sha256") != source_sha256
+        or not isinstance(stored.get("revision"), str)
+        or not re.fullmatch(r"cha-[0-9a-f]{64}", stored.get("revision", ""))
+    ):
+        return None
+    try:
+        fields = _validated_copy_curation_fields(
+            stored.get("fields"), omit_blank=True
+        )
+    except ValueError:
+        return None
+    return {
+        "namespace": "ch_library",
+        "source_id": source_id,
+        "source_sha256": source_sha256,
+        "revision": stored["revision"],
+        "updated_at": str(stored.get("updated_at") or ""),
+        "fields": fields,
+    }
+
+
+def _ch_row(idx: int, row: dict, annotation: Mapping | None = None) -> dict:
+    projected = {
         "idx": idx,
         "title": str(row.get("publication", "") or "").replace("_", " ").strip(),
         "subtitle": "",
@@ -2542,6 +2728,15 @@ def _ch_row(idx: int, row: dict) -> dict:
         "categories": _categories(row),
         "notes": str(row.get("notes", "") or "").strip(),
     }
+    source_sha256 = _catalog_source_data_sha256("ch_library", row)
+    projected["source_sha256"] = source_sha256
+    verified = _ch_annotation_projection(idx, row, annotation)
+    if verified is not None:
+        projected.update(verified["fields"])
+        projected["annotation_revision"] = verified["revision"]
+    elif annotation is not None:
+        projected["annotation_conflict"] = True
+    return projected
 
 
 # --- routes ----------------------------------------------------------------
@@ -2672,8 +2867,208 @@ def api_changelog():
 def api_books():
     """The CH private-library catalogue (output/ch_library.json)."""
     raw = lib.load_json(lib.CH_LIBRARY_JSON_PATH, [])
-    books = [_ch_row(i, r) for i, r in enumerate(raw)]
+    with _ch_annotations_lock:
+        annotations = _load_ch_annotations().get("annotations", {})
+    books = [
+        _ch_row(i, r, annotations.get(str(i)))
+        for i, r in enumerate(raw)
+    ]
     return jsonify({"books": [b for b in books if b["title"] or b["author"]]})
+
+
+def _ch_source_row(idx: int) -> tuple[dict, str]:
+    raw = lib.load_json(lib.CH_LIBRARY_JSON_PATH, [])
+    if (
+        not isinstance(raw, list)
+        or idx < 0
+        or idx >= len(raw)
+        or not isinstance(raw[idx], dict)
+    ):
+        abort(404)
+    row = raw[idx]
+    return row, _catalog_source_data_sha256("ch_library", row)
+
+
+def _ch_annotation_response(annotation: Mapping, *, replayed: bool = False):
+    body = {
+        "ok": True,
+        "schema": _CH_ANNOTATIONS_SCHEMA,
+        "annotation": copy.deepcopy(dict(annotation)),
+        "replayed": bool(replayed),
+    }
+    response = jsonify(body)
+    response.set_etag(annotation["revision"], weak=False)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.cache_control.private = True
+    response.cache_control.no_store = True
+    return response
+
+
+@app.get("/api/v1/ch-annotations/<int:idx>")
+def api_ch_annotation_get(idx: int):
+    source_row, source_sha256 = _ch_source_row(idx)
+    with _ch_annotations_lock:
+        stored = _load_ch_annotations()["annotations"].get(str(idx))
+    if stored is None:
+        return jsonify({
+            "ok": False,
+            "error": "CH annotation not found",
+            "code": "ch_annotation_not_found",
+            "namespace": "ch_library",
+            "source_id": str(idx),
+            "source_sha256": source_sha256,
+        }), 404
+    annotation = _ch_annotation_projection(idx, source_row, stored)
+    if annotation is None:
+        return jsonify({
+            "ok": False,
+            "error": "CH source row changed or annotation integrity failed",
+            "code": "ch_annotation_source_conflict",
+            "namespace": "ch_library",
+            "source_id": str(idx),
+            "source_sha256": source_sha256,
+        }), 409
+    return _ch_annotation_response(annotation)
+
+
+@app.put("/api/v1/ch-annotations/<int:idx>")
+def api_ch_annotation_put(idx: int):
+    source_row, source_sha256 = _ch_source_row(idx)
+    operation_id = request.headers.get("Idempotency-Key", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}", operation_id):
+        return jsonify({
+            "ok": False,
+            "error": "Idempotency-Key is required",
+            "code": "idempotency_key_required",
+        }), 428
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) - {"fields", "source_sha256"}:
+        return jsonify({
+            "ok": False,
+            "error": "annotation document is invalid",
+            "code": "invalid_ch_annotation",
+        }), 400
+    requested_source_sha256 = payload.get("source_sha256")
+    if (
+        not isinstance(requested_source_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", requested_source_sha256)
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "an exact CH source-row hash is required",
+            "code": "invalid_ch_annotation",
+        }), 400
+    if requested_source_sha256 != source_sha256:
+        return jsonify({
+            "ok": False,
+            "error": "CH source row changed",
+            "code": "ch_annotation_source_conflict",
+            "source_sha256": source_sha256,
+        }), 409
+    try:
+        fields = _validated_copy_curation_fields(
+            payload.get("fields"), omit_blank=True
+        )
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "code": "invalid_ch_annotation",
+        }), 400
+
+    request_document = {
+        "namespace": "ch_library",
+        "source_id": str(idx),
+        "source_sha256": source_sha256,
+        "fields": fields,
+    }
+    request_sha256 = hashlib.sha256(json.dumps(
+        request_document,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+    with _ch_annotations_lock:
+        document = _load_ch_annotations()
+        operations = document["operations"]
+        replay = operations.get(operation_id)
+        if isinstance(replay, Mapping):
+            if replay.get("request_sha256") != request_sha256:
+                return jsonify({
+                    "ok": False,
+                    "error": "Idempotency-Key was used for another annotation",
+                    "code": "operation_id_conflict",
+                }), 409
+            replayed = replay.get("annotation")
+            if isinstance(replayed, Mapping):
+                return _ch_annotation_response(replayed, replayed=True)
+
+        current = document["annotations"].get(str(idx))
+        current_projection = _ch_annotation_projection(idx, source_row, current)
+        if current is not None and current_projection is None:
+            return jsonify({
+                "ok": False,
+                "error": "CH source row changed or annotation integrity failed",
+                "code": "ch_annotation_source_conflict",
+                "source_sha256": source_sha256,
+            }), 409
+        if current_projection is None:
+            if request.headers.get("If-None-Match") != "*":
+                return jsonify({
+                    "ok": False,
+                    "error": "If-None-Match: * is required to create an annotation",
+                    "code": "annotation_precondition_required",
+                }), 428
+            created_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        else:
+            expected = request.headers.get("If-Match", "")
+            if expected != f'"{current_projection["revision"]}"':
+                return jsonify({
+                    "ok": False,
+                    "error": "the CH annotation changed elsewhere",
+                    "code": "annotation_revision_conflict",
+                    "current_revision": current_projection["revision"],
+                }), 412
+            created_at = str(current.get("created_at") or
+                             current_projection.get("updated_at") or "")
+
+        updated_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        revision_payload = json.dumps(
+            {**request_document, "operation_id": operation_id,
+             "updated_at": updated_at},
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        revision = "cha-" + hashlib.sha256(revision_payload).hexdigest()
+        stored = {
+            **(copy.deepcopy(dict(current))
+               if isinstance(current, Mapping) else {}),
+            **request_document,
+            "revision": revision,
+            "created_at": created_at or updated_at,
+            "updated_at": updated_at,
+        }
+        document["annotations"][str(idx)] = stored
+        annotation = _ch_annotation_projection(idx, source_row, stored)
+        assert annotation is not None
+        operations[operation_id] = {
+            "request_sha256": request_sha256,
+            "annotation": annotation,
+            "created_at": updated_at,
+        }
+        if len(operations) > _CH_ANNOTATIONS_OPERATION_LIMIT:
+            oldest = sorted(
+                operations,
+                key=lambda key: str(operations[key].get("created_at") or ""),
+            )[:len(operations) - _CH_ANNOTATIONS_OPERATION_LIMIT]
+            for key in oldest:
+                operations.pop(key, None)
+        _save_ch_annotations(document, operation_id=operation_id)
+    return _ch_annotation_response(annotation)
 
 
 # --- book builder: catalog entries being prepared for WHL submission -------------
@@ -2838,7 +3233,8 @@ def _builds_apply(
 _BUILD_FIELDS = ("published_slug",
                  "title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "volume", "group_id",
-                 "language", "pages",
+                 "language", "pages", "marked_price", "scan_priority",
+                 "scan_verdict",
                  "categories", "category_ids", "description",
                  "pdf_source", "pdf_file",
                  "pdf_sources", "bundle",
@@ -3117,8 +3513,18 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
     )
     if capture_id and capture_source is None:
         return None, "capture_id has no committed capture source"
-    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
-             if f not in _BUILD_STRUCTURED_FIELDS}
+    build = {}
+    try:
+        for field in _BUILD_FIELDS:
+            if field in _BUILD_STRUCTURED_FIELDS:
+                continue
+            build[field] = (
+                _copy_curation_field_value(field, seed.get(field, ""))
+                if field in _COPY_CURATION_FIELDS
+                else str(seed.get(field, "") or "").strip()
+            )
+    except ValueError as exc:
+        return None, str(exc)
     # Source attachment is a separate versioned aggregate. The browser
     # creates catalogue state first, then attaches any seed source through
     # the representation command service under dual CAS preconditions.
@@ -3302,7 +3708,16 @@ def api_builds_update(build_id: str):
         for f in _BUILD_FIELDS:
             if f not in payload:
                 continue
-            if f == "pdf_sources":
+            if f in _COPY_CURATION_FIELDS:
+                try:
+                    candidate[f] = _copy_curation_field_value(f, payload[f])
+                except ValueError as exc:
+                    return jsonify({
+                        "ok": False,
+                        "error": str(exc),
+                        "code": "invalid_copy_curation_metadata",
+                    }), 400
+            elif f == "pdf_sources":
                 candidate[f] = _clean_pdf_sources(payload[f])
             elif f == "category_ids":
                 candidate[f] = _clean_category_ids(
@@ -5415,6 +5830,9 @@ def _engine_open_lib_draft(metadata: Mapping) -> ItemDraft:
     # catalogue schema can drop this projection without changing OpenLibService.
     bibliographic.update({
         "group_id": "",
+        "marked_price": "",
+        "scan_priority": "",
+        "scan_verdict": "",
         "categories": "",
         "category_ids": [],
         "description": "",
@@ -6863,12 +7281,24 @@ def _resolve_corrections_targets() -> dict[str, _CorrectionsTarget]:
     return targets
 
 
-def _resolve_corrections_targets_locked() -> dict[str, _CorrectionsTarget]:
+def _resolve_corrections_targets_locked(
+    *,
+    builds_snapshot: Mapping | None = None,
+    manual_entries_snapshot: Mapping | None = None,
+) -> dict[str, _CorrectionsTarget]:
     """Resolve one fail-closed authority snapshot under build/manual locks."""
 
     try:
-        builds = lib.load_json(BUILDS_PATH, {})
-        manual_entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        builds = (
+            lib.load_json(BUILDS_PATH, {})
+            if builds_snapshot is None
+            else builds_snapshot
+        )
+        manual_entries = (
+            lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+            if manual_entries_snapshot is None
+            else manual_entries_snapshot
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         raise _corrections_target_error(
             "the Corrections target stores could not be loaded",
@@ -7707,6 +8137,645 @@ def _ensure_engine_session() -> FilesystemEngineSession:
     return session
 
 
+def _scan_assessment_service() -> ScanAssessmentService:
+    """Bind private reasoning storage to the mutable Desktop workspace."""
+
+    repository = FilesystemScanAssessmentRepository(
+        _ensure_engine_session().write_set,
+        relative_root="scan_assessments",
+    )
+    return ScanAssessmentService(repository)
+
+
+def _scan_assessment_source_sha256(
+        key: ScanAssessmentKey) -> str | None:
+    """Resolve the current exact source projection for provenance checks."""
+
+    if key.namespace == "manual_entries":
+        with _manual_lock:
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+            row = entries.get(key.source_id) if isinstance(entries, dict) else None
+        return (
+            _catalog_source_data_sha256("manual_entries", row)
+            if isinstance(row, Mapping)
+            else None
+        )
+    if key.namespace == "ch_library":
+        if not key.source_id.isdigit():
+            return None
+        index = int(key.source_id)
+        if str(index) != key.source_id:
+            return None
+        rows = lib.load_json(lib.CH_LIBRARY_JSON_PATH, [])
+        if (
+            not isinstance(rows, list)
+            or index < 0
+            or index >= len(rows)
+            or not isinstance(rows[index], Mapping)
+        ):
+            return None
+        return _catalog_source_data_sha256("ch_library", rows[index])
+    return None
+
+
+def _scan_assessment_source_aliases(
+        key: ScanAssessmentKey) -> Mapping[str, str] | None:
+    """Resolve assessment aliases from the same fail-closed active authority.
+
+    The original manual/CH source reference remains the artifact identity.
+    Only a captured manual holding can additionally bind a canonical item and
+    capture ID; those values come from Corrections authority rather than from
+    client-authored request JSON.
+    """
+
+    empty = {"canonical_item_id": "", "capture_id": ""}
+    if key.namespace == "ch_library":
+        return empty if _scan_assessment_source_sha256(key) is not None else None
+    if key.namespace != "manual_entries":
+        return None
+    with _corrections_workspace_locks():
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        row = entries.get(key.source_id) if isinstance(entries, dict) else None
+        if not isinstance(row, Mapping):
+            return None
+        raw_capture_id = row.get("capture_id")
+        if raw_capture_id in (None, ""):
+            return empty
+        if (
+            not isinstance(raw_capture_id, str)
+            or _capture_archive_id(raw_capture_id) != raw_capture_id
+        ):
+            raise _corrections_target_error(
+                "the scan-assessment source has an invalid capture identity",
+                code="invalid_corrections_target_snapshot",
+                field="capture_id",
+            )
+        matches = [
+            target
+            for target in _corrections_targets_for_context().values()
+            if target.capture_id == raw_capture_id
+            and (
+                target.manual_storage_id == key.source_id
+                or (
+                    target.storage_kind == "manual"
+                    and target.storage_id == key.source_id
+                )
+            )
+        ]
+        if len(matches) != 1:
+            raise _corrections_target_error(
+                "the scan-assessment source has no unique active authority",
+                code="corrections_target_identity_conflict",
+                capture_id=raw_capture_id,
+            )
+        target = matches[0]
+        return {
+            "canonical_item_id": target.canonical_id,
+            "capture_id": target.capture_id,
+        }
+
+
+# --- versioned portable book + scan-assessment backup bundles -----------------
+
+_PORTABLE_BUNDLE_EXPORT_REQUEST_MAX_BYTES = 2 * 1024 * 1024
+_PORTABLE_BUNDLE_COMMIT_REQUEST_MAX_BYTES = 4096
+_PORTABLE_BUNDLE_HTTP_ARCHIVE_MAX_BYTES = MAX_PORTABLE_BOOK_BUNDLE_BYTES
+_PORTABLE_BUNDLE_PLAN_TTL_SECONDS = 10 * 60
+_PORTABLE_BUNDLE_PLAN_CACHE_MAX_ENTRIES = 8
+# A decoded plan retains the bundle's bounded uncompressed members plus pins,
+# actions, and frozen Python containers.  Two archive limits leave bounded
+# headroom for that representation while guaranteeing one codec-valid export
+# is always eligible for the dry-run cache.
+_PORTABLE_BUNDLE_PLAN_CACHE_MAX_BYTES = 2 * MAX_PORTABLE_BOOK_BUNDLE_BYTES
+_PORTABLE_BUNDLE_COMMIT_CONFIRMATION = "COMMIT-PORTABLE-BOOK-BUNDLE"
+_PORTABLE_BUNDLE_PLAN_ID_RE = re.compile(r"^pbp-[0-9a-f]{32}$", re.ASCII)
+_PORTABLE_BUNDLE_OPERATION_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", re.ASCII
+)
+_portable_bundle_plan_lock = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedPortableBundlePlan:
+    plan: PortableBookImportPlan
+    expires_monotonic: float
+    expires_at: str
+    weight: int
+
+
+_portable_bundle_plan_cache: collections.OrderedDict[
+    str, _CachedPortableBundlePlan
+] = collections.OrderedDict()
+
+
+def _portable_manual_authority_resolver(
+    source_id: str,
+    manual_entries: Mapping,
+    builds: Mapping,
+    source_fallback: Mapping | None,
+) -> ResolvedManualBookAuthority:
+    base = resolve_manual_book_authority(
+        source_id,
+        manual_entries,
+        builds,
+        source_fallback,
+    )
+    if not base.capture_id:
+        return base
+    targets = _resolve_corrections_targets_locked(
+        builds_snapshot=builds,
+        manual_entries_snapshot=manual_entries,
+    )
+    matches = [
+        target
+        for target in targets.values()
+        if target.capture_id == base.capture_id
+        and (
+            target.manual_storage_id == source_id
+            or (
+                target.storage_kind == "manual"
+                and target.storage_id == source_id
+            )
+            or not base.source_exists
+        )
+    ]
+    if not matches:
+        # A completely absent destination is a create candidate. Its archived
+        # descriptor is still validated against both bundled rows.
+        if not base.source_exists and not base.active_exists:
+            return base
+        raise PortableBookBundleConflict(
+            "manual source has no unique resolved capture authority",
+            code="portable_authority_not_found",
+            details={"namespace": "manual_entries", "source_id": source_id},
+        )
+    if len(matches) != 1:
+        raise PortableBookBundleConflict(
+            "manual source resolves to multiple capture authorities",
+            code="duplicate_portable_authority_claim",
+            details={"capture_id": base.capture_id},
+        )
+    target = matches[0]
+    return ResolvedManualBookAuthority(
+        source_id=source_id,
+        source_row=base.source_row,
+        source_exists=base.source_exists,
+        storage_kind=(
+            "whl_builds" if target.storage_kind == "build" else "manual_entries"
+        ),
+        storage_id=target.storage_id,
+        active_row=target.record,
+        active_exists=True,
+        record_revision=target.record_revision,
+        canonical_item_id=target.canonical_id,
+        capture_id=target.capture_id,
+    )
+
+
+def _portable_bundle_service() -> FilesystemPortableBookBundleService:
+    write_set = _ensure_engine_session().write_set
+
+    def relative_to_workspace(path: Path, *, label: str) -> str:
+        configured = Path(os.path.abspath(path))
+        try:
+            return configured.relative_to(write_set.root).as_posix()
+        except ValueError as exc:
+            raise EngineRepositoryError(
+                f"the {label} store is outside the mutable workspace",
+                code="portable_bundle_store_unavailable",
+                retryable=False,
+            ) from exc
+
+    return FilesystemPortableBookBundleService(
+        write_set,
+        ch_library_path=lib.CH_LIBRARY_JSON_PATH,
+        manual_entries_relative=relative_to_workspace(
+            lib.MANUAL_ENTRIES_PATH,
+            label="manual entry",
+        ),
+        builds_relative=relative_to_workspace(
+            BUILDS_PATH,
+            label="WHL build",
+        ),
+        ch_annotations_relative=relative_to_workspace(
+            lib.CH_ANNOTATIONS_PATH,
+            label="CH annotation",
+        ),
+        scan_assessments_relative="scan_assessments",
+        receipts_relative="portable_bundle_imports",
+        captures_path=CAPTURES_DIR,
+        manual_authority_resolver=_portable_manual_authority_resolver,
+    )
+
+
+@contextlib.contextmanager
+def _portable_bundle_catalogue_locks(
+        service: FilesystemPortableBookBundleService):
+    """Use workspace -> build -> manual -> CH lock order consistently."""
+
+    # Service methods re-enter this same workspace lease.  Acquiring it here
+    # first prevents a portable request holding ``_builds_lock`` from waiting
+    # on a Corrections request that already holds the lease and is waiting for
+    # ``_builds_lock``.
+    with service._write_set.workspace_lease():
+        with _builds_lock:
+            with _manual_lock:
+                with _ch_annotations_lock:
+                    yield
+
+
+def _portable_bundle_strict_json(
+        encoded: bytes, *, artifact: str) -> object:
+    def unique_object(pairs):
+        value = {}
+        for name, item in pairs:
+            if name in value:
+                raise ValueError("duplicate JSON member")
+            value[name] = item
+        return value
+
+    try:
+        return json.loads(
+            encoded.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")
+            ),
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise EngineValidationError(
+            f"{artifact} must be strict UTF-8 JSON",
+            code="invalid_portable_bundle_request",
+        ) from exc
+
+
+def _portable_bundle_json_request(maximum: int, *, artifact: str) -> object:
+    if request.content_encoding:
+        raise EngineValidationError(
+            "content encoding is not supported",
+            code="invalid_portable_bundle_request",
+        )
+    if request.mimetype != "application/json":
+        raise EngineValidationError(
+            "Content-Type must be application/json",
+            code="invalid_portable_bundle_content_type",
+        )
+    declared = request.content_length
+    if declared is not None and declared > maximum:
+        raise PortableBookBundleError(
+            "portable bundle request is too large",
+            code="portable_book_bundle_too_large",
+            details={"maximum_bytes": maximum},
+        )
+    encoded = request.stream.read(maximum + 1)
+    if not encoded:
+        raise EngineValidationError(
+            "portable bundle request body is required",
+            code="invalid_portable_bundle_request",
+        )
+    if len(encoded) > maximum:
+        raise PortableBookBundleError(
+            "portable bundle request is too large",
+            code="portable_book_bundle_too_large",
+            details={"maximum_bytes": maximum},
+        )
+    return _portable_bundle_strict_json(encoded, artifact=artifact)
+
+
+def _portable_bundle_sources(value) -> tuple[ScanAssessmentKey, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > MAX_PORTABLE_BOOK_RECORDS
+    ):
+        raise EngineValidationError(
+            "sources must be a non-empty bounded array",
+            code="invalid_portable_bundle_selection",
+        )
+    sources: list[ScanAssessmentKey] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, dict) or set(raw) != {"namespace", "source_id"}:
+            raise EngineValidationError(
+                "each source must contain exactly namespace and source_id",
+                code="invalid_portable_bundle_selection",
+                details={"index": index},
+            )
+        try:
+            source = ScanAssessmentKey(raw["namespace"], raw["source_id"])
+        except (TypeError, EngineValidationError) as exc:
+            raise EngineValidationError(
+                "portable bundle source identity is invalid",
+                code="invalid_portable_bundle_selection",
+                details={"index": index},
+            ) from exc
+        if source.namespace not in {"manual_entries", "ch_library"}:
+            raise EngineValidationError(
+                "portable bundle source namespace is unsupported",
+                code="unsupported_portable_book_namespace",
+                details={"index": index, "namespace": source.namespace},
+            )
+        sources.append(source)
+    if len(set(sources)) != len(sources):
+        raise EngineValidationError(
+            "portable bundle source selection contains duplicates",
+            code="duplicate_portable_book_source",
+        )
+    return tuple(sources)
+
+
+def _portable_bundle_archive_request() -> bytes:
+    if request.content_encoding:
+        raise EngineValidationError(
+            "content encoding is not supported",
+            code="invalid_portable_bundle_request",
+        )
+    if request.mimetype != "application/zip":
+        raise EngineValidationError(
+            "Content-Type must be application/zip",
+            code="invalid_portable_bundle_content_type",
+        )
+    declared = request.content_length
+    if declared is not None and declared > _PORTABLE_BUNDLE_HTTP_ARCHIVE_MAX_BYTES:
+        raise PortableBookBundleError(
+            "portable bundle archive is too large",
+            code="portable_book_bundle_too_large",
+            details={"maximum_bytes": _PORTABLE_BUNDLE_HTTP_ARCHIVE_MAX_BYTES},
+        )
+    archive = request.stream.read(_PORTABLE_BUNDLE_HTTP_ARCHIVE_MAX_BYTES + 1)
+    if not archive:
+        raise EngineValidationError(
+            "portable bundle archive body is required",
+            code="invalid_portable_bundle_request",
+        )
+    if len(archive) > _PORTABLE_BUNDLE_HTTP_ARCHIVE_MAX_BYTES:
+        raise PortableBookBundleError(
+            "portable bundle archive exceeds its HTTP limit",
+            code="portable_book_bundle_too_large",
+            details={"maximum_bytes": _PORTABLE_BUNDLE_HTTP_ARCHIVE_MAX_BYTES},
+        )
+    return archive
+
+
+def _portable_bundle_plan_weight(plan: PortableBookImportPlan) -> int:
+    weight = 4096
+    for record in plan.bundle.records:
+        # Conservative per-record allowance for the record, pin, action, and
+        # their small immutable containers in addition to exact payload bytes.
+        weight += 4096
+        weight += len(portable_book_canonical_json(record.metadata))
+        weight += len(portable_book_canonical_json(record.source_metadata))
+        weight += len(portable_book_canonical_json(record.source_evidence))
+        if record.assessment is not None:
+            weight += len(record.assessment.text.encode("utf-8"))
+            weight += len(
+                portable_book_canonical_json(record.assessment.manifest.as_dict())
+            )
+    return weight
+
+
+def _portable_bundle_cache_purge_locked(now: float) -> None:
+    expired = [
+        plan_id
+        for plan_id, cached in _portable_bundle_plan_cache.items()
+        if cached.expires_monotonic <= now
+    ]
+    for plan_id in expired:
+        _portable_bundle_plan_cache.pop(plan_id, None)
+
+
+def _portable_bundle_cache_put(
+        plan: PortableBookImportPlan) -> tuple[str, str]:
+    weight = _portable_bundle_plan_weight(plan)
+    if weight > _PORTABLE_BUNDLE_PLAN_CACHE_MAX_BYTES:
+        raise PortableBookBundleError(
+            "portable bundle plan is too large to retain safely",
+            code="portable_book_bundle_too_large",
+            details={"maximum_bytes": _PORTABLE_BUNDLE_PLAN_CACHE_MAX_BYTES},
+        )
+    now = time.monotonic()
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=_PORTABLE_BUNDLE_PLAN_TTL_SECONDS)
+    ).isoformat(timespec="seconds")
+    cached = _CachedPortableBundlePlan(
+        plan=plan,
+        expires_monotonic=now + _PORTABLE_BUNDLE_PLAN_TTL_SECONDS,
+        expires_at=expires_at,
+        weight=weight,
+    )
+    with _portable_bundle_plan_lock:
+        _portable_bundle_cache_purge_locked(now)
+        while _portable_bundle_plan_cache and (
+            len(_portable_bundle_plan_cache)
+            >= _PORTABLE_BUNDLE_PLAN_CACHE_MAX_ENTRIES
+            or sum(item.weight for item in _portable_bundle_plan_cache.values())
+            + weight
+            > _PORTABLE_BUNDLE_PLAN_CACHE_MAX_BYTES
+        ):
+            _portable_bundle_plan_cache.popitem(last=False)
+        plan_id = "pbp-" + secrets.token_hex(16)
+        _portable_bundle_plan_cache[plan_id] = cached
+    return plan_id, expires_at
+
+
+def _portable_bundle_cache_get(plan_id: str) -> _CachedPortableBundlePlan:
+    if not _PORTABLE_BUNDLE_PLAN_ID_RE.fullmatch(plan_id):
+        raise EngineNotFoundError(
+            "portable bundle import plan was not found",
+            code="portable_bundle_plan_not_found",
+        )
+    now = time.monotonic()
+    with _portable_bundle_plan_lock:
+        cached = _portable_bundle_plan_cache.get(plan_id)
+        if cached is not None and cached.expires_monotonic <= now:
+            _portable_bundle_plan_cache.pop(plan_id, None)
+            raise EngineError(
+                "portable bundle import plan expired",
+                code="portable_bundle_plan_expired",
+            )
+        _portable_bundle_cache_purge_locked(now)
+        if cached is None:
+            raise EngineNotFoundError(
+                "portable bundle import plan was not found",
+                code="portable_bundle_plan_not_found",
+            )
+        _portable_bundle_plan_cache.move_to_end(plan_id)
+        return cached
+
+
+def _portable_bundle_cache_clear() -> None:
+    """Test/startup seam; never changes any durable Desktop data."""
+
+    with _portable_bundle_plan_lock:
+        _portable_bundle_plan_cache.clear()
+
+
+def _portable_bundle_response(body: Mapping, status: int = 200):
+    response = jsonify(dict(body))
+    response.cache_control.private = True
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response, status
+
+
+def _portable_bundle_error_response(exc: EngineError):
+    if isinstance(exc, EngineRepositoryError):
+        body = {
+            "ok": False,
+            "error": "portable bundle storage operation failed safely",
+            "code": exc.code,
+            "retryable": exc.retryable,
+        }
+        status = 503 if exc.retryable else 500
+        return _portable_bundle_response(body, status)
+    body = {
+        "ok": False,
+        "error": exc.message,
+        "code": exc.code,
+        "retryable": exc.retryable,
+    }
+    safe_details = {
+        key: value
+        for key, value in exc.details.items()
+        if key in {
+            "field",
+            "index",
+            "namespace",
+            "source_id",
+            "record",
+            "member",
+            "members",
+            "maximum_bytes",
+            "planned_state_sha256",
+            "current_state_sha256",
+            "conflicts",
+        }
+    }
+    if safe_details:
+        body["details"] = safe_details
+    if exc.code == "portable_bundle_plan_expired":
+        status = 410
+    elif exc.code == "invalid_portable_bundle_content_type":
+        status = 415
+    elif isinstance(exc, EngineNotFoundError):
+        status = 404
+    elif isinstance(exc, (PortableBookBundleConflict, EngineConflictError)):
+        status = 409
+    elif isinstance(exc, EnginePreconditionRequiredError):
+        status = 428
+    elif exc.code.endswith("too_large"):
+        status = 413
+    else:
+        status = 400
+    return _portable_bundle_response(body, status)
+
+
+@app.post("/api/v1/portable-book-bundles/export")
+def api_portable_book_bundle_export():
+    try:
+        payload = _portable_bundle_json_request(
+            _PORTABLE_BUNDLE_EXPORT_REQUEST_MAX_BYTES,
+            artifact="portable bundle export request",
+        )
+        if not isinstance(payload, dict) or set(payload) != {"sources"}:
+            raise EngineValidationError(
+                "export request must contain exactly sources",
+                code="invalid_portable_bundle_request",
+            )
+        sources = _portable_bundle_sources(payload["sources"])
+        service = _portable_bundle_service()
+        with _portable_bundle_catalogue_locks(service):
+            archive = service.export_bundle(sources)
+    except EngineError as exc:
+        return _portable_bundle_error_response(exc)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    response = send_file(
+        io.BytesIO(archive),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"library-tool-book-backup-{stamp}.zip",
+        conditional=False,
+        max_age=0,
+    )
+    response.cache_control.private = True
+    response.cache_control.no_store = True
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@app.post("/api/v1/portable-book-bundles/import-plans")
+def api_portable_book_bundle_import_plan():
+    try:
+        archive = _portable_bundle_archive_request()
+        service = _portable_bundle_service()
+        bundle = service.decode_bundle(archive)
+        # Uploading this exact ZIP is the explicit selection.  The service has
+        # already validated every declared member; there is no import-all
+        # fallback, fuzzy match, or server-side source discovery here.
+        with _portable_bundle_catalogue_locks(service):
+            pins = service.archive_pins_for_import(bundle)
+            plan = service.plan_import(bundle, pins)
+        plan_id, expires_at = _portable_bundle_cache_put(plan)
+    except EngineError as exc:
+        return _portable_bundle_error_response(exc)
+    return _portable_bundle_response({
+        "ok": True,
+        "schema": "librarytool.portable-book-import-plan-http/1",
+        "plan_id": plan_id,
+        "expires_at": expires_at,
+        "validated_records": len(bundle.records),
+        "plan": plan.as_dict(),
+    })
+
+
+@app.post(
+    "/api/v1/portable-book-bundles/import-plans/<plan_id>/commit"
+)
+def api_portable_book_bundle_import_commit(plan_id: str):
+    try:
+        payload = _portable_bundle_json_request(
+            _PORTABLE_BUNDLE_COMMIT_REQUEST_MAX_BYTES,
+            artifact="portable bundle commit request",
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"confirmation"}
+            or not isinstance(payload.get("confirmation"), str)
+            or not hmac.compare_digest(
+                payload["confirmation"],
+                _PORTABLE_BUNDLE_COMMIT_CONFIRMATION,
+            )
+        ):
+            raise EnginePreconditionRequiredError(
+                "explicit portable bundle confirmation is required",
+                code="portable_bundle_confirmation_required",
+            )
+        operation_id = request.headers.get("Idempotency-Key", "")
+        if not _PORTABLE_BUNDLE_OPERATION_ID_RE.fullmatch(operation_id):
+            raise EnginePreconditionRequiredError(
+                "a valid Idempotency-Key is required",
+                code="portable_bundle_idempotency_key_required",
+                details={"header": "Idempotency-Key"},
+            )
+        cached = _portable_bundle_cache_get(plan_id)
+        service = _portable_bundle_service()
+        with _portable_bundle_catalogue_locks(service):
+            receipt = service.commit_import(
+                cached.plan,
+                operation_id=operation_id,
+            )
+    except EngineError as exc:
+        return _portable_bundle_error_response(exc)
+    return _portable_bundle_response({
+        "ok": True,
+        "schema": "librarytool.portable-book-import-receipt-http/1",
+        "plan_id": plan_id,
+        "receipt": receipt.as_dict(),
+    })
+
+
 def _close_engine_session() -> None:
     """Unpublish and close the transport session after workers have stopped.
 
@@ -8087,6 +9156,7 @@ def _corrections_item_invalidate_capture(
         | (
             _MANUAL_ENTRY_ITEM_CODEC.editable_fields
             - {"attention"}
+            - _COPY_CURATION_FIELDS
         )
     )
     if (
@@ -8401,7 +9471,8 @@ def _corrections_promoted_manual_replay(
 class _CorrectionsItemUpdateService:
     """Dispatch one canonical metadata edit to its sole active row."""
 
-    def update(self, command: UpdateItemCommand):
+    @staticmethod
+    def _canonical_command(command: UpdateItemCommand) -> UpdateItemCommand:
         if not isinstance(command, UpdateItemCommand):
             raise EngineValidationError(
                 "the Corrections item update is invalid",
@@ -8412,7 +9483,7 @@ class _CorrectionsItemUpdateService:
             # removed object and an empty object when private provenance must
             # remain stored. Canonicalize both spellings to removal so the
             # generic repository can round-trip the exact candidate.
-            command = UpdateItemCommand(
+            return UpdateItemCommand(
                 item_id=command.item_id,
                 expected_revision=command.expected_revision,
                 patch=ItemPatch(
@@ -8430,6 +9501,10 @@ class _CorrectionsItemUpdateService:
                 ),
                 operation_id=command.operation_id,
             )
+        return command
+
+    def update(self, command: UpdateItemCommand):
+        command = self._canonical_command(command)
         with _corrections_workspace_locks():
             target = _corrections_item_current_target(command.item_id)
             storage_kind = target.storage_kind
@@ -16937,6 +18012,18 @@ def _trash_restore_record(item: dict) -> tuple[dict, int]:
                        lib.MANUAL_ENTRIES_PATH, _manual_lock)
     if not rid:
         return {"ok": False, "error": "the trashed record has no id"}, 410
+    try:
+        for field in _COPY_CURATION_FIELDS:
+            if field in record:
+                record[field] = _copy_curation_field_value(
+                    field, record[field]
+                )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "code": "invalid_copy_curation_metadata",
+        }, 410
 
     def apply(doc):
         if rid in doc:
@@ -18450,8 +19537,12 @@ def _manual_entry_fingerprint(entry) -> str:
     )
 
 
-def _save_manual_entries(entries: dict) -> None:
-    """Persist manual entries, advancing ``updated_at`` on every changed row.
+def _save_manual_entries(
+        entries: dict,
+        *,
+        restored_entry_ids: frozenset[str] = frozenset(),
+) -> None:
+    """Persist entries, advancing ``updated_at`` on each changed live row.
 
     ``updated_at`` is this store's revision token and the ``manual_updated_at``
     component of a phone capture's projection vector clock
@@ -18465,13 +19556,19 @@ def _save_manual_entries(entries: dict) -> None:
     be monotonic per entry (see :func:`_build_updated_at`), and a future
     manual-entry writer must not be able to forget it.  Callers hold
     ``_manual_lock`` and have not yet written, so the file still holds the
-    pre-edit rows to compare against.
+    pre-edit rows to compare against. A named undo restoration is the one
+    exception: its deleted row and source bindings are reconstituted verbatim.
     """
     prior = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
     for entry_id, entry in (entries or {}).items():
         if not isinstance(entry, dict):
             continue
         before = prior.get(entry_id) if isinstance(prior, dict) else None
+        if before is None and entry_id in restored_entry_ids:
+            # Undo reconstitutes the exact deleted source row. Advancing its
+            # source revision solely because it was absent for a moment would
+            # break assessment/source-hash bindings on every delete/restore.
+            continue
         if _manual_entry_fingerprint(entry) == _manual_entry_fingerprint(before):
             continue
         entry["updated_at"] = _build_updated_at(
@@ -18593,30 +19690,128 @@ def api_manual_list():
     # Cloud capture ingest publishes one whole entry at a time. Pair the read
     # with that writer's lock so a progress-event consumer can fetch the book
     # named by the event immediately and always see a coherent durable row.
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    out = sorted(
-        (
-            _manual_entry_api_projection(entry_id, entry)
-            for entry_id, entry in entries.items()
-            if isinstance(entry_id, str) and isinstance(entry, Mapping)
-        ),
-        key=lambda e: e.get("created_at", ""),
-        reverse=True,
-    )
+    try:
+        with _corrections_workspace_locks():
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+            targets = _corrections_targets_for_context()
+            out = sorted(
+                (
+                    _manual_entry_api_projection(
+                        entry_id,
+                        entry,
+                        curation_target=_manual_entry_corrections_target(
+                            entry_id,
+                            targets,
+                        ),
+                    )
+                    for entry_id, entry in entries.items()
+                    if isinstance(entry_id, str)
+                    and isinstance(entry, Mapping)
+                ),
+                key=lambda e: e.get("created_at", ""),
+                reverse=True,
+            )
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify(out)
 
 
+def _manual_entry_corrections_target(
+        entry_id: str,
+        targets: Mapping[str, _CorrectionsTarget] | None = None,
+) -> _CorrectionsTarget | None:
+    """Resolve one legacy manual key to its sole active Corrections target.
+
+    A promoted capture retains its manual source row for compatibility, but
+    the build is its active curation authority.  Reuse the Corrections
+    resolver's already-validated snapshot instead of independently matching
+    loose capture or identity aliases here.
+    """
+
+    current = (
+        _corrections_targets_for_context()
+        if targets is None
+        else targets
+    )
+    matches = tuple(
+        target
+        for target in current.values()
+        if target.manual_storage_id == entry_id
+        or (
+            target.storage_kind == "manual"
+            and target.storage_id == entry_id
+        )
+    )
+    if len(matches) > 1:
+        raise EngineRepositoryError(
+            "a manual source alias resolves to multiple active items",
+            code="ambiguous_manual_entry_authority",
+            details={
+                "storage_id": _corrections_public_storage_id(
+                    "manual",
+                    entry_id,
+                ),
+            },
+        )
+    return matches[0] if matches else None
+
+
 def _manual_entry_api_projection(
-        entry_id: str, entry: Mapping) -> dict:
-    """Add a full-row CAS token without persisting transport metadata."""
+        entry_id: str,
+        entry: Mapping,
+        *,
+        curation_target: _CorrectionsTarget | None = None,
+) -> dict:
+    """Project source identity plus active capture curation for the UI."""
 
     out = copy.deepcopy(dict(entry))
+    if curation_target is not None:
+        try:
+            for field in _COPY_CURATION_FIELDS:
+                if field in curation_target.record:
+                    out[field] = _copy_curation_field_value(
+                        field,
+                        curation_target.record[field],
+                    )
+                else:
+                    # Do not let an inactive manual shadow leak through after
+                    # the active build explicitly removed a curation field.
+                    out.pop(field, None)
+        except ValueError as exc:
+            raise EngineRepositoryError(
+                "the active copy-curation metadata is invalid",
+                code="invalid_corrections_target_snapshot",
+                details={
+                    "item_id": curation_target.canonical_id,
+                    "cause_type": type(exc).__name__,
+                },
+            ) from exc
     out["record_revision"] = _MANUAL_ENTRY_ITEM_CODEC.record_revision(
         entry_id,
         entry,
     )
+    out["source_sha256"] = _catalog_source_data_sha256(
+        "manual_entries",
+        entry,
+    )
     return out
+
+
+def _manual_entry_projection_with_active_curation(
+        entry_id: str,
+        entry: Mapping,
+) -> dict:
+    """Project a detached manual row under the canonical authority locks."""
+
+    with _corrections_workspace_locks():
+        return _manual_entry_api_projection(
+            entry_id,
+            entry,
+            curation_target=_manual_entry_corrections_target(
+                entry_id,
+                _corrections_targets_for_context(),
+            ),
+        )
 
 
 def _clean_extra(v) -> dict:
@@ -18706,7 +19901,21 @@ def _clean_capture_id(v) -> str:
 @app.route("/api/manual", methods=["POST"])
 def api_manual_add():
     payload = request.get_json(silent=True) or {}
-    entry = {f: str(payload.get(f, "") or "").strip() for f in lib.MANUAL_ENTRY_FIELDS}
+    try:
+        entry = {
+            f: (
+                _copy_curation_field_value(f, payload.get(f, ""))
+                if f in _COPY_CURATION_FIELDS
+                else str(payload.get(f, "") or "").strip()
+            )
+            for f in lib.MANUAL_ENTRY_FIELDS
+        }
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "code": "invalid_copy_curation_metadata",
+        }), 400
     if not entry["title"]:
         return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
     if payload.get("extra"):
@@ -18725,9 +19934,16 @@ def api_manual_add():
         entries[entry["id"]] = entry
         _save_manual_entries(entries)
     activity("added", "manual entry", detail=entry.get("title", ""))
+    try:
+        out = _manual_entry_projection_with_active_curation(
+            entry["id"],
+            entry,
+        )
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify({
         "ok": True,
-        "entry": _manual_entry_api_projection(entry["id"], entry),
+        "entry": out,
     })
 
 
@@ -18735,12 +19951,22 @@ def api_manual_add():
 def api_manual_get(entry_id: str):
     """Fetch one manual row for incremental capture-event consumption."""
 
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
-        entry = entries.get(entry_id)
-        if not isinstance(entry, dict):
-            abort(404)
-        out = _manual_entry_api_projection(entry_id, entry)
+    try:
+        with _corrections_workspace_locks():
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+            entry = entries.get(entry_id)
+            if not isinstance(entry, dict):
+                abort(404)
+            out = _manual_entry_api_projection(
+                entry_id,
+                entry,
+                curation_target=_manual_entry_corrections_target(
+                    entry_id,
+                    _corrections_targets_for_context(),
+                ),
+            )
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify({"ok": True, "entry": out})
 
 
@@ -18753,75 +19979,245 @@ def api_manual_update(entry_id: str):
     that don't alter the book's identity (title parsing migration, attaching
     a local scan PDF)."""
     payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, Mapping):
+        return jsonify({
+            "ok": False,
+            "error": "manual entry patch must be an object",
+            "code": "invalid_manual_entry_patch",
+        }), 400
     stale_capture_id = ""
     snapshot = None
     candidate = None
-    archive_fields = (
+    curation_command = None
+    target = None
+    bibliographic_fields = (
         set(lib.MANUAL_ENTRY_FIELDS)
         - {"local_pdf", "attention"}
+        - _COPY_CURATION_FIELDS
     ) | {"extra", "images", "category_ids"}
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        if entry_id not in entries:
-            abort(404)
-        snapshot = copy.deepcopy(entries[entry_id])
-        candidate = copy.deepcopy(snapshot)
-        for f in lib.MANUAL_ENTRY_FIELDS:
-            if f in payload:
-                candidate[f] = str(payload[f] or "").strip()
-        # non-column metadata: only replaced when explicitly sent (survives edits)
-        if "extra" in payload:
-            candidate["extra"] = _manual_extra_patch(
-                payload.get("extra"),
-                candidate.get("extra"),
+    changed_fields: set[str] = set()
+    bibliographic_changed = False
+    try:
+        with _corrections_workspace_locks():
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+            if entry_id not in entries:
+                abort(404)
+            snapshot = copy.deepcopy(entries[entry_id])
+            candidate = copy.deepcopy(snapshot)
+            target = _manual_entry_corrections_target(
+                entry_id,
+                _corrections_targets_for_context(),
             )
-        if "images" in payload:
-            candidate["images"] = _clean_images(payload.get("images"))
-        if "category_ids" in payload:
-            candidate["category_ids"] = _clean_category_ids(
-                payload.get("category_ids"), lib.load_taxonomy()["nodes"])
-        if not candidate.get("title"):
-            return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
-        if payload.get("_edited"):
-            candidate["edited"] = True
-        if not payload.get("_preserve"):
-            candidate["checks"] = _entry_checks(candidate)
-            # Metadata changed: stored matches and their verifications are stale.
-            candidate.pop("scans", None)
-            candidate.pop("verify", None)
-            candidate.pop("manual_urls", None)
-        if any(
-            candidate.get(field) != snapshot.get(field)
-            for field in archive_fields
-        ):
-            stale_capture_id = _capture_archive_id(
-                candidate.get("capture_id")
+            active_curation_changes: dict[str, str] = {}
+            for field in lib.MANUAL_ENTRY_FIELDS:
+                if field not in payload:
+                    continue
+                try:
+                    if field in _COPY_CURATION_FIELDS:
+                        value = _copy_curation_field_value(
+                            field,
+                            payload[field],
+                        )
+                        if target is not None:
+                            current_value = _copy_curation_field_value(
+                                field,
+                                target.record.get(field, ""),
+                            )
+                            if value != current_value:
+                                active_curation_changes[field] = value
+                            continue
+                    else:
+                        value = str(payload[field] or "").strip()
+                    candidate[field] = value
+                except ValueError as exc:
+                    return jsonify({
+                        "ok": False,
+                        "error": str(exc),
+                        "code": "invalid_copy_curation_metadata",
+                    }), 400
+            # Non-column metadata is replaced only when explicitly sent.
+            if "extra" in payload:
+                candidate["extra"] = _manual_extra_patch(
+                    payload.get("extra"),
+                    candidate.get("extra"),
+                )
+            if "images" in payload:
+                candidate["images"] = _clean_images(payload.get("images"))
+            if "category_ids" in payload:
+                candidate["category_ids"] = _clean_category_ids(
+                    payload.get("category_ids"),
+                    lib.load_taxonomy()["nodes"],
+                )
+            if not candidate.get("title"):
+                return jsonify({
+                    "ok": False,
+                    "error": "TITLE IS REQUIRED",
+                }), 400
+            source_fields = (
+                set(lib.MANUAL_ENTRY_FIELDS)
+                | {"extra", "images", "category_ids"}
             )
+
+            def source_field_value(record: Mapping, field: str):
+                if field == "extra":
+                    return record.get(field, {})
+                if field in {"images", "category_ids"}:
+                    return record.get(field, [])
+                return record.get(field, "")
+
+            source_changed_fields = {
+                field
+                for field in source_fields
+                if source_field_value(candidate, field) != source_field_value(
+                    snapshot,
+                    field,
+                )
+            }
+            if payload.get("_edited") and (
+                target is None or source_changed_fields
+            ):
+                candidate["edited"] = True
+            # The desktop's full editor posts empty defaults for historical
+            # rows that never stored those optional keys. Treat missing and an
+            # empty UI value as the same source value; otherwise a genuinely
+            # curation-only save would be misclassified as a cross-authority
+            # mutation merely because candidate contains extra blank keys.
+            source_row_changed = bool(source_changed_fields) or (
+                candidate.get("edited") != snapshot.get("edited")
+            )
+            if target is not None and not source_row_changed:
+                candidate = copy.deepcopy(snapshot)
+            if active_curation_changes and source_row_changed:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "copy-curation and manual source fields have different "
+                        "active storage authorities; save them separately"
+                    ),
+                    "code": "manual_patch_cross_authority",
+                    "details": {"item_id": target.canonical_id},
+                }), 409
+            changed_fields = (
+                source_changed_fields | set(active_curation_changes)
+            )
+            bibliographic_changed = bool(
+                source_changed_fields & bibliographic_fields
+            )
+            if bibliographic_changed and not payload.get("_preserve"):
+                candidate["checks"] = _entry_checks(candidate)
+                # Metadata changed: stored matches and verifications are stale.
+                candidate.pop("scans", None)
+                candidate.pop("verify", None)
+                candidate.pop("manual_urls", None)
+            if bibliographic_changed:
+                stale_capture_id = _capture_archive_id(
+                    candidate.get("capture_id")
+                )
+            if active_curation_changes:
+                metadata_set = {
+                    field: value
+                    for field, value in active_curation_changes.items()
+                    if value
+                }
+                metadata_remove = tuple(sorted(
+                    field
+                    for field, value in active_curation_changes.items()
+                    if not value
+                ))
+                curation_command = UpdateItemCommand(
+                    item_id=target.canonical_id,
+                    expected_revision=target.record_revision,
+                    patch=ItemPatch(
+                        metadata_set=metadata_set,
+                        metadata_remove=metadata_remove,
+                    ),
+                    operation_id=(
+                        "manual-copy-curation-" + uuid.uuid4().hex
+                    ),
+                )
+    except EngineError as exc:
+        return _engine_error_response(exc)
+
+    if curation_command is not None:
+        try:
+            # The command engine re-resolves active authority, verifies CAS,
+            # preserves unknown record fields, and deliberately excludes these
+            # three curation fields from capture invalidation.
+            _corrections_item_update_engine().update(curation_command)
+            with _corrections_workspace_locks():
+                entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+                current = entries.get(entry_id)
+                if not isinstance(current, Mapping):
+                    raise EngineConflictError(
+                        "the manual source alias changed during curation",
+                        code="item_revision_conflict",
+                        details={"item_id": curation_command.item_id},
+                    )
+                refreshed = _manual_entry_corrections_target(
+                    entry_id,
+                    _corrections_targets_for_context(),
+                )
+                if refreshed is None:
+                    raise EngineConflictError(
+                        "the manual source alias lost its active authority",
+                        code="item_revision_conflict",
+                        details={"item_id": curation_command.item_id},
+                    )
+                out = _manual_entry_api_projection(
+                    entry_id,
+                    current,
+                    curation_target=refreshed,
+                )
+        except EngineError as exc:
+            return _engine_error_response(exc)
+        return jsonify({
+            "ok": True,
+            "entry": out,
+            "changed_fields": sorted(changed_fields),
+            "bibliographic_changed": False,
+        })
 
     # Invalidate first: a failed stale publication leaves the manual row
     # untouched and therefore safely retryable.
-    if stale_capture_id:
-        _mark_capture_archive_stale(stale_capture_id)
-
-    with _manual_lock:
-        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        current = entries.get(entry_id)
-        if current != snapshot:
-            return jsonify({
-                "ok": False,
-                "error": "changed elsewhere",
-                "entry": (
-                    _manual_entry_api_projection(entry_id, current)
-                    if isinstance(current, Mapping)
-                    else current
-                ),
-            }), 409
-        assert candidate is not None
-        entries[entry_id] = candidate
-        _save_manual_entries(entries)
+    try:
+        if stale_capture_id:
+            _mark_capture_archive_stale(stale_capture_id)
+        with _corrections_workspace_locks():
+            entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+            current = entries.get(entry_id)
+            current_target = _manual_entry_corrections_target(
+                entry_id,
+                _corrections_targets_for_context(),
+            )
+            if current != snapshot:
+                return jsonify({
+                    "ok": False,
+                    "error": "changed elsewhere",
+                    "entry": (
+                        _manual_entry_api_projection(
+                            entry_id,
+                            current,
+                            curation_target=current_target,
+                        )
+                        if isinstance(current, Mapping)
+                        else current
+                    ),
+                }), 409
+            assert candidate is not None
+            entries[entry_id] = candidate
+            _save_manual_entries(entries)
+            out = _manual_entry_api_projection(
+                entry_id,
+                candidate,
+                curation_target=current_target,
+            )
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify({
         "ok": True,
-        "entry": _manual_entry_api_projection(entry_id, candidate),
+        "entry": out,
+        "changed_fields": sorted(changed_fields),
+        "bibliographic_changed": bibliographic_changed,
     })
 
 
@@ -18836,6 +20232,19 @@ def api_manual_restore():
     entry = copy.deepcopy(payload.get("entry") or {})
     if isinstance(entry, dict):
         entry.pop("record_revision", None)
+        entry.pop("source_sha256", None)
+        try:
+            for field in _COPY_CURATION_FIELDS:
+                if field in entry:
+                    entry[field] = _copy_curation_field_value(
+                        field, entry[field]
+                    )
+        except ValueError as exc:
+            return jsonify({
+                "ok": False,
+                "error": str(exc),
+                "code": "invalid_copy_curation_metadata",
+            }), 400
     eid = str(entry.get("id") or "")
     if not eid or not str(entry.get("title", "") or "").strip():
         abort(400)
@@ -18843,10 +20252,17 @@ def api_manual_restore():
         _canonicalize_collection_link(entry)
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         entries[eid] = entry
-        _save_manual_entries(entries)
+        _save_manual_entries(
+            entries,
+            restored_entry_ids=frozenset({eid}),
+        )
+    try:
+        out = _manual_entry_projection_with_active_curation(eid, entry)
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify({
         "ok": True,
-        "entry": _manual_entry_api_projection(eid, entry),
+        "entry": out,
     })
 
 
@@ -18858,15 +20274,28 @@ def api_manual_delete(entry_id: str):
             if entry_id not in entries:
                 abort(404)
             record = entries[entry_id]
-            target = next(
-                (
-                    candidate
-                    for candidate in _corrections_targets_for_context().values()
-                    if candidate.storage_kind == "manual"
-                    and candidate.storage_id == entry_id
-                ),
-                None,
+            target = _manual_entry_corrections_target(
+                entry_id,
+                _corrections_targets_for_context(),
             )
+            if (
+                target is not None
+                and target.storage_kind == "build"
+                and target.manual_storage_id == entry_id
+            ):
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "this manual row is the source alias for a promoted "
+                        "capture and cannot be deleted while its canonical "
+                        "item is active"
+                    ),
+                    "code": "promoted_manual_source_alias",
+                    "details": {
+                        "item_id": target.canonical_id,
+                        "capture_id": target.capture_id,
+                    },
+                }), 409
             deletion_guard = (
                 _job_manager.item_deletion_guard(target.canonical_id)
                 if target is not None
@@ -18905,9 +20334,13 @@ def api_manual_scans(entry_id: str):
         e = entries[entry_id]
         e["scans"] = scans
         _save_manual_entries(entries)
+    try:
+        out = _manual_entry_projection_with_active_curation(entry_id, e)
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify({
         "ok": True,
-        "entry": _manual_entry_api_projection(entry_id, e),
+        "entry": out,
     })
 
 
@@ -18940,9 +20373,13 @@ def api_manual_verify(entry_id: str):
             # A manually located source only exists alongside a rejected match.
             (e.get("manual_urls") or {}).pop(source, None)
         _save_manual_entries(entries)
+    try:
+        out = _manual_entry_projection_with_active_curation(entry_id, e)
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify({
         "ok": True,
-        "entry": _manual_entry_api_projection(entry_id, e),
+        "entry": out,
     })
 
 
@@ -18969,9 +20406,13 @@ def api_manual_source(entry_id: str):
         else:
             urls.pop(source, None)
         _save_manual_entries(entries)
+    try:
+        out = _manual_entry_projection_with_active_curation(entry_id, e)
+    except EngineError as exc:
+        return _engine_error_response(exc)
     return jsonify({
         "ok": True,
-        "entry": _manual_entry_api_projection(entry_id, e),
+        "entry": out,
     })
 
 
@@ -26013,13 +27454,16 @@ def _invalidate_capture_archive_before_item_update(
     but a conservative stale state is safe and explicit.
     """
 
-    changed_fields = (
-        set(patch.metadata_set)
-        | set(patch.metadata_remove)
+    relevant_set = set(patch.metadata_set).intersection(
+        _CAPTURE_ARCHIVE_BUILD_FIELDS
+    )
+    relevant_remove = set(patch.metadata_remove).intersection(
+        _CAPTURE_ARCHIVE_BUILD_FIELDS
     )
     if (
         patch.title is None
-        and not changed_fields.intersection(_CAPTURE_ARCHIVE_BUILD_FIELDS)
+        and not relevant_set
+        and not relevant_remove
     ):
         return
     with _builds_lock:
@@ -26032,6 +27476,36 @@ def _invalidate_capture_archive_before_item_update(
         ):
             # Exact command replay and ordinary CAS conflict are resolved by
             # the item service.  Only the still-matched writer can commit.
+            return
+        title_changed = (
+            patch.title is not None
+            and patch.title != str(build.get("title") or "")
+        )
+        def semantically_blank(value) -> bool:
+            return (
+                value is None
+                or value == ""
+                or (
+                    isinstance(value, (Mapping, list, tuple))
+                    and not value
+                )
+            )
+
+        def metadata_value_changed(field: str) -> bool:
+            current = build.get(field)
+            proposed = patch.metadata_set[field]
+            if semantically_blank(current) and semantically_blank(proposed):
+                return False
+            return current != proposed
+
+        metadata_changed = any(
+            metadata_value_changed(field)
+            for field in relevant_set
+        ) or any(
+            field in build and not semantically_blank(build.get(field))
+            for field in relevant_remove
+        )
+        if not title_changed and not metadata_changed:
             return
         capture_id = _capture_archive_id(build.get("capture_id"))
     if capture_id:
@@ -26422,7 +27896,7 @@ def _cloud_capture_association_shadow(
 
 
 def _queue_cloud_capture_stale_association(
-        association: CaptureArchiveAssociation,
+    association: CaptureArchiveAssociation,
 ) -> bool:
     """Durably queue an exact acknowledged current-to-stale transition.
 
@@ -27396,6 +28870,20 @@ def _import_capture(owner_cfg: dict | None, capture_cfg: dict,
 
 def _books_mirror_rows() -> list[dict]:
     """The whole catalog (checked + manual) as cloud `books` upsert rows."""
+    def mobile_projection(value: Mapping) -> dict:
+        data = copy.deepcopy(dict(value))
+        # Copy price and prose stay on Desktop. Textual priority is safe only
+        # after the Android rank reader owns scan_priority_rank and treats
+        # nonnumeric legacy scan_priority as unassigned (the current client).
+        data.pop("marked_price", None)
+        data.pop("scan_verdict", None)
+        data.pop("annotation_revision", None)
+        data.pop("source_sha256", None)
+        priority = data.get("scan_priority")
+        if priority not in set(lib.SCAN_PRIORITY_VALUES):
+            data.pop("scan_priority", None)
+        return data
+
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = []
     state = lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}
@@ -27406,9 +28894,17 @@ def _books_mirror_rows() -> list[dict]:
             continue
         book = (val or {}).get("book") or {}
         if book:
-            rows.append({"key": str(key), "data": book, "updated_at": now})
+            rows.append({
+                "key": str(key),
+                "data": mobile_projection(book),
+                "updated_at": now,
+            })
     for eid, e in (lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}).items():
-        data = {f: e.get(f, "") for f in lib.MANUAL_ENTRY_FIELDS}
+        data = mobile_projection({
+            f: e.get(f, "")
+            for f in lib.MANUAL_ENTRY_FIELDS
+            if f not in {"marked_price", "scan_verdict"}
+        })
         for k in ("extra", "images"):
             if e.get(k):
                 data[k] = e[k]

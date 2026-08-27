@@ -1108,13 +1108,21 @@ test("renderer and remote subframes never receive the capability", () => {
 });
 
 test("remote HTML is retired before automatic API authorization", () => {
+  const portableExportSource = block(
+    appSource,
+    "async function exportPortableBookBundle",
+    "function portableImportPlanValid",
+  );
   assert.doesNotMatch(appSource, /\/api\/webview\?/);
   assert.match(serverSource, /embedded_remote_content_disabled/);
   assert.match(serverSource, /return jsonify\([^\n]+\), 410/);
   assert.match(appSource, /authenticatedBlob/);
   assert.match(appSource, /frameObjectUrl = replaceObjectUrl\(frameObjectUrl, result\.blob\)/);
   assert.match(appSource, /iaViewer\.objectUrl = replaceObjectUrl\(iaViewer\.objectUrl, result\.blob\)/);
-  assert.doesNotMatch(appSource, /response\.blob\(\)/);
+  assert.match(portableExportSource,
+    /downloadPortableBundle\(blob, portableBundleFilename\(response\)\)/);
+  assert.doesNotMatch(appSource.replace(portableExportSource, ""),
+    /response\.blob\(\)/);
 });
 
 test("desktop windows are sandboxed with default-deny navigation and permissions", () => {

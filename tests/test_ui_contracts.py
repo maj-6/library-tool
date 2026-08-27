@@ -34,6 +34,85 @@ def _function(name: str, next_name: str) -> str:
     return APP.split(f"function {name}", 1)[1].split(f"function {next_name}", 1)[0]
 
 
+def test_copy_curation_forms_use_exact_native_priority_contract():
+    for prefix in ("m", "e", "b"):
+        assert f'id="{prefix}-marked_price"' in TEMPLATE
+        match = re.search(
+            rf'<select id="{prefix}-scan_priority"[^>]*>(.*?)</select>',
+            TEMPLATE,
+            re.DOTALL,
+        )
+        assert match
+        options = re.findall(
+            r'<option(?: value="([^"]*)")?>([^<]+)</option>',
+            match.group(1),
+        )
+        assert options == [
+            ("", "Unassessed"),
+            ("n/s (no scan)", "n/s (no scan)"),
+            ("Low", "Low"),
+            ("Medium", "Medium"),
+            ("High", "High"),
+        ]
+        assert f'id="{prefix}-scan_verdict"' in TEMPLATE
+
+
+def test_scan_priority_cell_and_reasoning_popover_are_accessible_and_inert():
+    button = _function("scanPriorityButtonHtml", "checkedRowTr")
+    assert '<button type="button"' in button
+    assert 'aria-haspopup="dialog"' in button
+    assert 'aria-expanded="false"' in button
+    assert 'aria-controls="scan-assessment-popover"' in button
+    assert 'data-scan-source-sha256=' in button
+    assert 'priority || "Unassessed"' in button
+    assert 'Scan priority: ${label}. ${description}' in button
+
+    assert 'id="cad-tooltip" role="tooltip"' in TEMPLATE
+    assert 'id="scan-assessment-popover"' in TEMPLATE
+    assert 'role="dialog"' in TEMPLATE
+    assert 'aria-modal="false"' in TEMPLATE
+    assert 'id="scan-assessment-close"' in TEMPLATE
+    assert re.search(
+        r'id="scan-assessment-body"[^>]*tabindex="0"',
+        TEMPLATE,
+    )
+
+    opener = _function("openScanAssessmentPopover", "initScanAssessmentPopover")
+    assert "encodeURIComponent(namespace)" in opener
+    assert "encodeURIComponent(sourceId)" in opener
+    assert "manifest.provenance.source_row_sha256" in opener
+    assert "actualSourceSha256 !== expectedSourceSha256" in opener
+    assert 'el("scan-assessment-body").textContent = text' in opener
+    assert "innerHTML" not in opener
+    assert "AbortController" in opener
+
+    init = _function("initScanAssessmentPopover", "loadReviews")
+    assert 'event.key === "Escape"' in init
+    assert 'closest(".scan-priority-btn")' in init
+    assert 'closest("#scan-assessment-popover")' in init
+    assert "positionScanAssessmentPopover()" in init
+
+
+def test_scan_popover_rerenders_restore_focus_and_ch_curation_does_not_rescan():
+    render = _function("renderChecked", "scheduleRenderChecked")
+    assert "scanFocusRestore" in render
+    assert "scan-assessment-popover" in render
+    assert 'tbody._streamReveal(`row:${scanFocusRestore.rowId}`)' in render
+    assert "replacement.focus()" in render
+
+    save = _function("saveBookEditTab", "saveWhlEditTab")
+    assert "const bibliographicChanged = bookEditBibliographicChanged(" in save
+    assert "const bibliographicChanged = !priorEntry" not in save
+    assert "if (bibliographicChanged) queueScan(key)" in save
+    assert "if (curationChanged) applyMasterEdit()" in save
+
+
+def test_focused_verdict_tooltip_survives_unrelated_pointer_movement():
+    tooltips = _function("initTooltips", "applyColumnState")
+    assert "restoreFocusedTipOrHide()" in tooltips
+    assert 'addEventListener("mouseleave", restoreFocusedTipOrHide)' in tooltips
+
+
 def test_run_scans_batch_is_search_only():
     body = _function("runScansBatch", "scanStatusLine")
     assert "queueScan(row.id, false)" in body

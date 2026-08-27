@@ -151,3 +151,21 @@ def test_published_volume_row_carries_volume_group_metadata():
 
     assert row["volume"] == "3"
     assert row["group_id"] == "a-work"
+
+
+def test_published_volume_row_omits_private_copy_review_metadata():
+    row = server._volume_row({
+        "title": "A Work",
+        "price": "published price",
+        "marked_price": "7/6 in pencil",
+        "scan_priority": "High",
+        "scan_verdict": "Private condition assessment.",
+        "scan_assessment": "Private full reasoning.",
+    }, "a-work", "https://example.test/a.pdf", "a.pdf", 10, "tester")
+
+    assert not {
+        "marked_price",
+        "scan_priority",
+        "scan_verdict",
+        "scan_assessment",
+    }.intersection(row)

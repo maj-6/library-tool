@@ -48,6 +48,9 @@ _LEGACY_EDITABLE_STRING_FIELDS = (
     "pages",
     "condition",
     "price",
+    "marked_price",
+    "scan_priority",
+    "scan_verdict",
     "illustrations",
     "categories",
     "notes",
@@ -148,8 +151,44 @@ _LOCAL_OR_SERVER_MANAGED_FIELDS = frozenset(
 _ALL_EDITABLE_FIELDS = frozenset(_CANONICAL_EDITABLE_STRING_FIELDS) | (
     _OPTIONAL_EDITABLE_FIELDS
 )
+_SCAN_PRIORITY_VALUES = frozenset(
+    {"n/s (no scan)", "Low", "Medium", "High"}
+)
+_SCAN_VERDICT_MAX_CHARACTERS = 500
+_SCAN_VERDICT_LINE_BREAKS = frozenset(
+    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+)
 _DROP = object()
 _MISSING = object()
+
+
+def _validate_scan_fields(
+    metadata: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    if "scan_priority" in metadata:
+        priority = metadata["scan_priority"]
+        if not isinstance(priority, str):
+            raise TypeError(f"{label} scan_priority must be a string")
+        if priority and priority not in _SCAN_PRIORITY_VALUES:
+            raise ValueError(f"{label} scan_priority is invalid")
+
+    if "scan_verdict" in metadata:
+        verdict = metadata["scan_verdict"]
+        if not isinstance(verdict, str):
+            raise TypeError(f"{label} scan_verdict must be a string")
+        normalized = verdict.strip()
+        if any(
+            character in _SCAN_VERDICT_LINE_BREAKS
+            for character in normalized
+        ):
+            raise ValueError(f"{label} scan_verdict must be a single line")
+        if len(normalized) > _SCAN_VERDICT_MAX_CHARACTERS:
+            raise ValueError(
+                f"{label} scan_verdict must be at most "
+                f"{_SCAN_VERDICT_MAX_CHARACTERS} characters"
+            )
 
 
 def _json_clone(value: Any, *, label: str) -> Any:
@@ -477,6 +516,7 @@ class ManualEntryItemCodec:
         for field in _LEGACY_EDITABLE_STRING_FIELDS:
             if field in raw and not isinstance(raw[field], str):
                 raise TypeError(f"manual entry {field} must be a string")
+        _validate_scan_fields(raw, label="manual entry")
         for field in ("created_at", "updated_at", "local_pdf"):
             if field in raw and not isinstance(raw[field], str):
                 raise TypeError(f"manual entry {field} must be a string")
@@ -587,6 +627,7 @@ class ManualEntryItemCodec:
                 raise ValueError(
                     f"manual entry {field} must not have outer whitespace"
                 )
+        _validate_scan_fields(draft.metadata, label="manual entry")
         category_ids = draft.metadata.get("category_ids")
         if category_ids is not None and (
             not isinstance(category_ids, (list, tuple))

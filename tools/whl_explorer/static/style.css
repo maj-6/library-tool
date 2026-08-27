@@ -2885,6 +2885,72 @@ form.orig-view .cad-input {
 }
 #confirm-cost[hidden] { display: none; }
 
+/* Portable book backups are planned before they can be committed.  Keep the
+   outcome matrix readable at narrow widths and make conflicts a text signal,
+   rather than relying on the status color alone. */
+.portable-import-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: min(72vh, 680px);
+  padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x);
+  overflow: auto;
+}
+.portable-import-body > .settings-note { margin: 0; }
+.portable-plan-scroll { overflow-x: auto; }
+.portable-plan-counts {
+  width: 100%;
+  border-collapse: collapse;
+  font: 11px/1.35 var(--ui);
+  font-variant-numeric: tabular-nums;
+}
+.portable-plan-counts th,
+.portable-plan-counts td {
+  padding: 5px 7px;
+  border: var(--border-w, 1px) solid var(--canvas-line);
+  text-align: right;
+  white-space: nowrap;
+}
+.portable-plan-counts th:first-child { text-align: left; }
+.portable-plan-counts thead th { background: var(--face-hi); color: var(--ink); }
+.portable-conflicts {
+  padding: 8px;
+  border: var(--border-w, 1px) solid var(--canvas-line);
+  border-radius: var(--radius);
+  background: var(--input-bg);
+}
+.portable-conflicts h3 {
+  margin: 0 0 5px;
+  color: var(--ink);
+  font: var(--wt-strong, 600) 11px/1.35 var(--ui);
+}
+.portable-conflicts ul {
+  max-height: 170px;
+  margin: 0;
+  padding-left: 20px;
+  overflow: auto;
+  color: var(--red);
+  font: 11px/1.5 var(--mono);
+  overflow-wrap: anywhere;
+}
+.portable-conflicts ul:empty { display: none; }
+.portable-conflicts .settings-note { margin: 0; }
+.portable-import-status {
+  min-height: 1.4em;
+  margin: 0;
+  color: var(--ink-mut);
+  font: 11px/1.4 var(--ui);
+}
+.portable-import-status.is-error { color: var(--red); }
+
+@media (forced-colors: active) {
+  .portable-conflicts,
+  .portable-plan-counts th,
+  .portable-plan-counts td { border-color: ButtonText; }
+  .portable-conflicts ul,
+  .portable-import-status.is-error { color: CanvasText; }
+}
+
 /* internet archive viewer (PDF preview + metadata + downloads) */
 #ia-overlay { z-index: 61; padding: 4vh 12px; }
 .ia-win { width: min(1500px, 94vw); height: 90vh; padding: 0; overflow: hidden; }
@@ -3133,6 +3199,130 @@ form.orig-view .cad-input {
   font-size: 11px;
   cursor: pointer;
   white-space: nowrap;
+}
+
+/* Copy-specific scan priority is an action as well as a label.  Text remains
+   the primary signal; borders/tints are redundant cues for sighted users. */
+.scan-priority-cell { padding: 1px 3px !important; }
+.scan-priority-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 76px;
+  max-width: 100%;
+  min-height: 23px;
+  padding: 2px 7px;
+  border: var(--border-w, 1px) solid var(--face-sh2);
+  border-radius: 999px;
+  background: var(--face);
+  color: var(--ink);
+  font: 10px/1.25 var(--ui);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.scan-priority-btn:hover { border-color: var(--cyan); background: var(--face-hi); }
+.scan-priority-btn:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+.scan-priority-unassessed { border-style: dashed; color: var(--ink-mut); }
+.scan-priority-n-s-no-scan { box-shadow: inset 3px 0 0 var(--face-sh2); }
+.scan-priority-low { box-shadow: inset 3px 0 0 var(--green); }
+.scan-priority-medium { box-shadow: inset 3px 0 0 var(--amber); }
+.scan-priority-high { box-shadow: inset 3px 0 0 var(--red); font-weight: 700; }
+
+.scan-assessment-popover {
+  position: fixed;
+  z-index: 62;
+  width: min(520px, calc(100vw - 16px));
+  max-height: min(620px, calc(100vh - 16px));
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px;
+  background: var(--canvas);
+  color: var(--ink-light);
+  border: var(--border-w, 1px) solid var(--cyan);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38);
+}
+.scan-assessment-popover[hidden] { display: none; }
+.scan-assessment-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
+  padding-bottom: 6px;
+}
+.scan-assessment-head > div { flex: 1 1 auto; min-width: 0; }
+.scan-assessment-title { font: 600 13px/1.3 var(--ui); color: var(--ink); }
+.scan-assessment-verdict {
+  margin-top: 2px;
+  color: var(--ink-soft);
+  font: 11px/1.4 var(--ui);
+  overflow-wrap: anywhere;
+}
+.scan-assessment-status {
+  min-height: 1.4em;
+  color: var(--ink-mut);
+  font: 10px/1.4 var(--mono);
+}
+.scan-assessment-popover.is-loading .scan-assessment-status::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border: 1px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: scan-assessment-spin .8s linear infinite;
+}
+.scan-assessment-popover.is-error .scan-assessment-status { color: var(--red); }
+.scan-assessment-popover.is-empty .scan-assessment-status { color: var(--amber); }
+.scan-assessment-body {
+  min-height: 0;
+  max-height: min(460px, calc(100vh - 170px));
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink-light);
+  background: var(--input-bg);
+  border: var(--border-w, 1px) solid var(--canvas-line);
+  border-radius: var(--radius);
+  padding: 8px;
+  font: 11px/1.55 var(--mono);
+}
+.scan-assessment-body:empty { display: none; }
+@keyframes scan-assessment-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 600px), (pointer: coarse) {
+  .scan-priority-btn { min-height: 32px; padding-inline: 9px; }
+  .scan-assessment-popover {
+    width: calc(100vw - 12px);
+    max-height: calc(100vh - 12px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scan-assessment-popover.is-loading .scan-assessment-status::before {
+    animation: none;
+    border-right-color: currentColor;
+  }
+}
+
+@media (forced-colors: active) {
+  .scan-priority-btn,
+  .scan-assessment-popover,
+  .scan-assessment-body { forced-color-adjust: auto; border-color: ButtonText; }
+  .scan-priority-btn:focus-visible { outline-color: Highlight; }
+  .scan-priority-high,
+  .scan-priority-medium,
+  .scan-priority-low,
+  .scan-priority-n-s-no-scan { box-shadow: inset 3px 0 0 ButtonText; }
+  .scan-assessment-popover.is-error .scan-assessment-status,
+  .scan-assessment-popover.is-empty .scan-assessment-status { color: CanvasText; }
 }
 
 /* the viewer's page-aligned mode reuses the OCR tab's row styling */

@@ -42,7 +42,7 @@ internal data class RemoteCollectionBook(
     /** `null` means this cache row predates or lacks a curator classification. */
     val digitizationCandidateClassification: Boolean? = null,
     /** Present only for an explicitly classified candidate; valid values are 1..5. */
-    val scanPriority: Int? = null,
+    val scanPriorityRank: Int? = null,
     /** Effective destination role projected by the inventory view. */
     val collectionType: CollectionType = CollectionType.CAPTURE,
     /** True while this physical book is set aside for digitization. */
@@ -514,7 +514,7 @@ internal fun enrichRemoteCollectionBooks(
         author = book.author.ifEmpty { projected.author },
         year = book.year.ifEmpty { projected.year },
         digitizationCandidateClassification = metadata.digitizationCandidateClassification,
-        scanPriority = metadata.scanPriority,
+        scanPriorityRank = metadata.scanPriorityRank,
     )
 }
 
@@ -534,7 +534,7 @@ internal fun RemoteCollectionBook.toInventoryItem(): CollectionInventoryItem =
             createdAt = createdAt,
             deliveryTransport = "cloud",
             digitizationCandidateClassification = digitizationCandidateClassification,
-            scanPriority = scanPriority,
+            scanPriorityRank = scanPriorityRank,
             collectionType = collectionType,
             scanMarked = scanMarked,
             scanSourceCollectionId = scanSourceCollectionId,
@@ -580,11 +580,11 @@ private fun fillUnknownScanMetadata(
     val preferredCandidate = preferred.summary.digitizationCandidateClassification
     val fallbackCandidate = fallback.summary.digitizationCandidateClassification
     val candidate = preferredCandidate ?: fallbackCandidate
-    val priority = when {
+    val rank = when {
         candidate != true -> null
-        preferredCandidate == true && preferred.summary.scanPriority != null ->
-            preferred.summary.scanPriority
-        fallbackCandidate == true -> fallback.summary.scanPriority
+        preferredCandidate == true && preferred.summary.scanPriorityRank != null ->
+            preferred.summary.scanPriorityRank
+        fallbackCandidate == true -> fallback.summary.scanPriorityRank
         else -> null
     }
     val preferredScan = preferred.summary
@@ -593,7 +593,7 @@ private fun fillUnknownScanMetadata(
         (fallbackScan.scanRevision == preferredScan.scanRevision &&
             !preferredScan.scanMarked && fallbackScan.scanMarked)
     val selectedScan = if (useFallbackScan) fallbackScan else preferredScan
-    if (candidate == preferredCandidate && priority == preferred.summary.scanPriority &&
+    if (candidate == preferredCandidate && rank == preferred.summary.scanPriorityRank &&
         selectedScan.collectionType == preferredScan.collectionType &&
         selectedScan.scanMarked == preferredScan.scanMarked &&
         selectedScan.scanSourceCollectionId == preferredScan.scanSourceCollectionId &&
@@ -605,7 +605,7 @@ private fun fillUnknownScanMetadata(
     return preferred.copy(
         summary = preferred.summary.copy(
             digitizationCandidateClassification = candidate,
-            scanPriority = priority,
+            scanPriorityRank = rank,
             collectionType = selectedScan.collectionType,
             scanMarked = selectedScan.scanMarked,
             scanSourceCollectionId = selectedScan.scanSourceCollectionId,
@@ -830,9 +830,9 @@ internal fun saveRemoteCollectionBooksStore(
 
 private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject {
     require(
-        book.scanPriority == null ||
-            (book.digitizationCandidateClassification == true && book.scanPriority in 1..5),
-    ) { "scan priority requires an explicit candidate and must be in 1..5" }
+        book.scanPriorityRank == null ||
+            (book.digitizationCandidateClassification == true && book.scanPriorityRank in 1..5),
+    ) { "scan priority rank requires an explicit candidate and must be in 1..5" }
     require(book.scanRevision >= 0L) { "scan revision must not be negative" }
     require(!book.scanMarked ||
         (book.collectionType == CollectionType.SCAN &&
@@ -856,7 +856,7 @@ private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject {
             "digitization_candidate",
             book.digitizationCandidateClassification ?: JSONObject.NULL,
         )
-        .put("scan_priority", book.scanPriority ?: JSONObject.NULL)
+        .put("scan_priority_rank", book.scanPriorityRank ?: JSONObject.NULL)
         .put("collection_type", book.collectionType.wireValue)
         .put("scan_marked", book.scanMarked)
         .put("scan_source_collection_id", book.scanSourceCollectionId)
@@ -887,12 +887,8 @@ private fun remoteBookFromJson(
     val digitizationCandidateClassification = if (version < 3) null else {
         optionalRemoteBoolean(row, "digitization_candidate")
     }
-    val scanPriority = if (version < 3) null else {
-        optionalRemotePriority(
-            row,
-            "scan_priority",
-            digitizationCandidateClassification,
-        )
+    val scanPriorityRank = if (version < 3) null else {
+        optionalRemotePriorityRank(row, digitizationCandidateClassification)
     }
     val collectionType = if (version < 4) CollectionType.CAPTURE else {
         CollectionType.fromWire(requiredRemoteString(row, "collection_type"))
@@ -930,7 +926,7 @@ private fun remoteBookFromJson(
         photoCount = photoCount.toInt(),
         createdAt = createdAt,
         digitizationCandidateClassification = digitizationCandidateClassification,
-        scanPriority = scanPriority,
+        scanPriorityRank = scanPriorityRank,
         collectionType = collectionType,
         scanMarked = scanMarked,
         scanSourceCollectionId = scanSourceCollectionId,
@@ -946,13 +942,20 @@ private fun optionalRemoteBoolean(source: JSONObject, name: String): Boolean? =
         else -> throw IllegalArgumentException("$name must be a boolean or null")
     }
 
-private fun optionalRemotePriority(
+private fun optionalRemotePriorityRank(
     source: JSONObject,
-    name: String,
     candidate: Boolean?,
 ): Int? {
+    val name = if (source.has("scan_priority_rank")) {
+        "scan_priority_rank"
+    } else {
+        "scan_priority"
+    }
     val raw = source.opt(name)
     if (raw == null || raw === JSONObject.NULL) return null
+    // `scan_priority` now belongs to the textual assessment enum. Only an
+    // actual legacy JSON integer can be recovered as an ordinal rank.
+    if (name == "scan_priority" && raw is String) return null
     require(candidate == true) { "$name requires an explicit candidate" }
     val value = when (raw) {
         is Byte, is Short, is Int, is Long -> (raw as Number).toLong()

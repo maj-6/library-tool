@@ -107,7 +107,7 @@ class ArchiveActivity : AppCompatActivity() {
             val scanPriority = bindScanPriorityIndicator(
                 bookView = row.root,
                 candidate = entryScanCandidate(this, entry),
-                priority = entry.desktopBook?.scanPriority,
+                rank = entry.desktopBook?.scanPriorityRank,
             )
             row.root.contentDescription = listOf(
                 title,
