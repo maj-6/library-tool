@@ -17,7 +17,7 @@ class ScanPrioritySurfaceResourceTest {
         assertTrue(layout.contains("android:background=\"@drawable/whl_row\""))
         assertTrue(source.contains("bookView = row.root"))
         assertTrue(source.contains("candidate = entryScanCandidate(this, entry)"))
-        assertTrue(source.contains("entry.desktopBook?.scanPriority"))
+        assertTrue(source.contains("entry.desktopBook?.scanPriorityRank"))
         assertTrue(source.contains("scanPriority.accessibilityLabel"))
     }
 
@@ -32,7 +32,7 @@ class ScanPrioritySurfaceResourceTest {
         assertTrue(source.contains("bookView = binding.lastBookPreview"))
         assertTrue(source.contains("candidate = entryScanCandidate(this, entry)"))
         assertTrue(source.contains("candidate = null"))
-        assertTrue(source.contains("priority = null"))
+        assertTrue(source.contains("rank = null"))
         assertTrue(source.contains("scanPriority.accessibilityLabel"))
     }
 

@@ -28,7 +28,7 @@ internal data class CollectionInventorySummary(
     /** `null` means the retained row predates or lacks a curator classification. */
     val digitizationCandidateClassification: Boolean? = null,
     /** Present only for an explicitly classified candidate; valid values are 1..5. */
-    val scanPriority: Int? = null,
+    val scanPriorityRank: Int? = null,
     /** Effective collection role. Legacy rows are ordinary capture records. */
     val collectionType: CollectionType = CollectionType.CAPTURE,
     /** Active physical set-aside for digitization, independent of OCR/photo capture. */
@@ -120,7 +120,7 @@ internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInvento
         deliveryTransport = entry.deliveryTransport,
         cloudOwnerId = entry.cloudOwnerId.trim().lowercase(),
         digitizationCandidateClassification = desktop?.digitizationCandidateClassification,
-        scanPriority = desktop?.scanPriority,
+        scanPriorityRank = desktop?.scanPriorityRank,
         collectionType = if (scanMark == null) {
             CollectionType.CAPTURE
         } else {
@@ -173,7 +173,9 @@ internal fun collectionInventoryStoreToJson(store: CollectionInventoryStore): St
  * version. Version 2 adds delivery transport. Version 3 adds the verified
  * cloud owner so a photo-free row can never be submitted under another
  * account merely because that account is signed in later. Version 4 retains
- * the desktop's tri-state scan-candidate classification and bounded priority.
+ * the desktop's tri-state scan-candidate classification and bounded priority
+ * rank. Current writers use `scan_priority_rank`; readers retain a numeric-only
+ * fallback for older rows written with the former `scan_priority` key.
  * Version 5 retains collection role plus the independent physical scan mark.
  */
 internal fun collectionInventoryStoreFromJson(text: String): CollectionInventoryStore = try {
@@ -242,10 +244,10 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
         "non-cloud delivery cannot have a cloud owner"
     }
     require(
-        summary.scanPriority == null ||
+        summary.scanPriorityRank == null ||
             (summary.digitizationCandidateClassification == true &&
-                summary.scanPriority in 1..5),
-    ) { "scan priority requires an explicit candidate and must be in 1..5" }
+                summary.scanPriorityRank in 1..5),
+    ) { "scan priority rank requires an explicit candidate and must be in 1..5" }
     require(summary.scanRevision >= 0L) { "scan revision must not be negative" }
     require(!summary.scanMarked ||
         (summary.collectionType == CollectionType.SCAN &&
@@ -266,7 +268,7 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
             "digitization_candidate",
             summary.digitizationCandidateClassification ?: JSONObject.NULL,
         )
-        .put("scan_priority", summary.scanPriority ?: JSONObject.NULL)
+        .put("scan_priority_rank", summary.scanPriorityRank ?: JSONObject.NULL)
         .put("collection_type", summary.collectionType.wireValue)
         .put("scan_marked", summary.scanMarked)
         .put("scan_source_collection_id", summary.scanSourceCollectionId)
@@ -301,12 +303,8 @@ private fun summaryFromJson(
     val digitizationCandidateClassification = if (version < 4) null else {
         optionalInventoryBoolean(row, "digitization_candidate")
     }
-    val scanPriority = if (version < 4) null else {
-        optionalInventoryPriority(
-            row,
-            "scan_priority",
-            digitizationCandidateClassification,
-        )
+    val scanPriorityRank = if (version < 4) null else {
+        optionalInventoryPriorityRank(row, digitizationCandidateClassification)
     }
     val collectionType = if (version < 5) CollectionType.CAPTURE else {
         CollectionType.fromWire(requiredString(row, "collection_type"))
@@ -343,7 +341,7 @@ private fun summaryFromJson(
         deliveryTransport = deliveryTransport,
         cloudOwnerId = cloudOwnerId,
         digitizationCandidateClassification = digitizationCandidateClassification,
-        scanPriority = scanPriority,
+        scanPriorityRank = scanPriorityRank,
         collectionType = collectionType,
         scanMarked = scanMarked,
         scanSourceCollectionId = scanSourceCollectionId,
@@ -359,13 +357,20 @@ private fun optionalInventoryBoolean(source: JSONObject, name: String): Boolean?
         else -> throw IllegalArgumentException("$name must be a boolean or null")
     }
 
-private fun optionalInventoryPriority(
+private fun optionalInventoryPriorityRank(
     source: JSONObject,
-    name: String,
     candidate: Boolean?,
 ): Int? {
+    val name = if (source.has("scan_priority_rank")) {
+        "scan_priority_rank"
+    } else {
+        "scan_priority"
+    }
     val raw = source.opt(name)
     if (raw == null || raw === JSONObject.NULL) return null
+    // `scan_priority` now belongs to the textual assessment enum. Only an
+    // actual legacy JSON integer can be recovered as an ordinal rank.
+    if (name == "scan_priority" && raw is String) return null
     require(candidate == true) { "$name requires an explicit candidate" }
     val value = when (raw) {
         is Byte, is Short, is Int, is Long -> (raw as Number).toLong()

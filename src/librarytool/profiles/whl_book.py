@@ -40,6 +40,9 @@ _STRING_FIELDS = frozenset(
         "group_id",
         "language",
         "pages",
+        "marked_price",
+        "scan_priority",
+        "scan_verdict",
         "categories",
         "description",
         "pdf_source",
@@ -48,6 +51,13 @@ _STRING_FIELDS = frozenset(
         "rights",
         "attention",
     }
+)
+_SCAN_PRIORITY_VALUES = frozenset(
+    {"n/s (no scan)", "Low", "Medium", "High"}
+)
+_SCAN_VERDICT_MAX_CHARACTERS = 500
+_SCAN_VERDICT_LINE_BREAKS = frozenset(
+    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 )
 _MANAGED_FIELDS = frozenset(
     {
@@ -189,6 +199,21 @@ class WhlBookItemCommandPolicy:
                 self._invalid_metadata(field, "string_required")
             if field in strict_fields and value != value.strip():
                 self._invalid_metadata(field, "outer_whitespace")
+
+        priority = metadata.get("scan_priority")
+        if priority and priority not in _SCAN_PRIORITY_VALUES:
+            self._invalid_metadata("scan_priority", "invalid_value")
+
+        verdict = metadata.get("scan_verdict")
+        if isinstance(verdict, str):
+            normalized_verdict = verdict.strip()
+            if any(
+                character in _SCAN_VERDICT_LINE_BREAKS
+                for character in normalized_verdict
+            ):
+                self._invalid_metadata("scan_verdict", "line_break")
+            if len(normalized_verdict) > _SCAN_VERDICT_MAX_CHARACTERS:
+                self._invalid_metadata("scan_verdict", "too_long")
 
         rights = metadata.get("rights")
         if rights is not None and rights not in _RIGHTS:

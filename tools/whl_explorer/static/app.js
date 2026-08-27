@@ -246,13 +246,14 @@ async function migrateLegacyRendererSecrets() {
 const MANUAL_FIELDS = [
   "title", "subtitle", "author", "publisher", "city", "year", "edition",
   "volume", "language", "pages", "condition", "price", "illustrations",
-  "notes",
+  "marked_price", "scan_priority", "scan_verdict", "notes",
 ];
 
 // Metadata columns of the combined table, in cell order; click-to-edit.
 const BOOK_COLS = [
   "title", "subtitle", "author", "year", "edition", "volume", "publisher",
   "city", "language", "pages", "condition", "illustrations", "price",
+  "marked_price", "scan_priority",
   "acquired", "collection", "from", "categories", "notes",
 ];
 
@@ -262,7 +263,9 @@ const CHECKED_COLS = [
   ["edition", "Edition"], ["volume", "Volume"], ["publisher", "Publisher"],
   ["city", "City"], ["language", "Language"], ["pages", "Pages"],
   ["condition", "Condition"], ["illustrations", "Illustrations"],
-  ["price", "Price"], ["acquired", "Acquired"], ["collection", "Collection"],
+  ["price", "Price"], ["marked_price", "Marked price"],
+  ["scan_priority", "Scan priority"], ["acquired", "Acquired"],
+  ["collection", "Collection"],
   ["from", "From"], ["categories", "Categories"], ["notes", "Notes"],
   ["img", "Img"], ["copyright", "Copyright"],
   ["whl", "WHL"], ["ia", "IA"], ["ht", "HT"], ["mark", "Mark"],
@@ -275,6 +278,9 @@ const PHONE_PROVENANCE_EXTRA_KEYS = new Set([
   "scan_collection_id", "scan_collection", "scan_from",
 ]);
 const READ_ONLY_BOOK_FIELDS = new Set(["collection", "from"]);
+const COPY_CURATION_FIELDS = new Set([
+  "marked_price", "scan_priority", "scan_verdict",
+]);
 
 function scanExtraText(extra, key) {
   if (!extra || typeof extra !== "object" || Array.isArray(extra)) return "";
@@ -316,7 +322,8 @@ const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
 
 const BUILD_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "publisher_city", "edition", "volume", "group_id", "language", "pages",
-  "rights", "pdf_source", "pdf_file", "source_url", "notes"];
+  "marked_price", "scan_priority", "scan_verdict", "rights", "pdf_source",
+  "pdf_file", "source_url", "notes"];
 
 const state = {
   // key `${source}:${idx}` -> { book, checks, scans, verify, manual_urls }
@@ -3586,6 +3593,41 @@ function showTip(text, x, y) {
 }
 function hideTip() { el("cad-tooltip").hidden = true; }
 
+let focusedTooltipTarget = null;
+
+function showFocusedTip(target) {
+  if (!target || !target.dataset || !target.dataset.tip) return;
+  focusedTooltipTarget = target;
+  const described = String(target.getAttribute("aria-describedby") || "")
+    .split(/\s+/).filter(Boolean);
+  if (!described.includes("cad-tooltip")) {
+    described.push("cad-tooltip");
+    target.setAttribute("aria-describedby", described.join(" "));
+    target.dataset.cadTooltipDescribed = "1";
+  }
+  const rect = target.getBoundingClientRect();
+  showTip(target.dataset.tip, rect.left + rect.width / 2, rect.bottom);
+}
+
+function clearFocusedTip(target) {
+  if (!target || focusedTooltipTarget !== target) return;
+  if (target.dataset && target.dataset.cadTooltipDescribed === "1") {
+    const described = String(target.getAttribute("aria-describedby") || "")
+      .split(/\s+/).filter((id) => id && id !== "cad-tooltip");
+    if (described.length) target.setAttribute("aria-describedby", described.join(" "));
+    else target.removeAttribute("aria-describedby");
+    delete target.dataset.cadTooltipDescribed;
+  }
+  focusedTooltipTarget = null;
+  hideTip();
+}
+
+function restoreFocusedTipOrHide() {
+  if (focusedTooltipTarget && document.contains(focusedTooltipTarget))
+    showFocusedTip(focusedTooltipTarget);
+  else hideTip();
+}
+
 function initTooltips() {
   document.addEventListener("mouseover", (ev) => {
     const tagged = ev.target.closest("[data-tip]");
@@ -3602,10 +3644,22 @@ function initTooltips() {
       showTip(td.textContent.trim(), ev.clientX, ev.clientY);
       return;
     }
-    hideTip();
+    restoreFocusedTipOrHide();
   });
-  document.addEventListener("scroll", hideTip, true);
-  document.addEventListener("mouseleave", hideTip);
+  document.addEventListener("focusin", (ev) => {
+    const tagged = ev.target.closest && ev.target.closest("[data-tip]");
+    if (tagged) showFocusedTip(tagged);
+  });
+  document.addEventListener("focusout", (ev) => {
+    const tagged = ev.target.closest && ev.target.closest("[data-tip]");
+    if (tagged) clearFocusedTip(tagged);
+  });
+  document.addEventListener("scroll", () => {
+    if (focusedTooltipTarget && document.contains(focusedTooltipTarget))
+      showFocusedTip(focusedTooltipTarget);
+    else hideTip();
+  }, true);
+  document.addEventListener("mouseleave", restoreFocusedTipOrHide);
 }
 
 // --- table chrome: per-table column visibility + resizable columns --------------
@@ -6053,6 +6107,8 @@ function manualToBook(e) {
     publisher: e.publisher || "", city: e.city || "", language: e.language || "",
     pages: e.pages || "", condition: e.condition || "",
     illustrations: e.illustrations || "", price: e.price || "",
+    marked_price: e.marked_price || "", scan_priority: e.scan_priority || "",
+    scan_verdict: e.scan_verdict || "",
     acquired: "", categories: e.categories || "", notes: e.notes || "",
     category_ids: e.category_ids || [],
   };
@@ -6062,6 +6118,7 @@ function manualToBook(e) {
   if (e.capture_id) book.capture_id = e.capture_id;
   if (e.capture_id && e.record_revision)
     book.capture_source_revision = e.record_revision;
+  if (e.source_sha256) book.source_sha256 = e.source_sha256;
   return applyScanProvenance(book);
 }
 
@@ -6086,11 +6143,13 @@ function combinedRows() {
       manualUrls: e.manual_urls || {},
       localPdf: e.local_pdf || "",
       attention: e.attention || "",   // "" / "1" / the reason text
+      sourceSha256: e.source_sha256 || "",
     });
   }
   for (const [k, v] of state.checked.entries()) {
     const book = applyScanProvenance(Object.assign(
       { subtitle: "", volume: "", language: "" }, v.book));
+    if (v.ch_annotation_conflict) book.annotation_conflict = true;
     rows.push({
       kind: "catalog", id: k, source: k.split(":")[0],
       captured: false,
@@ -6101,6 +6160,7 @@ function combinedRows() {
       manualUrls: v.manual_urls || {},
       localPdf: v.local_pdf || "",
       attention: v.attention || "",   // "" / "1" / the reason text
+      sourceSha256: v.ch_source_sha256 || book.source_sha256 || "",
     });
   }
   return rows;
@@ -7827,6 +7887,211 @@ function initAttnPop() {
   });
 }
 
+// --- scan-assessment reasoning popover ---------------------------------------
+// The short verdict is already available on hover/focus.  The longer Markdown
+// is fetched only when a user activates the source-bound priority button and
+// is rendered as inert pre-wrapped text, never as HTML.
+
+let scanAssessmentTrigger = null;
+let scanAssessmentRequest = null;
+let scanAssessmentGeneration = 0;
+
+function positionScanAssessmentPopover() {
+  const pop = el("scan-assessment-popover");
+  if (!pop || pop.hidden || !scanAssessmentTrigger) return;
+  const box = fixedPopupMetrics(pop);
+  const anchor = scanAssessmentTrigger.getBoundingClientRect();
+  let left = anchor.left;
+  let top = anchor.bottom + 6 * box.scale;
+  if (top + box.rect.height > innerHeight - 8 * box.scale)
+    top = anchor.top - box.rect.height - 6 * box.scale;
+  positionFixedPopup(pop, left, top, box);
+}
+
+function closeScanAssessmentPopover(options) {
+  const pop = el("scan-assessment-popover");
+  if (!pop || pop.hidden) return;
+  const trigger = scanAssessmentTrigger;
+  scanAssessmentGeneration += 1;
+  if (scanAssessmentRequest) scanAssessmentRequest.abort();
+  scanAssessmentRequest = null;
+  pop.hidden = true;
+  pop.classList.remove("is-loading", "is-error", "is-empty");
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  scanAssessmentTrigger = null;
+  if ((!options || options.returnFocus !== false) &&
+      trigger && document.contains(trigger)) trigger.focus();
+}
+
+function scanAssessmentResponseText(data) {
+  const candidates = [
+    data && data.text,
+    data && data.content,
+    data && data.assessment && data.assessment.text,
+    data && data.assessment && data.assessment.content,
+    data && data.view && data.view.text,
+  ];
+  return candidates.find((value) => typeof value === "string");
+}
+
+function scanAssessmentResponseManifest(data) {
+  const candidates = [
+    data && data.manifest,
+    data && data.assessment && data.assessment.manifest,
+    data && data.view && data.view.manifest,
+  ];
+  return candidates.find((value) =>
+    value && typeof value === "object" && !Array.isArray(value));
+}
+
+async function openScanAssessmentPopover(trigger) {
+  if (!trigger) return;
+  if (scanAssessmentTrigger === trigger &&
+      !el("scan-assessment-popover").hidden) {
+    closeScanAssessmentPopover();
+    return;
+  }
+  if (!el("scan-assessment-popover").hidden)
+    closeScanAssessmentPopover({ returnFocus: false });
+
+  scanAssessmentTrigger = trigger;
+  const generation = ++scanAssessmentGeneration;
+  trigger.setAttribute("aria-expanded", "true");
+  hideTip();
+  const pop = el("scan-assessment-popover");
+  const priority = String(trigger.textContent || "Unassessed").trim();
+  const verdict = String(trigger.dataset.scanVerdict || "").trim();
+  el("scan-assessment-title").textContent = `Scan assessment · ${priority}`;
+  el("scan-assessment-verdict").textContent = verdict || "No short verdict recorded.";
+  el("scan-assessment-status").textContent = "Loading full reasoning…";
+  el("scan-assessment-body").textContent = "";
+  pop.classList.add("is-loading");
+  pop.classList.remove("is-error", "is-empty");
+  pop.hidden = false;
+  positionScanAssessmentPopover();
+  el("scan-assessment-close").focus();
+
+  const namespace = trigger.dataset.scanNamespace;
+  const sourceId = trigger.dataset.scanSourceId;
+  const expectedSourceSha256 = String(
+    trigger.dataset.scanSourceSha256 || "");
+  if (!namespace || !sourceId) {
+    pop.classList.remove("is-loading");
+    pop.classList.add("is-error");
+    el("scan-assessment-status").textContent =
+      "This row has no stable source reference for full reasoning.";
+    positionScanAssessmentPopover();
+    return;
+  }
+  if ((namespace === "manual_entries" || namespace === "ch_library") &&
+      !/^[0-9a-f]{64}$/.test(expectedSourceSha256)) {
+    pop.classList.remove("is-loading");
+    pop.classList.add("is-error");
+    el("scan-assessment-status").textContent =
+      "The current source identity has not been verified. Reload the " +
+      "catalog before opening this reasoning.";
+    positionScanAssessmentPopover();
+    return;
+  }
+
+  scanAssessmentRequest = new AbortController();
+  try {
+    const response = await fetch(
+      `/api/v1/scan-assessments/${encodeURIComponent(namespace)}/` +
+      encodeURIComponent(sourceId),
+      { signal: scanAssessmentRequest.signal },
+    );
+    const data = await response.json().catch(() => ({}));
+    if (generation !== scanAssessmentGeneration || scanAssessmentTrigger !== trigger)
+      return;
+    pop.classList.remove("is-loading");
+    if (!response.ok) {
+      if (response.status === 404) {
+        pop.classList.add("is-empty");
+        el("scan-assessment-status").textContent =
+          "No full reasoning is stored for this holding.";
+      } else {
+        pop.classList.add("is-error");
+        el("scan-assessment-status").textContent = String(
+          data.error || data.message ||
+          "Full reasoning could not be loaded. The stored artifact may be unavailable or fail integrity checks.");
+      }
+      positionScanAssessmentPopover();
+      return;
+    }
+    const manifest = scanAssessmentResponseManifest(data);
+    const actualSourceSha256 = String(
+      manifest && manifest.provenance &&
+      manifest.provenance.source_row_sha256 || "");
+    if (!manifest ||
+        String(manifest.namespace || "") !== namespace ||
+        String(manifest.source_id || "") !== sourceId ||
+        (expectedSourceSha256 &&
+          actualSourceSha256 !== expectedSourceSha256)) {
+      pop.classList.add("is-error");
+      el("scan-assessment-status").textContent =
+        "This reasoning is bound to an older or different source record. " +
+        "Review the source conflict before using it.";
+      el("scan-assessment-body").textContent = "";
+      positionScanAssessmentPopover();
+      return;
+    }
+    const text = scanAssessmentResponseText(data);
+    if (typeof text !== "string" || !text.trim()) {
+      pop.classList.add("is-empty");
+      el("scan-assessment-status").textContent =
+        "The assessment artifact is present but contains no reasoning text.";
+    } else {
+      el("scan-assessment-status").textContent = "Full reasoning";
+      el("scan-assessment-body").textContent = text;
+    }
+    positionScanAssessmentPopover();
+  } catch (error) {
+    if (error && error.name === "AbortError") return;
+    if (generation !== scanAssessmentGeneration || scanAssessmentTrigger !== trigger)
+      return;
+    pop.classList.remove("is-loading");
+    pop.classList.add("is-error");
+    el("scan-assessment-status").textContent =
+      "Full reasoning could not be loaded. Check the local service and try again.";
+    positionScanAssessmentPopover();
+  } finally {
+    if (generation === scanAssessmentGeneration) scanAssessmentRequest = null;
+  }
+}
+
+function initScanAssessmentPopover() {
+  el("scan-assessment-close").addEventListener("click", () =>
+    closeScanAssessmentPopover());
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest &&
+      event.target.closest(".scan-priority-btn");
+    if (button) {
+      event.preventDefault();
+      void openScanAssessmentPopover(button);
+      return;
+    }
+    if (!el("scan-assessment-popover").hidden &&
+        !(event.target.closest &&
+          event.target.closest("#scan-assessment-popover"))) {
+      closeScanAssessmentPopover();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !el("scan-assessment-popover").hidden) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeScanAssessmentPopover();
+    }
+  });
+  document.addEventListener("scroll", () => {
+    if (!el("scan-assessment-popover").hidden) positionScanAssessmentPopover();
+  }, true);
+  addEventListener("resize", () => {
+    if (!el("scan-assessment-popover").hidden) positionScanAssessmentPopover();
+  });
+}
+
 // --- the review queue ---------------------------------------------------------
 // Items flagged "Needs review" in the Q popover. Server-backed and shared:
 // every contributor sees the same queue, comments under their own name
@@ -8314,6 +8579,58 @@ function filteredCheckedRows(prebuilt) {
 }
 
 // build a normal (or volume-child) row <tr>
+const SCAN_PRIORITY_VALUES = new Set([
+  "n/s (no scan)", "Low", "Medium", "High",
+]);
+
+function scanAssessmentRefForRow(row) {
+  if (!row) return null;
+  if (row.kind === "manual") {
+    const sourceId = String(row.id || "");
+    return sourceId ? {
+      namespace: "manual_entries",
+      sourceId,
+      sourceSha256: String(row.sourceSha256 || ""),
+    } : null;
+  }
+  const namespace = String(row.source || "");
+  const storageKey = String(row.id || "");
+  const separator = storageKey.indexOf(":");
+  const sourceId = separator >= 0 ? storageKey.slice(separator + 1) : "";
+  return namespace && sourceId ? {
+    namespace,
+    sourceId,
+    sourceSha256: String(row.sourceSha256 || ""),
+  } : null;
+}
+
+function scanPriorityButtonHtml(row, book) {
+  const raw = typeof book.scan_priority === "string"
+    ? book.scan_priority : "";
+  const priority = SCAN_PRIORITY_VALUES.has(raw) ? raw : "";
+  const label = priority || "Unassessed";
+  const verdict = typeof book.scan_verdict === "string"
+    ? book.scan_verdict.trim() : "";
+  const ref = scanAssessmentRefForRow(row);
+  const description = book.annotation_conflict
+    ? "Stored scan annotation conflicts with the current source row"
+    : (verdict || "No scan verdict recorded");
+  const attrs = ref
+    ? ` data-scan-namespace="${esc(ref.namespace)}"` +
+      ` data-scan-source-id="${esc(ref.sourceId)}"` +
+      ` data-scan-source-sha256="${esc(ref.sourceSha256)}"`
+    : ' data-scan-identity-missing="1"';
+  const tone = priority
+    ? priority.toLowerCase().replace(/[^a-z]+/g, "-").replace(/^-|-$/g, "")
+    : "unassessed";
+  return `<button type="button" class="scan-priority-btn scan-priority-${tone}"` +
+    ` aria-haspopup="dialog" aria-expanded="false"` +
+    ` aria-controls="scan-assessment-popover" aria-describedby="cad-tooltip"` +
+    ` aria-label="${esc(`Scan priority: ${label}. ${description}`)}"` +
+    ` data-scan-verdict="${esc(verdict)}" data-tip="${esc(description)}"${attrs}>` +
+    `${esc(label)}</button>`;
+}
+
 function checkedRowTr(row, cmode, opts) {
   opts = opts || {};
   const b = row.book;
@@ -8333,6 +8650,9 @@ function checkedRowTr(row, cmode, opts) {
   // volume titles are implied by the set header — optionally hide them
   const hideTitle = opts.isVol && !!state.settings.hideVolTitles;
   const cell = (f) => {
+    if (f === "scan_priority") {
+      return `<td class="scan-priority-cell">${scanPriorityButtonHtml(row, b)}</td>`;
+    }
     const val = f === "title" && hideTitle ? ""
       : f === "categories" ? bookCatsText(b) : b[f];
     const classes = [], attrs = [];
@@ -8343,7 +8663,7 @@ function checkedRowTr(row, cmode, opts) {
         attrs.push('data-tip="Recorded at capture · read-only snapshot"');
     }
     // editable only in Edit mode (Process mode is review-only, like the WHL table)
-    if (cmode === "edit" && !snapshotField &&
+    if (cmode === "edit" && !snapshotField && !COPY_CURATION_FIELDS.has(f) &&
         !(row.kind === "manual" && f === "acquired")) {
       classes.push("editable");
       attrs.push(`data-edit="${f}"`);
@@ -8498,6 +8818,24 @@ function renderChecked() {
   // Background re-renders must not destroy an in-progress cell edit.
   const active = document.activeElement;
   if (active && active.classList && active.classList.contains("cell-edit")) return;
+  let scanFocusRestore = null;
+  if (el("scan-assessment-popover") &&
+      !el("scan-assessment-popover").hidden) {
+    const trigger = scanAssessmentTrigger;
+    const triggerRow = trigger && trigger.closest && trigger.closest("tr");
+    scanFocusRestore = {
+      shouldFocus: !!(
+        active && (
+          active === trigger || el("scan-assessment-popover").contains(active)
+        )
+      ),
+      trigger,
+      rowId: triggerRow ? String(triggerRow.dataset.rowId || "") : "",
+      namespace: trigger ? String(trigger.dataset.scanNamespace || "") : "",
+      sourceId: trigger ? String(trigger.dataset.scanSourceId || "") : "",
+    };
+    closeScanAssessmentPopover({ returnFocus: false });
+  }
   updateCheckedCount();
   const tbody = el("checked-rows");
   const allRows = combinedRows();           // one scan, reused by the filter below
@@ -8513,8 +8851,12 @@ function renderChecked() {
   // fresh so lookups remain correct; every path that reveals the table
   // (tab click -> renderChecked at initTabs, switchTopTable -> renderTop)
   // re-renders it, so nothing is left stale.
-  if (!el("checked").classList.contains("active") || el("checked-pane").hidden)
+  if (!el("checked").classList.contains("active") || el("checked-pane").hidden) {
+    if (scanFocusRestore && scanFocusRestore.shouldFocus &&
+        scanFocusRestore.trigger && document.contains(scanFocusRestore.trigger))
+      scanFocusRestore.trigger.focus();
     return;
+  }
   const cmode = checkedMode();
   let rows = filteredCheckedRows(allRows);
   const so = state.sort.checked;
@@ -8590,6 +8932,17 @@ function renderChecked() {
 
   applyTableChrome("checked");
   markSortHeaders("checked");
+  if (scanFocusRestore && scanFocusRestore.shouldFocus) {
+    if (scanFocusRestore.rowId && tbody._streamReveal)
+      tbody._streamReveal(`row:${scanFocusRestore.rowId}`);
+    const replacement = Array.from(
+      tbody.querySelectorAll(".scan-priority-btn"),
+    ).find((button) =>
+      button.dataset.scanNamespace === scanFocusRestore.namespace &&
+      button.dataset.scanSourceId === scanFocusRestore.sourceId);
+    if (replacement) replacement.focus();
+    else el("checked-search").focus();
+  }
   refreshInfoIfActive();
   renderBottomPane();
 }
@@ -9089,7 +9442,24 @@ async function loadChBooks() {
     const res = await fetch("/api/books");
     state.chBooks = res.ok ? (await res.json()).books || [] : [];
   } catch (e) { state.chBooks = []; }
+  // The source catalogue is immutable; copy curation comes from its server
+  // sidecar and wins over any stale checked-book blob cached by an older UI.
+  for (const source of state.chBooks) {
+    const entry = state.checked.get(ckey("ch_library", source.idx));
+    if (!entry || !entry.book) continue;
+    for (const field of COPY_CURATION_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(source, field))
+        entry.book[field] = source[field];
+      else delete entry.book[field];
+    }
+    entry.ch_annotation_revision = source.annotation_revision || "";
+    entry.ch_source_sha256 = source.source_sha256 || "";
+    entry.ch_annotation_conflict = !!source.annotation_conflict;
+    if (source.annotation_conflict) entry.book.annotation_conflict = true;
+    else delete entry.book.annotation_conflict;
+  }
   renderRemarks();
+  renderChecked();
 }
 
 async function loadWhlRows(force) {
@@ -9109,8 +9479,12 @@ function chToRecord(b) {
     title: b.title, subtitle: b.subtitle || "", author: b.author,
     publisher: b.publisher, city: b.city, year: b.year, edition: b.edition,
     volume: "", language: "", pages: b.pages, condition: b.condition,
-    price: b.price, illustrations: b.illustrations, categories: b.categories,
+    price: b.price, marked_price: b.marked_price || "",
+    scan_priority: b.scan_priority || "", scan_verdict: b.scan_verdict || "",
+    illustrations: b.illustrations, categories: b.categories,
     notes: b.notes, acquired: b.acquired, url: "",
+    source_sha256: b.source_sha256 || "",
+    annotation_conflict: !!b.annotation_conflict,
   });
 }
 
@@ -9571,6 +9945,9 @@ function addChBook(idx) {
   const raw = (state.chBooks || []).find((x) => x.idx === idx);
   if (!raw) return;
   const book = parseBook(raw);   // subtitle / volume / edition split
+  delete book.annotation_revision;
+  delete book.source_sha256;
+  delete book.annotation_conflict;
   const key = ckey("ch_library", idx);
   trackChecked(`add ${book.title.slice(0, 40)}`, key, () => {
     const prev = state.checked.get(key) || {};
@@ -9580,6 +9957,9 @@ function addChBook(idx) {
       scans: prev.scans || null,
       verify: prev.verify || null,
       manual_urls: prev.manual_urls || null,
+      ch_annotation_revision: raw.annotation_revision || "",
+      ch_source_sha256: raw.source_sha256 || "",
+      ch_annotation_conflict: !!raw.annotation_conflict,
     });
     if (!prev.scans) queueScan(key);
   });
@@ -11347,10 +11727,88 @@ async function patchManualFields(id, fields) {
     const i = state.manual.findIndex((x) => x.id === id);
     if (i >= 0) state.manual[i] = data.entry;
     renderChecked();
-    queueScan(id);
+    // Copy-curation-only edits do not alter bibliographic identity or make
+    // existing source searches/verification stale. Older sidecars omit this
+    // flag, so retain their historical rescan behavior during upgrades.
+    if (data.bibliographic_changed !== false) queueScan(id);
     return true;
   }
   return false;
+}
+
+function chAnnotationOperationId() {
+  const random = globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `ch-annotation-${random}`;
+}
+
+async function putChAnnotation(idx, requestedFields) {
+  const source = (state.chBooks || []).find((row) => row.idx === idx);
+  if (!source) return null;
+  const key = ckey("ch_library", idx);
+  const checked = state.checked.get(key);
+  const revision = (checked && checked.ch_annotation_revision) ||
+    source.annotation_revision || "";
+  const fields = {};
+  for (const field of COPY_CURATION_FIELDS)
+    fields[field] = String(requestedFields[field] || "").trim();
+  const headers = {
+    "Content-Type": "application/json",
+    "Idempotency-Key": chAnnotationOperationId(),
+  };
+  if (revision) headers["If-Match"] = `"${revision}"`;
+  else headers["If-None-Match"] = "*";
+  const response = await fetch(`/api/v1/ch-annotations/${idx}`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({
+      fields,
+      source_sha256: (checked && checked.ch_source_sha256) ||
+        source.source_sha256 || "",
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok || !data.annotation) {
+    return { ok: false, error: String(data.error || "CH annotation save failed") };
+  }
+  const annotation = data.annotation;
+  for (const field of COPY_CURATION_FIELDS) {
+    delete source[field];
+    if (checked && checked.book) delete checked.book[field];
+  }
+  for (const [field, value] of Object.entries(annotation.fields || {})) {
+    if (!COPY_CURATION_FIELDS.has(field)) continue;
+    source[field] = value;
+    if (checked && checked.book) checked.book[field] = value;
+  }
+  source.annotation_revision = annotation.revision || "";
+  source.source_sha256 = annotation.source_sha256 || source.source_sha256 || "";
+  source.annotation_conflict = false;
+  if (checked) {
+    checked.ch_annotation_revision = source.annotation_revision;
+    checked.ch_source_sha256 = source.source_sha256;
+    checked.ch_annotation_conflict = false;
+    if (checked.book) delete checked.book.annotation_conflict;
+  }
+  return { ok: true, annotation };
+}
+
+function bookEditBibliographicChanged(book, values, categoryIds) {
+  const source = book || {};
+  for (const field of MANUAL_FIELDS) {
+    if (COPY_CURATION_FIELDS.has(field)) continue;
+    if (String(source[field] || "") !== String(values[field] || "")) return true;
+  }
+  return JSON.stringify(source.category_ids || []) !==
+    JSON.stringify(categoryIds || []);
+}
+
+function bookEditCurationChanged(book, values) {
+  const source = book || {};
+  return [...COPY_CURATION_FIELDS].some((field) =>
+    String(source[field] || "") !== String(values[field] || ""));
 }
 
 async function saveBookEditTab(ev) {
@@ -11369,6 +11827,8 @@ async function saveBookEditTab(ev) {
     const row = state.rowsById.get(t.id);
     if (!row) { el("bookedit-msg").textContent = "Row is gone"; return; }
     if (row.kind === "manual") {
+      const bibliographicChanged = bookEditBibliographicChanged(
+        row.book, vals, catIds);
       const fields = { category_ids: catIds };
       const before = { category_ids: (row.book.category_ids || []).slice() };
       for (const f of MANUAL_FIELDS) {
@@ -11383,7 +11843,9 @@ async function saveBookEditTab(ev) {
           originTab);
         if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount, originTab);
         el("bookedit-msg").textContent = setCount >= 2 ? "Saved as set" : "Saved";
-        status(`ENTRY SAVED :: ${vals.title} :: RESCANNING`);
+        status(bibliographicChanged
+          ? `ENTRY SAVED :: ${vals.title} :: RESCANNING`
+          : `COPY CURATION SAVED :: ${vals.title}`);
       } else {
         el("bookedit-msg").textContent = "Save failed";
       }
@@ -11392,41 +11854,96 @@ async function saveBookEditTab(ev) {
     // checked catalog row: client-side metadata + fresh checks/scans
     const entry = state.checked.get(t.id);
     if (!entry) { el("bookedit-msg").textContent = "Row is gone"; return; }
-    trackChecked(`edit ${vals.title.slice(0, 36)}`, t.id, () => {
+    const bibliographicChanged = bookEditBibliographicChanged(
+      row.book, vals, catIds);
+    const curationChanged = bookEditCurationChanged(row.book, vals);
+    if (row.source === "ch_library" && curationChanged) {
+      const separator = String(t.id).indexOf(":");
+      const idx = Number(String(t.id).slice(separator + 1));
+      const saved = Number.isInteger(idx) ? await putChAnnotation(idx, vals) : null;
+      if (!saved || !saved.ok) {
+        el("bookedit-msg").textContent = saved && saved.error
+          ? saved.error : "Scan annotation save failed";
+        return;
+      }
+    }
+    const applyCheckedEdit = () => {
       entry.book = Object.assign({}, entry.book, vals,
                                  { category_ids: catIds });
       entry.edited = true;
-      entry.checks = null;
-      entry.scans = null;
-      entry.verify = null;
-      queueScan(t.id);
-    }, originTab);
+      if (bibliographicChanged) {
+        entry.checks = null;
+        entry.scans = null;
+        entry.verify = null;
+        queueScan(t.id);
+      }
+    };
+    // A CH annotation is a separately CAS-guarded server record. Do not add a
+    // client-only undo entry that would claim to reverse that durable write.
+    if (row.source === "ch_library" && curationChanged) applyCheckedEdit();
+    else trackChecked(
+      `edit ${vals.title.slice(0, 36)}`, t.id, applyCheckedEdit, originTab);
     saveChecked();
     renderChecked();
     if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount, originTab);
     el("bookedit-msg").textContent = setCount >= 2 ? "Saved as set" : "Saved";
-    status(`BOOK SAVED :: ${vals.title} :: RESCANNING`);
+    status(bibliographicChanged
+      ? `BOOK SAVED :: ${vals.title} :: RESCANNING`
+      : `COPY CURATION SAVED :: ${vals.title}`);
     return;
   }
 
   // Master-list record: check it (or update the checked copy) with the
   // edits — parse-on-add applies here as on every other add path
   const key = ckey("ch_library", t.idx);
-  trackChecked(`check ${vals.title.slice(0, 38)}`, key, () => {
+  const priorEntry = state.checked.get(key);
+  const baseSource = (state.chBooks || []).find((x) => x.idx === t.idx) || {};
+  const priorBook = priorEntry && priorEntry.book
+    ? priorEntry.book : parseBook(baseSource);
+  const bibliographicChanged = bookEditBibliographicChanged(
+    priorBook, vals, catIds);
+  const curationChanged = bookEditCurationChanged(priorBook, vals);
+  if (curationChanged) {
+    const saved = await putChAnnotation(t.idx, vals);
+    if (!saved || !saved.ok) {
+      el("bookedit-msg").textContent = saved && saved.error
+        ? saved.error : "Scan annotation save failed";
+      return;
+    }
+  }
+  const applyMasterEdit = () => {
     const prev = state.checked.get(key) || {};
     const base = (state.chBooks || []).find((x) => x.idx === t.idx) || {};
+    const book = parseBook(Object.assign(
+      { idx: t.idx }, base, prev.book || {}, vals,
+      { category_ids: catIds }));
+    delete book.annotation_revision;
+    delete book.source_sha256;
+    delete book.annotation_conflict;
     state.checked.set(key, {
-      book: parseBook(Object.assign({ idx: t.idx }, base, prev.book || {}, vals)),
+      book,
       edited: true,
-      checks: null, scans: null, verify: null, manual_urls: null,
+      checks: bibliographicChanged ? null : prev.checks || null,
+      scans: bibliographicChanged ? null : prev.scans || null,
+      verify: bibliographicChanged ? null : prev.verify || null,
+      manual_urls: prev.manual_urls || null,
+      ch_annotation_revision: base.annotation_revision ||
+        prev.ch_annotation_revision || "",
+      ch_source_sha256: base.source_sha256 || prev.ch_source_sha256 || "",
+      ch_annotation_conflict: !!base.annotation_conflict,
     });
-    queueScan(key);
-  }, originTab);
+    if (bibliographicChanged) queueScan(key);
+  };
+  if (curationChanged) applyMasterEdit();
+  else trackChecked(
+    `check ${vals.title.slice(0, 38)}`, key, applyMasterEdit, originTab);
   saveChecked();
   renderChecked();
   updateCheckedCount();
   el("bookedit-msg").textContent = "Saved — added to checked books";
-  status(`CH BOOK CHECKED WITH EDITS :: ${vals.title}`);
+  status(bibliographicChanged
+    ? `CH BOOK CHECKED WITH EDITS :: ${vals.title} :: RESCANNING`
+    : `CH COPY CURATION SAVED :: ${vals.title}`);
 }
 
 async function saveWhlEditTab(ev) {
@@ -18198,6 +18715,345 @@ async function deleteManual(id, originTab = activeHistoryTab()) {
 
 // --- checked-tab batch actions ----------------------------------------------------
 
+const PORTABLE_BUNDLE_EXPORT_URL = "/api/v1/portable-book-bundles/export";
+const PORTABLE_BUNDLE_PLAN_URL = "/api/v1/portable-book-bundles/import-plans";
+const PORTABLE_BUNDLE_COMMIT_CONFIRMATION = "COMMIT-PORTABLE-BOOK-BUNDLE";
+const PORTABLE_PLAN_PARTS = ["metadata", "assessment"];
+const PORTABLE_PLAN_OUTCOMES = [
+  "create", "update", "delete", "unchanged", "conflict",
+];
+const portableImportState = {
+  planId: "", plan: null, idempotencyKey: "", busy: false,
+};
+
+// The portable endpoint never has an "all" mode.  Every request enumerates the
+// exact source identities represented by the currently filtered Checked view.
+function portableBundleSourceForRow(row) {
+  if (!row || typeof row !== "object") return null;
+  if (row.kind === "manual") {
+    const sourceId = String(row.id || "");
+    return sourceId
+      ? { namespace: "manual_entries", source_id: sourceId } : null;
+  }
+  if (String(row.source || "") !== "ch_library") return null;
+  const storageKey = String(row.id || "");
+  const prefix = "ch_library:";
+  if (!storageKey.startsWith(prefix)) return null;
+  const sourceId = storageKey.slice(prefix.length);
+  if (!/^(0|[1-9]\d*)$/.test(sourceId)) return null;
+  return { namespace: "ch_library", source_id: sourceId };
+}
+
+function portableBundleSources(rows) {
+  if (!Array.isArray(rows)) throw new Error("filtered rows are unavailable");
+  const sources = [], seen = new Set();
+  for (const row of rows) {
+    const source = portableBundleSourceForRow(row);
+    if (!source) throw new Error("a filtered row has no portable source identity");
+    const key = source.namespace + "\0" + source.source_id;
+    if (seen.has(key)) throw new Error("a filtered source identity occurs twice");
+    seen.add(key);
+    sources.push(source);
+  }
+  return sources;
+}
+
+function portableBundleFilename(response) {
+  const headers = response && response.headers;
+  const disposition = headers && typeof headers.get === "function"
+    ? String(headers.get("Content-Disposition") || "") : "";
+  let candidate = "";
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+  if (encoded) {
+    try { candidate = decodeURIComponent(encoded[1].trim()); }
+    catch (e) { candidate = ""; }
+  }
+  if (!candidate) {
+    const plain = /filename=(?:"([^"]+)"|([^;]+))/i.exec(disposition);
+    candidate = plain ? String(plain[1] || plain[2] || "").trim() : "";
+  }
+  candidate = candidate.split(/[\\/]/).pop().replace(/[\u0000-\u001f<>:"|?*]/g, "-");
+  if (!candidate) candidate = "library-tool-books-backup.zip";
+  if (!candidate.toLowerCase().endsWith(".zip")) candidate += ".zip";
+  return candidate;
+}
+
+function downloadPortableBundle(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+async function portableResponseError(response, fallback) {
+  let data = null;
+  try { data = await response.json(); }
+  catch (e) { data = null; }
+  return String((data && (data.error || data.message || data.code)) || fallback);
+}
+
+async function exportPortableBookBundle() {
+  if (state.settings.topTable !== "checked") {
+    statusErr("BOOKS BACKUP :: open the Checked books table first");
+    return false;
+  }
+  let sources;
+  try { sources = portableBundleSources(filteredCheckedRows()); }
+  catch (error) {
+    statusErr("BOOKS BACKUP :: " + (error.message || "invalid source identity"));
+    return false;
+  }
+  if (!sources.length) {
+    status("NOTHING TO BACK UP (check the filters)");
+    return false;
+  }
+  status(`BOOKS BACKUP :: PACKING ${sources.length} FILTERED SOURCE` +
+    (sources.length === 1 ? "" : "S") + " ...");
+  try {
+    const response = await fetch(PORTABLE_BUNDLE_EXPORT_URL, {
+      method: "POST",
+      headers: { "Accept": "application/zip", "Content-Type": "application/json" },
+      body: JSON.stringify({ sources }),
+    });
+    if (!response.ok) {
+      throw new Error(await portableResponseError(response, "export failed"));
+    }
+    const blob = await response.blob();
+    if (!blob || !blob.size) throw new Error("server returned an empty archive");
+    downloadPortableBundle(blob, portableBundleFilename(response));
+    status(`BOOKS BACKUP :: EXPORTED ${sources.length} SOURCE` +
+      (sources.length === 1 ? "" : "S"));
+    return true;
+  } catch (error) {
+    statusErr("BOOKS BACKUP :: " + (error.message || "export failed"));
+    return false;
+  }
+}
+
+function portableImportPlanValid(plan) {
+  if (!plan || typeof plan !== "object" || Array.isArray(plan) ||
+      typeof plan.committable !== "boolean" || !Array.isArray(plan.actions) ||
+      !plan.counts || typeof plan.counts !== "object") return false;
+  for (const part of PORTABLE_PLAN_PARTS) {
+    const counts = plan.counts[part];
+    if (!counts || typeof counts !== "object") return false;
+    for (const outcome of PORTABLE_PLAN_OUTCOMES) {
+      if (!Number.isSafeInteger(counts[outcome]) || counts[outcome] < 0) return false;
+    }
+  }
+  for (const action of plan.actions) {
+    const source = action && action.source;
+    if (!source || !["manual_entries", "ch_library"].includes(source.namespace) ||
+        !String(source.source_id || "") ||
+        !PORTABLE_PLAN_OUTCOMES.includes(action.metadata) ||
+        !PORTABLE_PLAN_OUTCOMES.includes(action.assessment) ||
+        !Array.isArray(action.conflicts) ||
+        action.conflicts.some((reason) => typeof reason !== "string")) return false;
+  }
+  return true;
+}
+
+function portableImportConflictItems(plan) {
+  const items = [];
+  for (const action of (plan && plan.actions) || []) {
+    const reasons = action.conflicts.filter((reason) => reason.trim());
+    if (action.metadata === "conflict" && !reasons.length)
+      reasons.push("Metadata conflicts with the current record");
+    if (action.assessment === "conflict" && !reasons.length)
+      reasons.push("Assessment conflicts with the current artifact");
+    if (!reasons.length) continue;
+    items.push({
+      source_ref: `${action.source.namespace}:${action.source.source_id}`,
+      reasons,
+    });
+  }
+  return items;
+}
+
+function portableBundleOperationId() {
+  const cryptoApi = globalThis.crypto;
+  const suffix = cryptoApi && typeof cryptoApi.randomUUID === "function"
+    ? cryptoApi.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return "portable-book-bundle-" + suffix;
+}
+
+function setPortableImportBusy(busy, message, error) {
+  portableImportState.busy = !!busy;
+  el("portable-import-close").disabled = !!busy;
+  el("portable-import-cancel").disabled = !!busy;
+  el("portable-import-commit").disabled = !!busy ||
+    !portableImportState.planId || !portableImportState.plan ||
+    portableImportState.plan.committable !== true;
+  const note = el("portable-import-status");
+  note.textContent = message || "";
+  note.classList.toggle("is-error", !!error);
+}
+
+function showPortableImportPlan(planId, plan, filename) {
+  portableImportState.planId = String(planId || "");
+  portableImportState.plan = plan;
+  portableImportState.idempotencyKey = portableImportState.planId
+    ? portableBundleOperationId() : "";
+  for (const part of PORTABLE_PLAN_PARTS) {
+    for (const outcome of PORTABLE_PLAN_OUTCOMES) {
+      el(`portable-count-${part}-${outcome}`).textContent =
+        String(plan.counts[part][outcome]);
+    }
+  }
+  const records = plan.actions.length;
+  el("portable-import-summary").textContent =
+    `${filename || "Selected ZIP"}: dry-run validated ${records} source` +
+    `${records === 1 ? "" : "s"}. No files have been changed.`;
+  const conflicts = portableImportConflictItems(plan);
+  const list = el("portable-conflict-list");
+  list.textContent = "";
+  for (const conflict of conflicts) {
+    const item = document.createElement("li");
+    item.dataset.sourceRef = conflict.source_ref;
+    item.textContent = `${conflict.source_ref} — ${conflict.reasons.join("; ")}`;
+    list.appendChild(item);
+  }
+  el("portable-conflicts-empty").hidden = conflicts.length !== 0;
+  el("portable-conflicts-title").textContent = conflicts.length
+    ? `Source conflicts (${conflicts.length})` : "Source conflicts";
+  el("portable-import-overlay").hidden = false;
+  const committable = plan.committable === true && !!portableImportState.planId;
+  setPortableImportBusy(false, committable
+    ? "Review this dry-run. Committing requires a separate confirmation."
+    : conflicts.length
+      ? "Resolve every source conflict before importing this backup."
+      : "This dry-run cannot be committed.", !committable);
+  el("portable-import-cancel").focus();
+}
+
+function closePortableImportPlan() {
+  if (portableImportState.busy) return false;
+  el("portable-import-overlay").hidden = true;
+  portableImportState.planId = "";
+  portableImportState.plan = null;
+  portableImportState.idempotencyKey = "";
+  return true;
+}
+
+function choosePortableBookBundle() {
+  const input = el("portable-bundle-file");
+  input.value = "";
+  input.click();
+}
+
+async function planPortableBookBundle(file) {
+  if (!file) return false;
+  if (!String(file.name || "").toLowerCase().endsWith(".zip")) {
+    statusErr("BOOKS BACKUP :: choose a ZIP archive");
+    return false;
+  }
+  status("BOOKS BACKUP :: VALIDATING DRY-RUN PLAN ...");
+  try {
+    const response = await fetch(PORTABLE_BUNDLE_PLAN_URL, {
+      method: "POST",
+      headers: { "Accept": "application/json", "Content-Type": "application/zip" },
+      body: file,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || data.ok !== true) {
+      throw new Error(String((data && (data.error || data.message || data.code)) ||
+        "import planning failed"));
+    }
+    if (!portableImportPlanValid(data.plan) ||
+        (data.plan.committable && !String(data.plan_id || ""))) {
+      throw new Error("server returned an invalid import plan");
+    }
+    showPortableImportPlan(data.plan_id, data.plan, file.name);
+    status(`BOOKS BACKUP :: DRY-RUN PLANNED ${data.plan.actions.length} SOURCE` +
+      (data.plan.actions.length === 1 ? "" : "S"));
+    return true;
+  } catch (error) {
+    statusErr("BOOKS BACKUP :: " + (error.message || "import planning failed"));
+    return false;
+  }
+}
+
+async function refreshPortableBookState() {
+  await loadManual();
+  state.chBooks = null;
+  await loadChBooks();
+  renderChecked();
+}
+
+async function commitPortableBookBundle() {
+  const plan = portableImportState.plan;
+  const planId = portableImportState.planId;
+  if (portableImportState.busy || !plan || !planId || plan.committable !== true) {
+    statusErr("BOOKS BACKUP :: a conflict-free dry-run plan is required");
+    return false;
+  }
+  const approved = await confirmDialog({
+    title: "Commit books backup import?",
+    message: `Apply the reviewed plan for ${plan.actions.length} source` +
+      (plan.actions.length === 1 ? "?" : "s?"),
+    detail: "This uses the exact dry-run plan and may create, update, or delete " +
+      "metadata and assessment files. No import has happened yet.",
+    confirmLabel: "Commit reviewed plan",
+    danger: true,
+  });
+  if (!approved) return false;
+  // The plan modal remains open behind the confirmation.  Re-check its exact
+  // identity in case a future UI path replaces it while confirmation is open.
+  if (portableImportState.plan !== plan || portableImportState.planId !== planId)
+    return false;
+  setPortableImportBusy(true, "Committing the reviewed dry-run plan ...", false);
+  try {
+    const response = await fetch(
+      `${PORTABLE_BUNDLE_PLAN_URL}/${encodeURIComponent(planId)}/commit`, {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "Idempotency-Key": portableImportState.idempotencyKey,
+        },
+        body: JSON.stringify({ confirmation: PORTABLE_BUNDLE_COMMIT_CONFIRMATION }),
+      });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || data.ok !== true) {
+      throw new Error(String((data && (data.error || data.message || data.code)) ||
+        "commit failed"));
+    }
+    setPortableImportBusy(false, "Import committed.", false);
+    closePortableImportPlan();
+    await refreshPortableBookState();
+    status(`BOOKS BACKUP :: IMPORTED ${plan.actions.length} SOURCE` +
+      (plan.actions.length === 1 ? "" : "S"));
+    return true;
+  } catch (error) {
+    setPortableImportBusy(false,
+      "Commit failed: " + (error.message || "server unavailable"), true);
+    statusCrit("BOOKS BACKUP :: COMMIT FAILED");
+    return false;
+  }
+}
+
+function initPortableBookBundles() {
+  const input = el("portable-bundle-file");
+  input.addEventListener("change", () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    planPortableBookBundle(file);
+  });
+  el("portable-import-close").addEventListener("click", closePortableImportPlan);
+  el("portable-import-cancel").addEventListener("click", closePortableImportPlan);
+  el("portable-import-commit").addEventListener("click", commitPortableBookBundle);
+  el("portable-import-overlay").addEventListener("mousedown", (event) => {
+    if (event.target === el("portable-import-overlay")) closePortableImportPlan();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !el("portable-import-overlay").hidden &&
+        el("confirm-overlay").hidden) closePortableImportPlan();
+  });
+}
+
 function exportJson() {
   // the export contains exactly what the table shows: the FIND box and the
   // filter menu both apply
@@ -18844,7 +19700,8 @@ const ITEM_CREATE_NON_METADATA_FIELDS = Object.freeze(new Set([
 const ITEM_CREATE_STRING_METADATA_FIELDS = Object.freeze(new Set([
   "subtitle", "authors", "year", "publisher", "publisher_city", "edition",
   "volume", "group_id", "language", "pages", "categories", "description",
-  "pdf_source", "source_url", "notes", "rights", "attention",
+  "marked_price", "scan_priority", "scan_verdict", "pdf_source",
+  "source_url", "notes", "rights", "attention",
 ]));
 const pendingBuildCreates = new Map();
 const pendingCapturePromotions = new Map();
@@ -18855,9 +19712,11 @@ function itemCreateDraft(seed) {
   const metadata = {};
   for (const [key, value] of Object.entries(requested)) {
     if (ITEM_CREATE_NON_METADATA_FIELDS.has(key) || value === undefined) continue;
-    metadata[key] = ITEM_CREATE_STRING_METADATA_FIELDS.has(key)
+    const cleaned = ITEM_CREATE_STRING_METADATA_FIELDS.has(key)
       ? String(value || "").trim()
       : JSON.parse(JSON.stringify(value));
+    if (COPY_CURATION_FIELDS.has(key) && cleaned === "") continue;
+    metadata[key] = cleaned;
   }
   return {
     kind: "book",
@@ -19723,7 +20582,8 @@ function pushRepresentationOp(label, buildId, sourceId, initialReceipt,
 const ITEM_EDIT_METADATA_FIELDS = Object.freeze([
   "subtitle", "authors", "year", "publisher", "publisher_city", "edition",
   "volume", "group_id", "language", "pages", "rights", "pdf_source",
-  "source_url", "notes", "category_ids", "description",
+  "source_url", "notes", "category_ids", "description", "marked_price",
+  "scan_priority", "scan_verdict",
 ]);
 // A few established compatibility extensions are still edited outside the
 // main Record form. They nevertheless belong to the durable item command
@@ -19913,10 +20773,15 @@ function buildMetadataPatchFromEditor(build) {
   const title = String(titleInput ? titleInput.value : build.title || "").trim();
   if (!title) return null;
   const metadata = {};
+  const remove = [];
   for (const field of ITEM_EDIT_METADATA_FIELDS) {
     if (field === "category_ids" || field === "description") continue;
     const input = el("b-" + field);
-    if (input) metadata[field] = String(input.value || "").trim();
+    if (input) {
+      const value = String(input.value || "").trim();
+      if (COPY_CURATION_FIELDS.has(field) && !value) remove.push(field);
+      else metadata[field] = value;
+    }
   }
   if (metadata.volume && !metadata.group_id)
     metadata.group_id = buildGroupIdFor({ title, ...metadata });
@@ -19927,7 +20792,7 @@ function buildMetadataPatchFromEditor(build) {
   return {
     title,
     metadata_set: metadata,
-    metadata_remove: [],
+    metadata_remove: remove,
     representations: null,
   };
 }
@@ -26001,6 +26866,8 @@ async function openCorrectionsManager(newWindow = false) {
 
 const MENU_CMDS = {
   "export": () => exportJson(),
+  "portable-bundle-export": () => exportPortableBookBundle(),
+  "portable-bundle-import": () => choosePortableBookBundle(),
   "export-builds": () => exportBuilds(),
   "dl-sources": () => downloadUploadList(),
   "master-sync": () => syncMasterList(),
@@ -26074,6 +26941,7 @@ function updateMenuState() {
     if (b) b.classList.toggle("on", !!v);
   };
   dis("export", !onChecked);
+  dis("portable-bundle-export", !onChecked);
   dis("run-scans", !onChecked);
   dis("dl-approved", !onChecked);
   dis("scrape", scrapeRunning);
@@ -26531,6 +27399,7 @@ function init() {
   boot("smart scan marker", initSmartScanMarker);
   boot("lib open", initLibOpen);   // after the dialog it drives is wired
   boot("overlay modals", initOverlayModals);
+  boot("portable book backups", initPortableBookBundles);
   boot("tabs", initTabs);
   boot("activity icons", initActivityIcons);
   boot("jobs", initJobs);
@@ -27153,6 +28022,7 @@ function init() {
   document.addEventListener("keydown", onFieldCopyKey);
   document.addEventListener("keydown", onFieldPasteKey);
   boot("attention popover", initAttnPop);
+  boot("scan assessment popover", initScanAssessmentPopover);
   boot("review queue", initReviewWin);
   boot("categories", initCategories);
   boot("collections", initCollections);
@@ -27285,6 +28155,7 @@ function init() {
       renderHome();
       renderRemarks();
     });
+    loadChBooks();
     loadBuilds().then(renderUpload).then(renderHome);
     switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
     renderBottomPane();

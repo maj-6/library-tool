@@ -426,7 +426,7 @@ class HomeListResourceTest {
         val homeSource = source("HomeActivity")
         assertTrue(homeSource.contains("bindScanPriorityIndicator("))
         assertTrue(homeSource.contains("entryScanCandidate(this, entry)"))
-        assertTrue(homeSource.contains("desktop?.scanPriority"))
+        assertTrue(homeSource.contains("desktop?.scanPriorityRank"))
         val summary = homeSource.substringAfter("val summaryIds = listOf(")
             .substringBefore(")")
         assertTrue(summary.contains("R.id.scanPriorityIndicator"))

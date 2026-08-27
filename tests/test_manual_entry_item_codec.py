@@ -67,6 +67,119 @@ def test_decode_projects_path_free_metadata_and_capture_kind():
     assert "checks" not in snapshot.metadata
 
 
+def test_scan_curation_fields_round_trip_without_conflating_prices_or_residuals():
+    row = _row()
+    row.update(
+        {
+            "price": "$40 paid at acquisition",
+            "marked_price": "£1/10/- (pencil)",
+            "scan_priority": "Low",
+            "scan_verdict": "Scan the annotated plates before the text.",
+            "future_custom": {"retain": [1, True]},
+        }
+    )
+    codec = _codec()
+    snapshot = codec.decode("manual-row", row)
+
+    assert snapshot.metadata["price"] == "$40 paid at acquisition"
+    assert snapshot.metadata["marked_price"] == "£1/10/- (pencil)"
+    assert snapshot.metadata["scan_priority"] == "Low"
+    assert snapshot.metadata["scan_verdict"].startswith("Scan the annotated")
+
+    metadata = dict(snapshot.metadata)
+    metadata["scan_priority"] = "High"
+    updated = codec.encode(
+        "manual-row",
+        ItemDraft(
+            kind="capture",
+            title=snapshot.title,
+            metadata=metadata,
+        ),
+        row,
+    )
+
+    assert updated["price"] == "$40 paid at acquisition"
+    assert updated["marked_price"] == "£1/10/- (pencil)"
+    assert updated["scan_priority"] == "High"
+    assert updated["scan_verdict"] == row["scan_verdict"]
+    assert updated["future_custom"] == {"retain": [1, True]}
+    assert updated["extra"] == row["extra"]
+
+
+def test_legacy_absence_and_blank_scan_priority_remain_unassessed():
+    codec = _codec()
+    absent = codec.decode("manual-row", _row())
+    assert "scan_priority" not in absent.metadata
+
+    row = {**_row(), "scan_priority": "", "scan_verdict": ""}
+    blank = codec.decode("manual-row", row)
+    assert blank.metadata["scan_priority"] == ""
+    assert blank.metadata["scan_verdict"] == ""
+
+
+@pytest.mark.parametrize(
+    ("change", "error", "message"),
+    [
+        ({"scan_priority": "high"}, ValueError, "scan_priority is invalid"),
+        ({"scan_priority": "3"}, ValueError, "scan_priority is invalid"),
+        ({"scan_priority": 3}, TypeError, "scan_priority must be a string"),
+        (
+            {"scan_verdict": "Scan plates.\nThen scan text."},
+            ValueError,
+            "single line",
+        ),
+        (
+            {"scan_verdict": chr(0x1F33F) * 501},
+            ValueError,
+            "at most 500",
+        ),
+    ],
+)
+def test_manual_rows_reject_invalid_scan_curation_fields(change, error, message):
+    row = _row()
+    row.update(change)
+
+    with pytest.raises(error, match=message):
+        _codec().decode("manual-row", row)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"marked_price": "  £1/10/-  "},
+        {"scan_priority": " High "},
+        {"scan_verdict": " Padded verdict "},
+        {"scan_verdict": "First line\rSecond line"},
+        {"scan_verdict": "x" * 501},
+    ],
+)
+def test_manual_writes_enforce_short_field_contracts(metadata):
+    with pytest.raises(ValueError):
+        _codec().encode(
+            "manual-row",
+            ItemDraft(
+                kind="capture",
+                title=_row()["title"],
+                metadata=metadata,
+            ),
+            _row(),
+        )
+
+
+def test_manual_write_counts_scan_verdict_length_as_unicode_code_points():
+    result = _codec().encode(
+        "manual-row",
+        ItemDraft(
+            kind="capture",
+            title=_row()["title"],
+            metadata={"scan_verdict": chr(0x1F33F) * 500},
+        ),
+        _row(),
+    )
+
+    assert result["scan_verdict"] == chr(0x1F33F) * 500
+
+
 def test_digitization_candidate_round_trips_as_first_class_metadata():
     row = _row()
     row["digitization_candidate"] = True

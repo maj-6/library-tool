@@ -81,7 +81,7 @@ class RemoteCollectionBooksTest {
         id: String,
         collectionId: String = boxA,
         digitizationCandidateClassification: Boolean? = null,
-        scanPriority: Int? = null,
+        scanPriorityRank: Int? = null,
     ) =
         RemoteCollectionBook(
             captureId = id,
@@ -96,7 +96,7 @@ class RemoteCollectionBooksTest {
             photoCount = 3,
             createdAt = 100L,
             digitizationCandidateClassification = digitizationCandidateClassification,
-            scanPriority = scanPriority,
+            scanPriorityRank = scanPriorityRank,
         )
 
     private fun liveEntry(id: String): Entries.Entry = Entries.Entry(
@@ -577,7 +577,7 @@ class RemoteCollectionBooksTest {
         val remote = remoteBook(
             "shared",
             digitizationCandidateClassification = true,
-            scanPriority = 2,
+            scanPriorityRank = 2,
         ).toInventoryItem()
 
         listOf(listOf(local, remote), listOf(remote, local)).forEach { input ->
@@ -588,7 +588,7 @@ class RemoteCollectionBooksTest {
             assertEquals(7, merged.single().summary.photoCount)
             assertTrue(merged.single().current === live)
             assertEquals(true, merged.single().summary.digitizationCandidateClassification)
-            assertEquals(2, merged.single().summary.scanPriority)
+            assertEquals(2, merged.single().summary.scanPriorityRank)
         }
     }
 
@@ -597,13 +597,13 @@ class RemoteCollectionBooksTest {
         val remote = remoteBook(
             "shared",
             digitizationCandidateClassification = true,
-            scanPriority = 2,
+            scanPriorityRank = 2,
         ).toInventoryItem()
         fun local(candidate: Boolean?, priority: Int?) = CollectionInventoryItem(
             summary = remote.summary.copy(
                 title = "Local title",
                 digitizationCandidateClassification = candidate,
-                scanPriority = priority,
+                scanPriorityRank = priority,
             ),
             current = liveEntry("shared"),
             remote = false,
@@ -613,19 +613,19 @@ class RemoteCollectionBooksTest {
             listOf(local(candidate = false, priority = null), remote),
         ).single()
         assertEquals(false, explicitlyCleared.summary.digitizationCandidateClassification)
-        assertNull(explicitlyCleared.summary.scanPriority)
+        assertNull(explicitlyCleared.summary.scanPriorityRank)
 
         val locallyPrioritized = mergeCollectionBookItems(
             listOf(local(candidate = true, priority = 4), remote),
         ).single()
         assertEquals(true, locallyPrioritized.summary.digitizationCandidateClassification)
-        assertEquals(4, locallyPrioritized.summary.scanPriority)
+        assertEquals(4, locallyPrioritized.summary.scanPriorityRank)
 
         val legacyPriority = mergeCollectionBookItems(
             listOf(local(candidate = true, priority = null), remote),
         ).single()
         assertEquals(true, legacyPriority.summary.digitizationCandidateClassification)
-        assertEquals(2, legacyPriority.summary.scanPriority)
+        assertEquals(2, legacyPriority.summary.scanPriorityRank)
     }
 
     @Test
@@ -645,13 +645,13 @@ class RemoteCollectionBooksTest {
         val item = remoteBook(
             "a",
             digitizationCandidateClassification = true,
-            scanPriority = 5,
+            scanPriorityRank = 5,
         ).toInventoryItem()
         assertTrue(item.remote)
         assertNull(item.current)
         assertEquals("a", item.summary.entryId)
         assertEquals(true, item.summary.digitizationCandidateClassification)
-        assertEquals(5, item.summary.scanPriority)
+        assertEquals(5, item.summary.scanPriorityRank)
     }
 
     // --- desktop bibliography enrichment ---------------------------------------
@@ -677,7 +677,7 @@ class RemoteCollectionBooksTest {
             data.put("bibliography", biblio)
         }
         candidate?.let { data.put("digitization_candidate", it) }
-        priority?.let { data.put("scan_priority", it) }
+        priority?.let { data.put("scan_priority_rank", it) }
         return desktopBookMetadataFromJson(
             JSONObject()
                 .put("capture_id", captureId)
@@ -708,19 +708,19 @@ class RemoteCollectionBooksTest {
         ).single()
         assertEquals(true, candidate.digitizationCandidateClassification)
         assertTrue(candidate.digitizationCandidate)
-        assertEquals(2, candidate.scanPriority)
+        assertEquals(2, candidate.scanPriorityRank)
 
         val cleared = enrichRemoteCollectionBooks(
             listOf(remoteBook(
                 capA,
                 digitizationCandidateClassification = true,
-                scanPriority = 1,
+                scanPriorityRank = 1,
             )),
             mapOf(capA to desktopMetadata(capA, candidate = false, priority = 1)),
         ).single()
         assertEquals(false, cleared.digitizationCandidateClassification)
         assertFalse(cleared.digitizationCandidate)
-        assertNull(cleared.scanPriority)
+        assertNull(cleared.scanPriorityRank)
     }
 
     @Test
@@ -802,13 +802,60 @@ class RemoteCollectionBooksTest {
         val expected = remoteBook(
             "one",
             digitizationCandidateClassification = true,
-            scanPriority = 4,
+            scanPriorityRank = 4,
         )
         assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(expected)))
         val store = readRemoteCollectionBooksStore(target, owner1)
         assertTrue(store.valid)
         assertEquals(1, store.byCollection.getValue(boxA).size)
         assertEquals(expected, store.byCollection.getValue(boxA).single())
+        val row = JSONObject(target.readText())
+            .getJSONObject("collections").getJSONArray(boxA).getJSONObject(0)
+        assertEquals(4, row.getInt("scan_priority_rank"))
+        assertFalse(row.has("scan_priority"))
+    }
+
+    @Test
+    fun legacyCachePriorityOnlyFallsBackForAnActualInteger() {
+        val encoded = remoteCollectionBooksStoreToJson(
+            RemoteCollectionBooksStore(
+                byCollection = mapOf(boxA to listOf(remoteBook(
+                    capA,
+                    digitizationCandidateClassification = true,
+                    scanPriorityRank = 2,
+                ))),
+                owner = owner1,
+            ),
+        )
+
+        val legacyNumeric = JSONObject(encoded)
+        legacyNumeric.getJSONObject("collections").getJSONArray(boxA).getJSONObject(0).apply {
+            remove("scan_priority_rank")
+            put("scan_priority", 4)
+        }
+        val migrated = remoteCollectionBooksStoreFromJson(legacyNumeric.toString())
+        assertTrue(migrated.valid)
+        assertEquals(4, migrated.byCollection.getValue(boxA).single().scanPriorityRank)
+
+        listOf("4", "High", "Medium", "Low", "n/s (no scan)").forEach { label ->
+            val textual = JSONObject(encoded)
+            textual.getJSONObject("collections").getJSONArray(boxA).getJSONObject(0).apply {
+                remove("scan_priority_rank")
+                put("scan_priority", label)
+            }
+            val parsed = remoteCollectionBooksStoreFromJson(textual.toString())
+            assertTrue(parsed.valid)
+            assertNull(parsed.byCollection.getValue(boxA).single().scanPriorityRank)
+        }
+
+        val both = JSONObject(encoded)
+        both.getJSONObject("collections").getJSONArray(boxA).getJSONObject(0)
+            .put("scan_priority", 5)
+        assertEquals(
+            2,
+            remoteCollectionBooksStoreFromJson(both.toString())
+                .byCollection.getValue(boxA).single().scanPriorityRank,
+        )
     }
 
     @Test
@@ -839,7 +886,7 @@ class RemoteCollectionBooksTest {
         assertFalse(book.removed)
         assertEquals(0L, book.membershipRevision)
         assertNull(book.digitizationCandidateClassification)
-        assertNull(book.scanPriority)
+        assertNull(book.scanPriorityRank)
     }
 
     @Test
@@ -852,7 +899,7 @@ class RemoteCollectionBooksTest {
         )).put("version", 2)
         val row = root.getJSONObject("collections").getJSONArray(boxA).getJSONObject(0)
         row.remove("digitization_candidate")
-        row.remove("scan_priority")
+        row.remove("scan_priority_rank")
 
         val parsed = remoteCollectionBooksStoreFromJson(root.toString())
         val book = parsed.byCollection.getValue(boxA).single()
@@ -860,7 +907,7 @@ class RemoteCollectionBooksTest {
         assertTrue(parsed.valid)
         assertNull(book.digitizationCandidateClassification)
         assertFalse(book.digitizationCandidate)
-        assertNull(book.scanPriority)
+        assertNull(book.scanPriorityRank)
     }
 
     @Test
@@ -870,7 +917,7 @@ class RemoteCollectionBooksTest {
                 byCollection = mapOf(boxA to listOf(remoteBook(
                     capA,
                     digitizationCandidateClassification = true,
-                    scanPriority = 1,
+                    scanPriorityRank = 1,
                 ))),
                 owner = owner1,
             ),
@@ -889,28 +936,28 @@ class RemoteCollectionBooksTest {
             val root = JSONObject(valid)
             val row = root.getJSONObject("collections").getJSONArray(boxA).getJSONObject(0)
             row.put("digitization_candidate", candidate)
-            row.put("scan_priority", priority)
+            row.put("scan_priority_rank", priority)
             assertFalse(remoteCollectionBooksStoreFromJson(root.toString()).valid)
         }
         assertFalse(remoteCollectionBooksStoreFromJson(
-            valid.replace("\"scan_priority\":1", "\"scan_priority\":1.0"),
+            valid.replace("\"scan_priority_rank\":1", "\"scan_priority_rank\":1.0"),
         ).valid)
 
         listOf(
             remoteBook(
                 "not-candidate",
                 digitizationCandidateClassification = false,
-                scanPriority = 1,
+                scanPriorityRank = 1,
             ),
             remoteBook(
                 "orphaned",
                 digitizationCandidateClassification = null,
-                scanPriority = 1,
+                scanPriorityRank = 1,
             ),
             remoteBook(
                 "out-of-range",
                 digitizationCandidateClassification = true,
-                scanPriority = 6,
+                scanPriorityRank = 6,
             ),
         ).forEach { invalid ->
             assertThrows(IllegalArgumentException::class.java) {

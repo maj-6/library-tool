@@ -177,6 +177,113 @@ def test_update_preserves_managed_state_and_unknown_metadata_exactly():
     assert codec.decode("book-one", updated).as_draft() == draft
 
 
+def test_scan_curation_fields_preserve_price_and_unknown_metadata_distinctly():
+    revisions = _RevisionSequence("2026-07-19T12:35:00.000000+00:00")
+    codec = _codec(revisions)
+    previous = {
+        **_managed_row(),
+        "price": "$40 paid at acquisition",
+        "marked_price": "£1/10/- (pencil)",
+        "scan_priority": "Medium",
+        "scan_verdict": "Scan the annotated plates before the text.",
+    }
+    snapshot = codec.decode("book-one", previous)
+    metadata = dict(snapshot.metadata)
+    metadata["scan_priority"] = "High"
+
+    updated = codec.encode(
+        "book-one",
+        ItemDraft(title=snapshot.title, metadata=metadata),
+        previous,
+    )
+
+    assert updated["price"] == "$40 paid at acquisition"
+    assert updated["marked_price"] == "£1/10/- (pencil)"
+    assert updated["scan_priority"] == "High"
+    assert updated["scan_verdict"] == previous["scan_verdict"]
+    round_tripped = codec.decode("book-one", updated).as_draft().as_dict()
+    assert round_tripped["metadata"]["future.extension"] == (
+        previous["future.extension"]
+    )
+
+
+def test_catalogue_legacy_absence_and_blank_priority_remain_unassessed():
+    codec = _codec(lambda _previous: "unused")
+
+    absent = codec.decode("book-one", _managed_row())
+    assert "scan_priority" not in absent.metadata
+
+    blank = codec.decode(
+        "book-one",
+        {**_managed_row(), "scan_priority": "", "scan_verdict": ""},
+    )
+    assert blank.metadata["scan_priority"] == ""
+    assert blank.metadata["scan_verdict"] == ""
+
+
+@pytest.mark.parametrize(
+    ("change", "error", "message"),
+    [
+        ({"scan_priority": "high"}, ValueError, "scan_priority is invalid"),
+        ({"scan_priority": "3"}, ValueError, "scan_priority is invalid"),
+        ({"scan_priority": 3}, TypeError, "scan_priority must be a string"),
+        (
+            {"scan_verdict": "Scan plates.\nThen scan text."},
+            ValueError,
+            "single line",
+        ),
+        (
+            {"scan_verdict": chr(0x1F33F) * 501},
+            ValueError,
+            "at most 500",
+        ),
+    ],
+)
+def test_catalogue_rows_reject_invalid_scan_curation_fields(
+    change,
+    error,
+    message,
+):
+    row = _managed_row()
+    row.update(change)
+
+    with pytest.raises(error, match=message):
+        _codec(lambda _previous: "unused").decode("book-one", row)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"marked_price": "  £1/10/-  "},
+        {"scan_priority": " High "},
+        {"scan_verdict": " Padded verdict "},
+        {"scan_verdict": "First line\rSecond line"},
+        {"scan_verdict": "x" * 501},
+    ],
+)
+def test_catalogue_writes_enforce_short_field_contracts(metadata):
+    codec = _codec(
+        lambda _previous: "2026-07-19T12:34:56.000000+00:00"
+    )
+
+    with pytest.raises(ValueError):
+        codec.encode("book-new", ItemDraft(metadata=metadata), None)
+
+
+def test_catalogue_scan_verdict_ceiling_counts_unicode_code_points():
+    codec = _codec(
+        lambda _previous: "2026-07-19T12:34:56.000000+00:00"
+    )
+
+    raw = codec.encode(
+        "book-new",
+        ItemDraft(metadata={"scan_verdict": chr(0x1F33F) * 500}),
+        None,
+    )
+
+    assert raw["scan_verdict"] == chr(0x1F33F) * 500
+
+
 def test_digitization_candidate_round_trips_and_requires_a_boolean():
     revisions = _RevisionSequence(
         "2026-07-19T12:35:00.000000+00:00",

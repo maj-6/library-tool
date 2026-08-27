@@ -89,7 +89,7 @@ class CaptureMetadataSyncTest {
             )
             .put("scan_status", "needs scan")
             .put("digitization_candidate", true)
-            .put("scan_priority", 2)
+            .put("scan_priority_rank", 2)
             .put("remarks", JSONArray().put("First remark").put(
                 JSONObject().put("text", "Second remark"),
             ))
@@ -107,7 +107,7 @@ class CaptureMetadataSyncTest {
         assertEquals("needs scan", parsed.scanStatus)
         assertEquals(true, parsed.digitizationCandidateClassification)
         assertTrue(parsed.digitizationCandidate)
-        assertEquals(2, parsed.scanPriority)
+        assertEquals(2, parsed.scanPriorityRank)
         assertEquals(listOf("First remark", "Second remark"), parsed.remarks)
     }
 
@@ -116,54 +116,86 @@ class CaptureMetadataSyncTest {
         val legacy = desktopBookMetadataFromJson(desktopRow())!!
         assertNull(legacy.digitizationCandidateClassification)
         assertFalse(legacy.digitizationCandidate)
-        assertNull(legacy.scanPriority)
+        assertNull(legacy.scanPriorityRank)
 
         val explicitClear = desktopBookMetadataFromJson(desktopRow(
             data = JSONObject()
                 .put("digitization_candidate", false)
-                .put("scan_priority", 1),
+                .put("scan_priority_rank", 1),
         ))!!
         assertEquals(false, explicitClear.digitizationCandidateClassification)
         assertFalse(explicitClear.digitizationCandidate)
-        assertNull(explicitClear.scanPriority)
+        assertNull(explicitClear.scanPriorityRank)
 
         listOf("true", 1, JSONObject.NULL).forEach { malformedCandidate ->
             val parsed = desktopBookMetadataFromJson(desktopRow(
                 data = JSONObject()
                     .put("digitization_candidate", malformedCandidate)
-                    .put("scan_priority", 1),
+                    .put("scan_priority_rank", 1),
             ))!!
             assertNull(parsed.digitizationCandidateClassification)
             assertFalse(parsed.digitizationCandidate)
-            assertNull(parsed.scanPriority)
+            assertNull(parsed.scanPriorityRank)
         }
-
-        val stringPriority = desktopBookMetadataFromJson(desktopRow(
-            data = JSONObject()
-                .put("digitization_candidate", true)
-                .put("scan_priority", "4"),
-        ))!!
-        assertEquals(4, stringPriority.scanPriority)
 
         listOf(
             0,
             6,
             1.5,
-            "01",
-            "1.0",
-            " 1",
-            "n/s",
+            "4",
+            "High",
             true,
             JSONObject.NULL,
-        ).forEach { malformedPriority ->
+        ).forEach { malformedRank ->
             val parsed = desktopBookMetadataFromJson(desktopRow(
                 data = JSONObject()
                     .put("digitization_candidate", true)
-                    .put("scan_priority", malformedPriority),
+                    .put("scan_priority_rank", malformedRank),
             ))!!
             assertEquals(true, parsed.digitizationCandidateClassification)
             assertTrue(parsed.digitizationCandidate)
-            assertNull(parsed.scanPriority)
+            assertNull(parsed.scanPriorityRank)
+        }
+    }
+
+    @Test
+    fun scanPriorityRankPrefersRenamedIntegerAndOnlyFallsBackToLegacyInteger() {
+        val renamed = desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject()
+                .put("digitization_candidate", true)
+                .put("scan_priority_rank", 2)
+                .put("scan_priority", 5),
+        ))!!
+        assertEquals(2, renamed.scanPriorityRank)
+
+        val legacyNumeric = desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject()
+                .put("digitization_candidate", true)
+                .put("scan_priority", 4),
+        ))!!
+        assertEquals(4, legacyNumeric.scanPriorityRank)
+
+        val explicitRenamedNull = desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject()
+                .put("digitization_candidate", true)
+                .put("scan_priority_rank", JSONObject.NULL)
+                .put("scan_priority", 4),
+        ))!!
+        assertNull(explicitRenamedNull.scanPriorityRank)
+
+        listOf(
+            "4",
+            "High",
+            "Medium",
+            "Low",
+            "n/s (no scan)",
+        ).forEach { textualPriority ->
+            val parsed = desktopBookMetadataFromJson(desktopRow(
+                data = JSONObject()
+                    .put("digitization_candidate", true)
+                    .put("scan_priority", textualPriority),
+            ))!!
+            assertNull(parsed.scanPriorityRank)
         }
     }
 

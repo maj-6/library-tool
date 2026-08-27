@@ -162,6 +162,24 @@
       Object.freeze({ key: "volume", label: "Volume" }),
       Object.freeze({ key: "language", label: "Language" }),
       Object.freeze({ key: "pages", label: "Pages" }),
+      Object.freeze({ key: "marked_price", label: "Marked price" }),
+      Object.freeze({
+        key: "scan_priority",
+        label: "Scan priority",
+        control: "select",
+        options: Object.freeze([
+          Object.freeze({ value: "", label: "Unassessed" }),
+          Object.freeze({ value: "n/s (no scan)", label: "n/s (no scan)" }),
+          Object.freeze({ value: "Low", label: "Low" }),
+          Object.freeze({ value: "Medium", label: "Medium" }),
+          Object.freeze({ value: "High", label: "High" }),
+        ]),
+      }),
+      Object.freeze({
+        key: "scan_verdict",
+        label: "Scan verdict",
+        maxLength: 500,
+      }),
     ]);
     const ITEM_FORM_CORE_FIELDS = Object.freeze([
       ...ITEM_FORM_SHARED_FIELDS,
@@ -177,6 +195,10 @@
       Object.freeze({ key: "notes", label: "Notes", multiline: true }),
       Object.freeze({ key: "description", label: "Description", multiline: true }),
       Object.freeze({ key: "rights", label: "Rights" }),
+    ]);
+    const ITEM_FORM_OUTER_TRIM_FIELDS = new Set([
+      "marked_price",
+      "scan_verdict",
     ]);
 
     // --- CH provisional fill ------------------------------------------------
@@ -854,8 +876,11 @@
           return;
         }
         if (!isPlainObject(metadata)) return;
-        if (input.value === "") delete metadata[key];
-        else metadata[key] = String(input.value);
+        const raw = String(input.value);
+        const value = ITEM_FORM_OUTER_TRIM_FIELDS.has(key)
+          ? raw.trim() : raw;
+        if (value === "") delete metadata[key];
+        else metadata[key] = value;
         this.updateDraft({ metadataText: stableMetadataText(metadata) });
       }
 
@@ -1331,18 +1356,27 @@
             const label = element(this.documentRef, "label", "", field.label);
             label.htmlFor = inputId;
             const input = element(this.documentRef,
-              field.multiline ? "textarea" : "input");
+              field.control === "select"
+                ? "select" : field.multiline ? "textarea" : "input");
             input.id = inputId;
-            if (field.multiline) input.rows = 3;
+            if (field.control === "select") {
+              for (const optionValue of field.options || []) {
+                const option = element(
+                  this.documentRef, "option", "", optionValue.label);
+                option.value = optionValue.value;
+                input.append(option);
+              }
+            } else if (field.multiline) input.rows = 3;
             else {
               input.type = "text";
-              input.maxLength = 4096;
+              input.maxLength = field.maxLength || 4096;
             }
             input.value = Object.prototype.hasOwnProperty.call(
               split.values, field.key) ? split.values[field.key] : "";
             input.disabled = this.busy;
             setAttribute(input, "data-item-field", field.key);
-            input.addEventListener("input",
+            input.addEventListener(
+              field.control === "select" ? "change" : "input",
               () => this.applyFieldEdit(field.key, input));
             row.append(label, input);
             if (this.fieldErrors && this.fieldErrors[field.key]) {

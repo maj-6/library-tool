@@ -41,18 +41,18 @@ internal fun entryScanCandidate(ctx: Context, entry: Entries.Entry): Boolean? {
 
 internal fun scanPriorityPresentation(
     candidate: Boolean?,
-    priority: Int?,
+    rank: Int?,
     candidateLabel: String,
-    priorityLabel: (Int) -> String,
-    priorityUnsetLabel: String,
+    rankLabel: (Int) -> String,
+    rankUnsetLabel: String,
 ): ScanPriorityPresentation {
     if (candidate != true) return ScanPriorityPresentation(false, "", "")
-    val safePriority = priority?.takeIf { it in 1..5 }
+    val safeRank = rank?.takeIf { it in 1..5 }
     return ScanPriorityPresentation(
         visible = true,
-        badge = safePriority?.toString() ?: "?",
-        accessibilityLabel = safePriority?.let(priorityLabel)
-            ?: "$candidateLabel. $priorityUnsetLabel",
+        badge = safeRank?.toString() ?: "?",
+        accessibilityLabel = safeRank?.let(rankLabel)
+            ?: "$candidateLabel. $rankUnsetLabel",
     )
 }
 
@@ -60,16 +60,16 @@ internal fun scanPriorityPresentation(
 internal fun bindScanPriorityIndicator(
     bookView: View,
     candidate: Boolean?,
-    priority: Int?,
+    rank: Int?,
 ): ScanPriorityPresentation {
     val presentation = scanPriorityPresentation(
         candidate = candidate,
-        priority = priority,
+        rank = rank,
         candidateLabel = bookView.context.getString(R.string.home_digitization_candidate),
-        priorityLabel = { value ->
+        rankLabel = { value ->
             bookView.context.getString(R.string.scan_priority_description, value)
         },
-        priorityUnsetLabel = bookView.context.getString(R.string.scan_priority_unset),
+        rankUnsetLabel = bookView.context.getString(R.string.scan_priority_unset),
     )
     // A scan candidate is metadata, not a user selection. A foreground keeps
     // the highlight visual-only, so TalkBack and Inspect action mode retain

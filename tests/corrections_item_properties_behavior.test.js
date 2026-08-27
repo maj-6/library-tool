@@ -703,14 +703,17 @@ test("typed form renders the manual field set from capture storage metadata", as
     itemFormFields("manual").map((field) => field.key));
   assert.deepEqual(itemFormFields("manual").map((field) => field.key), [
     "subtitle", "authors", "publisher", "publisher_city", "year", "edition",
-    "volume", "language", "pages", "condition", "price", "illustrations",
-    "categories", "notes",
+    "volume", "language", "pages", "marked_price", "scan_priority",
+    "scan_verdict", "condition", "price", "illustrations", "categories",
+    "notes",
   ]);
   assert.equal(root.querySelector('[data-item-field="authors"]').value, "Unknown");
   assert.equal(root.querySelector('[data-item-field="condition"]').value, "foxed");
   assert.equal(root.querySelector('[data-item-field="year"]').value, "1897");
   assert.equal(root.querySelector('[data-item-field="subtitle"]').value, "");
   assert.equal(root.querySelector('[data-item-field="notes"]').tagName, "TEXTAREA");
+  assert.equal(root.querySelector('[data-item-field="scan_priority"]').tagName,
+    "SELECT");
   assert.match(root.textContent, /manual storage/);
   const advanced = root.querySelector("[data-item-metadata-advanced]");
   assert.deepEqual(JSON.parse(advanced.value), { extra: { shelf: "B4" } });
@@ -813,6 +816,46 @@ test("typed field edits produce the same patch intents as the JSON editor", asyn
   assert.equal(editor.item.revision, "mir-r2");
   assert.equal(editor.draft.dirty, false);
 });
+
+
+test("copy curation controls trim transcription edges and keep exact priority",
+  async () => {
+    const calls = [];
+    const initial = item({ metadata: {} });
+    const saved = item({
+      metadata: {
+        marked_price: "£ 2/6",
+        scan_priority: "High",
+        scan_verdict: "Scan the annotated copy.",
+      },
+      record_revision: "mir-r2",
+    });
+    const { editor, root } = harness({
+      api: {
+        async loadItem() { return initial; },
+        async updateItem(payload) {
+          calls.push(payload);
+          return { item: saved, replayed: false };
+        },
+      },
+    });
+    await editor.setSelection(initial.id);
+
+    const marked = root.querySelector('[data-item-field="marked_price"]');
+    marked.value = "  £ 2/6  ";
+    marked.emit("input");
+    const priority = root.querySelector('[data-item-field="scan_priority"]');
+    priority.value = "High";
+    priority.emit("change");
+    const verdict = root.querySelector('[data-item-field="scan_verdict"]');
+    verdict.value = "  Scan the annotated copy.  ";
+    verdict.emit("input");
+
+    await editor.save();
+
+    assert.deepEqual(calls[0].patch.metadata_set, saved.metadata);
+    assert.deepEqual(calls[0].patch.metadata_remove, []);
+  });
 
 
 test("advanced JSON edits merge residual keys with typed field values", async () => {

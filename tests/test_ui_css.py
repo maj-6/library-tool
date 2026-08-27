@@ -51,6 +51,25 @@ def _rule(selector: str) -> str:
     return match.group(1)
 
 
+def test_scan_priority_and_reasoning_popover_cover_accessible_display_modes():
+    for selector in (
+        ".scan-priority-btn",
+        ".scan-priority-unassessed",
+        ".scan-priority-n-s-no-scan",
+        ".scan-priority-low",
+        ".scan-priority-medium",
+        ".scan-priority-high",
+        ".scan-assessment-popover",
+        ".scan-assessment-body",
+    ):
+        assert selector in STYLE
+    assert ".scan-priority-btn:focus-visible" in STYLE
+    assert "white-space: pre-wrap" in _rule(".scan-assessment-body")
+    assert "@media (max-width: 600px), (pointer: coarse)" in STYLE
+    assert "@media (prefers-reduced-motion: reduce)" in STYLE
+    assert "@media (forced-colors: active)" in STYLE
+
+
 def test_remarks_sidebar_preserves_workspace_width_and_scrolls_its_own_list():
     sidebar = _rule("#remarks-sidebar")
     assert "width: clamp(" in sidebar

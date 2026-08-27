@@ -64,12 +64,47 @@ def test_manual_entry_fields_exact_order():
         "pages",
         "condition",
         "price",
+        "marked_price",
+        "scan_priority",
+        "scan_verdict",
         "illustrations",
         "categories",
         "notes",
         "local_pdf",
         "attention",
     ]
+
+
+def test_scan_curation_short_field_helpers_preserve_exact_contracts():
+    assert lib.SCAN_PRIORITY_VALUES == (
+        "n/s (no scan)",
+        "Low",
+        "Medium",
+        "High",
+    )
+    assert lib.SCAN_VERDICT_MAX_CHARACTERS == 500
+    assert lib.normalize_marked_price(
+        "  £1/10/- (pencil, front pastedown)  "
+    ) == "£1/10/- (pencil, front pastedown)"
+    assert lib.validate_scan_priority("") == ""
+    for priority in lib.SCAN_PRIORITY_VALUES:
+        assert lib.validate_scan_priority(priority) == priority
+
+    with pytest.raises(ValueError, match="scan_priority"):
+        lib.validate_scan_priority("high")
+    with pytest.raises(ValueError, match="scan_priority"):
+        lib.validate_scan_priority(" High ")
+
+    assert lib.normalize_scan_verdict("  Review the plates first.  ") == (
+        "Review the plates first."
+    )
+    assert lib.normalize_scan_verdict(chr(0x1F33F) * 500) == (
+        chr(0x1F33F) * 500
+    )
+    with pytest.raises(ValueError, match="single line"):
+        lib.normalize_scan_verdict("Review plates.\nThen scan text.")
+    with pytest.raises(ValueError, match="at most 500"):
+        lib.normalize_scan_verdict(chr(0x1F33F) * 501)
 
 
 # --- slugify ------------------------------------------------------------------

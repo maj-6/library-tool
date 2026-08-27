@@ -2351,7 +2351,7 @@ class HomeActivity : AppCompatActivity() {
         bindScanPriorityIndicator(
             view,
             summary.digitizationCandidate,
-            summary.scanPriority,
+            summary.scanPriorityRank,
         )
         val details = mutableListOf<String>()
         summary.author.takeIf { it.isNotEmpty() }?.let(details::add)
@@ -2397,10 +2397,10 @@ class HomeActivity : AppCompatActivity() {
         val entryId = summary.entryId
         val priorityDescription = scanPriorityPresentation(
             candidate = summary.digitizationCandidate,
-            priority = summary.scanPriority,
+            rank = summary.scanPriorityRank,
             candidateLabel = getString(R.string.home_digitization_candidate),
-            priorityLabel = { getString(R.string.scan_priority_description, it) },
-            priorityUnsetLabel = getString(R.string.scan_priority_unset),
+            rankLabel = { getString(R.string.scan_priority_description, it) },
+            rankUnsetLabel = getString(R.string.scan_priority_unset),
         ).accessibilityLabel
         view.contentDescription = listOf(
             snapshot.titleLabel,
@@ -2539,7 +2539,7 @@ class HomeActivity : AppCompatActivity() {
             bindScanPriorityIndicator(
                 row,
                 summary.digitizationCandidate,
-                summary.scanPriority,
+                summary.scanPriorityRank,
             )
             item.snapshot.item.current?.let { entry ->
                 thumbnails += ThumbnailRequest(
@@ -2551,10 +2551,10 @@ class HomeActivity : AppCompatActivity() {
             }
             val priorityDescription = scanPriorityPresentation(
                 candidate = summary.digitizationCandidate,
-                priority = summary.scanPriority,
+                rank = summary.scanPriorityRank,
                 candidateLabel = getString(R.string.home_digitization_candidate),
-                priorityLabel = { getString(R.string.scan_priority_description, it) },
-                priorityUnsetLabel = getString(R.string.scan_priority_unset),
+                rankLabel = { getString(R.string.scan_priority_description, it) },
+                rankUnsetLabel = getString(R.string.scan_priority_unset),
             ).accessibilityLabel
             row.contentDescription = listOf(
                 item.book.title,
@@ -2656,8 +2656,8 @@ class HomeActivity : AppCompatActivity() {
                 currentDesktop?.digitizationCandidateClassification == false -> false
                 else -> rawSummary.digitizationCandidateClassification
             }
-            val priority = if (candidate == true) {
-                currentDesktop?.scanPriority ?: rawSummary.scanPriority
+            val rank = if (candidate == true) {
+                currentDesktop?.scanPriorityRank ?: rawSummary.scanPriorityRank
             } else {
                 null
             }
@@ -2666,7 +2666,7 @@ class HomeActivity : AppCompatActivity() {
                 author = book.author,
                 year = book.year,
                 digitizationCandidateClassification = candidate,
-                scanPriority = priority,
+                scanPriorityRank = rank,
             )
             val enrichedSnapshot = rawSnapshot.copy(
                 item = rawSnapshot.item.copy(summary = summary),
@@ -4540,7 +4540,7 @@ class HomeActivity : AppCompatActivity() {
         bindScanPriorityIndicator(
             row,
             entryScanCandidate(this, entry),
-            desktop?.scanPriority,
+            desktop?.scanPriorityRank,
         )
         row.findViewById<ImageView>(R.id.scanStatus).apply {
             val status = desktop?.scanStatus.orEmpty().trim()

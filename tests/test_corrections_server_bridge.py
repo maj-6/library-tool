@@ -130,6 +130,42 @@ def _use_capture_only_target(server, *, title: str = "Captured Herbal") -> None:
         )
 
 
+def _use_promoted_manual_alias(server):
+    manual_id = "manual-capture"
+    manual = {
+        "id": manual_id,
+        "title": "Compatibility source",
+        "author": "Source author",
+        "capture_id": CAPTURE_ID,
+        "marked_price": "source-only price",
+        "scan_priority": "Low",
+        "scan_verdict": "Inactive source verdict.",
+        "checks": {"isbn": "verified"},
+        "future_extension": {"manual": True},
+    }
+    build = {
+        "id": "promoted-local",
+        "title": "Promoted title",
+        "capture_id": CAPTURE_ID,
+        "capture_book_id": BOOK_ID,
+        "marked_price": "5/-",
+        "scan_priority": "Medium",
+        "scan_verdict": "Active build verdict.",
+        "future_extension": {"build": [1, 2, 3]},
+    }
+    with server._builds_lock:
+        server.lib.save_json(
+            server.BUILDS_PATH,
+            {build["id"]: build},
+        )
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {manual_id: manual},
+        )
+    return manual_id, manual, build
+
+
 @pytest.fixture()
 def corrections_workspace(monkeypatch, tmp_path: Path):
     import server
@@ -1021,6 +1057,8 @@ def test_capture_only_patch_ignores_unsupported_uncaptured_manual_rows(
         assert stored[entry_id] == expected
 
 
+
+
 def test_promoted_patch_and_replay_ignore_unsupported_uncaptured_manual_rows(
     client,
     corrections_workspace,
@@ -1154,6 +1192,166 @@ def test_promoted_capture_metadata_edit_targets_only_the_active_build(
     assert build["title"] == "Corrected promoted title"
     assert build["authors"] == "Corrected build author"
     assert source == manual
+
+
+def test_manual_api_projects_and_updates_promoted_build_curation(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    manual_id, manual, build = _use_promoted_manual_alias(server)
+    expected_source_sha256 = server._catalog_source_data_sha256(
+        "manual_entries",
+        manual,
+    )
+    before = client.get(f"/api/manual/{manual_id}")
+
+    assert before.status_code == 200, before.get_json()
+    projected = before.get_json()["entry"]
+    assert projected["marked_price"] == build["marked_price"]
+    assert projected["scan_priority"] == build["scan_priority"]
+    assert projected["scan_verdict"] == build["scan_verdict"]
+    assert projected["source_sha256"] == expected_source_sha256
+    listed = client.get("/api/manual")
+    assert listed.status_code == 200, listed.get_json()
+    assert listed.get_json()[0]["scan_priority"] == "Medium"
+
+    monkeypatch.setattr(
+        server,
+        "_mark_capture_archive_stale",
+        lambda _capture_id: pytest.fail(
+            "promoted copy curation must not invalidate capture evidence"
+        ),
+    )
+    full_form = {
+        field: projected.get(field, "")
+        for field in server.lib.MANUAL_ENTRY_FIELDS
+    }
+    full_form.update({
+        "category_ids": projected.get("category_ids", []),
+        "marked_price": "7/6 in pencil",
+        "scan_priority": "High",
+        "scan_verdict": "The active copy warrants priority scanning.",
+        "_edited": True,
+    })
+    response = client.patch(
+        f"/api/manual/{manual_id}",
+        json=full_form,
+    )
+
+    assert response.status_code == 200, response.get_json()
+    body = response.get_json()
+    assert body["bibliographic_changed"] is False
+    assert body["changed_fields"] == [
+        "marked_price",
+        "scan_priority",
+        "scan_verdict",
+    ]
+    assert body["entry"]["marked_price"] == "7/6 in pencil"
+    assert body["entry"]["scan_priority"] == "High"
+    assert body["entry"]["source_sha256"] == expected_source_sha256
+    assert body["entry"]["record_revision"] == projected["record_revision"]
+    with server._manual_lock:
+        stored_manual = server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )[manual_id]
+    with server._builds_lock:
+        stored_build = server.lib.load_json(
+            server.BUILDS_PATH,
+            {},
+        )[build["id"]]
+    assert stored_manual == manual
+    assert stored_build["marked_price"] == "7/6 in pencil"
+    assert stored_build["scan_priority"] == "High"
+    assert stored_build["scan_verdict"] == (
+        "The active copy warrants priority scanning."
+    )
+    assert stored_build["future_extension"] == build["future_extension"]
+
+    cleared = client.patch(
+        f"/api/manual/{manual_id}",
+        json={"scan_verdict": "", "_edited": True},
+    )
+    assert cleared.status_code == 200, cleared.get_json()
+    assert cleared.get_json()["changed_fields"] == ["scan_verdict"]
+    assert "scan_verdict" not in cleared.get_json()["entry"]
+    assert cleared.get_json()["entry"]["source_sha256"] == (
+        expected_source_sha256
+    )
+    with server._builds_lock:
+        cleared_build = server.lib.load_json(
+            server.BUILDS_PATH,
+            {},
+        )[build["id"]]
+    assert "scan_verdict" not in cleared_build
+    assert cleared_build["future_extension"] == build["future_extension"]
+    with server._manual_lock:
+        assert server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )[manual_id] == manual
+
+
+def test_manual_api_refuses_delete_of_promoted_source_alias(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    manual_id, manual, build = _use_promoted_manual_alias(server)
+    response = client.delete(f"/api/manual/{manual_id}")
+
+    assert response.status_code == 409, response.get_json()
+    assert response.get_json()["code"] == "promoted_manual_source_alias"
+    assert response.get_json()["details"] == {
+        "item_id": BOOK_ID,
+        "capture_id": CAPTURE_ID,
+    }
+    with server._manual_lock:
+        assert server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )[manual_id] == manual
+    with server._builds_lock:
+        assert server.lib.load_json(server.BUILDS_PATH, {})[build["id"]] == build
+    assert client.get(f"/api/manual/{manual_id}").status_code == 200
+
+
+def test_manual_api_fails_closed_on_ambiguous_capture_authority(
+    client,
+    corrections_workspace,
+):
+    del corrections_workspace
+    import server
+
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {
+                "manual-one": {
+                    "id": "manual-one",
+                    "title": "First claim",
+                    "capture_id": CAPTURE_ID,
+                },
+                "manual-two": {
+                    "id": "manual-two",
+                    "title": "Second claim",
+                    "capture_id": CAPTURE_ID,
+                },
+            },
+        )
+
+    response = client.get("/api/manual/manual-one")
+
+    assert response.status_code == 500, response.get_json()
+    assert response.get_json()["code"] == "duplicate_corrections_target_claim"
 
 
 def test_promoted_metadata_edit_does_not_commit_after_authority_conflict(
@@ -1306,6 +1504,141 @@ def test_capture_metadata_edit_does_not_commit_when_archive_invalidation_fails(
             {},
         )[manual_id]
     assert stored == manual
+
+
+def test_capture_copy_curation_edit_preserves_archive_and_unknown_metadata(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    manual_id = "manual-capture"
+    manual = {
+        "id": manual_id,
+        "title": "Captured title",
+        "price": "retail",
+        "capture_id": CAPTURE_ID,
+        "checks": {"isbn": "verified"},
+        "scans": {"internet_archive": ["match"]},
+        "verify": {"internet_archive": "approved"},
+        "extra": {"shelf": "B4"},
+        "future_extension": {"preserve": True},
+    }
+    with server._builds_lock:
+        server.lib.save_json(server.BUILDS_PATH, {})
+    with server._manual_lock:
+        server.lib.save_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {manual_id: manual},
+        )
+    endpoint = f"/api/v1/corrections/items/{BOOK_ID}"
+    before = client.get(endpoint).get_json()["item"]
+
+    monkeypatch.setattr(
+        server,
+        "_mark_capture_archive_stale",
+        lambda _capture_id: pytest.fail(
+            "copy curation must not invalidate sealed capture evidence"
+        ),
+    )
+    response = client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": None,
+                "metadata_set": {
+                    "marked_price": "£ 2/6",
+                    "scan_priority": "High",
+                    "scan_verdict": "The annotations warrant scanning.",
+                },
+                "metadata_remove": [],
+            }
+        },
+        headers={
+            "Idempotency-Key": "bridge-copy-curation-edit",
+            "If-Record-Match": f'"{before["record_revision"]}"',
+        },
+    )
+
+    assert response.status_code == 200, response.get_json()
+    metadata = response.get_json()["item"]["metadata"]
+    assert metadata["price"] == "retail"
+    assert metadata["marked_price"] == "£ 2/6"
+    assert metadata["scan_priority"] == "High"
+    with server._manual_lock:
+        stored = server.lib.load_json(
+            server.lib.MANUAL_ENTRIES_PATH,
+            {},
+        )[manual_id]
+    assert stored["checks"] == manual["checks"]
+    assert stored["scans"] == manual["scans"]
+    assert stored["verify"] == manual["verify"]
+    assert stored["extra"] == manual["extra"]
+    assert stored["future_extension"] == manual["future_extension"]
+
+
+def test_captured_build_full_form_curation_edit_does_not_stale_archive(
+    client,
+    corrections_workspace,
+    monkeypatch,
+):
+    del corrections_workspace
+    import server
+
+    with server._builds_lock:
+        builds = server.lib.load_json(server.BUILDS_PATH, {})
+        builds[BOOK_ID]["future_extension"] = {"preserve": [1, 2, 3]}
+        server.lib.save_json(server.BUILDS_PATH, builds)
+    endpoint = f"/api/v1/items/{BOOK_ID}"
+    before = client.get(endpoint).get_json()["item"]
+    monkeypatch.setattr(
+        server,
+        "_mark_capture_archive_stale",
+        lambda _capture_id: pytest.fail(
+            "curation-only full-form patch must not stale capture archive"
+        ),
+    )
+
+    response = client.patch(
+        endpoint,
+        json={
+            "patch": {
+                "title": "Captured Herbal",
+                "metadata_set": {
+                    "subtitle": "",
+                    "authors": "",
+                    "year": "",
+                    "publisher": "",
+                    "publisher_city": "",
+                    "edition": "",
+                    "volume": "",
+                    "language": "",
+                    "pages": "",
+                    "categories": "",
+                    "category_ids": [],
+                    "description": "",
+                    "notes": "",
+                    "marked_price": "7/6",
+                    "scan_priority": "Medium",
+                    "scan_verdict": "Scan after checking the binding.",
+                },
+                "metadata_remove": [],
+                "representations": None,
+            }
+        },
+        headers={
+            "Idempotency-Key": "build-curation-full-form",
+            "If-Record-Match": f'"{before["record_revision"]}"',
+        },
+    )
+
+    assert response.status_code == 200, response.get_json()
+    with server._builds_lock:
+        stored = server.lib.load_json(server.BUILDS_PATH, {})[BOOK_ID]
+    assert stored["scan_priority"] == "Medium"
+    assert stored["future_extension"] == {"preserve": [1, 2, 3]}
 
 
 def test_capture_target_duplicates_and_identity_conflicts_fail_closed(

@@ -58,6 +58,10 @@ DATA_ROOT = _data_root()
 # writable per-user state
 OUTPUT_DIR = DATA_ROOT / "output"
 MANUAL_ENTRIES_PATH = OUTPUT_DIR / "manual_entries.json"
+# Private, copy-specific annotations for the shipped read-only CH catalogue.
+# Keys are stable zero-based CH source ids; the source file itself is never
+# rewritten by Desktop review workflows.
+CH_ANNOTATIONS_PATH = OUTPUT_DIR / "ch_annotations.json"
 # UI/session state lifted out of browser localStorage so it is
 # port-independent and syncable (checked books, settings, attention marks).
 CLIENT_STATE_PATH = OUTPUT_DIR / "client_state.json"
@@ -111,6 +115,17 @@ CATEGORIES_PATH = OUTPUT_DIR / "categories.json"
 
 # Ordered fields for manually added books. local_pdf holds a locally
 # attached scan (a verified source for books marked SCAN).
+SCAN_PRIORITY_VALUES = (
+    "n/s (no scan)",
+    "Low",
+    "Medium",
+    "High",
+)
+SCAN_VERDICT_MAX_CHARACTERS = 500
+_SCAN_VERDICT_LINE_BREAKS = frozenset(
+    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+)
+
 MANUAL_ENTRY_FIELDS = [
     "title",
     "subtitle",
@@ -125,12 +140,49 @@ MANUAL_ENTRY_FIELDS = [
     "pages",
     "condition",
     "price",
+    "marked_price",
+    "scan_priority",
+    "scan_verdict",
     "illustrations",
     "categories",
     "notes",
     "local_pdf",
     "attention",
 ]
+
+
+def normalize_marked_price(value: object) -> str:
+    """Trim only outer whitespace from a copy's marked-price transcription."""
+
+    if not isinstance(value, str):
+        raise TypeError("marked_price must be a string")
+    return value.strip()
+
+
+def validate_scan_priority(value: object) -> str:
+    """Return an exact textual priority, retaining ``""`` as Unassessed."""
+
+    if not isinstance(value, str):
+        raise TypeError("scan_priority must be a string")
+    if value and value not in SCAN_PRIORITY_VALUES:
+        raise ValueError("scan_priority is invalid")
+    return value
+
+
+def normalize_scan_verdict(value: object) -> str:
+    """Trim and validate the bounded, single-line scan-verdict summary."""
+
+    if not isinstance(value, str):
+        raise TypeError("scan_verdict must be a string")
+    normalized = value.strip()
+    if any(character in _SCAN_VERDICT_LINE_BREAKS for character in normalized):
+        raise ValueError("scan_verdict must be a single line")
+    if len(normalized) > SCAN_VERDICT_MAX_CHARACTERS:
+        raise ValueError(
+            "scan_verdict must be at most "
+            f"{SCAN_VERDICT_MAX_CHARACTERS} characters"
+        )
+    return normalized
 
 
 # --- ids -------------------------------------------------------------------
