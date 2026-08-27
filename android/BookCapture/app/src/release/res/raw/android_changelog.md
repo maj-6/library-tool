@@ -3,6 +3,19 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.20 — 2026-08-26
+
+Android version code: `51`.
+
+### Other Changes
+
+- The numbered 1–5 scan-candidate rank now travels as
+  `scan_priority_rank`, leaving `scan_priority` available for Desktop's
+  separate textual assessment without changing the meaning of Android badges.
+- Readers retain numeric-only compatibility with older `scan_priority` rows.
+  Text values such as `High`, `Medium`, `Low`, and `n/s (no scan)` are never
+  converted into an ordinal rank.
+
 ## 0.5.2-alpha.19 — 2026-08-22
 
 Android version code: `50`.
