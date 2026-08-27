@@ -5830,6 +5830,9 @@ def _engine_open_lib_draft(metadata: Mapping) -> ItemDraft:
     # catalogue schema can drop this projection without changing OpenLibService.
     bibliographic.update({
         "group_id": "",
+        "marked_price": "",
+        "scan_priority": "",
+        "scan_verdict": "",
         "categories": "",
         "category_ids": [],
         "description": "",
