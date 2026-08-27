@@ -5515,6 +5515,10 @@ function stableJson(value) {
   return JSON.stringify(normalize(value));
 }
 
+const COPY_CURATION_FIELDS_FIXTURE = new Set([
+  "marked_price", "scan_priority", "scan_verdict",
+]);
+
 function metadataUiHarness(options = {}) {
   const app = fs.readFileSync(appPath, "utf8");
   const metadataStart = app.indexOf("const ITEM_EDIT_METADATA_FIELDS");
@@ -5623,6 +5627,7 @@ function metadataUiHarness(options = {}) {
   });
   context = vm.createContext({
     state,
+    COPY_CURATION_FIELDS: COPY_CURATION_FIELDS_FIXTURE,
     crypto: { randomUUID: () => `00000000-0000-4000-8000-${
       String(calls.updates.length + 1).padStart(12, "0")}` },
     engineClient: { items: { update } },
@@ -6068,6 +6073,7 @@ test("build creation strips legacy sources and attaches before history or select
   let compatibilityAttempts = 0;
   const context = vm.createContext({
     state,
+    COPY_CURATION_FIELDS: COPY_CURATION_FIELDS_FIXTURE,
     crypto: { randomUUID: () => "create-uuid" },
     engineClient: { items: {
       create: async (args) => {
@@ -6225,6 +6231,7 @@ test("captured source creation uses one atomic promotion command", async () => {
   const state = { builds: {} };
   const context = vm.createContext({
     state,
+    COPY_CURATION_FIELDS: COPY_CURATION_FIELDS_FIXTURE,
     crypto: { randomUUID: () => "promotion-uuid" },
     engineClient: { items: {
       create: async () => {
@@ -6311,6 +6318,7 @@ test("build creation retains one durable command across ambiguous retries", asyn
   let confirm = false;
   const context = vm.createContext({
     state,
+    COPY_CURATION_FIELDS: COPY_CURATION_FIELDS_FIXTURE,
     crypto: { randomUUID: () => "lost-response" },
     engineClient: { items: { create: async (args) => {
       calls.push(args);
@@ -6368,6 +6376,7 @@ test("pending create identity includes sources and acquisition provenance", asyn
   let sequence = 0;
   const context = vm.createContext({
     state: { builds: {} },
+    COPY_CURATION_FIELDS: COPY_CURATION_FIELDS_FIXTURE,
     crypto: { randomUUID: () => `intent-${++sequence}` },
     engineClient: { items: { create: async (args) => {
       calls.push(args);
