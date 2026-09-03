@@ -876,6 +876,7 @@ class CaptureMetadataSyncTest {
         )
         assertEquals(ids.take(80), first.ids)
         assertEquals("080", first.checkpoint)
+        assertTrue(first.attempted)
 
         val held = planArchivedMetadataRefresh(
             ids = ids,
@@ -887,6 +888,7 @@ class CaptureMetadataSyncTest {
         )
         assertTrue(held.ids.isEmpty())
         assertNull(held.checkpoint)
+        assertFalse(held.attempted)
 
         val second = planArchivedMetadataRefresh(
             ids = ids,
@@ -898,5 +900,26 @@ class CaptureMetadataSyncTest {
         )
         assertEquals(ids.drop(80).take(80), second.ids)
         assertEquals("160", second.checkpoint)
+        assertTrue(second.attempted)
+
+        val emptyDue = planArchivedMetadataRefresh(
+            ids = emptyList(),
+            cursor = second.checkpoint,
+            lastSuccessMs = 2_000L,
+            nowMs = 3_000L,
+            batchSize = 80,
+            minimumIntervalMs = 1_000L,
+        )
+        assertTrue(emptyDue.attempted)
+        assertTrue(emptyDue.ids.isEmpty())
+        assertNull(emptyDue.checkpoint)
+
+        assertTrue(
+            archivedMetadataRefreshDue(
+                lastSuccessMs = 3_000L,
+                nowMs = 2_000L,
+                minimumIntervalMs = 1_000L,
+            ),
+        )
     }
 }

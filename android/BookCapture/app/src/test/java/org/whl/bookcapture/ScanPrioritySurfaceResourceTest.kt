@@ -86,7 +86,13 @@ class ScanPrioritySurfaceResourceTest {
         ).readText()
         val cloud = source.substringAfter("override suspend fun doWork()")
             .substringBefore("private suspend fun syncLan(")
-        assertTrue(cloud.contains("Entries.archived(ctx)"))
+        assertTrue(cloud.contains("CaptureArchive.archivedIds(ctx)"))
+        assertTrue(!cloud.contains("Entries.archived(ctx)"))
+        assertTrue(cloud.contains("Entries.findIncludingArchive(ctx, id)"))
+        assertTrue(
+            cloud.indexOf("CaptureArchive.archivedIds(ctx)") <
+                cloud.indexOf("Entries.findIncludingArchive(ctx, id)"),
+        )
         assertTrue(cloud.contains("client.desktopBookMetadata(metadataIds)"))
         assertTrue(cloud.contains("Entries.findIncludingArchive(ctx, captureId)"))
         assertTrue(cloud.contains("if (entries.isEmpty()) return@withContext Result.success()"))
@@ -94,7 +100,7 @@ class ScanPrioritySurfaceResourceTest {
 
         val lan = source.substringAfter("private suspend fun syncLan(")
             .substringBefore("private suspend fun applyDesktopCorrection(")
-        assertTrue(lan.contains("archivePlan.entries"))
+        assertTrue(lan.contains("if (pass == 0) archivedEntries else emptyList()"))
         assertTrue(lan.contains("val currentBatch = batch.filter"))
         assertTrue(lan.contains("Entries.findIncludingArchive(ctx, captureId)"))
         assertTrue(lan.contains("CollectionInventory.recordFinalized"))

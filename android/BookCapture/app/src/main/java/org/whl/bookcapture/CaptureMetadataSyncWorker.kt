@@ -26,7 +26,18 @@ internal const val ARCHIVED_METADATA_REFRESH_INTERVAL_MS = 30L * 60L * 1000L
 internal data class ArchivedMetadataRefreshWindow(
     val ids: List<String>,
     val checkpoint: String?,
+    val attempted: Boolean,
 )
+
+internal fun archivedMetadataRefreshDue(
+    lastSuccessMs: Long,
+    nowMs: Long,
+    minimumIntervalMs: Long = ARCHIVED_METADATA_REFRESH_INTERVAL_MS,
+): Boolean {
+    require(minimumIntervalMs >= 0L) { "archive metadata interval cannot be negative" }
+    return lastSuccessMs <= 0L || nowMs < lastSuccessMs ||
+        nowMs - lastSuccessMs >= minimumIntervalMs
+}
 
 /**
  * Pick one stable, rotating archive window. A successful window is held for a
@@ -43,23 +54,25 @@ internal fun planArchivedMetadataRefresh(
 ): ArchivedMetadataRefreshWindow {
     require(batchSize > 0) { "archive metadata batch size must be positive" }
     require(minimumIntervalMs >= 0L) { "archive metadata interval cannot be negative" }
+    if (!archivedMetadataRefreshDue(lastSuccessMs, nowMs, minimumIntervalMs)) {
+        return ArchivedMetadataRefreshWindow(emptyList(), null, attempted = false)
+    }
     val ordered = ids.asSequence()
         .map(String::trim)
         .filter(String::isNotEmpty)
         .distinct()
         .sorted()
         .toList()
-    if (ordered.isEmpty()) return ArchivedMetadataRefreshWindow(emptyList(), null)
-    if (lastSuccessMs > 0L && nowMs >= lastSuccessMs &&
-        nowMs - lastSuccessMs < minimumIntervalMs
-    ) return ArchivedMetadataRefreshWindow(emptyList(), null)
+    if (ordered.isEmpty()) {
+        return ArchivedMetadataRefreshWindow(emptyList(), null, attempted = true)
+    }
 
     val start = cursor?.trim()?.takeIf(String::isNotEmpty)?.let { checkpoint ->
         ordered.indexOfFirst { it > checkpoint }.takeIf { it >= 0 } ?: 0
     } ?: 0
     val rotated = if (start == 0) ordered else ordered.drop(start) + ordered.take(start)
     val selected = rotated.take(batchSize)
-    return ArchivedMetadataRefreshWindow(selected, selected.lastOrNull())
+    return ArchivedMetadataRefreshWindow(selected, selected.lastOrNull(), attempted = true)
 }
 
 internal enum class MetadataSyncRouteDecision {
@@ -106,8 +119,9 @@ internal fun metadataSyncRouteDecision(
 
 private data class ArchivedMetadataRefreshPlan(
     val scope: String,
-    val entries: List<Entries.Entry>,
+    val ids: List<String>,
     val checkpoint: String?,
+    val attempted: Boolean,
 )
 
 /** Cursor and cadence are transport/destination scoped, so changing accounts
@@ -116,35 +130,52 @@ private object ArchivedMetadataRefreshStore {
     private const val PREFERENCES = "capture-metadata-archive-refresh"
     private val lock = Any()
 
+    fun isDue(ctx: Context, scope: String, nowMs: Long): Boolean = synchronized(lock) {
+        val lastSuccessMs = ctx.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .getLong("success:$scope", 0L)
+        archivedMetadataRefreshDue(lastSuccessMs, nowMs)
+    }
+
     fun plan(
         ctx: Context,
         scope: String,
-        candidates: List<Entries.Entry>,
+        ids: Collection<String>,
         nowMs: Long,
+        enabled: Boolean,
     ): ArchivedMetadataRefreshPlan = synchronized(lock) {
+        if (!enabled) {
+            return@synchronized ArchivedMetadataRefreshPlan(
+                scope = scope,
+                ids = emptyList(),
+                checkpoint = null,
+                attempted = false,
+            )
+        }
         val prefs = ctx.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
         val window = planArchivedMetadataRefresh(
-            ids = candidates.map(Entries.Entry::id),
+            ids = ids,
             cursor = prefs.getString("cursor:$scope", null),
             lastSuccessMs = prefs.getLong("success:$scope", 0L),
             nowMs = nowMs,
         )
-        val byId = candidates.associateBy(Entries.Entry::id)
         ArchivedMetadataRefreshPlan(
             scope = scope,
-            entries = window.ids.mapNotNull(byId::get),
+            ids = window.ids,
             checkpoint = window.checkpoint,
+            attempted = window.attempted,
         )
     }
 
     fun markSucceeded(ctx: Context, plan: ArchivedMetadataRefreshPlan, nowMs: Long): Boolean {
-        val checkpoint = plan.checkpoint ?: return true
+        if (!plan.attempted) return true
         return synchronized(lock) {
-            ctx.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-                .edit()
-                .putString("cursor:${plan.scope}", checkpoint)
-                .putLong("success:${plan.scope}", nowMs.coerceAtLeast(1L))
-                .commit()
+            val editor = ctx.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit()
+            if (plan.checkpoint == null) {
+                editor.remove("cursor:${plan.scope}")
+            } else {
+                editor.putString("cursor:${plan.scope}", plan.checkpoint)
+            }
+            editor.putLong("success:${plan.scope}", nowMs.coerceAtLeast(1L)).commit()
         }
     }
 }
@@ -247,28 +278,65 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
         val lanHost = Prefs.lanHost(ctx)
         val cloudConfigured = Prefs.configured(ctx) && Auth.signedIn(ctx) && owner.isNotEmpty()
         val recentEntries = Entries.recent(ctx)
-        val archivedEntries = Entries.archived(ctx)
         val nowMs = System.currentTimeMillis()
+        val lanArchiveScope = "lan:${lanHost.lowercase()}"
+        val cloudArchiveScope = "cloud:${owner.lowercase()}"
+        val lanArchiveEnabled = forcedRoute != "cloud" && lanHost.isNotEmpty()
+        val cloudArchiveEnabled = forcedRoute != "lan" && cloudConfigured
+        val archiveRefreshDue =
+            (lanArchiveEnabled &&
+                ArchivedMetadataRefreshStore.isDue(ctx, lanArchiveScope, nowMs)) ||
+                (cloudArchiveEnabled &&
+                    ArchivedMetadataRefreshStore.isDue(ctx, cloudArchiveScope, nowMs))
+        // Listing archive directory names is cheap. Parse only the bounded
+        // windows selected for transports whose cadence is actually due.
+        val archivedIds = if (archiveRefreshDue) {
+            CaptureArchive.archivedIds(ctx).filter(SAFE_CAPTURE_SYNC_ID::matches)
+        } else {
+            emptyList()
+        }
         val lanArchivePlan = ArchivedMetadataRefreshStore.plan(
             ctx = ctx,
-            scope = "lan:${lanHost.lowercase()}",
-            candidates = if (lanHost.isEmpty()) emptyList() else archivedEntries.filter { entry ->
-                isLanMetadataEntry(ctx, entry) && SAFE_CAPTURE_SYNC_ID.matches(entry.id)
-            },
+            scope = lanArchiveScope,
+            ids = archivedIds,
             nowMs = nowMs,
+            enabled = lanArchiveEnabled,
         )
         val cloudArchivePlan = ArchivedMetadataRefreshStore.plan(
             ctx = ctx,
-            scope = "cloud:${owner.lowercase()}",
-            candidates = if (!cloudConfigured) emptyList() else archivedEntries.filter { entry ->
-                isOwnedCloudMetadataEntry(ctx, entry, owner)
-            },
+            scope = cloudArchiveScope,
+            ids = archivedIds,
             nowMs = nowMs,
+            enabled = cloudArchiveEnabled,
         )
-        val hasLanEntries = lanArchivePlan.entries.isNotEmpty() || recentEntries.any { entry ->
+        val archivedEntriesById = (lanArchivePlan.ids + cloudArchivePlan.ids)
+            .distinct()
+            .mapNotNull { id ->
+                Entries.findIncludingArchive(ctx, id)?.takeIf(Entries.Entry::archived)
+            }
+            .associateBy(Entries.Entry::id)
+        val lanArchivedEntries = lanArchivePlan.ids
+            .mapNotNull(archivedEntriesById::get)
+            .filter { entry -> isLanMetadataEntry(ctx, entry) }
+        val cloudArchivedEntries = cloudArchivePlan.ids
+            .mapNotNull(archivedEntriesById::get)
+            .filter { entry -> isOwnedCloudMetadataEntry(ctx, entry, owner) }
+        // A due window with no matching/loadable records is still a completed
+        // archive check. Persist it so Home does not repeat the traversal.
+        if (lanArchivedEntries.isEmpty() &&
+            !ArchivedMetadataRefreshStore.markSucceeded(ctx, lanArchivePlan, nowMs)
+        ) return@withContext permanentFailure(
+            "could not persist empty LAN archive metadata refresh checkpoint",
+        )
+        if (cloudArchivedEntries.isEmpty() &&
+            !ArchivedMetadataRefreshStore.markSucceeded(ctx, cloudArchivePlan, nowMs)
+        ) return@withContext permanentFailure(
+            "could not persist empty cloud archive metadata refresh checkpoint",
+        )
+        val hasLanEntries = lanArchivedEntries.isNotEmpty() || recentEntries.any { entry ->
             isLanMetadataEntry(ctx, entry) && SAFE_CAPTURE_SYNC_ID.matches(entry.id)
         }
-        val hasCloudEntries = cloudArchivePlan.entries.isNotEmpty() || recentEntries.any { entry ->
+        val hasCloudEntries = cloudArchivedEntries.isNotEmpty() || recentEntries.any { entry ->
             cloudConfigured && isOwnedCloudMetadataEntry(ctx, entry, owner)
         }
         val shouldProbeLan = forcedRoute != "cloud" && hasLanEntries &&
@@ -290,6 +358,7 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                 checkNotNull(lan),
                 pushReviews,
                 lanArchivePlan,
+                lanArchivedEntries,
             )
             MetadataSyncRouteDecision.RETRY_LAN -> return@withContext Result.retry()
             MetadataSyncRouteDecision.CLOUD_AND_RETRY_LAN -> enqueueLanFollowup(ctx, pushReviews)
@@ -307,7 +376,7 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                 val entries = Entries.recent(ctx).filter { entry ->
                     isOwnedCloudMetadataEntry(ctx, entry, owner)
                 }
-                val archived = if (pass == 0) cloudArchivePlan.entries else emptyList()
+                val archived = if (pass == 0) cloudArchivedEntries else emptyList()
                 val metadataEntries = (entries + archived).distinctBy(Entries.Entry::id)
                 if (metadataEntries.isEmpty()) return@withContext Result.success()
                 val metadataIds = metadataEntries.map(Entries.Entry::id)
@@ -531,6 +600,7 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
         client: LanClient,
         pushReviews: Boolean,
         archivePlan: ArchivedMetadataRefreshPlan,
+        archivedEntries: List<Entries.Entry>,
     ): Result {
         try {
             repeat(if (pushReviews) MAX_PASSES else 1) { pass ->
@@ -539,7 +609,7 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                         SAFE_CAPTURE_SYNC_ID.matches(entry.id)
                 }
                 val entryIds = entries.mapTo(hashSetOf(), Entries.Entry::id)
-                val archived = if (pass == 0) archivePlan.entries else emptyList()
+                val archived = if (pass == 0) archivedEntries else emptyList()
                 val metadataEntries = (entries + archived).distinctBy(Entries.Entry::id)
                 if (metadataEntries.isEmpty()) {
                     return Result.success()

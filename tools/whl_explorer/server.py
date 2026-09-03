@@ -29690,8 +29690,8 @@ def _capture_retained_projection_evidence(data: dict) -> dict:
         value = data.get(key)
         if value not in (None, "", [], {}):
             out[key] = json.loads(json.dumps(value, ensure_ascii=False))
-    priority = _capture_scan_priority(data.get("scan_priority"))
-    if priority is not None:
+    priority_known, priority = _capture_projected_scan_priority(data)
+    if priority_known:
         out["scan_priority"] = priority
     # Rows from the former projection stored the unrelated 1-5 ordering rank
     # under `scan_priority`. Migrate that evidence into its renamed field while
@@ -29715,6 +29715,27 @@ def _capture_scan_priority(value) -> str | None:
     if isinstance(value, str) and value in set(lib.SCAN_PRIORITY_VALUES):
         return value
     return None
+
+
+def _capture_catalog_scan_priority(value) -> tuple[bool, str | None]:
+    """Return whether a catalogue value is an assessment, including blank."""
+    priority = _capture_scan_priority(value)
+    if priority is not None:
+        return True, priority
+    if value == "":
+        return True, None
+    return False, None
+
+
+def _capture_projected_scan_priority(data: dict) -> tuple[bool, str | None]:
+    """Read a phone projection without mistaking corruption for a clear."""
+    if "scan_priority" not in data:
+        return False, None
+    value = data.get("scan_priority")
+    if value is None or value == "":
+        return True, None
+    priority = _capture_scan_priority(value)
+    return (priority is not None), priority
 
 
 def _capture_scan_priority_rank(value) -> int | None:
@@ -29819,23 +29840,22 @@ def _merge_capture_projection_with_existing(row: dict,
     # explicit null means a curator cleared it. Numeric values from the former
     # field contract are not assessments and are migrated to the rank below.
     tombstone = desired.get("registered") is False
-    desired_priority_present = "scan_priority" in desired
     desired_priority_raw = desired.get("scan_priority")
     desired_legacy_rank = _capture_scan_priority_rank(desired_priority_raw) \
-        if desired_priority_present else None
+        if "scan_priority" in desired else None
+    desired_priority_known, desired_priority = \
+        _capture_projected_scan_priority(desired)
     if tombstone:
         desired.pop("scan_priority", None)
-    elif desired_priority_present:
-        priority = _capture_scan_priority(desired_priority_raw)
-        if priority is not None:
-            desired["scan_priority"] = priority
-        elif desired_legacy_rank is not None:
-            desired.pop("scan_priority", None)
-        else:
-            desired["scan_priority"] = None
+    elif desired_priority_known:
+        desired["scan_priority"] = desired_priority
     else:
-        old_priority = _capture_scan_priority(previous_facts.get("scan_priority"))
-        if old_priority is not None:
+        # Numeric legacy values belong to the rank below. Other invalid values
+        # are unknown/corrupt, not curator-authored clears.
+        desired.pop("scan_priority", None)
+        old_priority_known, old_priority = \
+            _capture_projected_scan_priority(previous_facts)
+        if old_priority_known:
             desired["scan_priority"] = old_priority
 
     # Candidate-order rank remains conditional on an explicit candidate. The
@@ -30116,18 +30136,17 @@ def _capture_book_metadata_rows(builds: dict | None = None,
         if isinstance(digitization_candidate, bool):
             data["digitization_candidate"] = digitization_candidate
         # Scan assessment is a catalogue verdict, independent of candidate
-        # membership. An explicit invalid/empty value is carried as JSON null so
-        # a merge cannot revive a stale cloud assessment. A numeric value belongs
-        # to the former rank contract and is migrated below instead.
+        # membership. Canonical blank means Unassessed and is carried as JSON
+        # null. Invalid values are unknown/corrupt and must not erase a valid
+        # cloud assessment. A numeric value belongs to the former rank contract.
         legacy_rank = None
         if "scan_priority" in build:
             raw_priority = build.get("scan_priority")
-            priority = _capture_scan_priority(raw_priority)
             legacy_rank = _capture_scan_priority_rank(raw_priority)
-            if priority is not None:
+            priority_known, priority = \
+                _capture_catalog_scan_priority(raw_priority)
+            if priority_known:
                 data["scan_priority"] = priority
-            elif legacy_rank is None:
-                data["scan_priority"] = None
         # A rank has meaning only for a candidate. Prefer its explicit renamed
         # field, including an explicit clear; otherwise migrate the old numeric
         # `scan_priority` spelling. Emit a JSON number, never a numeric string.

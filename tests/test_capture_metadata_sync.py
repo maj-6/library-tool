@@ -222,9 +222,10 @@ def test_scan_priority_projects_exact_assessment_independent_of_candidate():
     assert projected("Low", candidate=False)["scan_priority"] == "Low"
     assert projected("Medium")["scan_priority"] == "Medium"
     assert projected("High", candidate=True)["scan_priority"] == "High"
+    assert projected("")["scan_priority"] is None
 
     for malformed in (True, 1.0, "high", " High ", "n/s", None):
-        assert projected(malformed)["scan_priority"] is None
+        assert "scan_priority" not in projected(malformed)
     assert "scan_priority" not in projected()
 
 
@@ -253,7 +254,7 @@ def test_legacy_numeric_priority_projects_only_as_candidate_rank():
 
     for malformed in (True, 1.0, "01", "0", "6"):
         data = projected(malformed)
-        assert data["scan_priority"] is None
+        assert "scan_priority" not in data
         assert "scan_priority_rank" not in data
 
     noncandidate = projected(2, candidate=False)
@@ -295,7 +296,7 @@ def test_scan_priority_merge_preserves_clears_and_retains_separate_fields():
 
     explicit_clear = row({
         "digitization_candidate": True,
-        "scan_priority": None,
+        "scan_priority": "",
         "scan_priority_rank": None,
     })
     cleared = server._merge_capture_projection_with_existing(
@@ -303,6 +304,23 @@ def test_scan_priority_merge_preserves_clears_and_retains_separate_fields():
     )
     assert cleared["data"]["scan_priority"] is None
     assert cleared["data"]["scan_priority_rank"] is None
+
+    # A build-only/legacy writer that lacks the field cannot resurrect an old
+    # assigned value after another desktop explicitly marked it Unassessed.
+    preserved_clear = server._merge_capture_projection_with_existing(
+        legacy, {**explicit_clear, "revision": 2},
+    )
+    assert "scan_priority" in preserved_clear["data"]
+    assert preserved_clear["data"]["scan_priority"] is None
+
+    # Corruption is unknown, not an authoritative clear. Preserve the prior
+    # canonical assessment rather than erasing it.
+    malformed = deepcopy(legacy)
+    malformed["data"]["scan_priority"] = "urgent"
+    preserved_from_malformed = server._merge_capture_projection_with_existing(
+        malformed, {**known, "revision": 2},
+    )
+    assert preserved_from_malformed["data"]["scan_priority"] == "High"
 
     # Candidate membership affects only the rank. It must not erase or hide the
     # catalogue assessment.
@@ -322,6 +340,11 @@ def test_scan_priority_merge_preserves_clears_and_retains_separate_fields():
     )["data"]["projection_source"]["_retained_desktop_evidence"]
     assert retained["scan_priority"] == "High"
     assert retained["scan_priority_rank"] == 2
+    retained_clear = server._merge_capture_projection_with_existing(
+        tombstone, {**explicit_clear, "revision": 2},
+    )["data"]["projection_source"]["_retained_desktop_evidence"]
+    assert "scan_priority" in retained_clear
+    assert retained_clear["scan_priority"] is None
 
     # Existing rows written before the field split are migrated during either a
     # live merge or a tombstone handoff. Numeric legacy data never becomes a

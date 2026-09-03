@@ -3,6 +3,26 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.21 — 2026-09-03
+
+Android version code: `52`.
+
+### Additions
+
+- Desktop scan assessments now appear consistently on Home, every Inspect
+  layout, Archive, book details, and the last-captured preview. `N/S` is an
+  explicit no-scan assessment; an unassessed book has no assessment badge.
+
+### Other Changes
+
+- Archive and camera views refresh when desktop book metadata changes. Archive
+  refreshes use bounded, cadenced windows and remain metadata-only.
+
+### Bugfixes
+
+- Metadata projection preserves an explicit unassessed state and ignores
+  malformed scan-assessment values, preventing stale or erased badges.
+
 ## 0.5.2-alpha.20 — 2026-08-26
 
 Android version code: `51`.
@@ -10,17 +30,11 @@ Android version code: `51`.
 ### Other Changes
 
 - The numbered 1–5 scan-candidate rank now travels as
-  `scan_priority_rank`, leaving `scan_priority` for Desktop's separate textual
-  assessment.
+  `scan_priority_rank`, leaving `scan_priority` available for Desktop's
+  separate textual assessment without changing the meaning of Android badges.
 - Readers retain numeric-only compatibility with older `scan_priority` rows.
   Text values such as `High`, `Medium`, `Low`, and `n/s (no scan)` are never
   converted into an ordinal rank.
-- Desktop scan assessments now appear consistently on Home, every Inspect
-  layout, Archive, book details, and the last-captured preview. `N/S` is an
-  explicit no-scan assessment; an unassessed book has no assessment badge.
-- Archive and camera views refresh when desktop book metadata changes. Archived
-  captures receive book metadata only; they remain excluded from review writes,
-  correction downloads, import state, and asset-lifecycle synchronization.
 
 ## 0.5.2-alpha.19 — 2026-08-22
 
