@@ -32,7 +32,7 @@ def _acl(signature: str) -> None:
 
 def test_cas_hardening_is_latest_append_only_and_reloads_postgrest():
     assert cloud_setup.migration_files()[-1].name == (
-        "033_scan_search_queue_cas_hardening.sql"
+        "035_collection_inventory_live_metadata.sql"
     )
     assert cloud_setup.expected_schema(SQL) == {}
     assert "alter table" not in FLAT
