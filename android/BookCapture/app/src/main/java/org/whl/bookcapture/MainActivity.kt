@@ -269,6 +269,10 @@ class MainActivity : AppCompatActivity() {
                 ProcessWorker.UNIQUE_WORK_NAME,
                 ProcessWorker.BACKLOG_WORK_NAME,
                 "capture-upload",
+                CaptureMetadataSyncWorker.WORK_NAME,
+                CaptureMetadataSyncWorker.PULL_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_PULL_WORK_NAME,
             ))
             .observe(this) { scheduleBackgroundRefresh() }
     }
@@ -3077,6 +3081,7 @@ class MainActivity : AppCompatActivity() {
                 bookView = binding.lastBookPreview,
                 candidate = null,
                 rank = null,
+                assessment = null,
             )
             if (!load.thumbnailChanged) {
                 binding.lastBookThumb.setImageResource(R.drawable.ic_launcher_safe_fg)
@@ -3116,6 +3121,7 @@ class MainActivity : AppCompatActivity() {
             bookView = binding.lastBookPreview,
             candidate = entryScanCandidate(this, entry),
             rank = entry.desktopBook?.scanPriorityRank,
+            assessment = entry.desktopBook?.scanPriorityAssessment,
         )
 
         // Entries.titleLabel is valuable while extraction is pending, but its

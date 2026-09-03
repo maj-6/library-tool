@@ -200,30 +200,77 @@ def test_digitization_candidate_projects_from_the_selected_active_item_only():
     assert "digitization_candidate" not in legacy["data"]
 
 
-def test_scan_priority_projects_only_a_strict_candidate_ordinal():
-    def projected(priority, *, candidate=True, include=True):
+def test_scan_priority_projects_exact_assessment_independent_of_candidate():
+    missing = object()
+
+    def projected(priority=missing, *, candidate=missing):
         build = {
             "capture_id": CAPTURE_ID,
-            "digitization_candidate": candidate,
             "updated_at": "2026-08-21T10:00:00Z",
         }
-        if include:
+        if candidate is not missing:
+            build["digitization_candidate"] = candidate
+        if priority is not missing:
             build["scan_priority"] = priority
         return server._capture_book_metadata_rows(
             builds={"book-1": build}, manual_entries={}, reviews={},
             registration_cache={},
         )[0]["data"]
 
-    assert projected("1")["scan_priority"] == "1"
-    assert projected(5)["scan_priority"] == "5"
-    for malformed in (True, 1.0, "01", "0", "6", "n/s", None):
+    assert projected("n/s (no scan)", candidate=True)["scan_priority"] == \
+        "n/s (no scan)"
+    assert projected("Low", candidate=False)["scan_priority"] == "Low"
+    assert projected("Medium")["scan_priority"] == "Medium"
+    assert projected("High", candidate=True)["scan_priority"] == "High"
+
+    for malformed in (True, 1.0, "high", " High ", "n/s", None):
         assert projected(malformed)["scan_priority"] is None
-
-    assert "scan_priority" not in projected("2", candidate=False)
-    assert "scan_priority" not in projected(None, include=False)
+    assert "scan_priority" not in projected()
 
 
-def test_scan_priority_merge_preserves_unknown_but_honors_an_explicit_clear():
+def test_legacy_numeric_priority_projects_only_as_candidate_rank():
+    missing = object()
+
+    def projected(priority, *, candidate=True, rank=missing):
+        build = {
+            "capture_id": CAPTURE_ID,
+            "digitization_candidate": candidate,
+            "scan_priority": priority,
+            "updated_at": "2026-08-21T10:00:00Z",
+        }
+        if rank is not missing:
+            build["scan_priority_rank"] = rank
+        return server._capture_book_metadata_rows(
+            builds={"book-1": build}, manual_entries={}, reviews={},
+            registration_cache={},
+        )[0]["data"]
+
+    for legacy, expected in ((1, 1), ("2", 2), (5, 5)):
+        data = projected(legacy)
+        assert "scan_priority" not in data
+        assert data["scan_priority_rank"] == expected
+        assert isinstance(data["scan_priority_rank"], int)
+
+    for malformed in (True, 1.0, "01", "0", "6"):
+        data = projected(malformed)
+        assert data["scan_priority"] is None
+        assert "scan_priority_rank" not in data
+
+    noncandidate = projected(2, candidate=False)
+    assert "scan_priority" not in noncandidate
+    assert "scan_priority_rank" not in noncandidate
+
+    # The renamed rank is authoritative, including an explicit clear, and can
+    # coexist with the independent textual assessment.
+    explicit = projected("High", rank="4")
+    assert explicit["scan_priority"] == "High"
+    assert explicit["scan_priority_rank"] == 4
+    cleared = projected(2, rank=None)
+    assert "scan_priority" not in cleared
+    assert cleared["scan_priority_rank"] is None
+
+
+def test_scan_priority_merge_preserves_clears_and_retains_separate_fields():
     def row(build):
         return server._capture_book_metadata_rows(
             builds={"book-1": {
@@ -234,21 +281,36 @@ def test_scan_priority_merge_preserves_unknown_but_honors_an_explicit_clear():
             manual_entries={}, reviews={}, registration_cache={},
         )[0]
 
-    known = row({"digitization_candidate": True, "scan_priority": "2"})
+    known = row({
+        "digitization_candidate": True,
+        "scan_priority": "High",
+        "scan_priority_rank": 2,
+    })
     legacy = row({"digitization_candidate": True})
     preserved = server._merge_capture_projection_with_existing(
         legacy, {**known, "revision": 2},
     )
-    assert preserved["data"]["scan_priority"] == "2"
+    assert preserved["data"]["scan_priority"] == "High"
+    assert preserved["data"]["scan_priority_rank"] == 2
 
     explicit_clear = row({
         "digitization_candidate": True,
-        "scan_priority": "n/s",
+        "scan_priority": None,
+        "scan_priority_rank": None,
     })
     cleared = server._merge_capture_projection_with_existing(
         explicit_clear, {**known, "revision": 2},
     )
     assert cleared["data"]["scan_priority"] is None
+    assert cleared["data"]["scan_priority_rank"] is None
+
+    # Candidate membership affects only the rank. It must not erase or hide the
+    # catalogue assessment.
+    noncandidate = server._merge_capture_projection_with_existing(
+        row({"digitization_candidate": False}), {**known, "revision": 2},
+    )
+    assert noncandidate["data"]["scan_priority"] == "High"
+    assert "scan_priority_rank" not in noncandidate["data"]
 
     tombstone = server._capture_book_metadata_rows(
         builds={}, manual_entries={}, reviews={}, registration_cache={},
@@ -258,7 +320,24 @@ def test_scan_priority_merge_preserves_unknown_but_honors_an_explicit_clear():
     retained = server._merge_capture_projection_with_existing(
         tombstone, {**known, "revision": 2},
     )["data"]["projection_source"]["_retained_desktop_evidence"]
-    assert retained["scan_priority"] == "2"
+    assert retained["scan_priority"] == "High"
+    assert retained["scan_priority_rank"] == 2
+
+    # Existing rows written before the field split are migrated during either a
+    # live merge or a tombstone handoff. Numeric legacy data never becomes a
+    # textual assessment.
+    old_numeric = deepcopy(legacy)
+    old_numeric["data"]["scan_priority"] = "3"
+    migrated = server._merge_capture_projection_with_existing(
+        legacy, {**old_numeric, "revision": 2},
+    )
+    assert "scan_priority" not in migrated["data"]
+    assert migrated["data"]["scan_priority_rank"] == 3
+    migrated_retained = server._merge_capture_projection_with_existing(
+        tombstone, {**old_numeric, "revision": 2},
+    )["data"]["projection_source"]["_retained_desktop_evidence"]
+    assert "scan_priority" not in migrated_retained
+    assert migrated_retained["scan_priority_rank"] == 3
 
 
 def test_candidate_merge_preserves_legacy_unknown_but_explicit_false_clears():

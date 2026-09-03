@@ -20,6 +20,135 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+internal const val ARCHIVED_METADATA_REFRESH_BATCH_SIZE = CAPTURE_METADATA_BATCH_SIZE * 2
+internal const val ARCHIVED_METADATA_REFRESH_INTERVAL_MS = 30L * 60L * 1000L
+
+internal data class ArchivedMetadataRefreshWindow(
+    val ids: List<String>,
+    val checkpoint: String?,
+)
+
+/**
+ * Pick one stable, rotating archive window. A successful window is held for a
+ * short cadence so repeatedly foregrounding Home refreshes current captures
+ * without re-querying the entire retention archive.
+ */
+internal fun planArchivedMetadataRefresh(
+    ids: Collection<String>,
+    cursor: String?,
+    lastSuccessMs: Long,
+    nowMs: Long,
+    batchSize: Int = ARCHIVED_METADATA_REFRESH_BATCH_SIZE,
+    minimumIntervalMs: Long = ARCHIVED_METADATA_REFRESH_INTERVAL_MS,
+): ArchivedMetadataRefreshWindow {
+    require(batchSize > 0) { "archive metadata batch size must be positive" }
+    require(minimumIntervalMs >= 0L) { "archive metadata interval cannot be negative" }
+    val ordered = ids.asSequence()
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .distinct()
+        .sorted()
+        .toList()
+    if (ordered.isEmpty()) return ArchivedMetadataRefreshWindow(emptyList(), null)
+    if (lastSuccessMs > 0L && nowMs >= lastSuccessMs &&
+        nowMs - lastSuccessMs < minimumIntervalMs
+    ) return ArchivedMetadataRefreshWindow(emptyList(), null)
+
+    val start = cursor?.trim()?.takeIf(String::isNotEmpty)?.let { checkpoint ->
+        ordered.indexOfFirst { it > checkpoint }.takeIf { it >= 0 } ?: 0
+    } ?: 0
+    val rotated = if (start == 0) ordered else ordered.drop(start) + ordered.take(start)
+    val selected = rotated.take(batchSize)
+    return ArchivedMetadataRefreshWindow(selected, selected.lastOrNull())
+}
+
+internal enum class MetadataSyncRouteDecision {
+    LAN,
+    CLOUD,
+    RETRY_LAN,
+    CLOUD_AND_RETRY_LAN,
+    NONE,
+}
+
+/** Pure transport arbitration used after the optional LAN reachability probe. */
+internal fun metadataSyncRouteDecision(
+    forcedRoute: String,
+    hasLanEntries: Boolean,
+    hasCloudEntries: Boolean,
+    lanConfigured: Boolean,
+    cloudConfigured: Boolean,
+    lanReachable: Boolean,
+): MetadataSyncRouteDecision {
+    val cloudAvailable = cloudConfigured && hasCloudEntries
+    if (forcedRoute == "cloud") {
+        return if (cloudAvailable) MetadataSyncRouteDecision.CLOUD
+        else MetadataSyncRouteDecision.NONE
+    }
+    val lanAvailable = lanConfigured && hasLanEntries
+    if (forcedRoute == "lan") {
+        return when {
+            !lanAvailable -> MetadataSyncRouteDecision.NONE
+            lanReachable -> MetadataSyncRouteDecision.LAN
+            else -> MetadataSyncRouteDecision.RETRY_LAN
+        }
+    }
+    return when {
+        // When both transports have work, cloud stays on the primary chain and
+        // LAN gets its own retry chain. A desktop that answers /ping but fails
+        // during /metadata must not prevent the cloud projection from landing.
+        lanAvailable && cloudAvailable -> MetadataSyncRouteDecision.CLOUD_AND_RETRY_LAN
+        lanAvailable && lanReachable -> MetadataSyncRouteDecision.LAN
+        lanAvailable -> MetadataSyncRouteDecision.RETRY_LAN
+        cloudAvailable -> MetadataSyncRouteDecision.CLOUD
+        else -> MetadataSyncRouteDecision.NONE
+    }
+}
+
+private data class ArchivedMetadataRefreshPlan(
+    val scope: String,
+    val entries: List<Entries.Entry>,
+    val checkpoint: String?,
+)
+
+/** Cursor and cadence are transport/destination scoped, so changing accounts
+ * or paired desktops cannot suppress the first refresh for the new source. */
+private object ArchivedMetadataRefreshStore {
+    private const val PREFERENCES = "capture-metadata-archive-refresh"
+    private val lock = Any()
+
+    fun plan(
+        ctx: Context,
+        scope: String,
+        candidates: List<Entries.Entry>,
+        nowMs: Long,
+    ): ArchivedMetadataRefreshPlan = synchronized(lock) {
+        val prefs = ctx.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+        val window = planArchivedMetadataRefresh(
+            ids = candidates.map(Entries.Entry::id),
+            cursor = prefs.getString("cursor:$scope", null),
+            lastSuccessMs = prefs.getLong("success:$scope", 0L),
+            nowMs = nowMs,
+        )
+        val byId = candidates.associateBy(Entries.Entry::id)
+        ArchivedMetadataRefreshPlan(
+            scope = scope,
+            entries = window.ids.mapNotNull(byId::get),
+            checkpoint = window.checkpoint,
+        )
+    }
+
+    fun markSucceeded(ctx: Context, plan: ArchivedMetadataRefreshPlan, nowMs: Long): Boolean {
+        val checkpoint = plan.checkpoint ?: return true
+        return synchronized(lock) {
+            ctx.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .putString("cursor:${plan.scope}", checkpoint)
+                .putLong("success:${plan.scope}", nowMs.coerceAtLeast(1L))
+                .commit()
+        }
+    }
+}
+
 /**
  * Pulls desktop-authored registered-book metadata and shared review state.
  * Home may enqueue [enqueuePull], which never uploads local edits.
@@ -31,6 +160,8 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
     companion object {
         const val WORK_NAME = "capture-metadata-explicit-sync"
         const val PULL_WORK_NAME = "capture-metadata-pull"
+        const val LAN_WORK_NAME = "capture-metadata-explicit-lan-retry"
+        const val LAN_PULL_WORK_NAME = "capture-metadata-pull-lan-retry"
         private const val TAG = "CaptureMetadataSync"
         private const val KEY_PUSH_REVIEWS = "push-reviews"
         private const val KEY_ROUTE = "metadata-route"
@@ -84,23 +215,25 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
             )
         }
 
-        private fun enqueueCloudFollowup(ctx: Context, pushReviews: Boolean) {
-            if (!Prefs.configured(ctx) || !Auth.signedIn(ctx) ||
-                Prefs.userId(ctx).isEmpty()) return
+        /** LAN retries use their own unique chain. A retrying local desktop
+         * must never sit in front of an Internet-constrained cloud pull. */
+        private fun enqueueLanFollowup(ctx: Context, pushReviews: Boolean) {
+            if (Prefs.lanHost(ctx).isEmpty()) return
             val request = OneTimeWorkRequestBuilder<CaptureMetadataSyncWorker>()
                 .setInputData(workDataOf(
                     KEY_PUSH_REVIEWS to pushReviews,
-                    KEY_ROUTE to "cloud",
+                    KEY_ROUTE to "lan",
                 ))
                 .setConstraints(
                     Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
                         .build(),
                 )
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(ctx).enqueueUniqueWork(
-                if (pushReviews) WORK_NAME else PULL_WORK_NAME,
-                ExistingWorkPolicy.APPEND_OR_REPLACE,
+                if (pushReviews) LAN_WORK_NAME else LAN_PULL_WORK_NAME,
+                ExistingWorkPolicy.KEEP,
                 request,
             )
         }
@@ -110,35 +243,115 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
         val ctx = applicationContext
         val pushReviews = inputData.getBoolean(KEY_PUSH_REVIEWS, false)
         val forcedRoute = inputData.getString(KEY_ROUTE).orEmpty()
-        val hasLanEntries = Entries.recent(ctx).any { isLanMetadataEntry(ctx, it) }
-        if (forcedRoute != "cloud" && hasLanEntries &&
-            Prefs.lanHost(ctx).isNotEmpty()) {
-            val lan = try { LanClient(ctx) } catch (_: Exception) { null }
-            if (lan != null && lan.ping()) {
-                return@withContext syncLan(ctx, lan, pushReviews)
-            }
-            if (Entries.recent(ctx).any { isCloudMetadataEntry(ctx, it) }) {
-                enqueueCloudFollowup(ctx, pushReviews)
-            }
-            return@withContext Result.retry()
-        }
-        if (!Prefs.configured(ctx) || !Auth.signedIn(ctx)) return@withContext Result.success()
         val owner = Prefs.userId(ctx)
-        if (owner.isEmpty()) return@withContext Result.success()
+        val lanHost = Prefs.lanHost(ctx)
+        val cloudConfigured = Prefs.configured(ctx) && Auth.signedIn(ctx) && owner.isNotEmpty()
+        val recentEntries = Entries.recent(ctx)
+        val archivedEntries = Entries.archived(ctx)
+        val nowMs = System.currentTimeMillis()
+        val lanArchivePlan = ArchivedMetadataRefreshStore.plan(
+            ctx = ctx,
+            scope = "lan:${lanHost.lowercase()}",
+            candidates = if (lanHost.isEmpty()) emptyList() else archivedEntries.filter { entry ->
+                isLanMetadataEntry(ctx, entry) && SAFE_CAPTURE_SYNC_ID.matches(entry.id)
+            },
+            nowMs = nowMs,
+        )
+        val cloudArchivePlan = ArchivedMetadataRefreshStore.plan(
+            ctx = ctx,
+            scope = "cloud:${owner.lowercase()}",
+            candidates = if (!cloudConfigured) emptyList() else archivedEntries.filter { entry ->
+                isOwnedCloudMetadataEntry(ctx, entry, owner)
+            },
+            nowMs = nowMs,
+        )
+        val hasLanEntries = lanArchivePlan.entries.isNotEmpty() || recentEntries.any { entry ->
+            isLanMetadataEntry(ctx, entry) && SAFE_CAPTURE_SYNC_ID.matches(entry.id)
+        }
+        val hasCloudEntries = cloudArchivePlan.entries.isNotEmpty() || recentEntries.any { entry ->
+            cloudConfigured && isOwnedCloudMetadataEntry(ctx, entry, owner)
+        }
+        val shouldProbeLan = forcedRoute != "cloud" && hasLanEntries &&
+            lanHost.isNotEmpty() && (forcedRoute == "lan" || !hasCloudEntries)
+        val lan = if (shouldProbeLan) try { LanClient(ctx) } catch (_: Exception) { null } else null
+        val lanReachable = lan?.let { client ->
+            try { client.ping() } catch (_: Exception) { false }
+        } ?: false
+        when (metadataSyncRouteDecision(
+            forcedRoute = forcedRoute,
+            hasLanEntries = hasLanEntries,
+            hasCloudEntries = hasCloudEntries,
+            lanConfigured = lanHost.isNotEmpty(),
+            cloudConfigured = cloudConfigured,
+            lanReachable = lanReachable,
+        )) {
+            MetadataSyncRouteDecision.LAN -> return@withContext syncLan(
+                ctx,
+                checkNotNull(lan),
+                pushReviews,
+                lanArchivePlan,
+            )
+            MetadataSyncRouteDecision.RETRY_LAN -> return@withContext Result.retry()
+            MetadataSyncRouteDecision.CLOUD_AND_RETRY_LAN -> enqueueLanFollowup(ctx, pushReviews)
+            MetadataSyncRouteDecision.CLOUD -> Unit
+            MetadataSyncRouteDecision.NONE -> return@withContext Result.success()
+        }
+        if (!cloudConfigured) return@withContext Result.success()
         val client = SupabaseClient(ctx, owner)
         try {
-            repeat(if (pushReviews) MAX_PASSES else 1) {
+            repeat(if (pushReviews) MAX_PASSES else 1) { pass ->
                 if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
+                // Archived captures remain read-only. Include them only in the
+                // desktop-book projection; every mutable/review/media family
+                // below continues to operate on the current-entry set.
                 val entries = Entries.recent(ctx).filter { entry ->
-                    entry.uploaded && cloudUploadOwnership(
-                        readCaptureCreator(ctx, entry.dir),
-                        owner,
-                    ) == CloudUploadOwnership.ALLOWED &&
-                        entry.deliveryTransport != "lan"
+                    isOwnedCloudMetadataEntry(ctx, entry, owner)
+                }
+                val archived = if (pass == 0) cloudArchivePlan.entries else emptyList()
+                val metadataEntries = (entries + archived).distinctBy(Entries.Entry::id)
+                if (metadataEntries.isEmpty()) return@withContext Result.success()
+                val metadataIds = metadataEntries.map(Entries.Entry::id)
+                val desktopRows = client.desktopBookMetadata(metadataIds)
+                val refreshedArchivedEntries = mutableListOf<Entries.Entry>()
+                for ((captureId, metadata) in desktopRows) {
+                    if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
+                    val (result, archived) = EntryOperationLocks.withLock(captureId) {
+                        val entry = Entries.findIncludingArchive(ctx, captureId)
+                            ?: return@withLock DesktopMetadataApplyResult.STALE to false
+                        if (!isOwnedCloudMetadataEntry(ctx, entry, owner)) {
+                            return@withLock DesktopMetadataApplyResult.STALE to entry.archived
+                        }
+                        CaptureMetadataStore.applyDesktopBook(entry.dir, metadata) to entry.archived
+                    }
+                    if (result == DesktopMetadataApplyResult.CONFLICT) {
+                        throw CaptureMetadataStateException(
+                            "conflicting desktop metadata revision for $captureId",
+                        )
+                    }
+                    if (archived && result in setOf(
+                            DesktopMetadataApplyResult.APPLIED,
+                            DesktopMetadataApplyResult.UNCHANGED,
+                        )
+                    ) Entries.findIncludingArchive(ctx, captureId)
+                        ?.takeIf(Entries.Entry::archived)
+                        ?.let(refreshedArchivedEntries::add)
+                }
+                if (refreshedArchivedEntries.isNotEmpty() &&
+                    !CollectionInventory.recordFinalized(ctx, refreshedArchivedEntries)
+                ) {
+                    throw CaptureMetadataStateException(
+                        "could not refresh archived collection inventory",
+                    )
+                }
+                if (pass == 0 &&
+                    !ArchivedMetadataRefreshStore.markSucceeded(ctx, cloudArchivePlan, nowMs)
+                ) {
+                    throw CaptureMetadataStateException(
+                        "could not persist cloud archive metadata refresh checkpoint",
+                    )
                 }
                 if (entries.isEmpty()) return@withContext Result.success()
                 val ids = entries.map { it.id }
-                val desktopRows = client.desktopBookMetadata(ids)
                 val reviewRows = client.captureReviews(ids)
                 val importRows = client.captureImportStates(ids)
                 // Corrections are additive to the pull: a project whose
@@ -171,24 +384,6 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                     emptyMap()
                 }
 
-                for ((captureId, metadata) in desktopRows) {
-                    if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
-                    val result = EntryOperationLocks.withLock(captureId) {
-                        val entry = Entries.find(ctx, captureId)
-                            ?: return@withLock DesktopMetadataApplyResult.STALE
-                        if (!entry.uploaded || cloudUploadOwnership(
-                                readCaptureCreator(ctx, entry.dir), owner,
-                            ) != CloudUploadOwnership.ALLOWED) {
-                            return@withLock DesktopMetadataApplyResult.STALE
-                        }
-                        CaptureMetadataStore.applyDesktopBook(entry.dir, metadata)
-                    }
-                    if (result == DesktopMetadataApplyResult.CONFLICT) {
-                        throw CaptureMetadataStateException(
-                            "conflicting desktop metadata revision for $captureId",
-                        )
-                    }
-                }
                 for ((captureId, importState) in importRows) {
                     if (!sameSignedInOwner(ctx, owner)) return@withContext Result.success()
                     val applied = EntryOperationLocks.withLock(captureId) {
@@ -335,17 +530,25 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
         ctx: Context,
         client: LanClient,
         pushReviews: Boolean,
+        archivePlan: ArchivedMetadataRefreshPlan,
     ): Result {
         try {
-            repeat(if (pushReviews) MAX_PASSES else 1) {
+            repeat(if (pushReviews) MAX_PASSES else 1) { pass ->
                 val entries = Entries.recent(ctx).filter { entry ->
                     isLanMetadataEntry(ctx, entry) &&
                         SAFE_CAPTURE_SYNC_ID.matches(entry.id)
                 }
-                if (entries.isEmpty()) return finishLanMetadata(ctx, pushReviews)
-                for (batch in entries.chunked(CAPTURE_METADATA_BATCH_SIZE)) {
+                val entryIds = entries.mapTo(hashSetOf(), Entries.Entry::id)
+                val archived = if (pass == 0) archivePlan.entries else emptyList()
+                val metadataEntries = (entries + archived).distinctBy(Entries.Entry::id)
+                if (metadataEntries.isEmpty()) {
+                    return Result.success()
+                }
+                val refreshedArchivedEntries = mutableListOf<Entries.Entry>()
+                for (batch in metadataEntries.chunked(CAPTURE_METADATA_BATCH_SIZE)) {
+                    val currentBatch = batch.filter { it.id in entryIds }
                     val sent = linkedMapOf<String, CaptureReviewMetadata>()
-                    val outgoing = if (pushReviews) batch.mapNotNull { entry ->
+                    val outgoing = if (pushReviews) currentBatch.mapNotNull { entry ->
                         val store = EntryOperationLocks.withLock(entry.id) {
                             Entries.find(ctx, entry.id)?.let {
                                 when (val state = CaptureMetadataStore.reviewState(it.dir)) {
@@ -364,18 +567,29 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                     } else emptyList()
                     val exchange = client.syncMetadata(batch.map { it.id }, outgoing)
                     for ((captureId, metadata) in exchange.books) {
-                        val applied = EntryOperationLocks.withLock(captureId) {
-                            val entry = Entries.find(ctx, captureId)
-                                ?: return@withLock DesktopMetadataApplyResult.STALE
-                            CaptureMetadataStore.applyDesktopBook(entry.dir, metadata)
+                        val (applied, archived) = EntryOperationLocks.withLock(captureId) {
+                            val entry = Entries.findIncludingArchive(ctx, captureId)
+                                ?: return@withLock DesktopMetadataApplyResult.STALE to false
+                            if (!isLanMetadataEntry(ctx, entry)) {
+                                return@withLock DesktopMetadataApplyResult.STALE to entry.archived
+                            }
+                            CaptureMetadataStore.applyDesktopBook(entry.dir, metadata) to entry.archived
                         }
                         if (applied == DesktopMetadataApplyResult.CONFLICT) {
                             throw CaptureMetadataStateException(
                                 "conflicting LAN desktop metadata revision for $captureId",
                             )
                         }
+                        if (archived && applied in setOf(
+                                DesktopMetadataApplyResult.APPLIED,
+                                DesktopMetadataApplyResult.UNCHANGED,
+                            )
+                        ) Entries.findIncludingArchive(ctx, captureId)
+                            ?.takeIf(Entries.Entry::archived)
+                            ?.let(refreshedArchivedEntries::add)
                     }
                     for ((captureId, confirmation) in exchange.associations) {
+                        if (captureId !in entryIds) continue
                         val applied = EntryOperationLocks.withLock(captureId) {
                             val entry = Entries.find(ctx, captureId)
                                 ?: return@withLock CaptureLibApplyResult.STALE
@@ -387,7 +601,7 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                             )
                         }
                     }
-                    for (entrySnapshot in batch) {
+                    for (entrySnapshot in currentBatch) {
                         val remote = exchange.reviews[entrySnapshot.id] ?: continue
                         EntryOperationLocks.withLock(entrySnapshot.id) {
                             val entry = Entries.find(ctx, entrySnapshot.id)
@@ -414,12 +628,34 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
                         }
                     }
                 }
-                if (!pushReviews) return finishLanMetadata(ctx, pushReviews)
+                if (refreshedArchivedEntries.isNotEmpty() &&
+                    !CollectionInventory.recordFinalized(ctx, refreshedArchivedEntries)
+                ) {
+                    throw CaptureMetadataStateException(
+                        "could not refresh archived collection inventory",
+                    )
+                }
+                if (pass == 0 &&
+                    !ArchivedMetadataRefreshStore.markSucceeded(
+                        ctx,
+                        archivePlan,
+                        System.currentTimeMillis(),
+                    )
+                ) {
+                    throw CaptureMetadataStateException(
+                        "could not persist LAN archive metadata refresh checkpoint",
+                    )
+                }
+                if (!pushReviews) {
+                    return Result.success()
+                }
                 val dirtyRemaining = Entries.recent(ctx).any { entry ->
                     isLanMetadataEntry(ctx, entry) &&
                         CaptureMetadataStore.hasPendingReviewSync(entry.dir)
                 }
-                if (!dirtyRemaining) return finishLanMetadata(ctx, pushReviews)
+                if (!dirtyRemaining) {
+                    return Result.success()
+                }
             }
             return Result.retry()
         } catch (e: LanClient.HttpException) {
@@ -528,13 +764,6 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
         }
     }
 
-    private fun finishLanMetadata(ctx: Context, pushReviews: Boolean): Result {
-        if (Entries.recent(ctx).any { isCloudMetadataEntry(ctx, it) }) {
-            enqueueCloudFollowup(ctx, pushReviews)
-        }
-        return Result.success()
-    }
-
     private fun permanentFailure(message: String?): Result = Result.failure(
         Data.Builder().putString("error", message.orEmpty().take(500)).build(),
     )
@@ -542,6 +771,14 @@ class CaptureMetadataSyncWorker(ctx: Context, params: WorkerParameters) :
 
 private fun sameSignedInOwner(ctx: Context, expectedOwner: String): Boolean =
     Auth.signedIn(ctx) && expectedOwner.isNotEmpty() && Prefs.userId(ctx) == expectedOwner
+
+private fun isOwnedCloudMetadataEntry(
+    ctx: Context,
+    entry: Entries.Entry,
+    owner: String,
+): Boolean = entry.uploaded && entry.deliveryTransport != "lan" &&
+    cloudUploadOwnership(readCaptureCreator(ctx, entry.dir), owner) ==
+    CloudUploadOwnership.ALLOWED
 
 private fun isLanMetadataEntry(ctx: Context, entry: Entries.Entry): Boolean {
     if (!entry.uploaded) return false

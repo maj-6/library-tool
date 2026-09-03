@@ -405,7 +405,7 @@ class HomeListResourceTest {
     }
 
     @Test
-    fun digitizationCandidateHasNumberedScannerOverlayAndDetailIndicator() {
+    fun scanAssessmentAndLegacyCandidateShareTheBookOverlayWithoutConflation() {
         val homeLayout = File("src/main/res/layout/item_home.xml").readText()
         assertTrue(homeLayout.contains("android:id=\"@+id/thumbFrame\""))
         assertTrue(homeLayout.contains("layout=\"@layout/view_scan_priority_indicator\""))
@@ -427,6 +427,8 @@ class HomeListResourceTest {
         assertTrue(homeSource.contains("bindScanPriorityIndicator("))
         assertTrue(homeSource.contains("entryScanCandidate(this, entry)"))
         assertTrue(homeSource.contains("desktop?.scanPriorityRank"))
+        assertTrue(homeSource.contains("assessment = desktop?.scanPriorityAssessment"))
+        assertTrue(homeSource.contains("assessment = summary.scanPriorityAssessment"))
         val summary = homeSource.substringAfter("val summaryIds = listOf(")
             .substringBefore(")")
         assertTrue(summary.contains("R.id.scanPriorityIndicator"))
@@ -434,12 +436,16 @@ class HomeListResourceTest {
         val detailSource = source("EntryDetailActivity")
         assertTrue(detailSource.contains("if (entryScanCandidate(this, entry) == true)"))
         assertTrue(detailSource.contains("R.string.detail_digitization"))
+        assertTrue(detailSource.contains("R.string.detail_scan_priority"))
+        assertTrue(detailSource.contains("R.string.scan_priority_assessment_unassessed"))
         assertTrue(detailSource.contains("R.string.scan_priority_description"))
 
         val strings = File("src/main/res/values/strings.xml").readText()
         assertTrue(strings.contains(">Scan candidate</string>"))
         assertTrue(strings.contains("name=\"scan_priority_description\""))
         assertTrue(strings.contains("name=\"detail_digitization\">Digitization</string>"))
+        assertTrue(strings.contains("name=\"detail_scan_priority\">Scan priority</string>"))
+        assertTrue(strings.contains("name=\"scan_priority_assessment_unassessed\">Unassessed</string>"))
     }
 
     private fun source(name: String): String =

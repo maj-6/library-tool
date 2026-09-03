@@ -90,6 +90,7 @@ class CaptureMetadataSyncTest {
             .put("scan_status", "needs scan")
             .put("digitization_candidate", true)
             .put("scan_priority_rank", 2)
+            .put("scan_priority", "High")
             .put("remarks", JSONArray().put("First remark").put(
                 JSONObject().put("text", "Second remark"),
             ))
@@ -108,6 +109,8 @@ class CaptureMetadataSyncTest {
         assertEquals(true, parsed.digitizationCandidateClassification)
         assertTrue(parsed.digitizationCandidate)
         assertEquals(2, parsed.scanPriorityRank)
+        assertEquals(ScanPriorityAssessment.HIGH, parsed.scanPriorityAssessment)
+        assertTrue(parsed.scanPriorityAssessmentKnown)
         assertEquals(listOf("First remark", "Second remark"), parsed.remarks)
     }
 
@@ -196,6 +199,43 @@ class CaptureMetadataSyncTest {
                     .put("scan_priority", textualPriority),
             ))!!
             assertNull(parsed.scanPriorityRank)
+        }
+    }
+
+    @Test
+    fun textualScanPriorityUsesOnlyCanonicalValuesAndIsIndependentOfCandidate() {
+        mapOf(
+            "High" to ScanPriorityAssessment.HIGH,
+            "Medium" to ScanPriorityAssessment.MEDIUM,
+            "Low" to ScanPriorityAssessment.LOW,
+            "n/s (no scan)" to ScanPriorityAssessment.NO_SCAN,
+        ).forEach { (wireValue, expected) ->
+            val parsed = desktopBookMetadataFromJson(desktopRow(
+                data = JSONObject()
+                    .put("digitization_candidate", false)
+                    .put("scan_priority", wireValue),
+            ))!!
+            assertEquals(expected, parsed.scanPriorityAssessment)
+            assertTrue(parsed.scanPriorityAssessmentKnown)
+            assertNull(parsed.scanPriorityRank)
+        }
+
+        val unassessed = desktopBookMetadataFromJson(desktopRow(
+            data = JSONObject().put("scan_priority", JSONObject.NULL),
+        ))!!
+        assertNull(unassessed.scanPriorityAssessment)
+        assertTrue(unassessed.scanPriorityAssessmentKnown)
+
+        val missing = desktopBookMetadataFromJson(desktopRow(data = JSONObject()))!!
+        assertNull(missing.scanPriorityAssessment)
+        assertFalse(missing.scanPriorityAssessmentKnown)
+
+        listOf("high", " High", "", 1, true).forEach { malformed ->
+            val parsed = desktopBookMetadataFromJson(desktopRow(
+                data = JSONObject().put("scan_priority", malformed),
+            ))!!
+            assertNull(parsed.scanPriorityAssessment)
+            assertFalse(parsed.scanPriorityAssessmentKnown)
         }
     }
 
@@ -339,9 +379,34 @@ class CaptureMetadataSyncTest {
             CaptureMetadataStore.applyDesktopBook(dir, reset))
         assertEquals(DesktopMetadataApplyResult.STALE,
             CaptureMetadataStore.applyDesktopBook(dir, olderReset))
+        assertEquals(DesktopMetadataApplyResult.STALE,
+            CaptureMetadataStore.applyDesktopBook(dir, original))
+        assertEquals("reset", CaptureMetadataStore.readDesktopBook(dir)!!.scanStatus)
         assertEquals(DesktopMetadataApplyResult.APPLIED,
             CaptureMetadataStore.applyDesktopBook(dir, rotated))
         assertEquals("rotated", CaptureMetadataStore.readDesktopBook(dir)!!.scanStatus)
+    }
+
+    @Test
+    fun metadataVersionOrderingIsStableAcrossLedgerResets() {
+        assertTrue(metadataVersionSupersedes(
+            candidateRevision = 1,
+            candidateUpdatedAt = "2026-07-22T12:01:00Z",
+            baselineRevision = 9,
+            baselineUpdatedAt = "2026-07-22T12:00:00Z",
+        ))
+        assertFalse(metadataVersionSupersedes(
+            candidateRevision = 9,
+            candidateUpdatedAt = "2026-07-22T12:00:00Z",
+            baselineRevision = 1,
+            baselineUpdatedAt = "2026-07-22T12:01:00Z",
+        ))
+        assertTrue(metadataVersionSupersedes(
+            candidateRevision = 10,
+            candidateUpdatedAt = "",
+            baselineRevision = 9,
+            baselineUpdatedAt = "",
+        ))
     }
 
     @Test
@@ -750,5 +815,88 @@ class CaptureMetadataSyncTest {
         assertTrue(source.contains("fun enqueuePull(ctx: Context)"))
         assertTrue(source.contains("fun enqueueExplicitSync(ctx: Context)"))
         assertTrue(source.contains("if (!pushReviews || plan == null) continue"))
+    }
+
+    @Test
+    fun mixedMetadataSourcesAlwaysRunCloudOutsideTheLanRetryChain() {
+        fun decide(
+            lan: Boolean = false,
+            cloud: Boolean = false,
+            reachable: Boolean = false,
+            route: String = "",
+        ) = metadataSyncRouteDecision(
+            forcedRoute = route,
+            hasLanEntries = lan,
+            hasCloudEntries = cloud,
+            lanConfigured = lan,
+            cloudConfigured = cloud,
+            lanReachable = reachable,
+        )
+
+        assertEquals(
+            MetadataSyncRouteDecision.CLOUD_AND_RETRY_LAN,
+            decide(lan = true, cloud = true, reachable = true),
+        )
+        assertEquals(
+            MetadataSyncRouteDecision.CLOUD_AND_RETRY_LAN,
+            decide(lan = true, cloud = true, reachable = false),
+        )
+        assertEquals(
+            MetadataSyncRouteDecision.LAN,
+            decide(lan = true, reachable = true),
+        )
+        assertEquals(
+            MetadataSyncRouteDecision.RETRY_LAN,
+            decide(lan = true, reachable = false),
+        )
+        assertEquals(
+            MetadataSyncRouteDecision.CLOUD,
+            decide(cloud = true),
+        )
+        assertEquals(
+            MetadataSyncRouteDecision.LAN,
+            decide(lan = true, cloud = true, reachable = true, route = "lan"),
+        )
+        assertEquals(
+            MetadataSyncRouteDecision.CLOUD,
+            decide(lan = true, cloud = true, reachable = true, route = "cloud"),
+        )
+    }
+
+    @Test
+    fun archivedMetadataRefreshUsesACadencedRotatingWindow() {
+        val ids = (1..205).map { it.toString().padStart(3, '0') }
+        val first = planArchivedMetadataRefresh(
+            ids = ids,
+            cursor = null,
+            lastSuccessMs = 0L,
+            nowMs = 1_000L,
+            batchSize = 80,
+            minimumIntervalMs = 1_000L,
+        )
+        assertEquals(ids.take(80), first.ids)
+        assertEquals("080", first.checkpoint)
+
+        val held = planArchivedMetadataRefresh(
+            ids = ids,
+            cursor = first.checkpoint,
+            lastSuccessMs = 1_000L,
+            nowMs = 1_999L,
+            batchSize = 80,
+            minimumIntervalMs = 1_000L,
+        )
+        assertTrue(held.ids.isEmpty())
+        assertNull(held.checkpoint)
+
+        val second = planArchivedMetadataRefresh(
+            ids = ids,
+            cursor = first.checkpoint,
+            lastSuccessMs = 1_000L,
+            nowMs = 2_000L,
+            batchSize = 80,
+            minimumIntervalMs = 1_000L,
+        )
+        assertEquals(ids.drop(80).take(80), second.ids)
+        assertEquals("160", second.checkpoint)
     }
 }

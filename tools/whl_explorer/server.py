@@ -29686,26 +29686,45 @@ def _capture_retained_projection_evidence(data: dict) -> dict:
     # permanently, because the owning desktop's replay then compares "equal" and
     # push_capture_book_metadata refuses it.
     for key in ("bibliography", "copyright", "availability", "scan_status",
-                "digitization_candidate", "scan_priority", "remarks"):
+                "digitization_candidate", "remarks"):
         value = data.get(key)
         if value not in (None, "", [], {}):
             out[key] = json.loads(json.dumps(value, ensure_ascii=False))
+    priority = _capture_scan_priority(data.get("scan_priority"))
+    if priority is not None:
+        out["scan_priority"] = priority
+    # Rows from the former projection stored the unrelated 1-5 ordering rank
+    # under `scan_priority`. Migrate that evidence into its renamed field while
+    # a tombstone carries it between owner desktops. An explicit new rank key is
+    # authoritative, including when malformed/cleared, so do not fall back.
+    rank_source = (data.get("scan_priority_rank")
+                   if "scan_priority_rank" in data else data.get("scan_priority"))
+    rank = _capture_scan_priority_rank(rank_source)
+    if data.get("digitization_candidate") is True and rank is not None:
+        out["scan_priority_rank"] = rank
     return out
 
 
 def _capture_scan_priority(value) -> str | None:
-    """Return the strict 1-5 ordinal Android accepts, or no priority.
+    """Return an exact catalogue scan-assessment label, or no assessment.
 
-    Enrichment stores this field as a canonical string. Accept an integer too
-    for forward-compatible hand-authored rows, while rejecting booleans,
-    floats, padded strings and the enrichment sentinel ``n/s``.
+    This catalogue field is independent of digitization-candidate membership.
+    Preserve only the four values accepted by Desktop rather than coercing
+    misspellings, case variants, or the old numeric rank into this namespace.
     """
+    if isinstance(value, str) and value in set(lib.SCAN_PRIORITY_VALUES):
+        return value
+    return None
+
+
+def _capture_scan_priority_rank(value) -> int | None:
+    """Return a legacy candidate-order rank as a JSON integer, or none."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int) and 1 <= value <= 5:
-        return str(value)
-    if isinstance(value, str) and value in {"1", "2", "3", "4", "5"}:
         return value
+    if isinstance(value, str) and value in {"1", "2", "3", "4", "5"}:
+        return int(value)
     return None
 
 
@@ -29795,16 +29814,49 @@ def _merge_capture_projection_with_existing(row: dict,
             isinstance(old_candidate, bool)):
         desired["digitization_candidate"] = old_candidate
 
-    # Missing is legacy/unknown and may inherit a known cloud value. An
-    # explicit JSON null is a curator-authored clear (for example enrichment's
-    # ``n/s``) and must not resurrect the old rank. A non-candidate never keeps
-    # an orphaned priority in its phone-visible projection.
-    old_priority = _capture_scan_priority(previous_facts.get("scan_priority"))
-    if desired.get("digitization_candidate") is True:
-        if "scan_priority" not in desired and old_priority is not None:
-            desired["scan_priority"] = old_priority
-    else:
+    # The textual assessment is independent of candidate classification.
+    # Missing means this replica does not know it and may inherit cloud evidence;
+    # explicit null means a curator cleared it. Numeric values from the former
+    # field contract are not assessments and are migrated to the rank below.
+    tombstone = desired.get("registered") is False
+    desired_priority_present = "scan_priority" in desired
+    desired_priority_raw = desired.get("scan_priority")
+    desired_legacy_rank = _capture_scan_priority_rank(desired_priority_raw) \
+        if desired_priority_present else None
+    if tombstone:
         desired.pop("scan_priority", None)
+    elif desired_priority_present:
+        priority = _capture_scan_priority(desired_priority_raw)
+        if priority is not None:
+            desired["scan_priority"] = priority
+        elif desired_legacy_rank is not None:
+            desired.pop("scan_priority", None)
+        else:
+            desired["scan_priority"] = None
+    else:
+        old_priority = _capture_scan_priority(previous_facts.get("scan_priority"))
+        if old_priority is not None:
+            desired["scan_priority"] = old_priority
+
+    # Candidate-order rank remains conditional on an explicit candidate. The
+    # renamed key wins whenever present; otherwise accept numeric-only legacy
+    # `scan_priority`, and preserve known cloud rank evidence for a live row.
+    old_rank_source = (
+        previous_facts.get("scan_priority_rank")
+        if "scan_priority_rank" in previous_facts
+        else previous_facts.get("scan_priority")
+    )
+    old_rank = _capture_scan_priority_rank(old_rank_source)
+    if not tombstone and desired.get("digitization_candidate") is True:
+        if "scan_priority_rank" in desired:
+            desired["scan_priority_rank"] = _capture_scan_priority_rank(
+                desired.get("scan_priority_rank"))
+        elif desired_legacy_rank is not None:
+            desired["scan_priority_rank"] = desired_legacy_rank
+        elif old_rank is not None:
+            desired["scan_priority_rank"] = old_rank
+    else:
+        desired.pop("scan_priority_rank", None)
 
     desired_evidence = _capture_projection_stamp(
         desired_source.get("evidence_updated_at"))
@@ -30063,11 +30115,28 @@ def _capture_book_metadata_rows(builds: dict | None = None,
         )
         if isinstance(digitization_candidate, bool):
             data["digitization_candidate"] = digitization_candidate
-            if digitization_candidate and "scan_priority" in build:
-                # Preserve an explicit clear as JSON null so a merge cannot
-                # revive a stale cloud priority. Android treats it as unset.
-                data["scan_priority"] = _capture_scan_priority(
-                    build.get("scan_priority"))
+        # Scan assessment is a catalogue verdict, independent of candidate
+        # membership. An explicit invalid/empty value is carried as JSON null so
+        # a merge cannot revive a stale cloud assessment. A numeric value belongs
+        # to the former rank contract and is migrated below instead.
+        legacy_rank = None
+        if "scan_priority" in build:
+            raw_priority = build.get("scan_priority")
+            priority = _capture_scan_priority(raw_priority)
+            legacy_rank = _capture_scan_priority_rank(raw_priority)
+            if priority is not None:
+                data["scan_priority"] = priority
+            elif legacy_rank is None:
+                data["scan_priority"] = None
+        # A rank has meaning only for a candidate. Prefer its explicit renamed
+        # field, including an explicit clear; otherwise migrate the old numeric
+        # `scan_priority` spelling. Emit a JSON number, never a numeric string.
+        if digitization_candidate is True:
+            if "scan_priority_rank" in build:
+                data["scan_priority_rank"] = _capture_scan_priority_rank(
+                    build.get("scan_priority_rank"))
+            elif legacy_rank is not None:
+                data["scan_priority_rank"] = legacy_rank
         rows.append({
             "capture_id": capture_id,
             # An unregistered capture has no book id, and the phone's
