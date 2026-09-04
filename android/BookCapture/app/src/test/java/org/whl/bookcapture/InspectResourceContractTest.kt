@@ -31,11 +31,30 @@ class InspectResourceContractTest {
 
         assertEquals("LinearLayout", elementById(home, "inspectPane").tagName)
         assertNotNull(elementById(home, "inspectSummary"))
+        val collectionSearch = elementById(home, "inspectCollectionSearch")
         assertEquals(
-            "HorizontalScrollView",
-            elementById(home, "inspectCollectionScroll").tagName,
+            "androidx.appcompat.widget.AppCompatAutoCompleteTextView",
+            collectionSearch.tagName,
         )
-        assertEquals("LinearLayout", elementById(home, "inspectCollectionChips").tagName)
+        assertEquals("@style/WhlInput", collectionSearch.getAttribute("style"))
+        assertEquals(
+            "@string/inspect_collection_search_hint",
+            collectionSearch.getAttributeNS(androidNs, "hint"),
+        )
+        assertEquals("actionSearch", collectionSearch.getAttributeNS(androidNs, "imeOptions"))
+        assertEquals("true", collectionSearch.getAttributeNS(androidNs, "singleLine"))
+        assertEquals("1", collectionSearch.getAttributeNS(androidNs, "completionThreshold"))
+        assertEquals(
+            "@id/inspectCollectionSearch",
+            elementById(home, "inspectCollectionSearchLabel")
+                .getAttributeNS(androidNs, "labelFor"),
+        )
+        assertFalse(elements(home, "*").any {
+            it.getAttributeNS(androidNs, "id") in listOf(
+                "@+id/inspectCollectionScroll",
+                "@+id/inspectCollectionChips",
+            )
+        })
         assertNotNull(elementById(home, "inspectCollectionName"))
         assertNotNull(elementById(home, "inspectCollectionMeta"))
         assertNotNull(elementById(home, "inspectBooks"))
@@ -81,7 +100,10 @@ class InspectResourceContractTest {
 
         val source = source("HomeActivity")
         assertTrue(source.contains("button.isSelected = on"))
-        assertTrue(source.contains("chip.isSelected = isSelected"))
+        assertTrue(source.contains("binding.inspectCollectionSearch.setOnItemClickListener"))
+        assertTrue(source.contains("selectInspectCollection(choice.collectionId)"))
+        assertTrue(source.contains("inspectedCollectionId = collection.id"))
+        assertTrue(source.contains("binding.inspectCollectionSearch.announceForAccessibility"))
         assertTrue(source.contains("ViewCompat.setStateDescription"))
         assertTrue(source.contains("R.string.selection_selected_state"))
     }

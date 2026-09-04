@@ -285,6 +285,12 @@
          cloud is empty when the phone is signed out and could not ask. -->
     <string name="inspect_scan_box">Scan box QR</string>
     <string name="inspect_search_hint">Find a book by title</string>
+    <string name="inspect_collection_search_label">Search collections</string>
+    <string name="inspect_collection_search_hint">Type a name, tag, or origin</string>
+    <string name="inspect_collection_search_no_matches">No matching collection.</string>
+    <string name="inspect_collection_search_choose_match">Choose a collection from the matching results.</string>
+    <string name="inspect_collection_search_result_description">Collection %1$s, tag %2$s, %3$s</string>
+    <string name="inspect_collection_search_tag">tag %1$s</string>
     <string name="inspect_scan_cover">Scan a book cover</string>
     <string name="scan_queue_add">Queue scan book</string>
     <string name="scan_queue_capture_title">Physical scan capture</string>
@@ -389,8 +395,6 @@
         <item quantity="one">%1$d book</item>
         <item quantity="other">%1$d books</item>
     </plurals>
-    <string name="inspect_collection_chip">%1$s\n%2$s &#183; %3$s</string>
-    <string name="inspect_collection_description">Inspect %1$s, tag %2$s, %3$s</string>
     <string name="inspect_collection_meta">%1$s &#183; %2$s%3$s</string>
     <string name="inspect_mode_tiles">Tiles</string>
     <string name="inspect_mode_content">Content</string>

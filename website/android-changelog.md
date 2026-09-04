@@ -3,6 +3,24 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.22 — 2026-09-04
+
+Android version code: `53`.
+
+### Additions
+
+- Inspect replaces the horizontal collection carousel with a searchable
+  collection picker. It matches hierarchy paths, names, printed tag IDs, and
+  recorded origins, while selection remains bound to the collection's stable
+  identity.
+
+### Other Changes
+
+- Collection suggestion results are ranked and capped at 24. Filtering uses the
+  already-loaded snapshot, so typing does not reload the inventory or start
+  cloud requests, and an unconfirmed query never masquerades as the box
+  currently open below it.
+
 ## 0.5.2-alpha.21 — 2026-09-03
 
 Android version code: `52`.
